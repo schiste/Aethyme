@@ -21,6 +21,13 @@ pub(crate) enum TreeRemoval {
     Interrupted,
 }
 
+/// Error from a bounded tree removal, including successful unlink progress.
+#[derive(Debug)]
+pub(crate) struct TreeRemovalError {
+    pub(crate) source: io::Error,
+    pub(crate) entries_reclaimed: usize,
+}
+
 /// Stable identity of one opened directory object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TreeObjectIdentity {
@@ -102,6 +109,37 @@ impl PinnedTreeRemoval {
             Err(unsupported_platform())
         }
     }
+
+    /// Remove this tree only after validating the retained witness bytes.
+    ///
+    /// The callback receives bytes read through the pinned root directory
+    /// descriptor after the file's identity and bounded size are checked, and
+    /// before the first unlink. It can bind removal to an owner's recorded
+    /// marker payload. This is a point-in-time check; callers must still use
+    /// the broker's cooperative writer rules because an unrelated process can
+    /// rewrite the witness after validation.
+    pub(crate) fn remove_verified_witness<F>(
+        self,
+        _witness_name: &str,
+        _deadline: Option<Instant>,
+        _validate: F,
+    ) -> io::Result<TreeRemoval>
+    where
+        F: FnOnce(&[u8]) -> io::Result<()>,
+    {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.0
+                .remove_verified_witness(_witness_name, _deadline, _validate)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            drop(_validate);
+            let _self = self;
+            let _ = (_witness_name, _deadline);
+            Err(unsupported_platform())
+        }
+    }
 }
 
 /// Remove a path after pinning it. Registered orphan apply should instead keep
@@ -111,16 +149,38 @@ pub(crate) fn remove_condemned_tree(
     _keep_until_last: Option<&str>,
     _deadline: Option<Instant>,
 ) -> io::Result<TreeRemoval> {
+    remove_condemned_tree_with_progress(_dir, _keep_until_last, _deadline)
+        .map(|(outcome, _entries_reclaimed)| outcome)
+        .map_err(|error| error.source)
+}
+
+/// Remove a path after pinning it and preserve the number of successful
+/// unlinks even when the deadline interrupts removal or a later operation
+/// fails. A missing final leaf is complete with zero progress; an unavailable
+/// parent remains an error.
+pub(crate) fn remove_condemned_tree_with_progress(
+    _dir: &Path,
+    _keep_until_last: Option<&str>,
+    _deadline: Option<Instant>,
+) -> Result<(TreeRemoval, usize), TreeRemovalError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        return match unix::PinnedTreeRemoval::open_optional(_dir)? {
-            Some(tree) => tree.remove(_keep_until_last, _deadline, &mut || Ok(())),
-            None => Ok(TreeRemoval::Complete),
+        return match unix::PinnedTreeRemoval::open_optional(_dir) {
+            Ok(Some(tree)) => tree.remove_with_progress(_keep_until_last, _deadline),
+            Ok(None) => Ok((TreeRemoval::Complete, 0)),
+            Err(source) => Err(TreeRemovalError {
+                source,
+                entries_reclaimed: 0,
+            }),
         };
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        Err(unsupported_platform())
+        let _ = (_dir, _keep_until_last, _deadline);
+        Err(TreeRemovalError {
+            source: unsupported_platform(),
+            entries_reclaimed: 0,
+        })
     }
 }
 
@@ -157,8 +217,8 @@ mod unix {
         parent: File,
         name: CString,
         root: File,
-        object_identity: TreeObjectIdentity,
-        filesystem_identity: Vec<u8>,
+        pub(super) object_identity: TreeObjectIdentity,
+        pub(super) filesystem_identity: Vec<u8>,
         mount_identity: Vec<u8>,
     }
 
@@ -242,6 +302,40 @@ mod unix {
             )
         }
 
+        pub(super) fn remove_with_progress(
+            self,
+            keep_until_last: Option<&str>,
+            deadline: Option<Instant>,
+        ) -> Result<(TreeRemoval, usize), super::TreeRemovalError> {
+            self.remove_with_hooks_and_progress(
+                keep_until_last,
+                deadline,
+                &mut || Ok(()),
+                &mut || Ok(()),
+                |_| Ok(()),
+            )
+        }
+
+        pub(super) fn remove_verified_witness<F>(
+            self,
+            witness_name: &str,
+            deadline: Option<Instant>,
+            validate: F,
+        ) -> io::Result<TreeRemoval>
+        where
+            F: FnOnce(&[u8]) -> io::Result<()>,
+        {
+            self.remove_with_hooks_and_progress(
+                Some(witness_name),
+                deadline,
+                &mut || Ok(()),
+                &mut || Ok(()),
+                validate,
+            )
+            .map(|(outcome, _entries_reclaimed)| outcome)
+            .map_err(|error| error.source)
+        }
+
         fn remove_with_hooks<F, G>(
             self,
             keep_until_last: Option<&str>,
@@ -253,118 +347,165 @@ mod unix {
             F: FnMut() -> io::Result<()>,
             G: FnMut() -> io::Result<()>,
         {
-            let keep = keep_until_last.map(CString::new).transpose().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "witness name contains NUL")
-            })?;
-            if keep.as_ref().is_some_and(|name| {
-                name.as_bytes().contains(&b'/')
-                    || name.as_bytes() == b"."
-                    || name.as_bytes() == b".."
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "witness name must be a single ordinary path component",
-                ));
-            }
-            let witness_backup = if let Some(witness) = keep.as_ref() {
-                Some(read_witness(self.root.as_raw_fd(), witness)?)
-            } else {
-                None
-            };
-            let mut witness_identity = witness_backup.as_ref().map(|backup| backup.identity);
-            let mut witness_removed = false;
-            let mut attempts_left = TREE_REMOVAL_ATTEMPTS;
-            loop {
-                attempts_left -= 1;
-                self.ensure_root_binding()?;
-                match drain_directory(&self, keep.as_ref(), deadline, before_directory_open) {
-                    Ok(TreeRemoval::Complete) => {}
-                    Ok(TreeRemoval::Interrupted) => {
-                        if witness_removed {
-                            restore_witness(
-                                self.root.as_raw_fd(),
-                                keep.as_ref().expect("removed witness has a name"),
-                                witness_backup
-                                    .as_ref()
-                                    .expect("removed witness has a backup"),
-                            )?;
-                        }
-                        return Ok(TreeRemoval::Interrupted);
-                    }
-                    Err(error) => {
-                        return Err(restore_after_failure(
-                            error,
-                            witness_removed,
-                            self.root.as_raw_fd(),
-                            keep.as_ref(),
-                            witness_backup.as_ref(),
-                        ));
-                    }
-                }
+            self.remove_with_hooks_and_progress(
+                keep_until_last,
+                deadline,
+                before_directory_open,
+                after_witness_unlink,
+                |_| Ok(()),
+            )
+            .map(|(outcome, _entries_reclaimed)| outcome)
+            .map_err(|error| error.source)
+        }
 
-                if let (Some(witness), Some(identity), Some(backup)) =
-                    (keep.as_ref(), witness_identity, witness_backup.as_ref())
-                    && !witness_removed
-                {
+        fn remove_with_hooks_and_progress<F, G, V>(
+            self,
+            keep_until_last: Option<&str>,
+            deadline: Option<Instant>,
+            before_directory_open: &mut F,
+            after_witness_unlink: &mut G,
+            validate_witness: V,
+        ) -> Result<(TreeRemoval, usize), super::TreeRemovalError>
+        where
+            F: FnMut() -> io::Result<()>,
+            G: FnMut() -> io::Result<()>,
+            V: FnOnce(&[u8]) -> io::Result<()>,
+        {
+            let mut entries_reclaimed = 0;
+            let result = (|| -> io::Result<TreeRemoval> {
+                let keep = keep_until_last.map(CString::new).transpose().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "witness name contains NUL")
+                })?;
+                if keep.as_ref().is_some_and(|name| {
+                    name.as_bytes().contains(&b'/')
+                        || name.as_bytes() == b"."
+                        || name.as_bytes() == b".."
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "witness name must be a single ordinary path component",
+                    ));
+                }
+                let witness_backup = if let Some(witness) = keep.as_ref() {
+                    Some(read_witness(self.root.as_raw_fd(), witness)?)
+                } else {
+                    None
+                };
+                if let Some(backup) = witness_backup.as_ref() {
+                    validate_witness(&backup.bytes)?;
+                }
+                let mut witness_identity = witness_backup.as_ref().map(|backup| backup.identity);
+                let mut witness_removed = false;
+                let mut attempts_left = TREE_REMOVAL_ATTEMPTS;
+                loop {
+                    attempts_left -= 1;
                     self.ensure_root_binding()?;
-                    ensure_named_regular_file(self.root.as_raw_fd(), witness, identity)?;
-                    match unlink_at(self.root.as_raw_fd(), witness, false) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            witness_removed = true;
+                    match drain_directory(
+                        &self,
+                        keep.as_ref(),
+                        deadline,
+                        before_directory_open,
+                        &mut entries_reclaimed,
+                    ) {
+                        Ok(TreeRemoval::Complete) => {}
+                        Ok(TreeRemoval::Interrupted) => {
+                            if witness_removed {
+                                restore_witness(
+                                    self.root.as_raw_fd(),
+                                    keep.as_ref().expect("removed witness has a name"),
+                                    witness_backup
+                                        .as_ref()
+                                        .expect("removed witness has a backup"),
+                                )?;
+                            }
+                            return Ok(TreeRemoval::Interrupted);
+                        }
+                        Err(error) => {
                             return Err(restore_after_failure(
-                                changed_entry_error(),
+                                error,
+                                witness_removed,
+                                self.root.as_raw_fd(),
+                                keep.as_ref(),
+                                witness_backup.as_ref(),
+                            ));
+                        }
+                    }
+
+                    if let (Some(witness), Some(identity), Some(backup)) =
+                        (keep.as_ref(), witness_identity, witness_backup.as_ref())
+                        && !witness_removed
+                    {
+                        self.ensure_root_binding()?;
+                        ensure_named_regular_file(self.root.as_raw_fd(), witness, identity)?;
+                        match unlink_at(self.root.as_raw_fd(), witness, false) {
+                            Ok(()) => {
+                                entries_reclaimed = entries_reclaimed.saturating_add(1);
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                witness_removed = true;
+                                return Err(restore_after_failure(
+                                    changed_entry_error(),
+                                    witness_removed,
+                                    self.root.as_raw_fd(),
+                                    keep.as_ref(),
+                                    Some(backup),
+                                ));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        witness_removed = true;
+                        if let Err(error) = after_witness_unlink() {
+                            return Err(restore_after_failure(
+                                error,
                                 witness_removed,
                                 self.root.as_raw_fd(),
                                 keep.as_ref(),
                                 Some(backup),
                             ));
                         }
-                        Err(error) => return Err(error),
                     }
-                    witness_removed = true;
-                    if let Err(error) = after_witness_unlink() {
-                        return Err(restore_after_failure(
-                            error,
-                            witness_removed,
-                            self.root.as_raw_fd(),
-                            keep.as_ref(),
-                            Some(backup),
-                        ));
-                    }
-                }
 
-                let final_unlink = self
-                    .ensure_root_binding()
-                    .and_then(|()| unlink_at(self.parent.as_raw_fd(), &self.name, true));
-                match final_unlink {
-                    Ok(()) => return Ok(TreeRemoval::Complete),
-                    Err(error)
-                        if error.kind() == io::ErrorKind::DirectoryNotEmpty
-                            && attempts_left > 0 =>
-                    {
-                        if witness_removed {
-                            witness_identity = Some(restore_witness(
+                    let final_unlink = self
+                        .ensure_root_binding()
+                        .and_then(|()| unlink_at(self.parent.as_raw_fd(), &self.name, true));
+                    match final_unlink {
+                        Ok(()) => {
+                            entries_reclaimed = entries_reclaimed.saturating_add(1);
+                            return Ok(TreeRemoval::Complete);
+                        }
+                        Err(error)
+                            if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                                && attempts_left > 0 =>
+                        {
+                            if witness_removed {
+                                witness_identity = Some(restore_witness(
+                                    self.root.as_raw_fd(),
+                                    keep.as_ref().expect("removed witness has a name"),
+                                    witness_backup
+                                        .as_ref()
+                                        .expect("removed witness has a backup"),
+                                )?);
+                                witness_removed = false;
+                            }
+                        }
+                        Err(error) => {
+                            return Err(restore_after_failure(
+                                error,
+                                witness_removed,
                                 self.root.as_raw_fd(),
-                                keep.as_ref().expect("removed witness has a name"),
-                                witness_backup
-                                    .as_ref()
-                                    .expect("removed witness has a backup"),
-                            )?);
-                            witness_removed = false;
+                                keep.as_ref(),
+                                witness_backup.as_ref(),
+                            ));
                         }
                     }
-                    Err(error) => {
-                        return Err(restore_after_failure(
-                            error,
-                            witness_removed,
-                            self.root.as_raw_fd(),
-                            keep.as_ref(),
-                            witness_backup.as_ref(),
-                        ));
-                    }
                 }
-            }
+            })();
+            result
+                .map(|outcome| (outcome, entries_reclaimed))
+                .map_err(|source| super::TreeRemovalError {
+                    source,
+                    entries_reclaimed,
+                })
         }
 
         fn ensure_root_binding(&self) -> io::Result<()> {
@@ -393,6 +534,7 @@ mod unix {
         keep_until_last: Option<&CString>,
         deadline: Option<Instant>,
         before_directory_open: &mut F,
+        entries_reclaimed: &mut usize,
     ) -> io::Result<TreeRemoval>
     where
         F: FnMut() -> io::Result<()>,
@@ -429,7 +571,9 @@ mod unix {
                 ensure_bindings(pinned, &bindings)?;
                 ensure_named_directory(binding.parent_fd, &binding.name, binding.identity)?;
                 match unlink_at(parent_fd, &binding.name, true) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        *entries_reclaimed = entries_reclaimed.saturating_add(1);
+                    }
                     Err(error)
                         if error.kind() == io::ErrorKind::NotFound
                             || error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
@@ -502,7 +646,9 @@ mod unix {
                 ensure_bindings(pinned, &bindings)?;
                 ensure_named_entry(directory_fd, &c_name, observed.identity)?;
                 match unlink_at(directory_fd, &c_name, false) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        *entries_reclaimed = entries_reclaimed.saturating_add(1);
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
@@ -613,7 +759,7 @@ mod unix {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         // O_EXCL is the final no-overwrite check: a writer-created replacement
         // is left intact rather than replaced with the retained witness bytes.
-        let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags, 0o600 as libc::mode_t) };
+        let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags, 0o600 as libc::c_uint) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -970,6 +1116,10 @@ mod unix {
         use tempfile::tempdir;
 
         use super::*;
+        use crate::gc::{
+            PinnedTreeRemoval as PublicPinnedTreeRemoval, remove_condemned_tree,
+            remove_condemned_tree_with_progress,
+        };
 
         fn remove_with_hook<F>(
             root: &Path,
@@ -1075,7 +1225,7 @@ mod unix {
             fs::create_dir(&root).unwrap();
             fs::write(root.join("CACHEDIR.TAG"), b"witness").unwrap();
             fs::write(root.join("payload"), b"original").unwrap();
-            let pinned = PinnedTreeRemoval::open(&root).unwrap();
+            let pinned = PublicPinnedTreeRemoval::open(&root).unwrap();
             let identity = pinned.object_identity().unwrap();
             assert_eq!(identity.device, fs::metadata(&root).unwrap().dev());
             assert_eq!(identity.inode, fs::metadata(&root).unwrap().ino());
@@ -1103,6 +1253,67 @@ mod unix {
                 fs::read(root.join("payload")).unwrap(),
                 b"preserve without witness proof"
             );
+        }
+
+        #[test]
+        fn edited_same_inode_witness_refuses_before_mutating_the_tree() {
+            use std::io::Write;
+            use std::os::unix::fs::MetadataExt;
+
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            let witness = root.join("CACHEDIR.TAG");
+            fs::create_dir(&root).unwrap();
+            fs::write(&witness, b"registered owner marker").unwrap();
+            fs::write(root.join("payload"), b"preserve after marker edit").unwrap();
+            let original_inode = fs::metadata(&witness).unwrap().ino();
+            let pinned = PublicPinnedTreeRemoval::open(&root).unwrap();
+
+            let mut edited = File::options()
+                .write(true)
+                .truncate(true)
+                .open(&witness)
+                .unwrap();
+            edited.write_all(b"forged owner marker!").unwrap();
+            edited.sync_all().unwrap();
+            assert_eq!(fs::metadata(&witness).unwrap().ino(), original_inode);
+
+            let error = pinned
+                .remove_verified_witness("CACHEDIR.TAG", None, |bytes| {
+                    if bytes == b"registered owner marker" {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "witness differs from the registered owner payload",
+                        ))
+                    }
+                })
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                fs::read(root.join("payload")).unwrap(),
+                b"preserve after marker edit"
+            );
+            assert_eq!(fs::read(witness).unwrap(), b"forged owner marker!");
+        }
+
+        #[test]
+        fn interrupted_removal_reports_only_successful_unlinks() {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir(&root).unwrap();
+            let payload = root.join("payload");
+            fs::write(&payload, b"remove once").unwrap();
+
+            let (outcome, entries_reclaimed) =
+                remove_condemned_tree_with_progress(&root, None, Some(Instant::now())).unwrap();
+
+            assert_eq!(outcome, TreeRemoval::Interrupted);
+            assert_eq!(entries_reclaimed, 1);
+            assert!(root.is_dir());
+            assert!(!payload.exists());
         }
 
         #[test]
