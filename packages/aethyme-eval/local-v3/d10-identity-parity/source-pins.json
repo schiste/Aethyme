@@ -1,7 +1,7 @@
 {
   "schema": "aethyme.local-d10-typescript-parity-pins/v2",
   "fixture_source_commit": "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45",
-  "qualification_source_commit": "740ba93703a4abf3d449b241568af2c3f3560386",
+  "qualification_source_commit": "e6fb95f65f3bf91d46c1ab76136486f492529ebb",
   "rust_sources": [
     {
       "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
@@ -25,7 +25,7 @@
     },
     {
       "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs",
-      "sha256": "ef6c7949d5c0e7ec47c706e051a1df03d79017d2f4e6a5c28f7f60912b9841c3"
+      "sha256": "130fd50fa6ef2e6f14cc5b6efdde2d88de13116d9766716e5a4bdab8ddbd188b"
     },
     {
       "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/canonical_json_vectors.rs",
@@ -45,7 +45,7 @@
     },
     {
       "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/contribution_revision.rs",
-      "sha256": "46e1c8f982b002d131a1d50a994737eb69af3ba3056a17b8e1bf9b0db135d8da"
+      "sha256": "c648dca581d9137849292d7283448f1c55bd18de7054b35570d5151708f5835d"
     },
     {
       "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/project_identity.json",
@@ -55,15 +55,15 @@
   "typescript_sources": [
     {
       "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
-      "sha256": "0b9f582e57d1472abd7e78cb2f2c1e8d9ef2b65ae9ece4d3a4bb0274cb1b2e7f"
+      "sha256": "96a444d3d7f40c8d934586c9d8f49346c8e74973eba6d2fa60c01c4ebce92ebb"
     },
     {
       "path": "packages/aethyme-eval/local-v3/d10-identity-parity/project-identity.mts",
-      "sha256": "e95eb5aaebc7c250a8f902f6193d970e257ba85dc3e490d062b0fc38b7be1ab3"
+      "sha256": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3"
     },
     {
       "path": "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts",
-      "sha256": "a286583f8781977384684c45307a2b7b6e447a7520b761813dbb7aa5d31008c6"
+      "sha256": "9ce3c27355a43731a25ac85e94767a8a7350e25f1aab7b4bb06afb49fde581e9"
     }
   ],
   "fixture_files": [

@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import {
+  boundedCanonicalByteLength,
   canonicalizeValue,
   PROFILE_LIMITS,
   type CanonicalValue,
@@ -827,6 +828,7 @@ function sourceChangeState(
   ) {
     fail("invalid_source_change");
   }
+  if (pathHex.length > MAX_PATH_BYTES * 2) fail("invalid_source_change");
   if (!ALLOWED_MODES.has(mode)) fail("invalid_source_change");
   const path = validatePath(decodeLowerHex(pathHex));
   if (!/^[0-9a-f]{64}$/.test(contentSha256)) fail("invalid_source_change");
@@ -845,6 +847,21 @@ function sourceChangeIds(
     if (typeof value !== "string") fail("invalid_source_change");
     return parseFileId(value);
   });
+}
+
+function preflightOversizedReferenceCount(changes: CanonicalValue[]): void {
+  for (const change of changes) {
+    if (!(change instanceof Map)) continue;
+    for (const field of ["derived_from", "possible_sources"] as const) {
+      const references = change.get(field);
+      if (
+        Array.isArray(references) &&
+        references.length > PROFILE_LIMITS.max_container_entries
+      ) {
+        fail("too_many_references");
+      }
+    }
+  }
 }
 
 function validateContributionChanges(changes: CanonicalValue[]): void {
@@ -953,6 +970,35 @@ export function contributionRevisionRecord(args: {
   if (suppliedDependencies.length > PROFILE_LIMITS.max_container_entries) {
     fail("too_many_dependencies");
   }
+  preflightOversizedReferenceCount(args.source_changes);
+  if (
+    args.brief_object_sha256 !== undefined &&
+    (args.brief_object_sha256.length !== 64 ||
+      !/^[0-9a-f]{64}$/.test(args.brief_object_sha256))
+  ) {
+    fail("invalid_brief_object_sha256");
+  }
+
+  const sizeFields = new Map<string, CanonicalValue>([
+    ["schema", "aethyme.contribution-revision/experimental-v0"],
+    ["project_id", args.project_id],
+    ["contribution_id", args.contribution_id],
+    ["capture_record_id", args.capture_record_id],
+    ["base", args.base],
+    ["result", args.result],
+    ["source_changes", args.source_changes],
+    ["depends_on", suppliedDependencies],
+  ]);
+  if (args.brief_record_id !== undefined) {
+    sizeFields.set("brief_record_id", args.brief_record_id);
+  }
+  if (args.brief_object_sha256 !== undefined) {
+    sizeFields.set("brief_object_sha256", args.brief_object_sha256);
+  }
+  if (boundedCanonicalByteLength(sizeFields) === undefined) {
+    fail("too_large_revision");
+  }
+
   validateContributionChanges(args.source_changes);
   const dependencies = [...suppliedDependencies].sort();
   for (let index = 0; index < dependencies.length; index += 1) {
@@ -961,6 +1007,13 @@ export function contributionRevisionRecord(args: {
       fail("duplicate_dependency");
     }
   }
+  if (args.brief_record_id !== undefined) {
+    validateSha256Id(args.brief_record_id, "sha256:", "invalid_brief_record_id");
+  }
+  if ((args.brief_record_id === undefined) !== (args.brief_object_sha256 === undefined)) {
+    fail("incomplete_brief_reference");
+  }
+
   const fields = new Map<string, CanonicalValue>([
     ["schema", "aethyme.contribution-revision/experimental-v0"],
     ["project_id", args.project_id],
@@ -972,20 +1025,10 @@ export function contributionRevisionRecord(args: {
     ["depends_on", dependencies],
   ]);
   if (args.brief_record_id !== undefined) {
-    validateSha256Id(args.brief_record_id, "sha256:", "invalid_brief_record_id");
     fields.set("brief_record_id", args.brief_record_id);
   }
   if (args.brief_object_sha256 !== undefined) {
-    if (
-      args.brief_object_sha256.length !== 64 ||
-      !/^[0-9a-f]{64}$/.test(args.brief_object_sha256)
-    ) {
-      fail("invalid_brief_object_sha256");
-    }
     fields.set("brief_object_sha256", args.brief_object_sha256);
-  }
-  if ((args.brief_record_id === undefined) !== (args.brief_object_sha256 === undefined)) {
-    fail("incomplete_brief_reference");
   }
   const canonicalBytes = canonicalizeValue(fields);
   if (canonicalBytes.length > PROFILE_LIMITS.max_document_bytes) {

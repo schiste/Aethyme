@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  boundedCanonicalByteLength,
   canonicalizeValue,
   PROFILE_LIMITS,
   type CanonicalValue,
@@ -110,7 +111,7 @@ const EXPECTED_BOUND_REVISION_MANIFEST_SHA256 =
 const EXPECTED_RENAME_MANIFEST_SHA256 =
   "6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0";
 const EXPECTED_QUALIFICATION_SOURCE_COMMIT =
-  "740ba93703a4abf3d449b241568af2c3f3560386";
+  "e6fb95f65f3bf91d46c1ab76136486f492529ebb";
 const EXPECTED_FIXTURE_SOURCE_COMMIT =
   "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45";
 const REQUIRED_RUST_SOURCES = [
@@ -1162,6 +1163,83 @@ function run(): void {
     "too_many_references",
     [referenceChange(Array.from({ length: entryLimit + 1 }, () => referenceSourceId))],
     "ContributionRevision rejects 4097 file references before ID hashing",
+  );
+  const malformedReferenceShape = new Map<string, CanonicalValue>([
+    ["after", "not-a-source-state"],
+    ["derived_from", Array.from({ length: entryLimit + 1 }, () => referenceSourceId)],
+    ["relation", "unknown-relation"],
+  ]);
+  expectInvalidRevision(
+    "too_many_references",
+    [malformedReferenceShape],
+    "ContributionRevision scans oversized reference arrays before malformed change semantics",
+  );
+  const malformedChangeForBrief = new Map<string, CanonicalValue>([
+    ["unexpected", "unknown-field"],
+  ]);
+  resetHashCallCount();
+  expectProfileError(
+    "invalid_brief_object_sha256",
+    () =>
+      contributionRevisionRecord({
+        ...revisionArgs,
+        source_changes: [malformedChangeForBrief],
+        brief_record_id: revisionArgs.capture_record_id,
+        brief_object_sha256: "invalid-digest",
+      }),
+    "ContributionRevision validates the borrowed brief digest before change semantics",
+  );
+  check(
+    getHashCallCount() === 0,
+    "invalid borrowed brief digest was checked only after identity hashing",
+  );
+
+  const aggregateOversizeChanges = Array.from(
+    { length: 13 },
+    () => "x".repeat(64_000),
+  );
+  const aggregateChangesBytes = boundedCanonicalByteLength(aggregateOversizeChanges);
+  check(
+    aggregateChangesBytes === 832_040 &&
+      aggregateChangesBytes < PROFILE_LIMITS.max_document_bytes,
+    "13 canonical 64000-byte source-change strings remain below the 1 MiB array cap",
+  );
+  const aggregateOversizeEnvelope = new Map<string, CanonicalValue>([
+    ["schema", "aethyme.contribution-revision/experimental-v0"],
+    ["project_id", revisionArgs.project_id],
+    ["contribution_id", revisionArgs.contribution_id],
+    ["capture_record_id", revisionArgs.capture_record_id],
+    ["base", revisionArgs.base],
+    ["result", revisionArgs.result],
+    ["source_changes", aggregateOversizeChanges],
+    ["depends_on", maximumDependencies],
+  ]);
+  check(
+    boundedCanonicalByteLength(aggregateOversizeEnvelope) === undefined,
+    "13x64000 source changes plus 4096 distinct dependencies exceed the full 1 MiB envelope",
+  );
+  expectInvalidRevision(
+    "too_large_revision",
+    aggregateOversizeChanges,
+    "ContributionRevision rejects an oversized full envelope before malformed change semantics",
+    maximumDependencies,
+  );
+
+  const oversizedPathHexChange = new Map<string, CanonicalValue>([
+    ["after", new Map<string, CanonicalValue>([
+      ["path_hex", "61".repeat(4097)],
+      ["mode", "100644"],
+      ["content_sha256", "3".repeat(64)],
+      ["file_id", referenceFileId],
+    ])],
+    ["derived_from", []],
+    ["possible_sources", []],
+    ["relation", "new"],
+  ]);
+  expectInvalidRevision(
+    "invalid_source_change",
+    [oversizedPathHexChange],
+    "ContributionRevision rejects path_hex over the raw-path cap before decoding",
   );
 
   const maximumCountChanges = generatedNewChanges(entryLimit, 5);
