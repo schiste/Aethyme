@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::artifact_catalog::ArtifactWitness;
-use crate::broker::{WORKTREE_ROOT_MARKER, directory_size_without_following_links};
+#[cfg(test)]
+use crate::broker::WORKTREE_ROOT_MARKER;
+use crate::broker::directory_size_without_following_links;
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
@@ -5937,6 +5939,7 @@ mod tests {
         // This regression must exercise a real permission failure, not pass
         // vacuously under an identity that bypasses filesystem permissions.
         assert_ne!(
+            // SAFETY: geteuid has no arguments or pointer preconditions.
             unsafe { libc::geteuid() },
             0,
             "run this test as an unprivileged user"
@@ -5979,7 +5982,7 @@ mod tests {
             child.clone(),
             std::fs::metadata(&child).unwrap().permissions(),
         );
-        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o0)).unwrap();
         assert!(
             std::fs::read_dir(&child).is_err(),
             "permission denial must be real"
