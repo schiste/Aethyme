@@ -455,11 +455,11 @@ pub(crate) fn read_synthesized_wave_result(
         request_object: request_ref.object.hex(),
         group_record_id: result_ref.id.to_string(),
         group_object: result_ref.object.hex(),
-        input_manifest_sha256: synthesis.input_manifest.sha256,
+        input_manifest_sha256: synthesis.input_manifest.sha256.clone(),
         baseline_snapshot: synthesis.request.baseline().snapshot_id.to_string(),
         baseline_commit: synthesis.request.baseline().commit.as_str().to_owned(),
         candidate_subject: synthesis.candidate.subject.to_string(),
-        candidate_tree: synthesis.candidate.tree,
+        candidate_tree: synthesis.candidate.tree.clone(),
         candidate_commit: synthesis.candidate.commit.as_str().to_owned(),
         inputs,
     };
