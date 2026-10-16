@@ -29,6 +29,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   leave stale Git pointers after teardown. Assert paths and cleanup; avoid
   process-wide environment mutation in parallel tests.
 - Run the fastest relevant test command first.
+- For each deliberate guard-removal check, run the same named regression on
+  unmodified source, with the deliberate break, and after byte-for-byte
+  restoration. Require positive, intended runtime failure, positive; a compile
+  failure or a test that also fails without the break does not validate the
+  guard. A passing adjacent suite cannot replace either positive run.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
