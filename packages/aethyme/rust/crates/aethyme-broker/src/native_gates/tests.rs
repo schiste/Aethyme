@@ -718,8 +718,12 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
     // Reopen the durable store as a schema-22 client would see it, then keep
-    // that connection open while a new client adopts migrations 23 through 25.
+    // that connection open while a new client adopts migrations 23 through 26.
     // The old state update uses only columns that existed before migration 23.
+    crate::collaboration_state::drop_identity_revision_schema_for_legacy_fixture(
+        s.f.store.connection(),
+    )
+    .unwrap();
     crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
         s.f.store.connection(),
     )

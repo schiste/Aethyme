@@ -41,8 +41,16 @@ use crate::collaboration_state::{
 use crate::collaboration_submit::{Setting, setting};
 use crate::exit_status;
 
+#[path = "collaboration_cli/context_revisions.rs"]
+mod context_revisions;
+#[path = "collaboration_cli/contribution.rs"]
+mod contribution;
 #[path = "collaboration_cli/lifecycle.rs"]
 mod lifecycle;
+#[path = "collaboration_cli/project.rs"]
+mod project;
+#[cfg(test)]
+pub(crate) use project::test_support as project_test_support;
 #[path = "collaboration_cli/sensitive.rs"]
 mod sensitive;
 
@@ -84,6 +92,22 @@ Usage:
       current worktree (refused in the main checkout while broker sessions
       exist) when neither that file nor the policy in force mentions
       collaboration; review and commit it.
+  aethyme collab project enroll --commit <full-commit-oid> [--write] [--json]
+      Propose a logical project descriptor anchored to an explicit committed snapshot.
+      The proposal grants no local binding or authority until its pointer is committed.
+  aethyme collab project bind --confirm <descriptor-record-id> [--json]
+      Bind this local store to the exact descriptor and pointer committed in this clone.
+      Binding grants no execution or acceptance authority.
+  aethyme collab contribution revise --operation ID [--brief-file PATH]
+       [--file-operations PATH] [--depends-on RECORD_ID...] [--clear-dependencies] [--json]
+      Append an immutable revision for one retained capture operation. A retry
+      returns the same revision only when its normalized content matches; omitted
+      file operations and dependencies inherit from the current head. A changed
+      brief creates a new rationale revision.
+      The optional file-operation document uses schema
+      aethyme.collab-file-operations/experimental-v0 with lowercase-hex Git paths.
+      Rename/copy entries require kind, from_hex and to_hex; split entries use
+      kind, from_hex and a to_hex array. --clear-dependencies removes prior deps.
   aethyme collab capture recover [--json]
       Resolve captures a crashed process left in flight. Live ones are
       skipped; per-operation failures are reported and do not stop the rest.
@@ -105,15 +129,18 @@ Usage:
       Finish an interrupted apply, putting back anything now relied on.
   aethyme collab context --path <path> [--path <path>...] [--source <snapshot-id>]
                          [--analysis <envelope-file>...] [--max-items N]
+                         [--revision-pin CONTRIBUTION@REVISION@sha256:HEX...]
                          [--max-brief-tokens N] [--max-matched-paths N] [--max-bytes N]
                          [--json]
       Retained contributions relevant to the paths, ranked, budgeted and
       explained. Briefs are untrusted data written by other agents. Without
       --source and a complete analysis covering every path, the answer is
       partial: an empty answer is not evidence that nothing relevant exists.
-  aethyme collab brief attach --contribution <record-id> <decision-file> [--json]
+      --revision-pin selects exact immutable revisions; repeat it for each pin.
+  aethyme collab brief attach (--contribution <record-id> | --operation <id>) <decision-file> [--json]
       Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
-      a retained contribution, replacing an earlier one.
+      a retained contribution. Bound contributions append an immutable revision;
+      select --operation for a lineage shared by multiple logical contributions.
 
 Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab authority status [--json]
@@ -250,6 +277,8 @@ impl Failure {
                 | "injected"
                 | "corrupt_receipt"
                 | "corrupt_object"
+                | "corrupt_state"
+                | "archive_lock"
                 | "missing_object"
         ) {
             exit_status::FAILED
@@ -409,6 +438,8 @@ fn command_name(args: &[String]) -> String {
         "configure",
         "objective",
         "project",
+        "contribution",
+        "revise",
         "capture-notice",
         "ingest",
         "list",
@@ -450,7 +481,11 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
     let words: Vec<&str> = options.rest.iter().map(String::as_str).collect();
     // Everything but `status` and `enroll` needs an enabled policy; refuse
     // before reading any argument file or touching state.
-    if !matches!(words.first(), Some(&"status" | &"enroll") | None) {
+    let project_command = matches!(
+        words.as_slice(),
+        ["project", "enroll", ..] | ["project", "bind", ..]
+    );
+    if !matches!(words.first(), Some(&"status" | &"enroll") | None) && !project_command {
         require_enabled(&main_root)?;
     }
     match words.as_slice() {
@@ -460,6 +495,12 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
             &current_worktree(options.repo.as_deref())?,
             rest,
         ),
+        ["project", rest @ ..] => project::command(
+            &main_root,
+            &current_worktree(options.repo.as_deref())?,
+            rest,
+        ),
+        ["contribution", "revise", rest @ ..] => contribution::revise(&main_root, rest),
         ["capture", "recover"] => capture_recover(&main_root),
         ["capture", "abort", rest @ ..] => capture_abort(&main_root, rest),
         ["capture", "receipt", rest @ ..] => capture_receipt(&main_root, rest),
@@ -1384,6 +1425,7 @@ fn number(rest: &[&str], name: &str, default: usize) -> Result<usize, Failure> {
 fn context(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     const FLAGS: &[&str] = &[
         "--path",
+        "--revision-pin",
         "--source",
         "--analysis",
         "--max-items",
@@ -1392,6 +1434,7 @@ fn context(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         "--max-bytes",
     ];
     no_extra(rest, FLAGS, 0)?;
+    let pins = context_revisions::pins(rest)?;
     let mut scope = Vec::new();
     let mut analysis = Vec::new();
     let mut index = 0;
@@ -1447,6 +1490,9 @@ fn context(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         analysis,
         budget,
     };
+    if !pins.is_empty() {
+        return context_revisions::retrieve(&store, &query, &pins);
+    }
     let answer = crate::collaboration_context::retrieve_cached(&mut store, &query, &LocalProject)
         .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
     let record: Value = serde_json::from_slice(&answer.record)
@@ -1523,32 +1569,7 @@ fn context_text(record: &Value, served: &str, evidence: bool) -> String {
 // ------------------------------------------------------------------ brief
 
 fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
-    no_extra(rest, &["--contribution"], 1)?;
-    let contribution = flag_value(rest, "--contribution")?
-        .ok_or_else(|| Failure::usage("--contribution <record-id> is required"))?;
-    let mut skip = false;
-    let file = rest
-        .iter()
-        .find(|word| {
-            if skip {
-                skip = false;
-                return false;
-            }
-            if **word == "--contribution" {
-                skip = true;
-                return false;
-            }
-            true
-        })
-        .copied()
-        .ok_or_else(|| Failure::usage("the decision file is required"))?;
-    let contribution = RecordId::parse(contribution).map_err(|error| {
-        Failure::refused(
-            "invalid_record_id",
-            format!("{contribution}: {error}"),
-            "pass the contribution ID a capture receipt prints",
-        )
-    })?;
+    let (selector, file) = context_revisions::brief_selector(rest)?;
     let bytes = read_capped(file, MAX_BRIEF_FILE_BYTES, "decision file")?;
     let brief = Brief::from_decision_file(&bytes).map_err(|errors| {
         Failure::refused(
@@ -1558,15 +1579,76 @@ fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         )
     })?;
     let mut store = open(main_root)?;
-    let id = attach_brief(&mut store, &contribution, &brief)
-        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+    attach_selected_brief(&mut store, selector, &brief)
+}
+
+fn attach_selected_brief(
+    store: &mut CollaborationStore,
+    selector: context_revisions::BriefSelector,
+    brief: &Brief,
+) -> Result<Output, Failure> {
+    let (contribution, operation, revision, id) = match selector {
+        context_revisions::BriefSelector::Capture(contribution) => {
+            let id = attach_brief(store, &contribution, brief)
+                .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+            (contribution, None, None, id)
+        }
+        context_revisions::BriefSelector::Operation(operation) => {
+            use crate::collaboration_identity_store::{
+                ContributionRevisionRequest, resolve_approved_project_binding,
+                revise_contribution_for_operation,
+            };
+            let binding = resolve_approved_project_binding(store)
+                .map_err(|error| Failure::domain(error.code(), error.to_string()))?
+                .ok_or_else(|| {
+                    Failure::refused(
+                        "project_unbound",
+                        "project binding is missing",
+                        "run `aethyme collab project bind` first",
+                    )
+                })?;
+            let resolved = revise_contribution_for_operation(
+                store,
+                &binding,
+                ContributionRevisionRequest {
+                    operation_id: &operation,
+                    file_operations: None,
+                    brief: Some(brief),
+                    depends_on: None,
+                },
+            )
+            .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+            let id = resolved
+                .revision()
+                .brief()
+                .ok_or_else(|| {
+                    Failure::domain(
+                        "revision_identity",
+                        "committed revision has no requested Brief".to_string(),
+                    )
+                })?
+                .record_id
+                .clone();
+            (
+                resolved.capture_record_id().clone(),
+                Some(operation),
+                Some(resolved.record_id().clone()),
+                id,
+            )
+        }
+    };
+    let mut value = json!({
+        "schema": BRIEF_ATTACH_SCHEMA,
+        "contribution": contribution.as_str(),
+        "brief_record_id": id.as_str(),
+        "tokens": brief.token_count(),
+    });
+    if let Some(operation) = operation {
+        value["operation"] = json!(operation.as_str());
+        value["contribution_revision"] = json!(revision.as_ref().map(RecordId::as_str));
+    }
     Ok((
-        json!({
-            "schema": BRIEF_ATTACH_SCHEMA,
-            "contribution": contribution.as_str(),
-            "brief_record_id": id.as_str(),
-            "tokens": brief.token_count(),
-        }),
+        value,
         format!(
             "attached brief {} ({} tokens) to {}\n",
             id.as_str(),

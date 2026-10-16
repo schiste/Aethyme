@@ -1,0 +1,299 @@
+{
+  "argv_flags": [
+    "--max-old-space-size=256",
+    "--experimental-strip-types"
+  ],
+  "attempt": "attempt-005-clean-08578f25",
+  "broker_session": 1135,
+  "cargo_native_or_product_runtime": false,
+  "completed_at_utc": "2026-10-16T04:01:36.051947+00:00",
+  "deadline_seconds_per_runner": 60,
+  "fixture_source_commit": "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45",
+  "launcher_script_sha256": "07527917bb39751c190156170ef7353263f05a34f838bd37dcf270581942e656",
+  "max_old_space_size_mib": 256,
+  "network": "offline: standard-library-only runner, clean PATH, no install/provider/network operation",
+  "node_binary_sha256": "3e401401d90e7f0367b7737a613801242c9a6b2966fb50c2e48eb1c45d701c6a",
+  "node_path": "/opt/homebrew/bin/node",
+  "node_reported_exec_path": "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+  "node_version": "v26.8.2",
+  "node_version_exit_code": 0,
+  "qualification_result": "FAIL",
+  "qualification_source_commit": "324a493208517ba12f537c9e6a4ec7f608af322f",
+  "runner": {
+    "argv": [
+      "/opt/homebrew/bin/node",
+      "--max-old-space-size=256",
+      "--experimental-strip-types",
+      "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts"
+    ],
+    "completed_at_utc": "2026-10-16T04:01:36.051947+00:00",
+    "deadline_seconds": 60,
+    "elapsed_ms": 111,
+    "exit_code": 1,
+    "max_old_space_size_mib": 256,
+    "runner": "d10-identity-parity",
+    "script": "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts",
+    "started_at_utc": "2026-10-16T04:01:35.940508+00:00",
+    "stderr_bytes": 1556,
+    "stderr_sha256": "b20763b889d57cdd3abaafce699b3bcd305604bec8eb276494e0e6fb2b4c6650",
+    "stdout_bytes": 0,
+    "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "timed_out": false
+  },
+  "runner_report": null,
+  "schema": "aethyme.d10-offline-typescript-qualification-attempt/v1",
+  "source_commit": "08578f25cf0cdba0dbd524b8c811cb90c7759148",
+  "source_git_status_porcelain_before_run": "",
+  "source_hashes": [
+    {
+      "expected_sha256": "90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+      "sha256": "90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3"
+    },
+    {
+      "expected_sha256": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+      "sha256": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400"
+    },
+    {
+      "expected_sha256": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+      "sha256": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14"
+    },
+    {
+      "expected_sha256": "788a9f87485bca0aa35c91f1071bb647fc76c559c2f304f59ceb747b39437ab6",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/digest.rs",
+      "sha256": "788a9f87485bca0aa35c91f1071bb647fc76c559c2f304f59ceb747b39437ab6"
+    },
+    {
+      "expected_sha256": "932f0f8321042127454c51d3f2383fdfa3a9fc0988d119ad7cd65cd509fb604d",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs",
+      "sha256": "932f0f8321042127454c51d3f2383fdfa3a9fc0988d119ad7cd65cd509fb604d"
+    },
+    {
+      "expected_sha256": "bba6e7ae8747856905359a9fe7da63d510734c73726adc7019596319e8cd0538",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs",
+      "sha256": "bba6e7ae8747856905359a9fe7da63d510734c73726adc7019596319e8cd0538"
+    },
+    {
+      "expected_sha256": "403d6afa08ac94b71b1386bc20a50b401e513cb9765f2d60007c3ff7e8bba96e",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/canonical_json_vectors.rs",
+      "sha256": "403d6afa08ac94b71b1386bc20a50b401e513cb9765f2d60007c3ff7e8bba96e"
+    },
+    {
+      "expected_sha256": "563bd824740be45f994d50999da3f1a6dccb50b3f652378a9c0fd94533207c61",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/record_vectors.rs",
+      "sha256": "563bd824740be45f994d50999da3f1a6dccb50b3f652378a9c0fd94533207c61"
+    },
+    {
+      "expected_sha256": "881fb26bddb06042605b922dd706430502de4e4354ab6cfa9eefe53150623a40",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/source_snapshot_vectors.rs",
+      "sha256": "881fb26bddb06042605b922dd706430502de4e4354ab6cfa9eefe53150623a40"
+    },
+    {
+      "expected_sha256": "fc025be61c4af36d86b36b1bb76febef6655f2b0630df7492ae441029a636162",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/project_identity_vectors.rs",
+      "sha256": "fc025be61c4af36d86b36b1bb76febef6655f2b0630df7492ae441029a636162"
+    },
+    {
+      "expected_sha256": "967936df4b3b18c5658a599eaad81a9c0b24989909c72b197a503436f539edc5",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/contribution_revision.rs",
+      "sha256": "967936df4b3b18c5658a599eaad81a9c0b24989909c72b197a503436f539edc5"
+    },
+    {
+      "expected_sha256": "9b8a506c0830ebb49a72d8751c694465a213c64a8800b6ce90d51800cb8fb009",
+      "kind": "rust_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/project_identity.json",
+      "sha256": "9b8a506c0830ebb49a72d8751c694465a213c64a8800b6ce90d51800cb8fb009"
+    },
+    {
+      "expected_sha256": "0b9f582e57d1472abd7e78cb2f2c1e8d9ef2b65ae9ece4d3a4bb0274cb1b2e7f",
+      "kind": "typescript_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
+      "sha256": "0b9f582e57d1472abd7e78cb2f2c1e8d9ef2b65ae9ece4d3a4bb0274cb1b2e7f"
+    },
+    {
+      "expected_sha256": "0b71c5225878169bc8a12f6ea6d5de51ff66d246a5de9702f4d89ba08f28b1ab",
+      "kind": "typescript_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme-eval/local-v3/d10-identity-parity/project-identity.mts",
+      "sha256": "0b71c5225878169bc8a12f6ea6d5de51ff66d246a5de9702f4d89ba08f28b1ab"
+    },
+    {
+      "expected_sha256": "4b541b0b27f8a93d5f1e26db1c257d7ffb04cb718a66d02f73b0850b4f804fcc",
+      "kind": "typescript_sources",
+      "matches_pin": true,
+      "path": "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts",
+      "sha256": "4b541b0b27f8a93d5f1e26db1c257d7ffb04cb718a66d02f73b0850b4f804fcc"
+    },
+    {
+      "expected_sha256": "69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/ordinal-supplement/manifest.json",
+      "sha256": "69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f"
+    },
+    {
+      "expected_sha256": "a800c0f6622642e9cf0866a1e60f724270f7b9cfc1ee3afe06b600161e696fd8",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/ordinal-supplement/inputs.json",
+      "sha256": "a800c0f6622642e9cf0866a1e60f724270f7b9cfc1ee3afe06b600161e696fd8"
+    },
+    {
+      "expected_sha256": "67b9586320e91de0a5d3deda44ff03ee51f099846dc93597f46155f7e811711b",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/ordinal-supplement/expected.json",
+      "sha256": "67b9586320e91de0a5d3deda44ff03ee51f099846dc93597f46155f7e811711b"
+    },
+    {
+      "expected_sha256": "98b1c36ed2fea2b8a383e521901ee5ffb4cf51cad228a3a5f038482b26362072",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/ordinal-supplement/oracle.py",
+      "sha256": "98b1c36ed2fea2b8a383e521901ee5ffb4cf51cad228a3a5f038482b26362072"
+    },
+    {
+      "expected_sha256": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v1-invalid/manifest.json",
+      "sha256": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f"
+    },
+    {
+      "expected_sha256": "be5e1daa719a1ae076c58e1728f330900af06aeb63cbb3253fa1c97c4aacb2dd",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v1-invalid/inputs.json",
+      "sha256": "be5e1daa719a1ae076c58e1728f330900af06aeb63cbb3253fa1c97c4aacb2dd"
+    },
+    {
+      "expected_sha256": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v1-invalid/expected.json",
+      "sha256": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998"
+    },
+    {
+      "expected_sha256": "bd6685735a17a72014a05e1319b16d62983fef5381f8b2d8d4795ba39f032c95",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v1-invalid/oracle.py",
+      "sha256": "bd6685735a17a72014a05e1319b16d62983fef5381f8b2d8d4795ba39f032c95"
+    },
+    {
+      "expected_sha256": "4979504c53d8c23cefe22d577adc019154290f2466a06923eef3d772fe42d4e4",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v2-partially-invalid/manifest.json",
+      "sha256": "4979504c53d8c23cefe22d577adc019154290f2466a06923eef3d772fe42d4e4"
+    },
+    {
+      "expected_sha256": "b269c64f26ef1dd04603f0e062c5ccac98989c1875dff1546baa2f5f88465cd7",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v2-partially-invalid/inputs.json",
+      "sha256": "b269c64f26ef1dd04603f0e062c5ccac98989c1875dff1546baa2f5f88465cd7"
+    },
+    {
+      "expected_sha256": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v2-partially-invalid/expected.json",
+      "sha256": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048"
+    },
+    {
+      "expected_sha256": "3a95aa4a5b20f12fe13474d93e6c534685166de94dda5f1bea7c486c43e9c18e",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/prior-v2-partially-invalid/oracle.py",
+      "sha256": "3a95aa4a5b20f12fe13474d93e6c534685166de94dda5f1bea7c486c43e9c18e"
+    },
+    {
+      "expected_sha256": "ab85554b8b16543b2b356acaa29fcfbfcea8456292baa705d167daab5a14c9d1",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/contribution-revision-bound/manifest.json",
+      "sha256": "ab85554b8b16543b2b356acaa29fcfbfcea8456292baa705d167daab5a14c9d1"
+    },
+    {
+      "expected_sha256": "f168d9734ee9f4298c5abac430b944ab3e49d25cae46b293d7b4319a359b99c0",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/contribution-revision-bound/inputs.json",
+      "sha256": "f168d9734ee9f4298c5abac430b944ab3e49d25cae46b293d7b4319a359b99c0"
+    },
+    {
+      "expected_sha256": "335a8c93721d8fc29f09cbdeff2637a7eb000b4db90e17b0d13fef0e2155c0d2",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/contribution-revision-bound/expected.json",
+      "sha256": "335a8c93721d8fc29f09cbdeff2637a7eb000b4db90e17b0d13fef0e2155c0d2"
+    },
+    {
+      "expected_sha256": "b69674dcc74b5388baf13b4eef09059ed119afd47ab37a9768e811c5334e901e",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/contribution-revision-bound/oracle.py",
+      "sha256": "b69674dcc74b5388baf13b4eef09059ed119afd47ab37a9768e811c5334e901e"
+    },
+    {
+      "expected_sha256": "6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/explicit-rename/manifest.json",
+      "sha256": "6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0"
+    },
+    {
+      "expected_sha256": "5db662e3bbf4adab125b5f0cb1090eb586804815bc795a420d39d944fd4b3702",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/explicit-rename/inputs.json",
+      "sha256": "5db662e3bbf4adab125b5f0cb1090eb586804815bc795a420d39d944fd4b3702"
+    },
+    {
+      "expected_sha256": "ed8c5a28aa017e40661b965622001ddd23427f1e545203cefe8b8bccb5edd9b3",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/explicit-rename/expected.json",
+      "sha256": "ed8c5a28aa017e40661b965622001ddd23427f1e545203cefe8b8bccb5edd9b3"
+    },
+    {
+      "expected_sha256": "91c9bd162616a148258f8305e599319844f6891c6bb097ee0e7b7464b83323c5",
+      "kind": "fixture_files",
+      "matches_pin": true,
+      "path": "vectors/explicit-rename/oracle.py",
+      "sha256": "91c9bd162616a148258f8305e599319844f6891c6bb097ee0e7b7464b83323c5"
+    }
+  ],
+  "source_pin_count": 35,
+  "source_pins_path": "packages/aethyme-eval/local-v3/d10-identity-parity/source-pins.json",
+  "source_pins_sha256": "4802f4a0b898775f68f961f384de2adeed7d66db6701edcef8cfd8bfcddc862b",
+  "source_tree": "c10047b0dd8c775749c9a2c361e020180bc17e5a",
+  "started_at_utc": "2026-10-16T04:01:35.774565+00:00"
+}

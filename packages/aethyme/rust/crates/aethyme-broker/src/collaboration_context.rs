@@ -638,6 +638,10 @@ pub enum ContextError {
     NotRetained { id: String },
     #[error("the brief is invalid: {0}")]
     InvalidBrief(String),
+    #[error("immutable revision identity: {0}")]
+    RevisionIdentity(String),
+    #[error(transparent)]
+    ImmutableRevision(#[from] crate::collaboration_identity_store::IdentityStoreError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
@@ -656,6 +660,8 @@ impl ContextError {
             Self::EmptyScope => "empty_scope",
             Self::NotRetained { .. } => "not_retained",
             Self::InvalidBrief(_) => "invalid_brief",
+            Self::RevisionIdentity(_) => "revision_identity",
+            Self::ImmutableRevision(error) => error.code(),
             Self::Archive(error) => error.code(),
             Self::State(error) => error.code(),
             Self::Sqlite(_) => "sqlite",
@@ -680,6 +686,7 @@ pub fn attach_brief(
     contribution: &RecordId,
     brief: &Brief,
 ) -> Result<RecordId, ContextError> {
+    let archive_use = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(crate::collaboration_archive::ArchiveError::from)?;
     let errors = brief.validate();
@@ -687,6 +694,9 @@ pub fn attach_brief(
         return Err(ContextError::InvalidBrief(
             aethyme_contracts::experimental_v0::brief::BriefErrors(errors).to_string(),
         ));
+    }
+    if let Some(id) = revisions::attach_bound_brief(store, contribution, brief, &archive_use)? {
+        return Ok(id);
     }
     let (bytes, id) = brief.to_record();
     let digest = put_object(store, &bytes)?;
@@ -725,7 +735,10 @@ pub fn attach_brief(
 /// Drop a contribution from the derived index, and every cached answer that
 /// carries its data: a released or re-briefed contribution's content must not
 /// outlive it in the cache, even though no key would reach those answers.
-fn forget(connection: &rusqlite::Connection, contribution: &str) -> rusqlite::Result<()> {
+pub(crate) fn forget(
+    connection: &rusqlite::Connection,
+    contribution: &str,
+) -> rusqlite::Result<()> {
     for sql in [
         "DELETE FROM context_postings WHERE lineage_record_id = ?1",
         "DELETE FROM context_indexed WHERE lineage_record_id = ?1",
@@ -910,7 +923,7 @@ fn read_brief(
     }
 }
 
-fn hex_digest(text: &str) -> Option<ObjectDigest> {
+pub(crate) fn hex_digest(text: &str) -> Option<ObjectDigest> {
     if text.len() != 64 {
         return None;
     }
@@ -1805,6 +1818,7 @@ fn retrieve_with(
     mut hooks: Hooks<'_>,
     use_cache: bool,
 ) -> Result<Answer, ContextError> {
+    let _archive = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(crate::collaboration_archive::ArchiveError::from)?;
     query.budget.check()?;
@@ -3922,6 +3936,10 @@ mod tests {
         fixture.contribute(&[("Cargo.toml", "[workspace]\n")]);
         fresh(&mut fixture, &["src/search.rs"], &reader);
         // As a schema 5 binary would have left it.
+        crate::collaboration_state::drop_identity_revision_schema_for_legacy_fixture(
+            fixture.store.connection(),
+        )
+        .unwrap();
         crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
             fixture.store.connection(),
         )
@@ -4324,4 +4342,21 @@ mod tests {
             assert_eq!(served.record, expected.record);
         }
     }
+}
+
+mod revisions;
+pub use revisions::{
+    REVISION_CONTEXT_PROFILE, RevisionContextError, RevisionPin, retrieve_revisions,
+};
+
+/// Shared archive barrier, acquired before the sensitive-response barrier.
+fn archive_read(
+    store: &CollaborationStore,
+) -> Result<crate::collaboration_gc::ArchiveUse, ContextError> {
+    crate::collaboration_gc::archive_use(store)
+        .map_err(|source| ArchiveError::Io {
+            path: crate::collaboration_gc::lock_path(store),
+            source,
+        })
+        .map_err(ContextError::from)
 }

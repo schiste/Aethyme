@@ -1,0 +1,18 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.33s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 8 tests
+test collaboration_cli::project::binding_tests::a_committed_tampered_descriptor_pointer_is_refused ... ok
+test collaboration_cli::project::binding_tests::a_corrupt_bootstrap_transition_is_a_typed_binding_refusal ... ok
+test collaboration_cli::project::binding_tests::an_uncommitted_descriptor_pointer_does_not_authorize_binding ... ok
+test collaboration_cli::project::binding_tests::approved_binding_survives_pointer_removal_and_conflicting_rebind_refuses ... ok
+test collaboration_cli::project::binding_tests::enrollment_refuses_over_profile_file_count_before_writing_descriptor ... ok
+test collaboration_cli::project::binding_tests::exact_binding_confirmation_is_idempotent ... ok
+test collaboration_cli::project::binding_tests::malformed_confirmation_is_usage_and_never_creates_approval ... ok
+test collaboration_cli::project::binding_tests::mismatched_descriptor_confirmation_is_refused_without_approval ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1946 filtered out; finished in 5.51s
+

@@ -1,0 +1,20 @@
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.75s
+     Running tests/contribution_revision.rs (target/debug/deps/contribution_revision-9c0c2fe7d725049d)
+
+running 1 test
+test constructor_rejects_full_envelope_overflow_before_source_change_validation ... 
+thread 'constructor_rejects_full_envelope_overflow_before_source_change_validation' (16841737) panicked at crates/aethyme-contracts/tests/contribution_revision.rs:268:5:
+assertion failed: matches!(result, Err(ContributionRevisionError::TooLarge(bytes)) if bytes >
+    MAX_CONTRIBUTION_REVISION_BYTES)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    constructor_rejects_full_envelope_overflow_before_source_change_validation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p aethyme-contracts --test contribution_revision`

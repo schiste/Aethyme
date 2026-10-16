@@ -1,0 +1,110 @@
+{
+  "derived_golden": {
+    "base_snapshot_id": "sha256:2939b109e979106efe56e4132e534918d03524dd8391186d54e237cd871a43e3",
+    "new_file_id": "file:sha256:48cc972d1617f9537958fd4cdda113c3af1efe0d331cf7f7f626f9ccbb77f6d5",
+    "proposal_ordinal": 0,
+    "result_file_path_hex": "6e65772e7273",
+    "result_snapshot_id": "sha256:1a3403a80ff11a4e5519c4759adcf20eab46baab9c7e5150991221675d01f38b",
+    "revision_record_id": "sha256:e3803757a1c3c341a47e3fe171930bc911220f7989dd25f756605b7de28b0d85",
+    "source_change_relation": "new"
+  },
+  "files": {
+    "expected.json": "335a8c93721d8fc29f09cbdeff2637a7eb000b4db90e17b0d13fef0e2155c0d2",
+    "inputs.json": "f168d9734ee9f4298c5abac430b944ab3e49d25cae46b293d7b4319a359b99c0",
+    "oracle.py": "b69674dcc74b5388baf13b4eef09059ed119afd47ab37a9768e811c5334e901e"
+  },
+  "independent_checks": [
+    "Stdlib Python oracle computes source content hash, source snapshot IDs, proposed FileId preimage/hash, canonical source-change bytes, canonical revision bytes, and record ID.",
+    "Checked the computed base/result snapshots, FileId, and source-change object against the independently frozen ordinal supplement; all match exactly.",
+    "FileId format is exactly file:sha256:<64 lowercase hex>; revision and snapshot IDs are sha256:<64 lowercase hex>.",
+    "Canonical JSON is compact UTF-8 with sorted ASCII keys; source-change and revision bytes round-trip through JSON.",
+    "No Rust, TypeScript, Node, Cargo, native code, model, or production runtime was executed."
+  ],
+  "input_validation_before_hashing": {
+    "alphabet": "lowercase RFC 4648 base32 a-z, 2-7",
+    "contribution_id_suffix_length": 26,
+    "contribution_id_value": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe",
+    "input_schema": "aethyme.local-d10-bound-revision-golden-inputs/v1; exact top-level and file keys checked",
+    "invalid_control": "the prior 25-symbol contribution suffix is rejected before any SHA-256 call",
+    "path_hex_mode_content_record_id_anchor_and_duplicate_path_checks": true,
+    "project_id_suffix_length": 26,
+    "proposal_seed": "exactly ContributionId.as_str(); no new nonce/schema fields",
+    "tail_low_two_bits": 0
+  },
+  "package": "independent D10 corrected bound-file ContributionRevision golden v1",
+  "preserved_prior_packages_byte_exact": {
+    "failed_v1": {
+      "directory": "/private/tmp/review-d10-independent.rP4ZAU",
+      "files": {
+        "expected.json": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998",
+        "inputs.json": "be5e1daa719a1ae076c58e1728f330900af06aeb63cbb3253fa1c97c4aacb2dd",
+        "manifest.json": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f",
+        "oracle.py": "bd6685735a17a72014a05e1319b16d62983fef5381f8b2d8d4795ba39f032c95"
+      },
+      "manifest_sha256": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f"
+    },
+    "ordinal_supplement": {
+      "directory": "/private/tmp/review-d10-ordinals.hTOfKq",
+      "files": {
+        "expected.json": "67b9586320e91de0a5d3deda44ff03ee51f099846dc93597f46155f7e811711b",
+        "inputs.json": "a800c0f6622642e9cf0866a1e60f724270f7b9cfc1ee3afe06b600161e696fd8",
+        "oracle.py": "98b1c36ed2fea2b8a383e521901ee5ffb4cf51cad228a3a5f038482b26362072"
+      },
+      "manifest_sha256": "69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f"
+    },
+    "v2": {
+      "directory": "/private/tmp/review-d10-v2.4dXN6j",
+      "files": {
+        "expected.json": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048",
+        "inputs.json": "b269c64f26ef1dd04603f0e062c5ccac98989c1875dff1546baa2f5f88465cd7",
+        "oracle.py": "3a95aa4a5b20f12fe13474d93e6c534685166de94dda5f1bea7c486c43e9c18e"
+      },
+      "manifest_sha256": "4979504c53d8c23cefe22d577adc019154290f2466a06923eef3d772fe42d4e4"
+    }
+  },
+  "purpose": "Add the corrected file:sha256: bound-profile new-file source change inside an immutable ContributionRevision canonical record and its RecordId. Does not alter or requalify v1, v2, or the ordinal supplement.",
+  "source": {
+    "archive": "/private/tmp/review-d10-v2.4dXN6j/commit-archive",
+    "attribution": {
+      "canonical_json": {
+        "lines": "28-39, 106-175 (restricted canonical profile, UTF-16 key order, serializer)",
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+        "sha256": "90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3"
+      },
+      "contribution_id_validation": {
+        "lines": "31-55 (26 symbol length/alphabet/tail); 475-480 (base32 alphabet)",
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs",
+        "sha256": "bba6e7ae8747856905359a9fe7da63d510734c73726adc7019596319e8cd0538"
+      },
+      "digest_format": {
+        "lines": "7-23 (encode yields sha256:<64 lowercase hex>; canonical parser predicate)",
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/digest.rs",
+        "sha256": "788a9f87485bca0aa35c91f1071bb647fc76c559c2f304f59ceb747b39437ab6"
+      },
+      "generic_new_file_test_inputs": {
+        "lines": "60-112 (ContributionRevision constructor fields and empty-base/new.rs source-change constructor pattern)",
+        "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/contribution_revision.rs",
+        "sha256": "967936df4b3b18c5658a599eaad81a9c0b24989909c72b197a503436f539edc5"
+      },
+      "identity_and_corrected_bound_file_derivation": {
+        "lines": "821-923 transition changes and proposal IDs; 1096-1107 proposal seed validation; FileId formatting/parser lines 89-131",
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs",
+        "sha256": "a38be70e5e394003a3ea209521160f3c0ad5e5c12d8bd19f29629c1f80785901"
+      },
+      "record_id_domain": {
+        "lines": "52-59, 75-76 (immutable RecordId domain and canonical-byte rule)",
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+        "sha256": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400"
+      },
+      "source_snapshot_encoding": {
+        "lines": "23-60 (v0 byte encoding); 69-75 (domain); 164-209 (raw-path sort, manifest and ID)",
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+        "sha256": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14"
+      }
+    },
+    "commit": "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45",
+    "ordinal_supplement_manifest_sha256": "69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f",
+    "tree": "1acff82e4dc3f375aed028a0bbf13fa693f4fe64"
+  },
+  "status": "frozen additive expected-data package"
+}

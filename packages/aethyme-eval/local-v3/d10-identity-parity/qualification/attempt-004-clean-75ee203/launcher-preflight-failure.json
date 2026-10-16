@@ -1,0 +1,12 @@
+{
+  "attempt": "attempt-004-clean-75ee203",
+  "command": "/Users/christophehenner/.cargo/bin/aethyme broker advanced exec --session 1135 -- /opt/homebrew/bin/python3 /private/tmp/aethyme_d10_attempt004_launcher.py",
+  "correction": "the retained runner launcher resolves rust_sources and typescript_sources from repository root and fixture_files from the D10 package directory",
+  "failed_launcher_path": "packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-004-clean-75ee203/launcher.py",
+  "failed_launcher_sha256": "b5224aa2c56db3309082e52503f831b62998f9841c0d1decb8216435c3111b45",
+  "failure": "launcher resolved package-relative frozen fixture paths from repository root; no Node process was launched",
+  "outer_exit_code": 1,
+  "raw_tool_output": "Traceback (most recent call last):\n  File \"/private/tmp/aethyme_d10_attempt004_launcher.py\", line 57, in <module>\n    actual = digest((ROOT / path).read_bytes())\n                    ~~~~~^~~~~~~\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pathlib/__init__.py\", line 777, in read_bytes\n    with self.open(mode=\"rb\", buffering=0) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/pathlib/__init__.py\", line 771, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nFileNotFoundError: [Errno 2] No such file or directory: '/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/vectors/ordinal-supplement/manifest.json'\nexec session 1135: command failed (1)\n  command ran: yes\n  edits remain after command: yes\n  changed paths: packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-004-clean-75ee203/launcher.py\n  newly dirty: packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-004-clean-75ee203/launcher.py\nError: guarded exec: the command ran and exited 1 \u2014 the guard found no ownership violation, so this is the command's own failure",
+  "runner_invoked": false,
+  "schema": "aethyme.d10-offline-typescript-launcher-preflight/v1"
+}

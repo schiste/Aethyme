@@ -24,6 +24,22 @@ Usage:
       current worktree (refused in the main checkout while broker sessions
       exist) when neither that file nor the policy in force mentions
       collaboration; review and commit it.
+  aethyme collab project enroll --commit <full-commit-oid> [--write] [--json]
+      Propose a logical project descriptor anchored to an explicit committed snapshot.
+      The proposal grants no local binding or authority until its pointer is committed.
+  aethyme collab project bind --confirm <descriptor-record-id> [--json]
+      Bind this local store to the exact descriptor and pointer committed in this clone.
+      Binding grants no execution or acceptance authority.
+  aethyme collab contribution revise --operation ID [--brief-file PATH]
+       [--file-operations PATH] [--depends-on RECORD_ID...] [--clear-dependencies] [--json]
+      Append an immutable revision for one retained capture operation. A retry
+      returns the same revision only when its normalized content matches; omitted
+      file operations and dependencies inherit from the current head. A changed
+      brief creates a new rationale revision.
+      The optional file-operation document uses schema
+      aethyme.collab-file-operations/experimental-v0 with lowercase-hex Git paths.
+      Rename/copy entries require kind, from_hex and to_hex; split entries use
+      kind, from_hex and a to_hex array. --clear-dependencies removes prior deps.
   aethyme collab capture recover [--json]
       Resolve captures a crashed process left in flight. Live ones are
       skipped; per-operation failures are reported and do not stop the rest.
@@ -45,15 +61,18 @@ Usage:
       Finish an interrupted apply, putting back anything now relied on.
   aethyme collab context --path <path> [--path <path>...] [--source <snapshot-id>]
                          [--analysis <envelope-file>...] [--max-items N]
+                         [--revision-pin CONTRIBUTION@REVISION@sha256:HEX...]
                          [--max-brief-tokens N] [--max-matched-paths N] [--max-bytes N]
                          [--json]
       Retained contributions relevant to the paths, ranked, budgeted and
       explained. Briefs are untrusted data written by other agents. Without
       --source and a complete analysis covering every path, the answer is
       partial: an empty answer is not evidence that nothing relevant exists.
-  aethyme collab brief attach --contribution <record-id> <decision-file> [--json]
+      --revision-pin selects exact immutable revisions; repeat it for each pin.
+  aethyme collab brief attach (--contribution <record-id> | --operation <id>) <decision-file> [--json]
       Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
-      a retained contribution, replacing an earlier one.
+      a retained contribution. Bound contributions append an immutable revision;
+      select --operation for a lineage shared by multiple logical contributions.
 
 Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab authority status [--json]

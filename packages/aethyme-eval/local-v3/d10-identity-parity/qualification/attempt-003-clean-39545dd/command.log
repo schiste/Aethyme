@@ -1,0 +1,30 @@
+D10 TypeScript qualification attempt 003
+Source commit: 39545dd34f7484ade2a06c48a4041b9632ca6067
+Source tree: 7cc341d89e121b0ad6ddd9ba13bcce052dd31695
+Source worktree status before runner: clean
+Source pins SHA-256: c19b5d8b6b25a75b1adb00ee75d8c33837550e8d66cf771ea44c54d64130054e
+Node: v26.8.2 at /opt/homebrew/bin/node
+Node binary SHA-256: 3e401401d90e7f0367b7737a613801242c9a6b2966fb50c2e48eb1c45d701c6a
+Deadline: 60 seconds
+Heap cap: 256 MiB
+
+Broker guarded command:
+PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin aethyme broker advanced exec --session 1135 -- /usr/bin/python3 /private/tmp/run_d10_attempt_003.py
+
+Node argv:
+/opt/homebrew/bin/node
+--max-old-space-size=256
+--experimental-strip-types
+packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts
+
+Node result: timed_out=False, exit_code=1, elapsed_ms=108
+stdout: 0 bytes, SHA-256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+stderr: 1794 bytes, SHA-256 b295f7a247358f32f5e1fa82f71e8e7b88ce4a03255d7e89ee17e66e0e95ebe3
+
+Broker command output:
+{"attempt":"attempt-003-clean-39545dd","source_commit":"39545dd34f7484ade2a06c48a4041b9632ca6067","source_tree":"7cc341d89e121b0ad6ddd9ba13bcce052dd31695","qualification_result":"FAIL","exit_code":1,"stdout_bytes":0,"stderr_bytes":1794,"attempt_dir":"packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-003-clean-39545dd"}
+exec session 1135: command failed (1)
+  command ran: yes
+  edits remain after command: yes
+  changed paths: packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-003-clean-39545dd/d10-identity-parity/run.json, packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-003-clean-39545dd/d10-identity-parity/stderr, packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-003-clean-39545dd/d10-identity-parity/stdout, packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-003-clean-39545dd/source-snapshot.json
+Error: guarded exec: the command ran and exited 1 — the guard found no ownership violation, so this is the command's own failure

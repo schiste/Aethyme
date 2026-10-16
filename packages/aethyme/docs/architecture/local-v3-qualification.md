@@ -68,7 +68,7 @@ denied zero-test attempt and earlier failures separately. These two-clone symbol
 observations are advisory and do not establish an authorized shared ProjectId or
 FileId mapping.
 
-The [immutable capture replay checks](local-v3-qualification/final-integration-2026-10-15/README.md#immutable-capture-revision-replay)
+The [immutable capture replay checks](local-v3-qualification/final-integration-2026-10-15/README.md)
 at clean source `9a15fd24f437256f9ac33700a88ee856d108db65` passed both actual
 Git base-only/result-only revision cases. Removing each revision from the request
 digest caused its corresponding intended one-test assertion failure (exit 101);
