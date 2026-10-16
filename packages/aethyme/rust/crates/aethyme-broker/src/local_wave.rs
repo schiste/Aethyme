@@ -1265,6 +1265,46 @@ fn retain_resolution_request(
     Ok(())
 }
 
+fn attach_resolution_request(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    wave: &Wave,
+    source: &CompositionSource,
+    request: &resolution::RecordRef,
+    version: i64,
+    cancel: &AtomicBool,
+) -> Result<Wave, WaveError> {
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard_current(&tx, owner, wave, version)?;
+    // BEGIN IMMEDIATE may wait behind another writer. Cancellation is checked
+    // again under that lock, at the request issuance boundary.
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    if tx.execute(
+        "UPDATE local_waves SET resolution_request_record_id=?2, resolution_request_object=?3 WHERE wave=?1 AND target=?4 AND revision=?5 AND phase='verifying' AND candidate_snapshot=?6 AND candidate_commit=?7 AND recipe_object=?8 AND composition_source_record_id=?9 AND composition_source_object=?10 AND resolution_request_record_id IS NULL AND resolution_request_object IS NULL",
+        params![
+            wave.id.as_str(),
+            request.id.as_str(),
+            request.object.hex(),
+            owner.target(),
+            wave.spec.revision,
+            wave.candidate_snapshot.as_ref().map(SourceSnapshotId::as_str),
+            wave.candidate_commit.as_ref().map(CommitOid::as_str),
+            wave.recipe_object.as_ref().map(ObjectDigest::hex),
+            source.record.id.as_str(),
+            source.record.object.hex(),
+        ],
+    )? != 1
+    {
+        return Err(WaveError::Stale);
+    }
+    tx.commit()?;
+    load(store, &wave.id)
+}
+
 struct AcceptedCompletionRow {
     body: Vec<u8>,
     phase: String,
@@ -2233,30 +2273,15 @@ pub(crate) fn raise_resolution_for_failed_checks(
     if cancel.load(Ordering::SeqCst) {
         return Err(WaveError::Stale);
     }
-    let tx = store
-        .connection()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    guard_current(&tx, owner, &wave, state.version)?;
-    if tx.execute(
-        "UPDATE local_waves SET resolution_request_record_id=?2, resolution_request_object=?3 WHERE wave=?1 AND target=?4 AND revision=?5 AND phase='verifying' AND candidate_snapshot=?6 AND candidate_commit=?7 AND recipe_object=?8 AND composition_source_record_id=?9 AND composition_source_object=?10 AND resolution_request_record_id IS NULL AND resolution_request_object IS NULL",
-        params![
-            wave_id.as_str(),
-            request_record.id.as_str(),
-            request_record.object.hex(),
-            owner.target(),
-            wave.spec.revision,
-            wave.candidate_snapshot.as_ref().map(SourceSnapshotId::as_str),
-            wave.candidate_commit.as_ref().map(CommitOid::as_str),
-            wave.recipe_object.as_ref().map(ObjectDigest::hex),
-            source.record.id.as_str(),
-            source.record.object.hex(),
-        ],
-    )? != 1
-    {
-        return Err(WaveError::Stale);
-    }
-    tx.commit()?;
-    load(store, wave_id)
+    attach_resolution_request(
+        store,
+        owner,
+        &wave,
+        source,
+        request_record,
+        state.version,
+        cancel,
+    )
 }
 
 /// Observe external movement without changing the frozen baseline or bypassing

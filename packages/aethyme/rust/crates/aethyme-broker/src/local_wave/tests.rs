@@ -683,6 +683,108 @@ fn composition_source_survives_restart_and_raises_one_exact_failed_check_request
     assert_eq!(repeated.resolution_request.as_ref(), Some(request_ref));
 }
 
+static REQUEST_LINK_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_request_link_busy(_: i32) -> bool {
+    REQUEST_LINK_BUSY.store(true, Ordering::SeqCst);
+    true
+}
+
+#[test]
+fn cancellation_while_waiting_for_wave_write_lock_prevents_request_link() {
+    let mut f = Fixture::new();
+    let (owner, wave) = composed_candidate(&mut f);
+    let composed = compose_with_source(&mut f.store, &owner, f._repo.path(), &wave.id).unwrap();
+    let wave = composed.wave;
+    let source = composed.source.unwrap();
+    let checks = [FailedCheck {
+        check: "native-gate:unit:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .into(),
+    }];
+    let request = resolution::request_resolution(
+        &mut f.store,
+        f._repo.path(),
+        &source.request,
+        &source.composition,
+        &checks,
+        &source.requirements,
+        None,
+    )
+    .unwrap();
+    let request_ref = request.record().clone();
+    let revision = id(&wave.spec.revision).unwrap();
+    let archive_guard = archive_use(&mut f.store).unwrap();
+    let response_guard = crate::collaboration_sensitive::response_use(&f.store).unwrap();
+    let authority_guard = target::authorize(&mut f.store, &owner).unwrap();
+    retain_resolution_request(
+        &mut f.store,
+        &owner,
+        &revision,
+        &request,
+        &source.request,
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )
+    .unwrap();
+    let state = current(&f.store, &owner, &wave).unwrap();
+
+    REQUEST_LINK_BUSY.store(false, Ordering::SeqCst);
+    f.store
+        .connection()
+        .busy_handler(Some(note_request_link_busy))
+        .unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let database = f.store.project_dir().join("state.db");
+    let blocker = std::thread::spawn(move || {
+        let mut connection = rusqlite::Connection::open(database).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        connection.execute_batch("ROLLBACK").unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let cancel_waiter = std::sync::Arc::clone(&cancel);
+    let releaser = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !REQUEST_LINK_BUSY.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let observed_wait = REQUEST_LINK_BUSY.load(Ordering::SeqCst);
+        cancel_waiter.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        observed_wait
+    });
+
+    let result = attach_resolution_request(
+        &mut f.store,
+        &owner,
+        &wave,
+        &source,
+        &request_ref,
+        state.version,
+        &cancel,
+    );
+    assert!(
+        releaser.join().unwrap(),
+        "request link never waited on SQLite"
+    );
+    blocker.join().unwrap();
+    assert!(matches!(result, Err(WaveError::Stale)));
+    assert!(
+        load(&f.store, &wave.id)
+            .unwrap()
+            .resolution_request
+            .is_none()
+    );
+}
+
 #[test]
 fn legacy_candidate_waves_without_exact_composition_source_stay_request_free() {
     let mut f = Fixture::new();
