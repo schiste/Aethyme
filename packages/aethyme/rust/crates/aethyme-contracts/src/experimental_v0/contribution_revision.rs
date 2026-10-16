@@ -134,13 +134,9 @@ impl ContributionRevision {
                 depends_on.len(),
             ));
         }
-        let source_changes_bytes = canonical_json::bounded_canonical_array_size(
-            &source_changes,
-            MAX_CONTRIBUTION_REVISION_BYTES,
-        )
-        .ok_or(ContributionRevisionError::TooLarge(
-            MAX_CONTRIBUTION_REVISION_BYTES + 1,
-        ))?;
+        if let Some(count) = oversized_reference_count(&source_changes) {
+            return Err(ContributionRevisionError::TooManyReferences(count));
+        }
         if let Some(brief) = &brief {
             // `BriefReference` fields are public for compatibility, so a
             // literal can bypass `BriefReference::new`. Validate the borrowed
@@ -148,6 +144,13 @@ impl ContributionRevision {
             // by `to_record`.
             validate_brief_digest(&brief.object_sha256)?;
         }
+        let source_changes_bytes = canonical_json::bounded_canonical_array_size(
+            &source_changes,
+            MAX_CONTRIBUTION_REVISION_BYTES,
+        )
+        .ok_or(ContributionRevisionError::TooLarge(
+            MAX_CONTRIBUTION_REVISION_BYTES + 1,
+        ))?;
         validate_changes(&source_changes)?;
         let mut dependency_ids: Vec<String> = depends_on
             .iter()
@@ -412,6 +415,25 @@ fn validate_changes(changes: &[Value]) -> Result<(), ContributionRevisionError> 
         previous = Some(path);
     }
     Ok(())
+}
+
+/// Return an oversized file-reference array before bounded canonical sizing.
+/// This checks only borrowed cardinalities; full source-change validation and
+/// its allocations remain behind the document-size admission check.
+fn oversized_reference_count(changes: &[Value]) -> Option<usize> {
+    for change in changes {
+        let Value::Object(object) = change else {
+            continue;
+        };
+        for field in ["derived_from", "possible_sources"] {
+            if let Some(Value::Array(references)) = object.get(field)
+                && references.len() > MAX_REVISION_ARRAY_ENTRIES
+            {
+                return Some(references.len());
+            }
+        }
+    }
+    None
 }
 
 /// Parsed source file state: canonical raw path bytes.
