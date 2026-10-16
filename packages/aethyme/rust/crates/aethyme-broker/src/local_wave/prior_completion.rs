@@ -28,7 +28,7 @@ enum RevisionRelation {
 /// completion's accepted commit is the request baseline; its source snapshot
 /// is the retained identity used by the Local wave and resolver request.
 #[derive(Debug, Clone)]
-pub(super) struct Binding {
+pub(crate) struct Binding {
     key: RecordId,
     completion: CompletionSpec,
     previous: WaveSpec,
@@ -37,19 +37,43 @@ pub(super) struct Binding {
     accepted_commit: CommitOid,
 }
 
-pub(super) fn load(
+pub(crate) fn load(
     store: &CollaborationStore,
     owner: &ControllerOwner,
     wave: &Wave,
     pinned: &TargetRevision,
 ) -> Result<Option<Binding>, WaveError> {
+    if wave.spec.target != owner.target() || wave.spec.issuer != owner.issuer() {
+        return Err(WaveError::Stale);
+    }
+    load_for_identity(store, wave, pinned, owner.target(), owner.issuer())
+}
+
+/// Validate a retained wave binding without claiming that its historical
+/// completion confers current authority. Callers must separately authorize
+/// any present owner action.
+pub(crate) fn load_retained(
+    store: &CollaborationStore,
+    wave: &Wave,
+    pinned: &TargetRevision,
+) -> Result<Option<Binding>, WaveError> {
+    load_for_identity(store, wave, pinned, &wave.spec.target, &wave.spec.issuer)
+}
+
+fn load_for_identity(
+    store: &CollaborationStore,
+    wave: &Wave,
+    pinned: &TargetRevision,
+    target: &str,
+    issuer: &str,
+) -> Result<Option<Binding>, WaveError> {
     let Some(raw_key) = wave.spec.prior_completion.as_deref() else {
         return Ok(None);
     };
-    if wave.spec.target != owner.target()
-        || wave.spec.issuer != owner.issuer()
-        || pinned.target != wave.spec.target
-        || pinned.issuer != wave.spec.issuer
+    if wave.spec.target != target
+        || wave.spec.issuer != issuer
+        || pinned.target != target
+        || pinned.issuer != issuer
         || pinned.id.as_str() != wave.spec.revision
     {
         return Err(WaveError::Stale);
@@ -57,27 +81,14 @@ pub(super) fn load(
 
     let key = id(raw_key)?;
     let (completion, previous) = accepted_completion(store, &key, wave.spec.sequence)?;
-    if completion.target != owner.target()
+    if completion.target != target
         || previous.target != wave.spec.target
-        || previous.issuer != wave.spec.issuer
+        || previous.issuer != issuer
         || previous.revision != completion.revision
     {
         return Err(WaveError::Stale);
     }
-    let historical = HistoricalCompletionIdentity {
-        target: completion.target.clone(),
-        issuer: previous.issuer.clone(),
-        revision: completion.revision.clone(),
-        epoch: completion.epoch.clone(),
-        wave: completion.wave.clone(),
-        source: completion.source.clone(),
-        candidate_commit: completion.candidate_commit.clone(),
-        candidate_tree: completion.candidate_tree.clone(),
-        qualification: completion.qualification.clone(),
-        receipt: completion.acceptance_receipt.clone(),
-        accepted_commit: completion.accepted_commit.clone(),
-        accepted_tree: completion.accepted_tree.clone(),
-    };
+    let historical = historical_identity(&key, &completion, issuer);
     verify_historical_completion(store, &historical).map_err(|_| WaveError::Stale)?;
 
     let relation = classify_revision_relation(
@@ -107,6 +118,83 @@ pub(super) fn load(
     }))
 }
 
+fn historical_identity(
+    key: &RecordId,
+    completion: &CompletionSpec,
+    issuer: &str,
+) -> HistoricalCompletionIdentity {
+    HistoricalCompletionIdentity {
+        completion: key.as_str().to_owned(),
+        target: completion.target.clone(),
+        issuer: issuer.to_owned(),
+        revision: completion.revision.clone(),
+        epoch: completion.epoch.clone(),
+        wave: completion.wave.clone(),
+        source: completion.source.clone(),
+        candidate_commit: completion.candidate_commit.clone(),
+        candidate_tree: completion.candidate_tree.clone(),
+        qualification: completion.qualification.clone(),
+        receipt: completion.acceptance_receipt.clone(),
+        accepted_commit: completion.accepted_commit.clone(),
+        accepted_tree: completion.accepted_tree.clone(),
+    }
+}
+
+/// Select the newest proof-verified completion for this exact target issuer.
+/// Same-revision history is preferred; cross-revision reuse is considered
+/// only when its accepted source is the new revision's explicit baseline.
+/// A matching but damaged newest proof is an error, never a reason to fall
+/// back to an older completion.
+pub(super) fn latest_for_admission(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    pinned: &TargetRevision,
+) -> Result<Option<RecordId>, WaveError> {
+    if pinned.target != owner.target() || pinned.issuer != owner.issuer() {
+        return Err(WaveError::Stale);
+    }
+    let ids: Vec<String> = store
+        .read_connection()
+        .prepare(
+            "SELECT c.id FROM local_controller_completions c
+             JOIN local_waves w ON w.wave=c.wave
+             WHERE c.target=?1 ORDER BY w.sequence DESC,c.id DESC",
+        )?
+        .query_map([owner.target()], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut matching = Vec::new();
+    for raw in ids {
+        let key = id(&raw)?;
+        let (completion, previous) = accepted_completion(store, &key, i64::MAX)?;
+        if completion.target != owner.target() || previous.issuer != owner.issuer() {
+            continue;
+        }
+        let same_revision = completion.revision == pinned.id.as_str();
+        let cross_revision = !same_revision && completion.source == pinned.spec.baseline;
+        if !same_revision && !cross_revision {
+            continue;
+        }
+        matching.push((key, completion, previous, same_revision));
+    }
+    for want_same_revision in [true, false] {
+        for (key, completion, previous, same_revision) in &matching {
+            if *same_revision != want_same_revision {
+                continue;
+            }
+            verify_historical_completion(
+                store,
+                &historical_identity(key, completion, owner.issuer()),
+            )
+            .map_err(|_| WaveError::Stale)?;
+            if previous.target != owner.target() || previous.issuer != owner.issuer() {
+                return Err(WaveError::Stale);
+            }
+            return Ok(Some(key.clone()));
+        }
+    }
+    Ok(None)
+}
+
 fn classify_revision_relation(
     prior_revision: &str,
     current_revision: &str,
@@ -121,9 +209,7 @@ fn classify_revision_relation(
         let selected: BTreeSet<_> = current_selected.iter().collect();
         if previous.len() != prior_selected.len()
             || selected.len() != current_selected.len()
-            || prior_selected
-                .iter()
-                .any(|member| !selected.contains(member))
+            || current_selected.get(..prior_selected.len()) != Some(prior_selected)
             || prior_source != current_wave_baseline
         {
             return Err(WaveError::Invalid(
@@ -145,28 +231,28 @@ fn classify_revision_relation(
 }
 
 impl Binding {
-    pub(super) fn key(&self) -> &RecordId {
+    pub(crate) fn key(&self) -> &RecordId {
         &self.key
     }
 
-    pub(super) fn source(&self) -> &SourceSnapshotId {
+    pub(crate) fn source(&self) -> &SourceSnapshotId {
         &self.source
     }
 
     /// The actual request baseline is the accepted commit. WaveSpec::baseline
     /// is the source snapshot ID and must not be substituted for this commit.
-    pub(super) fn request_baseline_commit(&self) -> &CommitOid {
+    pub(crate) fn request_baseline_commit(&self) -> &CommitOid {
         &self.accepted_commit
     }
 
-    pub(super) fn previous_members(&self) -> &[String] {
+    pub(crate) fn previous_members(&self) -> &[String] {
         match self.relation {
             RevisionRelation::Same => &self.previous.selected,
             RevisionRelation::Cross => &[],
         }
     }
 
-    pub(super) fn same_revision(&self) -> bool {
+    pub(crate) fn same_revision(&self) -> bool {
         self.relation == RevisionRelation::Same
     }
 
@@ -174,7 +260,7 @@ impl Binding {
     /// only within the same revision. Across revisions, the accepted source
     /// itself is the explicit baseline and prior contribution IDs are not
     /// inherited.
-    pub(super) fn accepted_history(
+    pub(crate) fn accepted_history(
         &self,
         store: &CollaborationStore,
         pinned: &TargetRevision,
@@ -188,20 +274,20 @@ impl Binding {
         Ok(vec![retained.commit])
     }
 
-    pub(super) fn recipe_binding(&self) -> Value {
+    pub(crate) fn recipe_binding(&self) -> Value {
         serde_json::json!({
             "completion": self.key.as_str(),
             "members": self.previous_members(),
         })
     }
 
-    pub(super) fn producer_profile(&self) -> &'static str {
+    pub(crate) fn producer_profile(&self) -> &'static str {
         super::ACCEPTED_BASELINE_TEXT_PROFILE
     }
 
     /// A resolver request must name both halves of this binding exactly:
     /// the accepted commit and the snapshot retained by this wave.
-    pub(super) fn validate_request_baseline(
+    pub(crate) fn validate_request_baseline(
         &self,
         request: &ResolutionRequest,
         wave: &Wave,
@@ -219,7 +305,7 @@ impl Binding {
 
     /// Verify that the accepted commit still materializes the exact source
     /// snapshot and tree stated by the private completion.
-    pub(super) fn validate_git_binding(&self, repo: &Path) -> Result<(), WaveError> {
+    pub(crate) fn validate_git_binding(&self, repo: &Path) -> Result<(), WaveError> {
         if archive::raw_commit_tree(repo, &self.accepted_commit)? != self.completion.accepted_tree
             || archive::snapshot_of_commit(repo, &self.accepted_commit)?.id() != self.source
         {
@@ -232,7 +318,7 @@ impl Binding {
 
     /// Completion artifacts are rooted independently of a later revision.
     /// Check the completion record and accepted source before relying on them.
-    pub(super) fn validate_retained_completion(
+    pub(crate) fn validate_retained_completion(
         &self,
         store: &CollaborationStore,
     ) -> Result<(), WaveError> {

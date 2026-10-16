@@ -28,6 +28,48 @@ static HISTORICAL_EVIDENCE: RecordSchema = RecordSchema {
     }],
     capabilities: &[],
 };
+static HISTORICAL_ARTIFACT: RecordSchema = RecordSchema {
+    name: crate::execution_supervisor::ARTIFACT_SCHEMA,
+    fields: &[
+        FieldSpec {
+            name: "execution",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "target_revision",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "output",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "packaging",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "runtime",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "generation",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+    ],
+    capabilities: &[],
+};
 const fn schema(name: &'static str) -> RecordSchema {
     RecordSchema {
         name,
@@ -203,6 +245,7 @@ pub struct AcceptanceReceipt {
 /// reuse only; it is not a current acceptance grant or a producer permit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistoricalCompletionIdentity {
+    pub(crate) completion: String,
     pub(crate) target: String,
     pub(crate) issuer: String,
     pub(crate) revision: String,
@@ -275,6 +318,20 @@ fn lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn completion_rooted(
+    store: &CollaborationStore,
+    completion: &RecordId,
+    kind: &str,
+    reference: &str,
+) -> Result<bool, AcceptanceError> {
+    Ok(store.read_connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_controller_completion_roots
+         WHERE completion=?1 AND kind=?2 AND reference=?3)",
+        params![completion.as_str(), kind, reference],
+        |row| row.get(0),
+    )?)
+}
+
 /// Revalidate an accepted completion's historical qualification without
 /// querying provider state. A qualification row can be written only by
 /// qualify_receipt, after its private QualifiedAcceptance capability has
@@ -286,6 +343,7 @@ pub(crate) fn verify_historical_completion(
     completion: &HistoricalCompletionIdentity,
 ) -> Result<(), AcceptanceError> {
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    let completion_id = id(&completion.completion)?;
     let qualification_id = id(&completion.qualification)?;
     let expected_receipt_id = id(&completion.receipt)?;
     let expected_wave_id = id(&completion.wave)?;
@@ -303,6 +361,34 @@ pub(crate) fn verify_historical_completion(
         || candidate_tree != accepted_tree
     {
         return Err(invalid("historical completion identity"));
+    }
+
+    let stored_completion = crate::local_controller::load(store, &completion_id)
+        .map_err(|_| invalid("historical completion record"))?;
+    if stored_completion.target != completion.target
+        || stored_completion.revision != completion.revision
+        || stored_completion.epoch != completion.epoch
+        || stored_completion.wave != completion.wave
+        || stored_completion.source != completion.source
+        || stored_completion.candidate_commit != completion.candidate_commit
+        || stored_completion.candidate_tree != completion.candidate_tree
+        || stored_completion.qualification != completion.qualification
+        || stored_completion.acceptance_receipt != completion.receipt
+        || stored_completion.accepted_commit != completion.accepted_commit
+        || stored_completion.accepted_tree != completion.accepted_tree
+    {
+        return Err(invalid("historical completion identity"));
+    }
+    let completion_bytes: Vec<u8> = store.read_connection().query_row(
+        "SELECT body FROM local_controller_completions WHERE id=?1",
+        [completion_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let completion_object = ObjectDigest::of(&completion_bytes);
+    if archive::read_object(store, &completion_object)? != completion_bytes
+        || !completion_rooted(store, &completion_id, "object", completion_object.hex())?
+    {
+        return Err(invalid("historical completion is not retained"));
     }
 
     let (qualification_binding, qualification_bytes): (String, Vec<u8>) = store
@@ -325,12 +411,8 @@ pub(crate) fn verify_historical_completion(
     let execution_id = id(&qualification.execution)?;
     let qualification_object = archive::ObjectDigest::of(&qualification_bytes);
     let qualification_object_retained = archive::read_object(store, &qualification_object)?;
-    let qualification_rooted: bool = store.read_connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_target_roots
-         WHERE revision=?1 AND kind='object' AND reference=?2)",
-        rusqlite::params![completion.revision, qualification_object.hex()],
-        |row| row.get(0),
-    )?;
+    let qualification_rooted =
+        completion_rooted(store, &completion_id, "object", qualification_object.hex())?;
     if qualification_record.id() != qualification_id
         || qualification_record.canonical_bytes() != qualification_bytes
         || qualification_object_retained != qualification_bytes
@@ -405,12 +487,13 @@ pub(crate) fn verify_historical_completion(
     }
 
     let execution_object = object_for_record(&execution_id)?;
-    let execution = crate::execution_snapshot::load(
+    let execution = crate::execution_snapshot::load_from_completion(
         store,
         &crate::execution_snapshot::SnapshotRef {
             id: execution_id.clone(),
             object: execution_object,
         },
+        &completion_id,
     )?;
     if execution.target_revision() != &expected_revision_id
         || execution.spec().candidate_source != expected_source.as_str()
@@ -457,22 +540,72 @@ pub(crate) fn verify_historical_completion(
     let evidence: HistoricalEvidenceBody =
         serde_json::from_value(evidence_value["observation"].clone())
             .map_err(|_| invalid("historical evidence payload"))?;
-    let _artifact_id = id(&evidence.artifact)?;
-    let _output_snapshot =
+    let artifact_id = id(&evidence.artifact)?;
+    let output_snapshot =
         aethyme_contracts::experimental_v0::SourceSnapshotId::parse(&evidence.output)
             .map_err(|_| invalid("historical evidence output"))?;
-    let rooted: bool = store.read_connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_target_roots
-         WHERE revision=?1 AND kind='object' AND reference=?2)",
-        rusqlite::params![completion.revision, evidence_object_hex],
-        |row| row.get(0),
-    )?;
+    let rooted = completion_rooted(store, &completion_id, "object", &evidence_object_hex)?;
     let retained_evidence = archive::read_object(store, &evidence_object)?;
     let inventory_id = id(&execution.spec().assertion_inventory)?;
     let inventory_object = object_for_record(&inventory_id)?;
     let inventory_bytes = archive::read_object(store, &inventory_object)?;
     let inventory = verifier::AssertionInventory::decode(&inventory_bytes)?;
+    let harness_id =
+        aethyme_contracts::experimental_v0::SourceSnapshotId::parse(&execution.spec().harness)
+            .map_err(|_| invalid("historical verifier harness"))?;
+    let harness_manifest_bytes =
+        archive::read_object(store, &ObjectDigest::of_snapshot(&harness_id))?;
+    let harness_manifest =
+        archive::parse_manifest(&harness_manifest_bytes).ok_or(AcceptanceError::Missing)?;
+    let inventory_entry = harness_manifest
+        .entries()
+        .iter()
+        .find(|entry| entry.path() == b"harness/inventory.json")
+        .ok_or_else(|| invalid("historical verifier inventory file"))?;
+    let inventory_embedded = inventory_entry.kind()
+        == aethyme_contracts::experimental_v0::source_snapshot::EntryKind::Regular
+        && ObjectDigest::from_bytes(*inventory_entry.content_sha256()) == inventory_object;
+    let artifact_object = object_for_record(&artifact_id)?;
+    let artifact_bytes = archive::read_object(store, &artifact_object)?;
+    let artifact_record = Record::decode(&artifact_bytes, &[&HISTORICAL_ARTIFACT])
+        .map_err(|_| invalid("historical artifact record"))?;
+    let artifact_value: serde_json::Value = serde_json::from_slice(&artifact_bytes)?;
+    let expected_packaging = format!(
+        "sha256:{}",
+        ObjectDigest::of(&serde_json::to_vec(&execution.spec().build)?).hex()
+    );
+    let artifact_rooted =
+        completion_rooted(store, &completion_id, "object", artifact_object.hex())?;
+    let output_manifest_object = ObjectDigest::of_snapshot(&output_snapshot);
+    let output_manifest_bytes = archive::read_object(store, &output_manifest_object)?;
+    let output_manifest =
+        archive::parse_manifest(&output_manifest_bytes).ok_or(AcceptanceError::Missing)?;
+    let output_manifest_matches = output_manifest.id() == output_snapshot
+        && output_manifest.manifest_bytes() == output_manifest_bytes;
+    let mut output_closure_retained = completion_rooted(
+        store,
+        &completion_id,
+        "object",
+        output_manifest_object.hex(),
+    )?;
+    for entry in output_manifest.entries() {
+        let digest = ObjectDigest::from_bytes(*entry.content_sha256());
+        output_closure_retained &=
+            completion_rooted(store, &completion_id, "object", digest.hex())?;
+        archive::read_object(store, &digest)?;
+    }
+    let artifact_matches = artifact_record.id() == artifact_id
+        && artifact_record.canonical_bytes() == artifact_bytes
+        && artifact_value["execution"] == execution_id.as_str()
+        && artifact_value["target_revision"] == completion.revision
+        && artifact_value["output"] == output_snapshot.as_str()
+        && artifact_value["packaging"] == expected_packaging
+        && artifact_value["runtime"] == evidence.runtime
+        && artifact_value["generation"]
+            .as_str()
+            .is_some_and(|generation| !generation.is_empty());
     let assertions_match = evidence.assertions.len() == inventory.cases().len()
+        && inventory_embedded
         && inventory
             .cases()
             .iter()
@@ -490,6 +623,10 @@ pub(crate) fn verify_historical_completion(
         || archive::ObjectDigest::of(&evidence_bytes) != evidence_object
         || retained_evidence != evidence_bytes
         || !rooted
+        || !artifact_rooted
+        || !output_closure_retained
+        || !output_manifest_matches
+        || !artifact_matches
         || evidence_revision != completion.revision
         || evidence_generation <= 0
         || evidence_issued_ms <= 0
