@@ -111,6 +111,9 @@ fn shared_cache_tracks_each_worktrees_source_identity() {
         git(&repo, &["commit", "-m", "advance newer source"]);
         let second = git(&repo, &["rev-parse", "HEAD"]);
         assert_ne!(first, second);
+        // All existing Git watches must exist. Otherwise an absent packed-refs
+        // input can itself rerun the old script and conceal the cache bug.
+        git(&repo, &["pack-refs", "--all", "--no-prune"]);
         for (tree, expected) in [(&repo, &second), (&older, &first), (&repo, &second)] {
             assert_eq!(
                 run_probe(&tree.join("Cargo.toml"), &target, temp.path()),
@@ -119,6 +122,13 @@ fn shared_cache_tracks_each_worktrees_source_identity() {
                 tree.display()
             );
         }
+        // A same-checkout warm build also preserves the exact identity.
+        let warm_start = std::time::Instant::now();
+        assert_eq!(
+            run_probe(&repo.join("Cargo.toml"), &target, temp.path()),
+            second
+        );
+        eprintln!("{name} warm tiny-probe build: {:?}", warm_start.elapsed());
         // A moving branch must still invalidate a stationary symbolic HEAD.
         fs::write(repo.join("revision-marker"), "third source\n").unwrap();
         git(&repo, &["add", "revision-marker"]);
