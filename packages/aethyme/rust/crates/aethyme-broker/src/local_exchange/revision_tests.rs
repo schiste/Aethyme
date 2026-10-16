@@ -123,7 +123,11 @@ fn packet_with_brief(include_brief: bool, many_changes: bool) -> Metadata {
     }
 }
 
-fn large_packet_with_scope(revision_bytes: &[u8], scope: Vec<String>) -> Metadata {
+fn large_packet_with_scope(
+    revision_bytes: &[u8],
+    scope: Vec<String>,
+    capture_receipt_record_id: String,
+) -> Metadata {
     let (revision, revision_id) =
         ContributionRevision::from_record(revision_bytes).expect("large revision");
     Metadata::RevisionContribution {
@@ -132,7 +136,7 @@ fn large_packet_with_scope(revision_bytes: &[u8], scope: Vec<String>) -> Metadat
         descriptor_object_sha256: "e".repeat(64),
         logical_contribution_id: revision.contribution_id().to_string(),
         capture_record_id: revision.capture_record_id().to_string(),
-        capture_receipt_record_id: sha('f'),
+        capture_receipt_record_id,
         revision_record_id: revision_id.to_string(),
         revision_object_sha256: crate::collaboration_archive::ObjectDigest::of(revision_bytes)
             .hex()
@@ -432,7 +436,7 @@ fn snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap() {
     let first_event = Event {
         stream: stream.clone(),
         sequence: 1,
-        packet: large_packet_with_scope(&revision, scope.clone()),
+        packet: large_packet_with_scope(&revision, scope.clone(), format!("sha256:{:064x}", 0)),
     };
     let first_event_bytes = first_event.record().unwrap().canonical_bytes().len();
     let item_count = MAX_SNAPSHOT_PAGE_BYTES / first_event_bytes + 1;
@@ -441,10 +445,27 @@ fn snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap() {
         .map(|index| Event {
             stream: stream.clone(),
             sequence: index as u64 + 1,
-            packet: large_packet_with_scope(&revision, scope.clone()),
+            // Each packet needs its own record identity so the aggregate byte
+            // limit, rather than duplicate-event validation, is the first guard.
+            packet: large_packet_with_scope(
+                &revision,
+                scope.clone(),
+                format!("sha256:{:064x}", index),
+            ),
         })
         .collect::<Vec<_>>();
     assert!(items.len() > 1);
+    let receipt_ids = items
+        .iter()
+        .map(|event| match &event.packet {
+            Metadata::RevisionContribution {
+                capture_receipt_record_id,
+                ..
+            } => capture_receipt_record_id,
+            _ => panic!("large page fixture must contain revision packets"),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(receipt_ids.len(), items.len());
     assert!(
         items
             .iter()
