@@ -634,7 +634,7 @@ pub fn advance_file_identities(
         .collect();
     if base_state.files.len() != base_entries.len()
         || base_entries.iter().any(|(path, entry)| {
-            base_state.files.get(path).map_or(true, |state| {
+            base_state.files.get(path).is_none_or(|state| {
                 state.path != *path
                     || state.kind != entry.kind()
                     || state.content_sha256 != *entry.content_sha256()
@@ -789,13 +789,12 @@ pub fn advance_file_identities(
     }
 
     let mut ordinals = BTreeMap::new();
-    let mut ordinal = 0_u64;
-    for path in result_entries
+    for (ordinal, path) in result_entries
         .keys()
         .filter(|path| !base_entries.contains_key(*path))
+        .enumerate()
     {
-        ordinals.insert(path.clone(), ordinal);
-        ordinal += 1;
+        ordinals.insert(path.clone(), ordinal as u64);
     }
     let mut result_files = Vec::with_capacity(result_entries.len());
     for (path, entry) in &result_entries {
@@ -880,7 +879,7 @@ pub fn advance_file_identities(
                 continue;
             }
             changes.push(FileChange {
-                before,
+                before: None,
                 after: Some(after.clone()),
                 relation: *relation,
                 derived_from: derived_from.clone(),
@@ -949,18 +948,23 @@ pub fn validate_file_proposals(
             });
         }
         for change in &proposal.changes {
-            if change.before.is_none()
-                && change.after.is_some()
-                && matches!(
-                    change.relation,
-                    IdentityRelation::New
-                        | IdentityRelation::UncertainRename
-                        | IdentityRelation::ExplicitCopy
-                        | IdentityRelation::ExplicitSplit
-                )
-            {
+            let Some(after) = change.after.as_ref() else {
+                continue;
+            };
+            let destination_is_new = match change.relation {
+                IdentityRelation::ExplicitRename => change
+                    .before
+                    .as_ref()
+                    .is_some_and(|before| before.path != after.path),
+                IdentityRelation::New
+                | IdentityRelation::UncertainRename
+                | IdentityRelation::ExplicitCopy
+                | IdentityRelation::ExplicitSplit => change.before.is_none(),
+                _ => false,
+            };
+            if destination_is_new {
                 by_path
-                    .entry(change.after.as_ref().unwrap().path.clone())
+                    .entry(after.path.clone())
                     .or_default()
                     .insert(proposal.proposal_id.clone());
             }

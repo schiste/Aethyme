@@ -117,6 +117,8 @@ pub struct ContributionRevision {
 }
 
 impl ContributionRevision {
+    // This constructor names each fixed canonical record field explicitly.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: ProjectId,
         contribution_id: ContributionId,
@@ -309,7 +311,10 @@ fn validate_changes(changes: &[Value]) -> Result<(), ContributionRevisionError> 
             "derived_from",
             "possible_sources",
         ];
-        if object.iter().any(|(name, _)| !CHANGE_FIELDS.contains(name)) {
+        if object
+            .iter()
+            .any(|(name, _)| !CHANGE_FIELDS.contains(&name))
+        {
             return Err(ContributionRevisionError::InvalidSourceChange);
         }
         let relation_text = object_string(object, "relation")?;
@@ -383,7 +388,7 @@ fn object_state(
         None => Ok(None),
         Some(Value::Object(state)) => {
             const FIELDS: &[&str] = &["path_hex", "mode", "content_sha256", "file_id"];
-            if state.iter().any(|(name, _)| !FIELDS.contains(name)) {
+            if state.iter().any(|(name, _)| !FIELDS.contains(&name)) {
                 return Err(ContributionRevisionError::InvalidSourceChange);
             }
             let path = decode_hex(object_string(state, "path_hex")?, "path_hex")?;

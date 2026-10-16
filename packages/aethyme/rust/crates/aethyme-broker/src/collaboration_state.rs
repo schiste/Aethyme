@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 25;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 26;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -67,7 +67,10 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 25;
 // could read, recapture, or export data after administrative removal.
 // Schema 24 does not consume retained-capture notices at the appointed owner
 // tick and could run a target while an accepted notice remains queued.
-const MIN_COMPATIBLE_SCHEMA: i64 = 25;
+// Schema 26 introduces project/file mappings and immutable contribution
+// revision heads. A schema-25 writer would replace a brief without advancing
+// that head or rooting superseded brief objects, so stop it before writes.
+const MIN_COMPATIBLE_SCHEMA: i64 = 26;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -647,6 +650,91 @@ const MIGRATIONS: &[(i64, &str)] = &[
         (OLD.status='available' AND NEW.status='available') OR
         (OLD.status='stale' AND NEW.status='stale'))
     BEGIN SELECT RAISE(ABORT, 'capture notice outcome cannot be reopened'); END;"),
+            (26, "ALTER TABLE contribution_briefs ADD COLUMN revision_record_id TEXT;
+    CREATE UNIQUE INDEX capture_receipts_operation_lineage
+        ON capture_receipts(operation_id,lineage_record_id);
+    CREATE TABLE local_logical_contributions (
+        operation_id TEXT PRIMARY KEY NOT NULL REFERENCES capture_operations(operation_id),
+        contribution_id TEXT NOT NULL UNIQUE,
+        lineage_record_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        created_ms INTEGER NOT NULL,
+        UNIQUE (operation_id, contribution_id, lineage_record_id),
+        FOREIGN KEY (operation_id, lineage_record_id)
+            REFERENCES capture_receipts(operation_id, lineage_record_id)
+    ) STRICT;
+    CREATE INDEX local_logical_contributions_by_lineage
+        ON local_logical_contributions(lineage_record_id, contribution_id);
+    CREATE TABLE contribution_revisions (
+        revision_record_id TEXT PRIMARY KEY NOT NULL,
+        operation_id TEXT NOT NULL,
+        contribution_id TEXT NOT NULL,
+        lineage_record_id TEXT NOT NULL,
+        record_sha256 TEXT NOT NULL,
+        brief_record_id TEXT,
+        brief_object_sha256 TEXT,
+        created_ms INTEGER NOT NULL,
+        CHECK ((brief_record_id IS NULL) = (brief_object_sha256 IS NULL)),
+        UNIQUE (contribution_id, revision_record_id),
+        FOREIGN KEY (operation_id, contribution_id, lineage_record_id)
+            REFERENCES local_logical_contributions(operation_id, contribution_id, lineage_record_id)
+    ) STRICT;
+    CREATE INDEX contribution_revisions_by_lineage
+        ON contribution_revisions(lineage_record_id, created_ms, revision_record_id);
+    CREATE INDEX contribution_revisions_by_contribution
+        ON contribution_revisions(contribution_id, created_ms, revision_record_id);
+    CREATE INDEX contribution_revisions_by_object
+        ON contribution_revisions(record_sha256, revision_record_id);
+    CREATE TABLE reclaimed_contribution_revisions (
+        revision_record_id TEXT PRIMARY KEY NOT NULL,
+        generation INTEGER NOT NULL REFERENCES gc_generations(generation),
+        reclaimed_ms INTEGER NOT NULL CHECK(reclaimed_ms >= 0)
+    ) STRICT;
+    CREATE INDEX reclaimed_contribution_revisions_by_generation
+        ON reclaimed_contribution_revisions(generation, revision_record_id);
+    CREATE TABLE contribution_revision_identity_bases (
+        revision_record_id TEXT NOT NULL
+            REFERENCES contribution_revisions(revision_record_id),
+        base_revision_record_id TEXT NOT NULL
+            REFERENCES contribution_revisions(revision_record_id),
+        PRIMARY KEY (revision_record_id, base_revision_record_id),
+        CHECK (revision_record_id <> base_revision_record_id)
+    ) STRICT;
+    CREATE INDEX contribution_revision_identity_bases_by_base
+        ON contribution_revision_identity_bases(base_revision_record_id, revision_record_id);
+    CREATE TABLE contribution_revision_heads (
+        contribution_id TEXT PRIMARY KEY NOT NULL
+            REFERENCES local_logical_contributions(contribution_id),
+        revision_record_id TEXT NOT NULL,
+        FOREIGN KEY (contribution_id, revision_record_id)
+            REFERENCES contribution_revisions(contribution_id, revision_record_id)
+    ) STRICT;
+    CREATE TABLE local_project_bindings (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        project_id TEXT NOT NULL,
+        descriptor_record_id TEXT NOT NULL,
+        descriptor_object_sha256 TEXT NOT NULL,
+        anchor_commit TEXT NOT NULL,
+        anchor_snapshot TEXT NOT NULL,
+        confirmed_descriptor_record_id TEXT NOT NULL,
+        committed_config_commit TEXT NOT NULL,
+        bootstrap_snapshot TEXT NOT NULL REFERENCES retained_snapshots(snapshot_id),
+        bootstrap_transition_sha256 TEXT NOT NULL
+            CHECK (length(bootstrap_transition_sha256) = 64),
+        bound_ms INTEGER NOT NULL,
+        CHECK (descriptor_record_id = confirmed_descriptor_record_id)
+    ) STRICT;
+    CREATE TABLE local_project_file_ids (
+        snapshot_id TEXT NOT NULL REFERENCES retained_snapshots(snapshot_id),
+        path BLOB NOT NULL,
+        file_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        PRIMARY KEY (snapshot_id, path),
+        UNIQUE (snapshot_id, file_id)
+    ) STRICT;
+    CREATE INDEX local_project_file_ids_by_snapshot
+        ON local_project_file_ids(snapshot_id);"),
 ];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
@@ -1968,7 +2056,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
@@ -1988,11 +2076,11 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 25);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 26);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
-        // A schema 4 binary's reclamation does not keep attached briefs; a
-        // schema 5 binary posts no broad-risk keys and purges no cache entry.
-        const { assert!(MIN_COMPATIBLE_SCHEMA >= 6) };
+        // Earlier writers cannot preserve immutable revision heads or the
+        // historical brief objects they name.
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 26) };
     }
 
     /// Inspection opens read-only: it reports a store that needs migration
@@ -2009,7 +2097,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )
