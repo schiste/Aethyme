@@ -1796,10 +1796,13 @@ fn guard_current(
     Ok(())
 }
 
-/// Prove that a retained request still belongs to the latest eligible wave
+/// Verify that a retained request still belongs to the latest eligible wave
 /// before the controller prepares a charged resolution attempt. This checks
 /// the request from its archived record, not from caller-provided trigger data.
-pub(crate) fn require_current_resolution_request(
+///
+/// This is public because the CLI controller lives in a separate crate and
+/// must perform this check before charging or transitioning a resolver attempt.
+pub fn require_current_resolution_request(
     store: &mut CollaborationStore,
     repo: &Path,
     owner: &ControllerOwner,
