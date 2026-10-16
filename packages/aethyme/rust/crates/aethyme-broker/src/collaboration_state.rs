@@ -2874,6 +2874,35 @@ mod tests {
             phase: String,
             version: i64,
             attempts: i64,
+            spent: Vec<u8>,
+            receipt: Option<String>,
+            detail: Option<String>,
+            observed_overrun: Option<Vec<u8>>,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct AttemptSnapshot {
+            attempt_id: i64,
+            decision_key: String,
+            kind: String,
+            members: String,
+            paths: String,
+            request_record_id: String,
+            resolver: String,
+            outcome: Option<String>,
+            charged_ms: i64,
+            async_token: Option<String>,
+            client_key: Option<String>,
+            session_label: Option<String>,
+            attempt_number: Option<i64>,
+            request_sha256: Option<String>,
+            input_sha256: Option<String>,
+            input_manifest_sha256: Option<String>,
+            dispatch_limits: Option<String>,
+            response_sha256: Option<String>,
+            result_record_id: Option<String>,
+            result_sha256: Option<String>,
+            detail: Option<String>,
+            async_state: String,
         }
         #[derive(Debug, PartialEq, Eq)]
         struct BindingAuthoritySnapshot {
@@ -2881,6 +2910,7 @@ mod tests {
             roots: Vec<String>,
             bindings: Vec<BindingSnapshot>,
             reservation: ReservationSnapshot,
+            attempts: Vec<AttemptSnapshot>,
         }
 
         fn snapshot(
@@ -2951,7 +2981,8 @@ mod tests {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let reservation_state = connection.query_row(
-                "SELECT phase,version,attempts FROM local_budget_reservations
+                "SELECT phase,version,attempts,spent,receipt,detail,observed_overrun
+                 FROM local_budget_reservations
                  WHERE reservation=?1",
                 [reservation],
                 |row| {
@@ -2959,14 +2990,54 @@ mod tests {
                         phase: row.get(0)?,
                         version: row.get(1)?,
                         attempts: row.get(2)?,
+                        spent: row.get(3)?,
+                        receipt: row.get(4)?,
+                        detail: row.get(5)?,
+                        observed_overrun: row.get(6)?,
                     })
                 },
             )?;
+            let mut attempt_statement = connection.prepare(
+                "SELECT attempt_id,decision_key,kind,members,paths,request_record_id,resolver,
+                        outcome,charged_ms,async_token,client_key,session_label,attempt_number,
+                        request_sha256,input_sha256,input_manifest_sha256,dispatch_limits,
+                        response_sha256,result_record_id,result_sha256,detail,async_state
+                 FROM resolution_attempts WHERE client_key=?1 ORDER BY attempt_id",
+            )?;
+            let attempts = attempt_statement
+                .query_map([proof.client_key.as_str()], |row| {
+                    Ok(AttemptSnapshot {
+                        attempt_id: row.get(0)?,
+                        decision_key: row.get(1)?,
+                        kind: row.get(2)?,
+                        members: row.get(3)?,
+                        paths: row.get(4)?,
+                        request_record_id: row.get(5)?,
+                        resolver: row.get(6)?,
+                        outcome: row.get(7)?,
+                        charged_ms: row.get(8)?,
+                        async_token: row.get(9)?,
+                        client_key: row.get(10)?,
+                        session_label: row.get(11)?,
+                        attempt_number: row.get(12)?,
+                        request_sha256: row.get(13)?,
+                        input_sha256: row.get(14)?,
+                        input_manifest_sha256: row.get(15)?,
+                        dispatch_limits: row.get(16)?,
+                        response_sha256: row.get(17)?,
+                        result_record_id: row.get(18)?,
+                        result_sha256: row.get(19)?,
+                        detail: row.get(20)?,
+                        async_state: row.get(21)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(BindingAuthoritySnapshot {
                 proof,
                 roots,
                 bindings,
                 reservation: reservation_state,
+                attempts,
             })
         }
 
