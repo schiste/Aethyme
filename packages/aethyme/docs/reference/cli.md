@@ -1014,22 +1014,24 @@ does not open normal broker storage, and it never changes gate selection or
 runs during ordinary readiness inspection.
 
 The verification slot -- the disposable checkout merge simulation,
-graph-integrity verification, and the probe below all run in -- is placed
-outside the repository it verifies: under `<host state>/run/<repository>/`
-(`AETHYME_HOST_STATE_DIR`, else the platform state directory), or under the
-system temporary directory when the repository is itself ephemeral and no host
-state directory was named. A checkout nested inside the tree under test is not
-isolated from it: discovery that walks upward for a workspace root resolves to
-the enclosing checkout whenever the slot is absent or half-built, and answers
-with the wrong tree instead of failing. Outside the repository that walk finds
-nothing and fails loudly.
+graph-integrity verification, and the probe below all run in -- follows the
+same repository-scoped worktree root policy as sessions: a usable
+`[worktrees].root`, then host state, the system temporary directory, and the
+repository as the last resort. A checkout nested inside the tree under test is
+not isolated from it: discovery that walks upward for a workspace root resolves
+to the enclosing checkout whenever the slot is absent or half-built, and
+answers with the wrong tree instead of failing. `nested_verification_slot`
+reports an in-repository fallback, the preferred path, refusals, and this
+discovery hazard.
 
-Where every location outside the repository is unwritable -- a sandbox
-confining writes to the invoking checkout -- the slot falls back to
-`.aethyme/run/<namespace>` inside it. That is recorded, not silently accepted:
-`nested_verification_slot` reports where the slot was placed, where it was
-wanted, the refusal for each location outside the repository, and the discovery
-hazard the fallback carries.
+Explicit `AETHYME_WORKTREE_ROOT` and library overrides are strict. If the
+selected location is unavailable or below the gate storage reserve, Aethyme
+does not move verification to another volume: `gate doctor` reports
+`verification_slot_unavailable`, and the probe fails before writing. Placement
+planning does not create paths. Before a gate or probe writes, Aethyme checks
+the mounted volume and the 8 GiB / 100,000 inode reserve on each destination:
+repository logs and run state, the broker and host-resource databases, the
+checkout, and managed cache when configured.
 
 Probe execution is always explicit:
 
