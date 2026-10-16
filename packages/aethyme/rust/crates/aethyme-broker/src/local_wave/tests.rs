@@ -683,6 +683,86 @@ fn composition_source_survives_restart_and_raises_one_exact_failed_check_request
     assert_eq!(repeated.resolution_request.as_ref(), Some(request_ref));
 }
 
+#[test]
+fn resolution_preparation_requires_the_exact_current_failed_check_request() {
+    let mut f = Fixture::new();
+    let (owner, composed) = composed_candidate(&mut f);
+    let repo = f._repo.path().to_path_buf();
+    let resolved = compose_with_source(&mut f.store, &owner, &repo, &composed.id).unwrap();
+    let source = resolved
+        .source
+        .as_ref()
+        .expect("new composition retains source");
+    let checks = [FailedCheck {
+        check: "native-gate:unit:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .into(),
+    }];
+    let wave = raise_resolution_for_failed_checks(
+        &mut f.store,
+        &owner,
+        &repo,
+        &resolved.wave.id,
+        source,
+        &checks,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let request_ref = wave.resolution_request.as_ref().unwrap().clone();
+    let state = target::status(&f.store, owner.target()).unwrap();
+
+    require_current_resolution_request(
+        &mut f.store,
+        &repo,
+        &owner,
+        &wave.id,
+        state.version,
+        &request_ref,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        require_current_resolution_request(
+            &mut f.store,
+            &repo,
+            &owner,
+            &wave.id,
+            state.version - 1,
+            &request_ref,
+        ),
+        Err(WaveError::Stale)
+    ));
+    let swapped_ref = resolution::RecordRef {
+        id: request_ref.id.clone(),
+        object: ObjectDigest::of(b"not the linked request"),
+    };
+    assert!(matches!(
+        require_current_resolution_request(
+            &mut f.store,
+            &repo,
+            &owner,
+            &wave.id,
+            state.version,
+            &swapped_ref,
+        ),
+        Err(WaveError::Stale)
+    ));
+
+    let stopped = stop(&mut f.store, &owner, &wave.id).unwrap();
+    assert_eq!(stopped.phase, WavePhase::Stopped);
+    let stopped_state = target::status(&f.store, owner.target()).unwrap();
+    assert!(matches!(
+        require_current_resolution_request(
+            &mut f.store,
+            &repo,
+            &owner,
+            &wave.id,
+            stopped_state.version,
+            &request_ref,
+        ),
+        Err(WaveError::Stale)
+    ));
+}
+
 static REQUEST_LINK_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn note_request_link_busy(_: i32) -> bool {
@@ -738,16 +818,20 @@ fn cancellation_while_waiting_for_wave_write_lock_prevents_request_link() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let database = f.store.project_dir().join("state.db");
     let blocker = std::thread::spawn(move || {
-        let mut connection = rusqlite::Connection::open(database).unwrap();
+        let connection = rusqlite::Connection::open(database).unwrap();
         connection
             .busy_timeout(std::time::Duration::from_secs(3))
             .unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
         locked_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         connection.execute_batch("ROLLBACK").unwrap();
     });
-    locked_rx.recv().unwrap();
+    locked_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
 
     let cancel = std::sync::Arc::new(AtomicBool::new(false));
     let cancel_waiter = std::sync::Arc::clone(&cancel);
@@ -1098,12 +1182,24 @@ fn a_terminal_conflict_cannot_stop_or_drift_a_later_independent_wave() {
     };
     let older = frozen(admit(&mut f.store, &owner, p, 2).unwrap());
     assert_eq!(older.spec.selected, ["A", "C"]);
-    assert_eq!(
-        compose(&mut f.store, &owner, f._repo.path(), &older.id)
-            .unwrap()
-            .phase,
-        WavePhase::Blocked
-    );
+    let older = compose(&mut f.store, &owner, f._repo.path(), &older.id).unwrap();
+    assert_eq!(older.phase, WavePhase::Blocked);
+    let request_ref = older
+        .resolution_request
+        .as_ref()
+        .expect("real composer conflict stores its request")
+        .clone();
+    let conflict_state = target::status(&f.store, owner.target()).unwrap();
+    require_current_resolution_request(
+        &mut f.store,
+        f._repo.path(),
+        &owner,
+        &older.id,
+        conflict_state.version,
+        &request_ref,
+    )
+    .unwrap();
+
     let newer = frozen(admit(&mut f.store, &owner, p, 3).unwrap());
     assert_eq!(newer.spec.selected, ["B"]);
     assert_eq!(newer.spec.sequence, 2);
@@ -1125,6 +1221,18 @@ fn a_terminal_conflict_cannot_stop_or_drift_a_later_independent_wave() {
             .phase,
         WavePhase::Verifying
     );
+    let current_state = target::status(&f.store, owner.target()).unwrap();
+    assert!(matches!(
+        require_current_resolution_request(
+            &mut f.store,
+            f._repo.path(),
+            &owner,
+            &older.id,
+            current_state.version,
+            &request_ref,
+        ),
+        Err(WaveError::Stale)
+    ));
 }
 
 #[test]
