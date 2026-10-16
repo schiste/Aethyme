@@ -891,9 +891,10 @@ function run(): void {
     boundRevisionCanonicalHex,
     "corrected bound-file immutable ContributionRevision",
   );
+  const expectedBoundRevisionValue: unknown = JSON.parse(boundRevisionCanonicalJson);
   checkCanonicalValue(
     boundRevision.value,
-    correctedBoundGolden.value,
+    expectedBoundRevisionValue,
     "corrected bound-file ContributionRevision fields",
   );
   check(
