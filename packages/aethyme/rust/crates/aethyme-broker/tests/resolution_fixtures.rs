@@ -15,7 +15,8 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::{Arc, Barrier};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use aethyme_broker::collaboration_archive::{self, CommitOid};
 use aethyme_broker::collaboration_capture::{
@@ -930,27 +931,61 @@ fn concurrent_bound_imports_settle_one_attempt_once() {
     let response_bytes = serde_json::to_vec(&response_envelope).unwrap();
     let bound = resolution::decode_attempt_response_envelope(&status, &response_bytes).unwrap();
 
-    let barrier = Arc::new(Barrier::new(2));
     let host = world.root.path().join("state");
     let repo = world.repo.clone();
-    let first_barrier = Arc::clone(&barrier);
     let first_bound = bound.clone();
     let first_host = host.clone();
     let first_repo = repo.clone();
-    let first = std::thread::spawn(move || {
+    let (first_ready_tx, first_ready_rx) = mpsc::channel();
+    let (first_start_tx, first_start_rx) = mpsc::channel();
+    let (first_result_tx, first_result_rx) = mpsc::channel();
+    let first_worker = std::thread::spawn(move || {
         let mut store = open_store(&first_host, &first_repo);
-        first_barrier.wait();
-        resolution::finish_bound_attempt(&mut store, &first_repo, &first_bound)
+        let _ = first_ready_tx.send(());
+        if first_start_rx
+            .recv_timeout(Duration::from_secs(30))
+            .is_err()
+        {
+            return;
+        }
+        let result = resolution::finish_bound_attempt(&mut store, &first_repo, &first_bound);
+        drop(store);
+        let _ = first_result_tx.send(result);
     });
-    let second_barrier = Arc::clone(&barrier);
     let second_bound = bound;
-    let second = std::thread::spawn(move || {
+    let (second_ready_tx, second_ready_rx) = mpsc::channel();
+    let (second_start_tx, second_start_rx) = mpsc::channel();
+    let (second_result_tx, second_result_rx) = mpsc::channel();
+    let second_worker = std::thread::spawn(move || {
         let mut store = open_store(&host, &repo);
-        second_barrier.wait();
-        resolution::finish_bound_attempt(&mut store, &repo, &second_bound)
+        let _ = second_ready_tx.send(());
+        if second_start_rx
+            .recv_timeout(Duration::from_secs(30))
+            .is_err()
+        {
+            return;
+        }
+        let result = resolution::finish_bound_attempt(&mut store, &repo, &second_bound);
+        drop(store);
+        let _ = second_result_tx.send(result);
     });
-    let first = first.join().unwrap();
-    let second = second.join().unwrap();
+    let first_ready = first_ready_rx.recv_timeout(Duration::from_secs(30));
+    let second_ready = second_ready_rx.recv_timeout(Duration::from_secs(30));
+    if first_ready.is_err() || second_ready.is_err() {
+        let _ = first_start_tx.send(());
+        let _ = second_start_tx.send(());
+        panic!("both import workers must open before concurrent dispatch");
+    }
+    first_start_tx.send(()).unwrap();
+    second_start_tx.send(()).unwrap();
+    let first = first_result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("first import worker must finish within the bounded wait");
+    let second = second_result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("second import worker must finish within the bounded wait");
+    drop(first_worker);
+    drop(second_worker);
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
 
     let settled =
