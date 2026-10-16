@@ -43,8 +43,8 @@ admission cases. Broker binding and migration tests did not run: compilation
 stopped on two test-code borrow errors. The previous parent checkpoint had
 stopped earlier on two error-message format strings. Both failures are retained.
 The formatter check on `e47766f0` also retained the existing bridge-format diffs.
-Further bounded-allocation and brief-reference validation changes remain under
-review and are not qualified by these runs.
+Further bounded-allocation and brief-reference validation changes were still
+pending at that checkpoint and are not qualified by those runs.
 
 On merged source `595082df8f759a3f6c6c30340056d8ef9f93188d`, the eight
 public binding tests executed: seven passed and the corrupt-bootstrap case failed
@@ -61,6 +61,28 @@ ignored tests. The workspace formatter check passed. These runs include the
 bounded chunked transport and corrected aggregate-page fixture. Parent test-helper
 warnings remain; constructor hardening and the binding error mapping are still
 pending, so these checks do not qualify the final combined source.
+
+On merged source `e26db8069390027fdd1d0ac9277a3709c75d2b98`, the contract
+integration targets passed 49 tests. All eight public binding tests, the
+deterministic writer-lock contention test, and current-head inheritance retry
+passed. The compile-only check also passed; two warnings were corrected later.
+
+On merged source `3570a85346693cc3b8550e35c2ad5d8e4f447f97`, all 52 contract
+integration tests passed, including full-envelope size refusal before semantic
+validation. Public binding (8), writer contention (1), omitted-field inheritance
+(1), exact context (7), context CLI (5), revision CLI (6), replay entry budget
+(1), identity GC (4), revision consumers (18), target profile (6), waves (23),
+and seven individually selected migration tests passed with no ignored tests.
+These are overlapping command selections, not a distinct-test total. The
+formatter check passed. Strict combined Clippy failed on bridge argument-count,
+wire-enum layout, borrow and test-style diagnostics; its correction and rerun
+remain pending at this checkpoint.
+
+The actual help snapshot generator ran on `22da789b`, changing only the intended
+collaboration help snapshot. That generation run receives no qualification credit
+because its source changed. After independent review and commit `8b9a56bc`, the
+same help suite passed one test with snapshot updates disabled and unchanged
+source.
 
 ## Guard controls
 
@@ -98,6 +120,15 @@ packet IDs and reaches the aggregate byte boundary. The driver retained source
 and test hashes in a unique backup, restored exact source bytes, and the restored
 eight-test exchange suite passed with zero failures or ignored tests.
 
+Four constructor controls on source `3570a853` separately removed borrowed
+brief-digest admission, early reference-count refusal, aggregate source-array
+measurement, and the full-envelope byte check. Each executed its exact named test
+and failed the intended assertion (exit 101, one failure, zero ignored). The last
+case keeps the source array below 1 MiB while dependencies make the complete record
+exceed it. These demonstrate typed refusal precedence, not measured peak
+allocation. Exact reviewed source bytes were restored, and all 52 contract tests
+passed again.
+
 ## Retained failures and uncredited selections
 
 - The first exact-context build failed before tests because of an undeclared
@@ -107,7 +138,7 @@ eight-test exchange suite passed with zero failures or ignored tests.
   run passes both retention and retirement paths.
 - Strict broker Clippy on `52835882` failed on a context test clone and placement
   of a parent test module. The clone has since been fixed; parent cleanup and a
-  passing combined rerun are pending.
+  passing combined rerun were pending at that checkpoint.
 - The contracts `--lib` and nonexistent project CLI module selections each ran
   zero tests. They carry no test credit. The corrected contracts integration
   command executed and passed 45 tests.
@@ -124,6 +155,10 @@ eight-test exchange suite passed with zero failures or ignored tests.
   newly added column, an out-of-date collab help snapshot, formatting/test-module
   lint failures, and dependency-download failures. These are historical failures
   on their recorded heads, not passing final CI evidence.
+
+A replay-budget filter on `3570a853` initially selected zero tests. The driver
+stopped, the exact existing test filter was corrected, and that test passed in
+the subsequent run. The zero-test attempt remains uncredited.
 
 The inventory retains earlier positive runs as historical attempts without
 extending their claims to later source. Final workspace checks, complete public

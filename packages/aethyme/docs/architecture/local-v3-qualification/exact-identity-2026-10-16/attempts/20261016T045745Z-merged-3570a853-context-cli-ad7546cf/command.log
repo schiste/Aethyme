@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 5 tests
+test collaboration_cli::context_revisions::tests::brief_selector_requires_one_exact_selector_and_one_file ... ok
+test collaboration_cli::context_revisions::tests::exact_pin_parser_bounds_repeated_values_and_requires_an_argument ... ok
+test collaboration_cli::context_revisions::tests::exact_pin_parser_requires_all_three_canonical_identities ... ok
+test collaboration_cli::context_revisions::tests::identity_integrity_and_io_errors_remain_failures_at_the_cli_boundary ... ok
+test collaboration_cli::context_revisions::tests::operation_brief_handler_selects_one_of_two_identical_capture_lineages ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1949 filtered out; finished in 1.27s
+

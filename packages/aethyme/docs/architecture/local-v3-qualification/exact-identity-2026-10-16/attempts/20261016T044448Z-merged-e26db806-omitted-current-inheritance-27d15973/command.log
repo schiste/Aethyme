@@ -1,0 +1,20 @@
+warning: field `exit` is never read
+    --> crates/aethyme-broker/src/collaboration_cli/project.rs:1058:20
+     |
+1056 |     pub(crate) struct FixtureFailure {
+     |                       -------------- field in this struct
+1057 |         pub(crate) code: String,
+1058 |         pub(crate) exit: u8,
+     |                    ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test collaboration_cli::contribution::tests::an_old_omitted_fields_retry_inherits_the_current_operations_and_dependencies ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1953 filtered out; finished in 1.46s
+
