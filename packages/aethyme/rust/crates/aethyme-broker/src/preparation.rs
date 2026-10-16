@@ -6,6 +6,11 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::{CStr, CString};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -19,6 +24,11 @@ pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
 const PREPARATION_LEASE_TTL_SECONDS: u64 = 30;
 const PREPARATION_CACHE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
+// The scanner checks the deadline between filesystem operations. Individual
+// filesystem calls are not interruptible by this cooperative time limit.
+const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 100_000;
+const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
+const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreparationError {
@@ -1490,10 +1500,12 @@ fn shared_cache_budget_at(
     store: &Path,
     digest: &str,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
-    if budget.max_bytes == 0 || !store.is_dir() {
+    if budget.max_bytes == 0 {
         return Ok(None);
     }
-    let bytes = directory_bytes(store);
+    let Some(bytes) = directory_bytes(store)? else {
+        return Ok(None);
+    };
     if bytes <= budget.max_bytes {
         return Ok(None);
     }
@@ -1549,25 +1561,353 @@ pub(crate) fn preparation_cache_root() -> Result<PathBuf, PreparationError> {
     Ok(parent.join("preparation-cache"))
 }
 
-fn directory_bytes(path: &Path) -> u64 {
+#[derive(Clone, Copy)]
+struct SharedCacheScanLimits {
+    max_entries: usize,
+    max_depth: usize,
+    max_elapsed: Duration,
+}
+
+impl Default for SharedCacheScanLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: SHARED_CACHE_SCAN_MAX_ENTRIES,
+            max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+            max_elapsed: SHARED_CACHE_SCAN_MAX_ELAPSED,
+        }
+    }
+}
+
+fn directory_bytes(path: &Path) -> Result<Option<u64>, PreparationError> {
+    directory_bytes_with_limits(path, SharedCacheScanLimits::default())
+}
+
+fn directory_bytes_with_limits(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+) -> Result<Option<u64>, PreparationError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        directory_bytes_fd_relative(path, limits)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = limits;
+        Err(shared_cache_scan_refusal(
+            path,
+            "bounded no-follow inventory is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SharedCacheDirectoryStream(*mut libc::DIR);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl SharedCacheDirectoryStream {
+    fn from_owned_fd(fd: libc::c_int, path: &Path) -> Result<Self, PreparationError> {
+        // SAFETY: fd is an open directory descriptor and ownership transfers to
+        // fdopendir on success. The stream is closed by Drop.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let source = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so it did not take ownership of fd.
+            unsafe { libc::close(fd) };
+            return Err(shared_cache_scan_io_refusal(path, &source));
+        }
+        Ok(Self(stream))
+    }
+
+    fn fd(&self, path: &Path) -> Result<libc::c_int, PreparationError> {
+        // SAFETY: self owns a live DIR stream until Drop.
+        let fd = unsafe { libc::dirfd(self.0) };
+        if fd < 0 {
+            return Err(shared_cache_scan_io_refusal(
+                path,
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(fd)
+    }
+
+    fn next_name(&mut self, path: &Path) -> Result<Option<CString>, PreparationError> {
+        // readdir reports end-of-directory and errors with the same null
+        // pointer, so clear errno before each call and inspect it afterwards.
+        // SAFETY: the platform-specific errno accessor points to this thread's
+        // errno slot.
+        unsafe { *shared_cache_errno_location() = 0 };
+        // SAFETY: self owns a live DIR stream; readdir's pointer is copied
+        // before another call can invalidate it.
+        let entry = unsafe { libc::readdir(self.0) };
+        if entry.is_null() {
+            // SAFETY: errno was initialized above and readdir ran on this
+            // thread.
+            let errno = unsafe { *shared_cache_errno_location() };
+            if errno == 0 {
+                return Ok(None);
+            }
+            return Err(shared_cache_scan_io_refusal(
+                path,
+                &std::io::Error::from_raw_os_error(errno),
+            ));
+        }
+        // SAFETY: POSIX dirent::d_name is a NUL-terminated name valid until
+        // the next readdir call. CString copies the bytes now.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        CString::new(name)
+            .map(Some)
+            .map_err(|_| shared_cache_scan_refusal(path, "directory entry name is invalid"))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for SharedCacheDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this stream uniquely owns the DIR pointer from fdopendir.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn shared_cache_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno slot.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn shared_cache_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno slot.
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SharedCacheDirectoryFrame {
+    stream: SharedCacheDirectoryStream,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_bytes_fd_relative(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+) -> Result<Option<u64>, PreparationError> {
+    use std::mem::MaybeUninit;
+
+    let started = Instant::now();
+    let root_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(shared_cache_scan_io_refusal(path, &source)),
+    };
+    if root_metadata.file_type().is_symlink() {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache store root is a symlink",
+        ));
+    }
+    if !root_metadata.is_dir() {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache store root is not a directory",
+        ));
+    }
+    if limits.max_entries == 0 || limits.max_depth == 0 {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache inventory limit was exceeded",
+        ));
+    }
+    check_shared_cache_scan_deadline(path, started, limits)?;
+
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| shared_cache_scan_refusal(path, "cache store path is invalid"))?;
+    let flags =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: path_c is NUL-terminated and flags request a directory without
+    // following the final path component if it is a symlink.
+    let root_fd = unsafe { libc::open(path_c.as_ptr(), flags) };
+    if root_fd < 0 {
+        let source = std::io::Error::last_os_error();
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(shared_cache_scan_io_refusal(path, &source));
+    }
+
+    let mut root_stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: root_fd is open and root_stat is writable storage for stat.
+    if unsafe { libc::fstat(root_fd, root_stat.as_mut_ptr()) } != 0 {
+        let source = std::io::Error::last_os_error();
+        // SAFETY: fd was opened above and has not transferred to fdopendir.
+        unsafe { libc::close(root_fd) };
+        return Err(shared_cache_scan_io_refusal(path, &source));
+    }
+    // SAFETY: successful fstat initialized the structure.
+    let root_stat = unsafe { root_stat.assume_init() };
+    if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        // SAFETY: fd was opened above and has not transferred to fdopendir.
+        unsafe { libc::close(root_fd) };
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache store root changed type",
+        ));
+    }
+    let root_device = root_stat.st_dev;
+    let root_stream = SharedCacheDirectoryStream::from_owned_fd(root_fd, path)?;
+    let mut pending = vec![SharedCacheDirectoryFrame {
+        stream: root_stream,
+    }];
+    let mut visited_entries = 0_usize;
     let mut bytes = 0_u64;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(directory) else {
+
+    loop {
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        let Some(frame) = pending.last_mut() else {
+            break;
+        };
+        let name = frame.stream.next_name(path)?;
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        let Some(name) = name else {
+            pending.pop();
             continue;
         };
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else {
-                bytes = bytes.saturating_add(metadata.len());
+        if name.as_bytes() == b"." || name.as_bytes() == b".." {
+            continue;
+        }
+        visited_entries = visited_entries.checked_add(1).ok_or_else(|| {
+            shared_cache_scan_refusal(path, "cache inventory entry count overflowed")
+        })?;
+        if visited_entries > limits.max_entries {
+            return Err(shared_cache_scan_refusal(
+                path,
+                "cache inventory entry limit was exceeded",
+            ));
+        }
+
+        let parent_fd = pending
+            .last()
+            .expect("nonempty directory stack")
+            .stream
+            .fd(path)?;
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        let mut entry_stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: parent_fd is owned by the live stream, name is NUL-terminated,
+        // and entry_stat is writable storage. AT_SYMLINK_NOFOLLOW classifies
+        // links without opening their target.
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                entry_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(shared_cache_scan_io_refusal(
+                path,
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        // SAFETY: successful fstatat initialized the structure.
+        let entry_stat = unsafe { entry_stat.assume_init() };
+        if entry_stat.st_dev != root_device {
+            return Err(shared_cache_scan_refusal(
+                path,
+                "cache inventory crossed a filesystem boundary",
+            ));
+        }
+        let entry_type = entry_stat.st_mode & libc::S_IFMT;
+        match entry_type {
+            libc::S_IFDIR => {
+                if pending.len() >= limits.max_depth {
+                    return Err(shared_cache_scan_refusal(
+                        path,
+                        "cache inventory directory depth limit was exceeded",
+                    ));
+                }
+                check_shared_cache_scan_deadline(path, started, limits)?;
+                // SAFETY: name is NUL-terminated and parent_fd remains live.
+                let child_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+                if child_fd < 0 {
+                    return Err(shared_cache_scan_io_refusal(
+                        path,
+                        &std::io::Error::last_os_error(),
+                    ));
+                }
+                let mut child_stat = MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: child_fd is open and child_stat is writable storage.
+                if unsafe { libc::fstat(child_fd, child_stat.as_mut_ptr()) } != 0 {
+                    let source = std::io::Error::last_os_error();
+                    // SAFETY: child_fd remains owned here because fdopendir was
+                    // not called after the failed fstat.
+                    unsafe { libc::close(child_fd) };
+                    return Err(shared_cache_scan_io_refusal(path, &source));
+                }
+                // SAFETY: successful fstat initialized the structure.
+                let child_stat = unsafe { child_stat.assume_init() };
+                if child_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+                    || child_stat.st_dev != root_device
+                {
+                    // SAFETY: child_fd remains owned here because fdopendir was
+                    // not called after validation failed.
+                    unsafe { libc::close(child_fd) };
+                    return Err(shared_cache_scan_refusal(
+                        path,
+                        "cache directory changed or crossed a filesystem boundary",
+                    ));
+                }
+                let child = SharedCacheDirectoryStream::from_owned_fd(child_fd, path)?;
+                check_shared_cache_scan_deadline(path, started, limits)?;
+                pending.push(SharedCacheDirectoryFrame { stream: child });
+            }
+            libc::S_IFREG | libc::S_IFLNK => {
+                let size = u64::try_from(entry_stat.st_size).map_err(|_| {
+                    shared_cache_scan_refusal(path, "cache entry has an invalid size")
+                })?;
+                bytes = bytes.checked_add(size).ok_or_else(|| {
+                    shared_cache_scan_refusal(path, "cache inventory byte count overflowed")
+                })?;
+            }
+            _ => {
+                return Err(shared_cache_scan_refusal(
+                    path,
+                    "cache inventory contains a special file",
+                ));
             }
         }
     }
-    bytes
+
+    Ok(Some(bytes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_shared_cache_scan_deadline(
+    path: &Path,
+    started: Instant,
+    limits: SharedCacheScanLimits,
+) -> Result<(), PreparationError> {
+    if started.elapsed() >= limits.max_elapsed {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache inventory time limit was exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn shared_cache_scan_refusal(path: &Path, reason: &str) -> PreparationError {
+    PreparationError::StorageUnavailable {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn shared_cache_scan_io_refusal(path: &Path, source: &std::io::Error) -> PreparationError {
+    PreparationError::StorageUnavailable {
+        path: path.to_path_buf(),
+        reason: format!("cache inventory could not be read ({:?})", source.kind()),
+    }
 }
 
 fn epoch_ms() -> u128 {
@@ -2011,15 +2351,31 @@ mod tests {
         assert!(store.join("big").exists(), "the store must be untouched");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_missing_shared_store_is_not_created_by_budget_measurement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("missing-store");
+
+        assert_eq!(directory_bytes(&store).unwrap(), None);
+        assert!(
+            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.exists());
+    }
+
     /// Over budget rotates the store and leaves a usable one behind; under
     /// budget measures and does nothing.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn an_over_budget_shared_store_is_rotated_while_under_budget_is_not() {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().join("store");
         std::fs::create_dir_all(store.join("nested")).unwrap();
         std::fs::write(store.join("nested/payload"), vec![0_u8; 8192]).unwrap();
-        let bytes = directory_bytes(&store);
+        let bytes = directory_bytes(&store).unwrap().unwrap();
         assert!(bytes >= 8192);
 
         let budget = SharedCacheBudget {
@@ -2049,6 +2405,7 @@ mod tests {
 
     /// The report must not disclose where the store lives: it is host state
     /// outside the repository, and this record reaches JSON output.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_rotation_report_carries_no_host_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2065,6 +2422,162 @@ mod tests {
             "rotation report leaked a host path: {json}"
         );
         assert!(!json.contains("preparation-cache"), "{json}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_counts_links_without_following_targets_or_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(store.join("nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(store.join("nested/payload"), b"inside-data").unwrap();
+        fs::write(outside.join("large"), vec![0_u8; 128 * 1024]).unwrap();
+        symlink(&outside, store.join("external")).unwrap();
+        symlink(&store, store.join("cycle")).unwrap();
+
+        let expected = b"inside-data".len() as u64
+            + fs::symlink_metadata(store.join("external")).unwrap().len()
+            + fs::symlink_metadata(store.join("cycle")).unwrap().len();
+        assert_eq!(directory_bytes(&store).unwrap(), Some(expected));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_refuses_a_symlink_root_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("store");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("payload"), b"preserve me").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            directory_bytes(&link),
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(target.join("payload")).unwrap(), b"preserve me");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_refuses_entry_and_depth_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(store.join("nested/deeper")).unwrap();
+        fs::write(store.join("one"), b"1").unwrap();
+        fs::write(store.join("two"), b"2").unwrap();
+        fs::write(store.join("nested/deeper/three"), b"3").unwrap();
+        let base = SharedCacheScanLimits {
+            max_entries: 100,
+            max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+            max_elapsed: Duration::from_secs(5),
+        };
+
+        let entry_limited = directory_bytes_with_limits(
+            &store,
+            SharedCacheScanLimits {
+                max_entries: 2,
+                ..base
+            },
+        );
+        assert!(matches!(
+            entry_limited,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+
+        let depth_limited = directory_bytes_with_limits(
+            &store,
+            SharedCacheScanLimits {
+                max_depth: 1,
+                ..base
+            },
+        );
+        assert!(matches!(
+            depth_limited,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+
+        let time_limited = directory_bytes_with_limits(
+            &store,
+            SharedCacheScanLimits {
+                max_elapsed: Duration::ZERO,
+                ..base
+            },
+        );
+        assert!(matches!(
+            time_limited,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_fails_closed_on_permission_denied_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let denied = store.join("denied");
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(denied.join("payload"), b"not readable").unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = directory_bytes(&store);
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // SAFETY: geteuid reads the calling process's effective user ID.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root can bypass mode bits; the production scan still fails
+            // closed on the same openat error under an unprivileged caller.
+            return;
+        }
+        assert!(matches!(
+            result,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_refuses_special_files_without_opening_them() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("keep"), b"preserve me").unwrap();
+        let fifo = store.join("blocked-pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        assert!(matches!(
+            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456"),
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(store.join("keep")).unwrap(), b"preserve me");
+        assert!(fifo.exists());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn shared_cache_budget_fails_closed_on_unsupported_platforms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("keep"), b"keep").unwrap();
+
+        assert!(matches!(
+            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456"),
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(store.join("keep")).unwrap(), b"keep");
     }
 
     #[test]
