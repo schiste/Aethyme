@@ -683,6 +683,25 @@ const MIGRATIONS: &[(i64, &str)] = &[
         ON contribution_revisions(lineage_record_id, created_ms, revision_record_id);
     CREATE INDEX contribution_revisions_by_contribution
         ON contribution_revisions(contribution_id, created_ms, revision_record_id);
+    CREATE INDEX contribution_revisions_by_object
+        ON contribution_revisions(record_sha256, revision_record_id);
+    CREATE TABLE reclaimed_contribution_revisions (
+        revision_record_id TEXT PRIMARY KEY NOT NULL,
+        generation INTEGER NOT NULL REFERENCES gc_generations(generation),
+        reclaimed_ms INTEGER NOT NULL CHECK(reclaimed_ms >= 0)
+    ) STRICT;
+    CREATE INDEX reclaimed_contribution_revisions_by_generation
+        ON reclaimed_contribution_revisions(generation, revision_record_id);
+    CREATE TABLE contribution_revision_identity_bases (
+        revision_record_id TEXT NOT NULL
+            REFERENCES contribution_revisions(revision_record_id),
+        base_revision_record_id TEXT NOT NULL
+            REFERENCES contribution_revisions(revision_record_id),
+        PRIMARY KEY (revision_record_id, base_revision_record_id),
+        CHECK (revision_record_id <> base_revision_record_id)
+    ) STRICT;
+    CREATE INDEX contribution_revision_identity_bases_by_base
+        ON contribution_revision_identity_bases(base_revision_record_id, revision_record_id);
     CREATE TABLE contribution_revision_heads (
         contribution_id TEXT PRIMARY KEY NOT NULL
             REFERENCES local_logical_contributions(contribution_id),
@@ -699,6 +718,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
         anchor_snapshot TEXT NOT NULL,
         confirmed_descriptor_record_id TEXT NOT NULL,
         committed_config_commit TEXT NOT NULL,
+        bootstrap_snapshot TEXT NOT NULL REFERENCES retained_snapshots(snapshot_id),
+        bootstrap_transition_sha256 TEXT NOT NULL
+            CHECK (length(bootstrap_transition_sha256) = 64),
         bound_ms INTEGER NOT NULL,
         CHECK (descriptor_record_id = confirmed_descriptor_record_id)
     ) STRICT;
@@ -2034,7 +2056,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
@@ -2075,7 +2097,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )

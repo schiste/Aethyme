@@ -45,6 +45,8 @@ use crate::exit_status;
 mod lifecycle;
 #[path = "collaboration_cli/project.rs"]
 mod project;
+#[cfg(test)]
+pub(crate) use project::test_support as project_test_support;
 #[path = "collaboration_cli/sensitive.rs"]
 mod sensitive;
 

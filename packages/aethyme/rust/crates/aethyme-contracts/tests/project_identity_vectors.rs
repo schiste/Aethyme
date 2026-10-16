@@ -300,6 +300,54 @@ fn competing_new_files_at_the_same_path_conflict_even_with_equal_bytes() {
 }
 
 #[test]
+fn competing_explicit_renames_to_the_same_new_path_conflict() {
+    let base = snapshot(&[(b"old-a.rs", b"same"), (b"old-b.rs", b"same")]);
+    let descriptor = ProjectDescriptor::from_snapshot(
+        project(),
+        "1111111111111111111111111111111111111111",
+        &base,
+    )
+    .unwrap();
+    let base_state = descriptor.initial_file_identity_state().unwrap();
+    let result = snapshot(&[(b"new.rs", b"same")]);
+    let left = advance_file_identities(
+        &project(),
+        &base_state,
+        "proposal-rename-a",
+        &base,
+        &result,
+        &[FileOperation::Rename {
+            from: b"old-a.rs".to_vec(),
+            to: b"new.rs".to_vec(),
+        }],
+    )
+    .unwrap();
+    let right = advance_file_identities(
+        &project(),
+        &base_state,
+        "proposal-rename-b",
+        &base,
+        &result,
+        &[FileOperation::Rename {
+            from: b"old-b.rs".to_vec(),
+            to: b"new.rs".to_vec(),
+        }],
+    )
+    .unwrap();
+
+    let conflict = validate_file_proposals(&[left, right]).unwrap_err();
+    assert_eq!(
+        conflict.kind,
+        aethyme_contracts::experimental_v0::FileNamespaceConflictKind::CompetingPath
+    );
+    assert_eq!(conflict.path, b"new.rs");
+    assert_eq!(
+        conflict.proposal_ids,
+        ["proposal-rename-a", "proposal-rename-b"]
+    );
+}
+
+#[test]
 fn foreign_project_identity_state_and_wrong_base_snapshot_are_refused() {
     let base = snapshot(&[(b"a.rs", b"a")]);
     let result = snapshot(&[(b"a.rs", b"a")]);
