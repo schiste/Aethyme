@@ -44,14 +44,13 @@ pub(crate) struct PinnedTreeRemoval;
 impl PinnedTreeRemoval {
     /// Open and pin `path` and its containing directory without following any
     /// symlink in the canonical parent path or at the final path component.
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(_path: &Path) -> io::Result<Self> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            Ok(Self(unix::PinnedTreeRemoval::open(path)?))
+            Ok(Self(unix::PinnedTreeRemoval::open(_path)?))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = path;
             Err(unsupported_platform())
         }
     }
@@ -90,16 +89,16 @@ impl PinnedTreeRemoval {
     /// before final `rmdir`, so a replaced or unmounted root is left alone.
     pub(crate) fn remove(
         self,
-        keep_until_last: Option<&str>,
-        deadline: Option<Instant>,
+        _keep_until_last: Option<&str>,
+        _deadline: Option<Instant>,
     ) -> io::Result<TreeRemoval> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            self.0.remove(keep_until_last, deadline, &mut || Ok(()))
+            self.0.remove(_keep_until_last, _deadline, &mut || Ok(()))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = (self, keep_until_last, deadline);
+            let _self = self;
             Err(unsupported_platform())
         }
     }
@@ -108,20 +107,19 @@ impl PinnedTreeRemoval {
 /// Remove a path after pinning it. Registered orphan apply should instead keep
 /// a `PinnedTreeRemoval` inside its claim and invoke that handle directly.
 pub(crate) fn remove_condemned_tree(
-    dir: &Path,
-    keep_until_last: Option<&str>,
-    deadline: Option<Instant>,
+    _dir: &Path,
+    _keep_until_last: Option<&str>,
+    _deadline: Option<Instant>,
 ) -> io::Result<TreeRemoval> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        return match unix::PinnedTreeRemoval::open_optional(dir)? {
-            Some(tree) => tree.remove(keep_until_last, deadline, &mut || Ok(())),
+        return match unix::PinnedTreeRemoval::open_optional(_dir)? {
+            Some(tree) => tree.remove(_keep_until_last, _deadline, &mut || Ok(())),
             None => Ok(TreeRemoval::Complete),
         };
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (dir, keep_until_last, deadline);
         Err(unsupported_platform())
     }
 }
@@ -490,6 +488,9 @@ mod unix {
                 };
                 let child_fd = child.as_raw_fd();
                 let entries = DirectoryEntries::open(child_fd)?;
+                if super::super::check_deadline(deadline) {
+                    return Ok(TreeRemoval::Interrupted);
+                }
                 bindings.push(child_binding.clone());
                 stack.push(DirectoryFrame {
                     _directory: Some(child),
@@ -703,14 +704,23 @@ mod unix {
             }
             return Err(error);
         }
-        let mode = stat.st_mode as libc::mode_t;
+        let mode = stat.st_mode;
+        #[cfg(target_os = "linux")]
+        let device = stat.st_dev;
+        #[cfg(target_os = "macos")]
+        let device = u64::try_from(stat.st_dev).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "negative device number in stat result",
+            )
+        })?;
         Ok(Some(EntryMetadata {
             identity: TreeObjectIdentity {
-                device: stat.st_dev as u64,
-                inode: stat.st_ino as u64,
+                device,
+                inode: stat.st_ino,
             },
-            is_directory: mode & libc::S_IFMT as libc::mode_t == libc::S_IFDIR as libc::mode_t,
-            is_regular: mode & libc::S_IFMT as libc::mode_t == libc::S_IFREG as libc::mode_t,
+            is_directory: mode & libc::S_IFMT == libc::S_IFDIR,
+            is_regular: mode & libc::S_IFMT == libc::S_IFREG,
         }))
     }
 
@@ -1109,6 +1119,41 @@ mod unix {
             );
             assert!(root.join("CACHEDIR.TAG").is_file());
             assert!(!root.join("payload").exists());
+        }
+
+        #[test]
+        fn expired_deadline_does_not_descend_an_arbitrary_directory_chain() {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("CACHEDIR.TAG"), b"witness").unwrap();
+            let mut leaf = root.clone();
+            for depth in 0..40 {
+                leaf.push(format!("d{depth}"));
+                fs::create_dir(&leaf).unwrap();
+            }
+            fs::write(leaf.join("payload"), b"preserve").unwrap();
+
+            let mut directory_opens = 0;
+            let mut before_directory_open = || {
+                directory_opens += 1;
+                Ok(())
+            };
+            let result = remove_with_hook(
+                &root,
+                Some("CACHEDIR.TAG"),
+                Some(Instant::now()),
+                &mut before_directory_open,
+            )
+            .unwrap();
+
+            assert_eq!(result, TreeRemoval::Interrupted);
+            assert_eq!(
+                directory_opens, 1,
+                "do not descend after the budget expires"
+            );
+            assert_eq!(fs::read(root.join("CACHEDIR.TAG")).unwrap(), b"witness");
+            assert_eq!(fs::read(leaf.join("payload")).unwrap(), b"preserve");
         }
 
         #[test]
