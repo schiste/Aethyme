@@ -49,6 +49,14 @@ fn open_store(root: &Path, repo: &Path) -> CollaborationStore {
     .unwrap()
 }
 
+fn read_only_state_connection(store: &CollaborationStore) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        store.project_dir().join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+}
+
 fn capture_lineage(
     store: &mut CollaborationStore,
     repo: &Path,
@@ -636,9 +644,8 @@ fn asynchronous_attempt_is_charged_before_export_and_imported_once() {
     assert_eq!(packet["authority"]["session_label"], "provenance_only");
     assert!(packet["request"]["requirements"].is_array());
 
-    let charged: i64 = world
-        .store
-        .read_connection()
+    let ledger = read_only_state_connection(&world.store);
+    let charged: i64 = ledger
         .query_row(
             "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
             [&status.token],
@@ -648,9 +655,7 @@ fn asynchronous_attempt_is_charged_before_export_and_imported_once() {
     assert_eq!(charged, 1, "the ledger charge precedes request export");
 
     let holder = format!("resolution:{}", status.token);
-    let snapshot_roots: i64 = world
-        .store
-        .read_connection()
+    let snapshot_roots: i64 = ledger
         .query_row(
             "SELECT count(*) FROM reader_leases
              WHERE holder=?1 AND target_kind='snapshot'",
@@ -658,9 +663,7 @@ fn asynchronous_attempt_is_charged_before_export_and_imported_once() {
             |row| row.get(0),
         )
         .unwrap();
-    let contribution_roots: i64 = world
-        .store
-        .read_connection()
+    let contribution_roots: i64 = ledger
         .query_row(
             "SELECT count(*) FROM reader_leases
              WHERE holder=?1 AND target_kind='contribution'",
@@ -668,9 +671,7 @@ fn asynchronous_attempt_is_charged_before_export_and_imported_once() {
             |row| row.get(0),
         )
         .unwrap();
-    let request_roots: i64 = world
-        .store
-        .read_connection()
+    let request_roots: i64 = ledger
         .query_row(
             "SELECT count(*) FROM object_pins
              WHERE holder=?1 AND object_sha256=?2",
@@ -814,9 +815,8 @@ fn asynchronous_attempt_rejects_oversized_scoped_inputs_before_charge() {
         )
         .is_err()
     );
-    let charged: i64 = world
-        .store
-        .read_connection()
+    let ledger = read_only_state_connection(&world.store);
+    let charged: i64 = ledger
         .query_row(
             "SELECT count(*) FROM resolution_attempts WHERE session_label='session-test-oversize'",
             [],
