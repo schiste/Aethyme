@@ -178,7 +178,8 @@ pub(super) fn begin(
     if now_ms >= command.deadline_ms || command.deadline_ms.saturating_sub(now_ms) > 86_400_000 {
         return Err(BudgetError::Invalid("managed resolution deadline".into()));
     }
-    let stored_manifest = archive::put_object(store, &manifest_bytes)?;
+    let stored_manifest = archive::put_object(store, &manifest_bytes)
+        .map_err(|error| BudgetError::Invalid(format!("archive object: {error}")))?;
     if stored_manifest != manifest_object {
         return Err(BudgetError::Stale);
     }
@@ -565,7 +566,8 @@ fn retained_status(
         store,
         &manifest_digest,
         usize::try_from(limits.max_manifest_bytes).map_err(|_| BudgetError::Stale)?,
-    )?;
+    )
+    .map_err(|error| BudgetError::Invalid(format!("read retained input manifest: {error}")))?;
     if stored_manifest != manifest_bytes {
         return Err(BudgetError::Stale);
     }
@@ -662,7 +664,7 @@ fn load_retained_reservation(
         },
     )?;
     let spec: ReservationSpec = decode(reservation.as_str(), &row.0)?;
-    let encoded = record(&spec)?;
+    let encoded = super::record(&spec)?;
     let spent: Units = serde_json::from_slice(&row.10)?;
     spent.validate()?;
     let state = parse_state(&row.1)?;
@@ -998,6 +1000,7 @@ fn dispatch_acknowledgement(
     if !row_matches || stored_roots != expected_roots {
         return Err(BudgetError::Stale);
     }
+    drop(roots_statement);
     revalidate_current_budget(&transaction, owner, wave, &proof, &reservation_id)?;
     if wall_clock_ms()? >= permit.deadline_ms {
         return Err(BudgetError::Stale);
