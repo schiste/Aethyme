@@ -428,7 +428,7 @@ fn assert_native_job_sources_retained(
     }
 
     let job_record = ObjectDigest::of(&record(&job.spec).unwrap().canonical_bytes());
-    let recipe_record = digest(&job.spec.recipe).unwrap();
+    let recipe_record = digest(job.spec.recipe.as_deref().unwrap()).unwrap();
     archive::read_object(store, &job_record).unwrap();
     archive::read_object(store, &recipe_record).unwrap();
     expected_objects
@@ -473,6 +473,7 @@ fn age_archive_objects(store: &CollaborationStore) {
 }
 
 const GATES: &str = "[[gate]]\nname='retained-features'\ncommand='test \"$(cat one.txt)\" = A && test \"$(cat two.txt)\" = B && git rev-parse HEAD'\ncache=false\ntimeout_seconds=10\n";
+const METADATA_GATES: &str = "[[gate]]\nname='retained-head'\ncommand='git rev-parse HEAD'\ncache=false\ntimeout_seconds=10\n";
 #[test]
 fn checkout_placement_refuses_upward_project_discovery() {
     let outside = tempfile::tempdir().unwrap();
@@ -547,6 +548,459 @@ fn actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_write
     .unwrap();
     assert_eq!(repeated.observation, complete.observation);
 }
+
+#[test]
+fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
+    if run_in_clean_git_child(
+        "native_gates::tests::settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate",
+    ) {
+        return;
+    }
+    let mut s = setup(Some(METADATA_GATES));
+    let repo = s.f._repo.path().to_path_buf();
+    let owner = s.owner.as_ref().expect("setup owner is present");
+
+    let old_job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
+    let old_observation = json!({"status":"original candidate observation"});
+    s.f.store
+        .connection()
+        .execute(
+            "UPDATE local_native_gate_jobs SET state='completed',observation=?2 WHERE id=?1",
+            params![
+                old_job.id.as_str(),
+                serde_json::to_vec(&old_observation).unwrap()
+            ],
+        )
+        .unwrap();
+
+    let composed = wave::compose_with_source(&mut s.f.store, owner, &repo, &s.wave).unwrap();
+    let source = composed
+        .source
+        .expect("the original recipe source is retained");
+    let checks = [crate::resolution::FailedCheck {
+        check: format!("native-gate:retained-features:{}", "a".repeat(64)),
+    }];
+    let requested = wave::raise_resolution_for_failed_checks(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        &source,
+        &checks,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let request_ref = requested
+        .resolution_request
+        .clone()
+        .expect("the failed check request is linked to the wave");
+    let expected_version = target::status(&s.f.store, owner.target()).unwrap().version;
+
+    let session_label = "session-synthesized-attach-test";
+    let started = crate::resolution::begin_attempt(
+        &mut s.f.store,
+        &repo,
+        &request_ref,
+        session_label,
+        "client-synthesized-attach-test",
+        crate::resolution::DispatchLimits {
+            max_manifest_bytes: 1_000_000,
+            max_manifest_entries: 256,
+            max_file_bytes: 1_000_000,
+            max_total_input_bytes: 4_000_000,
+            max_response_bytes: 1_000_000,
+        },
+    )
+    .unwrap();
+    let crate::resolution::BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("the focused test must create one new charged attempt");
+    };
+    assert_eq!(status.request, request_ref);
+    crate::resolution::mark_attempt_dispatching(&mut s.f.store, &status.token, session_label)
+        .unwrap();
+    let envelope = json!({
+        "schema": crate::resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": session_label,
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {
+            "kind": "proposal",
+            "detail": null,
+            "brief": "repair the retained failed-check candidate",
+            "writes": [{
+                "path": "one.txt",
+                "delete": false,
+                "kind": "regular",
+                "bytes_hex": "410a7265736f6c7665640a"
+            }]
+        }
+    });
+    let response_bytes = serde_json::to_vec(&envelope).unwrap();
+    let bound =
+        crate::resolution::decode_attempt_response_envelope(&status, &response_bytes).unwrap();
+    let settled = crate::resolution::finish_bound_attempt(&mut s.f.store, &repo, &bound).unwrap();
+    assert!(
+        matches!(
+            &settled.outcome,
+            crate::resolution::ResolutionOutcome::Synthesized(_)
+        ),
+        "metadata-only source should allow synthesis, got {:?}",
+        settled.outcome
+    );
+    let ledger =
+        crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
+    assert_eq!(
+        ledger.state,
+        crate::resolution::ResolutionAttemptState::Settled
+    );
+    let result_ref = ledger.result.expect("the settled ledger names its result");
+
+    assert_eq!(
+        target::status(&s.f.store, owner.target()).unwrap().version,
+        expected_version
+    );
+    let cancelled = wave::attach_synthesized_attempt_result(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version,
+        &request_ref,
+        &status.token,
+        &std::sync::atomic::AtomicBool::new(true),
+    );
+    assert!(matches!(cancelled, Err(wave::WaveError::Stale)));
+    let before_attach = wave::load(&s.f.store, &s.wave).unwrap();
+    assert!(before_attach.resolution_result.is_none());
+    assert_eq!(
+        target::status(&s.f.store, owner.target()).unwrap().version,
+        expected_version
+    );
+
+    let guard_checks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let guard_checks_probe = guard_checks.clone();
+    let _guard_probe = wave::observe_synthesized_attach_guards(move |store| {
+        assert!(
+            gc::try_admin_exclusive(store).unwrap().is_none(),
+            "archive reclamation must remain blocked from result read through retention"
+        );
+        assert!(
+            crate::collaboration_sensitive::try_response_exclusive(store)
+                .unwrap()
+                .is_none(),
+            "sensitive purge must remain blocked from result read through retention"
+        );
+        guard_checks_probe.set(guard_checks_probe.get() + 1);
+    });
+    let attached = wave::attach_synthesized_attempt_result(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version,
+        &request_ref,
+        &status.token,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    drop(_guard_probe);
+    assert_eq!(
+        guard_checks.get(),
+        2,
+        "both barriers stay held after the strict read and after artifact retention"
+    );
+    assert_eq!(attached.phase, WavePhase::Verifying);
+    assert_eq!(attached.resolution_result.as_ref(), Some(&result_ref));
+    let attached_status = target::status(&s.f.store, owner.target()).unwrap();
+    assert_eq!(attached_status.version, expected_version + 1);
+    assert_eq!(attached_status.phase, target::Phase::Verifying);
+    let settled_after_attach =
+        crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
+    assert_eq!(
+        settled_after_attach.state,
+        crate::resolution::ResolutionAttemptState::Settled
+    );
+    assert_eq!(settled_after_attach.result.as_ref(), Some(&result_ref));
+    let charge_count: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
+                [&status.token],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        charge_count, 1,
+        "attachment does not create another attempt charge"
+    );
+    let (synthesis, provenance) =
+        wave::read_synthesized_wave_result(&mut s.f.store, &repo, &attached)
+            .unwrap()
+            .expect("only a strict settled result has synthesized provenance");
+    assert_eq!(provenance.request_record_id, request_ref.id.to_string());
+    assert_eq!(provenance.request_object, request_ref.object.hex());
+    assert_eq!(provenance.group_record_id, result_ref.id.to_string());
+    assert_eq!(provenance.group_object, result_ref.object.hex());
+    assert_eq!(
+        attached.candidate_snapshot.as_ref(),
+        Some(&synthesis.candidate.subject)
+    );
+    assert_eq!(
+        attached.candidate_commit.as_ref(),
+        Some(&synthesis.candidate.commit)
+    );
+    let repeated = wave::attach_synthesized_attempt_result(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version,
+        &request_ref,
+        &status.token,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(repeated, attached);
+
+    let fresh_job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
+    assert_ne!(fresh_job.id, old_job.id);
+    assert_eq!(fresh_job.spec.synthesized_group.as_ref(), Some(&provenance));
+    assert_eq!(
+        fresh_job.spec.recipe,
+        attached.recipe_object.map(|object| object.hex())
+    );
+    let verified_candidate =
+        validate_source(&mut s.f.store, owner, &repo, &fresh_job.spec).unwrap();
+    assert_eq!(verified_candidate.commit, fresh_job.spec.commit);
+    assert_eq!(verified_candidate.tree, fresh_job.spec.tree);
+    assert!(validate_source(&mut s.f.store, owner, &repo, &old_job.spec).is_err());
+
+    let refs_before_gate = git(repo.as_path(), &["show-ref"]);
+    let completed = run(&mut s.f.store, owner, &mut s.broker, &fresh_job.id).unwrap();
+    assert_eq!(completed.state, "completed");
+    let observation = completed
+        .observation
+        .as_ref()
+        .expect("the fresh synthesized gate records its observation");
+    assert_eq!(observation["status"], "passed", "{observation}");
+    assert_eq!(observation["selected_gates"], 1);
+    assert_eq!(
+        observation["candidate"]["commit"],
+        synthesis.candidate.commit.as_str()
+    );
+    assert_eq!(observation["candidate"]["tree"], synthesis.candidate.tree);
+    assert_eq!(
+        observation["gates"][0]["tree_hash"],
+        synthesis.candidate.tree
+    );
+    assert_eq!(observation["trusted_evidence"], false);
+    assert_eq!(observation["provider_acceptance"], false);
+    let gate_log =
+        std::fs::read_to_string(observation["gates"][0]["log_path"].as_str().unwrap()).unwrap();
+    assert!(
+        gate_log.contains(synthesis.candidate.commit.as_str()),
+        "fresh gate log must name the synthesized candidate commit"
+    );
+    assert_eq!(git(repo.as_path(), &["show-ref"]), refs_before_gate);
+
+    let merge_queue_count: i64 = s
+        .broker
+        .store()
+        .connection()
+        .query_row("SELECT count(*) FROM merge_queue", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        merge_queue_count, 0,
+        "native gate must not enqueue promotion"
+    );
+    let acceptance_count: i64 = s
+        .f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT (SELECT count(*) FROM local_acceptance_bindings) + (SELECT count(*) FROM local_acceptance_receipts) + (SELECT count(*) FROM local_acceptance_qualifications)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        acceptance_count, 0,
+        "synthesized gates must not mint acceptance"
+    );
+
+    let loaded_old = load(&s.f.store, &old_job.id).unwrap();
+    assert_eq!(loaded_old.observation, Some(old_observation));
+
+    for reference in [
+        provenance.request_object.as_str(),
+        provenance.group_object.as_str(),
+        provenance.input_manifest_sha256.as_str(),
+    ] {
+        let roots: i64 = s
+            .f
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_roots WHERE job=?1 AND kind='object' AND reference=?2",
+                params![fresh_job.id.as_str(), reference],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            roots, 1,
+            "fresh gate job must retain provenance object {reference}"
+        );
+    }
+    let same_wave_jobs: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_jobs WHERE wave=?1",
+                [&fresh_job.spec.wave],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(same_wave_jobs, 2);
+}
+
+#[test]
+fn exact_spec_identity_preserves_old_job_and_separates_same_wave_synthesis() {
+    let mut s = setup(Some(GATES));
+    let job = prepare(
+        &mut s.f.store,
+        s.owner.as_ref().expect("setup owner is present"),
+        &mut s.broker,
+        &s.wave,
+    )
+    .unwrap();
+
+    let mut legacy_spec = serde_json::Map::new();
+    macro_rules! legacy_field {
+        ($field:ident) => {
+            legacy_spec.insert(
+                stringify!($field).into(),
+                serde_json::to_value(&job.spec.$field).unwrap(),
+            );
+        };
+    }
+    legacy_field!(profile);
+    legacy_field!(repository_root);
+    legacy_field!(repository_common_dir);
+    legacy_field!(target);
+    legacy_field!(revision);
+    legacy_field!(epoch);
+    legacy_field!(wave);
+    legacy_spec.insert(
+        "recipe".into(),
+        serde_json::json!(job.spec.recipe.as_deref().unwrap()),
+    );
+    legacy_field!(baseline);
+    legacy_field!(subject);
+    legacy_field!(base_commit);
+    legacy_field!(tree);
+    legacy_field!(commit);
+    legacy_field!(inputs);
+    legacy_field!(policy_sha256);
+    for (name, value) in [
+        ("gate_config_sha256", &job.spec.gate_config_sha256),
+        ("graph_config_sha256", &job.spec.graph_config_sha256),
+        ("preparation_sha256", &job.spec.preparation_sha256),
+    ] {
+        if let Some(value) = value {
+            legacy_spec.insert(name.into(), serde_json::json!(value));
+        }
+    }
+    legacy_field!(max_dispatches);
+    legacy_field!(execution_allowance_seconds);
+    let old_shape = Record::decode(
+        &serde_json::to_vec(&json!({
+            "schema": SCHEMA_NAME,
+            "spec": serde_json::Value::Object(legacy_spec),
+        }))
+        .unwrap(),
+        &[&SCHEMA],
+    )
+    .unwrap();
+    assert_eq!(
+        old_shape.canonical_bytes(),
+        record(&job.spec).unwrap().canonical_bytes()
+    );
+
+    let old_observation = json!({"status":"historical original observation"});
+    s.f.store
+        .connection()
+        .execute(
+            "UPDATE local_native_gate_jobs SET state='completed',observation=?2 WHERE id=?1",
+            params![
+                job.id.as_str(),
+                serde_json::to_vec(&old_observation).unwrap()
+            ],
+        )
+        .unwrap();
+    let mut synthesized = job.spec.clone();
+    synthesized.synthesized_group = Some(wave::SynthesizedGroupProvenance {
+        schema: "aethyme.synthesized-group-provenance/experimental-v1".into(),
+        version: 1,
+        trust: "unverified_local".into(),
+        request_record_id: "sha256:request".into(),
+        request_object: "a".repeat(64),
+        group_record_id: "sha256:group".into(),
+        group_object: "b".repeat(64),
+        input_manifest_sha256: "c".repeat(64),
+        baseline_snapshot: synthesized.baseline.clone(),
+        baseline_commit: synthesized.base_commit.clone(),
+        candidate_subject: synthesized.subject.clone(),
+        candidate_tree: synthesized.tree.clone(),
+        candidate_commit: synthesized.commit.clone(),
+        inputs: Vec::new(),
+    });
+    let synthesized_record = record(&synthesized).unwrap();
+    assert_ne!(synthesized_record.id(), job.id);
+    s.f.store
+        .connection()
+        .execute(
+            "INSERT INTO local_native_gate_jobs(id,wave,target,revision,epoch,body,state)
+             VALUES(?1,?2,?3,?4,?5,?6,'prepared')",
+            params![
+                synthesized_record.id().as_str(),
+                synthesized.wave,
+                synthesized.target,
+                synthesized.revision,
+                synthesized.epoch,
+                synthesized_record.canonical_bytes(),
+            ],
+        )
+        .unwrap();
+
+    let loaded_old = load_exact_spec(&s.f.store, &job.spec).unwrap().unwrap();
+    let loaded_new = load_exact_spec(&s.f.store, &synthesized).unwrap().unwrap();
+    assert_eq!(loaded_old.id, job.id);
+    assert_eq!(loaded_old.observation, Some(old_observation.clone()));
+    assert_eq!(loaded_new.id, synthesized_record.id());
+    let prepared = prepare(
+        &mut s.f.store,
+        s.owner.as_ref().expect("setup owner is present"),
+        &mut s.broker,
+        &s.wave,
+    )
+    .unwrap();
+    assert_eq!(prepared.id, job.id);
+    assert_eq!(prepared.observation, Some(old_observation));
+    let same_wave_jobs: i64 =
+        s.f.store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_jobs WHERE wave=?1",
+                [&job.spec.wave],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(same_wave_jobs, 2);
+}
+
 #[test]
 fn a_dispatched_job_reopens_unknown_without_any_retry() {
     let mut s = setup(Some(GATES));
@@ -639,7 +1093,12 @@ fn corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch() {
     let mut forged = job.spec.clone();
     forged.subject = forged.baseline.clone();
     assert!(matches!(
-        validate_source(&s.f.store, s.f._repo.path(), &forged),
+        validate_source(
+            &mut s.f.store,
+            s.owner.as_ref().expect("setup owner is present"),
+            s.f._repo.path(),
+            &forged,
+        ),
         Err(NativeGateError::Mismatch | NativeGateError::Binding(_))
     ));
     s.f.store

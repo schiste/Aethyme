@@ -75,7 +75,10 @@ pub struct Spec {
     pub revision: String,
     pub epoch: String,
     pub wave: String,
-    pub recipe: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesized_group: Option<wave::SynthesizedGroupProvenance>,
     pub baseline: String,
     pub subject: String,
     pub base_commit: String,
@@ -227,6 +230,26 @@ pub fn load(store: &CollaborationStore, key: &RecordId) -> Result<Job, NativeGat
             .transpose()?,
         roots_released_ms: row.roots_released_ms,
     })
+}
+
+fn load_exact_spec(
+    store: &CollaborationStore,
+    spec: &Spec,
+) -> Result<Option<Job>, NativeGateError> {
+    let key = record(spec)?.id();
+    let exists: bool = store.read_connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_native_gate_jobs WHERE id=?1)",
+        [key.as_str()],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    let job = load(store, &key)?;
+    if job.spec != *spec {
+        return Err(NativeGateError::Mismatch);
+    }
+    Ok(Some(job))
 }
 
 fn retention_status(
@@ -448,7 +471,8 @@ fn current(
         || w.candidate_commit.as_ref().map(CommitOid::as_str) != Some(spec.commit.as_str())
         || w.candidate_snapshot.as_ref().map(SourceSnapshotId::as_str)
             != Some(spec.subject.as_str())
-        || w.recipe_object.map(|d| d.hex()) != Some(spec.recipe.clone())
+        || w.recipe_object.map(|d| d.hex()) != spec.recipe
+        || w.resolution_result.is_some() != spec.synthesized_group.is_some()
     {
         return Err(NativeGateError::Binding(
             "current wave candidate, recipe or baseline",
@@ -457,10 +481,13 @@ fn current(
     Ok(())
 }
 pub(crate) fn validate_source(
-    store: &CollaborationStore,
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
     repo: &Path,
     spec: &Spec,
 ) -> Result<crate::types::VerificationCandidate, NativeGateError> {
+    let _archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
     let candidate = commit(&spec.commit)?;
     let baseline = commit(&spec.base_commit)?;
     if archive::raw_commit_tree(repo, &candidate)? != spec.tree
@@ -471,7 +498,63 @@ pub(crate) fn validate_source(
             "raw Git candidate or baseline source",
         ));
     }
-    let bytes = archive::read_object(store, &digest(&spec.recipe)?)?;
+    let w = wave::load(store, &id(&spec.wave)?)?;
+    if let Some(expected_provenance) = &spec.synthesized_group {
+        let (synthesis, provenance) = wave::read_synthesized_wave_result(store, repo, &w)?
+            .ok_or(NativeGateError::Mismatch)?;
+        if &provenance != expected_provenance
+            || w.spec.baseline != spec.baseline
+            || synthesis.candidate.subject.as_str() != spec.subject
+            || synthesis.candidate.tree != spec.tree
+            || synthesis.candidate.commit.as_str() != spec.commit
+            || synthesis.candidate.baseline.as_str() != spec.base_commit
+            || synthesis
+                .candidate
+                .inputs
+                .iter()
+                .map(|input| input.result.as_str().to_owned())
+                .collect::<Vec<_>>()
+                != spec.inputs
+            || w.recipe_object.map(|object| object.hex()) != spec.recipe
+        {
+            return Err(NativeGateError::Binding(
+                "synthesized candidate or provenance differs from its exact settled result",
+            ));
+        }
+        wave::validate_synthesized_group_roots(store, &w, &synthesis, &provenance)?;
+        let (source_wave, source) =
+            wave::load_composition_source(store, owner, repo, &id(&spec.wave)?)?;
+        if source_wave != w {
+            return Err(NativeGateError::Binding("current synthesized wave"));
+        }
+        match (&spec.recipe, source.as_ref()) {
+            (Some(recipe), Some(source))
+                if source
+                    .composition
+                    .recipe
+                    .as_ref()
+                    .is_some_and(|reference| reference.object.hex() == *recipe) =>
+            {
+                // The source loader verifies the original composer candidate
+                // and recipe independently from this synthesized candidate.
+            }
+            (None, None) if w.recipe_object.is_none() && w.composition_source.is_none() => (),
+            _ => return Err(NativeGateError::Binding("original composition source")),
+        }
+        return Ok(crate::types::VerificationCandidate {
+            base: spec.base_commit.clone(),
+            inputs: spec.inputs.clone(),
+            tree: spec.tree.clone(),
+            commit: spec.commit.clone(),
+        });
+    }
+    if w.resolution_result.is_some() {
+        return Err(NativeGateError::Binding(
+            "synthesized result is absent from the native gate Spec",
+        ));
+    }
+    let recipe_hex = spec.recipe.as_deref().ok_or(NativeGateError::Mismatch)?;
+    let bytes = archive::read_object(store, &digest(recipe_hex)?)?;
     let recipe = Record::decode(&bytes, &[&crate::composer::COMPOSITION_RECIPE_SCHEMA])
         .map_err(|_| NativeGateError::Mismatch)?;
     if recipe.canonical_bytes() != bytes {
@@ -488,7 +571,6 @@ pub(crate) fn validate_source(
             "composition recipe candidate, baseline or inputs",
         ));
     }
-    let w = wave::load(store, &id(&spec.wave)?)?;
     match &w.spec.prior_completion {
         Some(key) => {
             let (completion, prior) = wave::accepted_completion(store, &id(key)?, w.spec.sequence)?;
@@ -572,38 +654,67 @@ pub fn prepare(
     broker: &mut Broker,
     wave_id: &RecordId,
 ) -> Result<Job, NativeGateError> {
-    let _authority = target::authorize(store, owner)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
-    if let Some(key) = store
-        .read_connection()
-        .query_row(
-            "SELECT id FROM local_native_gate_jobs WHERE wave=?1",
-            [wave_id.as_str()],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        let job = load(store, &id(&key)?)?;
-        repository_binding(broker, &job.spec)?;
-        if job.roots_released_ms.is_some() {
-            return Err(NativeGateError::RootsReleased);
-        }
-        current(store, owner, &job.spec)?;
-        return Ok(job);
-    }
-    let w = wave::load(store, wave_id)?;
-    let recipe = w.recipe_object.ok_or(NativeGateError::Mismatch)?;
-    let bytes = archive::read_object(store, &recipe)?;
-    let rec = Record::decode(&bytes, &[&crate::composer::COMPOSITION_RECIPE_SCHEMA])
-        .map_err(|error| NativeGateError::Canonical(format!("prepare recipe: {error}")))?;
-    if rec.canonical_bytes() != bytes {
-        return Err(NativeGateError::Mismatch);
-    }
-    let body: Value = serde_json::from_slice(&bytes)?;
-    let base = body["baseline_commit"]
-        .as_str()
-        .ok_or(NativeGateError::Mismatch)?;
-    let p = policy(broker.repo_handle().root(), &commit(base)?)?;
+    let _archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let (w, _source) =
+        wave::load_composition_source(store, owner, broker.repo_handle().root(), wave_id)?;
+    let synthesized = wave::read_synthesized_wave_result(store, broker.repo_handle().root(), &w)?;
+    let (base, subject, tree, candidate_commit, inputs, recipe, synthesized_group, synthesis) =
+        if let Some((synthesis, provenance)) = synthesized {
+            (
+                synthesis.candidate.baseline.as_str().to_owned(),
+                synthesis.candidate.subject.to_string(),
+                synthesis.candidate.tree.clone(),
+                synthesis.candidate.commit.as_str().to_owned(),
+                synthesis
+                    .candidate
+                    .inputs
+                    .iter()
+                    .map(|input| input.result.as_str().to_owned())
+                    .collect(),
+                w.recipe_object.map(|object| object.hex()),
+                Some(provenance),
+                Some(synthesis),
+            )
+        } else {
+            let recipe = w.recipe_object.ok_or(NativeGateError::Mismatch)?;
+            let bytes = archive::read_object(store, &recipe)?;
+            let rec = Record::decode(&bytes, &[&crate::composer::COMPOSITION_RECIPE_SCHEMA])
+                .map_err(|error| NativeGateError::Canonical(format!("prepare recipe: {error}")))?;
+            if rec.canonical_bytes() != bytes {
+                return Err(NativeGateError::Mismatch);
+            }
+            let body: Value = serde_json::from_slice(&bytes)?;
+            let base = body["baseline_commit"]
+                .as_str()
+                .ok_or(NativeGateError::Mismatch)?
+                .to_owned();
+            let subject = w
+                .candidate_snapshot
+                .as_ref()
+                .ok_or(NativeGateError::Mismatch)?
+                .to_string();
+            let candidate_commit = w
+                .candidate_commit
+                .as_ref()
+                .ok_or(NativeGateError::Mismatch)?
+                .as_str()
+                .to_owned();
+            let tree =
+                archive::raw_commit_tree(broker.repo_handle().root(), &commit(&candidate_commit)?)?;
+            let inputs = recipe_inputs(store, &body)?;
+            (
+                base,
+                subject,
+                tree,
+                candidate_commit,
+                inputs,
+                Some(recipe.hex()),
+                None,
+                None,
+            )
+        };
+    let p = policy(broker.repo_handle().root(), &commit(&base)?)?;
     require_explicit_trust(broker, &p.trust)?;
     let spec = Spec {
         profile: PROFILE.into(),
@@ -624,25 +735,14 @@ pub fn prepare(
         revision: w.spec.revision.clone(),
         epoch: owner.authority_epoch().as_str().into(),
         wave: wave_id.to_string(),
-        recipe: recipe.hex(),
+        recipe,
+        synthesized_group,
         baseline: w.spec.baseline.clone(),
-        subject: w
-            .candidate_snapshot
-            .ok_or(NativeGateError::Mismatch)?
-            .to_string(),
-        base_commit: base.into(),
-        tree: archive::raw_commit_tree(
-            broker.repo_handle().root(),
-            &w.candidate_commit
-                .clone()
-                .ok_or(NativeGateError::Mismatch)?,
-        )?,
-        commit: w
-            .candidate_commit
-            .ok_or(NativeGateError::Mismatch)?
-            .as_str()
-            .to_owned(),
-        inputs: recipe_inputs(store, &body)?,
+        subject,
+        base_commit: base,
+        tree,
+        commit: candidate_commit,
+        inputs,
         policy_sha256: p.trust.policy_sha256,
         gate_config_sha256: p.gate_sha,
         graph_config_sha256: p.graph_sha,
@@ -650,31 +750,68 @@ pub fn prepare(
         max_dispatches: 1,
         execution_allowance_seconds: 300,
     };
+    if let Some(job) = load_exact_spec(store, &spec)? {
+        repository_binding(broker, &job.spec)?;
+        if job.roots_released_ms.is_some() {
+            return Err(NativeGateError::RootsReleased);
+        }
+        current(store, owner, &job.spec)?;
+        validate_source(store, owner, broker.repo_handle().root(), &job.spec)?;
+        return Ok(job);
+    }
     current(store, owner, &spec)?;
-    validate_source(store, broker.repo_handle().root(), &spec)?;
+    validate_source(store, owner, broker.repo_handle().root(), &spec)?;
     let rec = record(&spec)?;
     let object = archive::put_object(store, &rec.canonical_bytes())?;
+    let recipe_bytes = if synthesis.is_none() {
+        let recipe = spec.recipe.as_deref().ok_or(NativeGateError::Mismatch)?;
+        Some(archive::read_object(store, &digest(recipe)?)?)
+    } else {
+        None
+    };
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute("INSERT INTO local_native_gate_jobs(id,wave,target,revision,epoch,body,state) VALUES(?1,?2,?3,?4,?5,?6,'prepared')",
+    tx.execute("INSERT OR IGNORE INTO local_native_gate_jobs(id,wave,target,revision,epoch,body,state) VALUES(?1,?2,?3,?4,?5,?6,'prepared')",
         params![rec.id().as_str(),spec.wave,spec.target,spec.revision,spec.epoch,rec.canonical_bytes()])?;
-    for (kind, reference) in [
-        ("snapshot", spec.subject.as_str()),
-        ("snapshot", spec.baseline.as_str()),
-        ("object", spec.recipe.as_str()),
-        ("object", &object.hex()),
-    ] {
+    let mut roots = std::collections::BTreeSet::new();
+    roots.insert(("snapshot", spec.subject.clone()));
+    roots.insert(("snapshot", spec.baseline.clone()));
+    roots.insert(("object", object.hex()));
+    if let Some(recipe) = &spec.recipe {
+        roots.insert(("object", recipe.clone()));
+    }
+    if let Some(provenance) = &spec.synthesized_group {
+        roots.insert(("object", provenance.request_object.clone()));
+        roots.insert(("object", provenance.group_object.clone()));
+        roots.insert(("object", provenance.input_manifest_sha256.clone()));
+        for input in &provenance.inputs {
+            roots.insert(("snapshot", input.base_snapshot.clone()));
+            roots.insert(("snapshot", input.result_snapshot.clone()));
+            roots.insert(("contribution", input.lineage.clone()));
+        }
+    }
+    if let Some(synthesis) = &synthesis {
+        for entry in &synthesis.input_manifest.entries {
+            if let Some(content) = &entry.sha256 {
+                roots.insert(("object", content.clone()));
+            }
+        }
+    }
+    for (kind, reference) in roots {
         tx.execute(
             "INSERT OR IGNORE INTO local_native_gate_roots(job,kind,reference) VALUES(?1,?2,?3)",
             params![rec.id().as_str(), kind, reference],
         )?;
     }
-    for member in body["order"].as_array().ok_or(NativeGateError::Mismatch)? {
-        for field in ["base", "result"] {
-            tx.execute("INSERT OR IGNORE INTO local_native_gate_roots(job,kind,reference) VALUES(?1,'snapshot',?2)",params![rec.id().as_str(),member[field].as_str().ok_or(NativeGateError::Mismatch)?])?;
+    if let Some(bytes) = recipe_bytes.as_deref() {
+        let body: Value = serde_json::from_slice(bytes)?;
+        for member in body["order"].as_array().ok_or(NativeGateError::Mismatch)? {
+            for field in ["base", "result"] {
+                tx.execute("INSERT OR IGNORE INTO local_native_gate_roots(job,kind,reference) VALUES(?1,'snapshot',?2)",params![rec.id().as_str(),member[field].as_str().ok_or(NativeGateError::Mismatch)?])?;
+            }
+            tx.execute("INSERT OR IGNORE INTO local_native_gate_roots(job,kind,reference) VALUES(?1,'contribution',?2)",params![rec.id().as_str(),member["lineage"].as_str().ok_or(NativeGateError::Mismatch)?])?;
         }
-        tx.execute("INSERT OR IGNORE INTO local_native_gate_roots(job,kind,reference) VALUES(?1,'contribution',?2)",params![rec.id().as_str(),member["lineage"].as_str().ok_or(NativeGateError::Mismatch)?])?;
     }
     tx.commit()?;
     load(store, &rec.id())
@@ -914,8 +1051,9 @@ fn run_inner(
     key: &RecordId,
     fresh: bool,
 ) -> Result<Job, NativeGateError> {
+    let _archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
     let _authority = target::authorize(store, owner)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
     let job = load(store, key)?;
     repository_binding(broker, &job.spec)?;
     if job.state == "prepared" && job.roots_released_ms.is_some() {
@@ -929,7 +1067,7 @@ fn run_inner(
         "prepared" => (),
         _ => return Err(NativeGateError::Mismatch),
     }
-    let candidate = validate_source(store, broker.repo_handle().root(), &job.spec)?;
+    let candidate = validate_source(store, owner, broker.repo_handle().root(), &job.spec)?;
     let p = policy(broker.repo_handle().root(), &commit(&candidate.base)?)?;
     if p.trust.policy_sha256 != job.spec.policy_sha256
         || p.gate_sha != job.spec.gate_config_sha256

@@ -1981,6 +1981,18 @@ pub struct ResolutionAttemptStatus {
     pub result: Option<RecordRef>,
 }
 
+/// A settled resolver result reconstructed from its durable ledger and
+/// canonical group record. The candidate is still unverified and grants no
+/// authority to skip the controller's fresh gates.
+#[derive(Debug, Clone)]
+pub struct UnverifiedSynthesis {
+    pub status: ResolutionAttemptStatus,
+    pub request: ResolutionRequest,
+    pub candidate: Candidate,
+    pub group_record: RecordRef,
+    pub input_manifest: ResolutionInputManifest,
+}
+
 impl ResolutionAttemptStatus {
     /// Public, read-only status shape. `session_label` is explicitly
     /// provenance and never authenticates a caller or agent.
@@ -3561,6 +3573,329 @@ fn load_attempt_manifest(
     }
     validate_manifest_scope(request, &manifest)?;
     Ok(manifest)
+}
+
+/// Read a settled synthesized result as an unverified candidate. This reloads
+/// the charge, request, bounded manifest, every retained input object, and the
+/// canonical result record; caller-held data cannot retarget the candidate.
+pub fn read_synthesized_attempt_result(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    token: &str,
+    session_label: &str,
+) -> Result<UnverifiedSynthesis, ResolutionError> {
+    let _archive = crate::collaboration_gc::archive_use(store)
+        .map_err(|error| invalid(format!("archive retention: {error}")))?;
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(|error| invalid(format!("response access: {error}")))?;
+    let status = attempt_status(store, token, session_label)?;
+    if status.state != ResolutionAttemptState::Settled
+        || status.outcome.as_deref() != Some("synthesized")
+        || status.response_sha256.is_none()
+    {
+        return Err(invalid("attempt is not a settled synthesized result"));
+    }
+    if status.request_sha256 != status.request.object.hex() {
+        return Err(ResolutionError::RecordMismatch {
+            record: status.request.id.as_str().to_string(),
+            detail: "charged request object digest changed".into(),
+        });
+    }
+    let request = load_request_bounded(
+        store,
+        repo,
+        &status.request,
+        request_record_limit(status.limits)?,
+    )?;
+    verify_attempt_inputs(&status, &request)?;
+    let input_manifest = load_attempt_manifest(store, &status, &request)?;
+    verify_manifest_objects(store, &status, &input_manifest)?;
+    let group_record = status
+        .result
+        .clone()
+        .ok_or_else(|| invalid("synthesized attempt has no result record"))?;
+    let bytes = collaboration_archive::read_object_bounded(
+        store,
+        &group_record.object,
+        MAX_DOCUMENT_BYTES,
+    )?;
+    let group = Record::decode(&bytes, &[&SYNTHESIZED_GROUP_SCHEMA])
+        .map_err(|error| invalid(format!("synthesized group record: {error}")))?;
+    if group.id() != group_record.id || group.canonical_bytes() != bytes {
+        return Err(ResolutionError::Archive(ArchiveError::CorruptObject {
+            digest: group_record.object.hex(),
+        }));
+    }
+    validate_synthesized_group_shape(&group, &status, &request)?;
+
+    let text_field = |name: &str| match group.get(name) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        _ => Err(ResolutionError::RecordMismatch {
+            record: group_record.id.as_str().to_string(),
+            detail: format!("synthesized group field {name} is missing"),
+        }),
+    };
+    let subject_text = text_field("candidate")?;
+    let subject = SourceSnapshotId::parse(&subject_text)
+        .map_err(|_| invalid("synthesized candidate snapshot id is malformed"))?;
+    let commit_text = text_field("candidate_commit")?;
+    let commit = CommitOid::parse(&commit_text)?;
+    let snapshot = collaboration_archive::snapshot_of_commit(repo, &commit)?;
+    if snapshot.id() != subject {
+        return Err(ResolutionError::RecordMismatch {
+            record: group_record.id.as_str().to_string(),
+            detail: "synthesized candidate subject does not match its commit".into(),
+        });
+    }
+    collaboration_archive::retained(store, &subject)?
+        .ok_or_else(|| invalid("synthesized candidate snapshot is not retained"))?;
+    let tree = collaboration_archive::raw_commit_tree(repo, &commit)?;
+    let mut inputs: Vec<&GroupMember> = request.contents.iter().collect();
+    for member in &request.members {
+        if !inputs
+            .iter()
+            .any(|existing| existing.lineage == member.lineage)
+        {
+            inputs.push(member);
+        }
+    }
+    let candidate = Candidate {
+        subject,
+        tree,
+        commit,
+        baseline: request.baseline.commit.clone(),
+        baseline_source: COMPOSER_BASELINE_SOURCE,
+        inputs: inputs
+            .iter()
+            .map(|member| CandidateInput {
+                base: member.base_commit.clone(),
+                result: member.result_commit.clone(),
+                base_snapshot: Some(member.base.clone()),
+                result_snapshot: Some(member.result.clone()),
+            })
+            .collect(),
+        producer: Producer::Resolver {
+            profile: SYNTHESIS_PROFILE.to_string(),
+        },
+        mode: CompositionMode::Synthesized,
+    };
+    Ok(UnverifiedSynthesis {
+        status,
+        request,
+        candidate,
+        group_record,
+        input_manifest,
+    })
+}
+
+/// Resolve a group only through the exact settled ledger row that binds both
+/// its request and result record references.
+pub(crate) fn read_synthesized_attempt_result_for_refs(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &RecordRef,
+    result: &RecordRef,
+) -> Result<UnverifiedSynthesis, ResolutionError> {
+    let count: i64 = store.read_connection().query_row(
+        "SELECT count(*) FROM resolution_attempts
+         WHERE async_state='settled' AND outcome='synthesized'
+           AND request_record_id=?1 AND request_sha256=?2
+           AND result_record_id=?3 AND result_sha256=?4
+           AND async_token IS NOT NULL AND session_label IS NOT NULL",
+        rusqlite::params![
+            request.id.as_str(),
+            request.object.hex(),
+            result.id.as_str(),
+            result.object.hex(),
+        ],
+        |row| row.get(0),
+    )?;
+    if count != 1 {
+        return Err(invalid(
+            "synthesized result is not bound to one settled request attempt",
+        ));
+    }
+    let (token, session_label): (String, String) = store.read_connection().query_row(
+        "SELECT async_token, session_label FROM resolution_attempts
+         WHERE async_state='settled' AND outcome='synthesized'
+           AND request_record_id=?1 AND request_sha256=?2
+           AND result_record_id=?3 AND result_sha256=?4
+           AND async_token IS NOT NULL AND session_label IS NOT NULL",
+        rusqlite::params![
+            request.id.as_str(),
+            request.object.hex(),
+            result.id.as_str(),
+            result.object.hex(),
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let synthesis = read_synthesized_attempt_result(store, repo, &token, &session_label)?;
+    if synthesis.status.request != *request || synthesis.group_record != *result {
+        return Err(invalid("synthesized result references changed during read"));
+    }
+    Ok(synthesis)
+}
+
+/// Read the exact synthesized result settled for one request and async token.
+/// The result reference comes from the immutable ledger row; caller-provided
+/// token/request data can only select that row, never retarget its group.
+pub(crate) fn read_synthesized_attempt_result_for_token_request(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    token: &str,
+    request: &RecordRef,
+) -> Result<UnverifiedSynthesis, ResolutionError> {
+    let result_count: i64 = store.read_connection().query_row(
+        "SELECT count(*) FROM resolution_attempts
+         WHERE async_token=?1 AND request_record_id=?2 AND request_sha256=?3
+           AND async_state='settled' AND outcome='synthesized'
+           AND result_record_id IS NOT NULL AND result_sha256 IS NOT NULL
+           AND session_label IS NOT NULL",
+        rusqlite::params![token, request.id.as_str(), request.object.hex()],
+        |row| row.get(0),
+    )?;
+    if result_count != 1 {
+        return Err(invalid(
+            "token and request do not identify one settled synthesized result",
+        ));
+    }
+    let (result_id, result_sha256): (String, String) = store.read_connection().query_row(
+        "SELECT result_record_id,result_sha256 FROM resolution_attempts
+         WHERE async_token=?1 AND request_record_id=?2 AND request_sha256=?3
+           AND async_state='settled' AND outcome='synthesized'
+           AND result_record_id IS NOT NULL AND result_sha256 IS NOT NULL
+           AND session_label IS NOT NULL",
+        rusqlite::params![token, request.id.as_str(), request.object.hex()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let result = RecordRef {
+        id: RecordId::parse(&result_id).map_err(|_| invalid("result record id is malformed"))?,
+        object: ObjectDigest::from_bytes(parse_digest_hex(&result_sha256)?),
+    };
+    let synthesis = read_synthesized_attempt_result_for_refs(store, repo, request, &result)?;
+    if synthesis.status.token != token || synthesis.status.request != *request {
+        return Err(invalid(
+            "settled result token or request changed during read",
+        ));
+    }
+    Ok(synthesis)
+}
+
+fn verify_manifest_objects(
+    store: &CollaborationStore,
+    status: &ResolutionAttemptStatus,
+    manifest: &ResolutionInputManifest,
+) -> Result<(), ResolutionError> {
+    let max_file_bytes = usize::try_from(status.limits.max_file_bytes)
+        .map_err(|_| invalid("stored input file byte limit"))?;
+    let mut seen = BTreeSet::new();
+    for entry in &manifest.entries {
+        let Some(digest_text) = entry.sha256.as_deref() else {
+            if entry.kind.is_some() || entry.bytes != 0 {
+                return Err(invalid("absent input entry has file metadata"));
+            }
+            continue;
+        };
+        let digest = ObjectDigest::from_bytes(parse_digest_hex(digest_text)?);
+        if !seen.insert(digest.raw()) {
+            continue;
+        }
+        let bytes = collaboration_archive::read_object_bounded(store, &digest, max_file_bytes)?;
+        if bytes.len() as u64 != entry.bytes || ObjectDigest::of(&bytes) != digest {
+            return Err(invalid("resolution input manifest object changed"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_synthesized_group_shape(
+    group: &Record,
+    status: &ResolutionAttemptStatus,
+    request: &ResolutionRequest,
+) -> Result<(), ResolutionError> {
+    let fail = |detail: &str| ResolutionError::RecordMismatch {
+        record: status
+            .result
+            .as_ref()
+            .map(|record| record.id.as_str().to_string())
+            .unwrap_or_else(|| status.request.id.as_str().to_string()),
+        detail: detail.into(),
+    };
+    let bytes = group.canonical_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("synthesized group JSON: {error}")))?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| fail("synthesized group is not an object"))?;
+    let allowed = [
+        "schema",
+        "request",
+        "decision",
+        "constituents",
+        "contents",
+        "derived_from",
+        "resolver",
+        "brief",
+        "attempt",
+        "baseline",
+        "accumulator",
+        "candidate",
+        "candidate_commit",
+        "profile",
+        "requires_verification",
+    ];
+    if object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || payload["schema"].as_str() != Some(SYNTHESIZED_GROUP_SCHEMA_NAME)
+        || group.get("request") != Some(&text(status.request.id.as_str()))
+        || group.get("decision") != Some(&text(&request.decision.key()))
+        || group.get("attempt") != Some(&Value::Integer(i64::from(status.attempt)))
+        || group.get("baseline") != Some(&text(request.baseline.snapshot_id.as_str()))
+        || group.get("accumulator") != Some(&text(request.accumulator.snapshot_id.as_str()))
+        || group.get("profile") != Some(&text(SYNTHESIS_PROFILE))
+        || group.get("requires_verification") != Some(&Value::Bool(true))
+    {
+        return Err(fail("synthesized group bindings or schema fields changed"));
+    }
+
+    let constituents = Value::Array(request.members.iter().map(member_value).collect());
+    let mut contents: Vec<&GroupMember> = request.contents.iter().collect();
+    for member in &request.members {
+        if !contents
+            .iter()
+            .any(|existing| existing.lineage == member.lineage)
+        {
+            contents.push(member);
+        }
+    }
+    let expected_contents =
+        Value::Array(contents.iter().map(|member| member_value(member)).collect());
+    let derived_from = Value::Array(contents.iter().map(|member| text(&member.id)).collect());
+    if group.get("constituents") != Some(&constituents)
+        || group.get("contents") != Some(&expected_contents)
+        || group.get("derived_from") != Some(&derived_from)
+    {
+        return Err(fail(
+            "synthesized group contributions differ from its request",
+        ));
+    }
+
+    match group.get("resolver") {
+        Some(Value::Object(resolver))
+            if resolver.len() == 2
+                && ["name", "version"].iter().all(|key| {
+                    matches!(resolver.get(key), Some(Value::String(value))
+                        if !value.trim().is_empty()
+                            && value.len() <= 256
+                            && !value.bytes().any(|byte| byte.is_ascii_control()))
+                }) => {}
+        _ => return Err(fail("synthesized group resolver identity is malformed")),
+    }
+    if let Some(brief) = group.get("brief")
+        && !matches!(brief, Value::String(_))
+    {
+        return Err(fail("synthesized group brief is malformed"));
+    }
+    Ok(())
 }
 
 fn decode_response(bytes: &[u8]) -> Result<Response, ResolutionError> {
