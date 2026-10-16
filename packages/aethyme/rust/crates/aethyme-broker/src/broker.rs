@@ -984,6 +984,72 @@ pub struct WorktreeRootPlan {
     pub preferred_unavailable_reason: Option<String>,
 }
 
+/// Storage locations selected before broker startup maintenance runs.
+///
+/// These options let embedded callers isolate a broker's host-scoped state
+/// without changing process-wide environment variables. They are applied
+/// before recovery, reconciliation, and GC maintenance; the older `with_*`
+/// builders remain useful for configuring operations on an already-open
+/// broker, but cannot affect work already done during open.
+#[derive(Debug, Clone, Default)]
+pub struct BrokerOpenOptions {
+    pub(crate) host_state_dir: Option<PathBuf>,
+    pub(crate) host_cache_dir: Option<PathBuf>,
+    pub(crate) host_operation_db_path: Option<PathBuf>,
+    pub(crate) worktree_root: Option<PathBuf>,
+    pub(crate) collaboration_state_dir: Option<PathBuf>,
+}
+
+impl BrokerOpenOptions {
+    /// Use a private host-state directory. Its `host-resources.db` file also
+    /// coordinates preparation-cache reclamation and gate-cache liveness.
+    pub fn with_host_state_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.host_state_dir = Some(path.into());
+        self
+    }
+
+    /// Use a private host-cache directory for managed gate caches.
+    pub fn with_host_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.host_cache_dir = Some(path.into());
+        self
+    }
+
+    /// Override the host-operation database used by this broker.
+    pub fn with_host_operation_database(mut self, path: impl Into<PathBuf>) -> Self {
+        self.host_operation_db_path = Some(path.into());
+        self
+    }
+
+    /// Use this exact per-repository worktree root, without appending a
+    /// repository key. Environment overrides keep their existing container
+    /// semantics and are captured separately when the broker opens.
+    pub fn with_worktree_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.worktree_root = Some(path.into());
+        self
+    }
+
+    /// Use this exact collaboration-state root for the opened broker.
+    pub fn with_collaboration_state(mut self, path: impl Into<PathBuf>) -> Self {
+        self.collaboration_state_dir = Some(path.into());
+        self
+    }
+}
+
+/// The exact host paths captured for one broker handle. Detached maintenance
+/// workers receive this context explicitly so their environment cannot send
+/// them to a different host database or cache.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BrokerStorageContext {
+    pub(crate) host_state_dir: Option<PathBuf>,
+    pub(crate) host_resource_db_path: Option<PathBuf>,
+    pub(crate) host_cache_dir: Option<PathBuf>,
+    pub(crate) host_operation_db_path: Option<PathBuf>,
+    pub(crate) worktree_root_override: Option<PathBuf>,
+    pub(crate) worktree_root_environment_override: Option<PathBuf>,
+    pub(crate) collaboration_state_dir: Option<PathBuf>,
+    pub(crate) host_state_dir_is_explicit: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WorktreePlacement {
     pub root: PathBuf,
@@ -3032,6 +3098,7 @@ pub struct Broker {
     store: BrokerStore,
     main_root: PathBuf,
     graph_impact_provider: Box<dyn GraphImpactProvider>,
+    storage_context: BrokerStorageContext,
     host_operation_db_path: Option<PathBuf>,
     worktree_root_override: Option<PathBuf>,
     /// Test-only host state directory for collaboration state (#660).

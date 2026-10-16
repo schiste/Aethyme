@@ -1,5 +1,90 @@
 use super::*;
 
+const BROKER_OPEN_HOST_OPERATION_DB_ENV: &str = "AETHYME_BROKER_OPEN_HOST_OPERATION_DB";
+const BROKER_OPEN_HOST_STATE_EXPLICIT_ENV: &str = "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT";
+const BROKER_OPEN_WORKTREE_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_WORKTREE_ROOT";
+const BROKER_OPEN_COLLABORATION_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_COLLABORATION_ROOT";
+
+impl BrokerStorageContext {
+    fn capture(options: BrokerOpenOptions) -> Self {
+        let explicit_host_state_dir = options.host_state_dir.is_some();
+        let inherited_explicit_host_state =
+            match std::env::var_os(BROKER_OPEN_HOST_STATE_EXPLICIT_ENV)
+                .and_then(|value| value.into_string().ok())
+                .as_deref()
+            {
+                Some("true") => true,
+                Some("false") => false,
+                _ => crate::host_state::host_state_dir_is_explicit(),
+            };
+        let host_state_dir = options
+            .host_state_dir
+            .or_else(crate::host_state::default_host_state_dir);
+        let host_resource_db_path = host_state_dir
+            .as_ref()
+            .map(|directory| directory.join("host-resources.db"));
+        let host_operation_db_path = options
+            .host_operation_db_path
+            .or_else(|| environment_path(BROKER_OPEN_HOST_OPERATION_DB_ENV))
+            .or_else(|| {
+                host_state_dir
+                    .as_ref()
+                    .map(|directory| directory.join("host-operations.db"))
+            });
+        let worktree_root_override = options
+            .worktree_root
+            .or_else(|| environment_path(BROKER_OPEN_WORKTREE_ROOT_ENV));
+        let worktree_root_environment_override = if worktree_root_override.is_none() {
+            environment_path("AETHYME_WORKTREE_ROOT")
+        } else {
+            None
+        };
+        let collaboration_state_dir = options
+            .collaboration_state_dir
+            .or_else(|| environment_path(BROKER_OPEN_COLLABORATION_ROOT_ENV));
+        let host_cache_dir = options
+            .host_cache_dir
+            .or_else(crate::host_state::default_host_cache_dir);
+
+        Self {
+            host_state_dir_is_explicit: explicit_host_state_dir || inherited_explicit_host_state,
+            host_state_dir,
+            host_resource_db_path,
+            host_cache_dir,
+            host_operation_db_path,
+            worktree_root_override,
+            worktree_root_environment_override,
+            collaboration_state_dir,
+        }
+    }
+
+    pub(crate) fn preparation_cache_root(&self) -> Option<PathBuf> {
+        self.host_resource_db_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|parent| parent.join("preparation-cache"))
+    }
+
+    fn collaboration_root(&self) -> Option<crate::collaboration_state::CollaborationRoot> {
+        if let Some(path) = &self.collaboration_state_dir {
+            return Some(crate::collaboration_state::CollaborationRoot::at_path(path));
+        }
+        if self.host_state_dir_is_explicit {
+            return self
+                .host_state_dir
+                .as_deref()
+                .map(crate::collaboration_state::CollaborationRoot::under_host_state);
+        }
+        None
+    }
+}
+
+fn environment_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The shared, read-only worktree-root choice used by both session placement
 /// and disposable exact-tree verification. `repository_key` is already
 /// appended to `preferred_root`; downstream storage must not add it again.
@@ -8,11 +93,25 @@ pub(crate) fn plan_worktree_root_for(
     git_common_dir: Option<&Path>,
     worktree_root_override: Option<&Path>,
 ) -> WorktreeRootPlan {
+    let mut context = BrokerStorageContext::capture(BrokerOpenOptions::default());
+    if let Some(root) = worktree_root_override {
+        context.worktree_root_override = Some(root.to_path_buf());
+        context.worktree_root_environment_override = None;
+    }
+    plan_worktree_root_with_context(main_root, git_common_dir, &context)
+}
+
+fn plan_worktree_root_with_context(
+    main_root: &Path,
+    git_common_dir: Option<&Path>,
+    context: &BrokerStorageContext,
+) -> WorktreeRootPlan {
     let repository_key = crate::host_state::repository_key(main_root, git_common_dir);
-    let host_state_container = crate::host_state::default_host_state_dir()
+    let host_state_container = context
+        .host_state_dir
+        .clone()
         .filter(|_| {
-            crate::host_state::host_state_dir_is_explicit()
-                || !crate::host_state::path_is_ephemeral(main_root)
+            context.host_state_dir_is_explicit || !crate::host_state::path_is_ephemeral(main_root)
         })
         .map(|base| base.join("worktrees"));
     let mut preferred_unavailable_reason = None;
@@ -33,16 +132,14 @@ pub(crate) fn plan_worktree_root_for(
         }
     };
     let (preferred_root, preferred_source, root_container) =
-        if let Some(root) = worktree_root_override {
+        if let Some(root) = &context.worktree_root_override {
             (
                 Some(absolute_root(root)),
                 Some(WorktreeRootSource::LibraryOverride),
                 None,
             )
-        } else if let Some(base) =
-            std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
-        {
-            let container = absolute_root(Path::new(&base));
+        } else if let Some(base) = &context.worktree_root_environment_override {
+            let container = absolute_root(base);
             (
                 Some(container.join(&repository_key)),
                 Some(WorktreeRootSource::EnvironmentOverride),
@@ -310,7 +407,22 @@ fn prepare_worktree_root_directory(
 
 impl Broker {
     pub fn open(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
-        Self::open_with_graph_impact_provider(path_inside_repo, GraphStoreImpactProvider)
+        Self::open_with_options(path_inside_repo, BrokerOpenOptions::default())
+    }
+
+    /// Open a broker with storage locations captured before startup maintenance.
+    ///
+    /// The returned handle and its recovery, worktree, preparation-cache, and
+    /// gate-cache operations use the same host paths.
+    pub fn open_with_options(
+        path_inside_repo: &Path,
+        options: BrokerOpenOptions,
+    ) -> Result<Self, BrokerOpError> {
+        Self::open_with_graph_impact_provider_and_options(
+            path_inside_repo,
+            GraphStoreImpactProvider,
+            options,
+        )
     }
 
     /// Open a broker for compatibility diagnostics without changing the
@@ -327,6 +439,7 @@ impl Broker {
             store,
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
+            storage_context: BrokerStorageContext::capture(BrokerOpenOptions::default()),
             host_operation_db_path: None,
             worktree_root_override: None,
             collaboration_state_override: None,
@@ -350,6 +463,7 @@ impl Broker {
             store,
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
+            storage_context: BrokerStorageContext::capture(BrokerOpenOptions::default()),
             host_operation_db_path: None,
             worktree_root_override: None,
             collaboration_state_override: None,
@@ -366,6 +480,21 @@ impl Broker {
         path_inside_repo: &Path,
         graph_impact_provider: impl GraphImpactProvider + 'static,
     ) -> Result<Self, BrokerOpError> {
+        Self::open_with_graph_impact_provider_and_options(
+            path_inside_repo,
+            graph_impact_provider,
+            BrokerOpenOptions::default(),
+        )
+    }
+
+    /// Open a broker with an alternate read-only graph-impact provider and
+    /// explicit host storage locations captured before startup maintenance.
+    pub fn open_with_graph_impact_provider_and_options(
+        path_inside_repo: &Path,
+        graph_impact_provider: impl GraphImpactProvider + 'static,
+        options: BrokerOpenOptions,
+    ) -> Result<Self, BrokerOpError> {
+        let storage_context = BrokerStorageContext::capture(options);
         let here = GitRepo::discover(path_inside_repo)?;
         let main_root = here.main_root()?;
         let repo = GitRepo::discover(&main_root)?;
@@ -375,6 +504,7 @@ impl Broker {
             store,
             main_root,
             graph_impact_provider: Box::new(graph_impact_provider),
+            storage_context,
             host_operation_db_path: None,
             worktree_root_override: None,
             collaboration_state_override: None,
@@ -524,21 +654,106 @@ impl Broker {
         crate::collaboration_state::CollaborationStore,
         crate::collaboration_state::CollaborationStateError,
     > {
-        match &self.collaboration_state_override {
-            Some(host_state) => crate::collaboration_state::CollaborationStore::open(
-                &crate::collaboration_state::CollaborationRoot::under_host_state(host_state),
+        let root = self
+            .collaboration_state_override
+            .as_deref()
+            .map(crate::collaboration_state::CollaborationRoot::under_host_state)
+            .or_else(|| self.storage_context.collaboration_root());
+        match root {
+            Some(root) => crate::collaboration_state::CollaborationStore::open(
+                &root,
                 project,
                 &crate::collaboration_state::forbidden_roots(&self.main_root),
             ),
+            None if !self.storage_context.host_state_dir_is_explicit
+                && crate::host_state::path_is_ephemeral(&self.main_root) =>
+            {
+                Err(
+                    crate::collaboration_state::CollaborationStateError::EphemeralRepository {
+                        repository: self.main_root.clone(),
+                    },
+                )
+            }
             None => crate::collaboration_state::open_for_repository(&self.main_root, project),
         }
+    }
+
+    pub(crate) fn storage_context(&self) -> &BrokerStorageContext {
+        &self.storage_context
+    }
+
+    pub(crate) fn configure_storage_context_for_child(
+        &self,
+        command: &mut Command,
+    ) -> Result<(), BrokerOpError> {
+        set_command_path(
+            command,
+            "AETHYME_HOST_STATE_DIR",
+            self.storage_context.host_state_dir.as_deref(),
+        );
+        set_command_path(
+            command,
+            "AETHYME_HOST_CACHE_DIR",
+            self.storage_context.host_cache_dir.as_deref(),
+        );
+        set_command_path(command, "AETHYME_BROKER_DB", Some(self.store.db_path()));
+        command.env(
+            BROKER_OPEN_HOST_STATE_EXPLICIT_ENV,
+            if self.storage_context.host_state_dir_is_explicit {
+                "true"
+            } else {
+                "false"
+            },
+        );
+
+        let operation_db_path = self.host_operation_database_path()?;
+        command.env(BROKER_OPEN_HOST_OPERATION_DB_ENV, operation_db_path);
+
+        if let Some(path) = &self.worktree_root_override {
+            command.env(BROKER_OPEN_WORKTREE_ROOT_ENV, path);
+            command.env_remove("AETHYME_WORKTREE_ROOT");
+        } else if let Some(path) = &self.storage_context.worktree_root_override {
+            command.env(BROKER_OPEN_WORKTREE_ROOT_ENV, path);
+            command.env_remove("AETHYME_WORKTREE_ROOT");
+        } else {
+            command.env_remove(BROKER_OPEN_WORKTREE_ROOT_ENV);
+            set_command_path(
+                command,
+                "AETHYME_WORKTREE_ROOT",
+                self.storage_context
+                    .worktree_root_environment_override
+                    .as_deref(),
+            );
+        }
+
+        let collaboration_root = self
+            .collaboration_state_override
+            .as_deref()
+            .map(|host_state| host_state.join("collaboration"))
+            .or_else(|| self.storage_context.collaboration_state_dir.clone())
+            .or_else(|| {
+                (self.storage_context.host_state_dir_is_explicit)
+                    .then(|| {
+                        self.storage_context
+                            .host_state_dir
+                            .as_ref()
+                            .map(|path| path.join("collaboration"))
+                    })
+                    .flatten()
+            });
+        set_command_path(
+            command,
+            BROKER_OPEN_COLLABORATION_ROOT_ENV,
+            collaboration_root.as_deref(),
+        );
+        Ok(())
     }
 
     pub(crate) fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {
         self.host_operation_db_path
             .clone()
-            .map(Ok)
-            .unwrap_or_else(|| crate::default_host_operation_db_path().map_err(Into::into))
+            .or_else(|| self.storage_context.host_operation_db_path.clone())
+            .ok_or_else(|| crate::HostOperationError::StateDirectoryUnavailable.into())
     }
 
     pub fn store(&mut self) -> &mut BrokerStore {
@@ -1598,10 +1813,15 @@ impl Broker {
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
         let git_common_dir = self.main_git_common_dir()?;
-        Ok(plan_worktree_root_for(
+        let mut context = self.storage_context.clone();
+        if let Some(root) = &self.worktree_root_override {
+            context.worktree_root_override = Some(root.clone());
+            context.worktree_root_environment_override = None;
+        }
+        Ok(plan_worktree_root_with_context(
             &self.main_root,
             Some(&git_common_dir),
-            self.worktree_root_override.as_deref(),
+            &context,
         ))
     }
 
