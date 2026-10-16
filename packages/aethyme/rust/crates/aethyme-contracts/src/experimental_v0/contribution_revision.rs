@@ -117,6 +117,8 @@ pub struct ContributionRevision {
 }
 
 impl ContributionRevision {
+    // This constructor names each fixed canonical record field explicitly.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: ProjectId,
         contribution_id: ContributionId,

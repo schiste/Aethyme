@@ -634,7 +634,7 @@ pub fn advance_file_identities(
         .collect();
     if base_state.files.len() != base_entries.len()
         || base_entries.iter().any(|(path, entry)| {
-            base_state.files.get(path).map_or(true, |state| {
+            base_state.files.get(path).is_none_or(|state| {
                 state.path != *path
                     || state.kind != entry.kind()
                     || state.content_sha256 != *entry.content_sha256()
@@ -789,13 +789,12 @@ pub fn advance_file_identities(
     }
 
     let mut ordinals = BTreeMap::new();
-    let mut ordinal = 0_u64;
-    for path in result_entries
+    for (ordinal, path) in result_entries
         .keys()
         .filter(|path| !base_entries.contains_key(*path))
+        .enumerate()
     {
-        ordinals.insert(path.clone(), ordinal);
-        ordinal += 1;
+        ordinals.insert(path.clone(), ordinal as u64);
     }
     let mut result_files = Vec::with_capacity(result_entries.len());
     for (path, entry) in &result_entries {
@@ -949,8 +948,10 @@ pub fn validate_file_proposals(
             });
         }
         for change in &proposal.changes {
+            let Some(after) = change.after.as_ref() else {
+                continue;
+            };
             if change.before.is_none()
-                && change.after.is_some()
                 && matches!(
                     change.relation,
                     IdentityRelation::New
@@ -960,7 +961,7 @@ pub fn validate_file_proposals(
                 )
             {
                 by_path
-                    .entry(change.after.as_ref().unwrap().path.clone())
+                    .entry(after.path.clone())
                     .or_default()
                     .insert(proposal.proposal_id.clone());
             }
