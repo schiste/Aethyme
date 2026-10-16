@@ -1163,11 +1163,16 @@ pub struct ConfigEntry {
 impl GitRepo {
     /// Discover the repository containing `path`.
     pub fn discover(path: &Path) -> Result<Self, GitError> {
-        let root = run_git(path, &["rev-parse", "--show-toplevel"]).map_err(|_| {
-            GitError::NotARepository {
-                path: path.to_path_buf(),
-            }
-        })?;
+        let root =
+            run_git(path, &["rev-parse", "--show-toplevel"]).map_err(|error| match error {
+                GitError::Git { .. } => GitError::NotARepository {
+                    path: path.to_path_buf(),
+                },
+                // A deadline or an unavailable/untrusted Git executable says
+                // nothing about whether the checkout is a repository. Preserve
+                // that cause so cleanup can report its real blocker and retry.
+                other => other,
+            })?;
         Ok(Self {
             root: PathBuf::from(root),
         })
@@ -1447,6 +1452,28 @@ impl GitRepo {
     /// Whether Git ignores `path`, relative to the repository root.
     pub fn path_is_ignored(&self, path: &str) -> bool {
         run_git(&self.root, &["check-ignore", "--quiet", "--", path]).is_ok()
+    }
+
+    /// Whether Git ignores `path`, preserving command failures separately
+    /// from Git's expected exit status 1 for a path that is not ignored.
+    /// Cleanup callers need the distinction: a timeout or malformed checkout
+    /// must leave discovery incomplete instead of treating the path as safe.
+    pub(crate) fn path_is_ignored_checked(&self, path: &str) -> Result<bool, GitError> {
+        let args = ["check-ignore", "--quiet", "--", path];
+        let mut command = Command::new(&git_program().program);
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
     }
 
     /// Validate one fully-qualified destination ref with Git's own grammar.
@@ -4232,6 +4259,49 @@ mod subprocess_path_tests {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn checked_ignore_distinguishes_not_ignored_from_git_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q"]).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        let repo = GitRepo::discover(tmp.path()).unwrap();
+
+        assert!(repo.path_is_ignored_checked("target").unwrap());
+        assert!(!repo.path_is_ignored_checked("src").unwrap());
+
+        let _deadline = limit_git_until(Instant::now() - Duration::from_millis(1));
+        assert!(matches!(
+            repo.path_is_ignored_checked("target"),
+            Err(GitError::TimedOut { .. })
+        ));
+    }
+
+    #[test]
+    fn discovery_preserves_an_expired_deadline_instead_of_denying_the_repository() {
+        let fixture = tempfile::tempdir().expect("temporary discovery path");
+        let error = with_git_deadline(Duration::ZERO, || GitRepo::discover(fixture.path()))
+            .err()
+            .expect("an expired deadline cannot discover a repository");
+        assert!(
+            matches!(&error, GitError::TimedOut { args, .. } if args == "rev-parse --show-toplevel"),
+            "discovery must preserve the actual timeout: {error:?}"
+        );
+        assert!(error.to_string().contains("did not finish within"));
+    }
+
+    #[test]
+    fn discovery_still_identifies_an_actual_non_repository() {
+        let fixture = tempfile::tempdir().expect("temporary non-repository");
+        let error = GitRepo::discover(fixture.path())
+            .err()
+            .expect("the fixture has no repository");
+        assert!(
+            matches!(&error, GitError::NotARepository { path } if path == fixture.path()),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn a_git_that_outlives_its_deadline_is_killed_and_reported_as_timed_out() {

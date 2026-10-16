@@ -31,6 +31,10 @@ pub fn broker_cli(binary: &str, args: &[&str]) -> Command {
     let mut command = Command::new(binary);
     command
         .args(test_session_args(args))
-        .env("AETHYME_CHAU7_MCP_BRIDGE", disabled_bridge_path());
+        .env("AETHYME_CHAU7_MCP_BRIDGE", disabled_bridge_path())
+        // Test children must not inherit the developer's shared placement
+        // root. A test that covers this override sets it explicitly after
+        // calling this helper.
+        .env_remove("AETHYME_WORKTREE_ROOT");
     command
 }

@@ -656,10 +656,8 @@ pub(super) fn lowest_headroom_with(
 /// threshold, by which point every gate already refused.
 ///
 /// Both bands name `gc reclaim plan`. `gc plan` and `gc sweep` touch only
-/// closed sessions and sessions idle past `idle_session_artifact_hours`;
-/// build output in open sessions that are merely quiet -- the bulk of the
-/// 40 GiB reclaimed by hand that day -- is reachable only through the
-/// reviewed `gc reclaim` lane.
+/// closed sessions; build output in an open session is reachable only through
+/// the reviewed `gc reclaim` lane.
 ///
 /// Unknown headroom does not escalate, for the reason `refusal` fails open: a
 /// reading that could not be taken is not evidence of a full disk.

@@ -306,6 +306,7 @@ fn closed_session_with_target(repo: &Path, container: &Path, task: &str) -> (Pat
     let target = worktree.join("rust/target");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("artifact"), "output\n").unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
     (worktree, id)
 }
 
@@ -391,10 +392,11 @@ fn a_kept_candidate_appearing_after_review_does_not_block_apply() {
 /// The review authorizes; whether the path may go now is decided afresh.
 #[test]
 fn a_reviewed_worktree_that_became_active_is_skipped() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (worktree, _) = closed_session_with_target(repo.path(), container.path(), "resumed");
     let plan = reclaim_plan_json(repo.path(), container.path());
     let digest = plan["digest"].as_str().unwrap().to_string();
+    assert!(worktree.join("rust/target").exists());
 
     let adopted = common::broker_cli(
         CLI,
@@ -409,6 +411,7 @@ fn a_reviewed_worktree_that_became_active_is_skipped() {
         "adopt: {}",
         String::from_utf8_lossy(&adopted.stderr)
     );
+    assert!(worktree.join("rust/target").exists());
 
     let applied = run(
         repo.path(),
@@ -460,7 +463,7 @@ fn a_missing_review_still_requires_the_exact_digest() {
 /// digest, so it authorizes nothing.
 #[test]
 fn a_tampered_review_authorizes_nothing() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (worktree, id) = closed_session_with_target(repo.path(), container.path(), "tampered");
     let (other, _) = closed_session_with_target(repo.path(), container.path(), "not reviewed");
     let scoped = run(
@@ -495,6 +498,8 @@ fn a_tampered_review_authorizes_nothing() {
             .cmp(right["path"].as_str().unwrap())
     });
     std::fs::write(&snapshot, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(worktree.join("rust/target").exists());
+    assert!(other.join("rust/target").exists());
 
     let refused = run(
         repo.path(),
@@ -514,7 +519,7 @@ fn a_tampered_review_authorizes_nothing() {
 /// One worktree can be reviewed and applied without the others holding still.
 #[test]
 fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (first, first_id) = closed_session_with_target(repo.path(), container.path(), "first");
     let (second, _) = closed_session_with_target(repo.path(), container.path(), "second");
     let scoped = run(
@@ -531,6 +536,8 @@ fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
     let candidates = plan["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 1, "{plan}");
     let digest = plan["digest"].as_str().unwrap().to_string();
+    assert!(first.join("rust/target").exists());
+    assert!(second.join("rust/target").exists());
 
     let applied = run(
         repo.path(),
@@ -559,7 +566,7 @@ fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
 /// session, so neither confirmation is accepted for the other scope.
 #[test]
 fn a_reclaim_confirmation_is_refused_for_a_different_scope() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (first, first_id) = closed_session_with_target(repo.path(), container.path(), "first");
     let (second, _) = closed_session_with_target(repo.path(), container.path(), "second");
     let scoped = run(
@@ -577,6 +584,8 @@ fn a_reclaim_confirmation_is_refused_for_a_different_scope() {
     let whole = reclaim_plan_json(repo.path(), container.path());
     let whole_digest = whole["digest"].as_str().unwrap().to_string();
     assert!(whole.get("scope").is_none(), "{whole}");
+    assert!(first.join("rust/target").exists());
+    assert!(second.join("rust/target").exists());
 
     let unscoped_apply = run(
         repo.path(),
@@ -780,6 +789,15 @@ fn meta(repo: &Path, key: &str) -> Option<String> {
             row.get(0)
         })
         .ok()
+}
+
+fn interrupted_paths(repo: &Path) -> Vec<String> {
+    match meta(repo, "gc.artifact_sweep.interrupted_path") {
+        None => Vec::new(),
+        Some(value) if value.is_empty() => Vec::new(),
+        Some(value) if value.starts_with('[') => serde_json::from_str(&value).unwrap(),
+        Some(value) => vec![value],
+    }
 }
 
 fn clear_meta(repo: &Path, key: &str) {
@@ -1330,8 +1348,17 @@ fn a_live_session_keeps_its_build_cache() {
     // Without this the sweep would simply be disabled, and the assertion below
     // would hold for the wrong reason.
     enable_sweep(repo.path());
-
-    sweep(repo.path(), container.path());
+    let report = sweep(repo.path(), container.path());
+    assert!(
+        report["budget_ms"]
+            .as_u64()
+            .is_some_and(|budget| budget > 0),
+        "the sweep must have a nonzero budget: {report}"
+    );
+    assert_eq!(
+        report["complete"], true,
+        "the sweep must actually run: {report}"
+    );
     assert!(
         target.exists(),
         "a session still in use must keep its build cache"
@@ -1440,12 +1467,10 @@ fn session_status(repo: &Path, id: i64) -> String {
         .unwrap()
 }
 
-/// A session inside the 72-hour abandonment window used to hold its build
-/// output for all three days after its agent left. Past the shorter idle
-/// window the sweep takes the witnessed caches and nothing else: the session
-/// stays open, and reviewed-only output stays for a reviewed plan.
+/// Autonomous sweeps preserve build caches from open sessions even when the
+/// agent has been quiet for longer than the legacy idle window.
 #[test]
-fn an_idle_open_sessions_build_output_is_swept_and_the_session_stays_open() {
+fn an_idle_open_sessions_build_output_is_preserved_and_the_session_stays_open() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
@@ -1453,8 +1478,8 @@ fn an_idle_open_sessions_build_output_is_swept_and_the_session_stays_open() {
 
     let report = sweep(repo.path(), container.path());
     assert!(
-        !worktree.join("rust/target").exists(),
-        "an idle open session's Cargo cache should be swept: {report}"
+        worktree.join("rust/target/CACHEDIR.TAG").exists(),
+        "an idle open session's Cargo cache stays protected: {report}"
     );
     assert!(
         worktree.join("rust/build/bundle.js").exists(),
@@ -1469,24 +1494,63 @@ fn an_idle_open_sessions_build_output_is_swept_and_the_session_stays_open() {
 }
 
 #[test]
-fn an_open_session_inside_the_idle_window_keeps_its_build_output() {
+fn inline_sweep_removes_closed_cache_and_preserves_an_idle_open_cache() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
-    let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 3);
-    // Old output, so only the session's own recent activity can keep it; a
-    // fresh cache would be kept by the write-recency guard instead.
-    backdate_tree_top(&worktree.join("rust/target"), 30);
-    enable_sweep(repo.path());
+    let (closed_worktree, _) =
+        closed_session_with_target(repo.path(), container.path(), "closed-cache");
+    let (_open_id, open_worktree) = quiet_open_session(repo.path(), container.path(), 30);
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\n\
+         artifact_sweep_budget_ms = 5000\nidle_session_artifact_hours = 1\n",
+    )
+    .unwrap();
 
-    sweep(repo.path(), container.path());
+    let output = run(repo.path(), container.path(), &["status"]);
+
     assert!(
-        worktree.join("rust/target/CACHEDIR.TAG").exists(),
-        "three quiet hours is inside the default 24-hour idle window"
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        closed_worktree.exists(),
+        "automatic inline cleanup preserves the closed checkout"
+    );
+    assert!(
+        !closed_worktree.join("rust/target").exists(),
+        "the same inline sweep reclaims the eligible closed cache"
+    );
+    assert!(
+        open_worktree.join("rust/target/CACHEDIR.TAG").exists(),
+        "quiet open sessions are outside every autonomous cache scope"
     );
 }
 
 #[test]
-fn a_zero_idle_window_disables_the_open_session_lane() {
+fn a_legacy_idle_window_does_not_authorize_open_cache_removal() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 3);
+    // The open session remains protected regardless of how old its output is.
+    backdate_tree_top(&worktree.join("rust/target"), 30);
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n\
+         idle_session_artifact_hours = 1\n",
+    )
+    .unwrap();
+
+    sweep(repo.path(), container.path());
+    assert!(
+        worktree.join("rust/target/CACHEDIR.TAG").exists(),
+        "elapsed idle time must not make an open cache eligible"
+    );
+}
+
+#[test]
+fn a_zero_legacy_idle_window_keeps_open_cache_protected() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
@@ -1500,24 +1564,29 @@ fn a_zero_idle_window_disables_the_open_session_lane() {
     sweep(repo.path(), container.path());
     assert!(
         worktree.join("rust/target/CACHEDIR.TAG").exists(),
-        "idle_session_artifact_hours = 0 must leave open sessions alone"
+        "the legacy setting does not change open-session protection"
     );
 }
 
-/// The agent can be gone while something it started keeps writing: a dev
-/// server, a long build. Output touched inside the window is still in use.
+/// A deep build write does not update the cache root or its immediate entries.
+/// The unattended lane cannot use those shallow timestamps to prove an open
+/// session's cache is idle, so it preserves the cache.
 #[test]
-fn build_output_written_inside_the_idle_window_is_kept() {
+fn a_nested_recent_write_in_an_open_cache_is_preserved() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
-    std::fs::write(worktree.join("rust/target/debug/fresh.bin"), vec![0_u8; 16]).unwrap();
+    let target = worktree.join("rust/target");
+    let deep = target.join("debug/incremental/hash");
+    std::fs::create_dir_all(&deep).unwrap();
+    backdate_tree_top(&target, 30);
+    std::fs::write(deep.join("fresh.bin"), vec![0_u8; 16]).unwrap();
     enable_sweep(repo.path());
 
     sweep(repo.path(), container.path());
     assert!(
         worktree.join("rust/target/CACHEDIR.TAG").exists(),
-        "a cache still being written must not be swept under its writer"
+        "a nested build write must not be missed by a shallow mtime check"
     );
 }
 
@@ -1550,14 +1619,12 @@ fn a_budget_too_small_to_finish_still_makes_ground_and_keeps_the_cache_resumable
     }
     let before = count_entries(&target);
 
-    // A budget this small is spent before the removal even begins, which is
-    // the shape of the original defect: a `target/` of this size takes minutes
-    // to unlink and no budget on a broker-open path can hold one. The removal
-    // must still leave the tree smaller than it found it, and still leave it
-    // recognisable, or the sweep can never converge.
+    // The pass can discover the cache, but 50 ms is too short to unlink all of
+    // it. It must leave the tree smaller than it found it and still leave it
+    // recognizable, or later passes cannot resume safely.
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 1\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
     )
     .unwrap();
     for _ in 0..5 {
@@ -1677,11 +1744,11 @@ fn broker_opens_space_their_continuations_of_an_unfinished_sweep() {
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
     let target = worktree.join("rust/target");
     populate_large_cache(&target);
-    // One millisecond: every pass pauses, the shape of a backlog that no
-    // single inline budget can finish.
+    // A short pass pauses part-way through this cache, which no single inline
+    // budget can finish.
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 1\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 250\n",
     )
     .unwrap();
     let before = count_entries(&target);
@@ -1689,7 +1756,14 @@ fn broker_opens_space_their_continuations_of_an_unfinished_sweep() {
     let first = run(repo.path(), container.path(), &["status"]);
     assert!(first.status.success());
     let after_first = count_entries(&target);
-    assert!(after_first < before, "the first open must make ground");
+    assert!(
+        after_first < before,
+        "the first open must make ground: before={before}, after={after_first}, partial={:?}, interrupted={:?}, stdout={}, stderr={}",
+        meta(repo.path(), SWEEP_PARTIAL),
+        meta(repo.path(), "gc.artifact_sweep.interrupted_path"),
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
     let paused_at = meta(repo.path(), SWEEP_PARTIAL).expect("a paused pass records when");
     assert_ne!(paused_at, "0");
 
@@ -1724,7 +1798,7 @@ fn gc_sweep_drains_the_backlog_and_stamps_the_cadence() {
     populate_large_cache(&target);
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 1\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
     )
     .unwrap();
     assert!(
@@ -1786,7 +1860,7 @@ fn finish_continues_an_unfinished_sweep() {
     populate_large_cache(&target);
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 1\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
     )
     .unwrap();
     assert!(
@@ -1794,7 +1868,7 @@ fn finish_continues_an_unfinished_sweep() {
             .status
             .success()
     );
-    assert!(target.exists(), "the 1 ms open must leave a backlog");
+    assert!(target.exists(), "the 50 ms open must leave a backlog");
     assert_ne!(meta(repo.path(), SWEEP_PARTIAL).as_deref(), Some("0"));
 
     std::fs::write(
@@ -1836,20 +1910,21 @@ fn populate_large_cache(target: &Path) {
     }
 }
 
-/// Unlinking a tree's contents updates its modification time. A paused
-/// removal used to make an idle open session's half-removed cache look freshly
-/// written, so every later pass protected it for another idle window.
+/// Unlinking a tree's contents is resumable for a closed session after a short
+/// pass pauses part-way through the cache.
 #[test]
-fn a_paused_removal_in_an_idle_open_session_is_finished_by_the_next_pass() {
-    let (repo, container) =
-        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
-    let (id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
+fn a_paused_removal_in_a_closed_session_is_finished_by_the_next_pass() {
+    let (repo, container) = fixture(
+        "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+    );
+    let (worktree, _id) = closed_session_with_target(repo.path(), container.path(), "paused");
     let target = worktree.join("rust/target");
+    std::fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
     populate_large_cache(&target);
     backdate_tree_top(&target, 30);
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 1\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
     )
     .unwrap();
     assert!(
@@ -1857,15 +1932,13 @@ fn a_paused_removal_in_an_idle_open_session_is_finished_by_the_next_pass() {
             .status
             .success()
     );
-    assert!(target.exists(), "a 1 ms pass must pause part-way");
+    assert!(target.exists(), "a 50 ms pass must pause part-way");
+    let target_key = target.to_string_lossy().into_owned();
     assert!(
-        meta(repo.path(), "gc.artifact_sweep.interrupted_path")
-            .is_some_and(|path| path.ends_with("rust/target")),
+        interrupted_paths(repo.path()).contains(&target_key),
         "the paused tree is remembered"
     );
 
-    // `status` refreshed the worktree's index; the agent is still gone.
-    make_quiet(repo.path(), id, &worktree, 30);
     enable_sweep(repo.path());
     let report = sweep(repo.path(), container.path());
     assert!(
@@ -1926,6 +1999,10 @@ fn a_remembered_path_outside_the_session_worktree_is_never_touched() {
 
     sweep(repo.path(), container.path());
     assert!(precious.join("keep").exists());
+    assert_eq!(
+        meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
+        Some("")
+    );
 }
 
 fn remember_interrupted_tree(repo: &Path, path: &Path) {
@@ -1964,21 +2041,72 @@ fn a_remembered_parent_traversal_is_never_resumed() {
 }
 
 #[test]
+fn a_valid_remembered_open_cache_stays_pending_and_untouched() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
+    let target = worktree.join("rust/target");
+    let artifact = target.join("debug/artifact.bin");
+    let before = std::fs::read(&artifact).unwrap();
+    remember_interrupted_tree(repo.path(), &target);
+    enable_sweep(repo.path());
+
+    let report = sweep(repo.path(), container.path());
+    assert!(
+        target.is_dir(),
+        "an open session's cache remains present: {report}"
+    );
+    assert_eq!(std::fs::read(&artifact).unwrap(), before);
+    assert_eq!(
+        meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
+        Some(target.to_string_lossy().as_ref()),
+        "a valid live marker remains pending until its session closes"
+    );
+}
+
+#[test]
 fn a_remembered_non_artifact_directory_is_never_removed() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    let cache = worktree.join("rust/target");
     let precious = worktree.join("local-data");
     std::fs::create_dir(&precious).unwrap();
     std::fs::write(precious.join("keep"), "keep\n").unwrap();
     std::fs::write(repo.path().join(".git/info/exclude"), "local-data/\n").unwrap();
     remember_interrupted_tree(repo.path(), &precious);
+    assert!(
+        cache.exists(),
+        "the unrelated eligible cache starts present"
+    );
     enable_sweep(repo.path());
     sweep(repo.path(), container.path());
     assert!(precious.join("keep").exists());
+    assert!(
+        !cache.exists(),
+        "a revoked marker must not starve eligible caches"
+    );
     assert_eq!(
         meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
         Some("")
+    );
+    let payload: String = rusqlite::Connection::open(repo.path().join(".aethyme/broker.db"))
+        .unwrap()
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = 'broker.gc.artifacts-swept' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["directories"], 1);
+    assert_eq!(
+        payload["revoked_interrupted_paths"][0]["path"],
+        precious.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        payload["revoked_interrupted_paths"][0]["reason"],
+        "not_unattended_artifact"
     );
 }
 
