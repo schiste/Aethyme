@@ -8,9 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::artifact_catalog::ArtifactWitness;
-use crate::broker::{
-    WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
-};
+use crate::broker::{WORKTREE_ROOT_MARKER, directory_size_without_following_links};
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
@@ -1129,48 +1127,123 @@ impl Broker {
             return Ok((Vec::new(), false));
         }
         let plan = self.worktree_root_plan()?;
-        let Some(container) = plan.root_container.clone() else {
-            return Ok((Vec::new(), true));
-        };
-        let Ok(entries) = std::fs::read_dir(&container) else {
-            return Ok((Vec::new(), false));
-        };
+        let database = self.host_operation_database_path()?;
+        let inventory = crate::worktree_registry::inventory(&database, deadline);
+        let mut complete = inventory.complete;
+        for reason in inventory.issues {
+            blockers.push(GcBlocker {
+                kind: "worktree_root_history_uninspected".into(),
+                id: None,
+                reason,
+            });
+        }
+        let records: std::collections::BTreeMap<_, _> = inventory
+            .roots
+            .into_iter()
+            .map(|record| (record.root.clone(), record))
+            .collect();
+        let mut roots: std::collections::BTreeSet<_> = records.keys().cloned().collect();
+        roots.extend(plan.preferred_root);
+        roots.extend(plan.host_state_fallback_root);
+        roots.insert(plan.legacy_fallback_root);
+        if let Some(container) = plan.root_container {
+            match std::fs::read_dir(container) {
+                Ok(entries) => {
+                    for (index, entry) in entries.enumerate() {
+                        if index >= 8192
+                            || deadline
+                                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                        {
+                            complete = false;
+                            break;
+                        }
+                        match entry {
+                            Ok(entry) => {
+                                roots.insert(entry.path());
+                            }
+                            Err(error) => {
+                                complete = false;
+                                blockers.push(GcBlocker {
+                                    kind: "worktree_root_history_uninspected".into(),
+                                    id: None,
+                                    reason: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_root_history_uninspected".into(),
+                        id: None,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
         let mut candidates = Vec::new();
-        let mut complete = true;
-        for entry in entries.flatten() {
+        for root in roots {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 complete = false;
                 break;
             }
-            let root = entry.path();
             if !is_real_directory(&root) {
                 continue;
             }
-            let key = root.file_name().unwrap_or_default().to_string_lossy();
-            if key == plan.repository_key {
-                continue;
-            }
-            let marker_path = root.join(WORKTREE_ROOT_MARKER);
-            let Ok(bytes) = std::fs::read(&marker_path) else {
-                // No breadcrumb means no provable owner; never remove blind.
-                blockers.push(GcBlocker {
-                    kind: "unmarked_worktree_root".into(),
-                    id: None,
-                    reason: format!("{key} has no {WORKTREE_ROOT_MARKER} and is never swept"),
-                });
-                continue;
+            let marker = match crate::worktree_registry::read_marker(&root) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "unmarked_worktree_root".into(),
+                        id: None,
+                        reason: format!(
+                            "{}: {error}; never swept without ownership evidence",
+                            root.display()
+                        ),
+                    });
+                    continue;
+                }
             };
-            let Ok(marker) = serde_json::from_slice::<WorktreeRootMarker>(&bytes) else {
-                blockers.push(GcBlocker {
-                    kind: "unmarked_worktree_root".into(),
-                    id: None,
-                    reason: format!("{key} has an unreadable {WORKTREE_ROOT_MARKER}"),
-                });
-                continue;
-            };
-            if marker.repository_root.exists() {
-                continue;
+            // An existing origin always prevents orphan deletion. Missing
+            // legacy origins cannot be upgraded into mounted-volume proof.
+            match std::fs::symlink_metadata(&marker.repository_root) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_origin_uninspected".into(),
+                        id: None,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
             }
+            let fingerprint = records
+                .get(&root)
+                .ok_or_else(|| "root has no saved origin filesystem identity".to_string())
+                .and_then(|record| {
+                    crate::worktree_registry::ownership_fingerprint(record)
+                        .map_err(|error| error.to_string())
+                });
+            let fingerprint = match fingerprint {
+                Ok(fingerprint) => fingerprint,
+                Err(reason) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_origin_uninspected".into(),
+                        id: None,
+                        reason: format!(
+                            "{}: {reason}; retain until independently adopted",
+                            root.display()
+                        ),
+                    });
+                    continue;
+                }
+            };
             let age_days = std::fs::metadata(&root)
                 .and_then(|metadata| metadata.modified())
                 .ok()
@@ -1182,7 +1255,8 @@ impl Broker {
                     kind: "orphan_grace".into(),
                     id: None,
                     reason: format!(
-                        "orphaned root {key} is younger than the {} day grace period",
+                        "orphaned root {} is younger than the {} day grace period",
+                        root.display(),
                         policy.orphan_worktree_roots_days
                     ),
                 });
@@ -1207,7 +1281,9 @@ impl Broker {
                 repository_root: marker.repository_root.to_string_lossy().into_owned(),
                 estimated_bytes: usage.map_or(0, |usage| usage.bytes),
                 estimated_inodes: usage.map(|usage| usage.inodes),
-                reason: "owning repository no longer exists".into(),
+                ownership_fingerprint: Some(fingerprint),
+                reason: "owning repository no longer exists on its recorded mounted filesystem"
+                    .into(),
             });
         }
         candidates.sort_by(|left, right| left.worktree_root.cmp(&right.worktree_root));
@@ -3019,20 +3095,37 @@ impl Broker {
         while !journal.remaining_orphans.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_orphans[0].clone();
             let root = PathBuf::from(&candidate.worktree_root);
-            if !is_real_directory(&root) {
+            let Some(fingerprint) = candidate.ownership_fingerprint.as_deref() else {
+                failures.push(format!("{}: legacy orphan authorization revoked; no deletion performed; review a fresh GC plan", candidate.worktree_root));
                 journal.remaining_orphans.remove(0);
                 write_journal(&journal_path, &journal)?;
                 continue;
-            }
-            // The owning repository reappearing revokes the whole premise --
-            // for this root, and for no other, so the run continues.
-            let safe = root.join(WORKTREE_ROOT_MARKER).is_file()
-                && !Path::new(&candidate.repository_root).exists();
-            if !safe {
-                failures.push(format!(
-                    "{}: orphan evidence changed; review a new GC plan",
-                    candidate.worktree_root
-                ));
+            };
+            let database = self.host_operation_database_path()?;
+            // Keep exclusion through every unlink and journal update. A busy
+            // registry or unavailable filesystem leaves durable work pending.
+            let removal_claim = match crate::worktree_registry::claim_for_removal(
+                &database,
+                &root,
+                fingerprint,
+            ) {
+                Ok(claim) => claim,
+                Err(crate::worktree_registry::ClaimError::Revoked(reason)) => {
+                    failures.push(format!("{}: orphan authorization revoked ({reason}); no deletion performed; review a fresh GC plan", candidate.worktree_root));
+                    journal.remaining_orphans.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+                Err(crate::worktree_registry::ClaimError::Unavailable(error)) => {
+                    failures.push(format!(
+                        "{}: orphan removal temporarily unavailable ({error}); retained in journal",
+                        candidate.worktree_root
+                    ));
+                    write_journal(&journal_path, &journal)?;
+                    break;
+                }
+            };
+            if removal_claim.already_absent {
                 journal.remaining_orphans.remove(0);
                 write_journal(&journal_path, &journal)?;
                 continue;
@@ -3420,6 +3513,178 @@ mod tests {
         );
         assert!(parsed.remaining_checkpoint_pin_releases.is_empty());
         assert!(parsed.remaining_publication_exposure_expiries.is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn registered_orphan_fixture() -> (tempfile::TempDir, Broker, PathBuf, String) {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        std::fs::create_dir(repo.join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.join(".aethyme/broker.toml"),
+            "[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let database = fixture.path().join("host-state/host-operations.db");
+        // This constructor performs local migration/backfill, without startup
+        // maintenance, so host coordination is private before any GC work.
+        let mut broker = Broker::open_for_compatibility_backfill(&repo)
+            .unwrap()
+            .with_host_operation_database(&database)
+            .with_worktree_root(fixture.path().join("current-root"));
+        let origin = fixture.path().join("disappearing-origin");
+        let root = fixture.path().join("historical-placement/exact-root");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = crate::broker::WorktreeRootMarker {
+            schema_version: crate::broker::WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "historic-owned-root".into(),
+            repository_root: origin.clone(),
+        };
+        std::fs::write(
+            root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("retained.txt"),
+            "retained until reviewed deletion\n",
+        )
+        .unwrap();
+        crate::worktree_registry::register(
+            &database,
+            &root,
+            &marker,
+            crate::WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+        std::fs::remove_dir(&origin).unwrap();
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(
+            plan.orphans.len(),
+            1,
+            "historical placement must be discovered"
+        );
+        let digest = plan.digest.clone();
+        write_journal(
+            &repo.join(".aethyme/gc-journal.json"),
+            &GcJournal::from(plan),
+        )
+        .unwrap();
+        (fixture, broker, root.canonicalize().unwrap(), digest)
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_busy_orphan_claim_stays_journaled_until_a_later_apply_reclaims_it() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let journal = load_journal(&journal_path).unwrap().unwrap();
+        let database = broker.host_operation_database_path().unwrap();
+        let held = crate::worktree_registry::claim_for_removal(
+            &database,
+            &root,
+            journal.remaining_orphans[0]
+                .ownership_fingerprint
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let blocked = broker.gc_apply(&digest).unwrap();
+        assert!(
+            !blocked.complete,
+            "contention must not be reported as completed deletion"
+        );
+        assert!(blocked.recovery_action.is_some());
+        assert!(root.join("retained.txt").is_file());
+        assert_eq!(
+            load_journal(&journal_path)
+                .unwrap()
+                .unwrap()
+                .remaining_orphans
+                .len(),
+            1
+        );
+        drop(held);
+        let completed = broker.gc_apply(&digest).unwrap();
+        assert!(completed.complete, "{completed:?}");
+        assert_eq!(
+            completed.orphans_removed,
+            vec![root.to_string_lossy().into_owned()]
+        );
+        assert!(!root.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_legacy_orphan_authorization_is_revoked_before_fresh_review_can_remove_it() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let path = broker.main_root().join(".aethyme/gc-journal.json");
+        let mut journal = load_journal(&path).unwrap().unwrap();
+        journal.remaining_orphans[0].ownership_fingerprint = None;
+        write_journal(&path, &journal).unwrap();
+        let revoked = broker.gc_apply(&digest).unwrap();
+        assert!(revoked.complete);
+        assert!(revoked.orphans_removed.is_empty());
+        assert!(
+            revoked
+                .failures
+                .iter()
+                .any(|reason| reason.contains("legacy orphan authorization revoked"))
+        );
+        assert!(root.join("retained.txt").is_file());
+        assert!(
+            !path.exists(),
+            "revoked authorization must not trap later reviewed plans"
+        );
+        let fresh = broker.gc_plan().unwrap();
+        assert_eq!(fresh.orphans.len(), 1);
+        let applied = broker.gc_apply(&fresh.digest).unwrap();
+        assert!(applied.complete);
+        assert_eq!(
+            applied.orphans_removed,
+            vec![root.to_string_lossy().into_owned()]
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn changed_orphan_evidence_revokes_only_the_old_authorization_and_allows_fresh_review() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let database = broker.host_operation_database_path().unwrap();
+        let marker = crate::worktree_registry::read_marker(&root).unwrap();
+        std::fs::create_dir(&marker.repository_root).unwrap();
+        crate::worktree_registry::register(
+            &database,
+            &root,
+            &marker,
+            crate::WorktreeRootSource::HostState,
+        )
+        .unwrap();
+        std::fs::remove_dir(&marker.repository_root).unwrap();
+        let revoked = broker.gc_apply(&digest).unwrap();
+        assert!(revoked.complete);
+        assert!(revoked.orphans_removed.is_empty());
+        assert!(
+            revoked
+                .failures
+                .iter()
+                .any(|reason| reason.contains("authorization revoked"))
+        );
+        assert!(root.join("retained.txt").is_file());
+        let fresh = broker.gc_plan().unwrap();
+        assert_ne!(fresh.digest, digest);
+        let applied = broker.gc_apply(&fresh.digest).unwrap();
+        assert!(applied.complete);
+        assert!(!root.exists());
     }
 
     /// One interrupted pass must advance the next one, and one uninterrupted

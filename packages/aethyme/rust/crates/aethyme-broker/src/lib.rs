@@ -97,6 +97,7 @@ mod homebrew;
 pub mod hooks;
 mod host_operations;
 mod host_state;
+mod worktree_registry;
 pub mod init;
 pub mod insights;
 pub mod install_health;

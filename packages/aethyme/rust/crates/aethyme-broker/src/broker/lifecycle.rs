@@ -1716,6 +1716,20 @@ impl Broker {
             }
         })?;
         self.write_or_verify_worktree_root_marker(&root)?;
+        crate::worktree_registry::register(
+            &self.host_operation_database_path()?,
+            &root,
+            &WorktreeRootMarker {
+                schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+                repository_key: self.repository_worktree_key()?,
+                repository_root: self.main_root.clone(),
+            },
+            source,
+        )
+        .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason: format!("cannot retain worktree storage discovery: {error}"),
+        })?;
         // Best effort on purpose: this is a disk-hygiene default, and failing
         // to start a session over one is a far worse outcome than building a
         // worktree the way cargo would have anyway.
