@@ -27,6 +27,12 @@ export type FileState = SnapshotFile & {
   file_id: string;
 };
 
+export type RenameOperation = {
+  kind: "rename";
+  from_path_hex: string;
+  to_path_hex: string;
+};
+
 export type CopyOperation = {
   kind: "copy";
   from_path_hex: string;
@@ -39,7 +45,7 @@ export type SplitOperation = {
   to_path_hexes_input_order: string[];
 };
 
-export type FileOperation = CopyOperation | SplitOperation;
+export type FileOperation = RenameOperation | CopyOperation | SplitOperation;
 
 export type IdentityChange = {
   before?: FileState;
@@ -96,20 +102,32 @@ export function decodeLowerHex(value: string): Buffer {
   if (value.length % 2 !== 0 || !/^[0-9a-f]*$/.test(value)) {
     fail("invalid_hex");
   }
-  return Buffer.from(value, "hex");
+  const decoded = Buffer.from(value, "hex");
+  if (decoded.toString("hex") !== value) fail("invalid_hex");
+  return decoded;
 }
 
 function lowerHex(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("hex");
 }
 
-function validateCommit(value: string): string {
-  if (!/^[0-9a-f]{40}$/.test(value)) fail("invalid_commit");
+export function validateCommit(value: string): string {
+  if (
+    (value.length !== 40 && value.length !== 64) ||
+    /[^0-9a-f]/.test(value)
+  ) {
+    fail("invalid_commit");
+  }
   return value;
 }
 
 function validateSha256Id(value: string, prefix: string, code: string): string {
-  if (!new RegExp(`^${prefix}[0-9a-f]{64}$`).test(value)) fail(code);
+  if (
+    value.length !== prefix.length + 64 ||
+    !new RegExp(`^${prefix}[0-9a-f]{64}$`).test(value)
+  ) {
+    fail(code);
+  }
   return value;
 }
 
@@ -130,8 +148,16 @@ export function parseContributionId(value: string): string {
   return parseOpaqueId(value, "contrib:", "invalid_contribution_id");
 }
 
+export function validateProposalId(value: string): string {
+  if (value.length === 0 || value.length > 128 || /[^A-Za-z0-9._:-]/.test(value)) {
+    fail("invalid_proposal_id");
+  }
+  return value;
+}
+
 export function isCanonicalFileId(value: string): boolean {
-  return /^file:sha256:[0-9a-f]{64}$/.test(value);
+  return value.length === "file:sha256:".length + 64 &&
+    /^file:sha256:[0-9a-f]{64}$/.test(value);
 }
 
 export function parseFileId(value: string): string {
@@ -246,7 +272,7 @@ export function proposedFileId(
   rawPath: Uint8Array,
 ): { file_id: string; preimage_hex: string } {
   parseProjectId(projectId);
-  parseContributionId(proposalId);
+  validateProposalId(proposalId);
   validateSha256Id(resultSnapshotId, "sha256:", "invalid_snapshot_id");
   const path = validatePath(rawPath);
   const preimage = Buffer.concat([
@@ -344,7 +370,7 @@ export function advanceFileIdentities(
   proposed_preimages: Map<string, { file_id: string; ordinal: number; preimage_hex: string }>;
 } {
   parseProjectId(projectId);
-  parseContributionId(proposalId);
+  validateProposalId(proposalId);
   const baseSnapshot = sourceSnapshot(baseFiles);
   const resultSnapshot = sourceSnapshot(resultFiles);
   const baseEntries = fileEntryMap(baseFiles);
@@ -364,7 +390,13 @@ export function advanceFileIdentities(
 
   const destinationIds = new Map<
     string,
-    { relation: string; file_id: string; derived_from: string[]; ordinal: number; preimage_hex: string }
+    {
+      relation: string;
+      file_id: string;
+      derived_from: string[];
+      ordinal?: number;
+      preimage_hex?: string;
+    }
   >();
   const sourceOperations = new Map<string, { relation: string; destinations: string[] }>();
   const usedOperationPaths = new Set<string>();
@@ -372,7 +404,32 @@ export function advanceFileIdentities(
   for (const operation of operations) {
     const fromPath = lowerHex(validatePath(decodeLowerHex(operation.from_path_hex)));
     if (!baseEntries.has(fromPath)) fail("invalid_operation_source");
-    if (operation.kind === "copy") {
+    if (operation.kind === "rename") {
+      const toPath = lowerHex(validatePath(decodeLowerHex(operation.to_path_hex)));
+      const before = baseEntries.get(fromPath)!;
+      const after = resultEntries.get(toPath);
+      if (
+        after === undefined ||
+        baseEntries.has(toPath) ||
+        resultEntries.has(fromPath) ||
+        !sameContent(before, after) ||
+        usedOperationPaths.has(fromPath) ||
+        usedOperationPaths.has(toPath)
+      ) {
+        fail("invalid_rename_operation");
+      }
+      usedOperationPaths.add(fromPath);
+      usedOperationPaths.add(toPath);
+      sourceOperations.set(fromPath, {
+        relation: "explicit_rename",
+        destinations: [toPath],
+      });
+      destinationIds.set(toPath, {
+        relation: "explicit_rename",
+        file_id: baseIds.get(fromPath)!,
+        derived_from: [],
+      });
+    } else if (operation.kind === "copy") {
       const toPath = lowerHex(validatePath(decodeLowerHex(operation.to_path_hex)));
       const sourceAfter = resultEntries.get(fromPath);
       const copied = resultEntries.get(toPath);
@@ -469,11 +526,13 @@ export function advanceFileIdentities(
     const operated = destinationIds.get(path);
     if (operated !== undefined) {
       resultStates.set(path, stateFrom(file, operated.file_id));
-      proposedPreimages.set(path, {
-        file_id: operated.file_id,
-        ordinal: operated.ordinal,
-        preimage_hex: operated.preimage_hex,
-      });
+      if (operated.ordinal !== undefined && operated.preimage_hex !== undefined) {
+        proposedPreimages.set(path, {
+          file_id: operated.file_id,
+          ordinal: operated.ordinal,
+          preimage_hex: operated.preimage_hex,
+        });
+      }
       continue;
     }
     const ordinal = globalOrdinals.get(path);
@@ -497,12 +556,24 @@ export function advanceFileIdentities(
   for (const [path, before] of mapByRawPath(baseStates)) {
     const sourceOperation = sourceOperations.get(path);
     if (sourceOperation !== undefined) {
-      changes.push({
-        before,
-        relation: "removed",
-        derived_from: [],
-        possible_sources: [],
-      });
+      if (sourceOperation.relation === "explicit_rename") {
+        const after = resultStates.get(sourceOperation.destinations[0]!);
+        if (after === undefined) fail("missing_rename_destination");
+        changes.push({
+          before,
+          after,
+          relation: "explicit_rename",
+          derived_from: [],
+          possible_sources: [],
+        });
+      } else {
+        changes.push({
+          before,
+          relation: "removed",
+          derived_from: [],
+          possible_sources: [],
+        });
+      }
       continue;
     }
     const after = resultStates.get(path);
@@ -530,6 +601,7 @@ export function advanceFileIdentities(
     if (baseEntries.has(path)) continue;
     const operated = destinationIds.get(path);
     if (operated !== undefined) {
+      if (operated.relation === "explicit_rename") continue;
       changes.push({
         after,
         relation: operated.relation,
@@ -583,6 +655,151 @@ export function advanceFileIdentities(
   };
 }
 
+type ParsedSourceChangeState = {
+  path: Buffer;
+  file_id: string;
+};
+
+function sourceChangeObject(value: CanonicalValue): Map<string, CanonicalValue> {
+  if (!(value instanceof Map)) fail("invalid_source_change");
+  return value;
+}
+
+function sourceChangeString(
+  object: Map<string, CanonicalValue>,
+  field: string,
+): string {
+  const value = object.get(field);
+  if (typeof value !== "string") fail("invalid_source_change");
+  return value;
+}
+
+function sourceChangeState(
+  object: Map<string, CanonicalValue>,
+  field: "before" | "after",
+): ParsedSourceChangeState | undefined {
+  if (!object.has(field)) return undefined;
+  const stateValue = object.get(field);
+  if (!(stateValue instanceof Map)) fail("invalid_source_change");
+  const allowed = new Set(["path_hex", "mode", "content_sha256", "file_id"]);
+  for (const key of stateValue.keys()) {
+    if (!allowed.has(key)) fail("invalid_source_change");
+  }
+  const pathHex = stateValue.get("path_hex");
+  const mode = stateValue.get("mode");
+  const contentSha256 = stateValue.get("content_sha256");
+  const fileId = stateValue.get("file_id");
+  if (
+    typeof pathHex !== "string" ||
+    typeof mode !== "string" ||
+    typeof contentSha256 !== "string" ||
+    typeof fileId !== "string"
+  ) {
+    fail("invalid_source_change");
+  }
+  if (!ALLOWED_MODES.has(mode)) fail("invalid_source_change");
+  const path = validatePath(decodeLowerHex(pathHex));
+  if (!/^[0-9a-f]{64}$/.test(contentSha256)) fail("invalid_source_change");
+  if (decodeLowerHex(contentSha256).length !== 32) fail("invalid_source_change");
+  return { path, file_id: parseFileId(fileId) };
+}
+
+function sourceChangeIds(
+  object: Map<string, CanonicalValue>,
+  field: "derived_from" | "possible_sources",
+): string[] {
+  const values = object.get(field);
+  if (!Array.isArray(values)) fail("invalid_source_change");
+  return values.map((value) => {
+    if (typeof value !== "string") fail("invalid_source_change");
+    return parseFileId(value);
+  });
+}
+
+function validateContributionChanges(changes: CanonicalValue[]): void {
+  if (changes.length > 200_000) fail("too_many_changes");
+  const allowedFields = new Set([
+    "before",
+    "after",
+    "relation",
+    "derived_from",
+    "possible_sources",
+  ]);
+  let previousPath: Buffer | undefined;
+  for (const value of changes) {
+    const change = sourceChangeObject(value);
+    for (const key of change.keys()) {
+      if (!allowedFields.has(key)) fail("invalid_source_change");
+    }
+    const relation = sourceChangeString(change, "relation");
+    const before = sourceChangeState(change, "before");
+    const after = sourceChangeState(change, "after");
+    const sources = sourceChangeIds(change, "derived_from");
+    const possible = sourceChangeIds(change, "possible_sources");
+    let shapeIsValid = false;
+    switch (relation) {
+      case "same_path":
+        shapeIsValid =
+          before !== undefined &&
+          after !== undefined &&
+          Buffer.compare(before.path, after.path) === 0 &&
+          before.file_id === after.file_id &&
+          sources.length === 0 &&
+          possible.length === 0;
+        break;
+      case "explicit_rename":
+        shapeIsValid =
+          before !== undefined &&
+          after !== undefined &&
+          Buffer.compare(before.path, after.path) !== 0 &&
+          before.file_id === after.file_id &&
+          sources.length === 0 &&
+          possible.length === 0;
+        break;
+      case "explicit_copy":
+      case "explicit_split":
+        shapeIsValid =
+          before === undefined &&
+          after !== undefined &&
+          !sources.includes(after.file_id) &&
+          sources.length > 0 &&
+          (relation !== "explicit_copy" || sources.length === 1) &&
+          possible.length === 0;
+        break;
+      case "new":
+        shapeIsValid =
+          before === undefined &&
+          after !== undefined &&
+          sources.length === 0 &&
+          possible.length === 0;
+        break;
+      case "removed":
+        shapeIsValid =
+          before !== undefined &&
+          after === undefined &&
+          sources.length === 0 &&
+          possible.length === 0;
+        break;
+      case "uncertain_rename":
+        shapeIsValid =
+          before === undefined &&
+          after !== undefined &&
+          sources.length === 0 &&
+          possible.length > 0;
+        break;
+      default:
+        fail("invalid_source_change");
+    }
+    if (!shapeIsValid) fail("invalid_source_change");
+    const path = after?.path ?? before?.path;
+    if (path === undefined) fail("invalid_source_change");
+    if (previousPath !== undefined && Buffer.compare(previousPath, path) >= 0) {
+      fail("non_canonical_change_order");
+    }
+    previousPath = path;
+  }
+}
+
 export function contributionRevisionRecord(args: {
   project_id: string;
   contribution_id: string;
@@ -599,6 +816,7 @@ export function contributionRevisionRecord(args: {
   validateSha256Id(args.capture_record_id, "sha256:", "invalid_capture_record_id");
   validateSha256Id(args.base, "sha256:", "invalid_base_snapshot_id");
   validateSha256Id(args.result, "sha256:", "invalid_result_snapshot_id");
+  validateContributionChanges(args.source_changes);
   const dependencies = [...(args.depends_on ?? [])].sort();
   for (let index = 0; index < dependencies.length; index += 1) {
     validateSha256Id(dependencies[index]!, "sha256:", "invalid_dependency_id");
@@ -621,7 +839,10 @@ export function contributionRevisionRecord(args: {
     fields.set("brief_record_id", args.brief_record_id);
   }
   if (args.brief_object_sha256 !== undefined) {
-    if (!/^[0-9a-f]{64}$/.test(args.brief_object_sha256)) {
+    if (
+      args.brief_object_sha256.length !== 64 ||
+      !/^[0-9a-f]{64}$/.test(args.brief_object_sha256)
+    ) {
       fail("invalid_brief_object_sha256");
     }
     fields.set("brief_object_sha256", args.brief_object_sha256);

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { dirname, resolve, sep } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   canonicalizeValue,
@@ -22,6 +22,8 @@ import {
   sourceSnapshot,
   type FileOperation,
   type FileVector,
+  validateCommit,
+  validateProposalId,
 } from "./project-identity.mts";
 
 type Pin = { path: string; sha256: string };
@@ -54,6 +56,28 @@ type DescriptorInput = {
   };
   plain_new_path_hex: string;
 };
+type BoundRevisionInput = {
+  fixture_schema: string;
+  project_id: string;
+  contribution_id: string;
+  proposal_seed: string;
+  capture_record_id: string;
+  anchor_commit: string;
+  base_files: FileVector[];
+  new_file: FileVector;
+  validation_controls: { invalid_contribution_id: string };
+};
+type RenameInput = {
+  fixture_schema: string;
+  project_id: string;
+  contribution_id: string;
+  proposal_id: string;
+  capture_record_id: string;
+  base_files: FileVector[];
+  result_files: FileVector[];
+  operation: { kind: "rename"; from_path_hex: string; to_path_hex: string };
+  validation_controls: { invalid_contribution_id: string };
+};
 type V2Inputs = {
   fixture_schema: string;
   project_id: string;
@@ -81,6 +105,33 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "../../../../");
 const EXPECTED_ORDINAL_MANIFEST_SHA256 =
   "69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f";
+const EXPECTED_BOUND_REVISION_MANIFEST_SHA256 =
+  "ab85554b8b16543b2b356acaa29fcfbfcea8456292baa705d167daab5a14c9d1";
+const EXPECTED_RENAME_MANIFEST_SHA256 =
+  "6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0";
+const EXPECTED_QUALIFICATION_SOURCE_COMMIT =
+  "5a941df666eeb8c477ed0e2eda3e67610713d9bc";
+const EXPECTED_FIXTURE_SOURCE_COMMIT =
+  "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45";
+const REQUIRED_RUST_SOURCES = [
+  "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/digest.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/tests/canonical_json_vectors.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/tests/record_vectors.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/tests/source_snapshot_vectors.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/tests/project_identity_vectors.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/tests/contribution_revision.rs",
+  "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/project_identity.json",
+] as const;
+const REQUIRED_TYPESCRIPT_SOURCES = [
+  "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
+  "packages/aethyme-eval/local-v3/d10-identity-parity/project-identity.mts",
+  "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts",
+] as const;
 const REQUIRED_FIXTURE_PATHS = [
   "vectors/ordinal-supplement/manifest.json",
   "vectors/ordinal-supplement/inputs.json",
@@ -94,6 +145,14 @@ const REQUIRED_FIXTURE_PATHS = [
   "vectors/prior-v2-partially-invalid/inputs.json",
   "vectors/prior-v2-partially-invalid/expected.json",
   "vectors/prior-v2-partially-invalid/oracle.py",
+  "vectors/contribution-revision-bound/manifest.json",
+  "vectors/contribution-revision-bound/inputs.json",
+  "vectors/contribution-revision-bound/expected.json",
+  "vectors/contribution-revision-bound/oracle.py",
+  "vectors/explicit-rename/manifest.json",
+  "vectors/explicit-rename/inputs.json",
+  "vectors/explicit-rename/expected.json",
+  "vectors/explicit-rename/oracle.py",
 ] as const;
 let assertionCount = 0;
 
@@ -129,16 +188,17 @@ function toCanonical(value: unknown): CanonicalValue {
   }
   if (Array.isArray(value)) return value.map(toCanonical);
   if (value instanceof Map) {
-    return new Map(
-      [...value.entries()].map(([key, member]) => [key, toCanonical(member)]),
+    return new Map<string, CanonicalValue>(
+      [...value.entries()].map(
+        ([key, member]): [string, CanonicalValue] => [key, toCanonical(member)],
+      ),
     );
   }
   if (typeof value === "object" && value !== null) {
-    return new Map(
-      Object.entries(value as Record<string, unknown>).map(([key, member]) => [
-        key,
-        toCanonical(member),
-      ]),
+    return new Map<string, CanonicalValue>(
+      Object.entries(value as Record<string, unknown>).map(
+        ([key, member]): [string, CanonicalValue] => [key, toCanonical(member)],
+      ),
     );
   }
   throw new Error("fixture contains a value outside the frozen canonical profile");
@@ -207,22 +267,38 @@ function validateRelativePath(path: string): void {
 
 function verifyPins(pins: PinManifest): Array<{ path: string; sha256: string }> {
   check(
-    pins.schema === "aethyme.local-d10-typescript-parity-pins/v1",
+    pins.schema === "aethyme.local-d10-typescript-parity-pins/v2",
     "unsupported D10 pin manifest schema",
   );
   check(
-    pins.fixture_source_commit === "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45",
+    pins.fixture_source_commit === EXPECTED_FIXTURE_SOURCE_COMMIT,
     "independent fixture source commit changed",
   );
   check(
-    pins.fixture_files.length === REQUIRED_FIXTURE_PATHS.length,
-    "pin manifest does not cover the corrected and prior independent packages",
+    pins.qualification_source_commit === EXPECTED_QUALIFICATION_SOURCE_COMMIT,
+    "qualification source commit is not bound to the reviewed Rust contract source",
   );
-  const fixturePaths = pins.fixture_files.map(({ path }) => path).sort();
-  check(
-    fixturePaths.join("\n") === [...REQUIRED_FIXTURE_PATHS].sort().join("\n"),
-    "pin manifest fixture file set changed",
-  );
+  for (const [kind, entries, required] of [
+    ["Rust", pins.rust_sources, REQUIRED_RUST_SOURCES],
+    ["TypeScript", pins.typescript_sources, REQUIRED_TYPESCRIPT_SOURCES],
+    ["fixture", pins.fixture_files, REQUIRED_FIXTURE_PATHS],
+  ] as const) {
+    if (!Array.isArray(entries)) throw new Error(`${kind} pins are not an array`);
+    check(
+      entries.length === required.length,
+      `${kind} pin count differs from the reviewed required count`,
+    );
+    const paths = entries.map(({ path }) => path).sort();
+    check(
+      paths.join("\n") === [...required].sort().join("\n"),
+      `${kind} pin path set differs from the reviewed required set`,
+    );
+    for (const pin of entries) {
+      if (!/^[0-9a-f]{64}$/.test(pin.sha256)) {
+        throw new Error(`${kind} pin is not a lowercase SHA-256: ${pin.path}`);
+      }
+    }
+  }
   const seen = new Set<string>();
   const hashes: Array<{ path: string; sha256: string }> = [];
   for (const [kind, entries] of [
@@ -286,6 +362,22 @@ function run(): void {
   const priorV2Expected = readJson<V2Expected>(
     "vectors/prior-v2-partially-invalid/expected.json",
   );
+  const boundRevisionManifest = readJson<Record<string, unknown>>(
+    "vectors/contribution-revision-bound/manifest.json",
+  );
+  const boundRevisionInputs = readJson<BoundRevisionInput>(
+    "vectors/contribution-revision-bound/inputs.json",
+  );
+  const boundRevisionExpected = readJson<Record<string, unknown>>(
+    "vectors/contribution-revision-bound/expected.json",
+  );
+  const renameManifest = readJson<Record<string, unknown>>(
+    "vectors/explicit-rename/manifest.json",
+  );
+  const renameInputs = readJson<RenameInput>("vectors/explicit-rename/inputs.json");
+  const renameExpected = readJson<Record<string, unknown>>(
+    "vectors/explicit-rename/expected.json",
+  );
 
   parseProjectId(ordinalInputs.project_id);
   parseContributionId(ordinalInputs.contribution_id);
@@ -296,6 +388,10 @@ function run(): void {
   check(
     ordinalInputs.contribution_id === "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe",
     "ordinal supplement changed its pinned ContributionId",
+  );
+  check(
+    validateCommit(ordinalInputs.anchor_commit) === ordinalInputs.anchor_commit,
+    "descriptor anchor commit is not a canonical Rust commit ID",
   );
   resetHashCallCount();
   const oldContributionId = stringAt(priorV1Input.contribution_id, "v1 contribution_id");
@@ -334,6 +430,49 @@ function run(): void {
     "unqualified v2 FileId was rejected before identity hashing",
   );
 
+  parseProjectId(renameInputs.project_id);
+  parseContributionId(renameInputs.contribution_id);
+  check(
+    renameInputs.project_id === ordinalInputs.project_id &&
+      renameInputs.contribution_id === ordinalInputs.contribution_id,
+    "rename and ordinal fixtures disagree on opaque identity inputs",
+  );
+  resetHashCallCount();
+  const renameInvalidContributionId = renameInputs.validation_controls.invalid_contribution_id;
+  check(
+    renameInvalidContributionId.slice("contrib:".length).length === 25,
+    "rename fixture validation control no longer has the recorded 25-character suffix",
+  );
+  expectProfileError(
+    "invalid_contribution_id",
+    () => parseContributionId(renameInvalidContributionId),
+    "rename fixture invalid ContributionId refusal",
+  );
+  check(
+    validateProposalId(renameInputs.proposal_id) === "proposal-rename",
+    "Rust's generic proposal token was not accepted",
+  );
+  expectProfileError(
+    "invalid_contribution_id",
+    () => parseContributionId(renameInputs.proposal_id),
+    "generic proposal token is not an opaque ContributionId",
+  );
+  check(
+    validateProposalId("x".repeat(128)) === "x".repeat(128),
+    "Rust's maximum 128-byte proposal token was rejected",
+  );
+  for (const invalidProposalId of ["", "bad token", "proposal\n", "é", "x".repeat(129)]) {
+    expectProfileError(
+      "invalid_proposal_id",
+      () => validateProposalId(invalidProposalId),
+      `invalid generic proposal token ${JSON.stringify(invalidProposalId)}`,
+    );
+  }
+  check(
+    getHashCallCount() === 0,
+    "invalid ContributionIds or proposal tokens were checked after identity hashing",
+  );
+
   const verifiedHashes = verifyPins(pins);
   const ordinalManifestSha = directSha256(
     readFileSync(resolve(HERE, "vectors/ordinal-supplement/manifest.json")),
@@ -341,6 +480,34 @@ function run(): void {
   check(
     ordinalManifestSha === EXPECTED_ORDINAL_MANIFEST_SHA256,
     "corrected ordinal supplement manifest pin changed",
+  );
+  const boundRevisionManifestSha = directSha256(
+    readFileSync(resolve(HERE, "vectors/contribution-revision-bound/manifest.json")),
+  );
+  const renameManifestSha = directSha256(
+    readFileSync(resolve(HERE, "vectors/explicit-rename/manifest.json")),
+  );
+  check(
+    boundRevisionManifestSha === EXPECTED_BOUND_REVISION_MANIFEST_SHA256,
+    "corrected bound-file ContributionRevision manifest pin changed",
+  );
+  check(
+    renameManifestSha === EXPECTED_RENAME_MANIFEST_SHA256,
+    "explicit Rename manifest pin changed",
+  );
+  check(
+    objectAt(boundRevisionManifest.source, "bound revision manifest source").commit ===
+        EXPECTED_FIXTURE_SOURCE_COMMIT &&
+      objectAt(renameManifest.source, "Rename manifest source").commit ===
+        EXPECTED_FIXTURE_SOURCE_COMMIT,
+    "corrected independent fixtures do not name the expected Rust source commit",
+  );
+  check(
+    boundRevisionManifest.package ===
+      "independent D10 corrected bound-file ContributionRevision golden v1" &&
+      renameManifest.package ===
+        "independent Local D10 explicit-rename transition and ContributionRevision golden v1",
+    "corrected independent fixture package identity changed",
   );
   check(
     ordinalManifest.package === "independent Local D10 ordinal and FileId-format supplement v1",
@@ -563,6 +730,265 @@ function run(): void {
   checkCanonicalText(boundChange, boundChangeJson, boundChangeHex, "bound source change");
   checkCanonicalValue(boundChange, boundExpected.source_change, "bound source change fields");
 
+  check(
+    boundRevisionInputs.project_id === ordinalInputs.project_id &&
+      boundRevisionInputs.contribution_id === ordinalInputs.contribution_id &&
+      boundRevisionInputs.proposal_seed === ordinalInputs.contribution_id &&
+      boundRevisionInputs.capture_record_id === priorV2Input.capture_record_id,
+    "corrected bound-file revision inputs changed the frozen identity lineage",
+  );
+  checkCanonicalValue(
+    boundRevisionInputs.base_files,
+    [ordinalInputs.bound_profile_existing_file],
+    "corrected bound-file revision base inputs",
+  );
+  checkCanonicalValue(
+    boundRevisionInputs.new_file,
+    {
+      path_hex: ordinalInputs.generic_new_file.path_hex,
+      mode: ordinalInputs.generic_new_file.mode,
+      content_hex: ordinalInputs.generic_new_file.content_hex,
+    },
+    "corrected bound-file revision new-file inputs",
+  );
+  const correctedBoundGolden = objectAt(
+    boundRevisionExpected.contribution_revision,
+    "corrected bound ContributionRevision golden",
+  );
+  const boundRevision = contributionRevisionRecord({
+    project_id: boundRevisionInputs.project_id,
+    contribution_id: boundRevisionInputs.contribution_id,
+    capture_record_id: boundRevisionInputs.capture_record_id,
+    base: bound.base_snapshot.id,
+    result: bound.result_snapshot.id,
+    source_changes: bound.source_changes,
+    depends_on: [],
+  });
+  const boundRevisionCanonicalJson = stringAt(
+    correctedBoundGolden.canonical_json,
+    "corrected bound ContributionRevision canonical JSON",
+  );
+  const boundRevisionCanonicalHex = stringAt(
+    correctedBoundGolden.canonical_hex,
+    "corrected bound ContributionRevision canonical hex",
+  );
+  checkCanonicalText(
+    boundRevision.value,
+    boundRevisionCanonicalJson,
+    boundRevisionCanonicalHex,
+    "corrected bound-file immutable ContributionRevision",
+  );
+  checkCanonicalValue(
+    boundRevision.value,
+    correctedBoundGolden.value,
+    "corrected bound-file ContributionRevision fields",
+  );
+  check(
+    boundRevision.id === correctedBoundGolden.record_id &&
+      boundRevision.id ===
+        "sha256:e3803757a1c3c341a47e3fe171930bc911220f7989dd25f756605b7de28b0d85",
+    "corrected bound-file ContributionRevision RecordId mismatch",
+  );
+  const boundRevisionPreimage = Buffer.concat([
+    Buffer.from("aethyme record v0\0", "utf8"),
+    boundRevision.canonical_bytes,
+  ]);
+  check(
+    boundRevisionPreimage.toString("hex") === correctedBoundGolden.record_preimage_hex,
+    "corrected bound-file ContributionRevision preimage mismatch",
+  );
+
+  if (!(boundChange instanceof Map)) throw new Error("bound source change is not a canonical object");
+  const revisionArgs = {
+    project_id: boundRevisionInputs.project_id,
+    contribution_id: boundRevisionInputs.contribution_id,
+    capture_record_id: boundRevisionInputs.capture_record_id,
+    base: bound.base_snapshot.id,
+    result: bound.result_snapshot.id,
+    depends_on: [] as string[],
+  };
+  const expectInvalidRevision = (
+    expectedCode: string,
+    changes: CanonicalValue[],
+    label: string,
+  ): void => {
+    resetHashCallCount();
+    expectProfileError(
+      expectedCode,
+      () => contributionRevisionRecord({ ...revisionArgs, source_changes: changes }),
+      label,
+    );
+    check(getHashCallCount() === 0, `${label}: rejected only after hashing`);
+  };
+  const newChangeWithBefore = new Map<string, CanonicalValue>(boundChange);
+  const boundAfter = newChangeWithBefore.get("after");
+  if (!(boundAfter instanceof Map)) throw new Error("bound source change after state is absent");
+  newChangeWithBefore.set("before", boundAfter);
+  expectInvalidRevision(
+    "invalid_source_change",
+    [newChangeWithBefore],
+    "ContributionRevision rejects a New change with a before state",
+  );
+  const newChangeWithExtraField = new Map<string, CanonicalValue>(boundChange);
+  newChangeWithExtraField.set("unexpected", "value");
+  expectInvalidRevision(
+    "invalid_source_change",
+    [newChangeWithExtraField],
+    "ContributionRevision rejects an unknown source-change field",
+  );
+  const badFileState = new Map<string, CanonicalValue>(boundAfter);
+  badFileState.set("file_id", "file:invalid");
+  const badFileIdChange = new Map<string, CanonicalValue>(boundChange);
+  badFileIdChange.set("after", badFileState);
+  expectInvalidRevision(
+    "invalid_file_id",
+    [badFileIdChange],
+    "ContributionRevision rejects a non-canonical source-change FileId",
+  );
+  const newChange = (pathHex: string, fileId: string): CanonicalValue => {
+    const state = new Map<string, CanonicalValue>([
+      ["path_hex", pathHex],
+      ["mode", "100644"],
+      ["content_sha256", "3".repeat(64)],
+      ["file_id", fileId],
+    ]);
+    return new Map<string, CanonicalValue>([
+      ["relation", "new"],
+      ["derived_from", []],
+      ["possible_sources", []],
+      ["after", state],
+    ]);
+  };
+  expectInvalidRevision(
+    "non_canonical_change_order",
+    [
+      newChange("62", `file:sha256:${"a".repeat(64)}`),
+      newChange("61", `file:sha256:${"b".repeat(64)}`),
+    ],
+    "ContributionRevision enforces strictly increasing raw-path change order",
+  );
+  resetHashCallCount();
+
+  const renameIdentity = objectAt(renameExpected.identity, "rename identity expected values");
+  const renameBaseIdentityGoldens = objectAt(
+    renameIdentity.base_enrolled_file_ids,
+    "rename base enrolled FileIds",
+  );
+  const renameTransitionExpected = objectAt(renameExpected.transition, "rename transition golden");
+  const renameSourceChangeExpected = objectAt(
+    renameExpected.source_change,
+    "rename source-change golden",
+  );
+  const renameRevisionExpected = objectAt(
+    renameExpected.contribution_revision,
+    "rename ContributionRevision golden",
+  );
+  const renameTransition = advanceFileIdentities(
+    renameInputs.project_id,
+    renameInputs.proposal_id,
+    renameInputs.base_files,
+    renameInputs.result_files,
+    [renameInputs.operation],
+  );
+  checkExpectedSnapshot(
+    renameTransition.base_snapshot,
+    renameIdentity.base_snapshot,
+    "Rename base snapshot",
+  );
+  checkExpectedSnapshot(
+    renameTransition.result_snapshot,
+    renameIdentity.result_snapshot,
+    "Rename result snapshot",
+  );
+  for (const [pathHex, expectedValue] of Object.entries(renameBaseIdentityGoldens)) {
+    const expectedIdentity = objectAt(expectedValue, `Rename base identity ${pathHex}`);
+    const actualIdentity = enrolledFileId(
+      renameInputs.project_id,
+      renameTransition.base_snapshot.id,
+      decodeLowerHex(pathHex),
+    );
+    checkCanonicalValue(
+      actualIdentity,
+      expectedIdentity,
+      `Rename enrolled FileId preimage ${pathHex}`,
+    );
+  }
+  const renamedFileId = stringAt(renameIdentity.renamed_file_id, "preserved Rename FileId");
+  const renamedState = renameTransition.result_files.find(
+    (file) => file.path_hex === renameInputs.operation.to_path_hex,
+  );
+  if (renamedState === undefined) throw new Error("explicit Rename result file is absent");
+  check(
+    renamedState.file_id === renamedFileId &&
+      renamedState.file_id ===
+        "file:sha256:a69cfec7645a258107611f9e440d88f784a9a8ebff6e2f69d039aeb6af026e05",
+    "explicit Rename did not preserve the source FileId",
+  );
+  check(
+    !renameTransition.result_files.some(
+      (file) => file.path_hex === renameInputs.operation.from_path_hex,
+    ),
+    "explicit Rename retained the removed source path",
+  );
+  const renameSourceChange = renameTransition.source_changes[0];
+  if (renameSourceChange === undefined) throw new Error("explicit Rename source change is absent");
+  checkCanonicalText(
+    renameSourceChange,
+    stringAt(renameSourceChangeExpected.canonical_json, "Rename source-change JSON"),
+    stringAt(renameSourceChangeExpected.canonical_hex, "Rename source-change hex"),
+    "explicit Rename source change",
+  );
+  checkCanonicalValue(
+    renameSourceChange,
+    renameSourceChangeExpected.value,
+    "explicit Rename source-change fields",
+  );
+  checkCanonicalText(
+    renameTransition.transition,
+    stringAt(renameTransitionExpected.canonical_json, "Rename transition JSON"),
+    stringAt(renameTransitionExpected.canonical_hex, "Rename transition hex"),
+    "explicit Rename transition",
+  );
+  checkCanonicalValue(
+    renameTransition.transition,
+    renameTransitionExpected.value,
+    "explicit Rename transition fields",
+  );
+  const renameRevision = contributionRevisionRecord({
+    project_id: renameInputs.project_id,
+    contribution_id: renameInputs.contribution_id,
+    capture_record_id: renameInputs.capture_record_id,
+    base: renameTransition.base_snapshot.id,
+    result: renameTransition.result_snapshot.id,
+    source_changes: renameTransition.source_changes,
+    depends_on: [],
+  });
+  checkCanonicalText(
+    renameRevision.value,
+    stringAt(renameRevisionExpected.canonical_json, "Rename revision JSON"),
+    stringAt(renameRevisionExpected.canonical_hex, "Rename revision hex"),
+    "explicit Rename immutable ContributionRevision",
+  );
+  checkCanonicalValue(
+    renameRevision.value,
+    renameRevisionExpected.value,
+    "explicit Rename ContributionRevision fields",
+  );
+  check(
+    renameRevision.id === renameRevisionExpected.record_id &&
+      renameRevision.id ===
+        "sha256:ae98275074fdd0c63af8b5f7e0950df49333ce1aac3cd853ab781287d6a5fb0a",
+    "explicit Rename ContributionRevision RecordId mismatch",
+  );
+  const renameRevisionPreimage = Buffer.concat([
+    Buffer.from("aethyme record v0\0", "utf8"),
+    renameRevision.canonical_bytes,
+  ]);
+  check(
+    renameRevisionPreimage.toString("hex") === renameRevisionExpected.record_preimage_hex,
+    "explicit Rename ContributionRevision preimage mismatch",
+  );
+
   const mixedExpected = objectAt(
     ordinalExpected.mixed_copy_split_plain_new,
     "mixed_copy_split_plain_new",
@@ -666,8 +1092,10 @@ function run(): void {
     );
   }
 
-  check(fileStateFiles(mixed.result_snapshot, "mixed result snapshot").length === 5,
-    "mixed result snapshot did not retain all five raw-path entries");
+  check(
+    fileStateFiles(mixed.result_snapshot, "mixed result snapshot").length === 5,
+    "mixed result snapshot did not retain all five raw-path entries",
+  );
   const sourcePinsBytes = readFileSync(resolve(HERE, "source-pins.json"));
   const sourcePinsSha = directSha256(sourcePinsBytes);
   const report = {
@@ -678,14 +1106,21 @@ function run(): void {
     source_pins_sha256: sourcePinsSha,
     verified_files: verifiedHashes,
     assertions: assertionCount,
+    pin_counts: {
+      rust_sources: REQUIRED_RUST_SOURCES.length,
+      typescript_sources: REQUIRED_TYPESCRIPT_SOURCES.length,
+      frozen_fixture_files: REQUIRED_FIXTURE_PATHS.length,
+    },
     vectors: {
       descriptor: 1,
-      contribution_revision_records: 2,
+      contribution_revision_records: 4,
       bound_profile_new_file: 1,
+      explicit_rename: 1,
       mixed_copy_split_plain_new: 1,
+      contribution_revision_validation_negative_controls: 4,
       retained_invalid_attempts: { v1_contribution_id: "rejected", v2_file_id: "rejected" },
     },
-    runtime_boundary: "Node built-ins only; no network, Cargo, native product, or generated vector edits",
+    runtime_boundary: "Node built-ins only; offline; no Cargo, native product, external assets, or generated vector edits",
   };
   console.log(JSON.stringify(report, null, 2));
 }

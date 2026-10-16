@@ -6,16 +6,22 @@ This directory is a finite, arm's-length TypeScript qualification harness for th
 
 ## Frozen inputs
 
-The three vector directories each retain the four independently supplied files byte-for-byte:
+All five vector package directories retain their supplied files byte-for-byte:
 
-- `vectors/ordinal-supplement/` is the corrected frozen expected-data supplement. Its manifest SHA-256 is `69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f`.
+- `vectors/ordinal-supplement/` provides the corrected descriptor, enrolled and proposed FileId, source snapshot, and mixed Copy/Split/plain-new ordinal goldens. Its manifest SHA-256 is `69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f`.
+- `vectors/contribution-revision-bound/` provides the corrected bound-file ContributionRevision canonical bytes and RecordId. Its manifest SHA-256 is `ab85554b8b16543b2b356acaa29fcfbfcea8456292baa705d167daab5a14c9d1`.
+- `vectors/explicit-rename/` provides a Rename transition and ContributionRevision golden. Its manifest SHA-256 is `6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0`.
 - `vectors/prior-v1-invalid/` preserves the earlier invalid attempt, whose ContributionId suffix has 25 characters instead of 26.
 - `vectors/prior-v2-partially-invalid/` preserves the v2 attempt. Its baseline and rationale-only immutable ContributionRevision vectors remain attributable; its proposed FileId and new-file revision expectations are unqualified because the FileId omitted the required `sha256:` component.
 
-The runner checks the invalid v1 ContributionId and v2 FileId are rejected before identity hashing. It does not credit either invalid attempt as a passing vector.
+The runner rejects invalid ContributionIds and FileIds before identity hashing and does not credit either invalid attempt as passing evidence. It also distinguishes the generic Rust proposal token profile (1–128 ASCII letters, digits, `.`, `_`, `:`, or `-`) from the strict opaque ContributionId profile.
+
+## Qualification coverage
+
+The finite harness checks descriptor canonical bytes and immutable RecordId, enrolled/proposed FileIds, source snapshots, raw-path ordering, explicit Rename identity preservation, Copy/Split/plain-new ordinals, immutable ContributionRevision IDs, and no-hash validation refusals. ContributionRevision source changes are validated for relation shape, fields, canonical FileIds, strict raw-path order, and the Rust change-count cap before hashing. The fixed pin manifest must cover exactly the reviewed Rust sources, TypeScript sources, and 20 frozen vector files, and binds the expected Rust contract source commit.
 
 ## Pending qualification work
 
-This checkpoint is source-only and **UNRUN**. `d10-identity-parity.mts` expects `source-pins.json`, which will be added only after the contract author freezes the final Rust source commit and the independent reviewer freezes a corrected bound-file ContributionRevision golden. Node qualification, intended-failure controls, and their retained output have not been run or claimed in this checkpoint. No Cargo or native product runtime is used by the intended qualification.
+This checkpoint is source-only and **UNRUN**. `d10-identity-parity.mts` expects `source-pins.json`, which will be added only after the contract author freezes the final Rust source commit; the corrected bound-file ContributionRevision golden is already frozen and preserved above. Node qualification, intended-failure controls, and their retained output have not been run or claimed in this checkpoint. No Cargo or native product runtime is used by the intended qualification.
 
-The adapter covers descriptor canonical bytes and immutable RecordId, enrolled and proposed FileIds, source snapshots, source changes, Copy/Split/plain-new ordinals, operation-order invariance, and the two valid existing immutable ContributionRevision goldens. The independent corrected ordinal fixture provides the bound-file source-change and FileId goldens; the requested corrected bound-file ContributionRevision golden remains pending.
+The adapter covers descriptor canonical bytes and immutable RecordId, enrolled and proposed FileIds, source snapshots, source changes, Rename/Copy/Split/plain-new identity behavior, operation-order invariance, and four immutable ContributionRevision goldens. The corrected bound-file and Rename ContributionRevision records come from independent standard-library-only oracles. The preserved invalid v1/v2 packages remain provenance only.
