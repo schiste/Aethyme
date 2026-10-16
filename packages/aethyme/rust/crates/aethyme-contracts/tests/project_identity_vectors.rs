@@ -1,8 +1,10 @@
 //! Project and FileId qualification vectors for the bounded Local profile.
 
 use aethyme_contracts::experimental_v0::{
-    EntryKind, FileId, FileOperation, IdentityRelation, ProjectDescriptor, ProjectId, SourceEntry,
-    SourceSnapshot, advance_file_identities, validate_file_proposals,
+    EntryKind, FileId, FileOperation, IdentityRelation, ProjectDescriptor, ProjectId,
+    ProjectIdentityError, SourceEntry, SourceSnapshot, advance_file_identities,
+    project_identity::{MAX_DESCRIPTOR_BYTES, MAX_DESCRIPTOR_FILES},
+    validate_file_proposals,
 };
 use serde::Deserialize;
 
@@ -391,4 +393,48 @@ fn foreign_project_identity_state_and_wrong_base_snapshot_are_refused() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn descriptor_admission_matches_the_canonical_document_and_container_limits() {
+    use aethyme_contracts::experimental_v0::canonical_json::{
+        MAX_CONTAINER_ENTRIES, MAX_DOCUMENT_BYTES,
+    };
+
+    assert_eq!(MAX_DESCRIPTOR_BYTES, MAX_DOCUMENT_BYTES);
+    assert_eq!(MAX_DESCRIPTOR_FILES, MAX_CONTAINER_ENTRIES);
+
+    let too_many_entries = SourceSnapshot::new((0..=MAX_DESCRIPTOR_FILES).map(|index| {
+        SourceEntry::from_content(
+            format!("file-{index:04}.txt").into_bytes(),
+            EntryKind::Regular,
+            b"x",
+        )
+    }))
+    .unwrap();
+    assert!(matches!(
+        ProjectDescriptor::from_snapshot(
+            project(),
+            "1111111111111111111111111111111111111111",
+            &too_many_entries,
+        ),
+        Err(ProjectIdentityError::TooManyFiles { count })
+            if count == MAX_DESCRIPTOR_FILES + 1
+    ));
+
+    let long_paths = SourceSnapshot::new((0..128).map(|index| {
+        let mut path = format!("f{index:03}/").into_bytes();
+        path.resize(4096, b'a');
+        SourceEntry::from_content(path, EntryKind::Regular, b"x")
+    }))
+    .unwrap();
+    assert!(matches!(
+        ProjectDescriptor::from_snapshot(
+            project(),
+            "1111111111111111111111111111111111111111",
+            &long_paths,
+        ),
+        Err(ProjectIdentityError::DescriptorTooLarge { bytes })
+            if bytes > MAX_DESCRIPTOR_BYTES
+    ));
 }
