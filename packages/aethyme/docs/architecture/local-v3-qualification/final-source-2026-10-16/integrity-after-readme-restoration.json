@@ -1,0 +1,107 @@
+{
+  "verification_scope": "retained artifact integrity and local links only; does not establish Local qualification or operator rehearsal completion",
+  "source_head": "a717ebaa5526841980b343b6521180a6c1a20fca",
+  "unique_payloads": 1178,
+  "groups": [
+    {
+      "inventory": "target/local-resume/actual-fx17-twenty-stage-evidence-inventory.json",
+      "checked": 22
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/cross-revision-baseline-2026-10-15/ledger.json",
+      "checked": 42
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/unknown-publication-2026-10-15/ledger.json",
+      "checked": 10
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/model-adapter-2026-10-15/ledger.json",
+      "checked": 12
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/analysis-view-lifecycle-2026-10-15/artifact-inventory.json",
+      "checked": 59
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/final-integration-2026-10-15/ledger.json",
+      "checked": 346
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json",
+      "checked": 109
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/ledger.json",
+      "checked": 213
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/t64-cli-bootstrap-2026-10-15/ledger.json",
+      "checked": 119
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/aq0-symbol-identity-2026-10-16/ledger.json",
+      "checked": 74
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/t45-pressure-gc-interleaving-2026-10-15/evidence/inventory.json",
+      "checked": 126
+    },
+    {
+      "inventory": "packages/aethyme-eval/fx10/evidence/actual-1123-1f7b2266/INVENTORY.tsv",
+      "checked": 36
+    },
+    {
+      "inventory": "packages/aethyme-eval/docs/t01-t02-typescript-parity/ledger/proposal.sha256",
+      "checked": 9
+    }
+  ],
+  "local_summary_links": 48,
+  "archive_groups": [
+    {
+      "archive": "packages/aethyme-eval/docs/t01-t02-typescript-parity/qualification.tar.gz",
+      "verified_files": 346
+    }
+  ],
+  "identity_attempt_inventory": {
+    "schema": "aethyme.local-identity-attempts/experimental-v0",
+    "attempt_rows": 106,
+    "inventory_file_rows": 409,
+    "directory_file_rows_including_inventory": 410,
+    "scope": "retained inventory integrity only; no attempt or qualification totals are added to legacy groups"
+  },
+  "d10_typescript_additive_profile_integrity": {
+    "inventory_completeness": "no complete D10 payload inventory is present; checks are limited to source-pins and the explicit attempt-006 metadata chain",
+    "source_pin_rows": 35,
+    "current_source_pin_content_matches": 35,
+    "current_source_pin_drift_rows": 0,
+    "current_source_pin_drift_paths": [],
+    "attempt_006_recorded_source_hash_rows": 35,
+    "attempt_006_output_streams_verified": 2,
+    "attempt_006_pin_manifest_matches_current": false,
+    "qualification_credit": "none; attempt 006 is historical metadata only and grants no current-profile credit",
+    "qualification_gaps": [
+      "current source-pins.json differs from the manifest digest or pin rows recorded by attempt 006",
+      "current qualification source pin differs from the source commit recorded by attempt 006"
+    ]
+  },
+  "d10_typescript_runtime_qualification_integrity": {
+    "archive_members_verified": 76,
+    "attempt_001_disposition": "historical unqualified baseline failure; its partial D10 pass is not credited",
+    "attempt_002_source_checkpoint": {
+      "commit": "f02096084b3b17703ff8dc3e07d0fdc84795ddb2",
+      "tree": "e261027b49b71015305017a473584322073b98c5"
+    },
+    "attempt_002_positive_pairs": 2,
+    "t01_t02_assertions_per_pair": 880,
+    "d10_assertions_per_pair": 224,
+    "d10_verified_source_and_fixture_files_per_pair": 35,
+    "mutation_controls_verified": 6,
+    "parser_refusal_controls_verified": 2,
+    "attempt_006_status": "historical metadata only; no current runtime qualification credit",
+    "qualification_scope": "finite offline eval-side TypeScript contract parity only; no production consumer, product runtime, or Aethyme evaluation claim",
+    "integrity_verified": true,
+    "qualification_credit": "bounded profile qualification at the recorded source checkpoint only"
+  },
+  "errors": []
+}
