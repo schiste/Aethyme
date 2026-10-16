@@ -1661,14 +1661,59 @@ mod tests {
         assert_eq!(acknowledgements(), 1);
         assert_eq!(write_snapshot(&fixture.store, owner.target()), admitted);
 
+        let target = owner.target().to_owned();
+        let issuer = owner.issuer().to_owned();
+        let previous_epoch = owner.authority_epoch().clone();
+        let frozen = crate::local_authority::freeze(
+            &mut fixture.store,
+            &previous_epoch,
+            "verify retained managed key after authority rotation",
+        )
+        .unwrap();
+        crate::local_authority::resume(&mut fixture.store, &frozen.epoch).unwrap();
+        drop(owner);
+        let current_owner =
+            local_target::acquire_controller(&mut fixture.store, &target, &issuer).unwrap();
+        assert_ne!(current_owner.authority_epoch(), &previous_epoch);
+        let after_epoch_rotation = write_snapshot(&fixture.store, &target);
+
+        let retained_after_epoch = begin(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &current_owner,
+            &command,
+        )
+        .unwrap();
+        let ManagedResolutionOutcome::StatusOnly(retained_after_epoch) = retained_after_epoch
+        else {
+            panic!(
+                "expected retained status after authority rotation, got {retained_after_epoch:?}"
+            );
+        };
+        assert_eq!(retained_after_epoch.phase, State::ConsumptionUnknown);
+        assert_eq!(retained_after_epoch.async_state, "dispatching");
+        assert_eq!(acknowledgements(), 1);
+        assert_eq!(
+            write_snapshot(&fixture.store, &target),
+            after_epoch_rotation
+        );
+
         let mut changed = command.clone();
         changed.envelope = units(11);
         assert!(matches!(
-            begin(&mut fixture.store, fixture._repo.path(), &owner, &changed),
+            begin(
+                &mut fixture.store,
+                fixture._repo.path(),
+                &current_owner,
+                &changed
+            ),
             Err(BudgetError::Immutable)
         ));
         assert_eq!(acknowledgements(), 1);
-        assert_eq!(write_snapshot(&fixture.store, owner.target()), admitted);
+        assert_eq!(
+            write_snapshot(&fixture.store, &target),
+            after_epoch_rotation
+        );
     }
 
     #[test]
