@@ -152,6 +152,13 @@ Additional explicit lifecycle commands (provisional Local packages):
       Repeating a client key returns status without a new charge or packet.
   aethyme collab resolution status --attempt TOKEN --session-label LABEL [--json]
       Read-only attempt status, including the retained limits and unknowns.
+  aethyme collab resolution mark-dispatching --attempt TOKEN --session-label LABEL [--json]
+      Record handoff intent before giving the packet to a local agent.
+      This command records state only; it neither starts nor authorizes an agent.
+  aethyme collab resolution mark-unknown --attempt TOKEN --session-label LABEL
+       --detail PATH [--json]
+      Record uncertainty using a UTF-8 detail file (at most 4096 bytes).
+      The attempt stays charged; a late bound response may settle it.
   aethyme collab resolution packet --attempt TOKEN --session-label LABEL [--json]
       Recover an exported metadata packet without charging another attempt.
   aethyme collab resolution input --attempt TOKEN --session-label LABEL
@@ -476,6 +483,8 @@ fn command_name(args: &[String]) -> String {
         "dispatch",
         "sync",
         "resolution",
+        "mark-dispatching",
+        "mark-unknown",
         "packet",
         "input",
         "import",
@@ -539,6 +548,10 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ] => sensitive::command(&main_root, verb, rest),
         ["resolution", "prepare", rest @ ..] => resolution::prepare(&main_root, rest),
         ["resolution", "status", rest @ ..] => resolution::status(&main_root, rest),
+        ["resolution", "mark-dispatching", rest @ ..] => {
+            resolution::mark_dispatching(&main_root, rest)
+        }
+        ["resolution", "mark-unknown", rest @ ..] => resolution::mark_unknown(&main_root, rest),
         ["resolution", "packet", rest @ ..] => resolution::packet(&main_root, rest),
         ["resolution", "input", rest @ ..] => resolution::input(&main_root, rest),
         ["resolution", "import", rest @ ..] => resolution::import(&main_root, rest),

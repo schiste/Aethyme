@@ -100,6 +100,40 @@ pub(super) fn status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     )
 }
 
+/// Record the intent before an operator hands the packet to a local agent.
+/// This is ledger bookkeeping; it never starts or authorizes a process.
+pub(super) fn mark_dispatching(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--attempt", "--session-label"], &[])?;
+    let token = flags.one("--attempt")?;
+    let label = flags.one("--session-label")?;
+    let mut store = open(root)?;
+    let status =
+        resolution_api::mark_attempt_dispatching(&mut store, token, label).map_err(error)?;
+    output(
+        "aethyme.collab-resolution-mark-dispatching/experimental-v0",
+        json!({"status":status.to_json()}),
+    )
+}
+
+pub(super) fn mark_unknown(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--attempt", "--session-label", "--detail"], &[])?;
+    let token = flags.one("--attempt")?;
+    let label = flags.one("--session-label")?;
+    let detail = read_operator_bytes(flags.one("--detail")?, 4096)?;
+    let detail = std::str::from_utf8(&detail)
+        .map_err(|_| Failure::usage("unknown-attempt detail must be UTF-8"))?;
+    if detail.trim().is_empty() {
+        return Err(Failure::usage("unknown-attempt detail must not be empty"));
+    }
+    let mut store = open(root)?;
+    let status =
+        resolution_api::mark_attempt_unknown(&mut store, token, label, detail).map_err(error)?;
+    output(
+        "aethyme.collab-resolution-mark-unknown/experimental-v0",
+        json!({"status":status.to_json(),"automatic_replay":false}),
+    )
+}
+
 pub(super) fn packet(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     let flags = Flags::parse(rest, &["--attempt", "--session-label"], &[])?;
     let token = flags.one("--attempt")?;
@@ -197,7 +231,15 @@ mod tests {
     #[test]
     fn resolution_commands_reject_incomplete_and_duplicate_arguments_before_state_open() {
         let dir = tempfile::tempdir().unwrap();
-        for command in [prepare, status, packet, input, import] {
+        for command in [
+            prepare,
+            status,
+            mark_dispatching,
+            mark_unknown,
+            packet,
+            input,
+            import,
+        ] {
             assert_eq!(command(dir.path(), &[]).unwrap_err().code, "usage");
             assert_eq!(
                 command(dir.path(), &["--unknown", "value"])

@@ -58,6 +58,9 @@ fn resolution_commands_route_and_refuse_uninitialized_state_without_creating_it(
         br#"{"max_manifest_bytes":1048576,"max_manifest_entries":64,"max_file_bytes":65536,"max_total_input_bytes":1048576,"max_response_bytes":65536}"#,
     )
     .unwrap();
+    let detail = root.path().join("detail.txt");
+    std::fs::write(&detail, "completion unknown").unwrap();
+    let detail = detail.to_str().unwrap();
     let digest = format!("sha256:{}", "1".repeat(64));
     let limits = limits.to_str().unwrap();
     let cases: &[&[&str]] = &[
@@ -109,7 +112,25 @@ fn resolution_commands_route_and_refuse_uninitialized_state_without_creating_it(
             "not-opened.json",
         ],
     ];
-    for args in cases {
+    let marks: &[&[&str]] = &[
+        &[
+            "mark-dispatching",
+            "--attempt",
+            "unexported",
+            "--session-label",
+            "operator",
+        ],
+        &[
+            "mark-unknown",
+            "--attempt",
+            "unexported",
+            "--session-label",
+            "operator",
+            "--detail",
+            detail,
+        ],
+    ];
+    for args in cases.iter().chain(marks) {
         let output = Command::new(aethyme_testkit::aethyme_bin())
             .current_dir(&repo)
             .env("HOME", &home)

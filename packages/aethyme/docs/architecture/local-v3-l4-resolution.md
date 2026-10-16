@@ -10,6 +10,10 @@ requires an exact archived request and explicit byte/entry limits; it commits
 one attempt charge and retention roots before exposing a metadata-only packet.
 `status` is read-only. `packet` recovers a still-exported packet and `input`
 reads only an exact manifested snapshot/path under the retained limits.
+`mark-dispatching` records handoff intent before an operator supplies the
+packet to a local agent. `mark-unknown` preserves an uncertain attempt and
+its charge. Neither command starts a process or grants dispatch authority.
+A response cannot be imported from the merely exported state.
 `import` requires a strict attempt/request/manifest-bound response file and
 settles that same charge through `finish_bound_attempt`; it never calls
 `resolve()` to charge a second attempt.
