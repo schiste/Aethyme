@@ -473,6 +473,7 @@ fn age_archive_objects(store: &CollaborationStore) {
 }
 
 const GATES: &str = "[[gate]]\nname='retained-features'\ncommand='test \"$(cat one.txt)\" = A && test \"$(cat two.txt)\" = B && git rev-parse HEAD'\ncache=false\ntimeout_seconds=10\n";
+const METADATA_GATES: &str = "[[gate]]\nname='retained-head'\ncommand='git rev-parse HEAD'\ncache=false\ntimeout_seconds=10\n";
 #[test]
 fn checkout_placement_refuses_upward_project_discovery() {
     let outside = tempfile::tempdir().unwrap();
@@ -550,7 +551,7 @@ fn actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_write
 
 #[test]
 fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
-    let mut s = setup(Some(GATES));
+    let mut s = setup(Some(METADATA_GATES));
     let repo = s.f._repo.path().to_path_buf();
     let owner = s.owner.as_ref().expect("setup owner is present");
 
@@ -635,10 +636,14 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
     let bound =
         crate::resolution::decode_attempt_response_envelope(&status, &response_bytes).unwrap();
     let settled = crate::resolution::finish_bound_attempt(&mut s.f.store, &repo, &bound).unwrap();
-    assert!(matches!(
-        settled.outcome,
-        crate::resolution::ResolutionOutcome::Synthesized(_)
-    ));
+    assert!(
+        matches!(
+            &settled.outcome,
+            crate::resolution::ResolutionOutcome::Synthesized(_)
+        ),
+        "metadata-only source should allow synthesis, got {:?}",
+        settled.outcome
+    );
     let ledger =
         crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
     assert_eq!(
