@@ -2172,7 +2172,7 @@ mod tests {
         drop(connection);
 
         let migrated = CollaborationStore::open(
-            &CollaborationRoot::under_host_state(host_path),
+            &CollaborationRoot::under_host_state(&host_path),
             &project,
             &[],
         )
