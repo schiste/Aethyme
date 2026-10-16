@@ -1122,6 +1122,8 @@ fn validate_bound_contribution_revision_bytes_locked(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RevisionWriterStage {
     BeforeLock,
+    AfterLock,
+    PreflightStarted,
     AfterPreflight,
 }
 
@@ -1187,6 +1189,11 @@ pub(crate) fn revise_contribution_for_operation_with_archive_use(
         request.operation_id.as_str(),
     );
     let _writer = acquire_revision_writer_lock(store)?;
+    #[cfg(test)]
+    report_revision_writer_stage(
+        RevisionWriterStage::AfterLock,
+        request.operation_id.as_str(),
+    );
     revise_contribution_for_operation_locked(store, binding, request, archive_use)
 }
 
@@ -1212,6 +1219,11 @@ fn revise_contribution_for_operation_locked(
     request: ContributionRevisionRequest<'_>,
     archive_use: &ArchiveUse,
 ) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    #[cfg(test)]
+    report_revision_writer_stage(
+        RevisionWriterStage::PreflightStarted,
+        request.operation_id.as_str(),
+    );
     validate_binding_store(store, binding)?;
     require_schema(store)?;
 
@@ -2981,11 +2993,20 @@ mod identity_store_tests {
 
         let (competing_preflight_tx, competing_preflight_rx) = mpsc::channel();
         let (dependent_before_lock_tx, dependent_before_lock_rx) = mpsc::channel();
-        let (dependent_preflight_tx, dependent_preflight_rx) = mpsc::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let release_in_hook = Arc::clone(&release);
-        let hook: RevisionWriterTestHook =
-            Arc::new(move |stage, operation| match (stage, operation) {
+        let stage_trace = Arc::new(Mutex::new(Vec::new()));
+        let stage_trace_in_hook = Arc::clone(&stage_trace);
+        let writer_lock_path = fixture
+            .store
+            .project_dir()
+            .join("spool/contribution-revision-writer.lock");
+        let hook: RevisionWriterTestHook = Arc::new(move |stage, operation| {
+            stage_trace_in_hook
+                .lock()
+                .expect("revision writer stage trace")
+                .push((operation.to_string(), stage));
+            match (stage, operation) {
                 (RevisionWriterStage::AfterPreflight, "op-race-pair-b") => {
                     competing_preflight_tx
                         .send(())
@@ -2997,17 +3018,21 @@ mod identity_store_tests {
                     }
                 }
                 (RevisionWriterStage::BeforeLock, "op-race-dependent") => {
+                    let file = crate::file_lock::open_lock_file(&writer_lock_path)
+                        .expect("open the competing writer lock for a nonblocking probe");
+                    let probe = crate::file_lock::ExclusiveFileLock::try_acquire(file)
+                        .expect("probe the writer lock without blocking");
+                    assert!(
+                        probe.is_none(),
+                        "the competing writer must own the lock while paused after preflight"
+                    );
                     dependent_before_lock_tx
                         .send(())
-                        .expect("signal dependent writer waiting for lock");
-                }
-                (RevisionWriterStage::AfterPreflight, "op-race-dependent") => {
-                    dependent_preflight_tx
-                        .send(())
-                        .expect("signal dependent writer preflight");
+                        .expect("signal that the dependent observed lock contention");
                 }
                 _ => {}
-            });
+            }
+        });
         let previous_hook = replace_revision_writer_test_hook(Some(hook));
         let no_previous_hook = previous_hook.is_none();
         let _reset_hook = ResetWriterHook(previous_hook);
@@ -3032,13 +3057,7 @@ mod identity_store_tests {
         });
         dependent_before_lock_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("dependent writer reached the serialized writer lock");
-        assert!(
-            dependent_preflight_rx
-                .recv_timeout(Duration::from_millis(250))
-                .is_err(),
-            "dependent writer must not preflight against stale history while the competing writer is paused"
-        );
+            .expect("dependent writer observed the paused competitor holding the writer lock");
 
         release_guard.release();
         let competing_revision_id = competing
@@ -3048,6 +3067,21 @@ mod identity_store_tests {
         assert_ne!(competing_revision_id, first_revision_id);
 
         let dependent_result = dependent.join().expect("dependent revision thread");
+        let dependent_stages: Vec<_> = stage_trace
+            .lock()
+            .expect("revision writer stage trace")
+            .iter()
+            .filter_map(|(operation, stage)| (operation == "op-race-dependent").then_some(*stage))
+            .collect();
+        assert_eq!(
+            dependent_stages,
+            [
+                RevisionWriterStage::BeforeLock,
+                RevisionWriterStage::AfterLock,
+                RevisionWriterStage::PreflightStarted
+            ],
+            "the dependent must acquire the held lock before it can preflight"
+        );
         assert!(matches!(
             dependent_result,
             Err(IdentityStoreError::UnknownSnapshot {
