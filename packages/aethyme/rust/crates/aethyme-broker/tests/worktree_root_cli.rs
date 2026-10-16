@@ -344,6 +344,19 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
             upload_pack.to_str().unwrap(),
         ],
     );
+    let plan = json(
+        common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
+            .current_dir(&repo)
+            .env("AETHYME_HOST_STATE_DIR", &state)
+            .env("AETHYME_HOST_CACHE_DIR", &cache)
+            .env("AETHYME_WORKTREE_ROOT", &root)
+            .env_remove("AETHYME_BROKER_DB")
+            .env_remove("AETHYME_GATE_BROKER_DATABASES")
+            .output()
+            .unwrap(),
+    );
+    let actual_root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
+    assert!(!root.exists(), "read-only planning allocated the placement");
     let output = common::broker_cli(
         CLI,
         &[
@@ -389,16 +402,20 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
         !repo.join(".aethyme/logs").exists(),
         "agent log allocated before late admission"
     );
-    let entries: Vec<_> = std::fs::read_dir(&root)
+    let mut entries: Vec<_> = std::fs::read_dir(&actual_root)
         .unwrap()
-        .map(Result::unwrap)
+        .map(|entry| entry.unwrap().file_name())
         .collect();
+    entries.sort();
     assert_eq!(
-        entries.len(),
-        1,
+        entries,
+        vec![
+            std::ffi::OsString::from(".aethyme-worktree-root.json"),
+            std::ffi::OsString::from(".cargo")
+        ],
         "a checkout was created despite late refusal"
     );
-    assert_eq!(entries[0].file_name(), ".aethyme-worktree-root.json");
+    assert!(actual_root.join(".cargo/config.toml").is_file());
     let branches = Command::new("git")
         .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
         .current_dir(&repo)
