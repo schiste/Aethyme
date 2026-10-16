@@ -1,0 +1,55 @@
+{
+  "checkpoint_reviewed": "75ee20385b85529ea427e4fcd784727e8776c973",
+  "fixture_expected_json_sha256": {
+    "vectors/contribution-revision-bound/expected.json": "335a8c93721d8fc29f09cbdeff2637a7eb000b4db90e17b0d13fef0e2155c0d2",
+    "vectors/explicit-rename/expected.json": "ed8c5a28aa017e40661b965622001ddd23427f1e545203cefe8b8bccb5edd9b3",
+    "vectors/ordinal-supplement/expected.json": "67b9586320e91de0a5d3deda44ff03ee51f099846dc93597f46155f7e811711b",
+    "vectors/prior-v1-invalid/expected.json": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998",
+    "vectors/prior-v2-partially-invalid/expected.json": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048"
+  },
+  "golden_access_groups_checked": {
+    "contribution-revision-bound/expected.json": [
+      "contribution_revision.{canonical_json,canonical_hex,record_id,record_preimage_hex}",
+      "source_change and identity data are sourced from the ordinal supplement, not this file"
+    ],
+    "explicit-rename/expected.json": [
+      "identity.{base_enrolled_file_ids,base_snapshot,result_snapshot,renamed_file_id_preserved}",
+      "source_change.{canonical_json,canonical_hex,value}",
+      "transition.{canonical_json,canonical_hex,value}",
+      "contribution_revision.{canonical_json,canonical_hex,value,record_id,record_preimage_hex}"
+    ],
+    "ordinal-supplement/expected.json": [
+      "descriptor_fixture_vector.{anchor_snapshot,enrolled_file,descriptor,canonical_json,canonical_hex,record_id}",
+      "generic_minimal_new_file.{proposal_seed,raw_path_hex,base_snapshot_id,result_snapshot,source_change,source_change_canonical_json,source_change_canonical_hex,file_id,ordinal,preimage_hex}",
+      "bound_profile_new_file.{base_snapshot,result_snapshot,result_files,file_id,preimage_hex,ordinal,proposal_seed,proposal_seed_source,new_paths_sorted_raw_hex,source_change_canonical_json,source_change_canonical_hex,source_change}",
+      "mixed_copy_split_plain_new.{base_snapshot,result_snapshot,result_files_sorted_by_raw_path,changes_sorted_by_after_or_before_raw_path,transition_canonical_json,transition_canonical_hex,transition,ordinal_facts.global_new_paths_sorted_raw_hex,proposed_identity_preimages}"
+    ],
+    "prior-v1-invalid/expected.json": [
+      "no value fields read; the file is included in the exact fixture pin set and retained unchanged"
+    ],
+    "prior-v2-partially-invalid/expected.json": [
+      "contribution_revisions.baseline_immutable.{canonical_json,canonical_hex,id,record_preimage_hex}",
+      "source_snapshots.baseline.id",
+      "contribution_revisions.rationale_only_immutable.{canonical_json,canonical_hex,id,record_preimage_hex}",
+      "contribution_revisions.rationale_only_changed_members",
+      "contribution_revisions.bound_profile_new_file.canonical_json (used only to preserve/reject the invalid old FileId)"
+    ]
+  },
+  "inspection": {
+    "fixture_schema_inventory": "recursive JSON key-path inventory of all five frozen expected.json files",
+    "result": "all literal golden-backed keys were present except the preserved Rename FileId lookup recorded below; other fields used by descriptor, prior-v2, generic/bound new-file, ContributionRevision, and mixed Copy/Split checks matched their frozen schema",
+    "runner_golden_access_inventory": "rg -n over all golden-backed identifiers and objectAt/stringAt/arrayAt sites in d10-identity-parity.mts"
+  },
+  "mismatch": {
+    "available_frozen_field": "identity.renamed_file_id_preserved",
+    "corrected_runner_access": "identity.renamed_file_id_preserved",
+    "fixture": "vectors/explicit-rename/expected.json",
+    "fixture_changed": false,
+    "runner_access_before": "identity.renamed_file_id"
+  },
+  "no_vectors_or_oracles_modified": true,
+  "runner_sha256_after_field_correction": "4b541b0b27f8a93d5f1e26db1c257d7ffb04cb718a66d02f73b0850b4f804fcc",
+  "runner_sha256_before_field_correction": "4bd5ed4fbb78b99c1ee468a3d9303ca725d906e0b697699a5832746dbe0e1c08",
+  "schema": "aethyme.d10-frozen-golden-field-audit/v1",
+  "static_schema_inventory_method": "Recursively enumerate object keys in all five frozen expected.json files, then compare against every golden-backed objectAt/stringAt/arrayAt and direct property access in the TypeScript runner; confirmed all fields above and identified the single Rename field mismatch corrected in this checkpoint."
+}

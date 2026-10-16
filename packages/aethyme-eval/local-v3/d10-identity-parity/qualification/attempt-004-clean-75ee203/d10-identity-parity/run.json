@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "/opt/homebrew/bin/node",
+    "--max-old-space-size=256",
+    "--experimental-strip-types",
+    "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts"
+  ],
+  "completed_at_utc": "2026-10-16T03:55:18.815735+00:00",
+  "deadline_seconds": 60,
+  "elapsed_ms": 99,
+  "exit_code": 1,
+  "max_old_space_size_mib": 256,
+  "runner": "d10-identity-parity",
+  "script": "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts",
+  "started_at_utc": "2026-10-16T03:55:18.715845+00:00",
+  "stderr_bytes": 1304,
+  "stderr_sha256": "4b726333ab760f56a651470ad48fca485aa75edbbc04b5b44246aadb5ceede20",
+  "stdout_bytes": 0,
+  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "timed_out": false
+}

@@ -1027,7 +1027,10 @@ function run(): void {
       `Rename enrolled FileId preimage ${pathHex}`,
     );
   }
-  const renamedFileId = stringAt(renameIdentity.renamed_file_id, "preserved Rename FileId");
+  const renamedFileId = stringAt(
+    renameIdentity.renamed_file_id_preserved,
+    "preserved Rename FileId",
+  );
   const renamedState = renameTransition.result_files.find(
     (file) => file.path_hex === renameInputs.operation.to_path_hex,
   );
