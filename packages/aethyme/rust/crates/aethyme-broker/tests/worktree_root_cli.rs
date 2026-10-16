@@ -280,9 +280,13 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
                 "fallback bypassed the reserve"
             );
             assert!(!sentinel.exists(), "an unadmitted agent executed");
+            // Command metrics are emitted for refused commands too. Every
+            // other entry, including any session agent log, is forbidden.
             assert!(
                 std::fs::read_dir(repo.join(".aethyme/logs"))
-                    .map(|mut entries| entries.next().is_none())
+                    .map(|mut entries| {
+                        entries.all(|entry| entry.unwrap().file_name() == "command-metrics.jsonl")
+                    })
                     .unwrap_or_else(|error| {
                         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
                         true
@@ -403,9 +407,12 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     );
     assert!(text.contains("broker recovery reserve"), "{text}");
     assert!(!sentinel.exists(), "agent ran before late admission");
+    // Refusal still records command metrics; it must not create an agent log.
     assert!(
         std::fs::read_dir(repo.join(".aethyme/logs"))
-            .map(|mut entries| entries.next().is_none())
+            .map(|mut entries| {
+                entries.all(|entry| entry.unwrap().file_name() == "command-metrics.jsonl")
+            })
             .unwrap_or_else(|error| {
                 assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
                 true
