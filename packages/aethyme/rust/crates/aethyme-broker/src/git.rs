@@ -3497,6 +3497,27 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Remove a worktree without recursively deleting its directory if Git refuses.
+    /// Rollback callers use this after proving the worktree identity and cleanliness;
+    /// any new or ambiguous contents must remain available for recovery.
+    pub(crate) fn worktree_remove_without_orphan_fallback(
+        &self,
+        worktree: &Path,
+    ) -> Result<(), GitError> {
+        // Match `worktree_remove`: release only a lock that the broker itself placed.
+        if self.worktree_lock_reason(worktree).as_deref() == Some(BROKER_WORKTREE_LOCK_REASON) {
+            run_git(
+                &self.root,
+                &["worktree", "unlock", worktree.to_str().unwrap_or_default()],
+            )?;
+        }
+        run_git(
+            &self.root,
+            &["worktree", "remove", worktree.to_str().unwrap_or_default()],
+        )?;
+        Ok(())
+    }
+
     /// Delete an exact local branch only when it still names the expected
     /// object. Used to roll back a just-created session worktree if its
     /// atomic database registration loses a planned-lease race.
