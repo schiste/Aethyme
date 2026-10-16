@@ -1,6 +1,6 @@
 # Local v3 qualification (#682)
 
-Last Updated: 2026-10-15
+Last Updated: 2026-10-16
 
 ## Scope and status
 
@@ -29,7 +29,7 @@ lock witnesses; five deliberate guard breaks failed as intended. The clean-sourc
 workspace check at `1d0ce264` passed all 4,569 executed tests, with 38 skipped;
 formatting, strict workspace Clippy, examples and documentation commands also
 passed. The bounded Local sensitive-content response profile passed its
-source-bound checks; fresh command-line integration qualification remains open. These finite observations do not establish reliable autonomous operation. All results
+source-bound checks. The current CLI source profile also passed its bounded checks; fresh independent operator qualification remains open. These finite observations do not establish reliable autonomous operation. All results
 below name their source and profile; earlier operator profiles retain their
 original limits.
 
@@ -49,6 +49,7 @@ original limits.
 | Disable, old binary, offline and paired CLI behavior | #751 | [Native compatibility ledger](local-v3-qualification/compatibility-native-2026-10-12.json); one pinned old binary and a declared finite paired-command set |
 | Administrative sensitive-content response | #785 | [Bounded T56 evidence](local-v3-qualification/sensitive-response-2026-10-15/README.md): 28 tests, eight intended guard failures and pinned old-binary controls at the recorded source; unmanaged copies remain outside the claim |
 | Explicit lifecycle commands | #732 and #753 | [CLI qualification ledger](https://github.com/schiste/Aethyme/blob/97fd3ecaee36b110fda842eb93ba5d3aba0118cd/packages/aethyme/docs/architecture/local-v3-qualification/cli-restored-2026-10-12.json): 527 overlapping passing executions, 13 ignores, seven named guard failures and two strict Clippy checks; finite explicit commands only |
+| Current CLI source qualification | #784 | [Source-bound CLI ledger](local-v3-qualification/t64-cli-bootstrap-2026-10-15/ledger.json): 101 passing executions, two ignores, eight guard controls and schema-25 compatibility at source `3af335ab`; fresh T64 operator remains unrun |
 
 Each artifact names its tested source. A later parent fix does not turn
 historical evidence into evidence for a newer tree. Selected regression
@@ -129,13 +130,30 @@ selected regressions. Its 527 passing executions overlap across selections.
 Seven deliberate removals each failed their named assertion with actual exit
 101; exact source was restored. Both strict broker and CLI Clippy passed.
 Earlier compiler, wrapper and unsupported CLI `--lib` invocations stay
-explicitly uncredited in its ledger. Final delivery CI is green at
+explicitly uncredited in its ledger. Recorded CI was green at
 `97fd3ecaee36b110fda842eb93ba5d3aba0118cd`.
 
 Built CLI target transitions, exact epoch stop and exclusive historical export
 are qualified only for this finite profile. Handoff's projection unit uses
 modeled verifier evidence, without a built CLI positive handoff claim. Target
 run, remote sync and handoff dispatch still refuse unbound profiles.
+
+## Current CLI source qualification
+
+The [current CLI ledger](local-v3-qualification/t64-cli-bootstrap-2026-10-15/ledger.json)
+records the source profile at `3af335ab87618cc7fcb92a4a5b01ad23edb633d9`:
+19 commands selected 103 test executions, with 101 passes, two explicit ignores
+and no failures. Eight deliberate guard removals each failed their intended
+assertion; the exact source was restored and the named positive selections
+passed again. Strict broker/CLI/engine Clippy and both no-install binary builds
+passed. A pinned schema-23 binary refused the disposable schema-25 state, with
+the recorded state bytes unchanged by inspection.
+
+The package retains original logs, command metadata, numeric statuses and
+failed attempts. Its immutable manifest hash discrepancy is documented by a
+separate reconciliation record. These results qualify the declared CLI source
+profile. The fresh T64 operator run and two-contributor rehearsal remain unrun;
+its result is separate from these source checks.
 
 ## Native operator and pressure profile
 

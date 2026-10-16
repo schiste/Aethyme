@@ -1,6 +1,6 @@
 # Selected final Local integration checks
 
-Last Updated: 2026-10-15
+Last Updated: 2026-10-16
 
 The [ledger](ledger.json) records actual sequential local commands on the aggregate
 Local branch. Each run retains its complete original recorder metadata, raw log,
@@ -143,8 +143,8 @@ retains its successful checks, deliberate guard failures and failed or incomplet
 attempts. The separately [reviewed T45 interleaving](../t45-pressure-gc-interleaving-2026-10-15/README.md)
 records four bounded pressure cases in two passing native invocations and five
 intended guard failures, with their source and environmental limits.
-The Local T56/D29 sensitive-content response and fresh independent reviewer rehearsal
-remain open. Review found that the existing native fixture constructs its two
+The separately qualified Local T56/D29 sensitive-content response retains its own
+source-bound evidence. The fresh independent command-line rehearsal remains open. Review found that the existing native fixture constructs its two
 contributors serially and supplies wave availability and verifier policy through
 library APIs. It does not qualify fresh independent contributor processes through
 the command line. No later combined tree is credited by these earlier
@@ -179,3 +179,20 @@ uses that package's documented `payloads/` root; at the same source it checked
 753 unique payloads and 37 links with zero errors. The later portable package
 adds the byte-exact original ledger as one further artifact. These checks
 verify retained evidence and do not qualify runtime behavior.
+
+## Later dependency-download and catalog-index failures
+
+At PR #777 head `badd6700`, the product-path CI job failed while installing the
+engine: a crates.io dependency download reported an HTTP/2 framing error and
+exit 101. The product assertions were skipped. The retained job, workflow and
+checkout responses bind merge checkout `ba7c8bf1` and tree `229b8b0d`; this
+failure supplies no passing product-path or later-source credit. The original
+terminal-display refusal is preserved alongside the subsequent raw log download.
+
+At root `d7550d1b`, artifact verifier v2 could not identify the new CLI package's
+`payload_catalog` field and failed with one error. The independently reviewed
+exact-schema v3 adapter checked the same source's 962 unique payloads and 39
+local summary links with zero errors. Both outputs and scripts are preserved.
+This is evidence-integrity verification; the fresh T64 operator rehearsal remains
+unrun. The frozen validation plan and recording helpers are retained separately
+as provenance, without claiming their future results.
