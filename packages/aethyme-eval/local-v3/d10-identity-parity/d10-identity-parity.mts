@@ -597,6 +597,8 @@ function run(): void {
     ["content_sha256", descriptorEntry.content_sha256],
     ["file_id", descriptorFileId.file_id],
   ]);
+  const descriptorEnrollment = new Map<string, CanonicalValue>(descriptorFile);
+  descriptorEnrollment.set("preimage_hex", descriptorFileId.preimage_hex);
   const descriptor = new Map<string, CanonicalValue>([
     ["schema", "aethyme.project-descriptor/experimental-v0"],
     ["project_id", ordinalInputs.project_id],
@@ -615,9 +617,9 @@ function run(): void {
     "descriptor anchor snapshot",
   );
   checkExpectedSnapshot(
-    descriptorFileId,
+    descriptorEnrollment,
     descriptorVector.enrolled_file,
-    "descriptor enrolled FileId preimage",
+    "descriptor enrolled FileId state and preimage",
   );
   check(
     descriptorFileId.file_id === ordinalInputs.descriptor_fixture_expected.enrolled_file_id,
