@@ -21,6 +21,11 @@ use crate::{
     load_retention_policy_report,
 };
 
+mod tree_removal;
+pub(crate) use tree_removal::{
+    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, remove_condemned_tree,
+};
+
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// How deep below a worktree root a build directory is looked for. Deep enough
@@ -1324,194 +1329,6 @@ fn runtime_path(main_root: &Path, relative: &str) -> Result<PathBuf, BrokerOpErr
 
 fn check_deadline(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
-}
-
-/// How many times a directory whose `rmdir` raced a writer is swept again
-/// before the failure is reported. macOS writes `.DS_Store` into directories
-/// as they are browsed, so a removal that takes minutes can find a file in a
-/// directory it already emptied. The second sweep has nothing left to walk and
-/// costs milliseconds, which is far too short a window to lose again.
-const TREE_REMOVAL_ATTEMPTS: usize = 3;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TreeRemoval {
-    /// The directory is gone.
-    Complete,
-    /// The budget ran out. The directory is still there, still carrying the
-    /// evidence that classifies it, and the next pass resumes it.
-    Interrupted,
-}
-
-#[derive(Debug)]
-pub(crate) struct TreeRemovalError {
-    pub(crate) source: std::io::Error,
-    pub(crate) entries_reclaimed: usize,
-}
-
-/// Remove a condemned directory tree without ever losing the evidence that it
-/// was condemned.
-///
-/// Two properties `std::fs::remove_dir_all` does not have, both of which this
-/// code path needs:
-///
-/// * **Resumable.** Removing a multi-gigabyte `target/` takes minutes, which
-///   no budget on a broker-open path can absorb, and a deadline checked only
-///   between whole directories is no deadline at all. Entries go one at a
-///   time, and every call removes at least one of them before the deadline is
-///   consulted, so a budget too small to be worth spending still buys ground.
-///
-///   What makes an interrupted removal safe to resume is `keep_until_last`:
-///   the entry that proves what this directory is -- `CACHEDIR.TAG` for a
-///   cargo target, the root marker for an orphaned worktree root -- is taken
-///   only once everything else is gone. Remove it first and an interrupted
-///   run leaves an unclassifiable directory that GC must then refuse to
-///   touch, which is how a half-finished removal becomes permanent.
-///
-/// * **Tolerant of a racing writer.** Finder and Spotlight write `.DS_Store`
-///   into directories while they are being walked, so the final `rmdir` of a
-///   long removal fails `ENOTEMPTY` against a file created after that
-///   directory was already emptied. A directory that refuses to go is swept
-///   again rather than aborting the caller's whole run.
-pub(crate) fn remove_condemned_tree(
-    dir: &Path,
-    keep_until_last: Option<&str>,
-    deadline: Option<Instant>,
-) -> std::io::Result<TreeRemoval> {
-    remove_condemned_tree_with_progress(dir, keep_until_last, deadline)
-        .map(|(outcome, _)| outcome)
-        .map_err(|error| error.source)
-}
-
-/// Remove a condemned tree and count entries actually unlinked. A partial
-/// deletion can keep the same cursor and interrupted path across passes, so
-/// the continuation worker uses this count instead of mistaking that stable
-/// path for a stalled sweep.
-pub(crate) fn remove_condemned_tree_with_progress(
-    dir: &Path,
-    keep_until_last: Option<&str>,
-    deadline: Option<Instant>,
-) -> Result<(TreeRemoval, usize), TreeRemovalError> {
-    let mut entries_reclaimed = 0;
-    let mut attempts_left = TREE_REMOVAL_ATTEMPTS;
-    loop {
-        attempts_left -= 1;
-        if !is_real_directory(dir) {
-            return Ok((TreeRemoval::Complete, entries_reclaimed));
-        }
-        match drain_directory(dir, keep_until_last, deadline, &mut entries_reclaimed) {
-            Ok(TreeRemoval::Interrupted) => {
-                return Ok((TreeRemoval::Interrupted, entries_reclaimed));
-            }
-            Ok(TreeRemoval::Complete) => {}
-            Err(source) => {
-                return Err(TreeRemovalError {
-                    source,
-                    entries_reclaimed,
-                });
-            }
-        }
-        if let Some(name) = keep_until_last
-            && let Err(source) =
-                remove_entry_with_progress(&dir.join(name), false, &mut entries_reclaimed)
-        {
-            return Err(TreeRemovalError {
-                source,
-                entries_reclaimed,
-            });
-        }
-        match std::fs::remove_dir(dir) {
-            Ok(()) => {
-                entries_reclaimed = entries_reclaimed.saturating_add(1);
-                return Ok((TreeRemoval::Complete, entries_reclaimed));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((TreeRemoval::Complete, entries_reclaimed));
-            }
-            Err(source) if attempts_left == 0 => {
-                return Err(TreeRemovalError {
-                    source,
-                    entries_reclaimed,
-                });
-            }
-            // Something reappeared underneath while we walked. Sweep again.
-            Err(_) => {}
-        }
-    }
-}
-
-/// Empty one directory depth-first, leaving the directory itself in place.
-///
-/// `keep_until_last` is skipped at this level only; the recursion never defers
-/// anything, because only the top directory carries the witness.
-fn drain_directory(
-    dir: &Path,
-    keep_until_last: Option<&str>,
-    deadline: Option<Instant>,
-    entries_reclaimed: &mut usize,
-) -> std::io::Result<TreeRemoval> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(TreeRemoval::Complete);
-        }
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if keep_until_last.is_some_and(|name| entry.file_name() == std::ffi::OsStr::new(name)) {
-            continue;
-        }
-        let path = entry.path();
-        // `DirEntry::file_type` does not follow symlinks, so a link to a
-        // directory is unlinked rather than followed and emptied.
-        let is_directory = match entry.file_type() {
-            Ok(file_type) => file_type.is_dir(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if is_directory
-            && drain_directory(&path, None, deadline, entries_reclaimed)?
-                == TreeRemoval::Interrupted
-        {
-            return Ok(TreeRemoval::Interrupted);
-        }
-        remove_entry_with_progress(&path, is_directory, entries_reclaimed)?;
-        // Checked after the entry, never before: a pass that removes nothing
-        // is a pass that will be repeated forever. Budgets small enough to be
-        // spent on the scan alone are the normal case on a broker open, so
-        // every call has to be worth at least one unlink.
-        if check_deadline(deadline) {
-            return Ok(TreeRemoval::Interrupted);
-        }
-    }
-    Ok(TreeRemoval::Complete)
-}
-
-fn remove_entry_with_progress(
-    path: &Path,
-    is_directory: bool,
-    entries_reclaimed: &mut usize,
-) -> std::io::Result<()> {
-    let removed = if is_directory {
-        std::fs::remove_dir(path)
-    } else {
-        std::fs::remove_file(path)
-    };
-    match removed {
-        Ok(()) => {
-            *entries_reclaimed = entries_reclaimed.saturating_add(1);
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) if is_directory && error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
 }
 
 impl Broker {
@@ -6398,6 +6215,7 @@ mod tests {
     #[test]
     fn removing_what_is_already_gone_is_the_outcome_not_a_failure() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("rust")).unwrap();
         let missing = tmp.path().join("rust/target");
         assert_eq!(
             remove_condemned_tree(&missing, Some("CACHEDIR.TAG"), None).unwrap(),
