@@ -91,7 +91,8 @@ pub(super) fn validate_bindings(
     let descriptor_id = record_id(&bindings.descriptor_record_id)?;
     let descriptor_digest = archive::parse_digest(&bindings.descriptor_object_sha256)
         .ok_or_else(|| TargetError::Invalid("D10 descriptor object digest".into()))?;
-    let descriptor_bytes = archive::read_object(store, &descriptor_digest)?;
+    let descriptor_bytes =
+        archive::read_object_bounded(store, &descriptor_digest, MAX_D10_TARGET_BYTES)?;
     let (descriptor, observed_descriptor_id) = ProjectDescriptor::from_record(&descriptor_bytes)
         .map_err(|error| TargetError::Invalid(format!("D10 descriptor: {error}")))?;
     if observed_descriptor_id != descriptor_id || descriptor.project_id() != &project_id {
@@ -145,7 +146,9 @@ pub(super) fn validate_bindings(
                 "D10 revision is mapped more than once".into(),
             ));
         }
-        let revision_bytes = archive::read_object(store, &revision_digest)?;
+        let remaining_bytes = MAX_D10_TARGET_BYTES.saturating_sub(total_bytes);
+        let revision_bytes =
+            archive::read_object_bounded(store, &revision_digest, remaining_bytes)?;
         total_bytes = total_bytes
             .checked_add(revision_bytes.len())
             .ok_or_else(|| TargetError::Invalid("D10 target size".into()))?;
@@ -191,7 +194,8 @@ pub(super) fn validate_bindings(
         if let Some(brief) = revision.brief() {
             let digest = archive::parse_digest(&brief.object_sha256)
                 .ok_or_else(|| TargetError::Invalid("D10 brief object digest".into()))?;
-            let brief_bytes = archive::read_object(store, &digest)?;
+            let remaining_bytes = MAX_D10_TARGET_BYTES.saturating_sub(total_bytes);
+            let brief_bytes = archive::read_object_bounded(store, &digest, remaining_bytes)?;
             total_bytes = total_bytes
                 .checked_add(brief_bytes.len())
                 .ok_or_else(|| TargetError::Invalid("D10 target size".into()))?;
