@@ -7,6 +7,7 @@
 //! independently present in this store's retained archive. `ProjectKey`
 //! remains the local store key and is never treated as the logical ProjectId.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,16 +15,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aethyme_contracts::experimental_v0::project_identity::{
     PROJECT_DESCRIPTOR_PATH, ProjectDescriptor, ProjectId,
 };
-use aethyme_contracts::experimental_v0::{EntryKind, RecordId, SourceEntry, SourceSnapshot};
+use aethyme_contracts::experimental_v0::{
+    EntryKind, FileIdentityTransition, RecordId, SourceSnapshot, SourceSnapshotId,
+    advance_file_identities,
+};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
+use sha2::Digest;
 
 use crate::collaboration_archive::{self as archive, CommitOid, ObjectDigest};
+use crate::collaboration_gc;
+use crate::collaboration_identity_store::{self as identity_store, ApprovedProjectBinding};
 use crate::collaboration_state::{
-    CollaborationStore, ProjectKey, locate_for_repository, open_for_repository,
+    CollaborationRoot, CollaborationStore, ProjectKey, locate_for_repository, open_for_repository,
 };
-use crate::collaboration_submit::{self, Setting};
-use crate::exit_status;
 
 use super::{Failure, Output};
 
@@ -179,6 +184,25 @@ fn write_descriptor(worktree: &Path, bytes: &[u8]) -> Result<PathBuf, Failure> {
 }
 
 fn bind(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    bind_with_root(main_root, worktree, rest, None)
+}
+
+#[cfg(test)]
+fn bind_at_root(
+    main_root: &Path,
+    worktree: &Path,
+    rest: &[&str],
+    root: &CollaborationRoot,
+) -> Result<Output, Failure> {
+    bind_with_root(main_root, worktree, rest, Some(root))
+}
+
+fn bind_with_root(
+    main_root: &Path,
+    worktree: &Path,
+    rest: &[&str],
+    explicit_root: Option<&CollaborationRoot>,
+) -> Result<Output, Failure> {
     if rest.len() != 2 || rest[0] != "--confirm" {
         return Err(Failure::usage(
             "project bind requires exactly --confirm <descriptor-record-id>",
@@ -187,6 +211,63 @@ fn bind(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Fail
     let confirmed = RecordId::parse(rest[1]).map_err(|error| Failure::usage(error.to_string()))?;
     let head = archive::pin_commit(worktree, "HEAD")
         .map_err(|error| Failure::domain("git", error.to_string()))?;
+    // The initial parse only locates this clone's existing local store. All
+    // validation of the pinned commit is repeated under the archive barrier.
+    let preliminary_snapshot = archive::snapshot_of_commit(worktree, &head)
+        .map_err(|error| Failure::domain("archive", error.to_string()))?;
+    let preliminary_config = committed_regular_file(
+        worktree,
+        &head,
+        &preliminary_snapshot,
+        CONFIG_PATH,
+        MAX_POLICY_BYTES,
+    )?;
+    let preliminary_config = std::str::from_utf8(&preliminary_config).map_err(|_| {
+        Failure::refused(
+            "config_unreadable",
+            "committed config is not UTF-8",
+            CONFIRM_NEXT,
+        )
+    })?;
+    let (project_key, _) = committed_enrollment(preliminary_config)?;
+    let mut store = if let Some(root) = explicit_root {
+        CollaborationStore::open(root, &project_key, &[])
+            .map_err(|error| Failure::domain(error.code(), error.to_string()))?
+    } else {
+        let (_, _, exists) = locate_for_repository(main_root, &project_key)
+            .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+        if !exists {
+            return Err(Failure::refused(
+                "not_initialized",
+                format!(
+                    "local store {} does not exist; project bind never creates collaboration state",
+                    project_key.as_str()
+                ),
+                "initialize this local store through an explicit collaboration capture, then bind",
+            ));
+        }
+        open_for_repository(main_root, &project_key)
+            .map_err(|error| Failure::domain(error.code(), error.to_string()))?
+    };
+    let archive_use = collaboration_gc::archive_use(&store).map_err(|source| {
+        Failure::domain(
+            "archive_lock",
+            format!(
+                "{}: {source}",
+                collaboration_gc::lock_path(&store).display()
+            ),
+        )
+    })?;
+    let _response = crate::collaboration_sensitive::response_use(&store).map_err(|error| {
+        Failure::refused(
+            "sensitive_response",
+            error.to_string(),
+            "resolve the sensitive-content condition before binding a project",
+        )
+    })?;
+
+    // Re-read only the exact pinned commit and verify every authority-bearing
+    // file while reclamation is excluded. Dirty worktree files are irrelevant.
     let snapshot = archive::snapshot_of_commit(worktree, &head)
         .map_err(|error| Failure::domain("archive", error.to_string()))?;
     let config_bytes =
@@ -198,7 +279,13 @@ fn bind(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Fail
             CONFIRM_NEXT,
         )
     })?;
-    let (project_key, pointer) = committed_enrollment(config_text)?;
+    let (validated_project_key, pointer) = committed_enrollment(config_text)?;
+    if validated_project_key != project_key {
+        return Err(Failure::domain(
+            "git",
+            "pinned config changed while resolving the local store".into(),
+        ));
+    }
     if pointer != PROJECT_DESCRIPTOR_PATH {
         return Err(Failure::refused(
             "descriptor_pointer_mismatch",
@@ -241,55 +328,115 @@ fn bind(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Fail
     descriptor
         .validate_anchor(anchor_commit.as_str(), &anchor_snapshot)
         .map_err(|error| Failure::refused("anchor_mismatch", error.to_string(), CONFIRM_NEXT))?;
-
-    // The store's ProjectKey remains a local storage locator. It does not
-    // become the descriptor's logical ProjectId and cannot merge clones.
-    let (_, _, exists) = locate_for_repository(main_root, &project_key)
-        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
-    if !exists {
+    if snapshot.id() == *descriptor.anchor_snapshot() {
         return Err(Failure::refused(
-            "not_initialized",
-            format!(
-                "local store {} does not exist; project bind never creates collaboration state",
-                project_key.as_str()
-            ),
-            "initialize this local store through an explicit collaboration capture, then bind",
+            "bootstrap_not_committed",
+            "the descriptor and its committed config pointer must be committed after the anchor",
+            CONFIRM_NEXT,
         ));
     }
-    let mut store = open_for_repository(main_root, &project_key)
-        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+    if let Some(existing) =
+        identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
+            .map_err(|error| Failure::domain("identity_store", error.to_string()))?
+    {
+        if existing.project_id() != descriptor.project_id()
+            || existing.descriptor_record_id() != &actual_record_id
+        {
+            return Err(Failure::refused(
+                "project_binding_conflict",
+                "this local store is already bound to a different committed descriptor",
+                "inspect the existing descriptor binding; a project mapping is never replaced implicitly",
+            ));
+        }
+        return Ok(binding_output(&project_key, &existing, "already_bound"));
+    }
+
     retain_anchor(&store, &descriptor, &anchor_snapshot)?;
+    let retained_bootstrap =
+        archive::retain_snapshot_for_binding(&mut store, worktree, &head, &archive_use)
+            .map_err(|error| Failure::domain("archive", error.to_string()))?;
+    if retained_bootstrap.snapshot_id != snapshot.id() || retained_bootstrap.commit != head {
+        return Err(Failure::domain(
+            "archive",
+            "retained project bootstrap differs from the pinned committed HEAD snapshot".into(),
+        ));
+    }
     let descriptor_digest = archive::put_object(&store, &descriptor_bytes)
         .map_err(|error| Failure::domain("archive", error.to_string()))?;
+    let initial_state = descriptor
+        .initial_file_identity_state()
+        .map_err(|error| Failure::refused("invalid_descriptor", error.to_string(), CONFIRM_NEXT))?;
+    let transition = advance_file_identities(
+        descriptor.project_id(),
+        &initial_state,
+        actual_record_id.as_str(),
+        &anchor_snapshot,
+        &snapshot,
+        &[],
+    )
+    .map_err(|error| {
+        Failure::refused(
+            "bootstrap_identity_unknown",
+            error.to_string(),
+            CONFIRM_NEXT,
+        )
+    })?;
+    let bootstrap_digest = identity_store::bootstrap_transition_sha256(
+        descriptor.project_id(),
+        &actual_record_id,
+        descriptor.anchor_snapshot(),
+        &retained_bootstrap.snapshot_id,
+        &head,
+        &transition,
+    );
     let result = persist_binding(
         &mut store,
         &descriptor,
         &actual_record_id,
         descriptor_digest,
         &head,
+        &retained_bootstrap.snapshot_id,
+        &bootstrap_digest,
+        &transition,
     )?;
-    Ok((
+    let binding =
+        identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
+            .map_err(|error| Failure::domain("identity_store", error.to_string()))?
+            .ok_or_else(|| {
+                Failure::domain("identity_store", "binding row was not committed".into())
+            })?;
+    Ok(binding_output(&project_key, &binding, result))
+}
+
+fn binding_output(
+    project_key: &ProjectKey,
+    binding: &ApprovedProjectBinding,
+    status: &str,
+) -> Output {
+    (
         json!({
             "schema":"aethyme.collab-project-bind/experimental-v0",
-            "project_id":descriptor.project_id().as_str(),
+            "project_id":binding.project_id().as_str(),
             "project_key":project_key.as_str(),
-            "descriptor_record_id":actual_record_id.as_str(),
-            "descriptor_object_sha256":descriptor_digest.hex(),
-            "anchor_commit":descriptor.anchor_commit(),
-            "anchor_snapshot":descriptor.anchor_snapshot().as_str(),
-            "committed_config_commit":head.as_str(),
-            "status":result,
+            "descriptor_record_id":binding.descriptor_record_id().as_str(),
+            "descriptor_object_sha256":binding.descriptor_object().hex(),
+            "anchor_commit":binding.anchor_commit().as_str(),
+            "anchor_snapshot":binding.descriptor().anchor_snapshot().as_str(),
+            "committed_config_commit":binding.committed_config_commit().as_str(),
+            "bootstrap_snapshot":binding.bootstrap_snapshot().as_str(),
+            "bootstrap_transition_sha256":binding.bootstrap_transition_sha256(),
+            "status":status,
             "grants_execution_authority":false,
             "grants_acceptance_authority":false,
         }),
         format!(
             "local project {} is {} as logical project {} (descriptor {})\nfile identities are local mappings only; no execution or acceptance authority was granted\n",
             project_key.as_str(),
-            result,
-            descriptor.project_id(),
-            actual_record_id
+            status,
+            binding.project_id(),
+            binding.descriptor_record_id()
         ),
-    ))
+    )
 }
 
 fn committed_enrollment(config: &str) -> Result<(ProjectKey, String), Failure> {
@@ -386,13 +533,88 @@ fn committed_regular_file(
         ));
     }
     let spec = format!("{}:{path}", commit.as_str());
-    let output = archive::git(repo)
-        .args(["show", "--no-ext-diff", "--format=", &spec])
+    let blob_output = archive::git(repo)
+        .args(["rev-parse", "--verify", &spec])
         .stdin(Stdio::null())
         .output()
         .map_err(|error| {
+            Failure::domain(
+                "git",
+                format!("could not resolve committed {path}: {error}"),
+            )
+        })?;
+    if !blob_output.status.success() {
+        return Err(Failure::domain(
+            "git",
+            format!(
+                "could not resolve committed {path}: {}",
+                String::from_utf8_lossy(&blob_output.stderr).trim()
+            ),
+        ));
+    }
+    let blob_oid = String::from_utf8_lossy(&blob_output.stdout)
+        .trim()
+        .to_string();
+    CommitOid::parse(&blob_oid)
+        .map_err(|error| Failure::domain("git", format!("invalid committed blob id: {error}")))?;
+    let size_output = archive::git(repo)
+        .args(["cat-file", "-s", &blob_oid])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            Failure::domain(
+                "git",
+                format!("could not inspect committed {path}: {error}"),
+            )
+        })?;
+    if !size_output.status.success() {
+        return Err(Failure::domain(
+            "git",
+            format!(
+                "could not inspect committed {path}: {}",
+                String::from_utf8_lossy(&size_output.stderr).trim()
+            ),
+        ));
+    }
+    let object_size = String::from_utf8_lossy(&size_output.stdout)
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| {
+            Failure::domain("git", format!("invalid committed {path} size: {error}"))
+        })?;
+    if object_size > limit as u64 {
+        return Err(Failure::refused(
+            "file_too_large",
+            format!("committed {path} exceeds the {limit}-byte bound"),
+            "commit a smaller bounded file",
+        ));
+    }
+
+    let mut child = archive::git(repo)
+        .args(["cat-file", "blob", &blob_oid])
+        .stdin(Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
             Failure::domain("git", format!("could not read committed {path}: {error}"))
         })?;
+    let mut bytes = Vec::with_capacity(object_size as usize);
+    let read = child
+        .stdout
+        .take()
+        .ok_or_else(|| Failure::domain("git", "git cat-file did not expose stdout".into()))?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes);
+    let output = child.wait_with_output().map_err(|error| {
+        Failure::domain(
+            "git",
+            format!("could not finish reading committed {path}: {error}"),
+        )
+    })?;
+    read.map_err(|error| {
+        Failure::domain("git", format!("could not read committed {path}: {error}"))
+    })?;
     if !output.status.success() {
         return Err(Failure::domain(
             "git",
@@ -402,20 +624,20 @@ fn committed_regular_file(
             ),
         ));
     }
-    if output.stdout.len() > limit {
+    if bytes.len() as u64 != object_size || bytes.len() > limit {
         return Err(Failure::refused(
             "file_too_large",
-            format!("committed {path} exceeds the {limit}-byte bound"),
+            format!("committed {path} did not match its bounded object size"),
             "commit a smaller bounded file",
         ));
     }
-    if <[u8; 32]>::from(sha2::Sha256::digest(&output.stdout)) != *entry.content_sha256() {
+    if <[u8; 32]>::from(sha2::Sha256::digest(&bytes)) != *entry.content_sha256() {
         return Err(Failure::domain(
             "git",
             format!("committed {path} did not match the verified HEAD snapshot"),
         ));
     }
-    Ok(output.stdout)
+    Ok(bytes)
 }
 
 fn is_ancestor(repo: &Path, ancestor: &CommitOid, descendant: &CommitOid) -> Result<bool, Failure> {
@@ -461,18 +683,18 @@ fn retain_anchor(
     if retained.commit.as_str() != descriptor.anchor_commit() {
         return Err(Failure::domain(
             "archive",
-            "retained anchor snapshot points at a different commit",
+            "retained anchor snapshot points at a different commit".into(),
         ));
     }
     let manifest_digest = ObjectDigest::of_snapshot(descriptor.anchor_snapshot());
     let bytes = archive::read_object(store, &manifest_digest)
         .map_err(|error| Failure::domain("archive", error.to_string()))?;
     let manifest = archive::parse_manifest(&bytes)
-        .ok_or_else(|| Failure::domain("archive", "retained anchor manifest is invalid"))?;
+        .ok_or_else(|| Failure::domain("archive", "retained anchor manifest is invalid".into()))?;
     if &manifest != expected {
         return Err(Failure::domain(
             "archive",
-            "retained anchor manifest differs from the committed descriptor anchor",
+            "retained anchor manifest differs from the committed descriptor anchor".into(),
         ));
     }
     for entry in manifest.entries() {
@@ -489,16 +711,19 @@ fn persist_binding(
     record_id: &RecordId,
     object_digest: ObjectDigest,
     head: &CommitOid,
+    bootstrap_snapshot: &SourceSnapshotId,
+    bootstrap_transition_sha256: &str,
+    bootstrap_transition: &FileIdentityTransition,
 ) -> Result<&'static str, Failure> {
     let conn = store.connection();
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(sqlite)?;
-    type Binding = (String, String, String, String, String, String, String);
+    type Binding = (String, String, String, String, String, String);
     let existing: Option<Binding> = transaction
         .query_row(
             "SELECT project_id,descriptor_record_id,descriptor_object_sha256,anchor_commit,
-                    anchor_snapshot,confirmed_descriptor_record_id,committed_config_commit
+                    anchor_snapshot,confirmed_descriptor_record_id
              FROM local_project_bindings WHERE singleton=1",
             [],
             |row| {
@@ -509,7 +734,6 @@ fn persist_binding(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
-                    row.get(6)?,
                 ))
             },
         )
@@ -547,21 +771,24 @@ fn persist_binding(
     if unexpected {
         return Err(Failure::domain(
             "sqlite",
-            "file identity rows exist without a validated local project binding",
+            "file identity rows exist without a validated local project binding".into(),
         ));
     }
-    let bound_ms = SystemTime::now()
+    let bound_ms: i64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Failure::domain("io", error.to_string()))?
         .as_millis()
         .try_into()
-        .map_err(|_| Failure::domain("io", "system timestamp exceeds SQLite integer range"))?;
+        .map_err(|_| {
+            Failure::domain("io", "system timestamp exceeds SQLite integer range".into())
+        })?;
     transaction
         .execute(
             "INSERT INTO local_project_bindings
              (singleton,project_id,descriptor_record_id,descriptor_object_sha256,anchor_commit,
-              anchor_snapshot,confirmed_descriptor_record_id,committed_config_commit,bound_ms)
-             VALUES (1,?1,?2,?3,?4,?5,?2,?6,?7)",
+              anchor_snapshot,confirmed_descriptor_record_id,committed_config_commit,
+              bootstrap_snapshot,bootstrap_transition_sha256,bound_ms)
+             VALUES (1,?1,?2,?3,?4,?5,?2,?6,?7,?8,?9)",
             rusqlite::params![
                 expected_project,
                 record_id.as_str(),
@@ -569,27 +796,61 @@ fn persist_binding(
                 expected_commit,
                 expected_snapshot,
                 head.as_str(),
+                bootstrap_snapshot.as_str(),
+                bootstrap_transition_sha256,
                 bound_ms,
             ],
         )
         .map_err(sqlite)?;
-    for file in descriptor.files() {
-        transaction
-            .execute(
-                "INSERT INTO local_project_file_ids
-                 (snapshot_id,path,file_id,mode,content_sha256) VALUES (?1,?2,?3,?4,?5)",
-                rusqlite::params![
-                    expected_snapshot,
-                    &file.path,
-                    file.file_id.as_str(),
-                    file.kind.git_mode(),
-                    hex::encode(file.content_sha256),
-                ],
-            )
-            .map_err(sqlite)?;
+    let anchor_state = descriptor
+        .initial_file_identity_state()
+        .map_err(|error| Failure::domain("invalid_descriptor", error.to_string()))?;
+    for file in anchor_state.files() {
+        insert_identity_file_row(
+            &transaction,
+            expected_snapshot,
+            file.path.as_slice(),
+            file.kind,
+            &file.content_sha256,
+            file.file_id.as_str(),
+        )?;
+    }
+    for file in bootstrap_transition.result_files() {
+        insert_identity_file_row(
+            &transaction,
+            bootstrap_snapshot.as_str(),
+            file.path.as_slice(),
+            file.kind,
+            &file.content_sha256,
+            file.file_id.as_str(),
+        )?;
     }
     transaction.commit().map_err(sqlite)?;
     Ok("bound")
+}
+
+fn insert_identity_file_row(
+    transaction: &rusqlite::Transaction<'_>,
+    snapshot: &str,
+    path: &[u8],
+    kind: EntryKind,
+    content_sha256: &[u8; 32],
+    file_id: &str,
+) -> Result<(), Failure> {
+    transaction
+        .execute(
+            "INSERT INTO local_project_file_ids
+             (snapshot_id,path,file_id,mode,content_sha256) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                snapshot,
+                path,
+                file_id,
+                kind.git_mode(),
+                ObjectDigest::from_bytes(*content_sha256).hex()
+            ],
+        )
+        .map_err(sqlite)?;
+    Ok(())
 }
 
 fn validate_file_rows(
@@ -621,14 +882,14 @@ fn validate_file_rows(
                 file.path.clone(),
                 file.file_id.as_str().to_string(),
                 file.kind.git_mode().to_string(),
-                hex::encode(file.content_sha256),
+                ObjectDigest::from_bytes(file.content_sha256).hex(),
             )
         })
         .collect();
     if actual != expected {
         return Err(Failure::domain(
             "sqlite",
-            "stored anchor FileId rows differ from the validated descriptor",
+            "stored anchor FileId rows differ from the validated descriptor".into(),
         ));
     }
     Ok(())
@@ -636,4 +897,268 @@ fn validate_file_rows(
 
 fn sqlite(error: rusqlite::Error) -> Failure {
     Failure::domain("sqlite", error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{PROJECT_DESCRIPTOR_PATH, bind_at_root, enroll};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use crate::collaboration_archive::{self as archive, CommitOid};
+    use crate::collaboration_capture::{
+        self as capture, CaptureOutcome, CapturePolicy, CaptureReceipt, CaptureRequest,
+        OperationId, RetentionBoundary,
+    };
+    use crate::collaboration_identity_store::{self as identity_store, ApprovedProjectBinding};
+    use crate::collaboration_state::{CollaborationRoot, CollaborationStore, ProjectKey};
+    use aethyme_contracts::experimental_v0::SourceSnapshotId;
+
+    pub(crate) type FixtureError = String;
+
+    /// A real local enrollment/binding fixture. It drives the same `enroll`
+    /// and `bind` command functions as the public CLI and owns an isolated
+    /// repository plus host-state root.
+    pub(crate) struct BoundProjectFixture {
+        pub(crate) repo: tempfile::TempDir,
+        pub(crate) host: tempfile::TempDir,
+        pub(crate) store: CollaborationStore,
+        pub(crate) binding: ApprovedProjectBinding,
+        pub(crate) anchor_commit: CommitOid,
+        pub(crate) bootstrap_commit: CommitOid,
+        pub(crate) bootstrap_snapshot: SourceSnapshotId,
+    }
+
+    impl BoundProjectFixture {
+        pub(crate) fn new() -> Result<Self, FixtureError> {
+            let repo = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let host = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let key = ProjectKey::parse("fixture-project").map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(repo.path().join(".aethyme"))
+                .map_err(|error| error.to_string())?;
+            std::fs::write(
+                repo.path().join(".aethyme/config.toml"),
+                format!(
+                    "[collaboration]\ncapture = \"required\"\nproject = \"{}\"\n",
+                    key.as_str()
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(repo.path().join("a.txt"), b"anchor\n")
+                .map_err(|error| error.to_string())?;
+            git(repo.path(), &["init", "-q", "-b", "main"])?;
+            git(repo.path(), &["add", "-A"])?;
+            git(repo.path(), &["commit", "-q", "-m", "fixture anchor"])?;
+            let anchor_commit =
+                archive::pin_commit(repo.path(), "HEAD").map_err(|error| error.to_string())?;
+
+            let root = CollaborationRoot::under_host_state(host.path());
+            let mut store =
+                CollaborationStore::open(&root, &key, &[]).map_err(|error| error.to_string())?;
+            capture_anchor(&mut store, repo.path(), &anchor_commit, "fixture-anchor")?;
+
+            let enroll_args = ["--commit", anchor_commit.as_str(), "--write"];
+            let enrolled = enroll(repo.path(), &enroll_args)
+                .map_err(|failure| format!("project enroll failed: {}", failure.message))?;
+            let descriptor_record_id = enrolled
+                .0
+                .get("descriptor_record_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "project enroll returned no descriptor RecordId".to_string())?
+                .to_string();
+            std::fs::write(
+                repo.path().join(".aethyme/config.toml"),
+                format!(
+                    "[collaboration]\ncapture = \"required\"\nproject = \"{}\"\ndescriptor = \"{}\"\n",
+                    key.as_str(), PROJECT_DESCRIPTOR_PATH
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            git(repo.path(), &["add", "-A"])?;
+            git(
+                repo.path(),
+                &["commit", "-q", "-m", "fixture project binding"],
+            )?;
+            let bootstrap_commit =
+                archive::pin_commit(repo.path(), "HEAD").map_err(|error| error.to_string())?;
+            let bootstrap_snapshot = archive::snapshot_of_commit(repo.path(), &bootstrap_commit)
+                .map_err(|error| error.to_string())?
+                .id();
+            let bind_args = ["--confirm", descriptor_record_id.as_str()];
+            bind_at_root(repo.path(), repo.path(), &bind_args, &root)
+                .map_err(|failure| format!("project bind failed: {}", failure.message))?;
+            let binding = identity_store::resolve_approved_project_binding(&store)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "project bind did not persist an approved binding".to_string())?;
+            Ok(Self {
+                repo,
+                host,
+                store,
+                binding,
+                anchor_commit,
+                bootstrap_commit,
+                bootstrap_snapshot,
+            })
+        }
+
+        pub(crate) fn repo_path(&self) -> &Path {
+            self.repo.path()
+        }
+
+        pub(crate) fn store(&self) -> &CollaborationStore {
+            &self.store
+        }
+
+        pub(crate) fn store_mut(&mut self) -> &mut CollaborationStore {
+            &mut self.store
+        }
+
+        pub(crate) fn commit_file(
+            &mut self,
+            path: &str,
+            bytes: &[u8],
+        ) -> Result<CommitOid, FixtureError> {
+            let destination = self.repo.path().join(path);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(destination, bytes).map_err(|error| error.to_string())?;
+            git(self.repo.path(), &["add", "--", path])?;
+            git(
+                self.repo.path(),
+                &["commit", "-q", "-m", "fixture file update"],
+            )?;
+            archive::pin_commit(self.repo.path(), "HEAD").map_err(|error| error.to_string())
+        }
+
+        pub(crate) fn capture_operation(
+            &mut self,
+            operation_id: &str,
+            base: &CommitOid,
+            result: &CommitOid,
+        ) -> Result<CaptureReceipt, FixtureError> {
+            let operation_id =
+                OperationId::parse(operation_id).map_err(|error| error.to_string())?;
+            let request = CaptureRequest {
+                operation_id,
+                repository: self.repo.path().to_path_buf(),
+                base: base.clone(),
+                result: result.clone(),
+                policy: CapturePolicy::Required,
+                retention: RetentionBoundary::UntilReleased,
+            };
+            match capture::capture(&mut self.store, &request).map_err(|error| error.to_string())? {
+                CaptureOutcome::Acknowledged(receipt) => Ok(receipt),
+                CaptureOutcome::Incomplete { code, detail, .. } => {
+                    Err(format!("capture was incomplete ({code}): {detail}"))
+                }
+            }
+        }
+
+        pub(crate) fn clone_and_bind(&self) -> Result<Self, FixtureError> {
+            let repo = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let host = tempfile::tempdir().map_err(|error| error.to_string())?;
+            git_clone(self.repo.path(), repo.path())?;
+            let root = CollaborationRoot::under_host_state(host.path());
+            let key = self.store.project().clone();
+            let mut store =
+                CollaborationStore::open(&root, &key, &[]).map_err(|error| error.to_string())?;
+            capture_anchor(
+                &mut store,
+                repo.path(),
+                &self.anchor_commit,
+                "fixture-clone-anchor",
+            )?;
+            let descriptor_record_id = self.binding.descriptor_record_id().as_str().to_string();
+            let bind_args = ["--confirm", descriptor_record_id.as_str()];
+            bind_at_root(repo.path(), repo.path(), &bind_args, &root)
+                .map_err(|failure| format!("clone project bind failed: {}", failure.message))?;
+            let binding = identity_store::resolve_approved_project_binding(&store)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "clone bind did not persist an approved binding".to_string())?;
+            let bootstrap_commit =
+                archive::pin_commit(repo.path(), "HEAD").map_err(|error| error.to_string())?;
+            let bootstrap_snapshot = archive::snapshot_of_commit(repo.path(), &bootstrap_commit)
+                .map_err(|error| error.to_string())?
+                .id();
+            Ok(Self {
+                repo,
+                host,
+                store,
+                binding,
+                anchor_commit: self.anchor_commit.clone(),
+                bootstrap_commit,
+                bootstrap_snapshot,
+            })
+        }
+    }
+
+    fn capture_anchor(
+        store: &mut CollaborationStore,
+        repo: &Path,
+        anchor: &CommitOid,
+        operation_id: &str,
+    ) -> Result<(), FixtureError> {
+        let request = CaptureRequest {
+            operation_id: OperationId::parse(operation_id).map_err(|error| error.to_string())?,
+            repository: PathBuf::from(repo),
+            base: anchor.clone(),
+            result: anchor.clone(),
+            policy: CapturePolicy::Required,
+            retention: RetentionBoundary::UntilReleased,
+        };
+        match capture::capture(store, &request).map_err(|error| error.to_string())? {
+            CaptureOutcome::Acknowledged(_) => Ok(()),
+            CaptureOutcome::Incomplete { code, detail, .. } => {
+                Err(format!("anchor capture was incomplete ({code}): {detail}"))
+            }
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> Result<String, FixtureError> {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Aethyme Fixture",
+                "-c",
+                "user.email=fixture@aethyme.invalid",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn git_clone(source: &Path, destination: &Path) -> Result<(), FixtureError> {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+            ])
+            .arg(source)
+            .arg(destination)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
 }

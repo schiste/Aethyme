@@ -725,7 +725,10 @@ pub fn attach_brief(
 /// Drop a contribution from the derived index, and every cached answer that
 /// carries its data: a released or re-briefed contribution's content must not
 /// outlive it in the cache, even though no key would reach those answers.
-fn forget(connection: &rusqlite::Connection, contribution: &str) -> rusqlite::Result<()> {
+pub(crate) fn forget(
+    connection: &rusqlite::Connection,
+    contribution: &str,
+) -> rusqlite::Result<()> {
     for sql in [
         "DELETE FROM context_postings WHERE lineage_record_id = ?1",
         "DELETE FROM context_indexed WHERE lineage_record_id = ?1",

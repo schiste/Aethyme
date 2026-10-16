@@ -951,15 +951,18 @@ pub fn validate_file_proposals(
             let Some(after) = change.after.as_ref() else {
                 continue;
             };
-            if change.before.is_none()
-                && matches!(
-                    change.relation,
-                    IdentityRelation::New
-                        | IdentityRelation::UncertainRename
-                        | IdentityRelation::ExplicitCopy
-                        | IdentityRelation::ExplicitSplit
-                )
-            {
+            let destination_is_new = match change.relation {
+                IdentityRelation::ExplicitRename => change
+                    .before
+                    .as_ref()
+                    .is_some_and(|before| before.path != after.path),
+                IdentityRelation::New
+                | IdentityRelation::UncertainRename
+                | IdentityRelation::ExplicitCopy
+                | IdentityRelation::ExplicitSplit => change.before.is_none(),
+                _ => false,
+            };
+            if destination_is_new {
                 by_path
                     .entry(after.path.clone())
                     .or_default()

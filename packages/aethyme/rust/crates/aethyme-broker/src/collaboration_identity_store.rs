@@ -10,23 +10,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aethyme_contracts::experimental_v0::{
     BriefReference, ContributionId, ContributionRevision, EntryKind, FileId,
-    FileIdentityTransition, FileOperation, IdentityRelation, ProjectDescriptor,
-    ProjectFileIdentityState, ProjectId, RecordId, SourceSnapshot, SourceSnapshotId,
-    advance_file_identities,
+    FileIdentityTransition, FileOperation, ProjectDescriptor, ProjectFileIdentityState, ProjectId,
+    RecordId, SourceSnapshot, SourceSnapshotId, advance_file_identities,
     brief::Brief,
     canonical_json::{Object, Value as CanonicalValue},
     contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
-    project_identity::MAX_DESCRIPTOR_BYTES,
+    project_identity::{MAX_DESCRIPTOR_BYTES, PROJECT_DESCRIPTOR_PATH},
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use thiserror::Error;
 
 use crate::collaboration_archive::{self as archive, CommitOid, ObjectDigest};
 use crate::collaboration_capture::OperationId;
+use crate::collaboration_gc::{self, ArchiveUse};
 use crate::collaboration_state::{CollaborationStore, ProjectKey};
 
 const REQUIRED_SCHEMA: i64 = 26;
 const MAX_REPLAY_REVISIONS: usize = 10_000;
+const MAX_REPLAY_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SNAPSHOT_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 
 /// An approved mapping for this exact local store. Fields are private so
@@ -41,6 +42,8 @@ pub struct ApprovedProjectBinding {
     descriptor_object: ObjectDigest,
     anchor_commit: CommitOid,
     committed_config_commit: CommitOid,
+    bootstrap_snapshot: SourceSnapshotId,
+    bootstrap_transition_sha256: String,
 }
 
 impl ApprovedProjectBinding {
@@ -68,6 +71,14 @@ impl ApprovedProjectBinding {
         &self.committed_config_commit
     }
 
+    pub fn bootstrap_snapshot(&self) -> &SourceSnapshotId {
+        &self.bootstrap_snapshot
+    }
+
+    pub fn bootstrap_transition_sha256(&self) -> &str {
+        &self.bootstrap_transition_sha256
+    }
+
     fn belongs_to(&self, store: &CollaborationStore) -> bool {
         self.store_project == *store.project() && self.store_dir == store.project_dir()
     }
@@ -80,6 +91,12 @@ pub enum IdentityStateProvenance {
         descriptor_record_id: RecordId,
         anchor_commit: CommitOid,
         committed_config_commit: CommitOid,
+    },
+    ProjectBindingBootstrap {
+        descriptor_record_id: RecordId,
+        bootstrap_snapshot: SourceSnapshotId,
+        committed_config_commit: CommitOid,
+        transition_sha256: String,
     },
     Replayed {
         revision_record_ids: Vec<RecordId>,
@@ -144,6 +161,7 @@ pub enum IdentityStateUnknownReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityStateResolution {
     Anchor(ResolvedProjectFileIdentityState),
+    Bootstrap(ResolvedProjectFileIdentityState),
     Replayed(ResolvedProjectFileIdentityState),
     Unknown {
         snapshot: SourceSnapshotId,
@@ -162,6 +180,15 @@ pub struct ContributionRevisionRequest<'a> {
     pub depends_on: Option<&'a [RecordId]>,
 }
 
+/// One exact immutable revision pin; the logical ContributionId is checked
+/// against both the row and archived revision bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct ContributionRevisionPin<'a> {
+    pub revision_record_id: &'a RecordId,
+    pub object_digest: ObjectDigest,
+    pub contribution_id: &'a ContributionId,
+}
+
 /// An exact retained D10 revision, validated against the approved binding and
 /// replayed identity history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,10 +199,13 @@ pub struct ResolvedContributionRevision {
     object_digest: ObjectDigest,
     brief_object_digest: Option<ObjectDigest>,
     brief: Option<Brief>,
+    brief_record_bytes: Option<Vec<u8>>,
     capture_record_id: RecordId,
     base_state: ResolvedProjectFileIdentityState,
     result_state: ResolvedProjectFileIdentityState,
     identity_transition: FileIdentityTransition,
+    identity_proof_revision_ids: BTreeSet<RecordId>,
+    identity_proof_object_digests: BTreeSet<ObjectDigest>,
 }
 
 impl ResolvedContributionRevision {
@@ -210,6 +240,11 @@ impl ResolvedContributionRevision {
         self.brief.as_ref()
     }
 
+    /// Exact canonical bytes of the brief object validated against this revision.
+    pub fn brief_record_bytes(&self) -> Option<&[u8]> {
+        self.brief_record_bytes.as_deref()
+    }
+
     pub fn capture_record_id(&self) -> &RecordId {
         &self.capture_record_id
     }
@@ -232,6 +267,18 @@ impl ResolvedContributionRevision {
     pub fn identity_transition(&self) -> &FileIdentityTransition {
         &self.identity_transition
     }
+
+    /// Exact revision ancestors, including this revision, whose immutable
+    /// FileId transitions support the resolved result.
+    pub fn identity_proof_revision_ids(&self) -> &BTreeSet<RecordId> {
+        &self.identity_proof_revision_ids
+    }
+
+    /// Archive objects for the exact identity proof: each revision record
+    /// and its immutable brief when present, including this revision.
+    pub fn identity_proof_object_digests(&self) -> &BTreeSet<ObjectDigest> {
+        &self.identity_proof_object_digests
+    }
 }
 
 #[derive(Debug, Error)]
@@ -248,6 +295,18 @@ pub enum IdentityStoreError {
     Corrupt(String),
     #[error("bounded identity replay is limited to {MAX_REPLAY_REVISIONS} revisions")]
     ReplayLimit,
+    #[error("bounded identity replay exceeds the {MAX_REPLAY_ARCHIVE_BYTES}-byte archive budget")]
+    ReplayByteLimit,
+    #[error("duplicate revision pin {0}")]
+    DuplicateRevisionPin(String),
+    #[error("archive use guard belongs to a different project store")]
+    ForeignArchiveUse,
+    #[error("could not acquire the shared archive-use lock at {path}: {source}")]
+    ArchiveLock {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("revision {0} is not retained in the approved local project")]
     UnknownRevision(String),
     #[error("capture operation {0} has no retained committed receipt")]
@@ -281,6 +340,69 @@ pub enum IdentityStoreError {
     Snapshot(#[from] aethyme_contracts::experimental_v0::SourceSnapshotError),
 }
 
+impl IdentityStoreError {
+    /// Stable machine-readable code for CLI and typed context error mapping.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedSchema { .. } => "unsupported_schema",
+            Self::Unbound => "project_unbound",
+            Self::ForeignStore => "foreign_store",
+            Self::Corrupt(_) => "corrupt_state",
+            Self::ReplayLimit => "identity_replay_limit",
+            Self::ReplayByteLimit => "identity_replay_byte_limit",
+            Self::DuplicateRevisionPin(_) => "duplicate_revision_pin",
+            Self::ForeignArchiveUse => "foreign_archive_guard",
+            Self::ArchiveLock { .. } => "archive_lock",
+            Self::UnknownRevision(_) => "unknown_revision",
+            Self::UnknownCaptureOperation(_) => "unknown_capture_operation",
+            Self::AmbiguousCaptureLineage(_) => "ambiguous_capture_lineage",
+            Self::ConcurrentRevision => "concurrent_revision",
+            Self::Randomness(_) => "io",
+            Self::UnknownSnapshot { reason, .. } => match reason {
+                IdentityStateUnknownReason::SnapshotNotRetained => "snapshot_not_retained",
+                IdentityStateUnknownReason::NoValidatedHistory => "identity_history_unknown",
+                IdentityStateUnknownReason::CompetingHistories => "identity_history_conflict",
+                IdentityStateUnknownReason::HistoryDependsOnUnretainedCapture => {
+                    "identity_history_unretained"
+                }
+            },
+            Self::Archive(error) => error.code(),
+            Self::Sqlite(_) => "sqlite",
+            Self::Sensitive(error) => match error {
+                crate::collaboration_sensitive::SensitiveError::Quarantined => {
+                    "sensitive_quarantined"
+                }
+                crate::collaboration_sensitive::SensitiveError::Mismatch => {
+                    "sensitive_authority_mismatch"
+                }
+                crate::collaboration_sensitive::SensitiveError::NotFrozen => "sensitive_not_frozen",
+                crate::collaboration_sensitive::SensitiveError::Busy => "sensitive_busy",
+                crate::collaboration_sensitive::SensitiveError::UnknownWork => {
+                    "sensitive_unknown_work"
+                }
+                crate::collaboration_sensitive::SensitiveError::UnclassifiedFiles => {
+                    "sensitive_unclassified_files"
+                }
+                crate::collaboration_sensitive::SensitiveError::Invalid(_) => {
+                    "sensitive_state_invalid"
+                }
+                crate::collaboration_sensitive::SensitiveError::Io(_) => "io",
+                crate::collaboration_sensitive::SensitiveError::Sqlite(_) => "sqlite",
+                crate::collaboration_sensitive::SensitiveError::Json(_) => {
+                    "sensitive_state_invalid"
+                }
+                crate::collaboration_sensitive::SensitiveError::State(_) => "state",
+                crate::collaboration_sensitive::SensitiveError::Authority(_) => "authority",
+                crate::collaboration_sensitive::SensitiveError::Gc(error) => error.code(),
+            },
+            Self::Project(_) => "invalid_project_identity",
+            Self::Revision(_) => "invalid_contribution_revision",
+            Self::Brief(_) => "invalid_brief",
+            Self::Snapshot(_) => "invalid_source_snapshot",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RevisionRow {
     record_id: RecordId,
@@ -290,6 +412,7 @@ struct RevisionRow {
     revision: ContributionRevision,
     brief_object_digest: Option<ObjectDigest>,
     brief: Option<Brief>,
+    brief_record_bytes: Option<Vec<u8>>,
     source_retained: bool,
 }
 
@@ -315,13 +438,39 @@ struct ReplayIndex {
 pub fn resolve_approved_project_binding(
     store: &CollaborationStore,
 ) -> Result<Option<ApprovedProjectBinding>, IdentityStoreError> {
+    let archive_use = acquire_archive_use(store)?;
+    resolve_approved_project_binding_with_archive_use(store, &archive_use)
+}
+
+pub(crate) fn resolve_approved_project_binding_with_archive_use(
+    store: &CollaborationStore,
+    archive_use: &ArchiveUse,
+) -> Result<Option<ApprovedProjectBinding>, IdentityStoreError> {
+    validate_archive_use(store, archive_use)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    resolve_approved_project_binding_locked(store)
+}
+
+fn resolve_approved_project_binding_locked(
+    store: &CollaborationStore,
+) -> Result<Option<ApprovedProjectBinding>, IdentityStoreError> {
     require_schema(store)?;
-    let row: Option<(String, String, String, String, String, String, String)> = store
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )> = store
         .read_connection()
         .query_row(
             "SELECT project_id,descriptor_record_id,descriptor_object_sha256,anchor_commit,
-                    anchor_snapshot,confirmed_descriptor_record_id,committed_config_commit
+                    anchor_snapshot,confirmed_descriptor_record_id,committed_config_commit,
+                    bootstrap_snapshot,bootstrap_transition_sha256
              FROM local_project_bindings WHERE singleton=1",
             [],
             |row| {
@@ -333,6 +482,8 @@ pub fn resolve_approved_project_binding(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
@@ -345,6 +496,8 @@ pub fn resolve_approved_project_binding(
         anchor_snapshot_text,
         confirmed_text,
         config_commit_text,
+        bootstrap_snapshot_text,
+        bootstrap_transition_text,
     )) = row
     else {
         return Ok(None);
@@ -365,6 +518,17 @@ pub fn resolve_approved_project_binding(
         .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
     let committed_config_commit = CommitOid::parse(&config_commit_text)
         .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+    let bootstrap_snapshot = SourceSnapshotId::parse(&bootstrap_snapshot_text)
+        .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+    if bootstrap_transition_text.len() != 64
+        || !bootstrap_transition_text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(IdentityStoreError::Corrupt(
+            "invalid bootstrap transition digest".into(),
+        ));
+    }
     let descriptor_bytes =
         archive::read_object_bounded(store, &descriptor_object, MAX_DESCRIPTOR_BYTES)?;
     let (descriptor, observed_id) = ProjectDescriptor::from_record(&descriptor_bytes)?;
@@ -391,7 +555,57 @@ pub fn resolve_approved_project_binding(
             "retained anchor manifest differs from the descriptor file inventory".into(),
         ));
     }
-    validate_anchor_file_rows(store, &descriptor)?;
+    validate_identity_file_rows(
+        store,
+        descriptor.anchor_snapshot(),
+        &descriptor.initial_file_identity_state()?,
+    )?;
+
+    let retained_bootstrap = archive::retained(store, &bootstrap_snapshot)?.ok_or_else(|| {
+        IdentityStoreError::Corrupt("binding bootstrap snapshot is not retained".into())
+    })?;
+    if retained_bootstrap.commit != committed_config_commit {
+        return Err(IdentityStoreError::Corrupt(
+            "committed config commit differs from the retained bootstrap snapshot".into(),
+        ));
+    }
+    if bootstrap_snapshot == *descriptor.anchor_snapshot() {
+        return Err(IdentityStoreError::Corrupt(
+            "binding bootstrap must be a distinct committed snapshot after the anchor".into(),
+        ));
+    }
+    let bootstrap_source = read_retained_snapshot(store, &bootstrap_snapshot)?;
+    validate_committed_binding_files(
+        store,
+        &bootstrap_source,
+        &descriptor_bytes,
+        &descriptor_record_id,
+    )?;
+    let anchor_source = read_retained_snapshot(store, descriptor.anchor_snapshot())?;
+    let bootstrap_transition = advance_file_identities(
+        &project_id,
+        &descriptor.initial_file_identity_state()?,
+        descriptor_record_id.as_str(),
+        &anchor_source,
+        &bootstrap_source,
+        &[],
+    )
+    .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+    let expected_bootstrap_digest = bootstrap_transition_sha256(
+        &project_id,
+        &descriptor_record_id,
+        descriptor.anchor_snapshot(),
+        &bootstrap_snapshot,
+        &committed_config_commit,
+        &bootstrap_transition,
+    );
+    if expected_bootstrap_digest != bootstrap_transition_text {
+        return Err(IdentityStoreError::Corrupt(
+            "stored bootstrap transition differs from its committed source snapshots".into(),
+        ));
+    }
+    let bootstrap_state = bootstrap_transition.result_identity_state();
+    validate_identity_file_rows(store, &bootstrap_snapshot, &bootstrap_state)?;
 
     Ok(Some(ApprovedProjectBinding {
         store_project: store.project().clone(),
@@ -402,6 +616,8 @@ pub fn resolve_approved_project_binding(
         descriptor_object,
         anchor_commit,
         committed_config_commit,
+        bootstrap_snapshot,
+        bootstrap_transition_sha256: bootstrap_transition_text,
     }))
 }
 
@@ -414,7 +630,26 @@ pub fn resolve_project_file_identity_state(
     binding: &ApprovedProjectBinding,
     snapshot: &SourceSnapshotId,
 ) -> Result<IdentityStateResolution, IdentityStoreError> {
+    let archive_use = acquire_archive_use(store)?;
+    resolve_project_file_identity_state_with_archive_use(store, binding, snapshot, &archive_use)
+}
+
+pub(crate) fn resolve_project_file_identity_state_with_archive_use(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    snapshot: &SourceSnapshotId,
+    archive_use: &ArchiveUse,
+) -> Result<IdentityStateResolution, IdentityStoreError> {
+    validate_archive_use(store, archive_use)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    resolve_project_file_identity_state_locked(store, binding, snapshot)
+}
+
+fn resolve_project_file_identity_state_locked(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    snapshot: &SourceSnapshotId,
+) -> Result<IdentityStateResolution, IdentityStoreError> {
     validate_binding_store(store, binding)?;
     require_schema(store)?;
     if archive::retained(store, snapshot)?.is_none() {
@@ -444,6 +679,8 @@ pub fn resolve_project_file_identity_state(
     let resolved = resolved_state(binding, snapshot, state);
     if snapshot == binding.descriptor.anchor_snapshot() {
         Ok(IdentityStateResolution::Anchor(resolved))
+    } else if snapshot == binding.bootstrap_snapshot() {
+        Ok(IdentityStateResolution::Bootstrap(resolved))
     } else {
         Ok(IdentityStateResolution::Replayed(resolved))
     }
@@ -459,11 +696,98 @@ pub fn resolve_bound_contribution_revision(
     expected_revision_object: ObjectDigest,
     expected_contribution: &ContributionId,
 ) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    let archive_use = acquire_archive_use(store)?;
+    resolve_bound_contribution_revision_with_archive_use(
+        store,
+        binding,
+        revision_record_id,
+        expected_revision_object,
+        expected_contribution,
+        &archive_use,
+    )
+}
+
+/// Resolve one exact target-pinned revision while the caller retains the
+/// shared archive barrier.
+pub(crate) fn resolve_bound_contribution_revision_with_archive_use(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    revision_record_id: &RecordId,
+    expected_revision_object: ObjectDigest,
+    expected_contribution: &ContributionId,
+    archive_use: &ArchiveUse,
+) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    let pin = ContributionRevisionPin {
+        revision_record_id,
+        object_digest: expected_revision_object,
+        contribution_id: expected_contribution,
+    };
+    let mut rows =
+        resolve_bound_contribution_revisions_with_archive_use(store, binding, &[pin], archive_use)?;
+    rows.remove(revision_record_id)
+        .ok_or_else(|| IdentityStoreError::UnknownRevision(revision_record_id.as_str().into()))
+}
+
+/// Resolve a bounded set of target/context revision pins using one validated
+/// history replay. The result is keyed by immutable revision RecordId.
+pub fn resolve_bound_contribution_revisions(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    pins: &[ContributionRevisionPin<'_>],
+) -> Result<BTreeMap<RecordId, ResolvedContributionRevision>, IdentityStoreError> {
+    let archive_use = acquire_archive_use(store)?;
+    resolve_bound_contribution_revisions_with_archive_use(store, binding, pins, &archive_use)
+}
+
+/// Resolve revision pins while the caller retains the shared archive barrier.
+pub(crate) fn resolve_bound_contribution_revisions_with_archive_use(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    pins: &[ContributionRevisionPin<'_>],
+    archive_use: &ArchiveUse,
+) -> Result<BTreeMap<RecordId, ResolvedContributionRevision>, IdentityStoreError> {
+    validate_archive_use(store, archive_use)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     validate_binding_store(store, binding)?;
     require_schema(store)?;
+
+    let mut seen = BTreeSet::new();
+    for pin in pins {
+        if !seen.insert(pin.revision_record_id.clone()) {
+            return Err(IdentityStoreError::DuplicateRevisionPin(
+                pin.revision_record_id.as_str().to_string(),
+            ));
+        }
+    }
+    if pins.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
     let replay = replay_history(store, binding)?;
     validate_cached_maps(store, &replay)?;
+    let mut resolved = BTreeMap::new();
+    for pin in pins {
+        let item = resolve_bound_contribution_revision_from_replay(
+            store,
+            binding,
+            &replay,
+            pin.revision_record_id,
+            pin.object_digest,
+            pin.contribution_id,
+        )?;
+        resolved.insert(pin.revision_record_id.clone(), item);
+    }
+    Ok(resolved)
+}
+
+fn resolve_bound_contribution_revision_from_replay(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    replay: &ReplayIndex,
+    revision_record_id: &RecordId,
+    expected_revision_object: ObjectDigest,
+    expected_contribution: &ContributionId,
+) -> Result<ResolvedContributionRevision, IdentityStoreError> {
     let Some(row) = replay.rows.get(revision_record_id) else {
         return Err(IdentityStoreError::UnknownRevision(
             revision_record_id.as_str().to_string(),
@@ -476,7 +800,7 @@ pub fn resolve_bound_contribution_revision(
             "target revision pin differs from the retained revision object".into(),
         ));
     }
-    let base = unique_state(&replay, row.revision.base())?;
+    let base = unique_state(replay, row.revision.base())?;
     if !row.source_retained
         || archive::retained(store, row.revision.base())?.is_none()
         || archive::retained(store, row.revision.result())?.is_none()
@@ -498,22 +822,15 @@ pub fn resolve_bound_contribution_revision(
                 IdentityStateUnknownReason::NoValidatedHistory
             },
         })?;
-    let base_revision_record_ids = match &base.provenance {
-        IdentityStateProvenance::DescriptorAnchor { .. } => Vec::new(),
-        IdentityStateProvenance::Replayed {
-            revision_record_ids,
-        } => revision_record_ids.clone(),
-        IdentityStateProvenance::RevisionTransition {
-            revision_record_id,
-            base_revision_record_ids,
-        } => {
-            let mut ids = base_revision_record_ids.clone();
-            ids.push(revision_record_id.clone());
-            ids.sort();
-            ids.dedup();
-            ids
-        }
-    };
+    let base_state = resolved_state(binding, row.revision.base(), base);
+    let (identity_proof_revision_ids, identity_proof_object_digests) = identity_proof_artifacts(
+        replay,
+        &base_state,
+        &row.record_id,
+        row.object_digest,
+        row.brief_object_digest,
+    )?;
+    let base_revision_record_ids = base.provenance.iter().cloned().collect();
     let result_state = ResolvedProjectFileIdentityState {
         store_project: binding.store_project.clone(),
         store_dir: binding.store_dir.clone(),
@@ -532,10 +849,13 @@ pub fn resolve_bound_contribution_revision(
         object_digest: row.object_digest,
         brief_object_digest: row.brief_object_digest,
         brief: row.brief.clone(),
+        brief_record_bytes: row.brief_record_bytes.clone(),
         capture_record_id: row.lineage_record_id.clone(),
-        base_state: resolved_state(binding, row.revision.base(), base),
+        base_state,
         result_state,
         identity_transition: transition,
+        identity_proof_revision_ids,
+        identity_proof_object_digests,
     })
 }
 
@@ -556,7 +876,61 @@ pub fn validate_bound_contribution_revision_bytes(
     revision_bytes: &[u8],
     brief_bytes: Option<&[u8]>,
 ) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    let archive_use = acquire_archive_use(store)?;
+    validate_bound_contribution_revision_bytes_with_archive_use(
+        store,
+        binding,
+        base_state,
+        expected_record_id,
+        expected_object_digest,
+        expected_contribution,
+        expected_capture_lineage,
+        revision_bytes,
+        brief_bytes,
+        &archive_use,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_bound_contribution_revision_bytes_with_archive_use(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    base_state: &ResolvedProjectFileIdentityState,
+    expected_record_id: &RecordId,
+    expected_object_digest: ObjectDigest,
+    expected_contribution: &ContributionId,
+    expected_capture_lineage: Option<&RecordId>,
+    revision_bytes: &[u8],
+    brief_bytes: Option<&[u8]>,
+    archive_use: &ArchiveUse,
+) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    validate_archive_use(store, archive_use)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    validate_bound_contribution_revision_bytes_locked(
+        store,
+        binding,
+        base_state,
+        expected_record_id,
+        expected_object_digest,
+        expected_contribution,
+        expected_capture_lineage,
+        revision_bytes,
+        brief_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_bound_contribution_revision_bytes_locked(
+    store: &CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    base_state: &ResolvedProjectFileIdentityState,
+    expected_record_id: &RecordId,
+    expected_object_digest: ObjectDigest,
+    expected_contribution: &ContributionId,
+    expected_capture_lineage: Option<&RecordId>,
+    revision_bytes: &[u8],
+    brief_bytes: Option<&[u8]>,
+) -> Result<ResolvedContributionRevision, IdentityStoreError> {
     validate_binding_store(store, binding)?;
     require_schema(store)?;
     if !base_state.belongs_to(binding) {
@@ -595,8 +969,8 @@ pub fn validate_bound_contribution_revision_bytes(
         ));
     }
 
-    let (brief_object_digest, brief) = match (revision.brief(), brief_bytes) {
-        (None, None) => (None, None),
+    let (brief_object_digest, brief, brief_record_bytes) = match (revision.brief(), brief_bytes) {
+        (None, None) => (None, None, None),
         (Some(reference), Some(bytes)) => {
             let digest = ObjectDigest::of(bytes);
             if digest.hex().as_str() != reference.object_sha256.as_str() {
@@ -605,12 +979,12 @@ pub fn validate_bound_contribution_revision_bytes(
                 ));
             }
             let (brief, observed_brief_id) = Brief::from_record(bytes)?;
-            if observed_brief_id != reference.record_id {
+            if observed_brief_id.as_str() != reference.record_id.as_str() {
                 return Err(IdentityStoreError::Corrupt(
                     "received brief bytes differ from the immutable revision RecordId".into(),
                 ));
             }
-            (Some(digest), Some(brief))
+            (Some(digest), Some(brief), Some(bytes.to_vec()))
         }
         _ => {
             return Err(IdentityStoreError::Corrupt(
@@ -664,6 +1038,13 @@ pub fn validate_bound_contribution_revision_bytes(
             base_revision_record_ids,
         },
     };
+    let (identity_proof_revision_ids, identity_proof_object_digests) = identity_proof_artifacts(
+        &replay,
+        &verified_base,
+        &observed_record_id,
+        expected_object_digest,
+        brief_object_digest,
+    )?;
     let capture_record_id = revision.capture_record_id().clone();
     Ok(ResolvedContributionRevision {
         revision,
@@ -672,10 +1053,13 @@ pub fn validate_bound_contribution_revision_bytes(
         object_digest: expected_object_digest,
         brief_object_digest,
         brief,
+        brief_record_bytes,
         capture_record_id,
         base_state: verified_base,
         result_state,
         identity_transition: transition,
+        identity_proof_revision_ids,
+        identity_proof_object_digests,
     })
 }
 
@@ -689,7 +1073,27 @@ pub fn revise_contribution_for_operation(
     binding: &ApprovedProjectBinding,
     request: ContributionRevisionRequest<'_>,
 ) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    let archive_use = acquire_archive_use(store)?;
+    revise_contribution_for_operation_with_archive_use(store, binding, request, &archive_use)
+}
+
+pub(crate) fn revise_contribution_for_operation_with_archive_use(
+    store: &mut CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    request: ContributionRevisionRequest<'_>,
+    archive_use: &ArchiveUse,
+) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    validate_archive_use(store, archive_use)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    revise_contribution_for_operation_locked(store, binding, request, archive_use)
+}
+
+fn revise_contribution_for_operation_locked(
+    store: &mut CollaborationStore,
+    binding: &ApprovedProjectBinding,
+    request: ContributionRevisionRequest<'_>,
+    archive_use: &ArchiveUse,
+) -> Result<ResolvedContributionRevision, IdentityStoreError> {
     validate_binding_store(store, binding)?;
     require_schema(store)?;
 
@@ -730,8 +1134,15 @@ pub fn revise_contribution_for_operation(
         ));
     }
 
-    let base_state = match resolve_project_file_identity_state(store, binding, &base_snapshot)? {
-        IdentityStateResolution::Anchor(state) | IdentityStateResolution::Replayed(state) => state,
+    let base_state = match resolve_project_file_identity_state_with_archive_use(
+        store,
+        binding,
+        &base_snapshot,
+        archive_use,
+    )? {
+        IdentityStateResolution::Anchor(state)
+        | IdentityStateResolution::Bootstrap(state)
+        | IdentityStateResolution::Replayed(state) => state,
         IdentityStateResolution::Unknown { snapshot, reason } => {
             return Err(IdentityStoreError::UnknownSnapshot {
                 snapshot: snapshot.as_str().to_string(),
@@ -789,8 +1200,14 @@ pub fn revise_contribution_for_operation(
             .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
         let digest = archive::parse_digest(digest_text)
             .ok_or_else(|| IdentityStoreError::Corrupt("invalid current revision digest".into()))?;
-        let resolved =
-            resolve_bound_contribution_revision(store, binding, &head, digest, &contribution_id)?;
+        let resolved = resolve_bound_contribution_revision_with_archive_use(
+            store,
+            binding,
+            &head,
+            digest,
+            &contribution_id,
+            archive_use,
+        )?;
         Some(resolved.revision().clone())
     } else {
         None
@@ -972,64 +1389,69 @@ pub fn revise_contribution_for_operation(
             ));
         }
     }
-    transaction.execute(
-        "INSERT INTO contribution_revision_heads (contribution_id,revision_record_id)
-         VALUES (?1,?2)
-         ON CONFLICT(contribution_id) DO UPDATE
-         SET revision_record_id=excluded.revision_record_id",
-        rusqlite::params![contribution_id.as_str(), revision_record_id.as_str()],
-    )?;
+    if changed > 0 {
+        transaction.execute(
+            "INSERT INTO contribution_revision_heads (contribution_id,revision_record_id)
+             VALUES (?1,?2)
+             ON CONFLICT(contribution_id) DO UPDATE
+             SET revision_record_id=excluded.revision_record_id",
+            rusqlite::params![contribution_id.as_str(), revision_record_id.as_str()],
+        )?;
+    }
 
-    let logical_count: i64 = transaction.query_row(
-        "SELECT count(*) FROM local_logical_contributions WHERE lineage_record_id=?1",
-        [lineage_record_id.as_str()],
-        |row| row.get(0),
-    )?;
-    if logical_count == 1 {
-        if let (Some(brief_record_id), Some(brief_digest)) = (&brief_record_id, &brief_digest) {
-            transaction.execute(
-                "INSERT INTO contribution_briefs
-                     (lineage_record_id,brief_record_id,brief_sha256,attached_ms,revision_record_id)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(lineage_record_id) DO UPDATE SET
-                     brief_record_id=excluded.brief_record_id,
-                     brief_sha256=excluded.brief_sha256,
-                     attached_ms=excluded.attached_ms,
-                     revision_record_id=excluded.revision_record_id",
-                rusqlite::params![
-                    lineage_record_id.as_str(),
-                    brief_record_id.as_str(),
-                    brief_digest.hex(),
-                    now,
-                    revision_record_id.as_str()
-                ],
-            )?;
+    if changed > 0 {
+        let logical_count: i64 = transaction.query_row(
+            "SELECT count(*) FROM local_logical_contributions WHERE lineage_record_id=?1",
+            [lineage_record_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if logical_count == 1 {
+            if let (Some(brief_record_id), Some(brief_digest)) = (&brief_record_id, &brief_digest) {
+                transaction.execute(
+                    "INSERT INTO contribution_briefs
+                         (lineage_record_id,brief_record_id,brief_sha256,attached_ms,revision_record_id)
+                     VALUES (?1,?2,?3,?4,?5)
+                     ON CONFLICT(lineage_record_id) DO UPDATE SET
+                         brief_record_id=excluded.brief_record_id,
+                         brief_sha256=excluded.brief_sha256,
+                         attached_ms=excluded.attached_ms,
+                         revision_record_id=excluded.revision_record_id",
+                    rusqlite::params![
+                        lineage_record_id.as_str(),
+                        brief_record_id.as_str(),
+                        brief_digest.hex(),
+                        now,
+                        revision_record_id.as_str()
+                    ],
+                )?;
+            } else {
+                transaction.execute(
+                    "DELETE FROM contribution_briefs
+                     WHERE lineage_record_id=?1 AND revision_record_id IS NOT NULL",
+                    [lineage_record_id.as_str()],
+                )?;
+            }
+            crate::collaboration_context::forget(&transaction, lineage_record_id.as_str())?;
         } else {
-            transaction.execute(
+            let removed = transaction.execute(
                 "DELETE FROM contribution_briefs
                  WHERE lineage_record_id=?1 AND revision_record_id IS NOT NULL",
                 [lineage_record_id.as_str()],
             )?;
-        }
-        crate::collaboration_context::forget(&transaction, lineage_record_id.as_str())?;
-    } else {
-        let removed = transaction.execute(
-            "DELETE FROM contribution_briefs
-             WHERE lineage_record_id=?1 AND revision_record_id IS NOT NULL",
-            [lineage_record_id.as_str()],
-        )?;
-        if removed > 0 {
-            crate::collaboration_context::forget(&transaction, lineage_record_id.as_str())?;
+            if removed > 0 {
+                crate::collaboration_context::forget(&transaction, lineage_record_id.as_str())?;
+            }
         }
     }
     transaction.commit()?;
 
-    resolve_bound_contribution_revision(
+    resolve_bound_contribution_revision_with_archive_use(
         store,
         binding,
         &revision_record_id,
         revision_digest,
         &contribution_id,
+        archive_use,
     )
 }
 
@@ -1064,6 +1486,66 @@ fn base32_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn read_replay_object(
+    store: &CollaborationStore,
+    digest: &ObjectDigest,
+    per_object_limit: usize,
+    remaining: &mut usize,
+) -> Result<Vec<u8>, IdentityStoreError> {
+    let path = archive::object_path(store, digest);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(IdentityStoreError::Archive(archive::ArchiveError::Io {
+                path,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "identity replay object is not a regular file",
+                ),
+            }));
+        }
+        Err(source) => {
+            return Err(IdentityStoreError::Archive(archive::ArchiveError::Io {
+                path,
+                source,
+            }));
+        }
+    };
+    if metadata.len() > per_object_limit as u64 {
+        return Err(IdentityStoreError::Archive(archive::ArchiveError::Io {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "identity replay object exceeds its per-object bound",
+            ),
+        }));
+    }
+    if metadata.len() > *remaining as u64 {
+        return Err(IdentityStoreError::ReplayByteLimit);
+    }
+    let bytes = archive::read_object_bounded(store, digest, per_object_limit.min(*remaining))?;
+    *remaining -= bytes.len();
+    Ok(bytes)
+}
+
+fn acquire_archive_use(store: &CollaborationStore) -> Result<ArchiveUse, IdentityStoreError> {
+    collaboration_gc::archive_use(store).map_err(|source| IdentityStoreError::ArchiveLock {
+        path: collaboration_gc::lock_path(store),
+        source,
+    })
+}
+
+fn validate_archive_use(
+    store: &CollaborationStore,
+    archive_use: &ArchiveUse,
+) -> Result<(), IdentityStoreError> {
+    if archive_use.covers(store) {
+        Ok(())
+    } else {
+        Err(IdentityStoreError::ForeignArchiveUse)
+    }
+}
+
 fn require_schema(store: &CollaborationStore) -> Result<(), IdentityStoreError> {
     if store.schema_version() < REQUIRED_SCHEMA {
         return Err(IdentityStoreError::UnsupportedSchema {
@@ -1084,39 +1566,193 @@ fn validate_binding_store(
     }
 }
 
-fn validate_anchor_file_rows(
+fn validate_committed_binding_files(
     store: &CollaborationStore,
-    descriptor: &ProjectDescriptor,
+    snapshot: &SourceSnapshot,
+    expected_descriptor_bytes: &[u8],
+    expected_descriptor_id: &RecordId,
+) -> Result<(), IdentityStoreError> {
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+    let config_bytes =
+        source_file_bytes(store, snapshot, b".aethyme/config.toml", MAX_CONFIG_BYTES)?;
+    let config_text = std::str::from_utf8(&config_bytes).map_err(|_| {
+        IdentityStoreError::Corrupt("committed collaboration config is not UTF-8".into())
+    })?;
+    let parsed: toml::Value = config_text.parse().map_err(|error| {
+        IdentityStoreError::Corrupt(format!(
+            "committed collaboration config is invalid: {error}"
+        ))
+    })?;
+    let table = parsed
+        .get("collaboration")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            IdentityStoreError::Corrupt(
+                "bootstrap snapshot has no committed [collaboration] table".into(),
+            )
+        })?;
+    if table
+        .keys()
+        .any(|key| !["capture", "project", "descriptor"].contains(&key.as_str()))
+    {
+        return Err(IdentityStoreError::Corrupt(
+            "bootstrap config contains an unsupported collaboration setting".into(),
+        ));
+    }
+    if !matches!(
+        table.get("capture").and_then(toml::Value::as_str),
+        Some("advisory" | "required")
+    ) {
+        return Err(IdentityStoreError::Corrupt(
+            "bootstrap config does not enable advisory or required capture".into(),
+        ));
+    }
+    let project_text = table
+        .get("project")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            IdentityStoreError::Corrupt("bootstrap config has no local project key".into())
+        })?;
+    let project = ProjectKey::parse(project_text)
+        .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+    if project != *store.project() {
+        return Err(IdentityStoreError::Corrupt(
+            "bootstrap config project key differs from its local state store".into(),
+        ));
+    }
+    if table.get("descriptor").and_then(toml::Value::as_str) != Some(PROJECT_DESCRIPTOR_PATH) {
+        return Err(IdentityStoreError::Corrupt(
+            "bootstrap config does not name the exact experimental descriptor path".into(),
+        ));
+    }
+    let descriptor_bytes = source_file_bytes(
+        store,
+        snapshot,
+        PROJECT_DESCRIPTOR_PATH.as_bytes(),
+        MAX_DESCRIPTOR_BYTES,
+    )?;
+    if descriptor_bytes != expected_descriptor_bytes {
+        return Err(IdentityStoreError::Corrupt(
+            "committed bootstrap descriptor differs from the approved archived descriptor".into(),
+        ));
+    }
+    let (_, observed_id) = ProjectDescriptor::from_record(&descriptor_bytes)?;
+    if observed_id != *expected_descriptor_id {
+        return Err(IdentityStoreError::Corrupt(
+            "committed bootstrap descriptor differs from its confirmed RecordId".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn source_file_bytes(
+    store: &CollaborationStore,
+    snapshot: &SourceSnapshot,
+    path: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, IdentityStoreError> {
+    let entry = snapshot
+        .entries()
+        .iter()
+        .find(|entry| entry.path() == path)
+        .ok_or_else(|| {
+            IdentityStoreError::Corrupt(format!(
+                "retained binding snapshot does not contain {}",
+                String::from_utf8_lossy(path)
+            ))
+        })?;
+    if !matches!(entry.kind(), EntryKind::Regular | EntryKind::Executable) {
+        return Err(IdentityStoreError::Corrupt(format!(
+            "retained binding path {} is not a regular file",
+            String::from_utf8_lossy(path)
+        )));
+    }
+    let digest = ObjectDigest::from_bytes(*entry.content_sha256());
+    archive::read_object_bounded(store, &digest, limit).map_err(Into::into)
+}
+
+pub(crate) fn bootstrap_transition_sha256(
+    project_id: &ProjectId,
+    descriptor_record_id: &RecordId,
+    anchor_snapshot: &SourceSnapshotId,
+    bootstrap_snapshot: &SourceSnapshotId,
+    bootstrap_commit: &CommitOid,
+    transition: &FileIdentityTransition,
+) -> String {
+    let changes = transition
+        .changes()
+        .iter()
+        .map(|change| change.to_value())
+        .collect();
+    let bytes = CanonicalValue::Object(
+        Object::new(vec![
+            (
+                "domain".into(),
+                CanonicalValue::String("aethyme project binding bootstrap v0".into()),
+            ),
+            (
+                "project_id".into(),
+                CanonicalValue::String(project_id.as_str().into()),
+            ),
+            (
+                "descriptor_record_id".into(),
+                CanonicalValue::String(descriptor_record_id.as_str().into()),
+            ),
+            (
+                "anchor_snapshot".into(),
+                CanonicalValue::String(anchor_snapshot.as_str().into()),
+            ),
+            (
+                "bootstrap_snapshot".into(),
+                CanonicalValue::String(bootstrap_snapshot.as_str().into()),
+            ),
+            (
+                "bootstrap_commit".into(),
+                CanonicalValue::String(bootstrap_commit.as_str().into()),
+            ),
+            ("changes".into(), CanonicalValue::Array(changes)),
+        ])
+        .expect("bootstrap digest fields are unique"),
+    )
+    .to_canonical_bytes();
+    ObjectDigest::of(&bytes).hex()
+}
+
+fn validate_identity_file_rows(
+    store: &CollaborationStore,
+    snapshot: &SourceSnapshotId,
+    expected_state: &ProjectFileIdentityState,
 ) -> Result<(), IdentityStoreError> {
     let mut statement = store.read_connection().prepare(
         "SELECT path,file_id,mode,content_sha256 FROM local_project_file_ids
          WHERE snapshot_id=?1 ORDER BY path",
     )?;
-    let rows = statement.query_map([descriptor.anchor_snapshot().as_str()], |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    let actual: Vec<_> = rows.collect::<Result<_, _>>()?;
-    let expected: Vec<_> = descriptor
+    let actual: Vec<_> = statement
+        .query_map([snapshot.as_str()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let expected: Vec<_> = expected_state
         .files()
-        .iter()
         .map(|file| {
             (
                 file.path.clone(),
                 file.file_id.as_str().to_string(),
                 file.kind.git_mode().to_string(),
-                hex::encode(file.content_sha256),
+                ObjectDigest::from_bytes(file.content_sha256).hex(),
             )
         })
         .collect();
     if actual != expected {
-        return Err(IdentityStoreError::Corrupt(
-            "stored anchor FileId rows differ from the validated descriptor".into(),
-        ));
+        return Err(IdentityStoreError::Corrupt(format!(
+            "stored FileId rows differ from the validated snapshot {}",
+            snapshot.as_str()
+        )));
     }
     Ok(())
 }
@@ -1145,27 +1781,44 @@ fn load_history(
     store: &CollaborationStore,
     binding: &ApprovedProjectBinding,
 ) -> Result<BTreeMap<RecordId, RevisionRow>, IdentityStoreError> {
-    let count: i64 = store.read_connection().query_row(
-        "SELECT count(*) FROM contribution_revisions",
-        [],
-        |row| row.get(0),
-    )?;
-    if count < 0 || count as usize > MAX_REPLAY_REVISIONS {
+    let live_revision_ids =
+        collaboration_gc::live_identity_revision_roots(store, collaboration_gc::now_ms()).map_err(
+            |error| match error {
+                collaboration_gc::GcError::IdentityReplayLimit => IdentityStoreError::ReplayLimit,
+                other => IdentityStoreError::Corrupt(format!(
+                    "could not enumerate retained identity history: {other}"
+                )),
+            },
+        )?;
+    if live_revision_ids.len() > MAX_REPLAY_REVISIONS {
         return Err(IdentityStoreError::ReplayLimit);
     }
+    if live_revision_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let live_id_text: Vec<String> = live_revision_ids
+        .iter()
+        .map(|record_id| record_id.as_str().to_string())
+        .collect();
+    let placeholders = (1..=live_id_text.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT r.revision_record_id,r.operation_id,r.contribution_id,
+                r.lineage_record_id,r.record_sha256,r.brief_record_id,
+                r.brief_object_sha256,l.project_id
+         FROM contribution_revisions r
+         JOIN local_logical_contributions l
+           ON l.operation_id=r.operation_id
+          AND l.contribution_id=r.contribution_id
+          AND l.lineage_record_id=r.lineage_record_id
+         WHERE r.revision_record_id IN ({placeholders})
+         ORDER BY r.created_ms,r.revision_record_id"
+    );
     let raw_rows = {
-        let mut statement = store.read_connection().prepare(
-            "SELECT r.revision_record_id,r.operation_id,r.contribution_id,
-                    r.lineage_record_id,r.record_sha256,r.brief_record_id,
-                    r.brief_object_sha256,l.project_id
-             FROM contribution_revisions r
-             JOIN local_logical_contributions l
-               ON l.operation_id=r.operation_id
-              AND l.contribution_id=r.contribution_id
-              AND l.lineage_record_id=r.lineage_record_id
-             ORDER BY r.created_ms,r.revision_record_id",
-        )?;
-        let rows = statement.query_map([], |row| {
+        let mut statement = store.read_connection().prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(live_id_text.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1179,13 +1832,13 @@ fn load_history(
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    if raw_rows.len() != count as usize {
+    if raw_rows.len() != live_revision_ids.len() {
         return Err(IdentityStoreError::Corrupt(
-            "a contribution revision has no exact persisted logical-operation binding".into(),
+            "a live identity proof has no exact persisted logical-operation binding".into(),
         ));
     }
-
     let mut history = BTreeMap::new();
+    let mut replay_archive_bytes = MAX_REPLAY_ARCHIVE_BYTES;
     let mut contribution_owners = BTreeMap::<ContributionId, (String, RecordId)>::new();
 
     for (
@@ -1214,8 +1867,12 @@ fn load_history(
         }
         let object_digest = archive::parse_digest(&object_hex)
             .ok_or_else(|| IdentityStoreError::Corrupt("invalid revision object digest".into()))?;
-        let bytes =
-            archive::read_object_bounded(store, &object_digest, MAX_CONTRIBUTION_REVISION_BYTES)?;
+        let bytes = read_replay_object(
+            store,
+            &object_digest,
+            MAX_CONTRIBUTION_REVISION_BYTES,
+            &mut replay_archive_bytes,
+        )?;
         let (revision, observed_id) = ContributionRevision::from_record(&bytes)?;
         if observed_id != record_id
             || revision.project_id() != binding.project_id()
@@ -1226,9 +1883,9 @@ fn load_history(
                 "revision record identity, project, contribution, or capture lineage differs from its row".into(),
             ));
         }
-        let (brief_object_digest, brief) =
+        let (brief_object_digest, brief, brief_record_bytes) =
             match (revision.brief(), brief_record_text, brief_object_hex) {
-                (None, None, None) => (None, None),
+                (None, None, None) => (None, None, None),
                 (
                     Some(BriefReference {
                         record_id: expected_id,
@@ -1242,18 +1899,19 @@ fn load_history(
                     let digest = archive::parse_digest(&object_sha256).ok_or_else(|| {
                         IdentityStoreError::Corrupt("invalid brief object digest".into())
                     })?;
-                    let brief_bytes = archive::read_object_bounded(
+                    let brief_bytes = read_replay_object(
                         store,
                         &digest,
                         aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES,
+                        &mut replay_archive_bytes,
                     )?;
                     let (brief, observed_brief_id) = Brief::from_record(&brief_bytes)?;
-                    if observed_brief_id != expected_id {
+                    if &observed_brief_id != expected_id {
                         return Err(IdentityStoreError::Corrupt(
                             "brief object does not match its revision RecordId".into(),
                         ));
                     }
-                    (Some(digest), Some(brief))
+                    (Some(digest), Some(brief), Some(brief_bytes))
                 }
                 _ => {
                     return Err(IdentityStoreError::Corrupt(
@@ -1291,6 +1949,7 @@ fn load_history(
             revision,
             brief_object_digest,
             brief,
+            brief_record_bytes,
             source_retained,
         };
         if history.insert(record_id, row).is_some() {
@@ -1309,14 +1968,53 @@ fn replay_history(
     let history = load_history(store, binding)?;
     let anchor_state = binding.descriptor.initial_file_identity_state()?;
     let anchor = binding.descriptor.anchor_snapshot().clone();
+    let bootstrap_source = read_retained_snapshot(store, binding.bootstrap_snapshot())?;
+    let anchor_source = read_retained_snapshot(store, binding.descriptor.anchor_snapshot())?;
+    let bootstrap_transition = advance_file_identities(
+        binding.project_id(),
+        &anchor_state,
+        binding.descriptor_record_id().as_str(),
+        &anchor_source,
+        &bootstrap_source,
+        &[],
+    )
+    .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+    if bootstrap_transition_sha256(
+        binding.project_id(),
+        binding.descriptor_record_id(),
+        binding.descriptor.anchor_snapshot(),
+        binding.bootstrap_snapshot(),
+        binding.committed_config_commit(),
+        &bootstrap_transition,
+    ) != binding.bootstrap_transition_sha256()
+    {
+        return Err(IdentityStoreError::Corrupt(
+            "bootstrap transition changed after binding resolution".into(),
+        ));
+    }
+    let bootstrap = binding.bootstrap_snapshot().clone();
+    if bootstrap == anchor {
+        return Err(IdentityStoreError::Corrupt(
+            "binding bootstrap snapshot equals its descriptor anchor".into(),
+        ));
+    }
     let mut replay = ReplayIndex {
-        states: BTreeMap::from([(
-            anchor.clone(),
-            SnapshotState {
-                state: anchor_state,
-                provenance: BTreeSet::new(),
-            },
-        )]),
+        states: BTreeMap::from([
+            (
+                anchor.clone(),
+                SnapshotState {
+                    state: anchor_state,
+                    provenance: BTreeSet::new(),
+                },
+            ),
+            (
+                bootstrap.clone(),
+                SnapshotState {
+                    state: bootstrap_transition.result_identity_state(),
+                    provenance: BTreeSet::new(),
+                },
+            ),
+        ]),
         rows: history,
         ..ReplayIndex::default()
     };
@@ -1509,9 +2207,7 @@ fn replay_history(
                     ));
                 }
                 replay.states.remove(result);
-                if replay.conflicts.insert(result.clone()) {
-                    changed = true;
-                }
+                replay.conflicts.insert(result.clone());
                 changed = true;
             }
         }
@@ -1624,6 +2320,33 @@ fn explicit_operations(
     Ok(operations)
 }
 
+fn decode_lower_hex(text: &str) -> Result<Vec<u8>, IdentityStoreError> {
+    if text.len() % 2 != 0 {
+        return Err(IdentityStoreError::Corrupt(
+            "source change hex field has an odd number of digits".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let high = lower_hex_nibble(pair[0]).ok_or_else(|| {
+            IdentityStoreError::Corrupt("source change hex field is not lowercase hex".into())
+        })?;
+        let low = lower_hex_nibble(pair[1]).ok_or_else(|| {
+            IdentityStoreError::Corrupt("source change hex field is not lowercase hex".into())
+        })?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 fn state_field(
     object: &Object,
     field: &'static str,
@@ -1633,12 +2356,10 @@ fn state_field(
             "source change is missing the {field} state"
         )));
     };
-    let path = hex::decode(text_field(state, "path_hex")?)
-        .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+    let path = decode_lower_hex(text_field(state, "path_hex")?)?;
     let kind = EntryKind::from_git_mode(text_field(state, "mode")?)
         .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
-    let digest: [u8; 32] = hex::decode(text_field(state, "content_sha256")?)
-        .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?
+    let digest: [u8; 32] = decode_lower_hex(text_field(state, "content_sha256")?)?
         .try_into()
         .map_err(|_| IdentityStoreError::Corrupt("invalid content digest length".into()))?;
     let file_id = FileId::parse(text_field(state, "file_id")?)
@@ -1697,9 +2418,38 @@ fn unique_state<'a>(
         })
 }
 
+fn identity_proof_artifacts(
+    replay: &ReplayIndex,
+    base_state: &ResolvedProjectFileIdentityState,
+    current_record_id: &RecordId,
+    current_object_digest: ObjectDigest,
+    current_brief_digest: Option<ObjectDigest>,
+) -> Result<(BTreeSet<RecordId>, BTreeSet<ObjectDigest>), IdentityStoreError> {
+    let mut revision_ids = provenance_ids(base_state.provenance());
+    revision_ids.insert(current_record_id.clone());
+    let mut object_digests = BTreeSet::new();
+    for revision_id in &revision_ids {
+        if revision_id == current_record_id {
+            object_digests.insert(current_object_digest);
+            object_digests.extend(current_brief_digest);
+            continue;
+        }
+        let row = replay.rows.get(revision_id).ok_or_else(|| {
+            IdentityStoreError::Corrupt(format!(
+                "validated base provenance names missing revision {}",
+                revision_id.as_str()
+            ))
+        })?;
+        object_digests.insert(row.object_digest);
+        object_digests.extend(row.brief_object_digest);
+    }
+    Ok((revision_ids, object_digests))
+}
+
 fn provenance_ids(provenance: &IdentityStateProvenance) -> BTreeSet<RecordId> {
     match provenance {
-        IdentityStateProvenance::DescriptorAnchor { .. } => BTreeSet::new(),
+        IdentityStateProvenance::DescriptorAnchor { .. }
+        | IdentityStateProvenance::ProjectBindingBootstrap { .. } => BTreeSet::new(),
         IdentityStateProvenance::Replayed {
             revision_record_ids,
         } => revision_record_ids.iter().cloned().collect(),
@@ -1724,6 +2474,13 @@ fn resolved_state(
             descriptor_record_id: binding.descriptor_record_id.clone(),
             anchor_commit: binding.anchor_commit.clone(),
             committed_config_commit: binding.committed_config_commit.clone(),
+        }
+    } else if snapshot == binding.bootstrap_snapshot() {
+        IdentityStateProvenance::ProjectBindingBootstrap {
+            descriptor_record_id: binding.descriptor_record_id.clone(),
+            bootstrap_snapshot: binding.bootstrap_snapshot.clone(),
+            committed_config_commit: binding.committed_config_commit.clone(),
+            transition_sha256: binding.bootstrap_transition_sha256.clone(),
         }
     } else {
         IdentityStateProvenance::Replayed {
@@ -1788,7 +2545,7 @@ fn validate_cached_maps(
                     file.path.clone(),
                     file.file_id.as_str().to_string(),
                     file.kind.git_mode().to_string(),
-                    hex::encode(file.content_sha256),
+                    ObjectDigest::from_bytes(file.content_sha256).hex(),
                 )
             })
             .collect();
