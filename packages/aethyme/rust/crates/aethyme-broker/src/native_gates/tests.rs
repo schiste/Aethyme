@@ -473,6 +473,7 @@ fn age_archive_objects(store: &CollaborationStore) {
 }
 
 const GATES: &str = "[[gate]]\nname='retained-features'\ncommand='test \"$(cat one.txt)\" = A && test \"$(cat two.txt)\" = B && git rev-parse HEAD'\ncache=false\ntimeout_seconds=10\n";
+const METADATA_GATES: &str = "[[gate]]\nname='retained-head'\ncommand='git rev-parse HEAD'\ncache=false\ntimeout_seconds=10\n";
 #[test]
 fn checkout_placement_refuses_upward_project_discovery() {
     let outside = tempfile::tempdir().unwrap();
@@ -550,7 +551,12 @@ fn actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_write
 
 #[test]
 fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
-    let mut s = setup(Some(GATES));
+    if run_in_clean_git_child(
+        "native_gates::tests::settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate",
+    ) {
+        return;
+    }
+    let mut s = setup(Some(METADATA_GATES));
     let repo = s.f._repo.path().to_path_buf();
     let owner = s.owner.as_ref().expect("setup owner is present");
 
@@ -635,10 +641,14 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
     let bound =
         crate::resolution::decode_attempt_response_envelope(&status, &response_bytes).unwrap();
     let settled = crate::resolution::finish_bound_attempt(&mut s.f.store, &repo, &bound).unwrap();
-    assert!(matches!(
-        settled.outcome,
-        crate::resolution::ResolutionOutcome::Synthesized(_)
-    ));
+    assert!(
+        matches!(
+            &settled.outcome,
+            crate::resolution::ResolutionOutcome::Synthesized(_)
+        ),
+        "metadata-only source should allow synthesis, got {:?}",
+        settled.outcome
+    );
     let ledger =
         crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
     assert_eq!(
@@ -767,6 +777,60 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
     assert_eq!(verified_candidate.commit, fresh_job.spec.commit);
     assert_eq!(verified_candidate.tree, fresh_job.spec.tree);
     assert!(validate_source(&mut s.f.store, owner, &repo, &old_job.spec).is_err());
+
+    let refs_before_gate = git(repo.as_path(), &["show-ref"]);
+    let completed = run(&mut s.f.store, owner, &mut s.broker, &fresh_job.id).unwrap();
+    assert_eq!(completed.state, "completed");
+    let observation = completed
+        .observation
+        .as_ref()
+        .expect("the fresh synthesized gate records its observation");
+    assert_eq!(observation["status"], "passed", "{observation}");
+    assert_eq!(observation["selected_gates"], 1);
+    assert_eq!(
+        observation["candidate"]["commit"],
+        synthesis.candidate.commit.as_str()
+    );
+    assert_eq!(observation["candidate"]["tree"], synthesis.candidate.tree);
+    assert_eq!(
+        observation["gates"][0]["tree_hash"],
+        synthesis.candidate.tree
+    );
+    assert_eq!(observation["trusted_evidence"], false);
+    assert_eq!(observation["provider_acceptance"], false);
+    let gate_log =
+        std::fs::read_to_string(observation["gates"][0]["log_path"].as_str().unwrap()).unwrap();
+    assert!(
+        gate_log.contains(synthesis.candidate.commit.as_str()),
+        "fresh gate log must name the synthesized candidate commit"
+    );
+    assert_eq!(git(repo.as_path(), &["show-ref"]), refs_before_gate);
+
+    let merge_queue_count: i64 = s
+        .broker
+        .store()
+        .connection()
+        .query_row("SELECT count(*) FROM merge_queue", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        merge_queue_count, 0,
+        "native gate must not enqueue promotion"
+    );
+    let acceptance_count: i64 = s
+        .f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT (SELECT count(*) FROM local_acceptance_bindings) + (SELECT count(*) FROM local_acceptance_receipts) + (SELECT count(*) FROM local_acceptance_qualifications)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        acceptance_count, 0,
+        "synthesized gates must not mint acceptance"
+    );
+
     let loaded_old = load(&s.f.store, &old_job.id).unwrap();
     assert_eq!(loaded_old.observation, Some(old_observation));
 
