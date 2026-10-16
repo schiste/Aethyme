@@ -6,17 +6,23 @@ use aethyme_contracts::experimental_v0::{
     RecordSchema, SourceSnapshotId, brief::Brief,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    io::{self, Write},
+};
 
 pub const PROFILE: &str = "aethyme.exchange.scoped-metadata/provisional-v0";
 pub const MAX_PACKET_BYTES: usize = 16 * 1024;
-/// The experimental immutable revision packet carries bounded canonical
-/// revision and brief bytes as lowercase hex. The larger limit applies only
-/// to that explicit variant; legacy metadata remains capped at 16 KiB.
+/// Revision packets use the same total-document cap as every generic Record.
+/// Both the packet and enclosing event are measured before serialization, so
+/// the full event envelope must fit this limit too.
 pub const MAX_REVISION_PACKET_BYTES: usize =
-    2 * aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES
-        + 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
-        + 32 * 1024;
+    aethyme_contracts::experimental_v0::canonical_json::MAX_DOCUMENT_BYTES;
+const MAX_REVISION_OBJECT_BYTES_IN_PACKET: usize = MAX_REVISION_PACKET_BYTES / 2;
+const MAX_REVISION_HEX_CHUNK_CHARS: usize =
+    aethyme_contracts::experimental_v0::canonical_json::MAX_STRING_BYTES;
+const MAX_REVISION_HEX_CHUNK_BYTES: usize = MAX_REVISION_HEX_CHUNK_CHARS / 2;
+const MAX_REVISION_HEX_CHUNKS: usize = MAX_REVISION_PACKET_BYTES / MAX_REVISION_HEX_CHUNK_CHARS;
 pub const MAX_SNAPSHOT_PAGE_BYTES: usize = 32 * 1024 * 1024;
 /// Bound the complete in-memory snapshot assembled from multiple pages.
 pub const MAX_SNAPSHOT_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
@@ -297,7 +303,7 @@ pub enum Metadata {
         capture_receipt_record_id: String,
         revision_record_id: String,
         revision_object_sha256: String,
-        revision_bytes_hex: String,
+        revision_bytes_hex: BoundedHexPayload,
         #[serde(skip_serializing_if = "Option::is_none")]
         brief_record_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,6 +321,43 @@ pub enum Metadata {
         pending_contributions: Vec<String>,
     },
 }
+#[derive(Serialize)]
+struct RecordEnvelope<'a, T> {
+    schema: &'static str,
+    spec: &'a T,
+}
+
+struct LimitedWriter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for LimitedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(total) = self.bytes.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "record size limit",
+            ));
+        };
+        if total > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "record size limit",
+            ));
+        }
+        self.bytes = total;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn canonical(
     schema: &'static RecordSchema,
     spec: &impl Serialize,
@@ -326,11 +369,135 @@ fn canonical_with_limit(
     spec: &impl Serialize,
     max_bytes: usize,
 ) -> Result<Record, ExchangeError> {
-    let bytes = serde_json::to_vec(&serde_json::json!({"schema":schema.name,"spec":spec}))?;
-    if bytes.len() > max_bytes {
+    let envelope = RecordEnvelope {
+        schema: schema.name,
+        spec,
+    };
+    let limit = max_bytes.min(MAX_REVISION_PACKET_BYTES);
+    let mut counter = LimitedWriter {
+        bytes: 0,
+        limit,
+        exceeded: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut counter, &envelope) {
+        if counter.exceeded {
+            return Err(ExchangeError::Limit);
+        }
+        return Err(error.into());
+    }
+    let encoded_len = counter.bytes;
+    let mut bytes = Vec::with_capacity(encoded_len);
+    serde_json::to_writer(&mut bytes, &envelope)?;
+    if bytes.len() != encoded_len {
+        return Err(invalid("record size changed after preflight"));
+    }
+    let record = Record::decode(&bytes, &[schema])?;
+    if record.canonical_bytes().len() != encoded_len {
+        return Err(invalid("canonical record size differs from preflight"));
+    }
+    Ok(record)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum HexPayloadWire {
+    Inline(String),
+    Chunks(Vec<String>),
+}
+
+/// Canonical bounded lowercase-hex bytes for the experimental revision packet.
+/// Values up to the generic string cap remain a string for legacy compatibility;
+/// larger values use normalized 64 KiB hex chunks in the same field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BoundedHexPayload(HexPayloadWire);
+
+impl BoundedHexPayload {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ExchangeError> {
+        if bytes.is_empty() {
+            return Err(invalid("empty revision byte payload"));
+        }
+        if bytes.len() > MAX_REVISION_OBJECT_BYTES_IN_PACKET {
+            return Err(ExchangeError::Limit);
+        }
+        if bytes.len() <= MAX_REVISION_HEX_CHUNK_BYTES {
+            return Ok(Self(HexPayloadWire::Inline(lower_hex(bytes))));
+        }
+
+        let chunks = bytes
+            .chunks(MAX_REVISION_HEX_CHUNK_BYTES)
+            .map(lower_hex)
+            .collect::<Vec<_>>();
+        if chunks.len() > MAX_REVISION_HEX_CHUNKS {
+            return Err(ExchangeError::Limit);
+        }
+        Ok(Self(HexPayloadWire::Chunks(chunks)))
+    }
+
+    fn encoded_hex_len(&self) -> Result<usize, ExchangeError> {
+        match &self.0 {
+            HexPayloadWire::Inline(value) => {
+                validate_hex_chunk(value)?;
+                Ok(value.len())
+            }
+            HexPayloadWire::Chunks(chunks) => {
+                if chunks.is_empty() {
+                    return Err(invalid("empty revision hex chunks"));
+                }
+                if chunks.len() > MAX_REVISION_HEX_CHUNKS {
+                    return Err(ExchangeError::Limit);
+                }
+                let mut total = 0usize;
+                for (index, chunk) in chunks.iter().enumerate() {
+                    validate_hex_chunk(chunk)?;
+                    if index + 1 < chunks.len() && chunk.len() != MAX_REVISION_HEX_CHUNK_CHARS {
+                        return Err(invalid("noncanonical revision hex chunks"));
+                    }
+                    total = total.checked_add(chunk.len()).ok_or(ExchangeError::Limit)?;
+                }
+                if total <= MAX_REVISION_HEX_CHUNK_CHARS {
+                    return Err(invalid("noncanonical revision hex chunks"));
+                }
+                if total > MAX_REVISION_PACKET_BYTES {
+                    return Err(ExchangeError::Limit);
+                }
+                Ok(total)
+            }
+        }
+    }
+
+    pub fn decode(&self, max_bytes: usize) -> Result<Vec<u8>, ExchangeError> {
+        let encoded_len = self.encoded_hex_len()?;
+        let decoded_len = encoded_len / 2;
+        if decoded_len > max_bytes || decoded_len > MAX_REVISION_OBJECT_BYTES_IN_PACKET {
+            return Err(ExchangeError::Limit);
+        }
+        let mut decoded = Vec::with_capacity(decoded_len);
+        match &self.0 {
+            HexPayloadWire::Inline(value) => {
+                decoded.extend(decode_lower_hex(value, max_bytes)?);
+            }
+            HexPayloadWire::Chunks(chunks) => {
+                for chunk in chunks {
+                    decoded.extend(decode_lower_hex(chunk, max_bytes - decoded.len())?);
+                }
+            }
+        }
+        Ok(decoded)
+    }
+}
+
+fn validate_hex_chunk(value: &str) -> Result<(), ExchangeError> {
+    if value.len() > MAX_REVISION_HEX_CHUNK_CHARS {
         return Err(ExchangeError::Limit);
     }
-    Ok(Record::decode(&bytes, &[schema])?)
+    if value.is_empty()
+        || value.len() % 2 != 0
+        || value.bytes().any(|byte| hex_digit(byte).is_none())
+    {
+        return Err(invalid("lowercase hex payload chunk"));
+    }
+    Ok(())
 }
 impl Metadata {
     /// Build the advisory peer envelope around one canonical immutable
@@ -347,13 +514,19 @@ impl Metadata {
         availability: SourceAvailability,
         scope: Vec<String>,
     ) -> Result<Self, ExchangeError> {
+        if revision_bytes.len() > MAX_REVISION_OBJECT_BYTES_IN_PACKET {
+            return Err(ExchangeError::Limit);
+        }
         let (revision, revision_record_id) = ContributionRevision::from_record(revision_bytes)
             .map_err(|_| invalid("revision record"))?;
         let brief_fields = match (revision.brief(), brief_bytes) {
             (None, None) => (None, None, None),
             (Some(reference), Some(bytes)) => {
-                let (_, observed_id) = Brief::from_record(bytes)
-                    .map_err(|_| invalid("brief record"))?;
+                if bytes.len() > aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES {
+                    return Err(ExchangeError::Limit);
+                }
+                let (_, observed_id) =
+                    Brief::from_record(bytes).map_err(|_| invalid("brief record"))?;
                 if observed_id != reference.record_id
                     || crate::collaboration_archive::ObjectDigest::of(bytes).hex()
                         != reference.object_sha256
@@ -379,7 +552,7 @@ impl Metadata {
             revision_object_sha256: crate::collaboration_archive::ObjectDigest::of(revision_bytes)
                 .hex()
                 .to_string(),
-            revision_bytes_hex: lower_hex(revision_bytes),
+            revision_bytes_hex: BoundedHexPayload::from_bytes(revision_bytes)?,
             brief_record_id: brief_fields.0,
             brief_object_sha256: brief_fields.1,
             brief_bytes_hex: brief_fields.2,
@@ -405,7 +578,7 @@ impl Metadata {
         capture_receipt_record_id: &str,
         revision_record_id: &str,
         revision_object_sha256: &str,
-        revision_bytes_hex: &str,
+        revision_bytes_hex: &BoundedHexPayload,
         brief_record_id: Option<&str>,
         brief_object_sha256: Option<&str>,
         brief_bytes_hex: Option<&str>,
@@ -426,16 +599,24 @@ impl Metadata {
         availability.validate()?;
         revision_paths(&scope)?;
 
-        // Check encoded lengths before allocating decoded bytes.
-        if revision_bytes_hex.len()
-            > 2 * aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES
+        // Preflight both object payloads before allocating either decoded byte
+        // buffer. The enclosing Record length is measured separately below.
+        let revision_hex_len = revision_bytes_hex.encoded_hex_len()?;
+        let brief_hex_len = brief_bytes_hex.map_or(Ok(0), |encoded| {
+            if encoded.len() > 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
+            {
+                return Err(ExchangeError::Limit);
+            }
+            validate_hex_chunk(encoded)?;
+            Ok(encoded.len())
+        })?;
+        if revision_hex_len
+            .checked_add(brief_hex_len)
+            .is_none_or(|total| total > MAX_REVISION_PACKET_BYTES)
         {
             return Err(ExchangeError::Limit);
         }
-        let revision_bytes = decode_lower_hex(
-            revision_bytes_hex,
-            aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
-        )?;
+        let revision_bytes = revision_bytes_hex.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET)?;
         if crate::collaboration_archive::ObjectDigest::of(&revision_bytes).hex()
             != revision_object_sha256
         {
@@ -462,11 +643,7 @@ impl Metadata {
             (Some(reference), Some(id), Some(digest), Some(encoded)) => {
                 record_id(id)?;
                 digest_text(digest)?;
-                if encoded.len()
-                    > 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
-                {
-                    return Err(ExchangeError::Limit);
-                }
+                validate_hex_chunk(encoded)?;
                 let brief_bytes = decode_lower_hex(
                     encoded,
                     aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES,
@@ -477,13 +654,10 @@ impl Metadata {
                 {
                     return Err(invalid("brief object binding"));
                 }
-                let (brief, brief_id) = Brief::from_record(&brief_bytes)
-                    .map_err(|_| invalid("brief record"))?;
+                let (brief, brief_id) =
+                    Brief::from_record(&brief_bytes).map_err(|_| invalid("brief record"))?;
                 let (canonical, canonical_id) = brief.to_record();
-                if brief_id.as_str() != id
-                    || canonical_id != brief_id
-                    || canonical != brief_bytes
-                {
+                if brief_id.as_str() != id || canonical_id != brief_id || canonical != brief_bytes {
                     return Err(invalid("brief canonical record"));
                 }
             }
@@ -787,6 +961,6 @@ pub use manager::{
 };
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod revision_tests;
+#[cfg(test)]
+mod tests;

@@ -523,10 +523,7 @@ fn validate_capture_envelope(
             && source == receipt.result.as_str()
             && payload == receipt.receipt_record_id.as_str() =>
         {
-            let revision_bytes = decode_lower_hex(
-                revision_bytes_hex,
-                aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
-            )?;
+            let revision_bytes = revision_bytes_hex.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET)?;
             let (revision, _) = ContributionRevision::from_record(&revision_bytes)
                 .map_err(|_| invalid("revision record"))?;
             if revision.base() != &receipt.base || revision.result() != &receipt.result {
@@ -579,10 +576,7 @@ fn validate_revision_project_binding(
         RecordId::parse(revision_record_id).map_err(|_| invalid("revision record identity"))?;
     let revision_object = archive::parse_digest(revision_object_sha256)
         .ok_or_else(|| invalid("revision object digest"))?;
-    let revision_bytes = decode_lower_hex(
-        revision_bytes_hex,
-        aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
-    )?;
+    let revision_bytes = revision_bytes_hex.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET)?;
     let (revision, observed_revision_id) = ContributionRevision::from_record(&revision_bytes)
         .map_err(|_| invalid("revision record"))?;
     if observed_revision_id != revision_record_id
@@ -706,7 +700,12 @@ fn validate_revision_project_binding(
             // them once more under the archive barrier to retain every
             // ancestor revision's base/result snapshots with the event.
             // A digest in this set must decode as either a revision or Brief.
-            let owned = archive::read_object_bounded(store, digest, MAX_REVISION_PACKET_BYTES)?;
+            let object_limit = if *digest == descriptor_object {
+                aethyme_contracts::experimental_v0::project_identity::MAX_DESCRIPTOR_BYTES
+            } else {
+                MAX_REVISION_PACKET_BYTES
+            };
+            let owned = archive::read_object_bounded(store, digest, object_limit)?;
             if resolver_proof_objects.contains(digest) {
                 if let Ok((proof_revision, proof_id)) = ContributionRevision::from_record(&owned) {
                     proof_revision_ids.insert(proof_id);

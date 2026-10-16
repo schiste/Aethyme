@@ -18,19 +18,12 @@ fn composition_request(deliveries: Vec<String>) -> CompositionRequest {
 }
 
 fn revision_id(digit: char) -> RecordId {
-    RecordId::parse(&format!("sha256:{}", digit.to_string().repeat(64)))
-        .expect("record id")
+    RecordId::parse(&format!("sha256:{}", digit.to_string().repeat(64))).expect("record id")
 }
 
 #[test]
 fn unbound_recipe_order_keeps_the_legacy_shape() {
-    let order = recipe_order_entry(
-        "A",
-        "sha256:lineage",
-        "sha256:base",
-        "sha256:result",
-        None,
-    );
+    let order = recipe_order_entry("A", "sha256:lineage", "sha256:base", "sha256:result", None);
     assert_eq!(
         order,
         object(vec![
@@ -66,19 +59,23 @@ fn bound_recipe_order_carries_the_exact_immutable_revision_id() {
 #[test]
 fn revision_binding_map_is_exact_for_every_delivery() {
     let request = composition_request(vec!["A".into()]);
-    assert!(validate_revision_bindings(
-        &request,
-        &request.deliveries,
-        &BTreeMap::from([("A".into(), revision_id('a'))]),
-    )
-    .is_ok());
+    assert!(
+        validate_revision_bindings(
+            &request,
+            &request.deliveries,
+            &BTreeMap::from([("A".into(), revision_id('a'))]),
+        )
+        .is_ok()
+    );
     assert!(validate_revision_bindings(&request, &request.deliveries, &BTreeMap::new()).is_err());
-    assert!(validate_revision_bindings(
-        &request,
-        &request.deliveries,
-        &BTreeMap::from([("outside-catalog".into(), revision_id('a'))]),
-    )
-    .is_err());
+    assert!(
+        validate_revision_bindings(
+            &request,
+            &request.deliveries,
+            &BTreeMap::from([("outside-catalog".into(), revision_id('a'))]),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -93,10 +90,12 @@ fn one_revision_cannot_be_pinned_to_two_contributions() {
         derived_from: Vec::new(),
     });
     let revision = revision_id('a');
-    assert!(validate_revision_bindings(
-        &request,
-        &request.deliveries,
-        &BTreeMap::from([("A".into(), revision.clone()), ("B".into(), revision)]),
-    )
-    .is_err());
+    assert!(
+        validate_revision_bindings(
+            &request,
+            &request.deliveries,
+            &BTreeMap::from([("A".into(), revision.clone()), ("B".into(), revision)]),
+        )
+        .is_err()
+    );
 }
