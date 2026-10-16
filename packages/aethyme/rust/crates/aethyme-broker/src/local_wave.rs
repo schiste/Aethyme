@@ -374,13 +374,19 @@ pub enum WaveError {
     #[error(transparent)]
     Compose(#[from] composer::ComposeError),
     #[error(transparent)]
-    Resolution(#[from] resolution::ResolutionError),
+    Resolution(Box<resolution::ResolutionError>),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+impl From<resolution::ResolutionError> for WaveError {
+    fn from(error: resolution::ResolutionError) -> Self {
+        Self::Resolution(Box::new(error))
+    }
 }
 
 fn id(value: &str) -> Result<RecordId, WaveError> {
@@ -942,9 +948,8 @@ fn validate_source_context(
             "composition source candidate does not match the current wave".into(),
         ));
     }
-    let retained_candidate =
-        archive::retained(store, &candidate.subject)?.ok_or(TargetError::Missing)?;
-    if retained_candidate.commit != candidate.commit {
+    archive::retained(store, &candidate.subject)?.ok_or(TargetError::Missing)?;
+    if archive::snapshot_of_commit(repo, &candidate.commit)?.id() != candidate.subject {
         return Err(WaveError::Invalid(
             "composition source subject and commit disagree".into(),
         ));
@@ -964,11 +969,8 @@ fn validate_source_context(
         .as_str()
         .ok_or_else(|| WaveError::Invalid("composition recipe baseline".into()))?;
     let baseline_snapshot = snapshot(baseline_snapshot)?;
-    if archive::retained(store, &baseline_snapshot)?
-        .ok_or(TargetError::Missing)?
-        .commit
-        != source.request.baseline
-    {
+    archive::retained(store, &baseline_snapshot)?.ok_or(TargetError::Missing)?;
+    if archive::snapshot_of_commit(repo, &source.request.baseline)?.id() != baseline_snapshot {
         return Err(WaveError::Invalid(
             "composition recipe baseline snapshot changed".into(),
         ));
@@ -996,16 +998,36 @@ fn validate_source_context(
             .ok_or_else(|| WaveError::Invalid("composition recipe input result".into()))?;
         let base = snapshot(base_text)?;
         let result = snapshot(result_text)?;
+        let contribution_id = entry["id"]
+            .as_str()
+            .ok_or_else(|| WaveError::Invalid("composition recipe input id".into()))?;
+        let lineage_text = entry["lineage"]
+            .as_str()
+            .ok_or_else(|| WaveError::Invalid("composition recipe input lineage".into()))?;
+        let contribution = source
+            .request
+            .catalog
+            .iter()
+            .find(|contribution| contribution.id == contribution_id)
+            .ok_or_else(|| {
+                WaveError::Invalid("composition recipe contribution is not requested".into())
+            })?;
+        let lineage = contribution.lineage.as_ref().ok_or_else(|| {
+            WaveError::Invalid("composition recipe lineage is not retained".into())
+        })?;
+        if lineage.as_str() != lineage_text {
+            return Err(WaveError::Invalid(
+                "composition recipe lineage does not match the pinned request".into(),
+            ));
+        }
+        let retained =
+            archive::retained_contribution(store, lineage)?.ok_or(TargetError::Missing)?;
         if input.base_snapshot.as_ref() != Some(&base)
             || input.result_snapshot.as_ref() != Some(&result)
-            || archive::retained(store, &base)?
-                .ok_or(TargetError::Missing)?
-                .commit
-                != input.base
-            || archive::retained(store, &result)?
-                .ok_or(TargetError::Missing)?
-                .commit
-                != input.result
+            || retained.base.snapshot_id != base
+            || retained.result.snapshot_id != result
+            || archive::snapshot_of_commit(repo, &input.base)?.id() != base
+            || archive::snapshot_of_commit(repo, &input.result)?.id() != result
         {
             return Err(WaveError::Invalid(
                 "composition source input does not match its recipe".into(),
@@ -1061,6 +1083,12 @@ fn load_composition_source(
     Ok((wave, Some(source)))
 }
 
+struct RetentionGuards<'a> {
+    archive: &'a crate::collaboration_gc::ArchiveUse,
+    response: &'a crate::collaboration_sensitive::ResponseUse,
+    authority: &'a crate::local_authority::Guard,
+}
+
 fn retain_composition_source(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
@@ -1068,9 +1096,7 @@ fn retain_composition_source(
     reference: &resolution::RecordRef,
     source: &CompositionSource,
     pinned: &target::TargetRevision,
-    archive_guard: &crate::collaboration_gc::ArchiveUse,
-    response_guard: &crate::collaboration_sensitive::ResponseUse,
-    authority_guard: &crate::local_authority::Guard,
+    guards: RetentionGuards<'_>,
 ) -> Result<(), WaveError> {
     let candidate = source
         .composition
@@ -1132,13 +1158,13 @@ fn retain_composition_source(
         );
     }
     let snapshots = snapshots.into_values().collect::<Vec<_>>();
-    let objects = [reference.object.clone(), recipe.object.clone()];
+    let objects = [reference.object, recipe.object];
     let retention = target::ArtifactRetentionPermit::new(
         store,
         owner,
-        archive_guard,
-        response_guard,
-        authority_guard,
+        guards.archive,
+        guards.response,
+        guards.authority,
     )?;
     target::retain_artifacts_under_guards(store, revision, &snapshots, &objects, &retention)?;
     Ok(())
@@ -1228,9 +1254,7 @@ fn retain_resolution_request(
     revision: &RecordId,
     request: &resolution::ResolutionRequest,
     composition_request: &CompositionRequest,
-    archive_guard: &crate::collaboration_gc::ArchiveUse,
-    response_guard: &crate::collaboration_sensitive::ResponseUse,
-    authority_guard: &crate::local_authority::Guard,
+    guards: RetentionGuards<'_>,
 ) -> Result<(), WaveError> {
     let mut snapshots = std::collections::BTreeMap::new();
     let mut add = |snapshot: &SourceSnapshotId| {
@@ -1257,13 +1281,13 @@ fn retain_resolution_request(
         add(&retained.result.snapshot_id);
     }
     let snapshots = snapshots.into_values().collect::<Vec<_>>();
-    let object = request.record().object.clone();
+    let object = request.record().object;
     let retention = target::ArtifactRetentionPermit::new(
         store,
         owner,
-        archive_guard,
-        response_guard,
-        authority_guard,
+        guards.archive,
+        guards.response,
+        guards.authority,
     )?;
     target::retain_artifacts_under_guards(store, revision, &snapshots, &[object], &retention)?;
     Ok(())
@@ -2131,9 +2155,11 @@ pub(crate) fn compose_with_source(
                         &id(&wave.spec.revision)?,
                         &request_record,
                         &request,
-                        &_archive_guard,
-                        &_response_guard,
-                        &authority_guard,
+                        RetentionGuards {
+                            archive: &_archive_guard,
+                            response: &_response_guard,
+                            authority: &authority_guard,
+                        },
                     ) {
                         Ok(()) => {
                             resolution_request = Some(request_record.record().clone());
@@ -2203,7 +2229,7 @@ pub(crate) fn compose_with_source(
                         .composition
                         .recipe
                         .as_ref()
-                        .map(|recipe| recipe.object.clone());
+                        .map(|recipe| recipe.object);
                     source_wave.composition_source = Some(reference.clone());
                     let revision = id(&wave.spec.revision)?;
                     let pinned =
@@ -2230,9 +2256,11 @@ pub(crate) fn compose_with_source(
                         &reference,
                         &retained_source,
                         &pinned,
-                        &_archive_guard,
-                        &_response_guard,
-                        &authority_guard,
+                        RetentionGuards {
+                            archive: &_archive_guard,
+                            response: &_response_guard,
+                            authority: &authority_guard,
+                        },
                     )
                 })();
                 match validate {
@@ -2359,9 +2387,11 @@ pub(crate) fn raise_resolution_for_failed_checks(
         &revision,
         &request,
         &source.request,
-        &_archive_guard,
-        &response_guard,
-        &authority_guard,
+        RetentionGuards {
+            archive: &_archive_guard,
+            response: &response_guard,
+            authority: &authority_guard,
+        },
     )?;
     if cancel.load(Ordering::SeqCst) {
         return Err(WaveError::Stale);

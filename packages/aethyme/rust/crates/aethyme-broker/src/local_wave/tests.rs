@@ -15,6 +15,34 @@ fn composed_candidate(f: &mut Fixture) -> (ControllerOwner, Wave) {
     (owner, composed.wave)
 }
 
+#[test]
+fn composition_source_accepts_content_identical_candidate_with_new_commit_locator() {
+    let mut f = Fixture::new();
+    let (owner, _) = setup(&mut f, &["A"]);
+    available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave = frozen(admit(&mut f.store, &owner, policy(), 0).unwrap());
+
+    let composed = compose_with_source(&mut f.store, &owner, f._repo.path(), &wave.id).unwrap();
+    let source = composed
+        .source
+        .as_ref()
+        .expect("the fresh composition source should be retained");
+    let candidate = source.composition.outcome.candidate().unwrap();
+    let retained = archive::retained(&f.store, &candidate.subject)
+        .unwrap()
+        .expect("candidate subject remains retained");
+    assert_ne!(retained.commit, candidate.commit);
+    assert_eq!(
+        archive::snapshot_of_commit(f._repo.path(), &candidate.commit)
+            .unwrap()
+            .id(),
+        candidate.subject
+    );
+
+    let resumed = compose_with_source(&mut f.store, &owner, f._repo.path(), &wave.id).unwrap();
+    assert!(resumed.source.is_some());
+}
+
 fn rewrite_source_record(
     f: &mut Fixture,
     owner: &ControllerOwner,
@@ -793,18 +821,20 @@ fn cancellation_while_waiting_for_wave_write_lock_prevents_request_link() {
     .unwrap();
     let request_ref = request.record().clone();
     let revision = id(&wave.spec.revision).unwrap();
-    let archive_guard = archive_use(&mut f.store).unwrap();
+    let archive_guard = archive_use(&f.store).unwrap();
     let response_guard = crate::collaboration_sensitive::response_use(&f.store).unwrap();
-    let authority_guard = target::authorize(&mut f.store, &owner).unwrap();
+    let authority_guard = target::authorize(&f.store, &owner).unwrap();
     retain_resolution_request(
         &mut f.store,
         &owner,
         &revision,
         &request,
         &source.request,
-        &archive_guard,
-        &response_guard,
-        &authority_guard,
+        RetentionGuards {
+            archive: &archive_guard,
+            response: &response_guard,
+            authority: &authority_guard,
+        },
     )
     .unwrap();
     let state = current(&f.store, &owner, &wave).unwrap();

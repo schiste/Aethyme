@@ -891,12 +891,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
 ];
 /// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
-/// while preserving all schema-25 rows. This is test setup only: production
-/// migrations continue to reject malformed databases instead of repairing them.
+/// while preserving all schema-25 rows. Fixtures start from a current store,
+/// so also remove schema-27 additions before lowering their version marker;
+/// otherwise they model an impossible hybrid database and make the migration
+/// add columns that the fixture already has. This is test setup only:
+/// production migrations continue to reject malformed databases instead of
+/// repairing them.
 #[cfg(test)]
 pub(crate) fn drop_identity_revision_schema_for_legacy_fixture(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<()> {
+    drop_resolution_schema_27_for_legacy_fixture(connection)?;
     connection.execute_batch(
         "DROP TABLE IF EXISTS contribution_revision_heads;
          DROP TABLE IF EXISTS contribution_revision_identity_bases;
@@ -935,6 +940,146 @@ pub(crate) fn drop_identity_revision_schema_for_legacy_fixture(
         }
     }
     Ok(())
+}
+
+/// Remove only schema-27 additions from a current test store before a fixture
+/// lowers `schema_version` to exercise an older migration. Keep the original
+/// resolution-attempt columns and rows: an old database has those, while it
+/// cannot contain the later async-ledger bindings or wave archive references.
+/// Refuse to discard any actual v27 data so this helper cannot make a test's
+/// current-state records disappear under the guise of a historical fixture.
+#[cfg(test)]
+fn drop_resolution_schema_27_for_legacy_fixture(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let has_attempts = fixture_table_exists(connection, "resolution_attempts")?;
+    let has_waves = fixture_table_exists(connection, "local_waves")?;
+    if !has_attempts && !has_waves {
+        return Ok(());
+    }
+
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS resolution_attempts_require_v27_charge;
+         DROP TRIGGER IF EXISTS resolution_attempts_legacy_rows_immutable;
+         DROP TRIGGER IF EXISTS resolution_attempts_never_delete;
+         DROP TRIGGER IF EXISTS resolution_attempts_identity_immutable;
+         DROP TRIGGER IF EXISTS resolution_attempts_lifecycle_guard;
+         DROP TRIGGER IF EXISTS local_waves_resolution_request_pair_insert;
+         DROP TRIGGER IF EXISTS local_waves_resolution_request_pair_update;
+         DROP TRIGGER IF EXISTS local_waves_composition_source_pair_insert;
+         DROP TRIGGER IF EXISTS local_waves_composition_source_pair_update;
+         DROP INDEX IF EXISTS resolution_attempts_async_token;
+         DROP INDEX IF EXISTS resolution_attempts_session_client_key;",
+    )?;
+
+    let attempt_columns = [
+        "async_token",
+        "client_key",
+        "session_label",
+        "attempt_number",
+        "request_sha256",
+        "input_sha256",
+        "input_manifest_sha256",
+        "dispatch_limits",
+        "response_sha256",
+        "result_record_id",
+        "result_sha256",
+        "detail",
+        "async_state",
+    ];
+    if has_attempts && fixture_column_exists(connection, "resolution_attempts", "async_token")? {
+        let has_v27_attempt_data: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM resolution_attempts
+                 WHERE async_token IS NOT NULL
+                    OR client_key IS NOT NULL
+                    OR session_label IS NOT NULL
+                    OR attempt_number IS NOT NULL
+                    OR request_sha256 IS NOT NULL
+                    OR input_sha256 IS NOT NULL
+                    OR input_manifest_sha256 IS NOT NULL
+                    OR dispatch_limits IS NOT NULL
+                    OR response_sha256 IS NOT NULL
+                    OR result_record_id IS NOT NULL
+                    OR result_sha256 IS NOT NULL
+                    OR detail IS NOT NULL
+                    OR async_state != 'settled'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            !has_v27_attempt_data,
+            "cannot downgrade a fixture containing schema-27 resolution-attempt data"
+        );
+        for column in attempt_columns {
+            if fixture_column_exists(connection, "resolution_attempts", column)? {
+                connection.execute_batch(&format!(
+                    "ALTER TABLE resolution_attempts DROP COLUMN {column};"
+                ))?;
+            }
+        }
+    }
+
+    let wave_columns = [
+        "resolution_request_record_id",
+        "resolution_request_object",
+        "composition_source_record_id",
+        "composition_source_object",
+    ];
+    if has_waves
+        && fixture_column_exists(connection, "local_waves", "resolution_request_record_id")?
+    {
+        let has_v27_wave_data: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM local_waves
+                 WHERE resolution_request_record_id IS NOT NULL
+                    OR resolution_request_object IS NOT NULL
+                    OR composition_source_record_id IS NOT NULL
+                    OR composition_source_object IS NOT NULL
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            !has_v27_wave_data,
+            "cannot downgrade a fixture containing schema-27 wave references"
+        );
+        for column in wave_columns {
+            if fixture_column_exists(connection, "local_waves", column)? {
+                connection
+                    .execute_batch(&format!("ALTER TABLE local_waves DROP COLUMN {column};"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn fixture_table_exists(connection: &rusqlite::Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+         )",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+#[cfg(test)]
+fn fixture_column_exists(
+    connection: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
@@ -2249,6 +2394,7 @@ mod tests {
         let mut store = open(host.path(), &[]).unwrap();
         assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
         // As a schema 3 binary left it.
+        drop_resolution_schema_27_for_legacy_fixture(store.connection()).unwrap();
         crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
             store.connection(),
         )
@@ -2633,6 +2779,7 @@ mod tests {
     fn inspection_reads_without_migrating_or_writing() {
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path(), &[]).unwrap();
+        drop_resolution_schema_27_for_legacy_fixture(store.connection()).unwrap();
         crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
             store.connection(),
         )

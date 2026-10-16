@@ -58,9 +58,9 @@ pub enum RunState {
 }
 #[derive(Debug)]
 pub enum DriveResult {
-    Waiting(wave::Admission),
+    Waiting(Box<wave::Admission>),
     Completed {
-        completion: CompletionSpec,
+        completion: Box<CompletionSpec>,
         historical: bool,
     },
     Held {
@@ -255,7 +255,7 @@ pub(super) fn drive_until(
     )?;
     let active = match admission {
         wave::Admission::Frozen(w) | wave::Admission::Existing(w) => w,
-        other => return Ok(DriveResult::Waiting(other)),
+        other => return Ok(DriveResult::Waiting(Box::new(other))),
     };
     // Revalidate and persist the dispatch record in one short, correctly
     // ordered guard scope. The external native/build/verify/Git work below
@@ -434,29 +434,39 @@ fn trusted_native_failed_checks(observation: &serde_json::Value) -> Vec<FailedCh
         .unwrap_or_default()
 }
 
+struct FailedCheckRequestContext<'a> {
+    owner: &'a ControllerOwner,
+    repo: &'a Path,
+    spec: &'a RunSpec,
+    wave_id: &'a RecordId,
+    cancel: &'a AtomicBool,
+    source: Option<&'a wave::CompositionSource>,
+}
+
 fn raise_failed_check_request(
     store: &mut CollaborationStore,
-    owner: &ControllerOwner,
-    repo: &Path,
-    spec: &RunSpec,
-    wave_id: &RecordId,
-    cancel: &AtomicBool,
-    source: Option<&wave::CompositionSource>,
+    context: FailedCheckRequestContext<'_>,
     checks: Vec<FailedCheck>,
 ) -> Result<Option<&'static str>, ControllerError> {
     if checks.is_empty() {
         return Ok(None);
     }
-    let Some(source) = source else {
+    let Some(source) = context.source else {
         // Legacy/resumed waves without their exact original composition may
         // still be verified, but never synthesize context for a new request.
         return Ok(Some(
             "legacy wave has no retained composition context for resolution",
         ));
     };
-    check(store, owner, spec, cancel)?;
+    check(store, context.owner, context.spec, context.cancel)?;
     match wave::raise_resolution_for_failed_checks(
-        store, owner, repo, wave_id, source, &checks, cancel,
+        store,
+        context.owner,
+        context.repo,
+        context.wave_id,
+        source,
+        &checks,
+        context.cancel,
     ) {
         Ok(_) => {}
         Err(wave::WaveError::ResolutionUnsupported) => {
@@ -466,7 +476,7 @@ fn raise_failed_check_request(
         }
         Err(error) => return Err(error.into()),
     }
-    check(store, owner, spec, cancel)?;
+    check(store, context.owner, context.spec, context.cancel)?;
     Ok(None)
 }
 
@@ -558,12 +568,14 @@ fn run(
         let failed_checks = trusted_native_failed_checks(&observation);
         let resolution_hold = raise_failed_check_request(
             store,
-            owner,
-            broker.repo_handle().root(),
-            spec,
-            wave_id,
-            cancel,
-            source.as_ref(),
+            FailedCheckRequestContext {
+                owner,
+                repo: broker.repo_handle().root(),
+                spec,
+                wave_id,
+                cancel,
+                source: source.as_ref(),
+            },
             failed_checks,
         )?;
         return Ok(DriveResult::Held {
@@ -599,12 +611,14 @@ fn run(
         if built.outcome() == Outcome::CodeFailed {
             let resolution_hold = raise_failed_check_request(
                 store,
-                owner,
-                broker.repo_handle().root(),
-                spec,
-                wave_id,
-                cancel,
-                source.as_ref(),
+                FailedCheckRequestContext {
+                    owner,
+                    repo: broker.repo_handle().root(),
+                    spec,
+                    wave_id,
+                    cancel,
+                    source: source.as_ref(),
+                },
                 vec![FailedCheck {
                     check: format!("native-build:{}:{}", execution.id(), built.generation()),
                 }],
@@ -648,12 +662,14 @@ fn run(
         if evidence.outcome() == VerificationOutcome::AssertionFailed {
             let resolution_hold = raise_failed_check_request(
                 store,
-                owner,
-                broker.repo_handle().root(),
-                spec,
-                wave_id,
-                cancel,
-                source.as_ref(),
+                FailedCheckRequestContext {
+                    owner,
+                    repo: broker.repo_handle().root(),
+                    spec,
+                    wave_id,
+                    cancel,
+                    source: source.as_ref(),
+                },
                 evidence
                     .failed_assertion_ids()
                     .into_iter()
@@ -745,7 +761,7 @@ fn run(
         Some((spec.deadline_ms, cancel)),
     )?;
     Ok(DriveResult::Completed {
-        completion,
+        completion: Box::new(completion),
         historical: false,
     })
 }
