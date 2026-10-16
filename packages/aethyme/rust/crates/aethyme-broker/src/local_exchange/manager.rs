@@ -11,6 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_BINDINGS: i64 = 64;
 const MAX_HISTORY_EVENTS: i64 = 4096;
 const MAX_OBSERVATION_OPERATIONS: i64 = 1024;
+const MAX_REVISION_PROOF_OBJECTS: usize = 128;
+const MAX_REVISION_PROOF_BYTES: usize = MAX_SNAPSHOT_RECOVERY_BYTES;
+const MAX_REVISION_PROOF_SNAPSHOTS: usize = MAX_REVISION_PROOF_OBJECTS * 2;
+const MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS: usize = 1024;
+const MAX_SNAPSHOT_RECOVERY_PROOF_SNAPSHOTS: usize = MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS * 2;
 const KIND: &str = "exchange_metadata_v0";
 static BINDING: RecordSchema = RecordSchema {
     name: "aethyme.exchange-binding/provisional-v0",
@@ -77,12 +82,82 @@ fn stream_id(stream: &StreamWitness) -> Result<RecordId, ExchangeError> {
     stream.validate()?;
     Ok(canonical(&STREAM, stream)?.id())
 }
+fn paths_within_peer_scope(paths: &[String], packet_paths: &[String]) -> bool {
+    !packet_paths.is_empty()
+        && packet_paths.iter().all(|value| {
+            paths.iter().any(|path| {
+                value == path
+                    || value
+                        .strip_prefix(path)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
+}
 fn pin(tx: &Transaction<'_>, digest: &ObjectDigest, holder: &str) -> Result<(), ExchangeError> {
     tx.execute("INSERT INTO object_pins(class,object_sha256,holder,created_ms) VALUES('cited_evidence',?1,?2,?3)",params![digest.hex(),holder,now()?])?;
     Ok(())
 }
+#[derive(Debug, Clone)]
+struct VerifiedRevisionRetention {
+    object_digests: BTreeSet<ObjectDigest>,
+    source_snapshots: BTreeSet<SourceSnapshotId>,
+    object_bytes: usize,
+}
+
+fn retain_revision_proof(
+    tx: &Transaction<'_>,
+    proof: &VerifiedRevisionRetention,
+) -> Result<(), ExchangeError> {
+    if proof.object_digests.len() > MAX_REVISION_PROOF_OBJECTS
+        || proof.object_bytes > MAX_REVISION_PROOF_BYTES
+        || proof.source_snapshots.len() > MAX_REVISION_PROOF_SNAPSHOTS
+    {
+        return Err(ExchangeError::Limit);
+    }
+    for digest in &proof.object_digests {
+        let holder = format!("exchange-revision-proof:{}", digest.hex());
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM object_pins
+             WHERE class='cited_evidence' AND object_sha256=?1
+               AND holder=?2 AND released_ms IS NULL)",
+            params![digest.hex(), holder],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            pin(tx, digest, &holder)?;
+        }
+    }
+    for snapshot in &proof.source_snapshots {
+        let retained: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retained_snapshots
+             WHERE snapshot_id=?1 AND snapshot_id NOT IN
+               (SELECT snapshot_id FROM reclaimed_snapshots))",
+            [snapshot.as_str()],
+            |row| row.get(0),
+        )?;
+        if !retained {
+            return Err(invalid("revision source snapshot is not retained"));
+        }
+        let holder = format!("exchange-revision-source:{}", snapshot.as_str());
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reader_leases
+             WHERE target_kind='snapshot' AND target=?1 AND holder=?2
+               AND released_ms IS NULL AND until_ms>?3)",
+            params![snapshot.as_str(), holder, now()?],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.execute(
+                "INSERT INTO reader_leases (target_kind,target,holder,until_ms,created_ms)
+                 VALUES ('snapshot',?1,?2,?3,?4)",
+                params![snapshot.as_str(), holder, i64::MAX, now()?],
+            )?;
+        }
+    }
+    Ok(())
+}
 fn packet_from(body: &[u8], expected: &str) -> Result<Metadata, ExchangeError> {
-    if body.len() > MAX_PACKET_BYTES {
+    if body.len() > MAX_REVISION_PACKET_BYTES {
         return Err(ExchangeError::Limit);
     }
     let rec = Record::decode(body, &[&PACKET])?;
@@ -92,9 +167,15 @@ fn packet_from(body: &[u8], expected: &str) -> Result<Metadata, ExchangeError> {
     let value: serde_json::Value = serde_json::from_slice(body)?;
     let packet: Metadata = serde_json::from_value(value["spec"].clone())?;
     packet.validate()?;
+    if body.len() > packet.wire_limit() {
+        return Err(ExchangeError::Limit);
+    }
     Ok(packet)
 }
 fn event_from(body: &[u8], expected: &str) -> Result<Event, ExchangeError> {
+    if body.len() > MAX_REVISION_PACKET_BYTES {
+        return Err(ExchangeError::Limit);
+    }
     let rec = Record::decode(body, &[&EVENT])?;
     if rec.id().as_str() != expected || rec.canonical_bytes() != body {
         return Err(invalid("stored event identity"));
@@ -269,12 +350,9 @@ impl CurrentPeer<'_> {
         }
         if let Scope::Paths(paths) = &spec.scope {
             match packet {
-                Metadata::Contribution { scope, .. }
-                    if scope.iter().all(|v| {
-                        paths.iter().any(|p| {
-                            v == p || v.strip_prefix(p).is_some_and(|rest| rest.starts_with('/'))
-                        })
-                    }) => {}
+                Metadata::Contribution { scope, .. } if paths_within_peer_scope(paths, scope) => {}
+                Metadata::RevisionContribution { scope, .. }
+                    if paths_within_peer_scope(paths, scope) => {}
                 _ => return Err(ExchangeError::Forbidden),
             }
         }
@@ -434,9 +512,252 @@ fn validate_capture_envelope(
         {
             Ok(digest)
         }
+        Metadata::RevisionContribution {
+            capture_record_id,
+            capture_receipt_record_id,
+            source,
+            revision_bytes_hex,
+            ..
+        } if capture_record_id == receipt.contribution.as_str()
+            && capture_receipt_record_id == receipt.receipt_record_id.as_str()
+            && source == receipt.result.as_str()
+            && payload == receipt.receipt_record_id.as_str() =>
+        {
+            let revision_bytes = decode_lower_hex(
+                revision_bytes_hex,
+                aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
+            )?;
+            let (revision, _) = ContributionRevision::from_record(&revision_bytes)
+                .map_err(|_| invalid("revision record"))?;
+            if revision.base() != &receipt.base || revision.result() != &receipt.result {
+                return Err(invalid("revision capture transition"));
+            }
+            Ok(digest)
+        }
         _ => Err(invalid("capture envelope subject")),
     }
 }
+
+/// Resolve a revision packet against the locally approved project descriptor
+/// and exact retained identity history. The packet stays advisory; this only
+/// verifies that its immutable references and source transition are bound to
+/// the selected project. Successful revision and brief bytes are returned for
+/// the caller to retain alongside the peer event.
+fn validate_revision_project_binding(
+    store: &mut CollaborationStore,
+    packet: &Metadata,
+) -> Result<Option<VerifiedRevisionRetention>, ExchangeError> {
+    let Metadata::RevisionContribution {
+        project_id,
+        descriptor_record_id,
+        descriptor_object_sha256,
+        logical_contribution_id,
+        capture_record_id,
+        revision_record_id,
+        revision_object_sha256,
+        revision_bytes_hex,
+        brief_object_sha256,
+        brief_bytes_hex,
+        scope,
+        ..
+    } = packet
+    else {
+        return Ok(None);
+    };
+
+    let project_id =
+        ProjectId::parse(project_id).map_err(|_| invalid("revision project identity"))?;
+    let descriptor_record_id = RecordId::parse(descriptor_record_id)
+        .map_err(|_| invalid("revision descriptor identity"))?;
+    let descriptor_object = archive::parse_digest(descriptor_object_sha256)
+        .ok_or_else(|| invalid("revision descriptor object"))?;
+    let logical_id = ContributionId::parse(logical_contribution_id)
+        .map_err(|_| invalid("revision logical contribution identity"))?;
+    let capture_record_id =
+        RecordId::parse(capture_record_id).map_err(|_| invalid("revision capture lineage"))?;
+    let revision_record_id =
+        RecordId::parse(revision_record_id).map_err(|_| invalid("revision record identity"))?;
+    let revision_object = archive::parse_digest(revision_object_sha256)
+        .ok_or_else(|| invalid("revision object digest"))?;
+    let revision_bytes = decode_lower_hex(
+        revision_bytes_hex,
+        aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
+    )?;
+    let (revision, observed_revision_id) = ContributionRevision::from_record(&revision_bytes)
+        .map_err(|_| invalid("revision record"))?;
+    if observed_revision_id != revision_record_id
+        || revision.project_id() != &project_id
+        || revision.contribution_id() != &logical_id
+        || revision.capture_record_id() != &capture_record_id
+    {
+        return Err(invalid("revision record binding"));
+    }
+
+    let approved = crate::collaboration_identity_store::resolve_approved_project_binding(store)
+        .map_err(|_| invalid("approved project binding unavailable"))?
+        .ok_or_else(|| invalid("approved project binding unavailable"))?;
+    if approved.project_id() != &project_id
+        || approved.descriptor_record_id() != &descriptor_record_id
+        || approved.descriptor_object() != descriptor_object
+    {
+        return Err(invalid("revision is outside the approved project binding"));
+    }
+    let base_state = match crate::collaboration_identity_store::resolve_project_file_identity_state(
+        store,
+        &approved,
+        revision.base(),
+    )
+    .map_err(|_| invalid("revision base identity state unavailable"))?
+    {
+        crate::collaboration_identity_store::IdentityStateResolution::Anchor(state)
+        | crate::collaboration_identity_store::IdentityStateResolution::Bootstrap(state)
+        | crate::collaboration_identity_store::IdentityStateResolution::Replayed(state) => state,
+        crate::collaboration_identity_store::IdentityStateResolution::Unknown { .. } => {
+            return Err(invalid("revision base identity state is unknown"));
+        }
+    };
+    let brief_bytes = brief_bytes_hex
+        .as_deref()
+        .map(|encoded| {
+            decode_lower_hex(
+                encoded,
+                aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES,
+            )
+        })
+        .transpose()?;
+    let resolved = crate::collaboration_identity_store::validate_bound_contribution_revision_bytes(
+        store,
+        &approved,
+        &base_state,
+        &revision_record_id,
+        revision_object,
+        &logical_id,
+        None,
+        &revision_bytes,
+        brief_bytes.as_deref(),
+    )
+    .map_err(|_| invalid("revision identity transition is not verified"))?;
+    if resolved.record_id() != &revision_record_id
+        || resolved.object_digest() != revision_object
+        || resolved.revision() != &revision
+        || resolved.capture_lineage() != &capture_record_id
+        || resolved.base_state().snapshot_id() != revision.base()
+        || resolved.result_state().snapshot_id() != revision.result()
+    {
+        return Err(invalid("revision identity transition binding"));
+    }
+    let mut actual_paths = BTreeSet::new();
+    for state in resolved
+        .identity_transition()
+        .changes()
+        .iter()
+        .flat_map(|change| [change.before.as_ref(), change.after.as_ref()])
+        .flatten()
+    {
+        let path = std::str::from_utf8(&state.path)
+            .map_err(|_| invalid("revision scope contains a non-UTF-8 source path"))?;
+        actual_paths.insert(path.to_string());
+    }
+    let actual_paths: Vec<_> = actual_paths.into_iter().collect();
+    super::revision_paths(&actual_paths)?;
+    if actual_paths.iter().collect::<BTreeSet<_>>() != scope.iter().collect::<BTreeSet<_>>() {
+        return Err(invalid(
+            "revision scope does not match verified source paths",
+        ));
+    }
+    let brief_digest = match (brief_object_sha256, resolved.brief_digest()) {
+        (Some(encoded), Some(digest)) if archive::parse_digest(encoded) == Some(digest) => {
+            Some(digest)
+        }
+        (None, None) => None,
+        _ => return Err(invalid("revision brief object binding")),
+    };
+
+    let retained_revision = archive::put_object(store, &revision_bytes)?;
+    if retained_revision != revision_object {
+        return Err(invalid("revision object changed during retention"));
+    }
+    let resolver_proof_objects = resolved.identity_proof_object_digests().clone();
+    let mut retained = resolver_proof_objects.clone();
+    retained.insert(descriptor_object);
+    retained.insert(revision_object);
+    if let Some(bytes) = brief_bytes.as_deref() {
+        let digest = archive::put_object(store, bytes)?;
+        if Some(digest) != brief_digest {
+            return Err(invalid("revision brief digest changed during retention"));
+        }
+        retained.insert(digest);
+    }
+    if retained.len() > MAX_REVISION_PROOF_OBJECTS {
+        return Err(ExchangeError::Limit);
+    }
+    let mut object_bytes = 0usize;
+    let mut source_snapshots = BTreeSet::new();
+    let mut proof_revision_ids = BTreeSet::new();
+    for digest in &retained {
+        let bytes = if *digest == revision_object {
+            revision_bytes.as_slice()
+        } else if Some(*digest) == brief_digest {
+            brief_bytes
+                .as_deref()
+                .ok_or_else(|| invalid("revision brief bytes are absent"))?
+        } else {
+            // The resolver already verified these immutable objects. Read
+            // them once more under the archive barrier to retain every
+            // ancestor revision's base/result snapshots with the event.
+            // A digest in this set must decode as either a revision or Brief.
+            let owned = archive::read_object_bounded(store, digest, MAX_REVISION_PACKET_BYTES)?;
+            if resolver_proof_objects.contains(digest) {
+                if let Ok((proof_revision, proof_id)) = ContributionRevision::from_record(&owned) {
+                    proof_revision_ids.insert(proof_id);
+                    source_snapshots.insert(proof_revision.base().clone());
+                    source_snapshots.insert(proof_revision.result().clone());
+                } else if Brief::from_record(&owned).is_err() {
+                    return Err(invalid(
+                        "revision proof object is not a canonical revision or brief",
+                    ));
+                }
+            }
+            object_bytes = object_bytes
+                .checked_add(owned.len())
+                .ok_or(ExchangeError::Limit)?;
+            if object_bytes > MAX_REVISION_PROOF_BYTES {
+                return Err(ExchangeError::Limit);
+            }
+            continue;
+        };
+        object_bytes = object_bytes
+            .checked_add(bytes.len())
+            .ok_or(ExchangeError::Limit)?;
+        if object_bytes > MAX_REVISION_PROOF_BYTES {
+            return Err(ExchangeError::Limit);
+        }
+        if *digest == revision_object || resolver_proof_objects.contains(digest) {
+            if let Ok((proof_revision, proof_id)) = ContributionRevision::from_record(bytes) {
+                proof_revision_ids.insert(proof_id);
+                source_snapshots.insert(proof_revision.base().clone());
+                source_snapshots.insert(proof_revision.result().clone());
+            } else if resolver_proof_objects.contains(digest) && Brief::from_record(bytes).is_err()
+            {
+                return Err(invalid(
+                    "revision proof object is not a canonical revision or brief",
+                ));
+            }
+        }
+    }
+    if proof_revision_ids != *resolved.identity_proof_revision_ids()
+        || source_snapshots.is_empty()
+        || source_snapshots.len() > MAX_REVISION_PROOF_SNAPSHOTS
+    {
+        return Err(invalid("revision proof closure is incomplete or too large"));
+    }
+    Ok(Some(VerifiedRevisionRetention {
+        object_digests: retained,
+        source_snapshots,
+        object_bytes,
+    }))
+}
+
 /// Attach one immutable metadata envelope to a real committed capture outbox
 /// row. The original sequence, capture operation, payload receipt and global
 /// delivery marker remain the capture's; the wire envelope has its own identity.
@@ -457,6 +778,7 @@ pub fn stage_capture_metadata(
     }
     let record = packet.record()?;
     let receipt_digest = validate_capture_envelope(store, &operation, &payload, packet)?;
+    let revision_proof = validate_revision_project_binding(store, packet)?;
     let digest = archive::put_object(store, &record.canonical_bytes())?;
     let tx = store
         .connection()
@@ -472,6 +794,10 @@ pub fn stage_capture_metadata(
         if body != record.canonical_bytes() {
             return Err(invalid("capture envelope is immutable"));
         }
+        if let Some(proof) = &revision_proof {
+            retain_revision_proof(&tx, proof)?;
+        }
+        tx.commit()?;
         return Ok(record.id());
     }
     let count: i64 = tx.query_row("SELECT count(*) FROM local_exchange_messages", [], |r| {
@@ -490,6 +816,9 @@ pub fn stage_capture_metadata(
         &receipt_digest,
         &format!("exchange-capture-receipt:{sequence}"),
     )?;
+    if let Some(proof) = &revision_proof {
+        retain_revision_proof(&tx, proof)?;
+    }
     tx.commit()?;
     Ok(record.id())
 }
@@ -570,6 +899,7 @@ pub fn deliver(
         } else {
             validate_capture_envelope(store, &operation, &payload, &packet)?;
         }
+        validate_revision_project_binding(store, &packet)?;
         proof.visible(&peer.spec, &packet)?;
         let record = packet.record()?;
         let ack = peer.adapter.send(&*proof.lease, &record)?;
@@ -647,7 +977,7 @@ fn save_event(
     stream: &RecordId,
     event: &Event,
     digest: &ObjectDigest,
-) -> Result<(), ExchangeError> {
+) -> Result<bool, ExchangeError> {
     let record = event.record()?;
     let existing:Option<(String,Vec<u8>)>=tx.query_row("SELECT id,body FROM local_exchange_events WHERE binding=?1 AND stream=?2 AND sequence=?3",params![id.as_str(),stream.as_str(),event.sequence],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     if let Some((old, body)) = existing {
@@ -655,7 +985,7 @@ fn save_event(
             return Err(invalid("event position reused"));
         }
         tx.execute("UPDATE local_exchange_events SET applied=0 WHERE binding=?1 AND stream=?2 AND sequence=?3 AND applied=2",params![id.as_str(),stream.as_str(),event.sequence])?;
-        return Ok(());
+        return Ok(false);
     }
     let count: i64 = tx.query_row(
         "SELECT count(*) FROM local_exchange_events WHERE binding=?1",
@@ -667,7 +997,7 @@ fn save_event(
     }
     tx.execute("INSERT INTO local_exchange_events(binding,stream,sequence,id,body,applied) VALUES(?1,?2,?3,?4,?5,0)",params![id.as_str(),stream.as_str(),event.sequence,record.id().as_str(),record.canonical_bytes()])?;
     pin(tx, digest, record.id().as_str())?;
-    Ok(())
+    Ok(true)
 }
 fn project(tx: &Transaction<'_>, id: &RecordId, packet: &Metadata) -> Result<(), ExchangeError> {
     let record = packet.record()?;
@@ -710,6 +1040,7 @@ pub fn poll(
     let _local = authority::guard(store, &peer.epoch)?;
     let _lock = peer_lock(store, peer)?;
     reserve_observation(store, peer, operation)?;
+    let _use = gc::archive_use(store)?;
     let proof = current(store, peer)?;
     let position = require_stream(store, peer, &proof)?;
     let cursor = Cursor {
@@ -723,25 +1054,76 @@ pub fn poll(
         }
         let stream = stream_id(&cursor.stream)?;
         let mut retained = Vec::new();
+        let mut revision_proofs = Vec::new();
+        let mut total_event_bytes = 0usize;
+        let mut total_proof_objects = 0usize;
+        let mut total_proof_snapshots = 0usize;
         for event in &events {
             if event.stream != cursor.stream {
                 return Err(ExchangeError::Stale);
             }
             proof.visible(&peer.spec, &event.packet)?;
+            let record = event.record()?;
+            total_event_bytes = total_event_bytes
+                .checked_add(record.canonical_bytes().len())
+                .ok_or(ExchangeError::Limit)?;
+            if total_event_bytes > MAX_SNAPSHOT_PAGE_BYTES {
+                return Err(ExchangeError::Limit);
+            }
+            let proof = validate_revision_project_binding(store, &event.packet)?;
+            if let Some(proof) = &proof {
+                total_event_bytes = total_event_bytes
+                    .checked_add(proof.object_bytes)
+                    .ok_or(ExchangeError::Limit)?;
+                total_proof_objects = total_proof_objects
+                    .checked_add(proof.object_digests.len())
+                    .ok_or(ExchangeError::Limit)?;
+                total_proof_snapshots = total_proof_snapshots
+                    .checked_add(proof.source_snapshots.len())
+                    .ok_or(ExchangeError::Limit)?;
+                if total_event_bytes > MAX_SNAPSHOT_RECOVERY_BYTES
+                    || total_proof_objects > MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS
+                    || total_proof_snapshots > MAX_SNAPSHOT_RECOVERY_PROOF_SNAPSHOTS
+                {
+                    return Err(ExchangeError::Limit);
+                }
+            }
+            revision_proofs.push(proof);
             if event.sequence <= position {
                 let known:bool=store.read_connection().query_row("SELECT EXISTS(SELECT 1 FROM local_exchange_events WHERE binding=?1 AND stream=?2 AND sequence=?3)",params![peer.id.as_str(),stream.as_str(),event.sequence],|r|r.get(0))?;
                 if !known {
                     return Err(ExchangeError::Stale);
                 }
             }
-            let record = event.record()?;
             retained.push(archive::put_object(store, &record.canonical_bytes())?);
+        }
+        let buffered = {
+            let mut statement = store.read_connection().prepare(
+                "SELECT id,body FROM local_exchange_events WHERE binding=?1 AND applied=0 ORDER BY sequence LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    params![peer.id.as_str(), MAX_BUFFERED_EVENTS as i64 + 1],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, body) in buffered {
+            let event = event_from(&body, &id)?;
+            if event.stream != cursor.stream {
+                return Err(ExchangeError::Stale);
+            }
+            proof.visible(&peer.spec, &event.packet)?;
+            validate_revision_project_binding(store, &event.packet)?;
         }
         let tx = store
             .connection()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (event, digest) in events.iter().zip(&retained) {
+        for ((event, digest), proof) in events.iter().zip(&retained).zip(&revision_proofs) {
             save_event(&tx, &peer.id, &stream, event, digest)?;
+            if let Some(proof) = proof {
+                retain_revision_proof(&tx, proof)?;
+            }
         }
         let mut next = position;
         loop {
@@ -791,6 +1173,7 @@ pub fn recover_snapshot(
     let _local = authority::guard(store, &peer.epoch)?;
     let _lock = peer_lock(store, peer)?;
     reserve_observation(store, peer, operation)?;
+    let _use = gc::archive_use(store)?;
     let proof = current(store, peer)?;
     let old = cursor_row(store, &peer.id)?;
     if old
@@ -803,8 +1186,12 @@ pub fn recover_snapshot(
         let mut descriptor = None;
         let mut offset = 0;
         let mut items = Vec::new();
+        let mut revision_proofs = Vec::new();
         let mut positions = BTreeSet::new();
         let mut packets = BTreeSet::new();
+        let mut total_snapshot_bytes = 0usize;
+        let mut total_proof_objects = 0usize;
+        let mut total_proof_snapshots = 0usize;
         loop {
             proof.check()?;
             let page = peer
@@ -818,7 +1205,27 @@ pub fn recover_snapshot(
             }
             descriptor = Some(page.snapshot.clone());
             for event in page.items {
+                let event_bytes = event.record()?.canonical_bytes().len();
+                total_snapshot_bytes =
+                    add_snapshot_recovery_bytes(total_snapshot_bytes, event_bytes)?;
                 proof.visible(&peer.spec, &event.packet)?;
+                let proof = validate_revision_project_binding(store, &event.packet)?;
+                if let Some(proof) = &proof {
+                    total_snapshot_bytes =
+                        add_snapshot_recovery_bytes(total_snapshot_bytes, proof.object_bytes)?;
+                    total_proof_objects = total_proof_objects
+                        .checked_add(proof.object_digests.len())
+                        .ok_or(ExchangeError::Limit)?;
+                    total_proof_snapshots = total_proof_snapshots
+                        .checked_add(proof.source_snapshots.len())
+                        .ok_or(ExchangeError::Limit)?;
+                    if total_proof_objects > MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS
+                        || total_proof_snapshots > MAX_SNAPSHOT_RECOVERY_PROOF_SNAPSHOTS
+                    {
+                        return Err(ExchangeError::Limit);
+                    }
+                }
+                revision_proofs.push(proof);
                 if !positions.insert(event.sequence) || !packets.insert(event.packet.record()?.id())
                 {
                     return Err(invalid("duplicate complete snapshot item"));
@@ -849,8 +1256,11 @@ pub fn recover_snapshot(
             .connection()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         clear_projection(&tx, &peer.id)?;
-        for (event, digest) in items.iter().zip(&retained) {
+        for ((event, digest), proof) in items.iter().zip(&retained).zip(&revision_proofs) {
             save_event(&tx, &peer.id, &stream, event, digest)?;
+            if let Some(proof) = proof {
+                retain_revision_proof(&tx, proof)?;
+            }
             project(&tx, &peer.id, &event.packet)?;
             tx.execute("UPDATE local_exchange_events SET applied=1 WHERE binding=?1 AND stream=?2 AND sequence=?3",params![peer.id.as_str(),stream.as_str(),event.sequence])?;
         }
@@ -867,6 +1277,31 @@ pub fn recover_snapshot(
     }
     result
 }
+
+fn add_snapshot_recovery_bytes(total: usize, next: usize) -> Result<usize, ExchangeError> {
+    let total = total.checked_add(next).ok_or(ExchangeError::Limit)?;
+    if total > MAX_SNAPSHOT_RECOVERY_BYTES {
+        return Err(ExchangeError::Limit);
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod revision_snapshot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_recovery_rejects_aggregate_over_budget_before_append() {
+        assert_eq!(
+            add_snapshot_recovery_bytes(MAX_SNAPSHOT_RECOVERY_BYTES - 1, 1).unwrap(),
+            MAX_SNAPSHOT_RECOVERY_BYTES
+        );
+        assert!(matches!(
+            add_snapshot_recovery_bytes(MAX_SNAPSHOT_RECOVERY_BYTES - 1, 2),
+            Err(ExchangeError::Limit)
+        ));
+    }
+}
 /// Cached remote projection is accessible only after a fresh native lease.
 /// Offline/expired/revoked peer data cannot silently regain current visibility.
 pub fn projection(
@@ -876,11 +1311,18 @@ pub fn projection(
     let _lock = peer_lock(store, peer)?;
     let proof = current(store, peer)?;
     require_stream(store, peer, &proof)?;
+    let _use = gc::archive_use(store)?;
     let result = (|| {
-        let tx = store
-            .connection()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows:Vec<(String,Vec<u8>)>=tx.prepare("SELECT packet,body FROM local_exchange_projection WHERE binding=?1 ORDER BY packet LIMIT 1025")?.query_map([peer.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+        let rows = {
+            let mut statement = store.read_connection().prepare(
+                "SELECT packet,body FROM local_exchange_projection WHERE binding=?1 ORDER BY packet LIMIT 1025",
+            )?;
+            statement
+                .query_map([peer.id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         if rows.len() > MAX_VISIBLE_ITEMS {
             return Err(ExchangeError::Limit);
         }
@@ -888,8 +1330,12 @@ pub fn projection(
         for (id, body) in rows {
             let packet = packet_from(&body, &id)?;
             proof.visible(&peer.spec, &packet)?;
+            validate_revision_project_binding(store, &packet)?;
             packets.push(packet);
         }
+        let tx = store
+            .connection()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         proof.check_in(&tx, peer)?;
         tx.commit()?;
         Ok(packets)
@@ -899,3 +1345,6 @@ pub fn projection(
     }
     result
 }
+
+#[cfg(test)]
+mod revision_tests;

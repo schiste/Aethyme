@@ -155,6 +155,7 @@ pub fn compose_structural(
         &request.deliveries,
         None,
         None,
+        None,
         &mut profile,
     )?;
     Ok(StructuralComposition {
@@ -370,6 +371,7 @@ pub fn compose(
         &request.deliveries,
         None,
         None,
+        None,
         &mut MergeProfile {
             engine: None,
             observations: Vec::new(),
@@ -395,6 +397,34 @@ pub(crate) fn compose_with_candidate_retainer(
         request,
         &request.deliveries,
         None,
+        None,
+        Some(retainer),
+        &mut MergeProfile {
+            engine: None,
+            observations: Vec::new(),
+            text_merges: 0,
+            accepted_baseline: None,
+        },
+    )
+}
+
+/// Internal Local D10 adapter: every delivered contribution must have one
+/// exact immutable revision pin, which is copied into the ordered recipe.
+/// The caller validates the project/capture/FileId binding before calling.
+pub(crate) fn compose_with_candidate_retainer_and_revisions(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    revisions: &BTreeMap<String, RecordId>,
+    retainer: &mut CandidateRetainer<'_>,
+) -> Result<Composition, ComposeError> {
+    compose_inner(
+        store,
+        repo,
+        request,
+        &request.deliveries,
+        None,
+        Some(revisions),
         Some(retainer),
         &mut MergeProfile {
             engine: None,
@@ -416,7 +446,7 @@ pub(crate) fn compose_after_accepted(
     completion: RecordId,
     members: Vec<String>,
 ) -> Result<Composition, ComposeError> {
-    compose_after_accepted_inner(store, repo, request, completion, members, None)
+    compose_after_accepted_inner(store, repo, request, completion, members, None, None)
 }
 
 pub(crate) fn compose_after_accepted_with_candidate_retainer(
@@ -427,7 +457,35 @@ pub(crate) fn compose_after_accepted_with_candidate_retainer(
     members: Vec<String>,
     retainer: &mut CandidateRetainer<'_>,
 ) -> Result<Composition, ComposeError> {
-    compose_after_accepted_inner(store, repo, request, completion, members, Some(retainer))
+    compose_after_accepted_inner(
+        store,
+        repo,
+        request,
+        completion,
+        members,
+        None,
+        Some(retainer),
+    )
+}
+
+pub(crate) fn compose_after_accepted_with_candidate_retainer_and_revisions(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    completion: RecordId,
+    members: Vec<String>,
+    revisions: &BTreeMap<String, RecordId>,
+    retainer: &mut CandidateRetainer<'_>,
+) -> Result<Composition, ComposeError> {
+    compose_after_accepted_inner(
+        store,
+        repo,
+        request,
+        completion,
+        members,
+        Some(revisions),
+        Some(retainer),
+    )
 }
 
 fn compose_after_accepted_inner(
@@ -436,6 +494,7 @@ fn compose_after_accepted_inner(
     request: &CompositionRequest,
     completion: RecordId,
     members: Vec<String>,
+    revision_bindings: Option<&BTreeMap<String, RecordId>>,
     retainer: Option<&mut CandidateRetainer<'_>>,
 ) -> Result<Composition, ComposeError> {
     let mut lineages = BTreeSet::new();
@@ -461,6 +520,7 @@ fn compose_after_accepted_inner(
         request,
         &request.deliveries,
         None,
+        revision_bindings,
         retainer,
         &mut MergeProfile {
             engine: None,
@@ -601,6 +661,7 @@ fn recompose_inner(
         &deliveries,
         Some(subtraction),
         None,
+        None,
         profile,
     )
 }
@@ -656,9 +717,13 @@ fn compose_inner(
     request: &CompositionRequest,
     deliveries: &[String],
     recomposition: Option<&Subtraction>,
+    revision_bindings: Option<&BTreeMap<String, RecordId>>,
     candidate_retainer: Option<&mut CandidateRetainer<'_>>,
     profile: &mut MergeProfile<'_>,
 ) -> Result<Composition, ComposeError> {
+    if let Some(revisions) = revision_bindings {
+        validate_revision_bindings(request, deliveries, revisions)?;
+    }
     // Reclamation cannot remove an input while this composition reads it.
     let _use = crate::collaboration_gc::archive_use(store)
         .map_err(|source| io(&crate::collaboration_gc::lock_path(store), source))?;
@@ -786,6 +851,7 @@ fn compose_inner(
         deliveries,
         usage,
         recomposition,
+        revision_bindings,
         profile,
     )?;
     let object = collaboration_archive::put_object(store, &bytes)?;
@@ -799,6 +865,35 @@ fn compose_inner(
         order,
         usage,
     })
+}
+
+fn validate_revision_bindings(
+    request: &CompositionRequest,
+    deliveries: &[String],
+    revisions: &BTreeMap<String, RecordId>,
+) -> Result<(), ComposeError> {
+    let catalog = catalog(request)?;
+    let mut unique_revisions = BTreeSet::new();
+    for (contribution, revision) in revisions {
+        if !catalog.contains_key(contribution.as_str()) {
+            return Err(ComposeError::InvalidRequest(format!(
+                "revision pin names unknown contribution {contribution}"
+            )));
+        }
+        if !unique_revisions.insert(revision) {
+            return Err(ComposeError::InvalidRequest(
+                "one immutable revision is pinned to multiple contributions".into(),
+            ));
+        }
+    }
+    for contribution in deliveries {
+        if !revisions.contains_key(contribution) {
+            return Err(ComposeError::InvalidRequest(format!(
+                "delivered contribution {contribution} has no immutable revision pin"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) type CandidateRetainer<'a> = dyn FnMut(
@@ -2212,6 +2307,7 @@ fn recipe_record(
     deliveries: &[String],
     usage: BudgetUsage,
     recomposition: Option<&Subtraction>,
+    revision_bindings: Option<&BTreeMap<String, RecordId>>,
     profile: &MergeProfile<'_>,
 ) -> Result<(Vec<u8>, RecordId), ComposeError> {
     let engine_version = git_version()?;
@@ -2219,12 +2315,15 @@ fn recipe_record(
         .steps
         .iter()
         .map(|step| {
-            object(vec![
-                ("id", text(&step.spec.id)),
-                ("lineage", text(step.retained.lineage_record_id.as_str())),
-                ("base", text(step.retained.base.snapshot_id.as_str())),
-                ("result", text(step.retained.result.snapshot_id.as_str())),
-            ])
+            recipe_order_entry(
+                &step.spec.id,
+                step.retained.lineage_record_id.as_str(),
+                step.retained.base.snapshot_id.as_str(),
+                step.retained.result.snapshot_id.as_str(),
+                revision_bindings
+                    .and_then(|bindings| bindings.get(&step.spec.id))
+                    .map(RecordId::as_str),
+            )
         })
         .collect();
     let budget = |contributions: usize, paths: usize, bytes: u64, merges: usize| {
@@ -2342,6 +2441,25 @@ fn recipe_record(
         .map_err(|error| ComposeError::InvalidRequest(format!("recipe record: {error}")))?
         .id();
     Ok((bytes, id))
+}
+
+fn recipe_order_entry(
+    contribution: &str,
+    lineage: &str,
+    base: &str,
+    result: &str,
+    revision: Option<&str>,
+) -> Value {
+    let mut fields = vec![
+        ("id", text(contribution)),
+        ("lineage", text(lineage)),
+        ("base", text(base)),
+        ("result", text(result)),
+    ];
+    if let Some(revision) = revision {
+        fields.push(("revision", text(revision)));
+    }
+    object(fields)
 }
 
 /// Read a recipe back from the archive.
@@ -2715,3 +2833,7 @@ mod tests {
         assert_eq!(profile.text_merges, 1);
     }
 }
+
+#[cfg(test)]
+#[path = "composer/revision_tests.rs"]
+mod revision_tests;
