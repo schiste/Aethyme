@@ -14,10 +14,10 @@ exit: 0
   aethyme broker gc sweep [--json]
       Run the unattended build-artifact sweep now with its full budget
       (scaled up when disk is below the gate headroom), ignoring its daily
-      cadence. It removes only git-ignored build caches of finished sessions
-      and of open sessions idle past idle_session_artifact_hours; broker open
-      spends at most 250 ms on the same sweep. Run again to continue a pass
-      that paused at its budget.
+      cadence. It removes only git-ignored build caches of closed sessions;
+      broker open spends at most 250 ms on the same sweep. Open-session caches
+      require the reviewed gc reclaim path. Run again to continue a pass that
+      paused at its budget.
   aethyme broker gc reclaim plan [--session <id>] [--json]
   aethyme broker gc reclaim apply --confirm <sha256> [--session <id>] [--json]
       Report regenerable build output (target, node_modules, .venv, build,

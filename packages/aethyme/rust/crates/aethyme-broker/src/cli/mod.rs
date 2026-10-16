@@ -835,10 +835,10 @@ Usage:
   aethyme broker gc sweep [--json]
       Run the unattended build-artifact sweep now with its full budget
       (scaled up when disk is below the gate headroom), ignoring its daily
-      cadence. It removes only git-ignored build caches of finished sessions
-      and of open sessions idle past idle_session_artifact_hours; broker open
-      spends at most 250 ms on the same sweep. Run again to continue a pass
-      that paused at its budget.
+      cadence. It removes only git-ignored build caches of closed sessions;
+      broker open spends at most 250 ms on the same sweep. Open-session caches
+      require the reviewed gc reclaim path. Run again to continue a pass that
+      paused at its budget.
   aethyme broker storage [--json]
   aethyme broker storage plan [--json]
   aethyme broker storage apply --confirm <sha256> [--json]
