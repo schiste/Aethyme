@@ -116,16 +116,19 @@ fn actual_clones() -> Clones {
         fs::copy(source, destination).unwrap();
     }
     let template_arg = format!("--template={}", templates.display());
-    command(
-        &seed,
-        &["init", "-q", "-b", "main", template_arg.as_str()],
-    );
+    command(&seed, &["init", "-q", "-b", "main", template_arg.as_str()]);
     command(&seed, &["add", "-A"]);
     command(&seed, &["commit", "-qm", "synthetic Playground seed"]);
     let left = root.path().join("clone-a");
     let right = root.path().join("clone-b");
-    command(root.path(), &["clone", "--quiet", "--local", "seed", "clone-a"]);
-    command(root.path(), &["clone", "--quiet", "--local", "seed", "clone-b"]);
+    command(
+        root.path(),
+        &["clone", "--quiet", "--local", "seed", "clone-a"],
+    );
+    command(
+        root.path(),
+        &["clone", "--quiet", "--local", "seed", "clone-b"],
+    );
     assert_eq!(git_root(&left), left.canonicalize().unwrap());
     assert_eq!(git_root(&right), right.canonicalize().unwrap());
     Clones {
@@ -173,14 +176,20 @@ fn collect_entries(root: &Path, directory: &Path, entries: &mut Vec<SourceEntry>
         if metadata.file_type().is_dir() {
             collect_entries(root, &path, entries);
         } else if metadata.file_type().is_file() {
-            let relative = relative.to_str().expect("UTF-8 fixture path").replace('\\', "/");
+            let relative = relative
+                .to_str()
+                .expect("UTF-8 fixture path")
+                .replace('\\', "/");
             entries.push(SourceEntry::from_content(
                 relative.into_bytes(),
                 EntryKind::Regular,
                 &fs::read(path).unwrap(),
             ));
         } else if metadata.file_type().is_symlink() {
-            let relative = relative.to_str().expect("UTF-8 fixture path").replace('\\', "/");
+            let relative = relative
+                .to_str()
+                .expect("UTF-8 fixture path")
+                .replace('\\', "/");
             let target = fs::read_link(path).unwrap();
             entries.push(SourceEntry::from_content(
                 relative.into_bytes(),
@@ -197,10 +206,7 @@ fn function_declarations(source: &str) -> Vec<(String, String)> {
         .filter_map(|line| {
             let declaration = line.trim().strip_prefix("export function ")?;
             let name_end = declaration.find('(')?;
-            Some((
-                declaration[..name_end].to_owned(),
-                declaration.to_owned(),
-            ))
+            Some((declaration[..name_end].to_owned(), declaration.to_owned()))
         })
         .collect()
 }
@@ -213,13 +219,7 @@ fn node_ids(root: &Path, relative: &str, name: &str) -> NodeId {
             .any(|(declared, _)| declared == name),
         "{name:?} is declared in {relative:?}"
     );
-    NodeId::new(
-        NodeKind::Function,
-        &repo_component(root),
-        relative,
-        name,
-    )
-    .expect("fixture NodeId")
+    NodeId::new(NodeKind::Function, &repo_component(root), relative, name).expect("fixture NodeId")
 }
 
 fn rid(label: &str) -> RecordId {
@@ -327,14 +327,12 @@ fn mapping_fixture_named(
         .to_string(),
         _ => right_node.to_string(),
     };
-    let (left_symbol, left_symbol_bytes) = if matches!(
-        scenario,
-        RecordScenario::ExternalPackageVersionMismatch
-    ) {
-        external_symbol_record(project.as_str(), left_clone.as_str(), "1.0.0")
-    } else {
-        symbol_record(project.as_str(), left_clone.as_str(), &left_symbol_node)
-    };
+    let (left_symbol, left_symbol_bytes) =
+        if matches!(scenario, RecordScenario::ExternalPackageVersionMismatch) {
+            external_symbol_record(project.as_str(), left_clone.as_str(), "1.0.0")
+        } else {
+            symbol_record(project.as_str(), left_clone.as_str(), &left_symbol_node)
+        };
     let (right_symbol, right_symbol_bytes) = if matches!(scenario, RecordScenario::UnknownScope) {
         canonical_record(json!({
             "schema": "aethyme.symbol-ref/experimental-v0",
@@ -343,11 +341,7 @@ fn mapping_fixture_named(
             "scope": { "kind": "future_scope", "opaque": "retained" }
         }))
     } else if matches!(scenario, RecordScenario::ExternalPackageVersionMismatch) {
-        external_symbol_record(
-            project.as_str(),
-            right_clone_in_records.as_str(),
-            "2.0.0",
-        )
+        external_symbol_record(project.as_str(), right_clone_in_records.as_str(), "2.0.0")
     } else {
         symbol_record(
             project.as_str(),
@@ -492,7 +486,10 @@ fn actual_playground_clones_bind_observations_and_keep_existing_node_ids() {
     assert_eq!(before_id, after_id, "NodeId tuple excludes function body");
 
     let fixture = mapping_fixture(&clones, RecordScenario::Exact);
-    assert_ne!(fixture.left_node, fixture.right_node, "clone namespaces differ");
+    assert_ne!(
+        fixture.left_node, fixture.right_node,
+        "clone namespaces differ"
+    );
     let records: Vec<&[u8]> = fixture.records.iter().map(Vec::as_slice).collect();
     let MappingResolution::EstablishedWithinBinding(established) =
         resolve_within_binding(&fixture.binding, &fixture.claim, &records)
@@ -500,7 +497,10 @@ fn actual_playground_clones_bind_observations_and_keep_existing_node_ids() {
         panic!("exact scoped evidence should resolve within its binding");
     };
     let (left_origin, right_origin) = established.origins();
-    assert_ne!(left_origin, right_origin, "independent origin records are retained");
+    assert_ne!(
+        left_origin, right_origin,
+        "independent origin records are retained"
+    );
     let (left_observation, right_observation) = established.observations();
     assert_ne!(left_observation, right_observation);
 }
@@ -551,7 +551,11 @@ fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
         .replace("export function rename_me(", "export function renamed(")
         .replace("export function copy_me(", "");
     fs::write(clones.right.join("src/api.ts"), renamed).unwrap();
-    fs::write(clones.right.join("src/lib.ts"), "export function stable(value: string) { return value; }\n").unwrap();
+    fs::write(
+        clones.right.join("src/lib.ts"),
+        "export function stable(value: string) { return value; }\n",
+    )
+    .unwrap();
     fs::write(
         clones.right.join("src/copied.ts"),
         "export function copy_me(value: string) { return value; }\n",
@@ -561,7 +565,10 @@ fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
     command(&clones.right, &["commit", "-qm", "move rename and copy"]);
     assert_ne!(old_move, node_ids(&clones.right, "src/api.ts", "move_me"));
     assert_ne!(old_rename, node_ids(&clones.right, "src/api.ts", "renamed"));
-    assert_ne!(old_copy, node_ids(&clones.right, "src/copied.ts", "copy_me"));
+    assert_ne!(
+        old_copy,
+        node_ids(&clones.right, "src/copied.ts", "copy_me")
+    );
     let refreshed = CloneSnapshotBinding::from_snapshots(
         RecordId::parse(PROJECT).unwrap(),
         CapturedCloneSnapshot::new(
@@ -581,7 +588,11 @@ fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
         resolve_within_binding(
             &refreshed,
             &fixture.claim,
-            &fixture.records.iter().map(Vec::as_slice).collect::<Vec<_>>()
+            &fixture
+                .records
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>()
         ),
         MappingResolution::Unknown("captured_clone_binding_mismatch")
     ));
@@ -592,7 +603,11 @@ fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
         .filter(|(name, _)| name == "convert")
         .map(|_| node_ids(&clones.left, "src/lib.ts", "convert"))
         .collect();
-    assert_eq!(overload_ids.len(), 3, "synthetic Playground has three overloads");
+    assert_eq!(
+        overload_ids.len(),
+        3,
+        "synthetic Playground has three overloads"
+    );
     assert!(overload_ids.windows(2).all(|pair| pair[0] == pair[1]));
     let claim = claim_with_state(&overloaded.claim, "unknown");
     let records: Vec<&[u8]> = overloaded.records.iter().map(Vec::as_slice).collect();
@@ -612,8 +627,14 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
             RecordScenario::CloneBindingMismatch,
             "captured_clone_binding_mismatch",
         ),
-        (RecordScenario::SourceMismatch, "captured_clone_binding_mismatch"),
-        (RecordScenario::ProfileMismatch, "captured_clone_binding_mismatch"),
+        (
+            RecordScenario::SourceMismatch,
+            "captured_clone_binding_mismatch",
+        ),
+        (
+            RecordScenario::ProfileMismatch,
+            "captured_clone_binding_mismatch",
+        ),
         (RecordScenario::OriginMismatch, "origin_binding_mismatch"),
         (RecordScenario::MalformedNodeId, "symbol_scope_mismatch"),
         (RecordScenario::WrongNodeIdRepo, "symbol_scope_mismatch"),
@@ -642,10 +663,7 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
         .as_str()
         .unwrap()
         .to_owned();
-    let mut wrong_evidence_refs = [
-        first_origin,
-        right_observation_id.as_str().to_owned(),
-    ];
+    let mut wrong_evidence_refs = [first_origin, right_observation_id.as_str().to_owned()];
     wrong_evidence_refs.sort();
     wrong_evidence_claim["evidence"] = json!(wrong_evidence_refs);
     let wrong_evidence_claim = serde_json::to_vec(&wrong_evidence_claim).unwrap();
@@ -703,5 +721,8 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
     ));
 
     let decoded = decode_symbol_identity_record(&fixture.claim).unwrap();
-    assert!(matches!(decoded.state("state"), StateReading::Known("proposed")));
+    assert!(matches!(
+        decoded.state("state"),
+        StateReading::Known("proposed")
+    ));
 }

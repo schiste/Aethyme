@@ -11,9 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use aethyme_contracts::experimental_v0::canonical_json::Value;
 use aethyme_contracts::experimental_v0::symbol_identity::{
     EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA_NAME, OBSERVED_SYMBOL_REVISION_SCHEMA_NAME,
-    SYMBOL_MAPPING_AUTHORITY, SYMBOL_MAPPING_CLAIM_SCHEMA_NAME,
-    SYMBOL_ORIGIN_EVIDENCE_SCHEMA_NAME, SYMBOL_REF_SCHEMA_NAME, SymbolScopeKind,
-    decode_symbol_identity_record, symbol_scope_kind,
+    SYMBOL_MAPPING_AUTHORITY, SYMBOL_MAPPING_CLAIM_SCHEMA_NAME, SYMBOL_ORIGIN_EVIDENCE_SCHEMA_NAME,
+    SYMBOL_REF_SCHEMA_NAME, SymbolScopeKind, decode_symbol_identity_record, symbol_scope_kind,
 };
 use aethyme_contracts::experimental_v0::{
     Record, RecordId, SourceSnapshot, SourceSnapshotId, StateReading,
@@ -299,8 +298,10 @@ pub fn resolve_within_binding(
     if project != local_binding.project_id
         || left_clone != local_binding.left_clone_id
         || right_clone != local_binding.right_clone_id
-        || text(binding, "left_source_snapshot") != Some(local_binding.left_source_snapshot.as_str())
-        || text(binding, "right_source_snapshot") != Some(local_binding.right_source_snapshot.as_str())
+        || text(binding, "left_source_snapshot")
+            != Some(local_binding.left_source_snapshot.as_str())
+        || text(binding, "right_source_snapshot")
+            != Some(local_binding.right_source_snapshot.as_str())
         || profile != local_binding.profile
     {
         return MappingResolution::Unknown("captured_clone_binding_mismatch");
@@ -321,14 +322,17 @@ pub fn resolve_within_binding(
     ) {
         return MappingResolution::Unknown("observation_binding_mismatch");
     }
-    if !symbol_matches(left_symbol, &project, &left_clone, &local_binding.left_repo_component)
-        || !symbol_matches(
-            right_symbol,
-            &project,
-            &right_clone,
-            &local_binding.right_repo_component,
-        )
-    {
+    if !symbol_matches(
+        left_symbol,
+        &project,
+        &left_clone,
+        &local_binding.left_repo_component,
+    ) || !symbol_matches(
+        right_symbol,
+        &project,
+        &right_clone,
+        &local_binding.right_repo_component,
+    ) {
         return MappingResolution::Unknown("symbol_scope_mismatch");
     }
     if let Err(reason) = mapping_scope_compatibility(left_symbol, right_symbol) {
@@ -412,18 +416,14 @@ fn symbol_matches(
             let Some(Value::String(node_id)) = scope.get("node_id") else {
                 return false;
             };
-            NodeId::parse(node_id)
-                .is_ok_and(|parsed| parsed.repo() == expected_repo)
+            NodeId::parse(node_id).is_ok_and(|parsed| parsed.repo() == expected_repo)
         }
         Some(SymbolScopeKind::ProducerLocal | SymbolScopeKind::ExternalPackage) => true,
         Some(SymbolScopeKind::Unknown) | None => false,
     }
 }
 
-fn mapping_scope_compatibility(
-    left: &Record,
-    right: &Record,
-) -> Result<(), &'static str> {
+fn mapping_scope_compatibility(left: &Record, right: &Record) -> Result<(), &'static str> {
     match (symbol_scope_kind(left), symbol_scope_kind(right)) {
         (Some(SymbolScopeKind::ExternalPackage), Some(SymbolScopeKind::ExternalPackage)) => {
             let Some((left_producer, left_package, left_version)) =
@@ -479,8 +479,7 @@ fn origin_matches(
         && record_id(origin, "symbol_ref").as_ref() == Some(symbol)
         && record_id(origin, "profile").as_ref() == Some(profile)
         && text(origin, "source_snapshot") == text(observation, "source_snapshot")
-        && record_id(origin, "fact_revision")
-            == record_id(observation, "fact_revision")
+        && record_id(origin, "fact_revision") == record_id(observation, "fact_revision")
         && text(origin, "authority") == Some(SYMBOL_MAPPING_AUTHORITY)
         && text(origin, "origin_namespace").is_some()
 }
