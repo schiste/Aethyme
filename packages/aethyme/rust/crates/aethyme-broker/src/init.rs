@@ -543,6 +543,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
+    ("collaboration", crate::collaboration_submit::KNOWN_SETTINGS),
     ("worktrees", &["root", "min_free_bytes"]),
     ("session", &["guidance"]),
 ];
@@ -672,6 +673,25 @@ fn check_config_valid(main_root: &Path) -> Check {
             status: CheckStatus::Fail,
             detail: format!("config.toml invalid: {error}"),
         };
+    }
+    match crate::collaboration_submit::setting_from_text(Some(&text)) {
+        crate::collaboration_submit::Setting::Off => {}
+        crate::collaboration_submit::Setting::On { project, .. } => {
+            if let Err(error) = project {
+                return Check {
+                    id: "certify.config",
+                    status: CheckStatus::Fail,
+                    detail: format!("config.toml invalid: {error}"),
+                };
+            }
+        }
+        crate::collaboration_submit::Setting::Unsupported { detail, .. } => {
+            return Check {
+                id: "certify.config",
+                status: CheckStatus::Fail,
+                detail: format!("config.toml invalid: {detail}"),
+            };
+        }
     }
     let unknown = unknown_config_keys(&value);
     if !unknown.is_empty() {

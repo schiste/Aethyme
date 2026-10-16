@@ -49,7 +49,7 @@ use crate::collaboration_state::{CollaborationStateError, CollaborationStore, Pr
 pub const SUBMIT_CAPTURE_SCHEMA: &str = "aethyme.submit-capture/experimental-v0";
 
 /// The `[collaboration]` settings this binary implements.
-const KNOWN_SETTINGS: &[&str] = &["capture", "project", "descriptor"];
+pub(crate) const KNOWN_SETTINGS: &[&str] = &["capture", "project", "descriptor"];
 
 /// What `[collaboration] capture` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
