@@ -633,6 +633,7 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
     .unwrap();
     assert_eq!(failure.outcome(), VerificationOutcome::AssertionFailed);
     assert_eq!(failure.collected_assertions(), 1);
+    assert_eq!(failure.failed_assertion_ids(), ["echo"]);
     assert!(applicable(&f.store, &owner, &wrong, &wrong_artifact, &permit, &failure).is_err());
     assert!(
         applicable(
@@ -745,6 +746,23 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
         );
         assert!(matches!(observed, Err(SupervisorError::Infrastructure(_))));
     }
+}
+
+#[test]
+fn failed_assertion_ids_require_a_trusted_assertion_failure_outcome() {
+    let mut fixture = Subject::fake();
+    let mut evidence = fixture.evidence();
+    assert!(evidence.failed_assertion_ids().is_empty());
+
+    evidence.body.result = VerificationOutcome::AssertionFailed;
+    evidence.body.assertions[0].outcome = VerificationOutcome::Passed;
+    assert!(evidence.failed_assertion_ids().is_empty());
+
+    evidence.body.assertions[0].outcome = VerificationOutcome::AssertionFailed;
+    assert_eq!(evidence.failed_assertion_ids(), ["echo"]);
+
+    evidence.body.result = VerificationOutcome::InfrastructureDeferred;
+    assert!(evidence.failed_assertion_ids().is_empty());
 }
 #[test]
 fn producer_dispatch_guard_excludes_rotation_until_acknowledgement() {
