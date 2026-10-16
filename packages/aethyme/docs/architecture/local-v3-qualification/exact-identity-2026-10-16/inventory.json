@@ -2268,13 +2268,145 @@
       ],
       "credited_for_narrow_command_only": true,
       "raw_directory": "attempts/20261016T050143Z-merged-3570a853-contracts-bebfe365"
+    },
+    {
+      "attempt": "20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be",
+      "label": "writer-binding-neuter-writer-lock-lifetime",
+      "kind": "deliberate_guard_control",
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "b199df15cf6f46051787c41cb90a0492f04c2a401e5b818e92976d3fe7f62713",
+        "head": "25dad81de0035577535e7696423d1a7a0e0baf9d",
+        "status": " M packages/aethyme/rust/crates/aethyme-broker/src/collaboration_identity_store.rs\n",
+        "tree": "9ec04a56b0a9e0b11aa0e37ae1ac194634e8582d",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be"
+    },
+    {
+      "attempt": "20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b",
+      "label": "writer-binding-neuter-corrupt-binding-refusal",
+      "kind": "deliberate_guard_control",
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "a9df81ac1908842447ac6caa4353535d635d094f6b57e8dee67704485bd0ca59",
+        "head": "25dad81de0035577535e7696423d1a7a0e0baf9d",
+        "status": " M packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/project.rs\n",
+        "tree": "9ec04a56b0a9e0b11aa0e37ae1ac194634e8582d",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b"
+    },
+    {
+      "attempt": "20261016T050702Z-merged-25dad81d-public-project-binding-0373f491",
+      "label": "merged-25dad81d-public-project-binding",
+      "kind": "test_or_lint_attempt",
+      "numeric_exit": 0,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "25dad81de0035577535e7696423d1a7a0e0baf9d",
+        "status": "",
+        "tree": "9ec04a56b0a9e0b11aa0e37ae1ac194634e8582d",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T050702Z-merged-25dad81d-public-project-binding-0373f491"
+    },
+    {
+      "attempt": "20261016T050736Z-merged-25dad81d-writer-serialization-d9bb3994",
+      "label": "merged-25dad81d-writer-serialization",
+      "kind": "test_or_lint_attempt",
+      "numeric_exit": 0,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "25dad81de0035577535e7696423d1a7a0e0baf9d",
+        "status": "",
+        "tree": "9ec04a56b0a9e0b11aa0e37ae1ac194634e8582d",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T050736Z-merged-25dad81d-writer-serialization-d9bb3994"
+    },
+    {
+      "attempt": "20261016T050738Z-merged-25dad81d-omitted-current-inheritance-06796da6",
+      "label": "merged-25dad81d-omitted-current-inheritance",
+      "kind": "test_or_lint_attempt",
+      "numeric_exit": 0,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "25dad81de0035577535e7696423d1a7a0e0baf9d",
+        "status": "",
+        "tree": "9ec04a56b0a9e0b11aa0e37ae1ac194634e8582d",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T050738Z-merged-25dad81d-omitted-current-inheritance-06796da6"
+    },
+    {
+      "attempt": "20261016T050931Z-merged-b89f4186-revision-consumers-e4ee5d3f",
+      "label": "merged-b89f4186-revision-consumers",
+      "kind": "test_or_lint_attempt",
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "b89f418634e28fb3bd913fd00e865bdce419626a",
+        "status": "",
+        "tree": "6c7edfd989bfcb05787ab949ec0f6262dede7597",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [],
+      "credited_for_narrow_command_only": false,
+      "raw_directory": "attempts/20261016T050931Z-merged-b89f4186-revision-consumers-e4ee5d3f"
     }
   ],
   "files": [
     {
       "path": "README.md",
-      "bytes": 10164,
-      "sha256": "46258cd0a67231641a3d14645ef3d32fa7ec8115dc2efba058923134e18cc29a"
+      "bytes": 11001,
+      "sha256": "5fbb339d922e2ad2a4b5e565db8548ac6a01d5d52cabcf633908240d8929e612"
     },
     {
       "path": "attempts/20261016T031107Z-exact-revision-context-positive-b3d71f92-1a5e87d4/command.json",
@@ -3702,6 +3834,96 @@
       "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
     },
     {
+      "path": "attempts/20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be/command.json",
+      "bytes": 4175,
+      "sha256": "0557b99b8d3f2262932508df266986d63e8cb0dbc64b54f7d8fec13f7d095ee6"
+    },
+    {
+      "path": "attempts/20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be/command.log",
+      "bytes": 1836,
+      "sha256": "f27a16e65ad0dd8e572326f48014abc87db743a8a245da6a3c3fc401909e4020"
+    },
+    {
+      "path": "attempts/20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "attempts/20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b/command.json",
+      "bytes": 4160,
+      "sha256": "64a01f0f3f5bbaa340b728bfc768428c9626519f1ac9a33fa38ffea78d42c868"
+    },
+    {
+      "path": "attempts/20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b/command.log",
+      "bytes": 1122,
+      "sha256": "b17bd02ef48a0dbb3596453f12bbb03f3458a9a5b7840a1dfd0bf5f1bd7f41af"
+    },
+    {
+      "path": "attempts/20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "attempts/20261016T050702Z-merged-25dad81d-public-project-binding-0373f491/command.json",
+      "bytes": 3887,
+      "sha256": "ccb68e21581d898bc39015e3b4cad2e7108423d9f4a46d50a4a8d180e5f3ccdf"
+    },
+    {
+      "path": "attempts/20261016T050702Z-merged-25dad81d-public-project-binding-0373f491/command.log",
+      "bytes": 1402,
+      "sha256": "674061913e056900e2eacc48f5c42c9c26fb2741b8a86e301914059bf2cfef44"
+    },
+    {
+      "path": "attempts/20261016T050702Z-merged-25dad81d-public-project-binding-0373f491/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "attempts/20261016T050736Z-merged-25dad81d-writer-serialization-d9bb3994/command.json",
+      "bytes": 3959,
+      "sha256": "e2b7e8edfff2ee368c55771adfe44cbbade93b56047397232a3bd76e72b5c8a9"
+    },
+    {
+      "path": "attempts/20261016T050736Z-merged-25dad81d-writer-serialization-d9bb3994/command.log",
+      "bytes": 412,
+      "sha256": "89f8bba6762deb26157c566ed3518f46074035e2bebb4063ff60d7f1c801859b"
+    },
+    {
+      "path": "attempts/20261016T050736Z-merged-25dad81d-writer-serialization-d9bb3994/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "attempts/20261016T050738Z-merged-25dad81d-omitted-current-inheritance-06796da6/command.json",
+      "bytes": 3985,
+      "sha256": "f544d01a909652de52efe284c40bebe4f4d147f3ae3c71ea98e89221629dde25"
+    },
+    {
+      "path": "attempts/20261016T050738Z-merged-25dad81d-omitted-current-inheritance-06796da6/command.log",
+      "bytes": 403,
+      "sha256": "7fedcde1751661a77ab5c3d6a9d1b0a7e2917eb1b96f2e42ea0a7a642a806c40"
+    },
+    {
+      "path": "attempts/20261016T050738Z-merged-25dad81d-omitted-current-inheritance-06796da6/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "attempts/20261016T050931Z-merged-b89f4186-revision-consumers-e4ee5d3f/command.json",
+      "bytes": 3842,
+      "sha256": "f6800238c239db9057b5b4ea8fa3b425360b7107d54d6ba6a00ada1e57b01851"
+    },
+    {
+      "path": "attempts/20261016T050931Z-merged-b89f4186-revision-consumers-e4ee5d3f/command.log",
+      "bytes": 1293,
+      "sha256": "693c6ddcdaee7121a09a4d6d61801da322ea6896f9ec2cce09e62ddd9f50a0b1"
+    },
+    {
+      "path": "attempts/20261016T050931Z-merged-b89f4186-revision-consumers-e4ee5d3f/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
       "path": "ci-attempts/local-current-pr-status-20261016T0400.json",
       "bytes": 9654,
       "sha256": "ea45af34ff3ca39cc322e2331b73c39add263f20a0ecfe88864ce098084948fc"
@@ -4105,6 +4327,51 @@
       "path": "control-sources/reviewed-gc-guard-driver.py",
       "bytes": 2468,
       "sha256": "3e71453afc6b1dd5cb9c31192de76a057aa880a508c0d83e09ec4983c1f67780"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/collaboration_identity_store.rs",
+      "bytes": 120995,
+      "sha256": "6ad5eebb54a4cf8c1e6902f22f64479c48bbffc447c58726d7fef23aa4959ce8"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/corrupt-binding-refusal.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/corrupt-binding-refusal.stdout",
+      "bytes": 1787,
+      "sha256": "eb41ecb1c9ba84a223894b8f71959a38a79806b81ff536bc881dc8c62918d511"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/project.rs",
+      "bytes": 59986,
+      "sha256": "8190ecf5a5723efd6b7ac72414478b8bdc3c24bddfed8426d2e4fe12227d00ff"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/source.json",
+      "bytes": 383,
+      "sha256": "da21b9dca03bc0779ad2cd4e8e84dc20082e5fd790c4843367c41395c3e30896"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/summary.json",
+      "bytes": 2780,
+      "sha256": "2938474603f40a3aa8936c0aeb5d8fb77e65fbb2435b690c4b6f30c69730c7a3"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/writer-lock-lifetime.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "control-sources/writer-binding-control-backup/writer-lock-lifetime.stdout",
+      "bytes": 1769,
+      "sha256": "0ae84bde6e9c3585302ccc43e873fe39b562a14612a778847a0d96eb610bca1e"
+    },
+    {
+      "path": "control-sources/writer-binding-guard-driver.py",
+      "bytes": 3915,
+      "sha256": "6e2546545aa215da6c0f2e94eb3082e0f88bea06e35ad32ff24f017dd4fee021"
     }
   ]
 }

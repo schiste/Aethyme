@@ -129,6 +129,14 @@ exceed it. These demonstrate typed refusal precedence, not measured peak
 allocation. Exact reviewed source bytes were restored, and all 52 contract tests
 passed again.
 
+Two writer/binding controls on source `25dad81d` separately released the writer
+lock immediately after acquisition and disabled the corrupt-binding refusal
+mapping. Both executed one test and failed its intended assertion (exit 101,
+zero ignored). The writer run includes the worker's explicit lock-ownership
+assertion before the main thread's receive timeout; timeout alone is not credited.
+Exact bytes were restored from a unique backup. The restored eight binding tests,
+one writer contention test, and one current-head inheritance test passed.
+
 ## Retained failures and uncredited selections
 
 - The first exact-context build failed before tests because of an undeclared
@@ -155,6 +163,11 @@ passed again.
   newly added column, an out-of-date collab help snapshot, formatting/test-module
   lint failures, and dependency-download failures. These are historical failures
   on their recorded heads, not passing final CI evidence.
+
+The first rerun after the bridge lint cleanup on `b89f4186` stopped at
+compilation: the borrowed revision digest was compared with an owned string.
+No tests executed; this attempt receives no qualification credit. Its owning
+bridge session is correcting the comparison before the rerun.
 
 A replay-budget filter on `3570a853` initially selected zero tests. The driver
 stopped, the exact existing test filter was corrected, and that test passed in
