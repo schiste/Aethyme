@@ -2990,7 +2990,7 @@ impl Broker {
             let database = self.host_operation_database_path()?;
             // Keep exclusion through every unlink and journal update. A busy
             // registry or unavailable filesystem leaves durable work pending.
-            let removal_claim = match crate::worktree_registry::claim_for_removal(
+            let mut removal_claim = match crate::worktree_registry::claim_for_removal(
                 &database,
                 &root,
                 fingerprint,
@@ -3024,14 +3024,16 @@ impl Broker {
             }
             // The root marker is the orphan evidence, so it goes last for the
             // same reason a build cache's witness does.
-            match remove_condemned_tree(&root, Some(WORKTREE_ROOT_MARKER), deadline) {
+            match removal_claim.remove(deadline) {
                 Ok(TreeRemoval::Complete) => {}
                 Ok(TreeRemoval::Interrupted) => break,
                 Err(error) => {
-                    failures.push(format!("{}: {error}", candidate.worktree_root));
-                    journal.remaining_orphans.remove(0);
+                    failures.push(format!(
+                        "{}: orphan deletion unavailable ({error}); retained in journal",
+                        candidate.worktree_root
+                    ));
                     write_journal(&journal_path, &journal)?;
-                    continue;
+                    break;
                 }
             }
             journal.reclaimed_bytes = journal
@@ -3530,6 +3532,75 @@ mod tests {
             1
         );
         drop(held);
+        let completed = broker.gc_apply(&digest).unwrap();
+        assert!(completed.complete, "{completed:?}");
+        assert_eq!(
+            completed.orphans_removed,
+            vec![root.to_string_lossy().into_owned()]
+        );
+        assert!(!root.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn orphan_deletion_io_failure_stays_journaled_and_resumes_after_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+            }
+        }
+
+        // This regression must exercise a real permission failure, not pass
+        // vacuously under an identity that bypasses filesystem permissions.
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "run this test as an unprivileged user"
+        );
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let child = root.join("temporarily-unreadable");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("retained.txt"), "recoverable payload").unwrap();
+        let restore = RestorePermissions(
+            child.clone(),
+            std::fs::metadata(&child).unwrap().permissions(),
+        );
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0)).unwrap();
+        assert!(
+            std::fs::read_dir(&child).is_err(),
+            "permission denial must be real"
+        );
+
+        let blocked = broker.gc_apply(&digest).unwrap();
+        assert!(!blocked.complete, "{blocked:?}");
+        assert!(blocked.recovery_action.is_some());
+        assert!(blocked.orphans_removed.is_empty());
+        assert!(
+            blocked
+                .failures
+                .iter()
+                .any(|reason| reason.contains("retained in journal"))
+        );
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        assert_eq!(
+            load_journal(&journal_path)
+                .unwrap()
+                .unwrap()
+                .remaining_orphans
+                .len(),
+            1
+        );
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+
+        drop(restore);
+        assert_eq!(
+            std::fs::read_to_string(child.join("retained.txt")).unwrap(),
+            "recoverable payload"
+        );
         let completed = broker.gc_apply(&digest).unwrap();
         assert!(completed.complete, "{completed:?}");
         assert_eq!(

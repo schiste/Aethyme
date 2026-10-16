@@ -298,10 +298,14 @@ pub(crate) fn read_marker(root: &Path) -> io::Result<WorktreeRootMarker> {
     let mut bytes = Vec::new();
     file.take(MAX_RECORD_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
+    decode_marker(&bytes)
+}
+
+fn decode_marker(bytes: &[u8]) -> io::Result<WorktreeRootMarker> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(invalid("worktree marker exceeds its byte limit"));
     }
-    let marker: WorktreeRootMarker = serde_json::from_slice(&bytes).map_err(invalid)?;
+    let marker: WorktreeRootMarker = serde_json::from_slice(bytes).map_err(invalid)?;
     if marker.schema_version != WORKTREE_ROOT_SCHEMA_VERSION
         || marker.repository_key.is_empty()
         || !marker.repository_root.is_absolute()
@@ -313,6 +317,10 @@ pub(crate) fn read_marker(root: &Path) -> io::Result<WorktreeRootMarker> {
 
 fn marker_matches(record: &RootRecord) -> io::Result<()> {
     let marker = read_marker(&record.root)?;
+    marker_owner_matches(record, &marker)
+}
+
+fn marker_owner_matches(record: &RootRecord, marker: &WorktreeRootMarker) -> io::Result<()> {
     if marker.repository_key != record.repository_key
         || marker.repository_root != record.repository_root
     {
@@ -612,10 +620,40 @@ fn revalidate(host_database: &Path, root: &Path, expected: &str) -> io::Result<(
     Ok(())
 }
 
-#[derive(Debug)]
 pub(crate) struct RemovalClaim {
     _lock: crate::file_lock::ExclusiveFileLock,
     pub(crate) already_absent: bool,
+    tree: Option<crate::gc::PinnedTreeRemoval>,
+    record: RootRecord,
+}
+
+impl std::fmt::Debug for RemovalClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemovalClaim")
+            .field("already_absent", &self.already_absent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemovalClaim {
+    /// Delete through the directory handle whose identity this claim proved.
+    /// Keep this claim alive through the caller's durable journal update.
+    pub(crate) fn remove(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> io::Result<crate::gc::TreeRemoval> {
+        if self.already_absent {
+            return Ok(crate::gc::TreeRemoval::Complete);
+        }
+        let record = &self.record;
+        self.tree
+            .take()
+            .ok_or_else(|| invalid("removal claim has already consumed its directory handle"))?
+            .remove_verified_witness(WORKTREE_ROOT_MARKER, deadline, |bytes| {
+                marker_owner_matches(record, &decode_marker(bytes)?)
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -665,6 +703,8 @@ pub(crate) fn claim_for_removal(
                 return Ok(RemovalClaim {
                     _lock: claim,
                     already_absent: true,
+                    tree: None,
+                    record,
                 });
             }
             return Err(ClaimError::Unavailable(invalid(
@@ -697,9 +737,25 @@ pub(crate) fn claim_for_removal(
     if !origin_is_missing(&record)? {
         return Err(ClaimError::Revoked("owning repository reappeared".into()));
     }
+    let tree = crate::gc::PinnedTreeRemoval::open(root)?;
+    let pinned: crate::gc::TreeObjectIdentity = tree.object_identity()?;
+    let saved = record
+        .identity
+        .as_ref()
+        .ok_or_else(|| invalid("no supported root filesystem identity"))?;
+    if pinned.device != saved.device
+        || pinned.inode != saved.inode
+        || tree.filesystem_identity()? != saved.filesystem
+    {
+        return Err(ClaimError::Revoked(
+            "registered root changed before its removal handle was pinned".into(),
+        ));
+    }
     Ok(RemovalClaim {
         _lock: claim,
         already_absent: false,
+        tree: Some(tree),
+        record,
     })
 }
 
@@ -781,6 +837,73 @@ mod tests {
         assert!(revalidate(&fixture.database, &first, &fingerprint).is_err());
         assert!(first.is_dir());
         assert!(second.is_dir());
+    }
+
+    #[test]
+    fn replacing_a_claimed_root_cannot_redirect_removal_to_the_new_directory() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fs::write(root.join("original.txt"), "keep original").unwrap();
+        fixture.register(&root, &owner);
+        fs::remove_dir(&fixture.origin).unwrap();
+        let record = inventory(&fixture.database, None).roots.remove(0);
+        let fingerprint = ownership_fingerprint(&record).unwrap();
+        let mut claim = claim_for_removal(&fixture.database, &root, &fingerprint).unwrap();
+
+        let retained = root.with_extension("retained");
+        fs::rename(&root, &retained).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("replacement.txt"), "keep replacement").unwrap();
+        fs::write(
+            root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+
+        assert!(claim.remove(None).is_err());
+        assert_eq!(
+            fs::read_to_string(retained.join("original.txt")).unwrap(),
+            "keep original"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("replacement.txt")).unwrap(),
+            "keep replacement"
+        );
+        assert!(retained.join(WORKTREE_ROOT_MARKER).is_file());
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert!(
+            claim.remove(None).is_err(),
+            "a consumed claim cannot be replayed"
+        );
+    }
+
+    #[test]
+    fn marker_edits_after_claim_are_validated_from_the_pinned_witness_before_deletion() {
+        use std::os::unix::fs::MetadataExt;
+
+        let fixture = Fixture::new();
+        let (root, mut owner) = fixture.root("root");
+        let payload = root.join("retained.txt");
+        fs::write(&payload, "must survive changed authority").unwrap();
+        fixture.register(&root, &owner);
+        fs::remove_dir(&fixture.origin).unwrap();
+        let record = inventory(&fixture.database, None).roots.remove(0);
+        let fingerprint = ownership_fingerprint(&record).unwrap();
+        let mut claim = claim_for_removal(&fixture.database, &root, &fingerprint).unwrap();
+        let marker_path = root.join(WORKTREE_ROOT_MARKER);
+        let before = fs::metadata(&marker_path).unwrap();
+        owner.repository_key = "changed-owner-after-claim".into();
+        let changed = serde_json::to_vec(&owner).unwrap();
+        fs::write(&marker_path, &changed).unwrap();
+        let after = fs::metadata(&marker_path).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+
+        assert!(claim.remove(None).is_err());
+        assert_eq!(
+            fs::read_to_string(&payload).unwrap(),
+            "must survive changed authority"
+        );
+        assert_eq!(fs::read(&marker_path).unwrap(), changed);
     }
 
     #[test]

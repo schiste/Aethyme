@@ -35,15 +35,23 @@ filesystem. A host-domain process lock excludes root registration throughout
 this check and deletion. It is released by the operating system after a crash.
 Contention refuses new admission promptly and leaves cleanup pending.
 
-The removal preserves its ownership marker until the remaining contents are
-gone. A deadline leaves resumable journal work. Unavailable registry or
-filesystem inspection leaves the candidate pending. A deletion I/O error is
-currently reported and retires that candidate from the journal; the saved root
-can be discovered by a fresh plan. Conclusively changed authority is retired
+The claim retains the directory handle whose identity it verified; deletion
+does not reopen the root by its pathname. Before the first mutation, the
+deleter reads the ownership marker through that handle and checks its exact
+owner fields against the reviewed record. This is a point-in-time check under
+the cooperative-writer rules. Removal preserves its ownership marker until
+the remaining contents are gone. A deadline leaves resumable
+journal work. Unavailable registry or filesystem inspection and deletion I/O
+errors leave the candidate pending with a visible failure. Conclusively
+changed authority is retired
 with a visible failure and no deletion; an operator can review a fresh plan.
 Lost history requires independent recovery and may cause a fresh plan to omit
 the root. Queue completion does not imply that every
 candidate was removed: callers must inspect failures and removed roots.
+
+Descriptor-relative deletion refuses link redirection and changed directory
+bindings. It assumes closed roots have cooperative writers; it does not freeze
+directory ancestry against arbitrary concurrent hostile renames.
 
 Existing unregistered roots whose origins are already missing cannot acquire
 original-filesystem evidence retrospectively. Preserve them for an independent
