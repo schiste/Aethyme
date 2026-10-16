@@ -1,0 +1,18 @@
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+error: invalid format string: expected `}`, found `:`
+   --> crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs:510:9
+    |
+510 |         "contribution revision has more than {canonical_json::MAX_CONTAINER_ENTRIES} dependencies ({0})"
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `}` in format string
+    |
+    = note: if you intended to print `{`, you can escape it using `{{`
+
+error: invalid format string: expected `}`, found `:`
+   --> crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs:514:9
+    |
+514 |         "a contribution source change has more than {canonical_json::MAX_CONTAINER_ENTRIES} file references ({0})"
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `}` in format string
+    |
+    = note: if you intended to print `{`, you can escape it using `{{`
+
+error: could not compile `aethyme-contracts` (lib) due to 2 previous errors

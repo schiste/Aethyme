@@ -36,6 +36,16 @@ waves and exclusion of unselected catalog entries. The consumer selection ran
 15 tests: 13 passed and two failed. The target profile selection ran six tests:
 four passed and two failed. These failed commands do not qualify the consumers.
 
+On merged source `d31ce5c4a78c2090972e12ae397e0a578a304496`, the revision
+contract integration target passed all three tests and the descriptor vector
+target passed all nine tests. These include the new canonical size/count
+admission cases. Broker binding and migration tests did not run: compilation
+stopped on two test-code borrow errors. The previous parent checkpoint had
+stopped earlier on two error-message format strings. Both failures are retained.
+The formatter check on `e47766f0` also retained the existing bridge-format diffs.
+Further bounded-allocation and brief-reference validation changes remain under
+review and are not qualified by these runs.
+
 ## Guard controls
 
 Unique backups and the exact drivers are under [control-sources](control-sources/).

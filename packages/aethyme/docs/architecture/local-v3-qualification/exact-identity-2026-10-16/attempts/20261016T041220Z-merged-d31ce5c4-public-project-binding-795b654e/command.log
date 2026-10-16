@@ -1,0 +1,47 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+error[E0308]: mismatched types
+    --> crates/aethyme-broker/src/collaboration_state.rs:2175:50
+     |
+2175 |             &CollaborationRoot::under_host_state(host_path),
+     |              ----------------------------------- ^^^^^^^^^ expected `&Path`, found `PathBuf`
+     |              |
+     |              arguments to this function are incorrect
+     |
+note: associated function defined here
+    --> crates/aethyme-broker/src/collaboration_state.rs:852:12
+     |
+ 852 |     pub fn under_host_state(host_state: &Path) -> Self {
+     |            ^^^^^^^^^^^^^^^^ -----------------
+help: consider borrowing here
+     |
+2175 |             &CollaborationRoot::under_host_state(&host_path),
+     |                                                  +
+
+warning: variable does not need to be mutable
+    --> crates/aethyme-broker/src/collaboration_cli/project.rs:1414:13
+     |
+1414 |         let mut fixture = BoundProjectFixture::new().unwrap();
+     |             ----^^^^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0596]: cannot borrow `fixture.store` as mutable, as `fixture` is not declared as mutable
+    --> crates/aethyme-broker/src/collaboration_cli/project.rs:1485:9
+     |
+1485 | /         fixture
+1486 | |             .store
+     | |__________________^ cannot borrow as mutable
+     |
+help: consider changing this to be mutable
+     |
+1484 |         let mut fixture = BoundProjectFixture::new().unwrap();
+     |             +++
+
+Some errors have detailed explanations: E0308, E0596.
+For more information about an error, try `rustc --explain E0308`.
+warning: `aethyme-broker` (lib test) generated 1 warning
+error: could not compile `aethyme-broker` (lib test) due to 2 previous errors; 1 warning emitted
