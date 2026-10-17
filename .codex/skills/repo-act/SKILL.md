@@ -37,6 +37,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- Give each validation attempt, including failed setup and guard-removal runs,
+  unique log and manifest paths. Preserve earlier outputs before retrying.
 - Run the fastest relevant test command first.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
