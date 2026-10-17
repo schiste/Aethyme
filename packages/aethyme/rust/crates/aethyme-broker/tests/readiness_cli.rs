@@ -2,9 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use aethyme_broker::{
-    AdvisoryAudience, AdvisoryProducer, Broker, HostResourceCoordinator, MergeStatus,
-    ReadinessDimensionId, ReadinessReport, ReadinessState, RepositoryOperatingMode,
-    RepositoryReadinessMode,
+    AdvisoryAudience, AdvisoryProducer, HostResourceCoordinator, MergeStatus, ReadinessDimensionId,
+    ReadinessReport, ReadinessState, RepositoryOperatingMode, RepositoryReadinessMode,
 };
 use aethyme_engine::index_store::materialize_graph_store;
 use aethyme_engine::map::RepositoryMap;
@@ -12,6 +11,8 @@ use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, lin
 use aethyme_graph_storage::{bootstrap_repo, write_graph_authority_manifest};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+
+mod common;
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -30,8 +31,8 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-fn init_repo() -> tempfile::TempDir {
-    let repo = tempfile::tempdir().unwrap();
+fn init_repo() -> common::FixtureRepository {
+    let repo = common::FixtureRepository::new();
     git(repo.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(repo.path().join("README.md"), "readiness fixture\n").unwrap();
     git(repo.path(), &["add", "README.md"]);
@@ -40,17 +41,25 @@ fn init_repo() -> tempfile::TempDir {
 }
 
 fn host_state_path(root: &Path) -> PathBuf {
-    root.join("host-state")
+    root.parent()
+        .expect("fixture repository has an owner")
+        .join("host-state")
 }
 
 fn run_readiness(root: &Path, host_state: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(["status", "readiness"])
+    let mut command = common::broker_cli(CLI, &["status", "readiness"]);
+    command
         .args(args)
         .current_dir(root)
         .env("AETHYME_HOST_STATE_DIR", host_state)
-        .output()
-        .expect("run readiness")
+        .env(
+            "AETHYME_HOST_CACHE_DIR",
+            host_state
+                .parent()
+                .expect("fixture host state has an owner")
+                .join("host-cache"),
+        );
+    command.output().expect("run readiness")
 }
 
 fn readiness_json(root: &Path, host_state: &Path) -> (Output, ReadinessReport) {
@@ -181,7 +190,7 @@ fn readiness_includes_read_only_maintainer_history_recommendations() {
     let state = host_state_path(repo.path());
     canonical_ready_fixture(repo.path(), &state);
 
-    let mut broker = Broker::open(repo.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&repo).unwrap();
     let session = broker
         .adopt(repo.path(), Some("must never enter readiness output"))
         .unwrap();
