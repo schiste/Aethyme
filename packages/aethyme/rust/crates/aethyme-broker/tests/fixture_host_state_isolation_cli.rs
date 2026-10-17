@@ -56,14 +56,6 @@ max_bytes = 64
     repo
 }
 
-fn merged(output: &Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
 fn configured_env(command: &Command) -> HashMap<OsString, Option<OsString>> {
     command
         .get_envs()

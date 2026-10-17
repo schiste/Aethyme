@@ -24,6 +24,7 @@ use crate::{
 pub const PREPARATION_CONFIG_RELPATH: &str = ".aethyme/prepare.toml";
 pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
 const PREPARATION_LEASE_TTL_SECONDS: u64 = 30;
+const PREPARATION_STORAGE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const PREPARATION_CACHE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 // The scanner checks the deadline between filesystem operations. Individual
@@ -31,6 +32,40 @@ const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 100_000;
 const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
 const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(5);
+
+/// Keep the recovery reserve observable while a preparation command is running.
+/// This is cooperative pressure detection, not a byte quota: a filesystem call
+/// may stall and a writer may consume space between observations.
+struct PreparationHeartbeat {
+    next_storage_check: Instant,
+    next_renewal: Instant,
+}
+
+impl PreparationHeartbeat {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_storage_check: now,
+            next_renewal: now + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3),
+        }
+    }
+
+    fn tick(
+        &mut self,
+        now: Instant,
+        storage: impl FnOnce() -> Result<(), PreparationError>,
+        renew: impl FnOnce() -> Result<(), PreparationError>,
+    ) -> Result<(), BrokerOpError> {
+        if now >= self.next_storage_check {
+            storage()?;
+            self.next_storage_check = now + PREPARATION_STORAGE_CHECK_INTERVAL;
+        }
+        if now >= self.next_renewal {
+            renew()?;
+            self.next_renewal = now + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreparationError {
@@ -629,8 +664,7 @@ impl Broker {
             .unwrap_or_default();
         let mut results = Vec::new();
         let main_root = self.main_root().to_path_buf();
-        let mut next_renewal =
-            std::time::Instant::now() + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+        let mut heartbeat = PreparationHeartbeat::new(Instant::now());
         for step in &config.steps {
             let command = if offline {
                 step.offline_command
@@ -647,24 +681,25 @@ impl Broker {
                         command,
                         &environment,
                         || {
-                            if std::time::Instant::now() < next_renewal {
-                                return Ok(());
-                            }
-                            if let (Some(coordinator), Some(grant)) =
-                                (coordinator.as_mut(), grant.as_mut())
-                            {
-                                grant.lease = coordinator
-                                    .renew(
-                                        &grant.lease.lease_id,
-                                        grant.lease.generation,
-                                        &grant.ownership_token,
-                                        PREPARATION_LEASE_TTL_SECONDS,
-                                    )
-                                    .map_err(PreparationError::from)?;
-                            }
-                            next_renewal = std::time::Instant::now()
-                                + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
-                            Ok(())
+                            heartbeat.tick(
+                                Instant::now(),
+                                || require_preparation_storage(&main_root, &storage_paths),
+                                || {
+                                    if let (Some(coordinator), Some(grant)) =
+                                        (coordinator.as_mut(), grant.as_mut())
+                                    {
+                                        grant.lease = coordinator
+                                            .renew(
+                                                &grant.lease.lease_id,
+                                                grant.lease.generation,
+                                                &grant.ownership_token,
+                                                PREPARATION_LEASE_TTL_SECONDS,
+                                            )
+                                            .map_err(PreparationError::from)?;
+                                    }
+                                    Ok(())
+                                },
+                            )
                         },
                     )
                 }) {
@@ -2119,6 +2154,110 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_heartbeat_checks_before_the_first_and_between_renewals() {
+        use std::cell::Cell;
+
+        let now = Instant::now();
+        let mut heartbeat = PreparationHeartbeat::new(now);
+        let storage_checks = Cell::new(0);
+        let renewals = Cell::new(0);
+        for (elapsed_ms, expected_storage, expected_renewals) in [
+            (0, 1, 0),
+            (200, 1, 0),
+            (999, 1, 0),
+            (1000, 2, 0),
+            (10_000, 3, 1),
+            (10_200, 3, 1),
+            (11_000, 4, 1),
+            (20_000, 5, 2),
+        ] {
+            heartbeat
+                .tick(
+                    now + Duration::from_millis(elapsed_ms),
+                    || {
+                        storage_checks.set(storage_checks.get() + 1);
+                        Ok(())
+                    },
+                    || {
+                        renewals.set(renewals.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(storage_checks.get(), expected_storage, "{elapsed_ms} ms");
+            assert_eq!(renewals.get(), expected_renewals, "{elapsed_ms} ms");
+        }
+    }
+
+    #[test]
+    fn storage_heartbeat_pressure_prevents_renewal_and_stays_due() {
+        use std::cell::Cell;
+
+        for reason in ["reserve exhausted", "filesystem observation unavailable"] {
+            let now = Instant::now();
+            let mut heartbeat = PreparationHeartbeat::new(now);
+            let due = now + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+            let renewals = Cell::new(0);
+            let error = heartbeat
+                .tick(
+                    due,
+                    || {
+                        Err(PreparationError::StorageUnavailable {
+                            path: "/fixture/write-volume".into(),
+                            reason: reason.into(),
+                        })
+                    },
+                    || {
+                        renewals.set(renewals.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(is_storage_unavailable(&error));
+            assert_eq!(renewals.get(), 0, "pressure must be checked before renewal");
+            assert_eq!(heartbeat.next_storage_check, now);
+            assert_eq!(heartbeat.next_renewal, due);
+
+            let checked = Cell::new(false);
+            heartbeat
+                .tick(
+                    due,
+                    || {
+                        checked.set(true);
+                        Ok(())
+                    },
+                    || {
+                        renewals.set(renewals.get() + 1);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert!(checked.get(), "failed observation must remain due");
+            assert_eq!(renewals.get(), 1);
+        }
+    }
+
+    #[test]
+    fn storage_heartbeat_renewal_failure_stays_due() {
+        let now = Instant::now();
+        let mut heartbeat = PreparationHeartbeat::new(now);
+        let due = now + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+        let error = heartbeat
+            .tick(
+                due,
+                || Ok(()),
+                || Err(invalid_config("injected renewal failure")),
+            )
+            .unwrap_err();
+        assert!(!is_storage_unavailable(&error));
+        assert_eq!(heartbeat.next_renewal, due);
+        assert_eq!(
+            heartbeat.next_storage_check,
+            due + PREPARATION_STORAGE_CHECK_INTERVAL
+        );
+    }
 
     #[test]
     fn a_storage_refusal_persists_a_cache_recovery_request() {

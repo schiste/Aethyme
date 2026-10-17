@@ -952,6 +952,7 @@ impl Broker {
             storage_context,
             host_operation_db_path: None,
             worktree_root_override: None,
+            agent_supervisor_executable: None,
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
@@ -979,6 +980,7 @@ impl Broker {
             storage_context,
             host_operation_db_path: None,
             worktree_root_override: None,
+            agent_supervisor_executable: None,
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
@@ -1022,6 +1024,7 @@ impl Broker {
             storage_context,
             host_operation_db_path: None,
             worktree_root_override: None,
+            agent_supervisor_executable: None,
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
@@ -1084,6 +1087,28 @@ impl Broker {
                 .anchor_override_path("worktree root", path.into()),
         );
         self
+    }
+
+    /// Select an exact executable implementing the private agent-supervisor protocol.
+    ///
+    /// CLI callers use their current executable by default. Library embedders
+    /// must either forward [`crate::agent_supervisor::dispatch`] before ordinary
+    /// argument parsing in their executable, or supply a compatible Aethyme
+    /// executable here. No PATH search or installed-runtime fallback is used.
+    /// The path is anchored and validated now, and revalidated before allocation.
+    pub fn with_agent_supervisor_executable(
+        mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, BrokerOpError> {
+        self.agent_supervisor_executable = Some(
+            crate::agent_supervisor::resolve_executable(Some(path.as_ref())).map_err(|source| {
+                BrokerOpError::Spawn {
+                    command: "agent supervisor executable".into(),
+                    source,
+                }
+            })?,
+        );
+        Ok(self)
     }
 
     /// Keep collaboration state under `host_state` instead of the host state
@@ -2293,6 +2318,11 @@ impl Broker {
             command: command.to_owned(),
             source,
         })?;
+        crate::agent_supervisor::resolve_executable(self.agent_supervisor_executable.as_deref())
+            .map_err(|source| BrokerOpError::Spawn {
+                command: command.to_owned(),
+                source,
+            })?;
         let context = self.session_context(context);
         let (slug, branch, start_base, worktree, worktree_placement) =
             self.create_session_worktree(task, explicit_base)?;
@@ -3269,6 +3299,8 @@ impl Drop for GatedAgent {
                     .spawn(move || {
                         loop {
                             let mut status = 0;
+                            // SAFETY: this thread is the sole waiter for this unreaped
+                            // owned child; status points to initialized writable storage.
                             let result = unsafe { libc::waitpid(pid, &mut status, 0) };
                             if result == pid {
                                 break;
@@ -3296,13 +3328,14 @@ pub(super) fn spawn_blocked_agent(
     log_err: File,
     broker: Option<&Broker>,
 ) -> Result<GatedAgent, BrokerOpError> {
-    let (mut process, nonce) =
-        crate::agent_supervisor::process(command, worktree, &log).map_err(|source| {
-            BrokerOpError::Spawn {
-                command: command.to_owned(),
-                source,
-            }
-        })?;
+    let executable = broker.and_then(|broker| broker.agent_supervisor_executable.as_deref());
+    let (mut process, nonce) = crate::agent_supervisor::process(
+        command, worktree, &log, executable,
+    )
+    .map_err(|source| BrokerOpError::Spawn {
+        command: command.to_owned(),
+        source,
+    })?;
     drop(log_err);
     process
         .current_dir(worktree)

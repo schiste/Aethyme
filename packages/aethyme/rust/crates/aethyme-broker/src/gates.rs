@@ -1346,31 +1346,6 @@ pub fn cancel_obsolete_runs(
     Ok(cancelled)
 }
 
-/// Run the affected gates for a checkout, cheap-first, with tree-hash
-/// caching. `session_id` scopes cancellation and result attribution.
-/// Stops after the first failure (later gates are pointless on a broken
-/// tree — and cheaper gates ran first by construction).
-pub(crate) fn run_affected(
-    store: &mut BrokerStore,
-    main_root: &Path,
-    checkout: &GitRepo,
-    gates: &[Gate],
-    changed: &[String],
-    session_id: Option<i64>,
-    cache_policy: CachePolicy,
-) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
-    run_affected_in(
-        store,
-        main_root,
-        checkout,
-        gates,
-        changed,
-        session_id,
-        cache_policy,
-        GateStorageLocations::default(),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_affected_in(
     store: &mut BrokerStore,
@@ -1395,32 +1370,6 @@ pub(crate) fn run_affected_in(
             progress: &progress,
         },
         storage,
-    )
-}
-
-/// [`run_affected`] for a submit: gate lines also become the submit's
-/// recorded progress.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_affected_for_submit(
-    store: &mut BrokerStore,
-    main_root: &Path,
-    checkout: &GitRepo,
-    gates: &[Gate],
-    changed: &[String],
-    session_id: Option<i64>,
-    cache_policy: CachePolicy,
-    submit: Option<&crate::submit_progress::SubmitProgress>,
-) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
-    run_affected_for_submit_in(
-        store,
-        main_root,
-        checkout,
-        gates,
-        changed,
-        session_id,
-        cache_policy,
-        submit,
-        GateStorageLocations::default(),
     )
 }
 
@@ -1464,7 +1413,8 @@ pub(crate) fn run_affected_for_submit_in(
     )
 }
 
-/// Same executor as native submit, with one finite admission/command allowance.
+/// Test adapter using default storage locations and a finite allowance.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_affected_bounded(
     store: &mut BrokerStore,
@@ -1512,28 +1462,6 @@ pub(crate) fn run_affected_bounded_in(
     )
 }
 
-/// Like [`run_affected`], with an injectable progress sink.
-pub(crate) fn run_affected_with_progress(
-    store: &mut BrokerStore,
-    main_root: &Path,
-    checkout: &GitRepo,
-    gates: &[Gate],
-    changed: &[String],
-    session_id: Option<i64>,
-    context: GateExecutionContext<'_>,
-) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
-    run_affected_with_progress_in(
-        store,
-        main_root,
-        checkout,
-        gates,
-        changed,
-        session_id,
-        context,
-        GateStorageLocations::default(),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_affected_with_progress_in(
     store: &mut BrokerStore,
@@ -1562,30 +1490,6 @@ pub(crate) fn run_affected_with_progress_in(
     )
 }
 
-/// Run EVERY configured gate cheap-first — no diff selection. This is
-/// the full-tree "verified" definition shared by CI (`gates run --all`)
-/// and the broker: the exact same executor as [`run_affected`], so
-/// streaming progress, the tree-hash result cache, and fail-fast
-/// semantics are identical by construction.
-pub(crate) fn run_all(
-    store: &mut BrokerStore,
-    main_root: &Path,
-    checkout: &GitRepo,
-    gates: &[Gate],
-    session_id: Option<i64>,
-    cache_policy: CachePolicy,
-) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
-    run_all_in(
-        store,
-        main_root,
-        checkout,
-        gates,
-        session_id,
-        cache_policy,
-        GateStorageLocations::default(),
-    )
-}
-
 pub(crate) fn run_all_in(
     store: &mut BrokerStore,
     main_root: &Path,
@@ -1608,7 +1512,7 @@ pub(crate) fn run_all_in(
     )
 }
 
-/// Like [`run_all`], with an injectable progress sink.
+/// Run every gate using the default storage paths and an injectable progress sink.
 pub(crate) fn run_all_with_progress(
     store: &mut BrokerStore,
     main_root: &Path,

@@ -1782,11 +1782,12 @@ pub(crate) fn session_pid_alive(pid: i64) -> bool {
     }
     #[cfg(unix)]
     {
-        // Signal zero probes existence/permission; it delivers no signal.
+        // SAFETY: the validated positive process-group id is only probed with
+        // signal zero, which delivers no signal or mutates another process.
         if unsafe { libc::killpg(pid as i32, 0) } == 0 {
             return true;
         }
-        return std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     false

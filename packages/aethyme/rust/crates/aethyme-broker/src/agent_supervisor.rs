@@ -59,11 +59,41 @@ pub(crate) fn ensure_supported() -> io::Result<()> {
     }
 }
 
+/// Resolve an exact local executable. The caller chooses its trust/version
+/// policy; this private protocol never searches PATH or guesses an installation.
+pub(crate) fn resolve_executable(explicit: Option<&Path>) -> io::Result<std::path::PathBuf> {
+    ensure_supported()?;
+    let executable = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe()?,
+    }
+    .canonicalize()?;
+    let metadata = executable.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent supervisor executable is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "agent supervisor file is not executable",
+            ));
+        }
+    }
+    Ok(executable)
+}
+
 #[cfg(unix)]
 pub(crate) fn process(
     command: &str,
     worktree: &Path,
     log: &std::fs::File,
+    executable: Option<&Path>,
 ) -> io::Result<(std::process::Command, String)> {
     use std::os::unix::fs::MetadataExt as _;
     ensure_supported()?;
@@ -76,7 +106,7 @@ pub(crate) fn process(
     let repo = crate::git::GitRepo::discover(worktree).map_err(io::Error::other)?;
     let metadata = log.metadata()?;
     let launch = Launch {
-        executable: std::env::current_exe()?.canonicalize()?,
+        executable: resolve_executable(executable)?,
         repository: repo.main_root().map_err(io::Error::other)?.canonicalize()?,
         common_dir: repo
             .git_common_dir()
@@ -106,14 +136,18 @@ pub(crate) fn process(
     #[cfg(not(test))]
     process.arg(FLAG).arg(payload);
     #[cfg(test)]
-    process
-        .args([
-            "--exact",
-            "agent_supervisor::tests::supervisor_child_fixture",
-            "--nocapture",
-            "--quiet",
-        ])
-        .env("AETHYME_TEST_AGENT_SUPERVISOR_PAYLOAD", payload);
+    if executable.is_none() {
+        process
+            .args([
+                "--exact",
+                "agent_supervisor::tests::supervisor_child_fixture",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env("AETHYME_TEST_AGENT_SUPERVISOR_PAYLOAD", payload);
+    } else {
+        process.arg(FLAG).arg(payload);
+    }
     Ok((process, launch.nonce))
 }
 
@@ -122,6 +156,7 @@ pub(crate) fn process(
     _: &str,
     _: &Path,
     _: &std::fs::File,
+    _: Option<&Path>,
 ) -> io::Result<(std::process::Command, String)> {
     ensure_supported()?;
     unreachable!()
@@ -201,17 +236,23 @@ fn run(payload: &str) -> io::Result<u8> {
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fcntl returned a fresh valid descriptor; this File assumes its
+    // sole ownership and closes only that duplicate.
     let log = unsafe { File::from_raw_fd(descriptor) };
     // Diagnostics and panics must never append to the bounded log outside its
     // collector. The retained duplicate is CLOEXEC and is not passed to agents.
     use std::os::fd::AsRawFd as _;
     let null = File::open("/dev/null")?;
+    // SAFETY: null owns a live descriptor and STDERR_FILENO is a valid dup2
+    // target; no Rust handle owns the inherited stderr descriptor.
     if unsafe { libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // The launcher creates this group before exec. Without that binding a
     // private invocation must never signal an interactive or unrelated group.
-    if unsafe { libc::getpgrp() } != unsafe { libc::getpid() } {
+    // SAFETY: these kernel identity queries take no arguments or pointers.
+    let (group, pid) = unsafe { (libc::getpgrp(), libc::getpid()) };
+    if group != pid {
         return Err(io::Error::other(
             "agent supervisor is not its owned group leader",
         ));
@@ -380,6 +421,8 @@ fn run(payload: &str) -> io::Result<u8> {
             crate::warn_unrecorded("persist cleanup watcher failure", log.sync_data());
             // This process remains the original group leader. A failed watcher
             // must not turn into permission to leave its command running.
+            // SAFETY: this live, verified group leader pins its own group id;
+            // SIGKILL targets only that owned group, including this process.
             unsafe {
                 libc::killpg(libc::getpid(), libc::SIGKILL);
             }
@@ -431,6 +474,8 @@ fn run(payload: &str) -> io::Result<u8> {
     });
     collector.sync_data()?;
     if !cleanup_ready {
+        // SAFETY: this live, verified group leader still pins its own group id.
+        // Killing that group includes this process and its owned descendants.
         unsafe {
             libc::killpg(libc::getpid(), libc::SIGKILL);
         }
@@ -484,17 +529,16 @@ fn stop_direct_child(child: &mut std::process::Child) {
 fn cleanup_watcher(expected: &str) -> io::Result<u8> {
     use std::io::Write as _;
     let parent: i32 = expected.parse().map_err(io::Error::other)?;
-    if parent <= 1
-        || unsafe { libc::getppid() } != parent
-        || unsafe { libc::getpgrp() } != parent
-        || unsafe { libc::getpid() } == parent
-    {
+    // SAFETY: these kernel identity queries take no arguments or pointers.
+    let (actual_parent, group, pid) = unsafe { (libc::getppid(), libc::getpgrp(), libc::getpid()) };
+    if parent <= 1 || actual_parent != parent || group != parent || pid == parent {
         return Err(io::Error::other("cleanup watcher ownership mismatch"));
     }
     let mut ready = io::stdout().lock();
     writeln!(ready, "AETHYME_AGENT_READY cleanup-{parent}")?;
     ready.flush()?;
     drop(ready);
+    // SAFETY: getppid is a read-only kernel identity query without arguments.
     while unsafe { libc::getppid() } == parent {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -509,9 +553,12 @@ fn cleanup_watcher(expected: &str) -> io::Result<u8> {
     // This still-live member pins the original PGID after the supervisor dies.
     // It kills itself with any remaining ordinary descendants, so no later
     // signal can accidentally target a recycled process-group id.
+    // SAFETY: getpgrp is a read-only kernel identity query without arguments.
     if unsafe { libc::getpgrp() } != parent {
         return Err(io::Error::other("cleanup watcher group changed"));
     }
+    // SAFETY: this still-live watcher belongs to and pins the verified group;
+    // SIGKILL includes itself, so no signal can follow group-id reuse.
     if unsafe { libc::killpg(parent, libc::SIGKILL) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -560,6 +607,30 @@ mod tests {
             return;
         };
         std::process::exit(super::run(&payload).unwrap_or(125).into());
+    }
+
+    #[test]
+    fn explicit_executable_is_exact_and_rejects_missing_directory_or_nonexecutable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let owner = tempfile::tempdir().unwrap();
+        let absent = owner.path().join("missing");
+        assert!(super::resolve_executable(Some(&absent)).is_err());
+        assert!(super::resolve_executable(Some(owner.path())).is_err());
+        let file = owner.path().join("supervisor");
+        std::fs::write(&file, b"unused executable fixture").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::resolve_executable(Some(&file)).is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = owner.path().join("selected");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(
+            super::resolve_executable(Some(&link)).unwrap(),
+            file.canonicalize().unwrap()
+        );
+        assert_eq!(
+            super::resolve_executable(None).unwrap(),
+            std::env::current_exe().unwrap().canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -623,7 +694,7 @@ mod tests {
     ) -> std::process::Child {
         use std::os::unix::process::CommandExt as _;
         let log = std::fs::File::create(log).unwrap();
-        let (mut process, nonce) = super::process(command, repo, &log).unwrap();
+        let (mut process, nonce) = super::process(command, repo, &log, None).unwrap();
         process
             .current_dir(repo)
             .stdin(std::process::Stdio::piped())
@@ -840,11 +911,12 @@ mod tests {
         let repo = temp.path().join("repo");
         initialized_repo(&repo);
         // A failed cleanup guard must still leave a finite, fixture-owned
-        // writer: TempDir teardown removes its stop sentinel, even on panic.
+        // writer: teardown removes its stop sentinel on panic. The write cap
+        // also bounds output if the test runner itself is killed.
         std::fs::write(repo.join("writer-alive"), b"fixture-owned writer lifetime").unwrap();
         let log = temp.path().join("agent.log");
         let mut child = spawn(
-            "sh -c 'while [ -f writer-alive ]; do printf x >> background-writes; sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15; printf foreground-done",
+            "sh -c 'n=0; while [ -f writer-alive ] && [ $n -lt 3000 ]; do printf x >> background-writes; n=$((n + 1)); sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15; printf foreground-done",
             &repo,
             &log,
         );
@@ -865,11 +937,12 @@ mod tests {
         let repo = temp.path().join("repo");
         initialized_repo(&repo);
         // A failed cleanup guard must still leave a finite, fixture-owned
-        // writer: TempDir teardown removes its stop sentinel, even on panic.
+        // writer: teardown removes its stop sentinel on panic. The write cap
+        // also bounds output if the test runner itself is killed.
         std::fs::write(repo.join("writer-alive"), b"fixture-owned writer lifetime").unwrap();
         let log = temp.path().join("agent.log");
         let mut child = spawn_configured(
-            "while [ -f writer-alive ]; do printf x >> background-writes; sleep 0.02; done",
+            "n=0; while [ -f writer-alive ] && [ $n -lt 3000 ]; do printf x >> background-writes; n=$((n + 1)); sleep 0.02; done",
             &repo,
             &log,
             true,
@@ -894,13 +967,14 @@ mod tests {
         let repo = temp.path().join("repo");
         initialized_repo(&repo);
         // A failed cleanup guard must still leave a finite, fixture-owned
-        // writer: TempDir teardown removes its stop sentinel, even on panic.
+        // writer: teardown removes its stop sentinel on panic. The write cap
+        // also bounds output if the test runner itself is killed.
         std::fs::write(repo.join("writer-alive"), b"fixture-owned writer lifetime").unwrap();
         let log = temp.path().join("agent.log");
         let hold = temp.path().join("hold-cleanup");
         std::fs::write(&hold, b"test-owned barrier").unwrap();
         let mut child = spawn_configured(
-            "sh -c 'while [ -f writer-alive ]; do printf x >> background-writes; sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15",
+            "sh -c 'n=0; while [ -f writer-alive ] && [ $n -lt 3000 ]; do printf x >> background-writes; n=$((n + 1)); sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15",
             &repo,
             &log,
             false,

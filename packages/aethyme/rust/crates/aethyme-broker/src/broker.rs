@@ -3140,6 +3140,8 @@ pub struct Broker {
     storage_context: BrokerStorageContext,
     host_operation_db_path: Option<PathBuf>,
     worktree_root_override: Option<PathBuf>,
+    /// Exact executable implementing the private supervisor protocol for embedders.
+    agent_supervisor_executable: Option<PathBuf>,
     /// Test-only host state directory for collaboration state (#660).
     collaboration_state_override: Option<PathBuf>,
     /// Set only while a bounded eligibility pass runs: the landing search
