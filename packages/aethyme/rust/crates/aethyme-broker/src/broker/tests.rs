@@ -45,6 +45,112 @@ fn routine_inventory_zero_budget_is_incomplete_and_cannot_authorize_cleanup() {
 }
 
 #[test]
+fn deadline_scoped_finish_skips_retention_audit_but_still_checks_dirty_target() {
+    let (repo, _) = landing_fixture();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let target = broker.start_worktree("target", None).unwrap();
+    let unrelated_retained = broker.start_worktree("unrelated-retained", None).unwrap();
+    broker
+        .store()
+        .set_session_status(unrelated_retained.id, SessionStatus::Closed, None)
+        .unwrap();
+    let dirty_path = Path::new(&target.worktree_path).join("uncommitted.txt");
+    std::fs::write(&dirty_path, "preserve this work\n").unwrap();
+
+    let _deadline =
+        crate::git::limit_git_until(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let audit_called = std::cell::Cell::new(false);
+    let report = broker
+        .finish_with_options_inner_with_retention_audit(
+            target.id,
+            crate::FinishOptions::default(),
+            None,
+            |_, _| {
+                audit_called.set(true);
+                panic!("deadline-scoped finish must not inspect unrelated retained Git state");
+            },
+        )
+        .unwrap();
+
+    assert!(
+        !audit_called.get(),
+        "the advisory retention audit was invoked"
+    );
+    assert_eq!(report.status, crate::FinishStatus::Blocked);
+    assert!(!report.closed, "dirty target work must remain open");
+    assert!(
+        report
+            .dirty_paths
+            .iter()
+            .any(|path| path == "uncommitted.txt")
+    );
+    assert!(std::path::Path::new(&target.worktree_path).exists());
+    assert_eq!(
+        broker.store().session(target.id).unwrap().status,
+        SessionStatus::Active
+    );
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("retention audit deferred") && warning.contains("aethyme broker gc plan")
+    }));
+}
+
+#[test]
+fn deadline_scoped_finish_closes_clean_target_without_touching_unrelated_retained_worktree() {
+    let (repo, _) = landing_fixture();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let target = broker.start_worktree("target", None).unwrap();
+    let unrelated_retained = broker.start_worktree("unrelated-retained", None).unwrap();
+    broker
+        .store()
+        .set_session_status(unrelated_retained.id, SessionStatus::Closed, None)
+        .unwrap();
+
+    let _deadline =
+        crate::git::limit_git_until(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let audit_called = std::cell::Cell::new(false);
+    let report = broker
+        .finish_with_options_inner_with_retention_audit(
+            target.id,
+            crate::FinishOptions {
+                keep_worktree: true,
+            },
+            None,
+            |_, _| {
+                audit_called.set(true);
+                panic!("deadline-scoped finish must not inspect unrelated retained Git state");
+            },
+        )
+        .unwrap();
+
+    assert!(
+        !audit_called.get(),
+        "the advisory retention audit was invoked"
+    );
+    assert_eq!(report.status, crate::FinishStatus::Closed);
+    assert!(report.closed);
+    assert!(report.cleanup.kept);
+    assert!(std::path::Path::new(&target.worktree_path).exists());
+    assert_eq!(
+        broker.store().session(target.id).unwrap().status,
+        SessionStatus::Closed
+    );
+    assert_eq!(
+        broker
+            .store()
+            .session(unrelated_retained.id)
+            .unwrap()
+            .status,
+        SessionStatus::Closed
+    );
+    assert!(std::path::Path::new(&unrelated_retained.worktree_path).exists());
+    assert!(report.warnings.iter().any(|warning| {
+        warning.contains("retention audit deferred") && warning.contains("aethyme broker gc plan")
+    }));
+}
+
+#[test]
 fn a_degraded_status_snapshot_keeps_git_refs_unknown_after_its_deadline() {
     let (repo, _) = landing_fixture();
     let storage = crate::test_storage::TestStorage::new();

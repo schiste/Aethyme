@@ -58,6 +58,8 @@
   "status": "string",
   "summary": "string",
   "unsubmitted_commits": "integer",
-  "warnings": [],
+  "warnings": [
+    "string"
+  ],
   "worktree_path": "string"
 }
