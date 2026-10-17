@@ -101,6 +101,11 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
         .env_remove("AETHYME_BROKER_DB")
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
         .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
         .env(
             "AETHYME_HOST_STATE_DIR",
             fixture_host_state_dir(fixture_root),
@@ -160,6 +165,13 @@ pub struct FixtureBroker {
 
 #[allow(dead_code)]
 impl FixtureBroker {
+    /// Consume the wrapper when a helper's established return type is `Broker`.
+    /// The fixture owner remains with the caller and must stay alive across
+    /// every broker handle opened against these paths.
+    pub fn into_broker(self) -> Broker {
+        self.broker
+    }
+
     /// The stable worktree root selected for this broker.
     #[allow(dead_code)]
     pub fn worktree_root(&self) -> &Path {
@@ -215,49 +227,4 @@ pub fn open_fixture_repository_broker(
     fixture: &FixtureRepository,
 ) -> Result<FixtureBroker, BrokerOpError> {
     open_fixture_broker(fixture.path(), fixture.owner_path())
-}
-
-/// Open a broker for an integration-test repository that is itself a
-/// disposable temporary directory. Keep its host state, cache, operation DB,
-/// collaboration state, and worktree root inside that repository's Git
-/// metadata so dropping the fixture removes every broker-owned path too.
-///
-/// This helper deliberately rejects linked worktrees and Git metadata outside
-/// the repository. Those fixtures need an explicit owner directory and should
-/// use `open_fixture_broker` instead.
-#[allow(dead_code)]
-pub fn open_ephemeral_repository_broker(repository: &Path) -> Result<FixtureBroker, BrokerOpError> {
-    let canonical_repository = repository
-        .canonicalize()
-        .expect("fixture repository must exist before broker open");
-    let canonical_temp = std::env::temp_dir()
-        .canonicalize()
-        .expect("system temporary directory must exist");
-    assert!(
-        canonical_repository.starts_with(&canonical_temp),
-        "ephemeral fixture repository must be below the system temporary directory: {}",
-        canonical_repository.display()
-    );
-    let git_dir = fixture_git_common_dir(&canonical_repository)
-        .and_then(|path| path.canonicalize().ok())
-        .expect("ephemeral fixture repository must have readable Git metadata");
-    assert!(
-        git_dir.starts_with(&canonical_repository),
-        "ephemeral fixture Git metadata must remain inside its temporary repository: {}",
-        git_dir.display()
-    );
-
-    let host_state_dir = git_dir.join("aethyme-test-state");
-    let worktree_root = git_dir.join("aethyme-test-worktrees");
-    let options = BrokerOpenOptions::default()
-        .with_host_state_dir(host_state_dir.clone())
-        .with_host_cache_dir(git_dir.join("aethyme-test-cache"))
-        .with_host_operation_database(host_state_dir.join("host-operations.db"))
-        .with_worktree_root(worktree_root.clone())
-        .with_collaboration_state(host_state_dir);
-    let broker = Broker::open_with_options(repository, options)?;
-    Ok(FixtureBroker {
-        broker,
-        worktree_root,
-    })
 }

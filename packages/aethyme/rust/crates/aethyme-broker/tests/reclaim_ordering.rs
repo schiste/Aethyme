@@ -65,7 +65,9 @@ fn fixture() -> (common::FixtureRepository, Broker) {
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
     write_policy(tmp.path(), 0);
-    let broker = common::open_fixture_repository_broker(&tmp).unwrap();
+    let broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     (tmp, broker)
 }
 

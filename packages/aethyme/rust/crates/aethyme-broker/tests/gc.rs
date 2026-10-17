@@ -48,7 +48,9 @@ impl Fixture {
     }
 
     fn open(&self) -> Broker {
-        common::open_fixture_broker(self.path(), self._root.path()).unwrap()
+        common::open_fixture_broker(self.path(), self._root.path())
+            .unwrap()
+            .into_broker()
     }
 }
 
