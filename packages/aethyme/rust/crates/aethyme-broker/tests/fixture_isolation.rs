@@ -80,7 +80,7 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
         );
         let captured_context = command
             .get_envs()
-            .find(|(key, _)| key == "AETHYME_BROKER_STORAGE_CONTEXT_V1")
+            .find(|(key, _)| *key == "AETHYME_BROKER_STORAGE_CONTEXT_V1")
             .and_then(|(_, value)| value)
             .and_then(|value| value.to_str())
             .expect("child must receive the captured broker storage context");

@@ -1562,6 +1562,7 @@ fn shared_cache_budget(
 /// broker, a host state directory, or a real package-manager store on disk.
 /// The caller holds the exclusive lease while this function recovers existing
 /// debt and applies any newly declared budget.
+#[cfg(test)]
 fn shared_cache_budget_at(
     budget: Option<&SharedCacheBudget>,
     cache_root: &Path,

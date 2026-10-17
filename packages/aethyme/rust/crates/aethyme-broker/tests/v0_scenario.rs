@@ -9,7 +9,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{AdoptMode, AdoptOptions, Broker, MergeStatus, SessionContext, SessionStatus};
+use aethyme_broker::{AdoptMode, AdoptOptions, MergeStatus, SessionContext, SessionStatus};
+
+mod common;
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -33,8 +35,8 @@ fn commit_edit(worktree: &Path, file: &str, content: &str) {
 
 #[test]
 fn v0_three_agents_end_to_end() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
+    let fixture = common::FixtureRepository::new();
+    let root = fixture.path();
 
     // ── fixture repo with one cheap gate ─────────────────────────────
     sh(root, &["init", "-q", "-b", "main"]);
@@ -51,7 +53,7 @@ fn v0_three_agents_end_to_end() {
     sh(root, &["add", "-A"]);
     sh(root, &["commit", "-qm", "init"]);
 
-    let mut broker = Broker::open(root).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
 
     // ── register three sessions: two adopted, one spawned ────────────
     // Adopted checkouts may live outside the broker-managed worktree root;
