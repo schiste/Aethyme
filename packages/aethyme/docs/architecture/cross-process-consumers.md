@@ -65,6 +65,33 @@ is resolved.
 Consumers of the report must tolerate this additive field and must not treat a
 current-context completion as global cleanup completion.
 
+### Separate preparation-cache placement
+
+The shared preparation cache can be placed independently of the host-resource
+database with `AETHYME_PREPARATION_CACHE_ROOT`, or with
+`BrokerOpenOptions::with_preparation_cache_root` in an embedding application.
+The outer directory must already exist and be a real canonical absolute path.
+On first initialization it must contain no unrelated entries; later opens
+reuse it only when its marker and cache namespace validate. The host-resource
+database remains the coordinator for leases and rotation journals; it is not
+relocated by this option. The first writable broker open checks journal state
+under the repository-scoped preparation lease before it initializes the root
+marker and nonce-scoped cache directory. Capture and read-only planning do not
+initialize the root. An initialized root is bound to the canonical coordinator
+database path and refuses a different canonical path. The coordinator database
+file must also remain stable; replacing it at the same path while connections
+are live is outside the guarantee. Existing cache data is not migrated or
+removed by selecting a new root.
+
+The private child-storage context carries the effective cache-root binding to
+the broker-owned artifact-continuation worker. No override keeps the existing
+V2 child context and default cache namespace; an opted-in root uses the private
+V4 child context so linked worktrees and continuation workers agree on the
+root identity. Preparation writers, rotation recovery, and cache reclamation
+use the same captured root and repository-scoped lease. The root setting
+changes placement only; it does not impose a disk quota or bound arbitrary
+writes made by preparation commands.
+
 ### Private spawned-agent supervision (#831)
 
 The router and broker shim dispatch the reserved
