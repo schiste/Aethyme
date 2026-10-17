@@ -88,7 +88,7 @@ fn deadline_scoped_finish_skips_retention_audit_but_still_checks_dirty_target() 
     assert!(std::path::Path::new(&target.worktree_path).exists());
     assert_eq!(
         broker.store().session(target.id).unwrap().status,
-        SessionStatus::Open
+        SessionStatus::Active
     );
     assert!(report.warnings.iter().any(|warning| {
         warning.contains("retention audit deferred") && warning.contains("aethyme broker gc plan")
