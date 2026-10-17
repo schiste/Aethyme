@@ -1873,6 +1873,37 @@ struct ManagedGateCacheRuntime {
 }
 
 impl GateResourceRuntime {
+    /// Unknown writer liveness retains named allocations. A shell exit or
+    /// closed output pipe does not establish that its descendants are gone.
+    fn finish(&mut self, writers_quiescent: bool) -> Option<String> {
+        if writers_quiescent {
+            return self
+                .release()
+                .err()
+                .map(|error| format!("host resource release failed: {error}"));
+        }
+        let retained = crate::HostResourceCoordinator::open(&self.resource_db_path).and_then(
+            |mut coordinator| {
+                coordinator.quarantine(
+                    &self.grant.lease.lease_id,
+                    self.grant.lease.generation,
+                    &self.grant.ownership_token,
+                )
+            },
+        );
+        let detail = match retained {
+            Ok(lease) => {
+                self.grant.lease = lease;
+                "host resource lease quarantined".to_string()
+            }
+            Err(error) => format!("host resource lease retained; quarantine failed: {error}"),
+        };
+        Some(format!(
+            "gate writer cleanup could not be confirmed; {detail}; inspect exact lease {} generation {} before reconciliation",
+            self.grant.lease.lease_id, self.grant.lease.generation,
+        ))
+    }
+
     fn release(&mut self) -> Result<(), crate::HostResourceError> {
         let mut coordinator = crate::HostResourceCoordinator::open(&self.resource_db_path)?;
         self.grant.lease = coordinator.release(
@@ -2734,6 +2765,7 @@ where
         }
         let started = Instant::now();
         let broker_database = std::cell::OnceCell::new();
+        let command_process_group = std::sync::atomic::AtomicI32::new(0);
         let run_labels =
             crate::gate_debris::GateRunLabels::new(&gate.name, session_id, &repository);
         let status = run_gate_command(
@@ -2758,18 +2790,27 @@ where
                 resources: resource_runtime.as_ref(),
                 managed_cache: managed_cache_runtime.as_ref(),
                 broker_database: &broker_database,
+                command_process_group: Some(&command_process_group),
                 run_labels: &run_labels,
             },
         );
+        let writers_quiescent = gate_process_group_absent(
+            command_process_group.load(std::sync::atomic::Ordering::Acquire),
+        );
         if let Some(cache) = managed_cache_runtime.as_mut() {
-            let usage_after = directory_usage(&cache.directory).ok();
+            let usage_after = writers_quiescent
+                .then(|| directory_usage(&cache.directory).ok())
+                .flatten();
             cache.provenance.bytes_after = usage_after.map(|usage| usage.bytes);
             cache.provenance.inodes_after = usage_after.map(|usage| usage.inodes);
         }
-        let release_error = resource_runtime
-            .as_mut()
-            .and_then(|runtime| runtime.release().err())
-            .map(|error| format!("host resource release failed: {error}"));
+        let release_error = match resource_runtime.as_mut() {
+            Some(runtime) => runtime.finish(writers_quiescent),
+            None if !writers_quiescent => {
+                Some("gate writer cleanup could not be confirmed".to_string())
+            }
+            None => None,
+        };
         drop(owner_locks);
         let duration_ms = started.elapsed().as_millis() as i64;
         environment.load_avg_1m_end = load_average_1m();
@@ -3345,6 +3386,10 @@ struct GateCommandContext<'a> {
     /// Filled once the command's disposable broker database is prepared, so
     /// the caller can report it whatever the command then does.
     broker_database: &'a std::cell::OnceCell<crate::GateBrokerDatabase>,
+    /// Set immediately after spawn, including paths returning an I/O error.
+    /// Zero means no command started. Tests not exercising finalization can
+    /// omit the slot; the production caller always supplies it.
+    command_process_group: Option<&'a std::sync::atomic::AtomicI32>,
     /// The labels the command puts on what it starts (#287).
     run_labels: &'a crate::gate_debris::GateRunLabels,
 }
@@ -3566,6 +3611,30 @@ fn signal_group_and_note(
     }
 }
 
+/// This is an absence probe, never a signal to a possibly recycled group.
+/// Deliberately escaping the command's process group is outside the cooperative
+/// gate contract. A positive observation or any other error remains unknown.
+fn gate_process_group_absent(process_group: i32) -> bool {
+    if process_group == 0 {
+        return true;
+    }
+    if process_group < 0 {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        // SAFETY: signal zero only probes the integer process-group identifier.
+        // It does not stop any process, including a group that reused the id.
+        if unsafe { libc::killpg(process_group, 0) } != 0 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn request_resource_stop(
     stop_requested: &std::sync::atomic::AtomicBool,
     error_slot: &std::sync::Mutex<Option<String>>,
@@ -3773,6 +3842,9 @@ fn run_gate_command(
         process.env("PATH", path);
     }
     let mut child = spawn_gate_command(&mut process, context.absolute_deadline)?;
+    if let Some(slot) = context.command_process_group {
+        slot.store(child.id() as i32, std::sync::atomic::Ordering::Release);
+    }
 
     let pidfile = context.session_id.map(|sid| {
         context
@@ -4636,6 +4708,7 @@ mod tests {
             resources: None,
             managed_cache: None,
             broker_database: &database,
+            command_process_group: None,
             run_labels: &labels,
         };
         let result = run_gate_command("touch dispatched", context());
@@ -4714,6 +4787,7 @@ mod tests {
             resources: None,
             managed_cache: None,
             broker_database: &database,
+            command_process_group: None,
             run_labels: &labels,
         };
         let collector = std::sync::Arc::new(std::sync::Mutex::new(
@@ -4762,6 +4836,134 @@ mod tests {
             renewal_error.lock().unwrap().as_deref(),
             Some("injected resource renewal failure")
         );
+    }
+
+    fn managed_gate_writer_lifecycle(command: &str, expected_quarantine: bool) {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repo");
+        init_repo(&root);
+        let checkout = GitRepo::discover(&root).unwrap();
+        let mut store = BrokerStore::open(&owner.path().join("broker.db")).unwrap();
+        let resource_db = owner.path().join("host-state/resources.db");
+        let mut gate = synthetic_gate("writer-lifecycle", false, command);
+        gate.managed_cache = Some(ManagedGateCache {
+            key: "writer-cache".into(),
+            max_bytes: 1024 * 1024,
+        });
+        let progress = Lines::default();
+        let host = SequencedAdmissionHost::new(vec![None]);
+        let outcomes = run_selections_with_admission(
+            &mut store,
+            &root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Bypass,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &host,
+                deadline: None,
+                storage: GateStorageLocations::Captured {
+                    host_resource_db_path: Some(resource_db.clone()),
+                    host_cache_dir: Some(owner.path().join("cache")),
+                },
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+        )
+        .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let outcome = &outcomes[0];
+        let mut coordinator = crate::HostResourceCoordinator::open(&resource_db).unwrap();
+        let request = crate::HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: "independent-cache-writer".into(),
+            repository: git_origin_fingerprint(&checkout),
+            worktree_fingerprint: "independent".into(),
+            run_id: "independent".into(),
+            ttl_seconds: 60,
+            holder_pid: Some(std::process::id()),
+            resources: vec![crate::HostResourceRequirement {
+                key: "managed_cache".into(),
+                resource: crate::HostResourceKind::ExclusiveKey {
+                    name: managed_cache_lease_name(
+                        &git_origin_fingerprint(&checkout),
+                        "writer-cache",
+                    ),
+                },
+            }],
+        };
+        if expected_quarantine {
+            assert_eq!(outcome.status, GateStatus::Error);
+            assert!(
+                coordinator.acquire(&request).is_err(),
+                "a second writer acquired a possibly live cache"
+            );
+            let cache = outcome.managed_cache.as_ref().unwrap();
+            assert_eq!(
+                cache.bytes_after, None,
+                "live-writer bytes cannot be a settled measurement"
+            );
+            let log = std::fs::read_to_string(outcome.log_path.as_ref().unwrap()).unwrap();
+            assert!(log.contains("gate writer cleanup could not be confirmed"));
+            let states: Vec<String> = rusqlite::Connection::open(&resource_db)
+                .unwrap()
+                .prepare("SELECT state FROM resource_leases ORDER BY generation")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(states, ["quarantined"]);
+        } else {
+            assert_eq!(outcome.status, GateStatus::Pass);
+            let next = coordinator.acquire(&request).unwrap();
+            coordinator
+                .release(
+                    &next.lease.lease_id,
+                    next.lease.generation,
+                    &next.ownership_token,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn closed_pipe_descendant_quarantines_cache_before_another_writer_can_acquire() {
+        // Finite even if the production guard is deliberately removed. Closing
+        // both streams makes output EOF insufficient as a liveness proof.
+        managed_gate_writer_lifecycle(
+            "(/bin/sleep 5; printf late >> \"$AETHYME_GATE_CACHE_DIR/late\") </dev/null >/dev/null 2>&1 & exit 0",
+            true,
+        );
+    }
+
+    #[test]
+    fn quiescent_gate_releases_cache_for_another_writer() {
+        managed_gate_writer_lifecycle("printf completed", false);
+    }
+
+    #[test]
+    fn gate_group_probe_preserves_live_owned_children_and_rejects_invalid_ids() {
+        use std::os::unix::process::CommandExt;
+        assert!(gate_process_group_absent(0));
+        assert!(!gate_process_group_absent(-1));
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+        let absent = gate_process_group_absent(process_group);
+        // Signal only this still-owned, unreaped child, never a saved group id.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!absent, "a live group was treated as quiescent");
+        assert!(gate_process_group_absent(process_group));
     }
 
     #[test]
@@ -5475,6 +5677,7 @@ mod tests {
             resources: None,
             managed_cache: None,
             broker_database,
+            command_process_group: None,
             run_labels,
         }
     }
