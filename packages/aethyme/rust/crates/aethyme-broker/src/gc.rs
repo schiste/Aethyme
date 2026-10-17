@@ -5031,11 +5031,11 @@ mod tests {
     #[test]
     fn broker_open_keeps_published_rotation_debt_pending_when_sweep_is_disabled() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        git(root, &["init", "-q", "-b", "main"]);
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
-        git(root, &["add", "README.md"]);
-        git(root, &["commit", "-qm", "fixture"]);
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(
             root.join(".aethyme/broker.toml"),
@@ -5044,7 +5044,7 @@ mod tests {
         .unwrap();
 
         let storage = crate::test_storage::TestStorage::new();
-        let broker = storage.open(root).unwrap();
+        let broker = storage.open(&root).unwrap();
         let cache_root = broker
             .storage_context()
             .preparation_cache_root()
@@ -5087,7 +5087,7 @@ mod tests {
 
         // This is a normal startup path. No explicit maintenance call repairs
         // the state: Broker::open must notice the published witness itself.
-        let mut reopened = storage.open(root).unwrap();
+        let mut reopened = storage.open(&root).unwrap();
         let requested = reopened
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
@@ -5120,11 +5120,11 @@ mod tests {
     #[test]
     fn broker_open_keeps_missing_cache_parent_pending_with_positive_budget() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        git(root, &["init", "-q", "-b", "main"]);
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
-        git(root, &["add", "README.md"]);
-        git(root, &["commit", "-qm", "fixture"]);
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(
             root.join(".aethyme/broker.toml"),
@@ -5133,7 +5133,7 @@ mod tests {
         .unwrap();
 
         let storage = crate::test_storage::TestStorage::new();
-        let mut first = storage.open(root).unwrap();
+        let mut first = storage.open(&root).unwrap();
         let cache_root = first
             .storage_context()
             .preparation_cache_root()
@@ -5160,7 +5160,7 @@ mod tests {
         drop(first);
         std::fs::remove_dir_all(&cache_parent).unwrap();
 
-        let mut reopened = storage.open(root).unwrap();
+        let mut reopened = storage.open(&root).unwrap();
         let requested = reopened
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)

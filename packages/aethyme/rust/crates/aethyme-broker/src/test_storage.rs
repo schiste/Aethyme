@@ -8,28 +8,35 @@ use crate::{Broker, BrokerOpError, BrokerOpenOptions};
 /// Storage is a sibling of the temporary repository, never an ambient host
 /// directory. Dropping a broker handle does not remove retained checkouts.
 pub(crate) struct TestStorage {
-    owner: tempfile::TempDir,
+    _owner: tempfile::TempDir,
+    root: PathBuf,
 }
 
 impl TestStorage {
     pub(crate) fn new() -> Self {
+        let owner = tempfile::tempdir().expect("create fixture storage owner");
+        let root = owner
+            .path()
+            .canonicalize()
+            .expect("canonicalize fixture storage owner");
         Self {
-            owner: tempfile::tempdir().expect("create fixture storage owner"),
+            _owner: owner,
+            root,
         }
     }
 
     pub(crate) fn worktree_root(&self) -> PathBuf {
-        self.owner.path().join("worktrees")
+        self.root.join("worktrees")
     }
 
     pub(crate) fn options(&self) -> BrokerOpenOptions {
-        let state = self.owner.path().join("host-state");
+        let state = self.root.join("host-state");
         BrokerOpenOptions::default()
             .with_host_state_dir(&state)
-            .with_host_cache_dir(self.owner.path().join("host-cache"))
+            .with_host_cache_dir(self.root.join("host-cache"))
             .with_host_operation_database(state.join("host-operations.db"))
             .with_worktree_root(self.worktree_root())
-            .with_collaboration_state(self.owner.path().join("collaboration"))
+            .with_collaboration_state(self.root.join("collaboration"))
     }
 
     pub(crate) fn open(&self, repository: &Path) -> Result<Broker, BrokerOpError> {
@@ -45,7 +52,7 @@ mod tests {
     fn fixture_options_bind_every_storage_domain_before_open() {
         let storage = TestStorage::new();
         let options = storage.options();
-        let root = storage.owner.path();
+        let root = &storage.root;
         assert_eq!(options.host_state_dir, Some(root.join("host-state")));
         assert_eq!(options.host_cache_dir, Some(root.join("host-cache")));
         assert_eq!(
@@ -78,7 +85,7 @@ mod tests {
             );
         }
         let storage = TestStorage::new();
-        let storage_root = storage.owner.path().to_path_buf();
+        let storage_root = storage.root.clone();
         let mut broker = storage.open(repository.path()).unwrap();
         let session = broker.start_worktree("retained fixture", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);

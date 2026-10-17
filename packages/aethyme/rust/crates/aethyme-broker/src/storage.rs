@@ -5157,8 +5157,9 @@ mod tests {
     #[test]
     fn preparation_cache_sweep_recovers_rotation_debt_without_a_later_writer() {
         let tmp = tempfile::tempdir().unwrap();
-        let main_root = tmp.path().join("main");
-        let cache_root = tmp.path().join("preparation-cache");
+        let root = tmp.path().canonicalize().unwrap();
+        let main_root = root.join("main");
+        let cache_root = root.join("preparation-cache");
         let store = cache_root.join(TEST_PREPARATION_REPOSITORY);
         std::fs::create_dir_all(&main_root).unwrap();
         std::fs::create_dir_all(&store).unwrap();
@@ -5182,7 +5183,7 @@ mod tests {
                 .expect("rotation intent is durable before the rename");
         crate::preparation::rotation_debt::retire_original_store(&cache_root, &retained).unwrap();
 
-        let resource_db_path = test_host_resource_db(tmp.path());
+        let resource_db_path = test_host_resource_db(&root);
         let report = sweep_preparation_cache_with_discovery(
             &cache_root,
             &resource_db_path,
