@@ -12,6 +12,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod managed_storage_inventory;
+pub(crate) use managed_storage_inventory::{
+    ManagedStorageAdmission, ManagedStorageGrowthPermit, ManagedStorageOwner,
+};
+
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
 /// Additive ledger version; the shared host-resource schema remains version 1.
 pub(crate) const MANAGED_STORAGE_SCHEMA_VERSION: u32 = 1;
@@ -594,6 +599,28 @@ impl HostResourceCoordinator {
         &self.path
     }
 
+    /// Hold the exact preparation-cache exclusive lease while managing one
+    /// finite materialization directory. The caller supplies the resolved
+    /// preparation-cache root from this broker's storage context; this API does
+    /// not constrain arbitrary child-process writes or prove child quiescence.
+    pub(crate) fn begin_managed_storage_owner<'a>(
+        &'a mut self,
+        grant: HostResourceGrant,
+        repository: &str,
+        preparation_cache_root: &Path,
+        materialization: &str,
+        ttl_seconds: u64,
+    ) -> Result<ManagedStorageOwner<'a>, HostResourceError> {
+        ManagedStorageOwner::new(
+            self,
+            grant,
+            repository,
+            preparation_cache_root,
+            materialization,
+            ttl_seconds,
+        )
+    }
+
     /// Read one exact durable claim so a restarted owner can distinguish an
     /// outstanding reservation from measured, uncertain, or released storage.
     pub(crate) fn managed_storage_claim(
@@ -838,7 +865,7 @@ impl HostResourceCoordinator {
 
     /// Record a complete inventory of a present root. Actual use is retained
     /// even above policy, so over-budget bytes cannot be hidden.
-    pub(crate) fn reconcile_managed_storage_claim(
+    fn reconcile_managed_storage_claim(
         &mut self,
         request: &ManagedStorageClaimRequest,
         measured_bytes: u64,
