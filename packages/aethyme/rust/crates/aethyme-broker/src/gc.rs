@@ -5046,6 +5046,151 @@ mod tests {
     }
 
     #[test]
+    fn inline_partial_cache_removal_respects_spacing_and_resumes_afterward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(root, &["add", "README.md", ".gitignore"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        let mut broker = Broker::open(root).unwrap();
+
+        let session = broker
+            .start_worktree("partial cache fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
+        git(&worktree, &["add", "landed.txt"]);
+        git(&worktree, &["commit", "-qm", "landed"]);
+        assert!(broker.submit(session.id).unwrap().promoted);
+        assert!(
+            broker
+                .finish_with_options(
+                    session.id,
+                    crate::FinishOptions {
+                        keep_worktree: true,
+                    },
+                )
+                .unwrap()
+                .closed
+        );
+
+        let cache = worktree.join("target");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("first"), b"first").unwrap();
+        std::fs::write(cache.join("second"), b"second").unwrap();
+        let cache_key = cache.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let (partial, entries_reclaimed) = broker
+            .sweep_artifacts_autonomously_with_test_deadlines(
+                &policy,
+                ArtifactSweepScope::Inline,
+                Instant::now() + Duration::from_secs(30),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            !partial.complete,
+            "an interrupted removal is not a full lap"
+        );
+        assert_eq!(entries_reclaimed, 1);
+        assert!(cache.join("CACHEDIR.TAG").is_file(), "the witness remains");
+        let queued = decode_interrupted_paths(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+        )
+        .unwrap();
+        assert_eq!(queued, vec![cache_key.clone()]);
+        let partial_stamp = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
+            .unwrap()
+            .expect("the incomplete inline pass records its spacing stamp");
+        assert_ne!(partial_stamp, "0");
+
+        let entries_after_partial = std::fs::read_dir(&cache).unwrap().count();
+        let (_, spaced_entries) = broker
+            .sweep_artifacts_autonomously_with_test_deadlines(
+                &policy,
+                ArtifactSweepScope::Inline,
+                Instant::now() + Duration::from_secs(30),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(spaced_entries, 0, "spacing prevents an immediate retry");
+        assert_eq!(
+            std::fs::read_dir(&cache).unwrap().count(),
+            entries_after_partial,
+            "the queued cache is untouched inside the spacing interval"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(cache_key.as_str()),
+            "the partial path remains queued while the retry is spaced"
+        );
+
+        // Advance only the persisted schedule marker; the test deadlines keep
+        // the filesystem transition deterministic without sleeping.
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")
+            .unwrap();
+        let (resumed, resumed_entries) = broker
+            .sweep_artifacts_autonomously_with_test_deadlines(
+                &policy,
+                ArtifactSweepScope::Inline,
+                Instant::now() + Duration::from_secs(30),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(resumed.complete, "the eligible retry finishes the cache");
+        assert!(resumed_entries > 0);
+        assert!(!cache.exists());
+        assert!(
+            worktree.join("landed.txt").is_file(),
+            "the checkout remains"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "completion clears the durable interrupted-path queue"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
     fn an_automatic_recovery_request_advances_its_durable_generation() {
         let tmp = tempfile::tempdir().unwrap();
         git(tmp.path(), &["init", "-q", "-b", "main"]);

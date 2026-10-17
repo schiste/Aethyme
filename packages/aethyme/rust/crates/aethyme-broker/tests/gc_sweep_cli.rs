@@ -862,6 +862,45 @@ fn clear_meta(repo: &Path, key: &str) {
         .unwrap();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenSweepState {
+    Completed,
+    Partial,
+}
+
+/// Inline work is time bounded, so a loaded machine may complete a fixture
+/// that pauses on another machine. Check both valid terminal states directly.
+fn assert_open_sweep_state(repo: &Path, target: &Path, target_key: &str) -> OpenSweepState {
+    let partial_stamp = meta(repo, SWEEP_PARTIAL).expect("an eligible open records sweep state");
+    let queued = interrupted_paths(repo);
+    if partial_stamp == "0" {
+        let cadence = meta(repo, SWEEP_STAMP).expect("a completed lap records its cadence");
+        assert_ne!(cadence, "0", "a completed lap has a nonzero cadence stamp");
+        assert!(!target.exists(), "a complete lap removed the cache");
+        assert!(
+            !queued.iter().any(|path| path == target_key),
+            "a complete lap clears this cache's interrupted entry"
+        );
+        OpenSweepState::Completed
+    } else {
+        assert!(
+            partial_stamp.parse::<i64>().is_ok_and(|stamp| stamp > 0),
+            "a partial lap records a positive timestamp: {partial_stamp}"
+        );
+        if target.exists() {
+            assert!(
+                queued.iter().any(|path| path == target_key)
+                    || target.join("CACHEDIR.TAG").is_file(),
+                "a partial cache is queued for resume or remains classifiable"
+            );
+        }
+        // A pass can finish this cache and hit its budget while classifying
+        // unrelated work. Its partial stamp is truthful even if this path is
+        // already absent and has no interrupted-path entry.
+        OpenSweepState::Partial
+    }
+}
+
 const SWEEP_STAMP: &str = "gc.artifact_sweep.last_run_ms";
 const SWEEP_PARTIAL: &str = "gc.artifact_sweep.last_partial_ms";
 
@@ -1662,7 +1701,7 @@ fn count_entries(dir: &Path) -> usize {
 }
 
 #[test]
-fn a_budget_too_small_to_finish_still_makes_ground_and_keeps_the_cache_resumable() {
+fn a_bounded_open_leaves_a_truthful_state_and_explicit_sweep_finishes() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
@@ -1672,39 +1711,48 @@ fn a_budget_too_small_to_finish_still_makes_ground_and_keeps_the_cache_resumable
         std::fs::create_dir_all(&bucket).unwrap();
         std::fs::write(bucket.join(format!("{index}.rlib")), b"artifact").unwrap();
     }
-    let before = count_entries(&target);
+    let target_key = target
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
 
-    // The pass can discover the cache, but 50 ms is too short to unlink all of
-    // it. It must leave the tree smaller than it found it and still leave it
-    // recognizable, or later passes cannot resume safely.
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
     )
     .unwrap();
-    for _ in 0..5 {
-        // Broker opens space their continuations; clearing the spacing stamp
-        // stands in for the minutes between them.
-        clear_meta(repo.path(), SWEEP_PARTIAL);
+    let first = run(repo.path(), container.path(), &["status"]);
+    assert!(
+        first.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_state = assert_open_sweep_state(repo.path(), &target, &target_key);
+    let first_entries = count_entries(&target);
+    let first_partial = meta(repo.path(), SWEEP_PARTIAL);
+    let first_cadence = meta(repo.path(), SWEEP_STAMP);
+    let first_queue = interrupted_paths(repo.path());
+
+    // Repeated opens inside the spacing/cadence interval leave the observed
+    // terminal state alone, whether this machine paused or completed the lap.
+    for _ in 0..4 {
         let output = run(repo.path(), container.path(), &["status"]);
         assert!(
             output.status.success(),
             "status: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            target.join("CACHEDIR.TAG").is_file(),
-            "a partly removed cache must stay classifiable or no later pass resumes it"
+        assert_eq!(
+            assert_open_sweep_state(repo.path(), &target, &target_key),
+            first_state
         );
+        assert_eq!(count_entries(&target), first_entries);
+        assert_eq!(meta(repo.path(), SWEEP_PARTIAL), first_partial);
+        assert_eq!(meta(repo.path(), SWEEP_STAMP), first_cadence);
+        assert_eq!(interrupted_paths(repo.path()), first_queue);
     }
-    assert!(
-        count_entries(&target) < before,
-        "every pass must be worth at least one unlink"
-    );
 
-    // An unfinished pass withholds the cadence stamp, so the backlog is not
-    // hidden for an interval. Give an explicit sweep enough budget and it
-    // finishes what the others started.
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 30000\n",
@@ -1712,14 +1760,14 @@ fn a_budget_too_small_to_finish_still_makes_ground_and_keeps_the_cache_resumable
     .unwrap();
     let report = sweep(repo.path(), container.path());
     assert_eq!(report["complete"], true, "{report}");
-    assert!(
-        !target.exists(),
-        "the resumed sweep must finish the removal"
-    );
+    assert!(!target.exists(), "the explicit sweep finishes the cache");
     assert!(
         worktree.join("work.txt").exists(),
         "committed work must be untouched"
     );
+    assert_eq!(meta(repo.path(), SWEEP_PARTIAL).as_deref(), Some("0"));
+    assert_ne!(meta(repo.path(), SWEEP_STAMP).as_deref(), Some("0"));
+    assert!(!interrupted_paths(repo.path()).contains(&target_key));
 }
 
 /// An orphaned root's owning database is gone, which is what makes it an
@@ -1807,57 +1855,62 @@ fn doctor_counts_an_unsized_orphaned_root_against_its_own_totals() {
     );
 }
 
-/// A backlog bigger than one budget used to be resumed by *every* broker open:
-/// the cadence stamp is withheld until a pass finishes, so each `gh`, `note`
-/// and hook call paid a full budget -- a minute under disk pressure. Opens now
-/// space their continuations: one open makes ground, the next ones within the
-/// spacing leave the backlog alone.
+/// Inline cleanup is bounded, so the same fixture may pause on one machine
+/// and finish on another. Repeated opens inside the spacing or cadence window
+/// must preserve whichever truthful state the first open recorded.
 #[test]
-fn broker_opens_space_their_continuations_of_an_unfinished_sweep() {
+fn broker_opens_preserve_the_completed_or_partial_sweep_state() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
     let target = worktree.join("rust/target");
     populate_large_cache(&target);
-    // A short pass pauses part-way through this cache, which no single inline
-    // budget can finish.
+    let target_key = target
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 250\n",
     )
     .unwrap();
-    let before = count_entries(&target);
 
     let first = run(repo.path(), container.path(), &["status"]);
-    assert!(first.status.success());
-    let after_first = count_entries(&target);
     assert!(
-        after_first < before,
-        "the first open must make ground: before={before}, after={after_first}, partial={:?}, interrupted={:?}, stdout={}, stderr={}",
-        meta(repo.path(), SWEEP_PARTIAL),
-        meta(repo.path(), "gc.artifact_sweep.interrupted_path"),
-        String::from_utf8_lossy(&first.stdout),
-        String::from_utf8_lossy(&first.stderr),
+        first.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&first.stderr)
     );
-    let paused_at = meta(repo.path(), SWEEP_PARTIAL).expect("a paused pass records when");
-    assert_ne!(paused_at, "0");
+    let first_state = assert_open_sweep_state(repo.path(), &target, &target_key);
+    let after_first = count_entries(&target);
+    let partial_stamp = meta(repo.path(), SWEEP_PARTIAL);
+    let cadence_stamp = meta(repo.path(), SWEEP_STAMP);
+    let queue = interrupted_paths(repo.path());
 
     for _ in 0..10 {
         let output = run(repo.path(), container.path(), &["status"]);
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "status: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            assert_open_sweep_state(repo.path(), &target, &target_key),
+            first_state
+        );
+        assert_eq!(
+            count_entries(&target),
+            after_first,
+            "opens inside spacing/cadence do not continue the bounded pass"
+        );
+        assert_eq!(meta(repo.path(), SWEEP_PARTIAL), partial_stamp);
+        assert_eq!(meta(repo.path(), SWEEP_STAMP), cadence_stamp);
+        assert_eq!(interrupted_paths(repo.path()), queue);
     }
-    assert_eq!(
-        count_entries(&target),
-        after_first,
-        "opens inside the spacing must not continue the sweep"
-    );
-    assert_eq!(
-        meta(repo.path(), SWEEP_PARTIAL).as_deref(),
-        Some(paused_at.as_str())
-    );
     assert!(
-        target.join("CACHEDIR.TAG").is_file(),
-        "the paused cache stays classifiable for the next pass"
+        worktree.join("work.txt").exists(),
+        "a sweep never removes the checkout itself"
     );
 }
 
