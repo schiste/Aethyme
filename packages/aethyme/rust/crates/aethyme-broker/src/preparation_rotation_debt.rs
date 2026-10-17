@@ -3532,7 +3532,7 @@ fn normalize_created_file_mode(file: &File, mode: libc::mode_t) -> io::Result<()
         return Err(io::Error::last_os_error());
     }
     let metadata = file.metadata()?;
-    if !is_private_owned_file(&metadata) || metadata.mode() & 0o777 != u32::from(mode) {
+    if !is_private_owned_file(&metadata) || u64::from(metadata.mode() & 0o777) != u64::from(mode) {
         return Err(invalid_record(
             "new private storage file did not retain its required owner mode",
         ));
