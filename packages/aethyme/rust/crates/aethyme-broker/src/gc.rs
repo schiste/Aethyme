@@ -1124,6 +1124,21 @@ fn artifact_worker_binaries() -> Option<(PathBuf, PathBuf)> {
     Some((router, engine))
 }
 
+/// Keep cache-only continuation outside the launching broker's owned process
+/// group. Agent and inline supervisors tear down their group after the launcher
+/// exits; the worker's durable request/cursor make this independent lifetime
+/// recoverable without leaving it attached to that cleanup.
+#[cfg(unix)]
+fn configure_artifact_worker_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_artifact_worker_process_group(_: &mut Command) {
+    // This continuation remains best-effort on platforms without Unix groups.
+}
+
 fn worker_binary_version(binary: &Path) -> Option<String> {
     let mut child = Command::new(binary)
         .arg("--version")
@@ -2864,6 +2879,7 @@ impl Broker {
             self.defer_artifact_sweep_worker("storage_context_unavailable")?;
             return Ok(());
         }
+        configure_artifact_worker_process_group(&mut command);
         let _child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -5472,19 +5488,28 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(tmp.path()).unwrap();
 
-        assert!(!broker.artifact_sweep_recovery_requested().unwrap());
+        let prior_generation = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
         broker.persist_artifact_sweep_recovery_request().unwrap();
         assert!(broker.artifact_sweep_recovery_requested().unwrap());
         let first = broker
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap();
+        let first_generation = first.as_ref().unwrap().parse::<i64>().unwrap();
+        assert!(
+            first_generation > prior_generation,
+            "a fresh request advances any generation produced during startup"
+        );
         broker.persist_artifact_sweep_recovery_request().unwrap();
         let second = broker
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap();
-        let first_generation = first.unwrap().parse::<i64>().unwrap();
         let second_generation = second.unwrap().parse::<i64>().unwrap();
         assert!(
             second_generation > first_generation,
@@ -5496,8 +5521,9 @@ mod tests {
     /// `detached_worker_survives_its_launcher_and_resumes_after_a_crash`.
     /// It deliberately exercises the real advisory lock, metadata store, and
     /// cache-tree remover without resolving or launching an installed broker.
-    // This test-only launcher must exit while its grandchild worker remains
-    // detached, so waiting here would invalidate the parent-exit regression.
+    // The test-only launcher holds its owned process group until the parent
+    // tears it down. Its grandchild worker uses the same process-group setup
+    // as the installed continuation command and must survive that teardown.
     #[test]
     #[allow(clippy::zombie_processes)]
     fn detached_artifact_worker_child_fixture() {
@@ -5625,9 +5651,9 @@ mod tests {
                 .unwrap();
             }
             "launch-crash-child" => {
-                let mut child = detached_fixture_command(&root, "crash-child")
-                    .spawn()
-                    .unwrap();
+                let mut command = detached_fixture_command(&root, "crash-child");
+                configure_artifact_worker_process_group(&mut command);
+                let mut child = command.spawn().unwrap();
                 std::fs::write(
                     detached_fixture_marker(&root, "child-pid"),
                     child.id().to_string(),
@@ -5641,9 +5667,14 @@ mod tests {
                     let _ = child.wait();
                     panic!("detached child did not acquire its worker lock");
                 }
-                // Dropping Child does not wait for it. Returning from this
-                // test exits the launcher while its detached child is held
-                // behind the parent's explicit exit marker.
+                // Keep this process, and therefore its process group, live
+                // until the parent test cancels that exact owned group. If
+                // the worker didn't get its own group, teardown kills it too.
+                #[cfg(unix)]
+                assert!(wait_for_fixture_marker(
+                    &detached_fixture_marker(&root, "launcher-release"),
+                    Duration::from_secs(20),
+                ));
             }
             "crash-child" => {
                 let lock = acquire_artifact_sweep_worker_lock(&root).unwrap();
@@ -5962,12 +5993,81 @@ mod tests {
         );
         drop(held_lock);
 
-        // A launcher process starts the worker, waits for its ready signal,
-        // then exits before the test permits the worker to do any work.
-        let launcher = detached_fixture_command(root, "launch-crash-child")
-            .status()
+        // Run the worker launcher as a supervised user command. The real
+        // cleanup watcher tears down that owned group after the command and
+        // supervisor exit; the worker must use the production process-group
+        // configuration to survive it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let executable = std::env::current_exe().unwrap();
+            let command_text = "exec \"$AETHYME_TEST_DETACHED_GC_EXECUTABLE\" --exact gc::tests::detached_artifact_worker_child_fixture --nocapture --quiet";
+            let log_path = root.join(".aethyme/test-worker/agent-supervisor.log");
+            let log = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(log_path)
+                .unwrap();
+            let (mut supervisor_command, nonce) =
+                crate::agent_supervisor::process(command_text, root, &log, None).unwrap();
+            supervisor_command
+                .current_dir(root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(log)
+                .env(DETACHED_FIXTURE_MODE_ENV, "launch-crash-child")
+                .env(DETACHED_FIXTURE_ROOT_ENV, root)
+                .env("AETHYME_TEST_DETACHED_GC_EXECUTABLE", executable)
+                .process_group(0);
+            let mut supervisor = supervisor_command.spawn().unwrap();
+            let supervisor_group = i32::try_from(supervisor.id()).unwrap();
+            crate::agent_supervisor::await_ready(supervisor.stdout.as_mut().unwrap(), &nonce)
+                .unwrap();
+            supervisor.stdout.take();
+            writeln!(
+                supervisor.stdin.take().unwrap(),
+                "{}",
+                crate::agent_supervisor::GO
+            )
             .unwrap();
-        assert!(launcher.success());
+            assert!(wait_for_fixture_marker(
+                &detached_fixture_marker(root, "child-ready"),
+                Duration::from_secs(10),
+            ));
+            std::fs::write(
+                detached_fixture_marker(root, "launcher-release"),
+                b"release",
+            )
+            .unwrap();
+            assert!(supervisor.wait().unwrap().success());
+            let group_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                // Probe only: never signal a numeric group ID after its leader
+                // has been reaped. ESRCH proves the owned group is gone;
+                // permission and unexpected probe errors fail closed.
+                let result = unsafe { libc::kill(-supervisor_group, 0) };
+                if result == -1 {
+                    let error = std::io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::ESRCH) => break,
+                        Some(libc::EINTR) => {}
+                        _ => panic!("could not prove supervisor group teardown: {error}"),
+                    }
+                }
+                assert!(
+                    Instant::now() < group_deadline,
+                    "supervisor process group remained after its cleanup watcher completed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let launcher = detached_fixture_command(root, "launch-crash-child")
+                .status()
+                .unwrap();
+            assert!(launcher.success());
+        }
         std::fs::write(detached_fixture_marker(root, "parent-exited"), b"exited").unwrap();
         assert!(wait_for_fixture_marker(
             &detached_fixture_marker(root, "child-progress"),
