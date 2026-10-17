@@ -1418,7 +1418,12 @@ mod tests {
         let supervisor = start_helper();
         std::thread::sleep(READY_TIMEOUT + Duration::from_millis(100));
         let result = supervisor
-            .run(Path::new("/"), &["/bin/true".into()], &[], || Ok(()))
+            .run(
+                Path::new("/"),
+                &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                &[],
+                || Ok(()),
+            )
             .unwrap();
 
         assert!(result.succeeded);
