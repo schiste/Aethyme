@@ -39,6 +39,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   is unchanged. Refusal must preserve the previous identity record and data.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Preserve earlier outputs before retrying.
+- When resolving stacked merges, preserve the stronger assertions from both
+  parents. Adapt tests to the merged API; do not replace explicit failure or
+  completeness checks with weaker count-only assertions.
 - Run the fastest relevant test command first.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
