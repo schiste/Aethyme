@@ -44,6 +44,12 @@ impl DirectoryIdentity {
         identity_for_directory(&directory)
     }
 
+    pub(crate) fn encode(&self) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|error| {
+            invalid_record(&format!("could not encode cache-root identity: {error}"))
+        })
+    }
+
     fn validate(&self) -> io::Result<()> {
         if !is_hex(&self.filesystem_id, 2, 128) || self.filesystem_id.len() % 2 != 0 {
             return Err(invalid_record("filesystem identity is malformed"));
@@ -111,6 +117,28 @@ impl RotationDebt {
             return Err(invalid_record("rotation debt identity is inconsistent"));
         }
         Ok(())
+    }
+
+    pub(crate) fn from_journal_payload(
+        cache_root: &Path,
+        repository: &str,
+        bytes: &[u8],
+    ) -> io::Result<Self> {
+        let debt: Self = serde_json::from_slice(bytes).map_err(|error| {
+            invalid_record(&format!("journal rotation debt is malformed: {error}"))
+        })?;
+        debt.validate()?;
+        let root = open_cache_root(cache_root)?;
+        let identity = identity_for_directory(&root)?;
+        if debt.repository != repository
+            || !debt.cache_root.same_directory(&identity)
+            || encode(&debt)? != bytes
+        {
+            return Err(invalid_record(
+                "journal rotation debt does not match its repository or cache root",
+            ));
+        }
+        Ok(debt)
     }
 
     fn record_component(repository: &str) -> io::Result<CString> {
@@ -383,6 +411,104 @@ fn classify_recovery(
         }
         _ => RecoveryStep::Conflict,
     }
+}
+
+/// Recover one repository's rotation only after publishing or validating
+/// its external journal row. The caller holds the same repository lease for
+/// this whole function; every journal transaction finishes before filesystem
+/// mutation starts.
+pub(crate) fn recover_with_journal(
+    cache_root: &Path,
+    resource_db: &Path,
+    repository: &str,
+    deadline: Instant,
+) -> Result<RecoveryProgress, RecoveryError> {
+    let mut progress = RecoveryProgress::default();
+    if Instant::now() >= deadline {
+        return Err(recovery_error(progress, deadline_error()));
+    }
+    let root_identity = DirectoryIdentity::capture(cache_root)
+        .map_err(|source| recovery_error(progress, source))?;
+    let root_identity_bytes = root_identity
+        .encode()
+        .map_err(|source| recovery_error(progress, source))?;
+
+    let journal_payload =
+        super::rotation_journal::load(resource_db, cache_root, &root_identity_bytes, repository)
+            .map_err(|source| recovery_error(progress, source))?;
+    let payload = match journal_payload {
+        Some(payload) => payload,
+        None => {
+            let retained =
+                read(cache_root, repository).map_err(|source| recovery_error(progress, source))?;
+            if let Some(retained) = retained {
+                let payload =
+                    encode(&retained.debt).map_err(|source| recovery_error(progress, source))?;
+                super::rotation_journal::publish(
+                    resource_db,
+                    cache_root,
+                    &root_identity_bytes,
+                    repository,
+                    &payload,
+                )
+                .map_err(|source| recovery_error(progress, source))?;
+                payload
+            } else {
+                if has_uncommitted_scratch(cache_root, repository)
+                    .map_err(|source| recovery_error(progress, source))?
+                {
+                    return Err(recovery_error(
+                        progress,
+                        invalid_record("unpublished rotation scratch has no durable journal row"),
+                    ));
+                }
+                return recover(cache_root, repository, deadline);
+            }
+        }
+    };
+
+    let debt = RotationDebt::from_journal_payload(cache_root, repository, &payload)
+        .map_err(|source| recovery_error(progress, source))?;
+    match recovery_step(cache_root, &debt).map_err(|source| recovery_error(progress, source))? {
+        RecoveryStep::Conflict => {
+            return Err(recovery_error(
+                progress,
+                invalid_record("journal rotation debt conflicts with current cache state"),
+            ));
+        }
+        RecoveryStep::ClearCompletedDebt => {}
+        RecoveryStep::RenameOriginalStore
+        | RecoveryStep::RemoveRetiredStore
+        | RecoveryStep::CreateFreshStore => {
+            restore_from_journal(cache_root, &debt)
+                .map_err(|source| recovery_error(progress, source))?;
+        }
+    }
+
+    progress = recover(cache_root, repository, deadline)?;
+    if progress.complete {
+        progress.found_debt = true;
+        if let Err(source) = super::rotation_journal::complete(
+            resource_db,
+            cache_root,
+            &root_identity_bytes,
+            repository,
+            &payload,
+        ) {
+            progress.complete = false;
+            return Err(recovery_error(progress, source));
+        }
+    }
+    Ok(progress)
+}
+
+/// Detect an uncommitted witness scratch. Without the external journal row it
+/// is deliberately not promoted, because recovery must not mutate a published
+/// rotation that the host-state journal cannot rediscover after another crash.
+pub(crate) fn has_uncommitted_scratch(cache_root: &Path, repository: &str) -> io::Result<bool> {
+    let root = open_cache_root(cache_root)?;
+    let name = RotationDebt::scratch_component(repository)?;
+    Ok(read_component(root.as_raw_fd(), &name)?.is_some())
 }
 
 /// Inspect the current and retired names with descriptor-relative no-follow
@@ -1355,6 +1481,141 @@ pub(crate) fn publish(
     decode_retained(file, &proposed.repository, &root_identity)
 }
 
+/// Restore the cache-root witness from a previously committed external
+/// journal row. The external row is the durable publication authority when a
+/// crash occurred before the in-cache witness was published or after it was
+/// cleared. The caller holds the repository's exclusive preparation lease.
+pub(crate) fn restore_from_journal(
+    cache_root: &Path,
+    debt: &RotationDebt,
+) -> io::Result<RetainedRotationDebt> {
+    debt.validate()?;
+    let root = open_cache_root(cache_root)?;
+    let root_identity = identity_for_directory(&root)?;
+    if !root_identity.same_directory(&debt.cache_root) {
+        return Err(invalid_record("cache root changed before journal recovery"));
+    }
+    match recovery_step_at(&root, debt)? {
+        RecoveryStep::ClearCompletedDebt => {
+            return Err(invalid_record(
+                "completed journal debt does not need an in-cache witness",
+            ));
+        }
+        RecoveryStep::Conflict => {
+            return Err(invalid_record(
+                "journal rotation debt conflicts with current cache state",
+            ));
+        }
+        RecoveryStep::RenameOriginalStore
+        | RecoveryStep::RemoveRetiredStore
+        | RecoveryStep::CreateFreshStore => {}
+    }
+
+    let committed_name = RotationDebt::record_component(&debt.repository)?;
+    let scratch_name = RotationDebt::scratch_component(&debt.repository)?;
+    let bytes = encode(debt)?;
+    if let Some(existing) = read_component(root.as_raw_fd(), &committed_name)? {
+        let retained = decode_retained(existing, &debt.repository, &root_identity)?;
+        if retained.debt != *debt || read_component(root.as_raw_fd(), &scratch_name)?.is_some() {
+            return Err(invalid_record(
+                "journal rotation witness conflicts with in-cache state",
+            ));
+        }
+        return Ok(retained);
+    }
+
+    if let Some(scratch) = read_component(root.as_raw_fd(), &scratch_name)? {
+        if scratch.bytes == bytes
+            && decode_retained(
+                ReadComponent {
+                    bytes: scratch.bytes.clone(),
+                    identity: scratch.identity,
+                },
+                &debt.repository,
+                &root_identity,
+            )
+            .is_ok()
+        {
+            ensure_component_identity(root.as_raw_fd(), &scratch_name, scratch.identity)?;
+            if recovery_step_at(&root, debt)? == RecoveryStep::Conflict {
+                return Err(invalid_record(
+                    "journal recovery state changed before scratch promotion",
+                ));
+            }
+            rename_noreplace(
+                root.as_raw_fd(),
+                &scratch_name,
+                root.as_raw_fd(),
+                &committed_name,
+            )?;
+            root.sync_all()?;
+            let file = read_component(root.as_raw_fd(), &committed_name)?
+                .ok_or_else(|| invalid_record("restored rotation witness disappeared"))?;
+            if file.identity != scratch.identity || file.bytes != bytes {
+                return Err(invalid_record("restored rotation witness was replaced"));
+            }
+            return decode_retained(file, &debt.repository, &root_identity);
+        }
+        // The external row is the exact published intent. A private
+        // incomplete scratch file has no authority and can be discarded only
+        // after the root and expected recovery state still match.
+        if recovery_step_at(&root, debt)? == RecoveryStep::Conflict {
+            return Err(invalid_record(
+                "journal recovery state changed before scratch cleanup",
+            ));
+        }
+        remove_scratch(root.as_raw_fd(), &scratch_name, &scratch)?;
+        root.sync_all()?;
+    }
+
+    let step = recovery_step_at(&root, debt)?;
+    if matches!(
+        step,
+        RecoveryStep::Conflict | RecoveryStep::ClearCompletedDebt
+    ) {
+        return Err(invalid_record(
+            "journal recovery state changed before witness creation",
+        ));
+    }
+    let mut scratch = create_regular_exclusive(root.as_raw_fd(), &scratch_name)?;
+    scratch.write_all(&bytes)?;
+    scratch.sync_all()?;
+    let metadata = scratch.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || !is_private_owned_file(&metadata)
+        || metadata.len() != bytes.len() as u64
+    {
+        return Err(invalid_record(
+            "restored rotation scratch changed while writing",
+        ));
+    }
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    drop(scratch);
+    if recovery_step_at(&root, debt)? != step {
+        return Err(invalid_record(
+            "journal recovery state changed before witness publication",
+        ));
+    }
+    ensure_component_identity(root.as_raw_fd(), &scratch_name, identity)?;
+    rename_noreplace(
+        root.as_raw_fd(),
+        &scratch_name,
+        root.as_raw_fd(),
+        &committed_name,
+    )?;
+    root.sync_all()?;
+    let file = read_component(root.as_raw_fd(), &committed_name)?
+        .ok_or_else(|| invalid_record("restored rotation witness disappeared"))?;
+    if file.identity != identity || file.bytes != bytes {
+        return Err(invalid_record("restored rotation witness was replaced"));
+    }
+    decode_retained(file, &debt.repository, &root_identity)
+}
+
 /// Remove only the exact witness after a descriptor-relative recovery check
 /// proves the old tree absent and the fresh store empty. The caller must hold
 /// the same per-repository preparation-cache lease used by every preparation
@@ -1417,7 +1678,7 @@ fn clear_completed_with_sync(
     sync_root(&root)
 }
 
-fn encode(debt: &RotationDebt) -> io::Result<Vec<u8>> {
+pub(crate) fn encode(debt: &RotationDebt) -> io::Result<Vec<u8>> {
     serde_json::to_vec(debt)
         .map_err(|error| invalid_record(&format!("could not encode debt: {error}")))
 }

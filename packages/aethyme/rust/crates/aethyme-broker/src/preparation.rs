@@ -27,6 +27,9 @@ pub(crate) mod rotation_debt;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "preparation_rotation_debt_unsupported.rs"]
 pub(crate) mod rotation_debt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "preparation_rotation_journal.rs"]
+pub(crate) mod rotation_journal;
 
 pub const PREPARATION_CONFIG_RELPATH: &str = ".aethyme/prepare.toml";
 pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
@@ -1501,9 +1504,18 @@ fn shared_cache_budget(
         .ok_or_else(|| {
             invalid_config("the broker's captured host resource database path is unavailable")
         })?;
-    shared_cache_budget_at(
+    let resource_db_path = broker
+        .storage_context()
+        .host_resource_db_path
+        .as_deref()
+        .ok_or_else(|| PreparationError::StorageUnavailable {
+            path: cache_root.clone(),
+            reason: "the broker's captured host resource database path is unavailable".into(),
+        })?;
+    shared_cache_budget_at_with_resource_db(
         budget.filter(|budget| budget.max_bytes > 0),
         &cache_root,
+        resource_db_path,
         &repository_identity(broker),
         digest,
     )
@@ -1521,8 +1533,28 @@ fn shared_cache_budget_at(
     repository: &str,
     digest: &str,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    let resource_db_path = cache_root
+        .parent()
+        .unwrap_or(cache_root)
+        .join(".aethyme-test-host-resources.sqlite3");
+    shared_cache_budget_at_with_resource_db(
+        budget,
+        cache_root,
+        &resource_db_path,
+        repository,
+        digest,
+    )
+}
+
+fn shared_cache_budget_at_with_resource_db(
+    budget: Option<&SharedCacheBudget>,
+    cache_root: &Path,
+    resource_db_path: &Path,
+    repository: &str,
+    digest: &str,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    recover_rotation_debt(cache_root, repository)?;
+    recover_rotation_debt(resource_db_path, cache_root, repository)?;
 
     let Some(budget) = budget.filter(|budget| budget.max_bytes > 0) else {
         return Ok(None);
@@ -1560,12 +1592,35 @@ fn shared_cache_budget_at(
         let debt = rotation_debt::RotationDebt::new(
             repository,
             &rotation_debt::new_transaction_id(),
-            cache_root_identity,
+            cache_root_identity.clone(),
             store_identity,
         )
         .map_err(|source| PreparationError::StorageUnavailable {
             path: store.clone(),
             reason: format!("cannot record shared-cache rotation intent: {source}"),
+        })?;
+        let root_identity_bytes = cache_root_identity.encode().map_err(|source| {
+            PreparationError::StorageUnavailable {
+                path: cache_root.to_path_buf(),
+                reason: format!("cannot encode shared-cache root identity: {source}"),
+            }
+        })?;
+        let payload = rotation_debt::encode(&debt).map_err(|source| {
+            PreparationError::StorageUnavailable {
+                path: store.clone(),
+                reason: format!("cannot encode shared-cache rotation intent: {source}"),
+            }
+        })?;
+        rotation_journal::publish(
+            resource_db_path,
+            cache_root,
+            &root_identity_bytes,
+            repository,
+            &payload,
+        )
+        .map_err(|source| PreparationError::StorageUnavailable {
+            path: store.clone(),
+            reason: format!("cannot durably journal shared-cache rotation intent: {source}"),
         })?;
         rotation_debt::publish(cache_root, debt).map_err(|source| {
             PreparationError::StorageUnavailable {
@@ -1573,7 +1628,7 @@ fn shared_cache_budget_at(
                 reason: format!("cannot publish shared-cache rotation intent: {source}"),
             }
         })?;
-        let progress = recover_rotation_debt(cache_root, repository)?;
+        let progress = recover_rotation_debt(resource_db_path, cache_root, repository)?;
         if !progress.found_debt || !progress.complete {
             return Err(PreparationError::StorageUnavailable {
                 path: store.clone(),
@@ -1593,12 +1648,88 @@ fn shared_cache_budget_at(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn recover_rotation_debt_for_cache_sweep(
+    cache_root: &Path,
+    resource_db_path: &Path,
+    repository: &str,
+    deadline: Instant,
+) -> Result<rotation_debt::RecoveryProgress, rotation_debt::RecoveryError> {
+    rotation_debt::recover_with_journal(cache_root, resource_db_path, repository, deadline)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn recover_rotation_debt_for_cache_sweep(
+    cache_root: &Path,
+    _resource_db_path: &Path,
+    repository: &str,
+    deadline: Instant,
+) -> Result<rotation_debt::RecoveryProgress, rotation_debt::RecoveryError> {
+    rotation_debt::recover(cache_root, repository, deadline)
+}
+
+pub(crate) fn probe_rotation_recovery(
+    _cache_root: &Path,
+    _resource_db_path: &Path,
+    max_entries: usize,
+    _deadline: Instant,
+) -> rotation_debt::DebtProbe {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if Instant::now() >= _deadline {
+            return rotation_debt::DebtProbe::Unknown;
+        }
+        let root_identity = match rotation_debt::DirectoryIdentity::capture(_cache_root) {
+            Ok(identity) => match identity.encode() {
+                Ok(bytes) => Some(bytes),
+                Err(_) => return rotation_debt::DebtProbe::Unknown,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match rotation_debt::cache_root_absent_under_observed_parent(_cache_root, _deadline)
+                {
+                    Ok(true) => None,
+                    _ => return rotation_debt::DebtProbe::Unknown,
+                }
+            }
+            Err(_) => return rotation_debt::DebtProbe::Unknown,
+        };
+        let cache_probe = rotation_debt::probe(_cache_root, max_entries, _deadline);
+        let journal_probe =
+            match rotation_journal::probe(_resource_db_path, _cache_root, root_identity.as_deref())
+            {
+                Ok(Some(rotation_journal::JournalProbe::Pending)) => {
+                    rotation_debt::DebtProbe::Pending
+                }
+                Ok(Some(rotation_journal::JournalProbe::Unknown)) | Err(_) => {
+                    rotation_debt::DebtProbe::Unknown
+                }
+                Ok(Some(rotation_journal::JournalProbe::NoDebt)) | Ok(None) => {
+                    rotation_debt::DebtProbe::NoDebt
+                }
+            };
+        match (cache_probe, journal_probe) {
+            (rotation_debt::DebtProbe::Unknown, _) | (_, rotation_debt::DebtProbe::Unknown) => {
+                rotation_debt::DebtProbe::Unknown
+            }
+            (rotation_debt::DebtProbe::Pending, _) | (_, rotation_debt::DebtProbe::Pending) => {
+                rotation_debt::DebtProbe::Pending
+            }
+            _ => rotation_debt::DebtProbe::NoDebt,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        rotation_debt::DebtProbe::Unknown
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recover_rotation_debt(
+    resource_db_path: &Path,
     cache_root: &Path,
     repository: &str,
 ) -> Result<rotation_debt::RecoveryProgress, PreparationError> {
     let deadline = Instant::now() + SHARED_CACHE_RECOVERY_MAX_ELAPSED;
-    match rotation_debt::recover(cache_root, repository, deadline) {
+    match rotation_debt::recover_with_journal(cache_root, resource_db_path, repository, deadline) {
         Ok(progress) if progress.complete => Ok(progress),
         Ok(progress) => Err(PreparationError::StorageUnavailable {
             path: cache_root.join(repository),

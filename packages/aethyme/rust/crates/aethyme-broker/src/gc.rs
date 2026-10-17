@@ -2726,17 +2726,21 @@ impl Broker {
     }
 
     fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
-        let probe = self
-            .storage_context()
-            .preparation_cache_root()
-            .map(|cache_root| {
-                crate::preparation::rotation_debt::probe(
+        let storage = self.storage_context();
+        let probe = match (
+            storage.preparation_cache_root(),
+            storage.host_resource_db_path.as_deref(),
+        ) {
+            (Some(cache_root), Some(resource_db_path)) => {
+                crate::preparation::probe_rotation_recovery(
                     &cache_root,
+                    resource_db_path,
                     PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES,
                     Instant::now() + PREPARATION_ROTATION_DEBT_PROBE_BUDGET,
                 )
-            })
-            .unwrap_or(crate::preparation::rotation_debt::DebtProbe::Unknown);
+            }
+            _ => crate::preparation::rotation_debt::DebtProbe::Unknown,
+        };
         if probe == crate::preparation::rotation_debt::DebtProbe::NoDebt
             || self.artifact_sweep_recovery_requested()?
         {
@@ -5050,11 +5054,27 @@ mod tests {
         let store = cache_root.join(repository);
         std::fs::create_dir(&store).unwrap();
         std::fs::write(store.join("payload"), b"preserve until verified recovery").unwrap();
+        let root_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
         let debt = crate::preparation::rotation_debt::RotationDebt::new(
             repository,
             &crate::preparation::rotation_debt::new_transaction_id(),
-            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap(),
+            root_identity.clone(),
             crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        let resource_db_path = broker
+            .storage_context()
+            .host_resource_db_path
+            .clone()
+            .expect("the fixture captures its host-resource database");
+        let payload = crate::preparation::rotation_debt::encode(&debt).unwrap();
+        crate::preparation::rotation_journal::publish(
+            &resource_db_path,
+            &cache_root,
+            &root_identity.encode().unwrap(),
+            repository,
+            &payload,
         )
         .unwrap();
         crate::preparation::rotation_debt::publish(&cache_root, debt).unwrap();

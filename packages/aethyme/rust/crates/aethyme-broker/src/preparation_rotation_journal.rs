@@ -199,10 +199,12 @@ pub(crate) fn load(
 /// per-repository lease. The SQLite transaction is closed before filesystem
 /// recovery, so publisher lock order remains repository lease -> journal.
 ///
-/// Call this only after a new full cache-root inventory succeeded. An active
-/// lap resumes its persisted cursor and generation unchanged; an idle or
-/// exhausted lap starts at the current generation. Starting a lap never moves
-/// `completed_generation`, so pending work remains visible until acknowledged.
+/// Call after a bounded cache-root inventory attempt. Exact journal rows may
+/// be processed even when unrelated inventory is incomplete; callers must then
+/// mark the lap incomplete and cannot acknowledge it. An active lap resumes its
+/// persisted cursor and generation unchanged; an idle or exhausted lap starts
+/// at the current generation. Starting a lap never moves `completed_generation`,
+/// so pending work remains visible until acknowledged.
 pub(crate) fn begin_lap(
     resource_db: &Path,
     cache_root: &Path,
@@ -275,7 +277,7 @@ fn next_page_inner(
         .map_err(sqlite_error)?;
     let root = cache_root.as_os_str().as_bytes();
     let generation = ensure_root(&transaction, root, root_identity)?;
-    let (lap_generation, mut cursor, lap_state): (i64, Option<Vec<u8>>, i64) = transaction
+    let (lap_generation, cursor, lap_state): (i64, Option<Vec<u8>>, i64) = transaction
         .query_row(
             "SELECT lap_generation, cursor, lap_state \
              FROM rotation_root WHERE root_path=?1",
