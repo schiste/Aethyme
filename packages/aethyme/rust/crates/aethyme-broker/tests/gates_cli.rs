@@ -35,15 +35,14 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    common::broker_cli(CLI, args)
+    common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
         .output()
         .unwrap()
 }
 
 fn run_with_stdin(repo: &Path, args: &[&str], input: &str) -> Output {
-    let mut child = Command::new(CLI)
-        .args(args)
+    let mut child = common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -69,8 +68,8 @@ fn stdout(output: Output) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture() -> common::FixtureRepository {
+    let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(tmp.path().join("tracked.txt"), "first\n").unwrap();
@@ -97,7 +96,7 @@ fn fixture() -> tempfile::TempDir {
 #[test]
 fn affected_gates_json_stays_an_array_and_timings_are_opt_in() {
     let tmp = fixture();
-    let mut broker = aethyme_broker::Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let session = broker
         .start_worktree("affected gate timings", None)
         .unwrap();
@@ -573,13 +572,16 @@ fn adopted_json(path: &Path) -> serde_json::Value {
 fn gate_refuses_invalid_inherited_database_scope_before_running_the_command() {
     let repo = fixture();
     write_gate(repo.path(), "touch must-not-run");
-    let output = Command::new(CLI)
-        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
-        .current_dir(repo.path())
-        .env("AETHYME_GATE_BROKER_DATABASES", "invalid json")
-        .env_remove(aethyme_broker::BROKER_DB_ENV)
-        .output()
-        .unwrap();
+    let output = common::broker_cli_for_fixture(
+        CLI,
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+        repo.path(),
+    )
+    .current_dir(repo.path())
+    .env("AETHYME_GATE_BROKER_DATABASES", "invalid json")
+    .env_remove(aethyme_broker::BROKER_DB_ENV)
+    .output()
+    .unwrap();
     assert!(!repo.path().join("must-not-run").exists());
     assert!(!output.status.success());
     // #361: an unreadable scope is refused where the database is resolved,
@@ -662,17 +664,18 @@ fn gate_scope_separates_fixtures_and_protects_the_linked_primary() {
         assert_eq!(adopted["id"], 1, "{name}: {adopted}");
         assert_eq!(adopted["task"], name);
     }
-    let live = aethyme_broker::Broker::open(primary.path())
+    let live = common::open_fixture_repository_broker(&primary)
         .unwrap()
         .store()
         .live_sessions()
         .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].task.as_deref(), Some("live operator"));
-    for repo in [first.path(), second.path()] {
+    for fixture in [&first, &second] {
+        let repo = fixture.path();
         assert!(repo.join(aethyme_broker::BROKER_DB_RELPATH).is_file());
         assert_eq!(
-            aethyme_broker::Broker::open(repo)
+            common::open_fixture_repository_broker(fixture)
                 .unwrap()
                 .store()
                 .live_sessions()
@@ -724,7 +727,7 @@ fn nested_gate_retains_ancestor_database_isolation() {
         assert_eq!(adopted["id"], 1, "{name}: {adopted}");
         assert_eq!(adopted["task"], name);
     }
-    let live = aethyme_broker::Broker::open(outer.path())
+    let live = common::open_fixture_repository_broker(&outer)
         .unwrap()
         .store()
         .live_sessions()
@@ -732,7 +735,7 @@ fn nested_gate_retains_ancestor_database_isolation() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].task.as_deref(), Some("live operator"));
     assert!(
-        aethyme_broker::Broker::open(inner.path())
+        common::open_fixture_repository_broker(&inner)
             .unwrap()
             .store()
             .live_sessions()
@@ -975,7 +978,7 @@ fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
     git(&worktree, &["commit", "-qm", "prepare pending submission"]);
 
     let broker_state = || {
-        let mut broker = aethyme_broker::Broker::open(tmp.path()).unwrap();
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
         let queue_entries = broker.store().merge_queue().unwrap().len();
         let holder_event = broker
             .store()
@@ -1201,14 +1204,18 @@ name = "host-test-shared"
         git(repo, &["commit", "-qm", "configure host resource gate"]);
     }
 
-    let running = Command::new(CLI)
-        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
-        .current_dir(first.path())
-        .env("AETHYME_HOST_STATE_DIR", state.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let running = common::broker_cli_for_fixture(
+        CLI,
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+        first.path(),
+    )
+    .current_dir(first.path())
+    .env("AETHYME_HOST_STATE_DIR", state.path())
+    .env("AETHYME_HOST_CACHE_DIR", state.path().join("cache"))
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
     let db_path = state.path().join("host-resources.db");
     let mut observed = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -1225,12 +1232,16 @@ name = "host-test-shared"
     }
     assert!(observed, "first gate never acquired its host bundle");
 
-    let blocked = Command::new(CLI)
-        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
-        .current_dir(second.path())
-        .env("AETHYME_HOST_STATE_DIR", state.path())
-        .output()
-        .unwrap();
+    let blocked = common::broker_cli_for_fixture(
+        CLI,
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+        second.path(),
+    )
+    .current_dir(second.path())
+    .env("AETHYME_HOST_STATE_DIR", state.path())
+    .env("AETHYME_HOST_CACHE_DIR", state.path().join("cache"))
+    .output()
+    .unwrap();
     assert!(!blocked.status.success());
     let blocked_json: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
     assert_eq!(blocked_json[0]["status"], "error");
@@ -1280,12 +1291,16 @@ name = "host-test-shared"
 
     let failing_config = config.replace(" && sleep 6", " && false");
     std::fs::write(first.path().join(".aethyme/gates.toml"), failing_config).unwrap();
-    let failed = Command::new(CLI)
-        .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
-        .current_dir(first.path())
-        .env("AETHYME_HOST_STATE_DIR", state.path())
-        .output()
-        .unwrap();
+    let failed = common::broker_cli_for_fixture(
+        CLI,
+        &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+        first.path(),
+    )
+    .current_dir(first.path())
+    .env("AETHYME_HOST_STATE_DIR", state.path())
+    .env("AETHYME_HOST_CACHE_DIR", state.path().join("cache"))
+    .output()
+    .unwrap();
     assert!(!failed.status.success());
     assert!(
         aethyme_broker::HostResourceCoordinator::open_read_only(&db_path)
@@ -1319,13 +1334,16 @@ max_bytes = 3
     .unwrap();
 
     let run = || {
-        Command::new(CLI)
-            .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
-            .current_dir(repo.path())
-            .env("AETHYME_HOST_STATE_DIR", host_state.path())
-            .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
-            .output()
-            .unwrap()
+        common::broker_cli_for_fixture(
+            CLI,
+            &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+            repo.path(),
+        )
+        .current_dir(repo.path())
+        .env("AETHYME_HOST_STATE_DIR", host_state.path())
+        .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
+        .output()
+        .unwrap()
     };
     let first = run();
     assert!(
@@ -1453,14 +1471,17 @@ max_bytes = 4294967296
     let host_state = tempfile::tempdir().unwrap();
     let host_cache = tempfile::tempdir().unwrap();
     let gate = |tree: &Path| {
-        let output = Command::new(CLI)
-            .args(["advanced", "gates", "run", "--all", "--no-cache", "--json"])
-            .current_dir(tree)
-            .env("AETHYME_HOST_STATE_DIR", host_state.path())
-            .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .unwrap();
+        let output = common::broker_cli_for_fixture(
+            CLI,
+            &["advanced", "gates", "run", "--all", "--no-cache", "--json"],
+            tree,
+        )
+        .current_dir(tree)
+        .env("AETHYME_HOST_STATE_DIR", host_state.path())
+        .env("AETHYME_HOST_CACHE_DIR", host_cache.path())
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap();
         let outcomes: serde_json::Value =
             serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
@@ -1756,14 +1777,18 @@ name = "gate-doctor-cli-probe"
     git(repo.path(), &["commit", "-qm", "add probe fixture"]);
     let original = std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap();
 
-    let output = Command::new(CLI)
-        .args([
+    let output = common::broker_cli_for_fixture(
+        CLI,
+        &[
             "advanced", "gates", "doctor", "--probe", "--only", "mutator", "--json",
-        ])
-        .current_dir(repo.path())
-        .env("AETHYME_HOST_STATE_DIR", host_state.path())
-        .output()
-        .unwrap();
+        ],
+        repo.path(),
+    )
+    .current_dir(repo.path())
+    .env("AETHYME_HOST_STATE_DIR", host_state.path())
+    .env("AETHYME_HOST_CACHE_DIR", host_state.path().join("cache"))
+    .output()
+    .unwrap();
     let report: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
     assert_eq!(report["probe"]["passed"], true);
     assert_eq!(

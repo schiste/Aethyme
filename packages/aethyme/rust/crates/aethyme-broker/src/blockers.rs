@@ -440,12 +440,20 @@ impl Broker {
         Ok(found)
     }
 
+    fn captured_host_resource_db_path(&self) -> Result<&Path, BrokerOpError> {
+        self.storage_context()
+            .host_resource_db_path
+            .as_deref()
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "captured host resource database is unavailable".into(),
+            })
+    }
+
     fn resource_lease_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
-        let coordinator =
-            crate::HostResourceCoordinator::open_read_only_default().map_err(|error| {
-                BrokerOpError::InvalidCoordinatedOperation {
-                    reason: error.to_string(),
-                }
+        let resource_db_path = self.captured_host_resource_db_path()?;
+        let coordinator = crate::HostResourceCoordinator::open_read_only(resource_db_path)
+            .map_err(|error| BrokerOpError::InvalidCoordinatedOperation {
+                reason: error.to_string(),
             })?;
         let repository = self.origin_fingerprint();
         let sessions = self.sessions_by_worktree_fingerprint()?;
@@ -949,8 +957,9 @@ impl Broker {
             .resource_lease_blockers()?
             .into_iter()
             .find(|blocker| blocker.id == request.id);
+        let resource_db_path = self.captured_host_resource_db_path()?;
         let mut coordinator =
-            crate::HostResourceCoordinator::open_default().map_err(resource_error)?;
+            crate::HostResourceCoordinator::open(resource_db_path).map_err(resource_error)?;
         let lease = coordinator
             .list(false)
             .map_err(resource_error)?

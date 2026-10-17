@@ -79,6 +79,7 @@ pub use gate_debris::{
     DebrisPlan, DebrisRemoval, DebrisRuntime, GATE_LABELS_ENV, GATE_RUN_ID_ENV, GateRunLabels,
     RuntimeResource, RuntimeResourceKind,
 };
+pub mod agent_supervisor;
 mod auto_cleanup;
 pub mod execution_resources;
 pub mod execution_snapshot;
@@ -124,6 +125,7 @@ mod operation_stats;
 mod operations;
 mod overlap_pairs;
 mod ownership;
+mod worktree_registry;
 pub use ownership::{
     MAX_OWNERSHIP_CLAIM_NAME_CHARS, OwnershipClaim, OwnershipClaimReport, OwnershipClaimView,
 };
@@ -145,6 +147,8 @@ pub mod lease_liveness;
 pub mod lease_requests;
 pub mod session_guidance;
 pub mod session_holder;
+#[cfg(test)]
+mod test_storage;
 mod text_redaction;
 mod unpushed;
 pub mod worktree_location;
@@ -244,7 +248,7 @@ pub use blockers::{
 pub use broker::{
     AdoptCarriedOwnership, AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
-    Broker, BrokerOpError, BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION,
+    Broker, BrokerOpError, BrokerOpenOptions, BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION,
     CheckpointRecoveryAction, CheckpointRefusalCode, CleanupDisposition, CleanupPlan,
     CleanupProvenance, CleanupRepresentation, CleanupRetention, CleanupSweepFailure,
     CleanupSweepReport, CleanupWorktreePlan, DoctorRepairStatus, DoctorReport,

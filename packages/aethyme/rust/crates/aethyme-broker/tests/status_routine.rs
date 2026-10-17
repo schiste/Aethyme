@@ -38,7 +38,7 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn status(repo: &std::path::Path, args: &[&str]) -> serde_json::Value {
-    let output = common::broker_cli(CLI, args)
+    let output = common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
         .output()
         .unwrap();
@@ -97,7 +97,7 @@ fn cli_rejects_summary_with_refresh_and_refresh_on_another_command() {
         vec!["status", "--summary", "--refresh"],
         vec!["advanced", "events", "--refresh"],
     ] {
-        let output = common::broker_cli(CLI, &args)
+        let output = common::broker_cli_for_fixture(CLI, &args, repo.path())
             .current_dir(repo.path())
             .output()
             .unwrap();

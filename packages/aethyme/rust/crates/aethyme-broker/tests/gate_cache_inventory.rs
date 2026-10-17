@@ -207,7 +207,10 @@ fn world() -> World {
     )
     .unwrap();
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let state = tmp.path().join("state");
+    let mut broker = Broker::open(&repo)
+        .unwrap()
+        .with_host_operation_database(state.join("host-operations.db"));
     let worktree_container = tmp.path().join("host-worktrees");
     std::fs::create_dir_all(&worktree_container).unwrap();
     let worktree_key = broker.worktree_root_plan().unwrap().repository_key;
@@ -242,7 +245,6 @@ fn world() -> World {
     drop(broker);
 
     let cache = tmp.path().join("cache");
-    let state = tmp.path().join("state");
     let mut world = World {
         _tmp: tmp,
         repo,
