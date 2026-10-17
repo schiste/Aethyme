@@ -81,7 +81,7 @@ pub(crate) fn publish(
     validate_inputs(cache_root, root_identity, repository, payload)?;
     let path = path_for_resource_db(resource_db)?;
     let mut connection = open_writer(&path)?;
-    ensure_schema(&connection, true)?;
+    ensure_writer_schema(&connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
@@ -222,7 +222,7 @@ fn next_page_inner(
     validate_root(cache_root, root_identity)?;
     let path = path_for_resource_db(resource_db)?;
     let mut connection = open_writer(&path)?;
-    ensure_schema(&connection, true)?;
+    ensure_writer_schema(&connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
@@ -241,14 +241,24 @@ fn next_page_inner(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(sqlite_error)?;
-    if generation as i64 != lap_generation {
+    if generation as i64 != lap_generation && cursor.is_none() {
         cursor = None;
-        incomplete = 0;
         transaction
             .execute(
-                "UPDATE rotation_root SET cursor=NULL, lap_generation=?2, lap_incomplete=0 \
+                "UPDATE rotation_root SET lap_generation=?2 \
                  WHERE root_path=?1",
                 params![root, generation as i64],
+            )
+            .map_err(sqlite_error)?;
+    } else if generation as i64 != lap_generation {
+        // Keep the in-flight keyset cursor so repeated low-key publications
+        // cannot restart the same prefix forever. This lap cannot complete
+        // because it did not observe a stable generation.
+        incomplete = 1;
+        transaction
+            .execute(
+                "UPDATE rotation_root SET lap_incomplete=1 WHERE root_path=?1",
+                params![root],
             )
             .map_err(sqlite_error)?;
     }
@@ -350,7 +360,7 @@ pub(crate) fn mark_lap_incomplete(
     validate_root(cache_root, root_identity)?;
     let path = path_for_resource_db(resource_db)?;
     let mut connection = open_writer(&path)?;
-    ensure_schema(&connection, true)?;
+    ensure_writer_schema(&connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
@@ -379,7 +389,7 @@ pub(crate) fn complete(
     validate_inputs(cache_root, root_identity, repository, expected_payload)?;
     let path = path_for_resource_db(resource_db)?;
     let mut connection = open_writer(&path)?;
-    ensure_schema(&connection, true)?;
+    ensure_writer_schema(&connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
@@ -727,6 +737,16 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
     Ok(true)
 }
 
+fn ensure_writer_schema(connection: &Connection) -> io::Result<()> {
+    if ensure_schema(connection, true)? {
+        Ok(())
+    } else {
+        Err(invalid_data(
+            "rotation journal schema version is unsupported",
+        ))
+    }
+}
+
 fn ensure_root(
     transaction: &rusqlite::Transaction<'_>,
     root: &[u8],
@@ -860,6 +880,7 @@ mod tests {
     const REPOSITORY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const REPOSITORY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const REPOSITORY_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const REPOSITORY_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
     struct Fixture {
         _directory: TempDir,
@@ -956,6 +977,99 @@ mod tests {
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
                 .unwrap();
         assert_eq!(retry.entries[0].repository.as_deref(), Some(REPOSITORY_A));
+    }
+
+    #[test]
+    fn repeated_low_key_publications_do_not_starve_later_repositories() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"a");
+        fixture.publish(REPOSITORY_B, b"b");
+        fixture.publish(REPOSITORY_C, b"c");
+        fixture.publish(REPOSITORY_D, b"d");
+
+        let first =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+                .unwrap();
+        assert_eq!(first.entries[0].repository.as_deref(), Some(REPOSITORY_A));
+
+        for (low_key, expected) in [
+            (format!("{:064x}", 0), REPOSITORY_B),
+            (format!("{:064x}", 1), REPOSITORY_C),
+            (format!("{:064x}", 2), REPOSITORY_D),
+        ] {
+            fixture.publish(&low_key, b"new-low-key");
+            let page =
+                next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+                    .unwrap();
+            assert_eq!(page.entries[0].repository.as_deref(), Some(expected));
+            assert!(!page.lap_complete);
+        }
+
+        let end = next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+            .unwrap();
+        assert!(end.entries.is_empty());
+        assert!(!end.lap_complete);
+
+        let next_lap =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+                .unwrap();
+        assert_eq!(next_lap.entries[0].repository, Some(format!("{:064x}", 0)));
+    }
+
+    #[test]
+    fn writers_refuse_a_compatible_future_schema_without_mutating_rows() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"debt-a");
+        let path = path_for_resource_db(&fixture.resource_db).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+
+        assert!(
+            publish(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                REPOSITORY_B,
+                b"debt-b"
+            )
+            .is_err()
+        );
+        assert!(next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).is_err());
+        assert!(
+            mark_lap_incomplete(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).is_err()
+        );
+        assert!(
+            complete(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                REPOSITORY_A,
+                b"debt-a"
+            )
+            .is_err()
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let (generation, debt_count, payload): (i64, i64, Vec<u8>) = connection
+            .query_row(
+                "SELECT generation, \
+                    (SELECT count(*) FROM rotation_debt), \
+                    (SELECT payload FROM rotation_debt WHERE repository=?1) \
+                 FROM rotation_root WHERE root_path=?2",
+                params![REPOSITORY_A, fixture.cache_root.as_os_str().as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
+        assert_eq!(generation, 1);
+        assert_eq!(debt_count, 1);
+        assert_eq!(payload, b"debt-a");
     }
 
     #[test]
