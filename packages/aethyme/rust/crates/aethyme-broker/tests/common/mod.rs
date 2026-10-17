@@ -167,7 +167,11 @@ impl FixtureRepository {
     }
 
     pub fn worktree_root(&self) -> PathBuf {
-        self.owner.path().join("worktrees")
+        self.owner
+            .path()
+            .canonicalize()
+            .expect("canonicalize fixture owner")
+            .join("worktrees")
     }
 }
 
@@ -224,7 +228,10 @@ pub fn open_fixture_broker(
     repository: &Path,
     fixture_root: &Path,
 ) -> Result<FixtureBroker, BrokerOpError> {
-    let worktree_root_path = fixture_root.join("worktrees");
+    let worktree_root_path = fixture_root
+        .canonicalize()
+        .expect("canonicalize fixture root")
+        .join("worktrees");
     let host_state_dir = fixture_host_state_dir(fixture_root);
     let options = BrokerOpenOptions::default()
         .with_host_state_dir(host_state_dir.clone())

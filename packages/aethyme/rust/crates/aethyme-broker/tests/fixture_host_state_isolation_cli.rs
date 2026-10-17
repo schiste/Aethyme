@@ -300,7 +300,7 @@ fn fixture_command_binds_captured_storage_context() {
             .and_then(Option::as_deref)
             .expect("fixture child exact worktree root"),
     );
-    let expected_root = fixture.owner_path().join("worktrees");
+    let expected_root = fixture.worktree_root();
     assert_eq!(captured_root, expected_root);
     assert!(
         env.get(OsStr::new("AETHYME_GATE_BROKER_DATABASES"))

@@ -38,7 +38,10 @@ fn fixture_root(repo: &Path) -> &Path {
 }
 
 pub fn worktree_root(repo: &Path) -> PathBuf {
-    fixture_root(repo).join("worktrees")
+    fixture_root(repo)
+        .canonicalize()
+        .expect("canonicalize fixture owner")
+        .join("worktrees")
 }
 
 /// Scope storage and worktree allocation to the fixture before startup.
