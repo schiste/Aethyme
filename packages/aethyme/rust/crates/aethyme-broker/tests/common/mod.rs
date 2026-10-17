@@ -2,7 +2,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::{Broker, BrokerOpError};
+use aethyme_broker::{Broker, BrokerOpError, BrokerOpenOptions};
 
 /// Run the broker CLI without reaching the developer's live Chau7 instance.
 /// Existing lifecycle fixtures get a stable test label unless a case is
@@ -42,7 +42,12 @@ pub fn broker_cli(binary: &str, args: &[&str]) -> Command {
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
         .env_remove("AETHYME_HOST_STATE_DIR")
         .env_remove("AETHYME_HOST_CACHE_DIR")
-        .env_remove("AETHYME_WORKTREE_ROOT");
+        .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT");
     command
 }
 
@@ -96,6 +101,11 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
         .env_remove("AETHYME_BROKER_DB")
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
         .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
         .env(
             "AETHYME_HOST_STATE_DIR",
             fixture_host_state_dir(fixture_root),
@@ -120,6 +130,7 @@ pub fn broker_cli_for_fixture(binary: &str, args: &[&str], fixture_root: &Path) 
 pub struct FixtureRepository {
     owner: tempfile::TempDir,
     repository: PathBuf,
+    _repository_owner: Option<tempfile::TempDir>,
 }
 
 #[allow(dead_code)]
@@ -128,7 +139,23 @@ impl FixtureRepository {
         let owner = tempfile::tempdir().expect("create fixture owner");
         let repository = owner.path().join("repo");
         std::fs::create_dir_all(&repository).expect("create fixture repository");
-        Self { owner, repository }
+        Self {
+            owner,
+            repository,
+            _repository_owner: None,
+        }
+    }
+
+    /// Adopt an existing temporary directory as the repository while keeping
+    /// broker worktrees and host state under a separate fixture-owned root.
+    pub fn from_tempdir(repository_owner: tempfile::TempDir) -> Self {
+        let repository = repository_owner.path().to_path_buf();
+        let owner = tempfile::tempdir().expect("create fixture storage owner");
+        Self {
+            owner,
+            repository,
+            _repository_owner: Some(repository_owner),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -140,7 +167,11 @@ impl FixtureRepository {
     }
 
     pub fn worktree_root(&self) -> PathBuf {
-        self.owner.path().join("worktrees")
+        self.owner
+            .path()
+            .canonicalize()
+            .expect("canonicalize fixture owner")
+            .join("worktrees")
     }
 }
 
@@ -155,6 +186,13 @@ pub struct FixtureBroker {
 
 #[allow(dead_code)]
 impl FixtureBroker {
+    /// Consume the wrapper when a helper's established return type is `Broker`.
+    /// The fixture owner remains with the caller and must stay alive across
+    /// every broker handle opened against these paths.
+    pub fn into_broker(self) -> Broker {
+        self.broker
+    }
+
     /// The stable worktree root selected for this broker.
     #[allow(dead_code)]
     pub fn worktree_root(&self) -> &Path {
@@ -190,14 +228,20 @@ pub fn open_fixture_broker(
     repository: &Path,
     fixture_root: &Path,
 ) -> Result<FixtureBroker, BrokerOpError> {
-    let worktree_root_path = fixture_root.join("worktrees");
+    let worktree_root_path = fixture_root
+        .canonicalize()
+        .expect("canonicalize fixture root")
+        .join("worktrees");
     let host_state_dir = fixture_host_state_dir(fixture_root);
-    let broker = Broker::open(repository)?;
+    let options = BrokerOpenOptions::default()
+        .with_host_state_dir(host_state_dir.clone())
+        .with_host_cache_dir(fixture_host_cache_dir(fixture_root))
+        .with_host_operation_database(host_state_dir.join("host-operations.db"))
+        .with_worktree_root(worktree_root_path.clone())
+        .with_collaboration_state(host_state_dir.join("collaboration"));
+    let broker = Broker::open_with_options(repository, options)?;
     Ok(FixtureBroker {
-        broker: broker
-            .with_host_operation_database(host_state_dir.join("host-operations.db"))
-            .with_worktree_root(worktree_root_path.clone())
-            .with_collaboration_state(host_state_dir),
+        broker,
         worktree_root: worktree_root_path,
     })
 }
@@ -207,4 +251,17 @@ pub fn open_fixture_repository_broker(
     fixture: &FixtureRepository,
 ) -> Result<FixtureBroker, BrokerOpError> {
     open_fixture_broker(fixture.path(), fixture.owner_path())
+}
+
+/// Open a repository whose owner is its immediate parent directory. The
+/// caller must retain that owner for the lifetime of this broker and any
+/// reopened handles.
+#[allow(dead_code)]
+pub fn open_fixture_repository_path_broker(
+    repository: &Path,
+) -> Result<FixtureBroker, BrokerOpError> {
+    let owner = repository
+        .parent()
+        .expect("fixture repository has an owning parent directory");
+    open_fixture_broker(repository, owner)
 }

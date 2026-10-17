@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::Broker;
+use aethyme_broker::{Broker, BrokerOpenOptions};
 
 /// Keep the repository and its external worktree container under one owner.
 pub struct FixtureRepo {
@@ -38,33 +38,47 @@ fn fixture_root(repo: &Path) -> &Path {
 }
 
 pub fn worktree_root(repo: &Path) -> PathBuf {
-    fixture_root(repo).join("worktrees")
+    fixture_root(repo)
+        .canonicalize()
+        .expect("canonicalize fixture owner")
+        .join("worktrees")
 }
 
-/// Scope worktree allocation and subsequent broker coordination to the fixture.
-/// Native test runners must also isolate host state before library startup.
+/// Scope storage and worktree allocation to the fixture before startup.
 pub fn open(repo: &Path) -> Broker {
     let root = fixture_root(repo);
-    let broker = Broker::open(repo).unwrap();
-    let key = broker.worktree_root_plan().unwrap().repository_key;
-    broker
-        .with_worktree_root(worktree_root(repo).join(key))
-        .with_host_operation_database(root.join("host-state/host-operations.db"))
-        .with_collaboration_state(root.join("host-state"))
+    let host_state_dir = root.join("host-state");
+    let options = BrokerOpenOptions::default()
+        .with_host_state_dir(host_state_dir.clone())
+        .with_host_cache_dir(root.join("host-cache"))
+        .with_host_operation_database(host_state_dir.join("host-operations.db"))
+        .with_worktree_root(worktree_root(repo))
+        .with_collaboration_state(host_state_dir.join("collaboration"));
+    Broker::open_with_options(repo, options).unwrap()
 }
 
 pub fn command(binary: &str, repo: &Path, args: &[&str]) -> Command {
-    let root = fixture_root(repo);
+    let broker = open(repo);
     let mut command = Command::new(binary);
     command
         .args(args)
         .current_dir(repo)
-        .env("AETHYME_WORKTREE_ROOT", worktree_root(repo))
-        .env("AETHYME_HOST_STATE_DIR", root.join("host-state"))
-        .env("AETHYME_HOST_CACHE_DIR", root.join("host-cache"))
+        .env_remove("AETHYME_BROKER_DB")
+        .env_remove("AETHYME_GATE_BROKER_DATABASES")
+        .env_remove("AETHYME_HOST_STATE_DIR")
+        .env_remove("AETHYME_HOST_CACHE_DIR")
+        .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
         .env(
             "AETHYME_CHAU7_MCP_BRIDGE",
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/no-chau7-bridge"),
         );
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
     command
 }
