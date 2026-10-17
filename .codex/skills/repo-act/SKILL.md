@@ -55,6 +55,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   never present a partial walk as full-volume accounting. Measure free space
   before and after authorized cleanup, and record concurrent writers rather
   than claiming removed file sizes are physical bytes freed.
+- When recording cleanup results, validate the pinned progress record and exact
+  removed set before updating progress. Hold the progress lock through an atomic
+  replacement, directory sync, and readback; publish the verification proof only
+  after that commit, bound to its digest. If proof publication then fails,
+  reconcile the committed record instead of repeating the deletion.
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove
