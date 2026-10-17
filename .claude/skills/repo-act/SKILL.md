@@ -52,6 +52,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
+- For build-cache identity changes, check an unchanged repeat build as well as
+  switching between linked worktrees and advancing a branch. Verify freshness
+  from Cargo output; correct embedded identity alone does not rule out forced
+  recompilation on every invocation. Use a dependency-free fixture first.
 - Run the fastest relevant test command first.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
