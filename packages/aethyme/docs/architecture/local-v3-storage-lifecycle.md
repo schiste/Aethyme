@@ -90,7 +90,14 @@ ownership review rather than treating an absent mount as a deleted repository.
 ## Prevention and remaining limits
 
 Preparation checks admission on its actual write volumes before work and
-between install steps. Cache writers and preparation-cache reclamation use the
+between install steps. During a running command, the heartbeat also observes
+those volumes every second, independently of the ten-second lease renewal.
+Low or unreadable headroom returns a typed storage refusal before renewal and
+requests recovery through the existing failure path. This is cooperative
+pressure detection: an observation can stall, and writes between observations
+can cross the reserve. Descendant shutdown and an unsettled writer lease must
+also be handled before cleanup can safely use that cache.
+Cache writers and preparation-cache reclamation use the
 same root resolver and lease key. These controls reduce avoidable allocation
 and protect data during cleanup.
 

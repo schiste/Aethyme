@@ -1278,44 +1278,6 @@ impl PreparationCacheSweepReport {
     }
 }
 
-/// Checks `deadline` between filesystem operations and streamed hash chunks.
-/// Filesystem calls themselves cannot be cancelled, so a stalled OS call can
-/// outlive the deadline. Entries are independent, making a partial sweep safe.
-/// Returns fully removed entries and their measured bytes; an interrupted
-/// entry may already be partly drained, so these totals can conservatively
-/// undercount bytes removed during that pass.
-pub(crate) fn sweep_preparation_cache(
-    main_root: &Path,
-    _orphan_worktree_roots_days: u32,
-    deadline: std::time::Instant,
-) -> PreparationCacheSweepReport {
-    if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    let Ok(context) = capture_storage_context_for_path(main_root) else {
-        return PreparationCacheSweepReport::incomplete_empty();
-    };
-    let Some(cache_root) = context.preparation_cache_root() else {
-        return PreparationCacheSweepReport::incomplete_empty();
-    };
-    let Some(resource_db_path) = context.host_resource_db_path.as_deref() else {
-        return PreparationCacheSweepReport::incomplete_empty();
-    };
-    let Ok(storage_root) = storage_container_with_context(main_root, &context) else {
-        return PreparationCacheSweepReport::incomplete_empty();
-    };
-    if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    sweep_preparation_cache_at_with_status(
-        main_root,
-        &storage_root,
-        &cache_root,
-        resource_db_path,
-        deadline,
-    )
-}
-
 /// Test adapter retaining the historical tuple result for fixture assertions.
 #[cfg(test)]
 fn sweep_preparation_cache_at(
@@ -1361,24 +1323,6 @@ pub(crate) fn sweep_preparation_cache_for_roots_with_status(
     sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
         discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline)
     })
-}
-
-/// Compatibility wrapper for callers that need only fully removed entries.
-pub(crate) fn sweep_preparation_cache_for_roots(
-    main_root: &Path,
-    worktree_roots: &[PathBuf],
-    cache_root: &Path,
-    resource_db_path: &Path,
-    deadline: std::time::Instant,
-) -> (usize, u64) {
-    let report = sweep_preparation_cache_for_roots_with_status(
-        main_root,
-        worktree_roots,
-        cache_root,
-        resource_db_path,
-        deadline,
-    );
-    (report.entries_removed, report.bytes_reclaimed)
 }
 
 fn sweep_preparation_cache_with_discovery(

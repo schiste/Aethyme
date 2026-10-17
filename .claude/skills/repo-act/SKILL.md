@@ -33,6 +33,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+- Give background-writer tests an independent, fixture-owned stop condition
+  and a finite write limit. Deliberately breaking production cleanup must not
+  leave the test itself writing indefinitely after an assertion fails.
 - For storage ownership and reclamation changes, test replacement of a root and
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
