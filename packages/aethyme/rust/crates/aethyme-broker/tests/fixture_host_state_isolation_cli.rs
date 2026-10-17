@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const CHILD_FLAG: &str = "AETHYME_TEST_FIXTURE_HOST_ISOLATION_CHILD";
