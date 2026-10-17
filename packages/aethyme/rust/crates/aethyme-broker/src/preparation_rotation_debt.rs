@@ -3989,7 +3989,7 @@ mod tests {
         assert_eq!(fs::read(retired.join("package-index")).unwrap(), b"cached");
 
         fs::remove_dir_all(&retired).unwrap();
-        fs::create_dir(&store).unwrap();
+        super::create_fresh_store(&cache_root, &retained).unwrap();
         fs::write(store.join("unexpected"), b"preserve me").unwrap();
         assert!(super::clear_completed(&cache_root, &retained).is_err());
         assert_eq!(read(&cache_root, REPOSITORY).unwrap().unwrap().debt, debt);
@@ -3998,6 +3998,22 @@ mod tests {
         fs::remove_file(store.join("unexpected")).unwrap();
         super::clear_completed(&cache_root, &retained).unwrap();
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -4176,7 +4192,7 @@ mod tests {
         let retired = cache_root.join(debt.retired_component());
         fs::rename(&store, &retired).unwrap();
         fs::remove_dir_all(&retired).unwrap();
-        fs::create_dir(&store).unwrap();
+        super::create_fresh_store(&cache_root, &retained).unwrap();
 
         let injected = super::clear_completed_with_sync(&cache_root, &retained, |_| {
             Err(std::io::Error::other(
@@ -4191,6 +4207,23 @@ mod tests {
         assert!(!retired.exists());
         assert!(!store.join("package-index").exists());
         assert!(fs::read_dir(&store).unwrap().next().is_none());
+
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
 
         let next_debt = RotationDebt::new(
             REPOSITORY,
@@ -4221,13 +4254,29 @@ mod tests {
             recovery_step(&cache_root, &debt).unwrap(),
             RecoveryStep::CreateFreshStore
         );
-        fs::create_dir(&store).unwrap();
+        super::create_fresh_store(&cache_root, &retained).unwrap();
         assert_eq!(
             recovery_step(&cache_root, &debt).unwrap(),
             RecoveryStep::ClearCompletedDebt
         );
         super::clear_completed(&cache_root, &retained).unwrap();
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
         assert!(fs::read_dir(&cache_root).unwrap().all(|entry| {
             !entry
                 .unwrap()
