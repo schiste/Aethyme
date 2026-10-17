@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_RECORD_BYTES: usize = 8 * 1024;
 const MAX_ROOT_BYTES: usize = 4 * 1024;
 const MAX_ROOT_IDENTITY_BYTES: usize = 512;
@@ -26,6 +27,9 @@ const MAX_PAGE_ROWS: i64 = 32;
 const MAX_PAGE_COUNT: i64 = 512;
 const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(150);
+const LAP_IDLE: i64 = 0;
+const LAP_ACTIVE: i64 = 1;
+const LAP_EXHAUSTED: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JournalDebt {
@@ -40,7 +44,9 @@ pub(crate) struct JournalDebt {
 pub(crate) struct JournalPage {
     pub(crate) generation: u64,
     pub(crate) entries: Vec<JournalDebt>,
-    pub(crate) lap_complete: bool,
+    /// The keyset reached its current end. Completion still requires an
+    /// explicit acknowledgement after the caller's full inventory succeeds.
+    pub(crate) lap_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,10 +67,9 @@ pub(crate) fn path_for_resource_db(resource_db: &Path) -> io::Result<PathBuf> {
     let parent = resource_db
         .parent()
         .ok_or_else(|| invalid_input("captured host resource DB has no parent"))?;
-    let digest = blake3::hash(bytes);
     Ok(parent.join(format!(
-        ".aethyme-preparation-rotation-{}.sqlite3",
-        digest.to_hex()
+        ".aethyme-preparation-rotation-{:x}.sqlite3",
+        Sha256::digest(bytes)
     )))
 }
 
@@ -192,6 +197,47 @@ pub(crate) fn load(
 /// Advance the durable keyset cursor before the caller acquires any
 /// per-repository lease. The SQLite transaction is closed before filesystem
 /// recovery, so publisher lock order remains repository lease -> journal.
+///
+/// Call this only after a new full cache-root inventory succeeded. An active
+/// lap resumes its persisted cursor and generation unchanged; an idle or
+/// exhausted lap starts at the current generation. Starting a lap never moves
+/// `completed_generation`, so pending work remains visible until acknowledged.
+pub(crate) fn begin_lap(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+) -> io::Result<u64> {
+    validate_root(cache_root, root_identity)?;
+    let path = path_for_resource_db(resource_db)?;
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let root = cache_root.as_os_str().as_bytes();
+    let generation = ensure_root(&transaction, root, root_identity)?;
+    let lap_state: i64 = transaction
+        .query_row(
+            "SELECT lap_state FROM rotation_root WHERE root_path=?1",
+            params![root],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    validate_lap_state(lap_state)?;
+    if lap_state != LAP_ACTIVE {
+        transaction
+            .execute(
+                "UPDATE rotation_root SET lap_generation=?2, cursor=NULL, \
+                    lap_incomplete=0, lap_state=?3 WHERE root_path=?1",
+                params![root, generation as i64, LAP_ACTIVE],
+            )
+            .map_err(sqlite_error)?;
+    }
+    transaction.commit().map_err(sqlite_error)?;
+    check_database_size(&path)?;
+    Ok(generation)
+}
+
 pub(crate) fn next_page(
     resource_db: &Path,
     cache_root: &Path,
@@ -228,21 +274,21 @@ fn next_page_inner(
         .map_err(sqlite_error)?;
     let root = cache_root.as_os_str().as_bytes();
     let generation = ensure_root(&transaction, root, root_identity)?;
-    let (completed_generation, lap_generation, mut cursor, mut incomplete): (
-        i64,
-        i64,
-        Option<Vec<u8>>,
-        i64,
-    ) = transaction
+    let (lap_generation, mut cursor, lap_state): (i64, Option<Vec<u8>>, i64) = transaction
         .query_row(
-            "SELECT completed_generation, lap_generation, cursor, lap_incomplete \
+            "SELECT lap_generation, cursor, lap_state \
              FROM rotation_root WHERE root_path=?1",
             params![root],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(sqlite_error)?;
+    validate_lap_state(lap_state)?;
+    if lap_state != LAP_ACTIVE {
+        return Err(invalid_data(
+            "rotation journal lap must be started before reading pages",
+        ));
+    }
     if generation as i64 != lap_generation && cursor.is_none() {
-        cursor = None;
         transaction
             .execute(
                 "UPDATE rotation_root SET lap_generation=?2 \
@@ -254,7 +300,6 @@ fn next_page_inner(
         // Keep the in-flight keyset cursor so repeated low-key publications
         // cannot restart the same prefix forever. This lap cannot complete
         // because it did not observe a stable generation.
-        incomplete = 1;
         transaction
             .execute(
                 "UPDATE rotation_root SET lap_incomplete=1 WHERE root_path=?1",
@@ -307,45 +352,107 @@ fn next_page_inner(
         return Ok(JournalPage {
             generation,
             entries,
-            lap_complete: false,
+            lap_exhausted: false,
         });
     }
 
-    let total: i64 = transaction
+    transaction
+        .execute(
+            "UPDATE rotation_root SET cursor=NULL, lap_state=?2 WHERE root_path=?1",
+            params![root, LAP_EXHAUSTED],
+        )
+        .map_err(sqlite_error)?;
+    transaction.commit().map_err(sqlite_error)?;
+    check_database_size(&path)?;
+    Ok(JournalPage {
+        generation,
+        entries,
+        lap_exhausted: true,
+    })
+}
+
+/// Acknowledge a complete keyset lap only after the caller's full cache-root
+/// inventory and all debt work succeeded. Rechecking the generation, end-of-
+/// lap state and empty debt set under one transaction prevents an external
+/// publication or unresolved row from being reported as complete.
+pub(crate) fn acknowledge_lap(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    expected_generation: u64,
+) -> io::Result<()> {
+    validate_root(cache_root, root_identity)?;
+    let expected_generation = i64::try_from(expected_generation)
+        .map_err(|_| invalid_input("rotation generation is out of range"))?;
+    let path = path_for_resource_db(resource_db)?;
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let root = cache_root.as_os_str().as_bytes();
+    ensure_root(&transaction, root, root_identity)?;
+    let (generation, completed, lap_generation, cursor, incomplete, lap_state): (
+        i64,
+        i64,
+        i64,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+    ) = transaction
+        .query_row(
+            "SELECT generation, completed_generation, lap_generation, cursor, \
+                lap_incomplete, lap_state FROM rotation_root WHERE root_path=?1",
+            params![root],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(sqlite_error)?;
+    validate_lap_state(lap_state)?;
+    validate_rotation_state(
+        generation,
+        completed,
+        lap_generation,
+        cursor.as_deref(),
+        incomplete,
+        lap_state,
+    )?;
+    let debt_count: i64 = transaction
         .query_row(
             "SELECT count(*) FROM rotation_debt WHERE root_path=?1",
             params![root],
             |row| row.get(0),
         )
         .map_err(sqlite_error)?;
-    let generation_stable = generation as i64 == lap_generation;
-    let lap_complete = total == 0 && incomplete == 0 && generation_stable;
-    if lap_complete {
-        transaction
-            .execute(
-                "UPDATE rotation_root SET completed_generation=?2, cursor=NULL \
-                 WHERE root_path=?1",
-                params![root, completed_generation.max(generation as i64)],
-            )
-            .map_err(sqlite_error)?;
-    } else {
-        // Start a fresh round-robin lap after reaching the end. A retained
-        // debt row or explicit incomplete mark prevents false completion.
-        transaction
-            .execute(
-                "UPDATE rotation_root SET cursor=NULL, lap_generation=?2, lap_incomplete=0 \
-                 WHERE root_path=?1",
-                params![root, generation as i64],
-            )
-            .map_err(sqlite_error)?;
+    if generation != expected_generation
+        || lap_generation != generation
+        || incomplete != 0
+        || lap_state != LAP_EXHAUSTED
+        || cursor.is_some()
+        || debt_count != 0
+        || completed > generation
+    {
+        return Err(invalid_data(
+            "rotation journal lap is not eligible for completion",
+        ));
     }
+    transaction
+        .execute(
+            "UPDATE rotation_root SET completed_generation=?2, lap_state=?3 \
+             WHERE root_path=?1",
+            params![root, generation, LAP_IDLE],
+        )
+        .map_err(sqlite_error)?;
     transaction.commit().map_err(sqlite_error)?;
-    check_database_size(&path)?;
-    Ok(JournalPage {
-        generation,
-        entries,
-        lap_complete,
-    })
+    check_database_size(&path)
 }
 
 /// Keep a lap incomplete when filesystem or lease state could not be
@@ -435,65 +542,77 @@ pub(crate) fn probe(
         return Err(invalid_data("rotation debt journal schema is absent"));
     }
     let root = root_path_bytes(cache_root)?;
-    let state: Option<(Vec<u8>, i64, i64, i64, i64)> = connection
+    let state: Option<(Vec<u8>, i64, i64, i64, Option<Vec<u8>>, i64, i64)> = connection
         .query_row(
-            "SELECT root_identity, generation, completed_generation, lap_generation, lap_incomplete \
+            "SELECT root_identity, generation, completed_generation, lap_generation, cursor, \
+                lap_incomplete, lap_state \
              FROM rotation_root WHERE root_path=?1",
             params![root],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((expected_identity, generation, completed_generation, lap_generation, incomplete)) =
-        state
+    let Some((
+        expected_identity,
+        generation,
+        completed_generation,
+        lap_generation,
+        cursor,
+        incomplete,
+        lap_state,
+    )) = state
     else {
         return Ok(Some(JournalProbe::NoDebt));
     };
     let count: i64 = connection
-        .query_row("SELECT count(*) FROM rotation_debt", [], |row| row.get(0))
+        .query_row(
+            "SELECT count(*) FROM rotation_debt WHERE root_path=?1",
+            params![root],
+            |row| row.get(0),
+        )
         .map_err(sqlite_error)?;
-    if generation < 0
-        || completed_generation < 0
-        || completed_generation > generation
-        || lap_generation < 0
-        || lap_generation > generation
-        || count > MAX_DEBT_ROWS
-        || !matches!(incomplete, 0 | 1)
-    {
+    if count > MAX_DEBT_ROWS {
         return Err(invalid_data("rotation journal state is malformed"));
     }
-    if let Some(actual) = current_root_identity {
-        if actual != expected_identity.as_slice() {
-            return Ok(Some(
-                if count > 0
-                    || generation > completed_generation
-                    || lap_generation != generation
-                    || incomplete != 0
-                {
-                    JournalProbe::Unknown
-                } else {
-                    JournalProbe::NoDebt
-                },
-            ));
-        }
-    } else if count > 0
+    validate_rotation_state(
+        generation,
+        completed_generation,
+        lap_generation,
+        cursor.as_deref(),
+        incomplete,
+        lap_state,
+    )?;
+    let pending = count > 0
         || generation > completed_generation
         || lap_generation != generation
         || incomplete != 0
-    {
+        || lap_state != LAP_IDLE;
+    if let Some(actual) = current_root_identity {
+        if actual != expected_identity.as_slice() {
+            return Ok(Some(if pending {
+                JournalProbe::Unknown
+            } else {
+                JournalProbe::NoDebt
+            }));
+        }
+    } else if pending {
         return Ok(Some(JournalProbe::Unknown));
     }
-    Ok(Some(
-        if count > 0
-            || generation > completed_generation
-            || lap_generation != generation
-            || incomplete != 0
-        {
-            JournalProbe::Pending
-        } else {
-            JournalProbe::NoDebt
-        },
-    ))
+    Ok(Some(if pending {
+        JournalProbe::Pending
+    } else {
+        JournalProbe::NoDebt
+    }))
 }
 
 fn validate_inputs(
@@ -697,6 +816,9 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
         if !roots || !debts {
             return Err(invalid_data("rotation journal schema is incomplete"));
         }
+        connection
+            .prepare("SELECT lap_state FROM rotation_root LIMIT 0")
+            .map_err(sqlite_error)?;
         return Ok(true);
     }
     if version != 0 || !create {
@@ -722,7 +844,8 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
                 completed_generation INTEGER NOT NULL CHECK(completed_generation >= 0 AND completed_generation <= generation),
                 lap_generation INTEGER NOT NULL CHECK(lap_generation >= 0 AND lap_generation <= generation),
                 cursor BLOB,
-                lap_incomplete INTEGER NOT NULL CHECK(lap_incomplete IN (0,1))
+                lap_incomplete INTEGER NOT NULL CHECK(lap_incomplete IN (0,1)),
+                lap_state INTEGER NOT NULL CHECK(lap_state IN (0,1,2))
              ) WITHOUT ROWID;
              CREATE TABLE rotation_debt(
                 root_path BLOB NOT NULL REFERENCES rotation_root(root_path) ON DELETE CASCADE,
@@ -730,7 +853,7 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
                 payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 8192),
                 PRIMARY KEY(root_path, repository)
              ) WITHOUT ROWID;
-             PRAGMA user_version=1;",
+             PRAGMA user_version=2;",
         )
         .map_err(sqlite_error)?;
     transaction.commit().map_err(sqlite_error)?;
@@ -752,9 +875,9 @@ fn ensure_root(
     root: &[u8],
     root_identity: &[u8],
 ) -> io::Result<u64> {
-    let existing: Option<(Vec<u8>, i64, i64, i64, Option<Vec<u8>>, i64)> = transaction
+    let existing: Option<(Vec<u8>, i64, i64, i64, Option<Vec<u8>>, i64, i64)> = transaction
         .query_row(
-            "SELECT root_identity, generation, completed_generation, lap_generation, cursor, lap_incomplete \
+            "SELECT root_identity, generation, completed_generation, lap_generation, cursor, lap_incomplete, lap_state \
              FROM rotation_root WHERE root_path=?1",
             params![root],
             |row| {
@@ -765,27 +888,35 @@ fn ensure_root(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()
         .map_err(sqlite_error)?;
     match existing {
-        Some((identity, generation, completed, lap_generation, _cursor, incomplete))
+        Some((identity, generation, completed, lap_generation, cursor, incomplete, lap_state))
             if identity == root_identity =>
         {
-            if generation < 0
-                || completed < 0
-                || completed > generation
-                || lap_generation < 0
-                || lap_generation > generation
-                || !matches!(incomplete, 0 | 1)
-            {
-                return Err(invalid_data("rotation journal state is malformed"));
-            }
+            validate_rotation_state(
+                generation,
+                completed,
+                lap_generation,
+                cursor.as_deref(),
+                incomplete,
+                lap_state,
+            )?;
             u64::try_from(generation).map_err(|_| invalid_data("negative rotation generation"))
         }
-        Some((_identity, generation, completed, lap_generation, cursor, incomplete)) => {
+        Some((_identity, generation, completed, lap_generation, cursor, incomplete, lap_state)) => {
+            validate_rotation_state(
+                generation,
+                completed,
+                lap_generation,
+                cursor.as_deref(),
+                incomplete,
+                lap_state,
+            )?;
             let count: i64 = transaction
                 .query_row(
                     "SELECT count(*) FROM rotation_debt WHERE root_path=?1",
@@ -798,6 +929,7 @@ fn ensure_root(
                 || lap_generation != generation
                 || cursor.is_some()
                 || incomplete != 0
+                || lap_state != LAP_IDLE
             {
                 return Err(invalid_data(
                     "preparation cache root changed with rotation debt pending",
@@ -806,9 +938,9 @@ fn ensure_root(
             transaction
                 .execute(
                     "UPDATE rotation_root SET root_identity=?2, generation=0, \
-                     completed_generation=0, lap_generation=0, cursor=NULL, lap_incomplete=0 \
+                     completed_generation=0, lap_generation=0, cursor=NULL, lap_incomplete=0, lap_state=?3 \
                      WHERE root_path=?1",
-                    params![root, root_identity],
+                    params![root, root_identity, LAP_IDLE],
                 )
                 .map_err(sqlite_error)?;
             Ok(0)
@@ -823,14 +955,44 @@ fn ensure_root(
             transaction
                 .execute(
                     "INSERT INTO rotation_root(root_path, root_identity, generation, \
-                     completed_generation, lap_generation, cursor, lap_incomplete) \
-                     VALUES (?1, ?2, 0, 0, 0, NULL, 0)",
-                    params![root, root_identity],
+                     completed_generation, lap_generation, cursor, lap_incomplete, lap_state) \
+                     VALUES (?1, ?2, 0, 0, 0, NULL, 0, ?3)",
+                    params![root, root_identity, LAP_IDLE],
                 )
                 .map_err(sqlite_error)?;
             Ok(0)
         }
     }
+}
+
+fn validate_lap_state(state: i64) -> io::Result<()> {
+    if matches!(state, LAP_IDLE | LAP_ACTIVE | LAP_EXHAUSTED) {
+        Ok(())
+    } else {
+        Err(invalid_data("rotation journal lap state is malformed"))
+    }
+}
+
+fn validate_rotation_state(
+    generation: i64,
+    completed: i64,
+    lap_generation: i64,
+    cursor: Option<&[u8]>,
+    incomplete: i64,
+    lap_state: i64,
+) -> io::Result<()> {
+    validate_lap_state(lap_state)?;
+    if generation < 0
+        || completed < 0
+        || completed > generation
+        || lap_generation < 0
+        || lap_generation > generation
+        || !matches!(incomplete, 0 | 1)
+        || (lap_state != LAP_ACTIVE && cursor.is_some())
+    {
+        return Err(invalid_data("rotation journal state is malformed"));
+    }
+    Ok(())
 }
 
 fn check_database_size(path: &Path) -> io::Result<()> {
@@ -938,10 +1100,11 @@ mod tests {
             .unwrap(),
             Some(b"debt-a".to_vec())
         );
+        begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         let page = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         assert_eq!(page.generation, 1);
         assert_eq!(page.entries.len(), 1);
-        assert!(!page.lap_complete);
+        assert!(!page.lap_exhausted);
     }
 
     #[test]
@@ -950,6 +1113,7 @@ mod tests {
         fixture.publish(REPOSITORY_A, b"a");
         fixture.publish(REPOSITORY_B, b"b");
         fixture.publish(REPOSITORY_C, b"c");
+        begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
 
         let first =
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
@@ -967,16 +1131,151 @@ mod tests {
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
                 .unwrap();
         assert_eq!(second.entries[0].repository.as_deref(), Some(REPOSITORY_C));
-        assert!(!second.lap_complete);
+        assert!(!second.lap_exhausted);
         let wrapped =
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
                 .unwrap();
         assert!(wrapped.entries.is_empty());
-        assert!(!wrapped.lap_complete);
+        assert!(wrapped.lap_exhausted);
+        assert!(
+            acknowledge_lap(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                wrapped.generation,
+            )
+            .is_err()
+        );
+        begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         let retry =
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
                 .unwrap();
         assert_eq!(retry.entries[0].repository.as_deref(), Some(REPOSITORY_A));
+    }
+
+    #[test]
+    fn fresh_inventory_resumes_cursor_but_only_success_acknowledges_completion() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"a");
+        fixture.publish(REPOSITORY_B, b"b");
+        let first_generation =
+            begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        let first =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+                .unwrap();
+        assert_eq!(first.entries[0].repository.as_deref(), Some(REPOSITORY_A));
+        mark_lap_incomplete(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+
+        let low_key = format!("{:064x}", 0);
+        fixture.publish(&low_key, b"new-low-key");
+        let resumed_generation =
+            begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        assert_eq!(resumed_generation, first_generation + 1);
+        let resumed =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+                .unwrap();
+        assert_eq!(resumed.entries[0].repository.as_deref(), Some(REPOSITORY_B));
+        let end = next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+            .unwrap();
+        assert!(end.lap_exhausted);
+        assert!(
+            acknowledge_lap(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                resumed_generation,
+            )
+            .is_err()
+        );
+
+        let retry_generation =
+            begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        let retry =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+                .unwrap();
+        assert_eq!(retry.entries[0].repository, Some(low_key));
+        complete(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            ROOT_IDENTITY,
+            &low_key,
+            b"new-low-key",
+        )
+        .unwrap();
+        complete(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            ROOT_IDENTITY,
+            REPOSITORY_A,
+            b"a",
+        )
+        .unwrap();
+        complete(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            ROOT_IDENTITY,
+            REPOSITORY_B,
+            b"b",
+        )
+        .unwrap();
+        let end = next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
+            .unwrap();
+        assert!(end.lap_exhausted);
+        acknowledge_lap(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            ROOT_IDENTITY,
+            retry_generation,
+        )
+        .unwrap();
+        assert_eq!(
+            probe(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                Some(ROOT_IDENTITY)
+            )
+            .unwrap(),
+            Some(JournalProbe::NoDebt)
+        );
+    }
+
+    #[test]
+    fn publication_after_exhaustion_prevents_acknowledging_the_old_generation() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"a");
+        let first_generation =
+            begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        let page = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        complete(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            ROOT_IDENTITY,
+            REPOSITORY_A,
+            b"a",
+        )
+        .unwrap();
+        assert!(
+            next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY)
+                .unwrap()
+                .lap_exhausted
+        );
+
+        fixture.publish(REPOSITORY_B, b"b");
+        assert!(
+            acknowledge_lap(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                first_generation,
+            )
+            .is_err()
+        );
+        let second_generation =
+            begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        assert_eq!(second_generation, first_generation + 1);
+        let pending = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        assert_eq!(pending.entries[0].repository.as_deref(), Some(REPOSITORY_B));
+        assert!(!page.lap_exhausted);
     }
 
     #[test]
@@ -986,6 +1285,7 @@ mod tests {
         fixture.publish(REPOSITORY_B, b"b");
         fixture.publish(REPOSITORY_C, b"c");
         fixture.publish(REPOSITORY_D, b"d");
+        begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
 
         let first =
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
@@ -998,18 +1298,44 @@ mod tests {
             (format!("{:064x}", 2), REPOSITORY_D),
         ] {
             fixture.publish(&low_key, b"new-low-key");
+            begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
             let page =
                 next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
                     .unwrap();
             assert_eq!(page.entries[0].repository.as_deref(), Some(expected));
-            assert!(!page.lap_complete);
+            assert!(!page.lap_exhausted);
+
+            let connection =
+                Connection::open(path_for_resource_db(&fixture.resource_db).unwrap()).unwrap();
+            let (lap_generation, cursor, incomplete): (i64, Vec<u8>, i64) = connection
+                .query_row(
+                    "SELECT lap_generation, cursor, lap_incomplete FROM rotation_root \
+                     WHERE root_path=?1",
+                    params![fixture.cache_root.as_os_str().as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(lap_generation, 4);
+            assert_eq!(cursor, expected.as_bytes());
+            assert_eq!(incomplete, 1);
         }
 
+        begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         let end = next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
             .unwrap();
         assert!(end.entries.is_empty());
-        assert!(!end.lap_complete);
+        assert!(end.lap_exhausted);
+        assert!(
+            acknowledge_lap(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                end.generation,
+            )
+            .is_err()
+        );
 
+        begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         let next_lap =
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
                 .unwrap();
@@ -1037,7 +1363,11 @@ mod tests {
             )
             .is_err()
         );
+        assert!(begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).is_err());
         assert!(next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).is_err());
+        assert!(
+            acknowledge_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1,).is_err()
+        );
         assert!(
             mark_lap_incomplete(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).is_err()
         );
@@ -1097,6 +1427,7 @@ mod tests {
             .unwrap();
         transaction.commit().unwrap();
 
+        begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         let page = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         assert_eq!(page.entries[0].repository, None);
         assert!(
@@ -1150,12 +1481,31 @@ mod tests {
             )
             .is_err()
         );
+        let generation =
+            begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        assert!(
+            !next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY)
+                .unwrap()
+                .lap_exhausted
+        );
         complete(
             &fixture.resource_db,
             &fixture.cache_root,
             ROOT_IDENTITY,
             REPOSITORY_A,
             b"debt-a",
+        )
+        .unwrap();
+        assert!(
+            next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY)
+                .unwrap()
+                .lap_exhausted
+        );
+        acknowledge_lap(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            ROOT_IDENTITY,
+            generation,
         )
         .unwrap();
         assert_eq!(
