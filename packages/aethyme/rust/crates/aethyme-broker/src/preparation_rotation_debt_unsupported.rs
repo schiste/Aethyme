@@ -1,162 +1,69 @@
-//! Fail-closed API for platforms without the descriptor-relative rotation
-//! recovery primitives used by `preparation_rotation_debt.rs`.
+//! Fail-closed inventory API for platforms without the descriptor-relative
+//! rotation recovery primitives used by `preparation_rotation_debt.rs`.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct DirectoryIdentity {
-    device: u64,
-    inode: u64,
-    filesystem_id: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DebtInventory {
+    pub(crate) repositories: Vec<String>,
+    pub(crate) blocked_repositories: BTreeSet<String>,
+    pub(crate) complete: bool,
+    pub(crate) block_legacy_retired: bool,
 }
 
-impl DirectoryIdentity {
-    pub(crate) fn capture(_path: &Path) -> io::Result<Self> {
-        Err(unsupported())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct RotationDebt {
-    schema: String,
-    version: u8,
-    repository: String,
-    transaction: String,
-    cache_root: DirectoryIdentity,
-    original_store: DirectoryIdentity,
-    retired_component: String,
-}
-
-impl RotationDebt {
-    pub(crate) fn new(
-        _repository: &str,
-        _transaction: &str,
-        _cache_root: DirectoryIdentity,
-        _original_store: DirectoryIdentity,
-    ) -> io::Result<Self> {
-        Err(unsupported())
-    }
-
-    pub(crate) fn repository(&self) -> &str {
-        &self.repository
-    }
-
-    pub(crate) fn retired_component(&self) -> &str {
-        &self.retired_component
-    }
-
-    pub(crate) fn cache_root(&self) -> &DirectoryIdentity {
-        &self.cache_root
-    }
-
-    pub(crate) fn original_store(&self) -> &DirectoryIdentity {
-        &self.original_store
-    }
-}
-
+/// Fail-closed result for the bounded startup probe on unsupported platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecoveryStep {
-    RenameOriginalStore,
-    RemoveRetiredStore,
-    CreateFreshStore,
-    ClearCompletedDebt,
-    Conflict,
+pub(crate) enum DebtProbe {
+    NoDebt,
+    Pending,
+    Unknown,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RetainedRotationDebt {
-    pub(crate) debt: RotationDebt,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RecoveryProgress {
+    pub(crate) found_debt: bool,
+    pub(crate) complete: bool,
+    pub(crate) bytes_reclaimed: u64,
+    pub(crate) entries_reclaimed: usize,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RetiredTreeWitness;
-
-impl RetiredTreeWitness {
-    pub(crate) fn component(&self) -> io::Result<&str> {
-        Err(unsupported())
-    }
-
-    pub(crate) fn validate_bytes(&self, _actual: &[u8]) -> io::Result<()> {
-        Err(unsupported())
-    }
-
-    pub(crate) fn matches_pinned_identity(
-        &self,
-        _device: u64,
-        _inode: u64,
-        _filesystem_identity: &[u8],
-    ) -> io::Result<bool> {
-        Err(unsupported())
-    }
+#[derive(Debug)]
+pub(crate) struct RecoveryError {
+    pub(crate) source: io::Error,
+    pub(crate) progress: RecoveryProgress,
 }
 
-pub(crate) fn ensure_supported() -> io::Result<()> {
-    Err(unsupported())
-}
-
-pub(crate) fn recovery_step(_cache_root: &Path, _debt: &RotationDebt) -> io::Result<RecoveryStep> {
-    Err(unsupported())
-}
-
-pub(crate) fn retire_original_store(
+pub(crate) fn inventory(
     _cache_root: &Path,
-    _retained: &RetainedRotationDebt,
-) -> io::Result<()> {
+    _max_entries: usize,
+    _deadline: Instant,
+) -> io::Result<DebtInventory> {
     Err(unsupported())
 }
 
-pub(crate) fn prepare_retired_store_removal(
+pub(crate) fn probe(_cache_root: &Path, _max_entries: usize, _deadline: Instant) -> DebtProbe {
+    DebtProbe::Unknown
+}
+
+pub(crate) fn cache_root_absent_under_observed_parent(
     _cache_root: &Path,
-    _retained: &RetainedRotationDebt,
-) -> io::Result<RetiredTreeWitness> {
+    _deadline: Instant,
+) -> io::Result<bool> {
     Err(unsupported())
 }
 
-pub(crate) fn create_fresh_store(
-    _cache_root: &Path,
-    _retained: &RetainedRotationDebt,
-) -> io::Result<DirectoryIdentity> {
-    Err(unsupported())
-}
-
-pub(crate) fn read(
+pub(crate) fn recover(
     _cache_root: &Path,
     _repository: &str,
-) -> io::Result<Option<RetainedRotationDebt>> {
-    Err(unsupported())
-}
-
-pub(crate) fn publish(
-    _cache_root: &Path,
-    _proposed: RotationDebt,
-) -> io::Result<RetainedRotationDebt> {
-    Err(unsupported())
-}
-
-pub(crate) fn clear_completed(
-    _cache_root: &Path,
-    _retained: &RetainedRotationDebt,
-) -> io::Result<()> {
-    Err(unsupported())
-}
-
-static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
-
-pub(crate) fn new_transaction_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or_default();
-    format!(
-        "{nanos:016x}{:08x}{:08x}",
-        std::process::id(),
-        NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed) as u32
-    )
+    _deadline: Instant,
+) -> Result<RecoveryProgress, RecoveryError> {
+    Err(RecoveryError {
+        source: unsupported(),
+        progress: RecoveryProgress::default(),
+    })
 }
 
 fn unsupported() -> io::Error {

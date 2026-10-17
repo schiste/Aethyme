@@ -680,17 +680,48 @@ mod tests {
         temp: PathBuf,
     }
 
+    fn git(repository: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn fixture() -> Fixture {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let main = root_path.join("repo");
         std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        std::fs::write(main.join("README.md"), "verification fixture\n").unwrap();
+        git(&main, &["add", "README.md"]);
+        git(&main, &["commit", "-qm", "verification fixture"]);
         Fixture {
             main,
             host: root_path.join("host"),
             temp: root_path.join("temp"),
             _root: root,
         }
+    }
+
+    fn fixture_worktree_root_plan(fixture: &Fixture, root: &Path) -> crate::WorktreeRootPlan {
+        let repository = GitRepo::discover(&fixture.main).unwrap();
+        let common_dir = repository.git_common_dir().unwrap();
+        crate::broker::lifecycle::plan_worktree_root_for(
+            &fixture.main,
+            Some(&common_dir),
+            Some(root),
+        )
     }
 
     #[test]
@@ -861,8 +892,7 @@ mod tests {
         let worktree_root = fx._root.path().join("library-worktrees");
         std::fs::create_dir_all(&worktree_root).unwrap();
         let resolved_worktree_root = std::fs::canonicalize(&worktree_root).unwrap();
-        let root_plan =
-            crate::broker::lifecycle::plan_worktree_root_for(&fx.main, None, Some(&worktree_root));
+        let root_plan = fixture_worktree_root_plan(&fx, &worktree_root);
 
         let placement =
             plan_slot_placement_with_worktree_root_plan(&fx.main, "merge-sim", &root_plan);
@@ -881,11 +911,7 @@ mod tests {
         let fx = fixture();
         let unavailable_root = fx._root.path().join("not-a-directory");
         std::fs::write(&unavailable_root, "file blocks the root path").unwrap();
-        let root_plan = crate::broker::lifecycle::plan_worktree_root_for(
-            &fx.main,
-            None,
-            Some(&unavailable_root),
-        );
+        let root_plan = fixture_worktree_root_plan(&fx, &unavailable_root);
         let expected = unavailable_root.join(".aethyme/run/merge-sim");
 
         let placement =
@@ -917,8 +943,7 @@ mod tests {
         let missing = fx._root.path().join("missing");
         // The unresolved traversal would end under the checkout if followed.
         let override_root = fx._root.path().join("missing/../repo/.aethyme/worktrees");
-        let root_plan =
-            crate::broker::lifecycle::plan_worktree_root_for(&fx.main, None, Some(&override_root));
+        let root_plan = fixture_worktree_root_plan(&fx, &override_root);
 
         let placement =
             plan_slot_placement_with_worktree_root_plan(&fx.main, "merge-sim", &root_plan);

@@ -61,7 +61,6 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
             ],
         );
         for (name, directory) in [
-            ("AETHYME_WORKTREE_ROOT", "worktrees"),
             ("AETHYME_HOST_STATE_DIR", "host-state"),
             ("AETHYME_HOST_CACHE_DIR", "host-cache"),
         ] {
@@ -72,6 +71,29 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
                     .any(|(key, value)| { key == name && value == Some(expected.as_os_str()) })
             );
         }
+        assert!(
+            command.get_envs().any(|(key, value)| {
+                key == "AETHYME_BROKER_OPEN_WORKTREE_ROOT"
+                    && value == Some(expected_root.as_os_str())
+            }),
+            "child must receive the broker's exact pinned worktree root"
+        );
+        let captured_context = command
+            .get_envs()
+            .find(|(key, _)| *key == "AETHYME_BROKER_STORAGE_CONTEXT_V1")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str())
+            .expect("child must receive the captured broker storage context");
+        let captured_context: serde_json::Value = serde_json::from_str(captured_context).unwrap();
+        assert_eq!(captured_context["version"], 2);
+        assert_eq!(
+            captured_context["worktree_root_override"].as_str(),
+            expected_root.to_str()
+        );
+        assert!(
+            captured_context["worktree_root_environment_override"].is_null(),
+            "the exact pinned root must be authoritative in the captured context"
+        );
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
         let cli_session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

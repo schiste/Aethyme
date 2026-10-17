@@ -97,6 +97,15 @@ requests recovery through the existing failure path. This is cooperative
 pressure detection: an observation can stall, and writes between observations
 can cross the reserve. Descendant shutdown and an unsettled writer lease must
 also be handled before cleanup can safely use that cache.
+Gate finalization also probes the command process group's absence before
+releasing host resources. A shell exit and output EOF do not establish that
+its descendants have stopped. Unconfirmed cleanup fails the gate, leaves
+cache-size observations unsettled and quarantines the exact resource grant.
+This probe never signals a group after its leader was reaped. It protects the
+named cache from another cooperative writer or collector; it does not itself
+stop a remaining writer. Deliberate process-group escape is outside this
+contract.
+
 Cache writers and preparation-cache reclamation use the
 same root resolver and lease key. These controls reduce avoidable allocation
 and protect data during cleanup.

@@ -13,7 +13,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -67,7 +67,6 @@ const WRITE_BUFFER_BYTES: usize = 32 * 1024;
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 #[cfg(unix)]
 const POLL_INTERVAL_MS: i32 = 50;
-const MAX_PATTERN_LEN: usize = 32;
 
 const CLASSIFIER_PATTERNS: &[&str] = &[
     "timed out",
@@ -354,27 +353,110 @@ impl BoundedGateLog {
     }
 }
 
+const DFA_COLUMNS: usize = 128;
+const MAX_DFA_STATES: usize = 475;
+const NO_DFA_STATE: u16 = u16::MAX;
+
+struct DfaNode {
+    transitions: [u16; DFA_COLUMNS],
+    failure: u16,
+    outputs: u64,
+}
+
+impl DfaNode {
+    fn new() -> Self {
+        Self {
+            transitions: [NO_DFA_STATE; DFA_COLUMNS],
+            failure: 0,
+            outputs: 0,
+        }
+    }
+}
+
+struct PatternDfa {
+    nodes: Vec<DfaNode>,
+}
+
+static CLASSIFIER_DFA: OnceLock<PatternDfa> = OnceLock::new();
+
+fn classifier_dfa() -> &'static PatternDfa {
+    CLASSIFIER_DFA.get_or_init(|| {
+        let mut nodes = Vec::with_capacity(MAX_DFA_STATES);
+        nodes.push(DfaNode::new());
+
+        for (pattern_index, pattern) in CLASSIFIER_PATTERNS.iter().enumerate() {
+            let mut state = 0usize;
+            for byte in pattern.bytes() {
+                let column = byte.to_ascii_lowercase() as usize;
+                debug_assert!(column < DFA_COLUMNS);
+                let next = nodes[state].transitions[column];
+                state = if next == NO_DFA_STATE {
+                    assert!(
+                        nodes.len() < MAX_DFA_STATES,
+                        "classifier DFA state cap exceeded"
+                    );
+                    let next = u16::try_from(nodes.len()).expect("classifier DFA fits in u16");
+                    nodes[state].transitions[column] = next;
+                    nodes.push(DfaNode::new());
+                    next as usize
+                } else {
+                    next as usize
+                };
+            }
+            nodes[state].outputs |= 1u64 << pattern_index;
+        }
+
+        let mut pending = VecDeque::with_capacity(nodes.len());
+        for column in 0..DFA_COLUMNS {
+            let next = nodes[0].transitions[column];
+            if next == NO_DFA_STATE {
+                nodes[0].transitions[column] = 0;
+            } else {
+                nodes[next as usize].failure = 0;
+                pending.push_back(next);
+            }
+        }
+
+        while let Some(state) = pending.pop_front() {
+            let state_index = state as usize;
+            let failure_index = nodes[state_index].failure as usize;
+            nodes[state_index].outputs |= nodes[failure_index].outputs;
+
+            for column in 0..DFA_COLUMNS {
+                let next = nodes[state_index].transitions[column];
+                if next == NO_DFA_STATE {
+                    nodes[state_index].transitions[column] =
+                        nodes[failure_index].transitions[column];
+                } else {
+                    nodes[next as usize].failure = nodes[failure_index].transitions[column];
+                    pending.push_back(next);
+                }
+            }
+        }
+
+        debug_assert!(nodes.len() <= MAX_DFA_STATES);
+        PatternDfa { nodes }
+    })
+}
+
 #[derive(Default)]
 struct PatternMatcher {
-    carry: Vec<u8>,
+    state: u16,
     matched: u64,
 }
 
 impl PatternMatcher {
     fn feed(&mut self, bytes: &[u8]) {
-        let mut window = Vec::with_capacity(self.carry.len() + bytes.len());
-        window.extend_from_slice(&self.carry);
-        window.extend(bytes.iter().map(u8::to_ascii_lowercase));
-        for (index, pattern) in CLASSIFIER_PATTERNS.iter().enumerate() {
-            let bit = 1u64 << index;
-            if self.matched & bit == 0 && contains_bytes(&window, pattern.as_bytes()) {
-                self.matched |= bit;
-            }
+        let dfa = classifier_dfa();
+        for byte in bytes.iter().copied() {
+            let folded = byte.to_ascii_lowercase();
+            self.state = if folded.is_ascii() {
+                dfa.nodes[self.state as usize].transitions[folded as usize]
+            } else {
+                0
+            };
+            self.matched |= dfa.nodes[self.state as usize].outputs;
         }
-        let keep = window.len().min(MAX_PATTERN_LEN - 1);
-        self.carry.clear();
-        self.carry
-            .extend_from_slice(&window[window.len().saturating_sub(keep)..]);
     }
 
     fn matched_patterns(&self) -> Vec<&'static str> {
@@ -388,11 +470,164 @@ impl PatternMatcher {
     }
 }
 
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+#[cfg(test)]
+mod classifier_tests {
+    use super::{CLASSIFIER_PATTERNS, DFA_COLUMNS, MAX_DFA_STATES, PatternMatcher, classifier_dfa};
+
+    fn oracle_mask(input: &[u8]) -> u64 {
+        let lowered: Vec<u8> = input.iter().map(u8::to_ascii_lowercase).collect();
+        CLASSIFIER_PATTERNS
+            .iter()
+            .enumerate()
+            .fold(0u64, |mask, (index, pattern)| {
+                let needle = pattern.as_bytes();
+                if lowered.windows(needle.len()).any(|window| window == needle) {
+                    mask | (1u64 << index)
+                } else {
+                    mask
+                }
+            })
+    }
+
+    fn matcher_mask_with_chunks(input: &[u8], chunks: &[usize]) -> u64 {
+        let mut matcher = PatternMatcher::default();
+        let mut offset = 0usize;
+        for chunk in chunks {
+            let end = offset.saturating_add(*chunk).min(input.len());
+            matcher.feed(&input[offset..end]);
+            offset = end;
+        }
+        matcher.feed(&input[offset..]);
+        let matched = matcher.matched_patterns();
+        CLASSIFIER_PATTERNS
+            .iter()
+            .enumerate()
+            .fold(0u64, |mask, (index, pattern)| {
+                if matched.contains(pattern) {
+                    mask | (1u64 << index)
+                } else {
+                    mask
+                }
+            })
+    }
+
+    fn alternating_case(pattern: &str) -> Vec<u8> {
+        pattern
+            .bytes()
+            .enumerate()
+            .map(|(index, byte)| {
+                if index % 2 == 0 {
+                    byte.to_ascii_uppercase()
+                } else {
+                    byte.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dfa_stays_within_the_fixed_dense_table_bounds() {
+        let dfa = classifier_dfa();
+        assert!(dfa.nodes.len() <= MAX_DFA_STATES);
+        assert_eq!(DFA_COLUMNS, 128);
+        assert!(
+            dfa.nodes
+                .iter()
+                .all(|node| node.transitions.len() == DFA_COLUMNS)
+        );
+    }
+
+    #[test]
+    fn every_pattern_and_mixed_case_pattern_matches_at_every_chunk_split() {
+        for pattern in CLASSIFIER_PATTERNS {
+            for bytes in [pattern.as_bytes().to_vec(), alternating_case(pattern)] {
+                let expected = oracle_mask(&bytes);
+                for split in 0..=bytes.len() {
+                    assert_eq!(
+                        matcher_mask_with_chunks(&bytes, &[split]),
+                        expected,
+                        "pattern {pattern:?} split at {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_patterns_and_ascii_folding_match_the_reference() {
+        for input in [
+            b"COMMAND TIMED OUT".as_slice(),
+            b"x: COMMAND NOT FOUND; command not found",
+            b"prefix TARGET/DEBUG suffix",
+            b"NO SPACE LEFT ON DEVICE and no space left on device",
+        ] {
+            let expected = oracle_mask(input);
+            assert_eq!(matcher_mask_with_chunks(input, &[1, 2, 3, 5]), expected);
+        }
+
+        let overlap = oracle_mask(b"command timed out");
+        let timed_out = CLASSIFIER_PATTERNS
+            .iter()
+            .position(|p| *p == "timed out")
+            .unwrap();
+        let command_timed_out = CLASSIFIER_PATTERNS
+            .iter()
+            .position(|p| *p == "command timed out")
+            .unwrap();
+        assert_ne!(overlap & (1u64 << timed_out), 0);
+        assert_ne!(overlap & (1u64 << command_timed_out), 0);
+
+        let nested = oracle_mask(b": command not found");
+        let colon_command = CLASSIFIER_PATTERNS
+            .iter()
+            .position(|p| *p == ": command not found")
+            .unwrap();
+        let command = CLASSIFIER_PATTERNS
+            .iter()
+            .position(|p| *p == "command not found")
+            .unwrap();
+        assert_ne!(nested & (1u64 << colon_command), 0);
+        assert_ne!(nested & (1u64 << command), 0);
+    }
+
+    #[test]
+    fn non_ascii_bytes_break_ascii_patterns_without_changing_following_matches() {
+        for input in [
+            b"permissi\xC3\xB3n denied".as_slice(),
+            b"permission denied\xFF",
+            b"\xC3permission denied",
+        ] {
+            assert_eq!(
+                matcher_mask_with_chunks(input, &[1, 2, 1, 4]),
+                oracle_mask(input)
+            );
+        }
+        assert_eq!(
+            matcher_mask_with_chunks(b"permission denied", &[2, 1]),
+            oracle_mask(b"permission denied")
+        );
+    }
+
+    #[test]
+    fn deterministic_random_chunking_matches_full_lowered_byte_oracle() {
+        let input = b"prefix COMMAND TIMED OUT, then \xC3 bytes, no space left on device; : COMMAND NOT FOUND; target/debug/.fingerprint";
+        let expected = oracle_mask(input);
+        for seed in 1u64..=256 {
+            let mut random = seed;
+            let mut offset = 0usize;
+            let mut matcher = PatternMatcher::default();
+            while offset < input.len() {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                let width = (random as usize % 19) + 1;
+                let end = offset.saturating_add(width).min(input.len());
+                matcher.feed(&input[offset..end]);
+                offset = end;
+            }
+            assert_eq!(matcher.matched, expected, "chunk sequence seed {seed}");
+        }
+    }
 }
 
 #[cfg(unix)]

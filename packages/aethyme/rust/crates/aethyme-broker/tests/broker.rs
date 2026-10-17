@@ -807,10 +807,25 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
     init_repo(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
+    // Missing host ownership history is unknown, even for an otherwise
+    // empty repository. It must not be silently interpreted as no orphans.
+    let uninitialized = broker.doctor().unwrap();
+    assert!(!uninitialized.healthy(), "{uninitialized:#?}");
+    assert!(
+        uninitialized
+            .deferred_checks
+            .iter()
+            .any(|check| check == "orphan_scan"),
+        "{uninitialized:#?}"
+    );
+    // A real managed start creates the fixture's isolated ownership history.
+    broker
+        .start_worktree("doctor ownership fixture", None)
+        .unwrap();
     let report = broker.doctor().unwrap();
     assert_eq!(report.integrity, "ok");
     assert_eq!(report.version.status, VersionDriftStatus::NotAethymeSource);
-    assert!(report.healthy());
+    assert!(report.healthy(), "{report:#?}");
 
     // A session whose worktree vanishes out-of-band is a finding.
     let wt = tmp.path().join("doomed-wt");
