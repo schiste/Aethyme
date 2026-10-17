@@ -551,20 +551,22 @@ fn scan_complete(
         }
         let root_fd = openat_directory(parent_fd.as_raw_fd(), &leaf_c, &leaf_path)?;
         let opened_stat = fstat(root_fd.as_raw_fd(), &leaf_path)?;
-        if !same_identity(&root_stat, &opened_stat) {
-            return Err(scan_refusal(
-                "managed root changed while it was being opened",
-            ));
-        }
+        ensure_same_identity(
+            &root_stat,
+            &opened_stat,
+            "managed root changed while it was being opened",
+        )?;
         scanner.visit_directory(root_fd.as_raw_fd(), &leaf_path, 0, Some(&opened_stat))?;
         let named_after = stat_at(parent_fd.as_raw_fd(), &leaf_c, libc::AT_SYMLINK_NOFOLLOW)
             .map_err(|source| HostResourceError::Io {
                 path: leaf_path.clone(),
                 source,
             })?;
-        if !same_identity(&opened_stat, &named_after) {
-            return Err(scan_refusal("managed root name changed during inventory"));
-        }
+        ensure_same_identity(
+            &opened_stat,
+            &named_after,
+            "managed root name changed during inventory",
+        )?;
         true
     } else {
         false
@@ -719,9 +721,11 @@ impl Scanner {
             if file_type(&child_stat) == libc::S_IFDIR {
                 let child = openat_directory(fd, &name, &child_path)?;
                 let opened_stat = fstat(child.as_raw_fd(), &child_path)?;
-                if !same_identity(&child_stat, &opened_stat) {
-                    return Err(scan_refusal("directory entry changed while opening"));
-                }
+                ensure_same_identity(
+                    &child_stat,
+                    &opened_stat,
+                    "directory entry changed while opening",
+                )?;
                 self.visit_directory(
                     child.as_raw_fd(),
                     &child_path,
@@ -733,9 +737,11 @@ impl Scanner {
                 if file_type(&child_stat) == libc::S_IFREG {
                     let child = openat_regular(fd, &name, &child_path)?;
                     let opened_stat = fstat(child.as_raw_fd(), &child_path)?;
-                    if !same_identity(&child_stat, &opened_stat) {
-                        return Err(scan_refusal("regular file changed while opening"));
-                    }
+                    ensure_same_identity(
+                        &child_stat,
+                        &opened_stat,
+                        "regular file changed while opening",
+                    )?;
                 }
             }
         }
@@ -934,6 +940,19 @@ fn same_identity(left: &libc::stat, right: &libc::stat) -> bool {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ensure_same_identity(
+    expected: &libc::stat,
+    actual: &libc::stat,
+    message: &str,
+) -> Result<(), HostResourceError> {
+    if same_identity(expected, actual) {
+        Ok(())
+    } else {
+        Err(scan_refusal(message))
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_filesystem_identity(value: &str) -> Result<u64, HostResourceError> {
     let Some(hex) = value.strip_prefix("unix-dev:") else {
         return Err(managed_storage_refusal(
@@ -1010,4 +1029,466 @@ unsafe fn errno_location() -> *mut libc::c_int {
 #[cfg(target_os = "linux")]
 unsafe fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod tests {
+    use super::*;
+    use crate::resources::{
+        HostResourceKind, HostResourceRequest, HostResourceRequirement, ManagedStoragePolicy,
+    };
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::symlink;
+
+    const REPOSITORY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MATERIALIZATION: &str = "bbbbbbbbbbbb";
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        database: PathBuf,
+        preparation_cache_root: PathBuf,
+        repository_root: PathBuf,
+        materialization_root: PathBuf,
+        repository: String,
+        materialization: String,
+        filesystem_id: String,
+        root_identity: String,
+        lease_request: HostResourceRequest,
+        coordinator: HostResourceCoordinator,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_resources(vec![preparation_requirement(REPOSITORY)])
+        }
+
+        fn with_resources(resources: Vec<HostResourceRequirement>) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let preparation_cache_root = temp.path().join("preparation-cache");
+            let repository_root = preparation_cache_root.join(REPOSITORY);
+            let materialization_root = repository_root.join(MATERIALIZATION);
+            std::fs::create_dir_all(&repository_root).unwrap();
+
+            let binding =
+                RootBinding::new(&preparation_cache_root, REPOSITORY, MATERIALIZATION).unwrap();
+            let filesystem_id = binding.filesystem_id.clone();
+            let root_identity = binding.identity.clone();
+            let database = temp.path().join("host-resources.db");
+            let mut coordinator = HostResourceCoordinator::open(&database).unwrap();
+            coordinator
+                .set_managed_storage_policy(&ManagedStoragePolicy {
+                    repository: REPOSITORY.into(),
+                    filesystem_id: filesystem_id.clone(),
+                    managed_cap_bytes: 1_000_000_000,
+                    free_reserve_bytes: 0,
+                })
+                .unwrap();
+
+            let lease_request = HostResourceRequest {
+                schema_version: crate::resources::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+                request_id: "managed-storage-owner-lease".into(),
+                repository: REPOSITORY.into(),
+                worktree_fingerprint: "fixture-worktree".into(),
+                run_id: "managed-storage-owner-run".into(),
+                ttl_seconds: 60,
+                holder_pid: Some(std::process::id()),
+                resources,
+            };
+
+            Self {
+                _temp: temp,
+                database,
+                preparation_cache_root,
+                repository_root,
+                materialization_root,
+                repository: REPOSITORY.into(),
+                materialization: MATERIALIZATION.into(),
+                filesystem_id,
+                root_identity,
+                lease_request,
+                coordinator,
+            }
+        }
+
+        fn owner(&mut self) -> Result<ManagedStorageOwner<'_>, HostResourceError> {
+            let grant = self.coordinator.acquire(&self.lease_request)?;
+            let repository = self.repository.clone();
+            let cache_root = self.preparation_cache_root.clone();
+            let materialization = self.materialization.clone();
+            self.coordinator.begin_managed_storage_owner(
+                grant,
+                &repository,
+                &cache_root,
+                &materialization,
+                60,
+            )
+        }
+
+        fn claim(&self, claim_id: &str, reserved_bytes: u64) -> ManagedStorageClaimRequest {
+            ManagedStorageClaimRequest {
+                repository: self.repository.clone(),
+                filesystem_id: self.filesystem_id.clone(),
+                claim_id: claim_id.into(),
+                materialization: self.materialization.clone(),
+                root_identity: self.root_identity.clone(),
+                reserved_bytes,
+            }
+        }
+    }
+
+    fn preparation_requirement(repository: &str) -> HostResourceRequirement {
+        HostResourceRequirement {
+            key: "preparation_cache".into(),
+            resource: HostResourceKind::ExclusiveKey {
+                name: crate::preparation::preparation_cache_lease_name(repository),
+            },
+        }
+    }
+
+    fn extra_requirement() -> HostResourceRequirement {
+        HostResourceRequirement {
+            key: "other_cache".into(),
+            resource: HostResourceKind::ExclusiveKey {
+                name: "some-other-cache".into(),
+            },
+        }
+    }
+
+    fn conflict_code(error: &HostResourceError) -> Option<&str> {
+        match error {
+            HostResourceError::Conflict { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    fn expect_permit(admission: ManagedStorageAdmission) -> ManagedStorageGrowthPermit {
+        match admission {
+            ManagedStorageAdmission::Materialize(permit) => permit,
+            ManagedStorageAdmission::Existing(claim) => {
+                panic!("expected a new materialization permit, got {claim:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn managed_storage_owner_requires_only_the_exact_preparation_lease() {
+        let cases = [
+            vec![extra_requirement()],
+            vec![preparation_requirement(REPOSITORY), extra_requirement()],
+        ];
+        for resources in cases {
+            let mut fixture = Fixture::with_resources(resources);
+            let result = fixture.owner();
+            let error = match result {
+                Err(error) => error,
+                Ok(owner) => {
+                    drop(owner);
+                    panic!("wrong or mixed lease unexpectedly created an owner")
+                }
+            };
+            assert_eq!(
+                conflict_code(&error),
+                Some("managed_storage_owner_missing"),
+                "unexpected owner rejection: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_storage_owner_refuses_an_absent_repository_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("preparation-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        let error = RootBinding::new(&cache_root, REPOSITORY, MATERIALIZATION).unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_repository_root_missing"),
+            "unexpected absent-parent result: {error:?}"
+        );
+    }
+
+    #[test]
+    fn managed_storage_owner_rejects_repository_root_replacement_before_reserving() {
+        let mut fixture = Fixture::new();
+        let repository_root = fixture.repository_root.clone();
+        let old_root = fixture._temp.path().join("repository-cache-old");
+        let outside = fixture._temp.path().join("outside-repository");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("payload"), b"must remain outside inventory").unwrap();
+        let request = fixture.claim("replaced-parent", 4096);
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let mut owner = fixture.owner().unwrap();
+
+        std::fs::rename(&repository_root, &old_root).unwrap();
+        symlink(&outside, &repository_root).unwrap();
+        let error = owner.reserve(&request).unwrap_err();
+        assert!(
+            conflict_code(&error).is_some() || matches!(error, HostResourceError::Io { .. }),
+            "repository-root replacement must fail closed: {error:?}"
+        );
+        assert!(
+            owner
+                .coordinator
+                .managed_storage_claim(&repository, &filesystem_id, &request.claim_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(outside.join("payload")).unwrap(),
+            b"must remain outside inventory"
+        );
+    }
+
+    #[test]
+    fn managed_storage_root_symlink_replacement_keeps_reservation_unsettled() {
+        let mut fixture = Fixture::new();
+        let root = fixture.materialization_root.clone();
+        let external = fixture._temp.path().join("external-root");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("payload"), b"outside").unwrap();
+        let request = fixture.claim("root-symlink", 4096);
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let mut owner = fixture.owner().unwrap();
+        let permit = expect_permit(owner.reserve(&request).unwrap());
+
+        symlink(&external, &root).unwrap();
+        assert!(owner.reconcile_new(permit).is_err());
+        assert_eq!(std::fs::read(external.join("payload")).unwrap(), b"outside");
+        let claim = owner
+            .coordinator
+            .managed_storage_claim(&repository, &filesystem_id, &request.claim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claim.state,
+            crate::resources::ManagedStorageClaimState::Reserved
+        );
+        assert!(matches!(
+            owner.reserve(&request).unwrap(),
+            ManagedStorageAdmission::Existing(existing)
+                if existing.state == crate::resources::ManagedStorageClaimState::Reserved
+        ));
+    }
+
+    #[test]
+    fn managed_storage_retry_after_reopen_is_status_only_for_same_root() {
+        let mut fixture = Fixture::new();
+        let request = fixture.claim("restart-retry", 4096);
+        {
+            let mut owner = fixture.owner().unwrap();
+            let _permit = expect_permit(owner.reserve(&request).unwrap());
+        }
+
+        drop(fixture.coordinator);
+        fixture.coordinator = HostResourceCoordinator::open(&fixture.database).unwrap();
+        let mut owner = fixture.owner().unwrap();
+        match owner.reserve(&request).unwrap() {
+            ManagedStorageAdmission::Existing(claim) => {
+                assert_eq!(
+                    claim.state,
+                    crate::resources::ManagedStorageClaimState::Reserved
+                );
+                assert_eq!(claim.request, request);
+            }
+            ManagedStorageAdmission::Materialize(_) => {
+                panic!("reopened exact claim granted another materialization")
+            }
+        }
+    }
+
+    #[test]
+    fn forged_owner_generation_cannot_settle_a_claim_or_grant_a_retry() {
+        let mut fixture = Fixture::new();
+        let request = fixture.claim("forged-generation", 4096);
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let mut owner = fixture.owner().unwrap();
+        let mut permit = expect_permit(owner.reserve(&request).unwrap());
+        permit.generation = permit.generation.saturating_add(1);
+
+        let error = owner.reconcile_new(permit).unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_permit_owner_mismatch")
+        );
+        let claim = owner
+            .coordinator
+            .managed_storage_claim(&repository, &filesystem_id, &request.claim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claim.state,
+            crate::resources::ManagedStorageClaimState::Reserved
+        );
+        assert!(matches!(
+            owner.reserve(&request).unwrap(),
+            ManagedStorageAdmission::Existing(existing)
+                if existing.state == crate::resources::ManagedStorageClaimState::Reserved
+        ));
+    }
+
+    #[test]
+    fn failed_inventory_stays_reserved_and_uncertain_claims_block_new_ids() {
+        let mut fixture = Fixture::new();
+        let request = fixture.claim("failed-inventory", 4096);
+        let next_request = fixture.claim("new-after-failed-scan", 4096);
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let root = fixture.materialization_root.clone();
+        let external = fixture._temp.path().join("failed-inventory-external");
+        let mut owner = fixture.owner().unwrap();
+        let permit = expect_permit(owner.reserve(&request).unwrap());
+
+        std::fs::create_dir(&external).unwrap();
+        symlink(&external, &root).unwrap();
+        assert!(owner.reconcile_new(permit).is_err());
+        let reserved = owner
+            .coordinator
+            .managed_storage_claim(&repository, &filesystem_id, &request.claim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reserved.state,
+            crate::resources::ManagedStorageClaimState::Reserved
+        );
+        assert!(matches!(
+            owner.reserve(&request).unwrap(),
+            ManagedStorageAdmission::Existing(existing)
+                if existing.state == crate::resources::ManagedStorageClaimState::Reserved
+        ));
+
+        std::fs::remove_file(&root).unwrap();
+        let error = owner.reserve(&next_request).unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_materialization_pending")
+        );
+
+        let mut uncertain_fixture = Fixture::new();
+        let uncertain_request = uncertain_fixture.claim("uncertain-inventory", 4096);
+        let blocked_request = uncertain_fixture.claim("blocked-after-uncertain", 4096);
+        let mut uncertain_owner = uncertain_fixture.owner().unwrap();
+        let permit = expect_permit(uncertain_owner.reserve(&uncertain_request).unwrap());
+        let uncertain = uncertain_owner.mark_uncertain(permit).unwrap();
+        assert_eq!(
+            uncertain.state,
+            crate::resources::ManagedStorageClaimState::Uncertain
+        );
+        assert!(matches!(
+            uncertain_owner.reserve(&uncertain_request).unwrap(),
+            ManagedStorageAdmission::Existing(existing)
+                if existing.state == crate::resources::ManagedStorageClaimState::Uncertain
+        ));
+        let error = uncertain_owner.reserve(&blocked_request).unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_uncertain")
+        );
+    }
+
+    #[test]
+    fn managed_storage_inventory_does_not_follow_child_symlinks() {
+        let mut fixture = Fixture::new();
+        let request = fixture.claim("child-symlink", 4096);
+        let root = fixture.materialization_root.clone();
+        let external = fixture._temp.path().join("external-child");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("payload"), vec![7_u8; 8192]).unwrap();
+        let mut owner = fixture.owner().unwrap();
+        let permit = expect_permit(owner.reserve(&request).unwrap());
+        std::fs::create_dir(&root).unwrap();
+        symlink(&external, root.join("link-to-external")).unwrap();
+
+        let inventory = scan_complete(&owner.root, &owner.grant, &request).unwrap();
+        assert_eq!(inventory.entry_count, 2, "root directory plus symlink only");
+        let claim = owner.reconcile_new(permit).unwrap();
+        assert_eq!(
+            claim.state,
+            crate::resources::ManagedStorageClaimState::Charged
+        );
+        assert_eq!(claim.measured_bytes, Some(inventory.allocated_bytes));
+    }
+
+    #[test]
+    fn scanner_refuses_entry_depth_and_deadline_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let fd = open_absolute_directory_nofollow(&root).unwrap();
+        let stat = fstat(fd.as_raw_fd(), &root).unwrap();
+
+        let mut entry_limited =
+            Scanner::new(stat.st_dev as u64, Instant::now() + SCAN_MAX_DURATION);
+        entry_limited.entry_count = SCAN_MAX_ENTRIES;
+        let error = entry_limited
+            .count_stat(&stat, b"one-too-many")
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_incomplete")
+        );
+
+        let mut depth_limited =
+            Scanner::new(stat.st_dev as u64, Instant::now() + SCAN_MAX_DURATION);
+        let error = depth_limited
+            .visit_directory(-1, Path::new("unopened"), SCAN_MAX_DEPTH + 1, None)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_incomplete")
+        );
+
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let expired = Scanner::new(stat.st_dev as u64, deadline);
+        let error = expired.check_deadline(Path::new("expired")).unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_incomplete")
+        );
+    }
+
+    #[test]
+    fn scanner_rejects_directory_and_regular_file_replacement_between_stat_and_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = std::fs::canonicalize(temp.path()).unwrap();
+        let parent_fd = open_absolute_directory_nofollow(&parent_path).unwrap();
+        let directory_path = parent_path.join("directory");
+        std::fs::create_dir(&directory_path).unwrap();
+        let directory_name = CString::new("directory").unwrap();
+        let expected_directory = stat_at(
+            parent_fd.as_raw_fd(),
+            &directory_name,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        let renamed_directory = parent_path.join("renamed-directory");
+        std::fs::rename(&directory_path, &renamed_directory).unwrap();
+        std::fs::create_dir(&directory_path).unwrap();
+        let replacement_directory =
+            openat_directory(parent_fd.as_raw_fd(), &directory_name, &directory_path).unwrap();
+        let opened_directory = fstat(replacement_directory.as_raw_fd(), &directory_path).unwrap();
+        assert!(
+            ensure_same_identity(
+                &expected_directory,
+                &opened_directory,
+                "directory replacement"
+            )
+            .is_err()
+        );
+
+        let file_path = parent_path.join("regular");
+        std::fs::write(&file_path, b"same bytes").unwrap();
+        let file_name = CString::new("regular").unwrap();
+        let expected_file =
+            stat_at(parent_fd.as_raw_fd(), &file_name, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+        let renamed_file = parent_path.join("renamed-regular");
+        std::fs::rename(&file_path, &renamed_file).unwrap();
+        std::fs::write(&file_path, b"same bytes").unwrap();
+        let replacement_file =
+            openat_regular(parent_fd.as_raw_fd(), &file_name, &file_path).unwrap();
+        let opened_file = fstat(replacement_file.as_raw_fd(), &file_path).unwrap();
+        assert!(ensure_same_identity(&expected_file, &opened_file, "file replacement").is_err());
+    }
 }
