@@ -61,7 +61,6 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
             ],
         );
         for (name, directory) in [
-            ("AETHYME_WORKTREE_ROOT", "worktrees"),
             ("AETHYME_HOST_STATE_DIR", "host-state"),
             ("AETHYME_HOST_CACHE_DIR", "host-cache"),
         ] {
@@ -72,6 +71,26 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
                     .any(|(key, value)| { key == name && value == Some(expected.as_os_str()) })
             );
         }
+        let captured_root = command
+            .get_envs()
+            .find(|(key, _)| key == "AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+            .and_then(|(_, value)| value)
+            .map(PathBuf::from)
+            .expect("child receives exact fixture worktree root");
+        assert!(
+            captured_root.canonicalize().unwrap() == expected_root,
+            "captured child root must equal the fixture-owned exact root"
+        );
+        assert!(
+            command.get_envs().any(|(key, value)| {
+                key == "AETHYME_BROKER_STORAGE_CONTEXT_V1" && value.is_some()
+            })
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| { key == "AETHYME_WORKTREE_ROOT" && value.is_none() })
+        );
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
         let cli_session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

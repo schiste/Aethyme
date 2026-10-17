@@ -9,6 +9,8 @@ const LIBRARY_CHILD_FLAG: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PLACEMENT_CHILD";
 const LIBRARY_PATH_REPORT: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PATH_REPORT";
 
 mod common;
+#[path = "common/isolation.rs"]
+mod isolation;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -248,6 +250,61 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         "child stdout={}\nchild stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fixture_command_binds_captured_storage_context() {
+    let fixture = fixture();
+    let command = isolation::command(CLI, fixture.path(), &[]);
+    let env = configured_env(&command);
+
+    let value = |name: &str| {
+        env.get(OsStr::new(name))
+            .and_then(Option::as_deref)
+            .unwrap_or_else(|| panic!("{name} must be set for fixture children"))
+    };
+    assert_eq!(
+        value("AETHYME_HOST_STATE_DIR"),
+        fixture.owner_path().join("host-state").as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_HOST_CACHE_DIR"),
+        fixture.owner_path().join("host-cache").as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_OPEN_HOST_OPERATION_DB"),
+        fixture
+            .owner_path()
+            .join("host-state/host-operations.db")
+            .as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_OPEN_COLLABORATION_ROOT"),
+        fixture
+            .owner_path()
+            .join("host-state/collaboration")
+            .as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT"),
+        OsStr::new("true")
+    );
+    assert!(
+        env.get(OsStr::new("AETHYME_BROKER_STORAGE_CONTEXT_V1"))
+            .and_then(Option::as_ref)
+            .is_some_and(|value| value != OsStr::new("poisoned-envelope"))
+    );
+    let captured_root = PathBuf::from(
+        env.get(OsStr::new("AETHYME_BROKER_OPEN_WORKTREE_ROOT"))
+            .and_then(Option::as_deref)
+            .expect("fixture child exact worktree root"),
+    );
+    let expected_root = fixture.owner_path().join("worktrees");
+    assert_eq!(captured_root, expected_root);
+    assert!(
+        env.get(OsStr::new("AETHYME_GATE_BROKER_DATABASES"))
+            .is_some_and(Option::is_none)
     );
 }
 
