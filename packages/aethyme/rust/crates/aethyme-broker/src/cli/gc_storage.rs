@@ -873,6 +873,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         .ok_or_else(|| {
             UsageError::Message("gc requires `plan`, `apply --confirm <sha256>` or `sweep`".into())
         })?;
+    if action == "__continue-artifacts" {
+        return run_artifact_sweep_continuation_worker(parsed);
+    }
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(
             "gc accepts exactly one action: `plan`, `apply --confirm <sha256>` or `sweep`".into(),
@@ -938,6 +941,104 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// Private detached-worker entry point. It is absent from help and refuses to
+/// open a broker unless the exact installed worker environment, repository,
+/// runtime pair, and singleton lock all agree.
+fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageError> {
+    validate_artifact_sweep_worker_invocation(
+        std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV)
+            .ok()
+            .as_deref(),
+        parsed.read_only_snapshot,
+        parsed.positional.len(),
+        artifact_worker_test_or_build_environment(),
+    )?;
+    let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot resolve automatic artifact continuation repository: {error}"
+        ))
+    })?;
+    let discovered = crate::GitRepo::discover(&requested_root)?;
+    let repository_root = std::fs::canonicalize(discovered.main_root()?)?;
+    if repository_root != requested_root {
+        return Err(UsageError::Message(
+            "automatic artifact continuation repository does not match its main checkout".into(),
+        ));
+    }
+    if crate::host_state::path_is_ephemeral(&repository_root)
+        || !crate::gc::artifact_worker_runtime_is_aligned()
+    {
+        return Err(UsageError::Message(
+            "automatic artifact continuation runtime or repository is not eligible".into(),
+        ));
+    }
+
+    // Hold the OS lock before Broker::open. The parent drops it only after
+    // this process has been spawned, so no second detached worker can enter.
+    let mut worker_lock = None;
+    for _ in 0..40 {
+        if let Some(lock) = crate::gc::try_artifact_sweep_worker_lock(&repository_root)? {
+            worker_lock = Some(lock);
+            break;
+        }
+        // The launcher still owns the lock while the child starts. Wait for
+        // that handoff, but do not queue another worker behind an active one.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let Some(_worker_lock) = worker_lock else {
+        return Err(UsageError::Message(
+            "automatic artifact continuation worker is already active".into(),
+        ));
+    };
+    let mut broker = Broker::open(&repository_root)?;
+    broker.run_artifact_sweep_recovery_worker()?;
+    Ok(())
+}
+
+fn validate_artifact_sweep_worker_invocation(
+    worker_environment: Option<&str>,
+    read_only_snapshot: bool,
+    positional_count: usize,
+    test_or_build_environment: bool,
+) -> Result<(), UsageError> {
+    if worker_environment != Some("1") {
+        return Err(UsageError::Message(
+            "automatic artifact continuation is an internal worker command".into(),
+        ));
+    }
+    if read_only_snapshot || positional_count != 2 {
+        return Err(UsageError::Message(
+            "automatic artifact continuation requires one repository path and writable broker state".into(),
+        ));
+    }
+    if test_or_build_environment {
+        return Err(UsageError::Message(
+            "automatic artifact continuation cannot run from a test or build environment".into(),
+        ));
+    }
+    Ok(())
+}
+
+const ARTIFACT_WORKER_TEST_ENVIRONMENT_KEYS: &[&str] = &[
+    crate::BROKER_DB_ENV,
+    "AETHYME_TEST_DB_SUFFIX",
+    crate::disk_headroom::TEST_AVAILABLE_BYTES_ENV,
+    crate::disk_headroom::TEST_AVAILABLE_INODES_ENV,
+    "CARGO_MANIFEST_DIR",
+    "CARGO_TARGET_DIR",
+    "CARGO_BIN_EXE_aethyme",
+];
+
+fn artifact_worker_test_or_build_environment() -> bool {
+    cfg!(test) || artifact_worker_environment_has(|key| std::env::var_os(key).is_some())
+}
+
+fn artifact_worker_environment_has(mut present: impl FnMut(&str) -> bool) -> bool {
+    ARTIFACT_WORKER_TEST_ENVIRONMENT_KEYS
+        .iter()
+        .any(|key| present(key))
+}
+
 fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
     let noun = if report.directories_reclaimed == 1 {
         "directory"
@@ -958,6 +1059,18 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
         out!("  complete: every eligible session was visited");
     } else {
         out!("  paused at the budget; run `aethyme broker gc sweep` again to continue");
+    }
+    match report.legacy_unscoped_state {
+        crate::ArtifactSweepLegacyUnscopedState::Clear => {
+            out!(
+                "  legacy unscoped artifact-sweep state: clear; this lap covers only the current storage context"
+            );
+        }
+        crate::ArtifactSweepLegacyUnscopedState::UnknownPending => {
+            out!(
+                "  legacy unscoped artifact-sweep state: unknown and still pending; this lap covers only the current storage context"
+            );
+        }
     }
 }
 
@@ -1021,4 +1134,26 @@ pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod artifact_worker_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_worker_cli_rejects_untrusted_invocations_before_repository_open() {
+        assert!(validate_artifact_sweep_worker_invocation(None, false, 2, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("wrong"), false, 2, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), true, 2, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 1, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 2, true).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 2, false).is_ok());
+        assert!(artifact_worker_environment_has(
+            |key| key == crate::BROKER_DB_ENV
+        ));
+        assert!(artifact_worker_environment_has(
+            |key| key == "AETHYME_TEST_DB_SUFFIX"
+        ));
+        assert!(!artifact_worker_environment_has(|_| false));
+    }
 }

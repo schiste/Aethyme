@@ -2022,7 +2022,8 @@ fn verify_ship_only_tree(
         },
     )?;
     let checkout = slot.materialize(&repo, publication_sha)?;
-    let outcomes = crate::gates::run_affected(
+    let storage = broker.storage_context().gate_storage_locations();
+    let outcomes = crate::gates::run_affected_in(
         broker.store(),
         &main_root,
         &checkout,
@@ -2030,6 +2031,7 @@ fn verify_ship_only_tree(
         changed_files,
         Some(session_id),
         crate::gates::CachePolicy::Use,
+        storage,
     )?;
     let failed = outcomes
         .iter()

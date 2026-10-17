@@ -1,16 +1,18 @@
 //! Pure broker garbage-collection planning.
 
-use std::collections::BTreeMap;
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
 use crate::artifact_catalog::ArtifactWitness;
-use crate::broker::{
-    WORKTREE_ROOT_MARKER, WorktreeRootMarker, directory_size_without_following_links,
-};
+#[cfg(test)]
+use crate::broker::WORKTREE_ROOT_MARKER;
+use crate::broker::directory_size_without_following_links;
 use crate::{
     Broker, BrokerOpError, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
@@ -20,12 +22,22 @@ use crate::{
     load_retention_policy_report,
 };
 
+mod tree_removal;
+pub(crate) use tree_removal::{
+    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, remove_condemned_tree,
+    remove_condemned_tree_with_progress,
+};
+
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// How deep below a worktree root a build directory is looked for. Deep enough
 /// for nested workspaces and package directories, shallow enough to keep the
 /// scan bounded on large trees.
 const ARTIFACT_SCAN_DEPTH: usize = 6;
+/// Maximum number of directory entries the unattended scanner examines in
+/// one worktree pass. The wall-clock budget remains the primary limit; this
+/// also bounds broad trees when metadata calls are unusually cheap.
+const ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET: usize = 16_384;
 
 /// How long a recorded-size plan spends looking for build directories in
 /// retained worktrees before it stops and reports how many it did not scan.
@@ -47,8 +59,11 @@ const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
 ///
 /// Without it an interrupted pass restarts at the lowest session id, so a
 /// budget smaller than one full scan services the head of the list forever and
-/// never reaches the backlog behind it. The cadence stamp records *when* a pass
-/// ran; this records *how far* it got (#222).
+/// never reaches the backlog behind it. An incompletely discovered worktree
+/// is recorded as an incomplete pass, but the cursor still advances past it;
+/// every later closed session gets a turn and no pass can claim completion
+/// while any worktree was unclassified. The cadence stamp records *when* a
+/// pass ran; this records *how far* it got (#222).
 const ARTIFACT_SWEEP_CURSOR_KEY: &str = "gc.artifact_sweep.cursor_session_id";
 /// When an unfinished pass last made progress on a broker open.
 ///
@@ -59,13 +74,51 @@ const ARTIFACT_SWEEP_CURSOR_KEY: &str = "gc.artifact_sweep.cursor_session_id";
 /// and hook call. Inline continuation is spaced by this instead.
 const ARTIFACT_SWEEP_PROGRESS_KEY: &str = "gc.artifact_sweep.last_partial_ms";
 
-/// The build cache an unfinished pass was part-way through removing.
+/// Build caches that an unfinished pass was part-way through removing.
 ///
 /// Unlinking a tree's contents updates its modification time, so without
-/// this the next pass mistook its own partial removal for a writer and
+/// this queue the next pass mistook its own partial removal for a writer and
 /// protected an idle open session's half-removed cache for another idle
-/// window. A cache already judged idle and partly removed is finished.
+/// window. Legacy single-path values remain readable; multiple in-progress
+/// trees are stored as a bounded JSON array.
 const ARTIFACT_SWEEP_INTERRUPTED_KEY: &str = "gc.artifact_sweep.interrupted_path";
+const ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX: usize = 32;
+const ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES: usize = 64 * 1024;
+const ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS: usize = 128;
+const ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX: usize = 32;
+/// Last diagnosed unavailable marker set; replaced or cleared to avoid an
+/// append-only event for every retry of the same blocked paths.
+const ARTIFACT_SWEEP_BLOCKED_PATHS_KEY: &str = "gc.artifact_sweep.blocked_paths";
+/// Bounded JSON for the capped diagnostic list: each entry has one path capped
+/// to 128 characters plus a fixed reason and JSON framing.
+const ARTIFACT_SWEEP_BLOCKED_PATHS_VALUE_MAX_BYTES: usize =
+    ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX * (6 * ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS + 256);
+/// Durable request for the detached, cache-only continuation worker.
+const ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY: &str = "gc.artifact_sweep.recovery_requested_ms";
+/// Highest recovery request generation completed by the cache-only worker.
+const ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY: &str = "gc.artifact_sweep.recovery_completed_ms";
+/// Retry time for an automatic continuation that made no filesystem progress.
+const ARTIFACT_SWEEP_RETRY_AFTER_KEY: &str = "gc.artifact_sweep.retry_after_ms";
+/// Bounded last-worker result; overwritten each run rather than appended.
+const ARTIFACT_SWEEP_WORKER_STATUS_KEY: &str = "gc.artifact_sweep.worker_status";
+const ARTIFACT_SWEEP_META_PREFIX: &str = "gc.artifact_sweep.";
+const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
+/// Internal marker which keeps Broker::open from starting a second inline GC
+/// pass before the continuation worker takes its cache-only path.
+pub(crate) const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
+const ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES: usize = 3;
+/// Positive partial deletion is progress, but must not let one detached worker
+/// run indefinitely while another process keeps replenishing the cache.
+const ARTIFACT_SWEEP_WORKER_MAX_PASSES: usize = 8;
+/// Pressure can multiply one sweep budget by twelve. Cap the worker's entire
+/// lifetime as well as each individual pass, retaining the cursor/request for
+/// a later normal open when this deadline expires.
+const ARTIFACT_SWEEP_WORKER_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
+const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
+/// Broker open checks only for rotation-debt control entries. A small bound
+/// keeps this crash-gap probe cheap even when the shared cache root is wide.
+const PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES: usize = 512;
+const PREPARATION_ROTATION_DEBT_PROBE_BUDGET: Duration = Duration::from_millis(20);
 
 /// Most a broker open may spend on the artifact sweep, whatever the policy
 /// budget or disk pressure. Broker open runs before every command, including
@@ -87,6 +140,9 @@ pub(crate) enum ArtifactSweepScope {
     /// An explicit reclaim command: the policy budget scaled by disk
     /// pressure, ignoring cadence and spacing.
     Drain,
+    /// Detached recovery: the policy budget scaled by disk pressure, ignoring
+    /// cadence and spacing, and without whole-checkout cleanup.
+    AutomaticContinuation,
     /// The targeted pass over one just-closed session.
     ClosedSession(i64),
 }
@@ -100,12 +156,23 @@ pub struct ArtifactSweepOutcome {
 }
 
 /// Result of an explicit `gc sweep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSweepLegacyUnscopedState {
+    Clear,
+    UnknownPending,
+}
+
+/// Result of an explicit `gc sweep`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ArtifactSweepReport {
     pub directories_reclaimed: usize,
     pub complete: bool,
     pub budget_ms: u64,
     pub disk_pressured: bool,
+    /// Whether durable pre-namespace state remains outside this context's
+    /// scoped sweep. The legacy values are inspected but never changed.
+    pub legacy_unscoped_state: ArtifactSweepLegacyUnscopedState,
     /// Disposable checkouts removed or kept by this sweep (#588).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_cleanup: Option<crate::AutoCleanupReport>,
@@ -140,9 +207,105 @@ fn sweep_order<T: Clone>(items: &[T], cursor: i64, id: impl Fn(&T) -> i64) -> Ve
 ///   root;
 /// - its name is still one the unattended lane may remove. The witness may be
 ///   gone after a partial removal; the name may not change.
-fn resumable_interrupted_tree(root: &Path, path: &Path, extras: &[String]) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptedTreeState {
+    Resume,
+    Revoked(&'static str),
+    Unavailable(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevokedInterruptedPath {
+    path: String,
+    reason: &'static str,
+    canonical_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockedInterruptedPath {
+    path: Option<String>,
+    reason: &'static str,
+}
+
+fn bounded_artifact_diagnostic_path(path: &str) -> String {
+    path.chars()
+        .take(ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS)
+        .collect()
+}
+
+struct ScopedArtifactSweepWriter<'a> {
+    store: &'a mut crate::BrokerStore,
+    namespace: &'a str,
+}
+
+impl ScopedArtifactSweepWriter<'_> {
+    fn persist_interrupted_paths(&mut self, paths: &[String]) -> Result<bool, BrokerOpError> {
+        persist_interrupted_paths(self.store, self.namespace, paths)
+    }
+}
+
+fn revoke_interrupted_paths_under_root(
+    sweep_writer: &mut ScopedArtifactSweepWriter<'_>,
+    interrupted_paths: &mut Vec<String>,
+    interrupted_paths_valid: &mut bool,
+    root: &Path,
+    reason: &'static str,
+    revoked: &mut Vec<RevokedInterruptedPath>,
+    blocked: &mut Vec<BlockedInterruptedPath>,
+) -> Result<bool, BrokerOpError> {
+    let revoked_paths = interrupted_paths
+        .iter()
+        .filter(|path| Path::new(path).starts_with(root))
+        .cloned()
+        .collect::<Vec<_>>();
+    if revoked_paths.is_empty() {
+        return Ok(true);
+    }
+    if !*interrupted_paths_valid {
+        blocked.extend(
+            revoked_paths
+                .into_iter()
+                .map(|path| BlockedInterruptedPath {
+                    path: Some(path),
+                    reason: "queue_unavailable_for_revocation",
+                }),
+        );
+        return Ok(false);
+    }
+    let mut updated_paths = interrupted_paths.clone();
+    updated_paths.retain(|path| !revoked_paths.contains(path));
+    if sweep_writer.persist_interrupted_paths(&updated_paths)? {
+        *interrupted_paths = updated_paths;
+        revoked.extend(
+            revoked_paths
+                .into_iter()
+                .map(|path| RevokedInterruptedPath {
+                    path,
+                    reason,
+                    canonical_path: None,
+                }),
+        );
+        Ok(true)
+    } else {
+        *interrupted_paths_valid = false;
+        blocked.extend(
+            revoked_paths
+                .into_iter()
+                .map(|path| BlockedInterruptedPath {
+                    path: Some(path),
+                    reason: "queue_update_unavailable",
+                }),
+        );
+        Ok(false)
+    }
+}
+
+/// Re-prove a remembered path before continuing removal. A known mismatch
+/// revokes only this path's old removal authority; an I/O failure is different
+/// because it says nothing about whether that authority is still valid.
+fn interrupted_tree_state(root: &Path, path: &Path, extras: &[String]) -> InterruptedTreeState {
     let Ok(relative) = path.strip_prefix(root) else {
-        return false;
+        return InterruptedTreeState::Revoked("outside_worktree");
     };
     let components = relative.components().collect::<Vec<_>>();
     if components.is_empty()
@@ -150,33 +313,140 @@ fn resumable_interrupted_tree(root: &Path, path: &Path, extras: &[String]) -> bo
             .iter()
             .all(|component| matches!(component, Component::Normal(_)))
     {
-        return false;
+        return InterruptedTreeState::Revoked("unsafe_path_components");
     }
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
+        return InterruptedTreeState::Revoked("invalid_artifact_name");
     };
     if crate::artifact_catalog::unattended_witness(name, extras).is_none() {
-        return false;
+        return InterruptedTreeState::Revoked("not_unattended_artifact");
     }
-    let real_directory = |candidate: &Path| {
-        std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_dir())
+    let inspect_directory = |candidate: &Path| match std::fs::symlink_metadata(candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            InterruptedTreeState::Revoked("symlink_component")
+        }
+        Ok(metadata) if metadata.is_dir() => InterruptedTreeState::Resume,
+        Ok(_) => InterruptedTreeState::Revoked("not_directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            InterruptedTreeState::Revoked("path_missing")
+        }
+        Err(_) => InterruptedTreeState::Unavailable("metadata_unavailable"),
     };
-    if !real_directory(root) {
-        return false;
+    let root_state = inspect_directory(root);
+    if root_state != InterruptedTreeState::Resume {
+        return root_state;
     }
     let mut walked = root.to_path_buf();
     for component in &components {
         walked.push(component);
-        if !real_directory(&walked) {
-            return false;
+        let state = inspect_directory(&walked);
+        if state != InterruptedTreeState::Resume {
+            return state;
         }
     }
     match (std::fs::canonicalize(root), std::fs::canonicalize(path)) {
         (Ok(canonical_root), Ok(canonical_path)) => {
-            canonical_path != canonical_root && canonical_path.starts_with(&canonical_root)
+            if canonical_path != canonical_root && canonical_path.starts_with(&canonical_root) {
+                InterruptedTreeState::Resume
+            } else {
+                InterruptedTreeState::Revoked("outside_worktree")
+            }
         }
-        _ => false,
+        (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            InterruptedTreeState::Revoked("path_missing")
+        }
+        _ => InterruptedTreeState::Unavailable("canonicalization_unavailable"),
     }
+}
+
+/// Read either the legacy single absolute path or the current bounded path
+/// queue. Invalid and oversized state is kept fail-closed by the caller.
+fn decode_interrupted_paths(value: Option<&str>) -> Result<Vec<String>, ()> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if value.len() > ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES {
+        return Err(());
+    }
+    let decoded = if value.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(value).map_err(|_| ())?
+    } else {
+        vec![value.to_string()]
+    };
+    if decoded.len() > ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX
+        || decoded.iter().any(|path| !Path::new(path).is_absolute())
+    {
+        return Err(());
+    }
+    let mut unique = Vec::with_capacity(decoded.len());
+    let mut seen = BTreeSet::new();
+    for path in decoded {
+        if seen.insert(path.clone()) {
+            unique.push(path);
+        }
+    }
+    Ok(unique)
+}
+
+fn has_parent_dir_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+/// Keep a one-path marker compatible with older brokers and encode multiple
+/// interrupted trees without ambiguous path delimiters.
+fn encode_interrupted_paths(paths: &[String]) -> Option<String> {
+    if paths.len() > ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX
+        || paths.iter().any(|path| !Path::new(path).is_absolute())
+    {
+        return None;
+    }
+    let value = match paths {
+        [] => String::new(),
+        [path] => path.clone(),
+        paths => serde_json::Value::Array(
+            paths
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+        .to_string(),
+    };
+    (value.len() <= ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES).then_some(value)
+}
+
+fn persist_interrupted_paths(
+    store: &mut crate::BrokerStore,
+    namespace: &str,
+    paths: &[String],
+) -> Result<bool, BrokerOpError> {
+    let Some(value) = encode_interrupted_paths(paths) else {
+        return Ok(false);
+    };
+    store.meta_set(
+        &scoped_artifact_sweep_key(namespace, ARTIFACT_SWEEP_INTERRUPTED_KEY),
+        &value,
+    )?;
+    Ok(true)
+}
+
+/// Drop paths that are conclusively absent or no longer directories. Keep
+/// symlinks for the per-worktree authority check, and preserve metadata errors
+/// as blockers rather than mistaking them for completed removals.
+fn prune_absent_interrupted_paths(paths: &mut Vec<String>) -> Vec<String> {
+    let mut unavailable = Vec::new();
+    paths.retain(|path| match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => true,
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            unavailable.push(path.clone());
+            true
+        }
+    });
+    unavailable
 }
 
 /// Wall-clock budget for one sweep pass. A broker open gets the smaller of the
@@ -190,37 +460,21 @@ fn artifact_sweep_budget_ms(
 ) -> u64 {
     match scope {
         ArtifactSweepScope::Inline => policy_budget_ms.min(INLINE_ARTIFACT_SWEEP_BUDGET_MS),
-        ArtifactSweepScope::Drain | ArtifactSweepScope::ClosedSession(_) => {
+        ArtifactSweepScope::Drain
+        | ArtifactSweepScope::AutomaticContinuation
+        | ArtifactSweepScope::ClosedSession(_) => {
             policy_budget_ms.saturating_mul(urgency.budget_scale())
         }
     }
 }
 
-fn is_real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+fn scope_runs_checkout_cleanup(scope: ArtifactSweepScope) -> bool {
+    scope != ArtifactSweepScope::AutomaticContinuation
+        && !matches!(scope, ArtifactSweepScope::ClosedSession(_))
 }
 
-/// Whether `path` or any entry directly inside it was modified within
-/// `window_ms` of `now`. One `read_dir`: tools that keep writing into a build
-/// directory touch its top level (Cargo's `debug/`, Vite's
-/// `node_modules/.vite`). An unreadable timestamp counts as recent.
-fn modified_within(path: &Path, now: i64, window_ms: i64) -> bool {
-    let recent = |metadata: std::io::Result<std::fs::Metadata>| {
-        metadata
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .is_none_or(|since| now.saturating_sub(since.as_millis() as i64) < window_ms)
-    };
-    if recent(std::fs::symlink_metadata(path)) {
-        return true;
-    }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return true;
-    };
-    entries
-        .flatten()
-        .any(|entry| recent(std::fs::symlink_metadata(entry.path())))
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
 fn days_between(now: i64, earlier: i64) -> u32 {
@@ -284,6 +538,93 @@ struct ArtifactCandidates {
 struct ArtifactScan {
     classified: Vec<PathBuf>,
     declined: Vec<PathBuf>,
+}
+
+struct BoundedArtifactDiscovery {
+    classified: Vec<PathBuf>,
+    complete: bool,
+    entries_examined: usize,
+}
+
+impl BoundedArtifactDiscovery {
+    fn new() -> Self {
+        Self {
+            classified: Vec::new(),
+            complete: true,
+            entries_examined: 0,
+        }
+    }
+}
+
+fn collect_artifact_dirs_bounded(
+    root: &Path,
+    extras: &[String],
+    deadline: Instant,
+    entry_budget: usize,
+) -> BoundedArtifactDiscovery {
+    fn visit(
+        current: &Path,
+        depth: usize,
+        extras: &[String],
+        deadline: Instant,
+        entry_budget: usize,
+        discovery: &mut BoundedArtifactDiscovery,
+    ) {
+        if !discovery.complete {
+            return;
+        }
+        if depth > ARTIFACT_SCAN_DEPTH {
+            // A depth cap is a discovery limit just like the entry budget: a
+            // hidden cache may exist below this point, so the caller must not
+            // advance the completed generation.
+            discovery.complete = false;
+            return;
+        }
+        if Instant::now() >= deadline || discovery.entries_examined >= entry_budget {
+            discovery.complete = false;
+            return;
+        }
+        let entries = match std::fs::read_dir(current) {
+            Ok(entries) => entries,
+            Err(_) => {
+                discovery.complete = false;
+                return;
+            }
+        };
+        for entry in entries {
+            if Instant::now() >= deadline || discovery.entries_examined >= entry_budget {
+                discovery.complete = false;
+                return;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    discovery.complete = false;
+                    return;
+                }
+            };
+            discovery.entries_examined = discovery.entries_examined.saturating_add(1);
+            let path = entry.path();
+            if !is_real_directory(&path) {
+                continue;
+            }
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            if artifact_witness_for_with_extras(&path, extras).is_some() {
+                discovery.classified.push(path);
+                continue;
+            }
+            visit(&path, depth + 1, extras, deadline, entry_budget, discovery);
+            if !discovery.complete {
+                return;
+            }
+        }
+    }
+
+    let mut discovery = BoundedArtifactDiscovery::new();
+    visit(root, 0, extras, deadline, entry_budget, &mut discovery);
+    discovery
 }
 
 /// Collect classified artifact directories and, when a checkout is supplied,
@@ -657,6 +998,335 @@ impl Drop for GcLock {
     }
 }
 
+const ARTIFACT_SWEEP_WORKER_LOCK_RELPATH: &str = ".aethyme/run/gc-artifact-worker.lock";
+
+/// Create the dedicated broker runtime directory and prove it remains inside
+/// the repository before opening the worker's advisory singleton lock.
+fn artifact_sweep_worker_lock_path(main_root: &Path) -> Result<PathBuf, BrokerOpError> {
+    let root = std::fs::canonicalize(main_root).map_err(|source| crate::BrokerError::Io {
+        path: main_root.to_path_buf(),
+        source,
+    })?;
+    let state_dir = root.join(".aethyme");
+    let state_metadata =
+        std::fs::symlink_metadata(&state_dir).map_err(|source| crate::BrokerError::Io {
+            path: state_dir.clone(),
+            source,
+        })?;
+    if !state_metadata.file_type().is_dir() {
+        return Err(worker_path_error(
+            &state_dir,
+            "repository state path is not a real directory",
+        ));
+    }
+
+    let run_dir = state_dir.join("run");
+    match std::fs::symlink_metadata(&run_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(worker_path_error(
+                &run_dir,
+                "broker runtime path is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(&run_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    return Err(crate::BrokerError::Io {
+                        path: run_dir.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            }
+            let metadata =
+                std::fs::symlink_metadata(&run_dir).map_err(|source| crate::BrokerError::Io {
+                    path: run_dir.clone(),
+                    source,
+                })?;
+            if !metadata.file_type().is_dir() {
+                return Err(worker_path_error(
+                    &run_dir,
+                    "broker runtime path is not a real directory",
+                ));
+            }
+        }
+        Err(source) => {
+            return Err(crate::BrokerError::Io {
+                path: run_dir.clone(),
+                source,
+            }
+            .into());
+        }
+    }
+    let canonical_run =
+        std::fs::canonicalize(&run_dir).map_err(|source| crate::BrokerError::Io {
+            path: run_dir.clone(),
+            source,
+        })?;
+    if !canonical_run.starts_with(&root) {
+        return Err(worker_path_error(
+            &run_dir,
+            "broker runtime path resolves outside the repository",
+        ));
+    }
+
+    let lock_path = canonical_run.join("gc-artifact-worker.lock");
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Err(worker_path_error(
+                        &lock_path,
+                        "worker lock file must not have hard links",
+                    ));
+                }
+            }
+        }
+        Ok(_) => {
+            return Err(worker_path_error(
+                &lock_path,
+                "worker lock path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(crate::BrokerError::Io {
+                path: lock_path,
+                source,
+            }
+            .into());
+        }
+    }
+    Ok(lock_path)
+}
+
+fn worker_path_error(path: &Path, message: &str) -> BrokerOpError {
+    crate::BrokerError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, message.to_string()),
+    }
+    .into()
+}
+
+fn artifact_worker_process_is_suppressed() -> bool {
+    cfg!(test)
+        || std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some()
+        || [
+            crate::BROKER_DB_ENV,
+            "AETHYME_TEST_DB_SUFFIX",
+            crate::disk_headroom::TEST_AVAILABLE_BYTES_ENV,
+            crate::disk_headroom::TEST_AVAILABLE_INODES_ENV,
+            "CARGO_MANIFEST_DIR",
+            "CARGO_TARGET_DIR",
+            "CARGO_BIN_EXE_aethyme",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+}
+
+/// Resolve only the router and paired engine that belong to this running
+/// installation. Never fall back to PATH: the detached process must be the
+/// exact broker runtime that recorded the request.
+fn artifact_worker_binaries() -> Option<(PathBuf, PathBuf)> {
+    let executable = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+    let installation = crate::update::detect_installation(&executable);
+    if installation.method == crate::update::InstallationMethod::Unknown {
+        return None;
+    }
+    if installation.method == crate::update::InstallationMethod::ManualArchive
+        && executable.components().any(|component| {
+            matches!(component, Component::Normal(name) if name == "target" || name == "deps")
+        })
+    {
+        return None;
+    }
+    let router = std::fs::canonicalize(installation.router_path).ok()?;
+    let engine = std::fs::canonicalize(installation.engine_path?).ok()?;
+    if router != executable
+        || router.parent().is_none()
+        || router.parent() != engine.parent()
+        || !engine.is_file()
+    {
+        return None;
+    }
+    Some((router, engine))
+}
+
+/// Keep cache-only continuation outside the launching broker's owned process
+/// group. Agent and inline supervisors tear down their group after the launcher
+/// exits; the worker's durable request/cursor make this independent lifetime
+/// recoverable without leaving it attached to that cleanup.
+#[cfg(unix)]
+fn configure_artifact_worker_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_artifact_worker_process_group(_: &mut Command) {
+    // This continuation remains best-effort on platforms without Unix groups.
+}
+
+fn worker_binary_version(binary: &Path) -> Option<String> {
+    let mut child = Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                crate::warn_unrecorded(
+                    "stop timed-out artifact worker version probe",
+                    child.kill(),
+                );
+                crate::warn_unrecorded(
+                    "reap timed-out artifact worker version probe",
+                    child.wait(),
+                );
+                return None;
+            }
+            Err(error) => {
+                crate::warn_unrecorded::<(), _>(
+                    "inspect artifact worker version probe",
+                    Err(error),
+                );
+                crate::warn_unrecorded("stop failed artifact worker version probe", child.kill());
+                crate::warn_unrecorded("reap failed artifact worker version probe", child.wait());
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()?
+        .take(4096)
+        .read_to_end(&mut stdout)
+        .ok()?;
+    String::from_utf8(stdout)
+        .ok()?
+        .lines()
+        .next()
+        .map(str::to_string)
+}
+
+pub(crate) fn artifact_worker_runtime_is_aligned() -> bool {
+    let Some((router, engine)) = artifact_worker_binaries() else {
+        return false;
+    };
+    let router_version = worker_binary_version(&router);
+    let engine_version = worker_binary_version(&engine);
+    let router_identity = router_version
+        .as_deref()
+        .and_then(crate::install_health::build_identity);
+    let engine_identity = engine_version
+        .as_deref()
+        .and_then(crate::install_health::build_identity);
+    matches!(
+        crate::install_health::pair_state(router_identity, engine_identity),
+        crate::install_health::PairState::Aligned(_)
+    )
+}
+
+fn worker_retry_pending(
+    store: &crate::BrokerStore,
+    namespace: &str,
+    now: i64,
+) -> Result<bool, BrokerOpError> {
+    Ok(store
+        .meta_get(&scoped_artifact_sweep_key(
+            namespace,
+            ARTIFACT_SWEEP_RETRY_AFTER_KEY,
+        ))?
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|retry_after| retry_after > now))
+}
+
+fn artifact_sweep_worker_lock_file(main_root: &Path) -> Result<std::fs::File, BrokerOpError> {
+    let path = artifact_sweep_worker_lock_path(main_root)?;
+    let file =
+        crate::file_lock::open_lock_file(&path).map_err(|source| crate::BrokerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    let named = std::fs::symlink_metadata(&path).map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let opened = file.metadata().map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if !named.file_type().is_file() || !opened.file_type().is_file() {
+        return Err(worker_path_error(
+            &path,
+            "worker lock path changed while it was opened",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if named.dev() != opened.dev()
+            || named.ino() != opened.ino()
+            || named.nlink() != 1
+            || opened.nlink() != 1
+        {
+            return Err(worker_path_error(
+                &path,
+                "worker lock path changed while it was opened",
+            ));
+        }
+    }
+    Ok(file)
+}
+
+/// Try to become the one process allowed to schedule or run continuation.
+pub(crate) fn try_artifact_sweep_worker_lock(
+    main_root: &Path,
+) -> Result<Option<crate::file_lock::ExclusiveFileLock>, BrokerOpError> {
+    let file = artifact_sweep_worker_lock_file(main_root)?;
+    crate::file_lock::ExclusiveFileLock::try_acquire(file).map_err(|source| {
+        crate::BrokerError::Io {
+            path: main_root.join(ARTIFACT_SWEEP_WORKER_LOCK_RELPATH),
+            source,
+        }
+        .into()
+    })
+}
+
+/// Worker entry acquires the same lock before Broker::open, so its open-time
+/// maintenance cannot overlap another worker or create an ordinary inline
+/// sweep ahead of cache-only continuation.
+#[cfg(test)]
+pub(crate) fn acquire_artifact_sweep_worker_lock(
+    main_root: &Path,
+) -> Result<crate::file_lock::ExclusiveFileLock, BrokerOpError> {
+    let file = artifact_sweep_worker_lock_file(main_root)?;
+    crate::file_lock::ExclusiveFileLock::acquire(file).map_err(|source| {
+        crate::BrokerError::Io {
+            path: main_root.join(ARTIFACT_SWEEP_WORKER_LOCK_RELPATH),
+            source,
+        }
+        .into()
+    })
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), BrokerOpError> {
     let parent = path
         .parent()
@@ -721,146 +1391,234 @@ fn check_deadline(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
-/// How many times a directory whose `rmdir` raced a writer is swept again
-/// before the failure is reported. macOS writes `.DS_Store` into directories
-/// as they are browsed, so a removal that takes minutes can find a file in a
-/// directory it already emptied. The second sweep has nothing left to walk and
-/// costs milliseconds, which is far too short a window to lose again.
-const TREE_REMOVAL_ATTEMPTS: usize = 3;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TreeRemoval {
-    /// The directory is gone.
-    Complete,
-    /// The budget ran out. The directory is still there, still carrying the
-    /// evidence that classifies it, and the next pass resumes it.
-    Interrupted,
+fn scoped_artifact_sweep_key(namespace: &str, legacy_key: &str) -> String {
+    let suffix = legacy_key
+        .strip_prefix(ARTIFACT_SWEEP_META_PREFIX)
+        .unwrap_or(legacy_key);
+    format!("gc.artifact_sweep.v2.{namespace}.{suffix}")
 }
 
-/// Remove a condemned directory tree without ever losing the evidence that it
-/// was condemned.
-///
-/// Two properties `std::fs::remove_dir_all` does not have, both of which this
-/// code path needs:
-///
-/// * **Resumable.** Removing a multi-gigabyte `target/` takes minutes, which
-///   no budget on a broker-open path can absorb, and a deadline checked only
-///   between whole directories is no deadline at all. Entries go one at a
-///   time, and every call removes at least one of them before the deadline is
-///   consulted, so a budget too small to be worth spending still buys ground.
-///
-///   What makes an interrupted removal safe to resume is `keep_until_last`:
-///   the entry that proves what this directory is -- `CACHEDIR.TAG` for a
-///   cargo target, the root marker for an orphaned worktree root -- is taken
-///   only once everything else is gone. Remove it first and an interrupted
-///   run leaves an unclassifiable directory that GC must then refuse to
-///   touch, which is how a half-finished removal becomes permanent.
-///
-/// * **Tolerant of a racing writer.** Finder and Spotlight write `.DS_Store`
-///   into directories while they are being walked, so the final `rmdir` of a
-///   long removal fails `ENOTEMPTY` against a file created after that
-///   directory was already emptied. A directory that refuses to go is swept
-///   again rather than aborting the caller's whole run.
-pub(crate) fn remove_condemned_tree(
-    dir: &Path,
-    keep_until_last: Option<&str>,
-    deadline: Option<Instant>,
-) -> std::io::Result<TreeRemoval> {
-    let mut attempts_left = TREE_REMOVAL_ATTEMPTS;
-    loop {
-        attempts_left -= 1;
-        if !is_real_directory(dir) {
-            return Ok(TreeRemoval::Complete);
+fn bounded_legacy_artifact_sweep_meta_get(
+    store: &crate::BrokerStore,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, BrokerOpError> {
+    let value = store
+        .connection()
+        .query_row(
+            "SELECT typeof(value), length(CAST(value AS BLOB)),
+                    CASE WHEN typeof(value) = 'text'
+                              AND length(CAST(value AS BLOB)) <= ?2
+                         THEN CAST(value AS BLOB)
+                         ELSE NULL
+                    END
+             FROM meta WHERE key = ?1",
+            rusqlite::params![key, max_bytes as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    match value {
+        None => Ok(None),
+        Some((kind, Some(length), Some(bytes)))
+            if kind == "text"
+                && length >= 0
+                && length as usize <= max_bytes
+                && bytes.len() == length as usize =>
+        {
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| BrokerOpError::InvalidStorageContext {
+                    reason: format!("legacy artifact-sweep field {key} is not UTF-8")
+                        .into_boxed_str(),
+                })
         }
-        if drain_directory(dir, keep_until_last, deadline)? == TreeRemoval::Interrupted {
-            return Ok(TreeRemoval::Interrupted);
-        }
-        if let Some(name) = keep_until_last {
-            remove_entry(&dir.join(name), false)?;
-        }
-        match std::fs::remove_dir(dir) {
-            Ok(()) => return Ok(TreeRemoval::Complete),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(TreeRemoval::Complete);
-            }
-            Err(error) if attempts_left == 0 => return Err(error),
-            // Something reappeared underneath while we walked. Sweep again.
-            Err(_) => {}
-        }
-    }
-}
-
-/// Empty one directory depth-first, leaving the directory itself in place.
-///
-/// `keep_until_last` is skipped at this level only; the recursion never defers
-/// anything, because only the top directory carries the witness.
-fn drain_directory(
-    dir: &Path,
-    keep_until_last: Option<&str>,
-    deadline: Option<Instant>,
-) -> std::io::Result<TreeRemoval> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(TreeRemoval::Complete);
-        }
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if keep_until_last.is_some_and(|name| entry.file_name() == std::ffi::OsStr::new(name)) {
-            continue;
-        }
-        let path = entry.path();
-        // `DirEntry::file_type` does not follow symlinks, so a link to a
-        // directory is unlinked rather than followed and emptied.
-        let is_directory = match entry.file_type() {
-            Ok(file_type) => file_type.is_dir(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if is_directory && drain_directory(&path, None, deadline)? == TreeRemoval::Interrupted {
-            return Ok(TreeRemoval::Interrupted);
-        }
-        remove_entry(&path, is_directory)?;
-        // Checked after the entry, never before: a pass that removes nothing
-        // is a pass that will be repeated forever. Budgets small enough to be
-        // spent on the scan alone are the normal case on a broker open, so
-        // every call has to be worth at least one unlink.
-        if check_deadline(deadline) {
-            return Ok(TreeRemoval::Interrupted);
-        }
-    }
-    Ok(TreeRemoval::Complete)
-}
-
-/// Unlink one entry, treating "already gone" as the outcome we wanted.
-///
-/// A nested directory that a writer refilled is left alone: it resurfaces as
-/// the parent's `ENOTEMPTY`, which is what the retry in
-/// [`remove_condemned_tree`] exists to absorb. Reporting it here would abort a
-/// removal that is one cheap sweep away from finishing.
-fn remove_entry(path: &Path, is_directory: bool) -> std::io::Result<()> {
-    let removed = if is_directory {
-        std::fs::remove_dir(path)
-    } else {
-        std::fs::remove_file(path)
-    };
-    match removed {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) if is_directory && error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-            Ok(())
-        }
-        Err(error) => Err(error),
+        Some(_) => Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "legacy artifact-sweep field {key} is non-text or exceeds its {max_bytes}-byte inspection bound"
+            )
+            .into_boxed_str(),
+        }),
     }
 }
 
 impl Broker {
+    fn ensure_artifact_sweep_namespace(&mut self) -> Result<String, BrokerOpError> {
+        if let Some(namespace) = self.artifact_sweep_namespace.get() {
+            return Ok(namespace.clone());
+        }
+        let namespace = self.storage_context().artifact_sweep_namespace()?;
+        let registration = self.store().register_artifact_sweep_namespace(&namespace)?;
+        match registration {
+            crate::broker::ArtifactSweepNamespaceRegistration::Registered => {
+                Ok(self
+                    .artifact_sweep_namespace
+                    .get_or_init(|| namespace.clone())
+                    .clone())
+            }
+            crate::broker::ArtifactSweepNamespaceRegistration::AtCapacity => {
+                Err(BrokerOpError::InvalidStorageContext {
+                    reason: "artifact-sweep context registry is full (64 namespaces); no sweep state was read or changed".into(),
+                })
+            }
+            crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry => {
+                Err(BrokerOpError::InvalidStorageContext {
+                    reason: "artifact-sweep context registry is invalid or exceeds its 8 KiB bound; its raw value was preserved and maintenance refused".into(),
+                })
+            }
+        }
+    }
+
+    fn artifact_sweep_namespace(&self) -> Result<&str, BrokerOpError> {
+        self.artifact_sweep_namespace
+            .get()
+            .map(String::as_str)
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "artifact-sweep context namespace was not registered before state access"
+                    .into(),
+            })
+    }
+
+    fn artifact_sweep_key(&self, legacy_key: &str) -> Result<String, BrokerOpError> {
+        Ok(scoped_artifact_sweep_key(
+            self.artifact_sweep_namespace()?,
+            legacy_key,
+        ))
+    }
+
+    fn artifact_sweep_meta_get(
+        &mut self,
+        legacy_key: &str,
+    ) -> Result<Option<String>, BrokerOpError> {
+        self.ensure_artifact_sweep_namespace()?;
+        let key = self.artifact_sweep_key(legacy_key)?;
+        Ok(self.store().meta_get(&key)?)
+    }
+
+    fn artifact_sweep_meta_set(
+        &mut self,
+        legacy_key: &str,
+        value: &str,
+    ) -> Result<(), BrokerOpError> {
+        self.ensure_artifact_sweep_namespace()?;
+        let key = self.artifact_sweep_key(legacy_key)?;
+        self.store().meta_set(&key, value)?;
+        Ok(())
+    }
+
+    /// Inspect the nine pre-v2 sweep keys within their write bounds. Any
+    /// malformed, oversized or non-text value remains untouched and is
+    /// surfaced as unresolved legacy state.
+    fn legacy_artifact_sweep_state(&mut self) -> ArtifactSweepLegacyUnscopedState {
+        let inspect = (|| -> Result<bool, BrokerOpError> {
+            let read_scalar = |broker: &mut Self, key| {
+                bounded_legacy_artifact_sweep_meta_get(
+                    broker.store(),
+                    key,
+                    ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES,
+                )
+            };
+            let stamp = read_scalar(self, ARTIFACT_SWEEP_STAMP_KEY)?;
+            let cursor = read_scalar(self, ARTIFACT_SWEEP_CURSOR_KEY)?;
+            let progress = read_scalar(self, ARTIFACT_SWEEP_PROGRESS_KEY)?;
+            let interrupted = bounded_legacy_artifact_sweep_meta_get(
+                self.store(),
+                ARTIFACT_SWEEP_INTERRUPTED_KEY,
+                ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES,
+            )?;
+            let blocked = bounded_legacy_artifact_sweep_meta_get(
+                self.store(),
+                ARTIFACT_SWEEP_BLOCKED_PATHS_KEY,
+                ARTIFACT_SWEEP_BLOCKED_PATHS_VALUE_MAX_BYTES,
+            )?;
+            let requested = read_scalar(self, ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?;
+            let completed = read_scalar(self, ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)?;
+            let retry_after = read_scalar(self, ARTIFACT_SWEEP_RETRY_AFTER_KEY)?;
+            let _worker_status = read_scalar(self, ARTIFACT_SWEEP_WORKER_STATUS_KEY)?;
+
+            let parse_nonnegative = |value: Option<String>| -> Result<i64, ()> {
+                match value.as_deref().filter(|value| !value.is_empty()) {
+                    None => Ok(0),
+                    Some(value) => value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|value| *value >= 0)
+                        .ok_or(()),
+                }
+            };
+            let stamp =
+                parse_nonnegative(stamp).map_err(|()| BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep stamp is malformed".into(),
+                })?;
+            let cursor =
+                parse_nonnegative(cursor).map_err(|()| BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep cursor is malformed".into(),
+                })?;
+            let progress =
+                parse_nonnegative(progress).map_err(|()| BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep progress is malformed".into(),
+                })?;
+            let requested = parse_nonnegative(requested).map_err(|()| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep request is malformed".into(),
+                }
+            })?;
+            let completed = parse_nonnegative(completed).map_err(|()| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep completion is malformed".into(),
+                }
+            })?;
+            let retry_after = parse_nonnegative(retry_after).map_err(|()| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep retry time is malformed".into(),
+                }
+            })?;
+            if completed > requested {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep request/completion state is inconsistent".into(),
+                });
+            }
+            let interrupted_pending = match interrupted.as_deref() {
+                None | Some("") => false,
+                Some(value) => !decode_interrupted_paths(Some(value))
+                    .map_err(|()| BrokerOpError::InvalidStorageContext {
+                        reason: "legacy artifact-sweep interrupted-path state is malformed".into(),
+                    })?
+                    .is_empty(),
+            };
+            let blocked_pending = match blocked.as_deref() {
+                None | Some("") => false,
+                Some(value) => {
+                    let paths =
+                        serde_json::from_str::<Vec<serde_json::Value>>(value).map_err(|_| {
+                            BrokerOpError::InvalidStorageContext {
+                                reason: "legacy artifact-sweep blocked-path state is malformed"
+                                    .into(),
+                            }
+                        })?;
+                    !paths.is_empty()
+                }
+            };
+            let pending = cursor > 0
+                || progress > 0
+                || interrupted_pending
+                || blocked_pending
+                || requested > completed
+                || retry_after > now_ms();
+            let _last_stamp = stamp;
+            Ok(pending)
+        })();
+        match inspect {
+            Ok(true) | Err(_) => ArtifactSweepLegacyUnscopedState::UnknownPending,
+            Ok(false) => ArtifactSweepLegacyUnscopedState::Clear,
+        }
+    }
+
     /// Build directories inside retained worktrees, for sessions idle at least
     /// `artifact_reclaim_days`.
     ///
@@ -1129,48 +1887,143 @@ impl Broker {
             return Ok((Vec::new(), false));
         }
         let plan = self.worktree_root_plan()?;
-        let Some(container) = plan.root_container.clone() else {
-            return Ok((Vec::new(), true));
-        };
-        let Ok(entries) = std::fs::read_dir(&container) else {
-            return Ok((Vec::new(), false));
-        };
+        let database = self.host_operation_database_path()?;
+        let inventory = crate::worktree_registry::inventory(&database, deadline);
+        let mut complete = inventory.complete;
+        for reason in inventory.issues {
+            blockers.push(GcBlocker {
+                kind: "worktree_root_history_uninspected".into(),
+                id: None,
+                reason,
+            });
+        }
+        let records: std::collections::BTreeMap<_, _> = inventory
+            .roots
+            .into_iter()
+            .map(|record| (record.root.clone(), record))
+            .collect();
+        let mut roots: std::collections::BTreeSet<_> = records.keys().cloned().collect();
+        roots.extend(plan.preferred_root);
+        roots.extend(plan.host_state_fallback_root);
+        roots.insert(plan.legacy_fallback_root);
+        if let Some(container) = plan.root_container {
+            match std::fs::read_dir(container) {
+                Ok(entries) => {
+                    for (index, entry) in entries.enumerate() {
+                        if index >= 8192
+                            || deadline
+                                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                        {
+                            complete = false;
+                            break;
+                        }
+                        match entry {
+                            Ok(entry) => {
+                                roots.insert(entry.path());
+                            }
+                            Err(error) => {
+                                complete = false;
+                                blockers.push(GcBlocker {
+                                    kind: "worktree_root_history_uninspected".into(),
+                                    id: None,
+                                    reason: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_root_history_uninspected".into(),
+                        id: None,
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
         let mut candidates = Vec::new();
-        let mut complete = true;
-        for entry in entries.flatten() {
+        let mut inspected_roots = std::collections::BTreeSet::new();
+        for root in roots {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 complete = false;
                 break;
             }
-            let root = entry.path();
             if !is_real_directory(&root) {
                 continue;
             }
-            let key = root.file_name().unwrap_or_default().to_string_lossy();
-            if key == plan.repository_key {
+            // Registry records use canonical roots. Container discovery may
+            // reach the same directory through an ancestor alias (for example
+            // macOS /var and /private/var); compare the same identity once.
+            // Reject a symlink leaf above before resolving ancestor aliases.
+            let root = match std::fs::canonicalize(&root) {
+                Ok(root) => root,
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_root_history_uninspected".into(),
+                        id: None,
+                        reason: format!("{}: {error}", root.display()),
+                    });
+                    continue;
+                }
+            };
+            if !inspected_roots.insert(root.clone()) {
                 continue;
             }
-            let marker_path = root.join(WORKTREE_ROOT_MARKER);
-            let Ok(bytes) = std::fs::read(&marker_path) else {
-                // No breadcrumb means no provable owner; never remove blind.
-                blockers.push(GcBlocker {
-                    kind: "unmarked_worktree_root".into(),
-                    id: None,
-                    reason: format!("{key} has no {WORKTREE_ROOT_MARKER} and is never swept"),
-                });
-                continue;
+            let marker = match crate::worktree_registry::read_marker(&root) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "unmarked_worktree_root".into(),
+                        id: None,
+                        reason: format!(
+                            "{}: {error}; never swept without ownership evidence",
+                            root.display()
+                        ),
+                    });
+                    continue;
+                }
             };
-            let Ok(marker) = serde_json::from_slice::<WorktreeRootMarker>(&bytes) else {
-                blockers.push(GcBlocker {
-                    kind: "unmarked_worktree_root".into(),
-                    id: None,
-                    reason: format!("{key} has an unreadable {WORKTREE_ROOT_MARKER}"),
-                });
-                continue;
-            };
-            if marker.repository_root.exists() {
-                continue;
+            // An existing origin always prevents orphan deletion. Missing
+            // legacy origins cannot be upgraded into mounted-volume proof.
+            match std::fs::symlink_metadata(&marker.repository_root) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_origin_uninspected".into(),
+                        id: None,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
             }
+            let fingerprint = records
+                .get(&root)
+                .ok_or_else(|| "root has no saved origin filesystem identity".to_string())
+                .and_then(|record| {
+                    crate::worktree_registry::ownership_fingerprint(record)
+                        .map_err(|error| error.to_string())
+                });
+            let fingerprint = match fingerprint {
+                Ok(fingerprint) => fingerprint,
+                Err(reason) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_origin_uninspected".into(),
+                        id: None,
+                        reason: format!(
+                            "{}: {reason}; retain until independently adopted",
+                            root.display()
+                        ),
+                    });
+                    continue;
+                }
+            };
             let age_days = std::fs::metadata(&root)
                 .and_then(|metadata| metadata.modified())
                 .ok()
@@ -1182,7 +2035,8 @@ impl Broker {
                     kind: "orphan_grace".into(),
                     id: None,
                     reason: format!(
-                        "orphaned root {key} is younger than the {} day grace period",
+                        "orphaned root {} is younger than the {} day grace period",
+                        root.display(),
                         policy.orphan_worktree_roots_days
                     ),
                 });
@@ -1207,7 +2061,9 @@ impl Broker {
                 repository_root: marker.repository_root.to_string_lossy().into_owned(),
                 estimated_bytes: usage.map_or(0, |usage| usage.bytes),
                 estimated_inodes: usage.map(|usage| usage.inodes),
-                reason: "owning repository no longer exists".into(),
+                ownership_fingerprint: Some(fingerprint),
+                reason: "owning repository no longer exists on its recorded mounted filesystem"
+                    .into(),
             });
         }
         candidates.sort_by(|left, right| left.worktree_root.cmp(&right.worktree_root));
@@ -1622,24 +2478,26 @@ impl Broker {
                     .collect()
             })
             .unwrap_or_default();
-        let (gate_cache, gate_caches) = match crate::gate_cache_gc::location(&main_root) {
-            Some(location) => {
-                let (inventory, candidates) = crate::gate_cache_gc::inspect(
-                    &main_root,
-                    &location,
-                    crate::gate_cache_gc::KeepRule {
-                        budget_bytes: policy.gate_cache_bytes_budget,
-                        include_active: include_active_gate_cache,
-                        configured_keys: &configured_keys,
-                    },
-                    evaluated_at,
-                    scan,
-                    &mut size_records,
-                );
-                (Some(inventory), candidates)
-            }
-            None => (None, Vec::new()),
-        };
+        let gate_storage = self.storage_context().gate_storage_locations();
+        let (gate_cache, gate_caches) =
+            match crate::gate_cache_gc::location_in(&main_root, &gate_storage) {
+                Some(location) => {
+                    let (inventory, candidates) = crate::gate_cache_gc::inspect(
+                        &main_root,
+                        &location,
+                        crate::gate_cache_gc::KeepRule {
+                            budget_bytes: policy.gate_cache_bytes_budget,
+                            include_active: include_active_gate_cache,
+                            configured_keys: &configured_keys,
+                        },
+                        evaluated_at,
+                        scan,
+                        &mut size_records,
+                    );
+                    (Some(inventory), candidates)
+                }
+                None => (None, Vec::new()),
+            };
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             deferred_checks.push("gate_cache_inventory".into());
         }
@@ -2108,6 +2966,23 @@ impl Broker {
     /// git-ignored build caches, which hold no contribution and are recovered
     /// by rebuilding.
     pub(crate) fn resume_gc_maintenance(&mut self) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        let continuation_worker = std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some();
+        if continuation_worker {
+            // This process is deliberately cache-only. In particular, do not
+            // resume an unrelated authorized checkout-removal journal from
+            // Broker::open before the worker's own scoped pass.
+            return Ok(None);
+        }
+        // Rotation publishes a durable witness before it changes the shared
+        // cache store, then requests the detached worker. A crash between
+        // those operations must not leave the retired store undiscoverable
+        // until another preparation writer runs. This bounded, read-only
+        // probe uses the Broker-captured cache root and only requests the
+        // existing cache-only continuation; it is never deletion authority.
+        crate::warn_unrecorded(
+            "record preparation-cache rotation recovery request",
+            self.request_recovery_for_rotation_debt(),
+        );
         let policy = load_retention_policy(self.main_root())?;
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let resumed = match load_journal(&journal_path)? {
@@ -2118,8 +2993,46 @@ impl Broker {
         };
         // The sweep only reclaims rebuildable caches, and this runs inside
         // broker open: its failure must not stop every command.
-        let _ = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline);
+        crate::warn_unrecorded(
+            "run bounded inline artifact sweep",
+            self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline),
+        );
+        // Inline admission stays capped at 250 ms. A detached, installed
+        // worker continues only the durable cache sweep when that pass leaves
+        // an unfinished lap or a pressure-triggered request is pending.
+        crate::warn_unrecorded(
+            "start artifact sweep continuation worker",
+            self.maybe_start_artifact_sweep_worker(false),
+        );
         Ok(resumed)
+    }
+
+    fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
+        let storage = self.storage_context();
+        let probe = match (
+            storage.preparation_cache_root(),
+            storage.host_resource_db_path.as_deref(),
+        ) {
+            (Some(cache_root), Some(resource_db_path)) => {
+                crate::preparation::probe_rotation_recovery(
+                    &cache_root,
+                    resource_db_path,
+                    PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES,
+                    Instant::now() + PREPARATION_ROTATION_DEBT_PROBE_BUDGET,
+                )
+            }
+            _ => crate::preparation::rotation_debt::DebtProbe::Unknown,
+        };
+        if probe == crate::preparation::rotation_debt::DebtProbe::NoDebt
+            || self.artifact_sweep_recovery_requested()?
+        {
+            return Ok(());
+        }
+        // Keep one durable request pending while the root is Pending or
+        // Unknown. Do not bump its generation on every ordinary open: a
+        // previous worker may have intentionally set retry backoff after
+        // making no progress.
+        self.persist_artifact_sweep_recovery_request()
     }
 
     /// Run the autonomous artifact sweep now with the full policy budget,
@@ -2134,6 +3047,7 @@ impl Broker {
             complete: outcome.complete,
             budget_ms,
             disk_pressured: urgency == crate::disk_headroom::SweepUrgency::Pressured,
+            legacy_unscoped_state: self.legacy_artifact_sweep_state(),
             auto_cleanup: outcome.auto_cleanup,
         })
     }
@@ -2152,19 +3066,285 @@ impl Broker {
             .map(Some)
     }
 
+    /// Persist an automatic recovery request when an admission failure or an
+    /// unfinished bounded sweep has exposed durable cache backlog. The marker
+    /// is intentionally separate from the cadence/cursor state: normal broker
+    /// opens can request a worker without pretending that the foreground pass
+    /// finished or resetting its resume point.
+    /// Record the durable request without launching the detached process.
+    /// Preparation uses this while holding its shared-cache lease, then starts
+    /// the worker only after the lease has been released successfully.
+    pub(crate) fn persist_artifact_sweep_recovery_request(&mut self) -> Result<(), BrokerOpError> {
+        let prior = self
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        // Treat every pressure refusal as a fresh generation. The worker
+        // compares this token before clearing its request, so a new refusal
+        // racing the end of a complete lap cannot disappear.
+        let requested_at = now_ms().max(prior.saturating_add(1)).max(1);
+        self.artifact_sweep_meta_set(
+            ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+            &requested_at.to_string(),
+        )?;
+        self.artifact_sweep_meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")?;
+        Ok(())
+    }
+
+    /// Launch recovery after the request is durable and any conflicting
+    /// preparation lease has been released.
+    pub(crate) fn start_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
+        self.maybe_start_artifact_sweep_worker(true)?;
+        Ok(())
+    }
+
+    /// Launch the installed router as a detached cache-only continuation.
+    /// The OS advisory lock is the singleton; its file stays content-free.
+    fn maybe_start_artifact_sweep_worker(
+        &mut self,
+        pressure_request: bool,
+    ) -> Result<(), BrokerOpError> {
+        let root = self.main_root().to_path_buf();
+        if crate::host_state::path_is_ephemeral(&root)
+            || artifact_worker_process_is_suppressed()
+            || !self.artifact_sweep_backlog_pending()?
+        {
+            return Ok(());
+        }
+        if !pressure_request {
+            let namespace = self.artifact_sweep_namespace()?.to_string();
+            if worker_retry_pending(self.store(), &namespace, now_ms())? {
+                return Ok(());
+            }
+        }
+        let Some((router, _engine)) = artifact_worker_binaries() else {
+            self.defer_artifact_sweep_worker("runtime_unverified")?;
+            return Ok(());
+        };
+        let Some(lock) = try_artifact_sweep_worker_lock(&root)? else {
+            return Ok(());
+        };
+        if !artifact_worker_runtime_is_aligned() {
+            self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
+            return Ok(());
+        }
+        let canonical_root =
+            std::fs::canonicalize(&root).map_err(|source| crate::BrokerError::Io {
+                path: root.clone(),
+                source,
+            })?;
+        let mut command = Command::new(&router);
+        command
+            .args(["broker", "gc", "__continue-artifacts"])
+            .arg(&canonical_root)
+            .current_dir(&canonical_root)
+            .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if self
+            .configure_storage_context_for_child(&mut command)
+            .is_err()
+        {
+            self.defer_artifact_sweep_worker("storage_context_unavailable")?;
+            return Ok(());
+        }
+        configure_artifact_worker_process_group(&mut command);
+        let _child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.defer_artifact_sweep_worker(&format!("worker_launch_failed: {error}"))?;
+                return Ok(());
+            }
+        };
+        // The advisory lock is intentionally content-free. Writing a PID
+        // here could truncate another file if the lock path were hard-linked
+        // between validation and open. Dropping the parent lock lets the
+        // child (which already exists and is blocked on the same OS lock) take
+        // over without a PID race.
+        drop(lock);
+        Ok(())
+    }
+
+    /// Execute the detached worker's bounded, cache-only continuation loop.
+    /// It exits after three passes without an actual unlink, or after a fixed
+    /// pass or wall-clock limit even when positive partial deletion continues.
+    /// It leaves the durable request/cursor in place and backs off so open
+    /// files or a concurrent writer cannot keep a background process alive
+    /// forever.
+    pub(crate) fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
+        if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1")) {
+            self.write_artifact_sweep_worker_status("refused_environment")?;
+            return Ok(());
+        }
+        if crate::host_state::path_is_ephemeral(self.main_root()) {
+            self.write_artifact_sweep_worker_status("refused_ephemeral_repository")?;
+            return Ok(());
+        }
+        if !self.artifact_sweep_backlog_pending()? {
+            self.write_artifact_sweep_worker_status("no_backlog")?;
+            return Ok(());
+        }
+        let namespace = self.artifact_sweep_namespace()?.to_string();
+        if worker_retry_pending(self.store(), &namespace, now_ms())? {
+            self.write_artifact_sweep_worker_status("retry_deferred")?;
+            return Ok(());
+        }
+        if !artifact_worker_runtime_is_aligned() {
+            self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
+            return Ok(());
+        }
+        let policy = load_retention_policy(self.main_root())?;
+        if policy.artifact_sweep_budget_ms == 0 {
+            self.defer_artifact_sweep_worker("artifact_sweep_disabled")?;
+            return Ok(());
+        }
+        let request_generation = self
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        self.run_artifact_sweep_recovery_worker_loop(
+            &policy,
+            request_generation,
+            Some(ARTIFACT_SWEEP_WORKER_MAX_PASSES),
+            Some(ARTIFACT_SWEEP_WORKER_MAX_DURATION),
+            |broker, policy, remaining| {
+                let deadline = remaining.map(|remaining| Instant::now() + remaining);
+                broker.sweep_artifacts_autonomously_with_deadline(
+                    policy,
+                    ArtifactSweepScope::AutomaticContinuation,
+                    deadline,
+                )
+            },
+        )
+    }
+
+    /// The durable worker loop is separated from the installed-runtime gate
+    /// so child-process tests can drive its real generation/cursor behavior
+    /// with the test harness binary. Production always calls it through
+    /// `run_artifact_sweep_recovery_worker` after runtime validation.
+    fn run_artifact_sweep_recovery_worker_loop(
+        &mut self,
+        policy: &RetentionPolicy,
+        request_generation: i64,
+        max_passes: Option<usize>,
+        max_duration: Option<Duration>,
+        mut sweep_pass: impl FnMut(
+            &mut Self,
+            &RetentionPolicy,
+            Option<Duration>,
+        ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError>,
+    ) -> Result<(), BrokerOpError> {
+        let started_at = Instant::now();
+        let mut passes = 0usize;
+        let mut no_progress_passes = 0usize;
+        let mut entries_reclaimed = 0usize;
+        loop {
+            let remaining = max_duration.map(|limit| limit.saturating_sub(started_at.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                self.defer_artifact_sweep_worker(&format!(
+                    "time_limit passes={passes} entries={entries_reclaimed}"
+                ))?;
+                return Ok(());
+            }
+            passes = passes.saturating_add(1);
+            let (outcome, pass_entries_reclaimed) = match sweep_pass(self, policy, remaining) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.defer_artifact_sweep_worker(&format!("sweep_failed: {error}"))?;
+                    return Ok(());
+                }
+            };
+            entries_reclaimed = entries_reclaimed.saturating_add(pass_entries_reclaimed);
+            if max_duration.is_some_and(|limit| started_at.elapsed() >= limit) {
+                self.defer_artifact_sweep_worker(&format!(
+                    "time_limit passes={passes} entries={entries_reclaimed}"
+                ))?;
+                return Ok(());
+            }
+            if outcome.complete {
+                // Preserve request history and advance only the generation
+                // this pass actually covered. A pressure refusal arriving
+                // between this write and the next open remains pending.
+                self.artifact_sweep_meta_set(
+                    ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY,
+                    &request_generation.to_string(),
+                )?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")?;
+                self.write_artifact_sweep_worker_status(&format!(
+                    "complete passes={passes} entries={entries_reclaimed}"
+                ))?;
+                return Ok(());
+            }
+            if max_passes.is_some_and(|limit| passes >= limit) {
+                // Keep the request and cursor pending for a later normal open
+                // after bounded positive work. A test can set a smaller limit
+                // to exercise process restart at this same checkpoint.
+                self.defer_artifact_sweep_worker(&format!(
+                    "pass_limit passes={passes} entries={entries_reclaimed}"
+                ))?;
+                return Ok(());
+            }
+            if pass_entries_reclaimed == 0 {
+                no_progress_passes = no_progress_passes.saturating_add(1);
+                if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
+                    self.defer_artifact_sweep_worker(&format!(
+                        "no_progress passes={passes} entries={entries_reclaimed}"
+                    ))?;
+                    return Ok(());
+                }
+                let sleep = Duration::from_millis(1_000);
+                let remaining = max_duration
+                    .map(|limit| limit.saturating_sub(started_at.elapsed()))
+                    .unwrap_or(sleep);
+                std::thread::sleep(sleep.min(remaining));
+            } else {
+                no_progress_passes = 0;
+            }
+        }
+    }
+
+    fn defer_artifact_sweep_worker(&mut self, reason: &str) -> Result<(), BrokerOpError> {
+        let retry_after = now_ms().saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS);
+        self.artifact_sweep_meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, &retry_after.to_string())?;
+        self.write_artifact_sweep_worker_status(reason)
+    }
+
+    fn write_artifact_sweep_worker_status(&mut self, status: &str) -> Result<(), BrokerOpError> {
+        // The value is intentionally bounded and replaced rather than logged
+        // to a file that could itself grow without limit.
+        let bounded = status.chars().take(160).collect::<String>();
+        self.artifact_sweep_meta_set(ARTIFACT_SWEEP_WORKER_STATUS_KEY, &bounded)?;
+        Ok(())
+    }
+
+    /// Whether a recovery request remains durable. The worker advances a
+    /// separate completed generation only after a complete cache-only lap;
+    /// interruptions retain this marker and the existing sweep cursor/tree.
+    pub(crate) fn artifact_sweep_recovery_requested(&mut self) -> Result<bool, BrokerOpError> {
+        let requested = self
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(requested > completed)
+    }
+
     /// An earlier pass stopped at its budget and has not finished a lap since.
     fn artifact_sweep_backlog_pending(&mut self) -> Result<bool, BrokerOpError> {
         let cursor = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let partial = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        Ok(cursor != 0 || partial != 0)
+        Ok(cursor != 0 || partial != 0 || self.artifact_sweep_recovery_requested()?)
     }
 
     /// Whether the millisecond stamp under `key` is set and younger than
@@ -2176,31 +3356,84 @@ impl Broker {
         window_ms: i64,
     ) -> Result<bool, BrokerOpError> {
         Ok(self
-            .store()
-            .meta_get(key)?
+            .artifact_sweep_meta_get(key)?
             .and_then(|value| value.parse::<i64>().ok())
             .is_some_and(|last| last > 0 && now.saturating_sub(last) < window_ms))
     }
 
     fn artifact_sweep_budget(
-        &self,
+        &mut self,
         policy: &RetentionPolicy,
         scope: ArtifactSweepScope,
     ) -> (u64, crate::disk_headroom::SweepUrgency) {
-        let main_root = self.main_root();
-        // React to the fact the gate refuses on, rather than sweeping at one
-        // fixed rate whether the volume is comfortable or already out of room.
-        let headroom = crate::disk_headroom::available_headroom_for(main_root, main_root);
-        let urgency = crate::disk_headroom::sweep_urgency_with_inodes(
-            headroom.map(|value| value.bytes),
-            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
-            headroom.and_then(|value| value.inodes),
-            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
-        );
+        let main_root = self.main_root().to_path_buf();
+        let roots = self.artifact_sweep_budget_roots(scope);
+        // One free-space sample per filesystem: many hundreds of session
+        // roots may share the same mounted volume.
+        let mut sampled_devices = BTreeSet::new();
+        let mut urgency = crate::disk_headroom::SweepUrgency::Routine;
+        for path in roots {
+            let Some(existing) = path.ancestors().find(|ancestor| ancestor.exists()) else {
+                continue;
+            };
+            #[cfg(unix)]
+            let device = {
+                use std::os::unix::fs::MetadataExt;
+                let Ok(metadata) = std::fs::metadata(existing) else {
+                    continue;
+                };
+                metadata.dev()
+            };
+            #[cfg(not(unix))]
+            let device = existing.to_path_buf();
+            if !sampled_devices.insert(device) {
+                continue;
+            }
+            let headroom =
+                crate::disk_headroom::available_headroom_at_or_above_for(&main_root, &path);
+            if crate::disk_headroom::sweep_urgency_with_inodes(
+                headroom.map(|value| value.bytes),
+                crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+                headroom.and_then(|value| value.inodes),
+                crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+            ) == crate::disk_headroom::SweepUrgency::Pressured
+            {
+                urgency = crate::disk_headroom::SweepUrgency::Pressured;
+                break;
+            }
+        }
         (
             artifact_sweep_budget_ms(policy.artifact_sweep_budget_ms, scope, urgency),
             urgency,
         )
+    }
+
+    fn artifact_sweep_budget_roots(&mut self, scope: ArtifactSweepScope) -> BTreeSet<PathBuf> {
+        let main_root = self.main_root().to_path_buf();
+        // The detached worker can reclaim caches from external worktree and
+        // preparation-cache volumes. Looking only at the main checkout misses
+        // pressure on those filesystems (the main checkout is often elsewhere).
+        let mut roots = BTreeSet::from([main_root.clone()]);
+        if scope == ArtifactSweepScope::AutomaticContinuation {
+            if let Ok(sessions) = self.store().live_sessions() {
+                roots.extend(
+                    sessions
+                        .into_iter()
+                        .map(|session| PathBuf::from(session.worktree_path)),
+                );
+            }
+            if let Ok(sessions) = self.store().cleaned_sessions() {
+                roots.extend(
+                    sessions
+                        .into_iter()
+                        .map(|session| PathBuf::from(session.worktree_path)),
+                );
+            }
+            if let Some(cache_root) = self.storage_context().preparation_cache_root() {
+                roots.insert(cache_root);
+            }
+        }
+        roots
     }
 
     /// Reclaim build caches from one just-closed session while retaining its
@@ -2215,18 +3448,11 @@ impl Broker {
     }
 
     /// Reclaim build caches from long-idle closed worktrees without operator
-    /// confirmation.
-    ///
-    /// Open sessions are included once their agent has shown no evidence of
-    /// work for `idle_session_artifact_hours` -- the abandonment rule over a
-    /// shorter window, because losing build output costs a rebuild while
-    /// abandonment releases the checkout. A session inside the 72-hour
-    /// abandonment window otherwise holds its caches for three days after its
-    /// agent left; observed, 8.3 GiB across three quiet sessions of one
-    /// repository. `gc plan` does not list these: its candidates are
-    /// re-validated at apply against closed sessions, and the reviewed lane for
-    /// an open session's build output is `gc reclaim`, which keeps only
-    /// sessions that are actively working.
+    /// confirmation. Every autonomous scope is closed-session-only: an open
+    /// session can have a build process that outlives its agent, and shallow
+    /// directory timestamps cannot prove that a deeply nested cache is idle.
+    /// The reviewed `gc reclaim` lane remains available for open-session
+    /// caches.
     ///
     /// Deliberately avoids [`Broker::cleanup_plan`]: sizing every retained
     /// worktree is a full stat walk over tens of gigabytes, far too expensive
@@ -2236,36 +3462,103 @@ impl Broker {
     ///
     /// The budget bounds the work, not the number of directories attempted.
     /// A single `target/` can hold several gigabytes and take minutes to
-    /// unlink, which no per-open budget can absorb in one go, so removal stops
-    /// at the deadline mid-directory and leaves the tree still classified as
-    /// the build cache it is. An unfinished pass withholds the cadence stamp,
-    /// so the next broker open resumes instead of waiting out the interval,
-    /// and records the session it stopped after so the next
-    /// pass continues from there. Resuming without that cursor re-scans the
-    /// head of the list every time, which is why a backlog larger than one
-    /// budget used to sit untouched behind it (#222).
+    /// unlink, so removal stops at the deadline and records each in-progress
+    /// path before unlinking. Later passes resume those exact paths and rotate
+    /// the session cursor past incomplete worktrees so a wide or blocked
+    /// checkout cannot starve the rest of the backlog (#222).
     fn sweep_artifacts_autonomously(
         &mut self,
         policy: &RetentionPolicy,
         scope: ArtifactSweepScope,
     ) -> Result<ArtifactSweepOutcome, BrokerOpError> {
+        self.sweep_artifacts_autonomously_with_progress(policy, scope)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn sweep_artifacts_autonomously_with_progress(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+    ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        self.sweep_artifacts_autonomously_with_deadline(policy, scope, None)
+    }
+
+    fn sweep_artifacts_autonomously_with_deadline(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+        deadline_override: Option<Instant>,
+    ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        self.sweep_artifacts_autonomously_with_deadlines(
+            policy,
+            scope,
+            deadline_override,
+            deadline_override,
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        )
+    }
+
+    #[cfg(test)]
+    fn sweep_artifacts_autonomously_with_test_deadlines(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+        discovery_deadline: Instant,
+        removal_deadline: Instant,
+    ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        self.sweep_artifacts_autonomously_with_deadlines(
+            policy,
+            scope,
+            Some(discovery_deadline),
+            Some(removal_deadline),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        )
+    }
+
+    #[cfg(test)]
+    fn sweep_artifacts_autonomously_with_test_discovery_budget(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+        entry_budget: usize,
+    ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        self.sweep_artifacts_autonomously_with_deadlines(policy, scope, None, None, entry_budget)
+    }
+
+    fn sweep_artifacts_autonomously_with_deadlines(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+        discovery_deadline_override: Option<Instant>,
+        removal_deadline_override: Option<Instant>,
+        discovery_entry_budget: usize,
+    ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
         if policy.artifact_sweep_budget_ms == 0 {
-            return Ok(ArtifactSweepOutcome {
-                directories_reclaimed: 0,
-                complete: true,
-                auto_cleanup: None,
-            });
+            return Ok((
+                ArtifactSweepOutcome {
+                    directories_reclaimed: 0,
+                    complete: true,
+                    auto_cleanup: None,
+                },
+                0,
+            ));
         }
+        let namespace = self.ensure_artifact_sweep_namespace()?;
         let closed_session_id = match scope {
             ArtifactSweepScope::ClosedSession(session_id) => Some(session_id),
-            ArtifactSweepScope::Inline | ArtifactSweepScope::Drain => None,
+            ArtifactSweepScope::Inline
+            | ArtifactSweepScope::Drain
+            | ArtifactSweepScope::AutomaticContinuation => None,
         };
         let main_root = self.main_root().to_path_buf();
         let now = now_ms();
         let (budget_ms, urgency) = self.artifact_sweep_budget(policy, scope);
         // The deadline covers discovery as well as removal: scanning dozens of
         // worktrees is itself work a broker open must not pay unbounded.
-        let deadline = Instant::now() + Duration::from_millis(budget_ms);
+        let budget_deadline = Instant::now() + Duration::from_millis(budget_ms);
+        let discovery_deadline = discovery_deadline_override.unwrap_or(budget_deadline);
+        let removal_deadline = removal_deadline_override.unwrap_or(budget_deadline);
+        let deadline = discovery_deadline.min(removal_deadline);
         if scope == ArtifactSweepScope::Inline {
             let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
                 / urgency.interval_divisor().max(1);
@@ -2273,20 +3566,27 @@ impl Broker {
             if self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
                 || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?
             {
-                return Ok(ArtifactSweepOutcome {
-                    directories_reclaimed: 0,
-                    complete: true,
-                    auto_cleanup: None,
-                });
+                return Ok((
+                    ArtifactSweepOutcome {
+                        directories_reclaimed: 0,
+                        complete: true,
+                        auto_cleanup: None,
+                    },
+                    0,
+                ));
             }
         }
         // A concurrent GC owns the artifact namespace; skip rather than race.
         let Ok(_lock) = GcLock::acquire(&main_root) else {
-            return Ok(ArtifactSweepOutcome {
-                directories_reclaimed: 0,
-                complete: closed_session_id.is_none(),
-                auto_cleanup: None,
-            });
+            return Ok((
+                ArtifactSweepOutcome {
+                    directories_reclaimed: 0,
+                    complete: closed_session_id.is_none()
+                        && scope != ArtifactSweepScope::AutomaticContinuation,
+                    auto_cleanup: None,
+                },
+                0,
+            ));
         };
         let live_sessions = self.store().live_sessions()?;
         let live = live_sessions
@@ -2297,35 +3597,53 @@ impl Broker {
             .iter()
             .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
-        // Open sessions whose agent has been gone for the idle window. They
-        // stay open and keep their checkout; only their witnessed build output
-        // is swept. The targeted pass after a close is about one closed
-        // session and never widens to these.
-        let idle_window_ms = i64::from(policy.idle_session_artifact_hours) * 3_600_000;
-        let idle_open = if closed_session_id.is_none() && idle_window_ms > 0 {
-            self.idle_open_sessions(now, idle_window_ms)?
-        } else {
-            Vec::new()
-        };
-        let idle_open_ids = idle_open
-            .iter()
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
+        let mut preparation_entries_reclaimed = 0usize;
+        let mut scan_completed = true;
         if closed_session_id.is_none() {
             // The shared preparation cache is content-addressed: an entry no
             // checkout computes is unreadable forever, so it needs no operator
             // review. It was reachable only from the manual lane, which is why a
             // hand reclaim of 13.3 GB returned as 15 GB within three days.
-            let (cache_entries, cache_bytes) = crate::storage::sweep_preparation_cache(
-                &main_root,
-                policy.orphan_worktree_roots_days,
-                deadline,
-            );
-            if cache_entries > 0 {
+            let storage_context = self.storage_context().clone();
+            let worktree_roots = self
+                .worktree_root_plan()
+                .ok()
+                .map(|plan| {
+                    crate::broker::lifecycle::worktree_root_candidates_for(&plan)
+                        .into_iter()
+                        .map(|(root, _source)| root)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let preparation_sweep = match (
+                worktree_roots.is_empty(),
+                storage_context.preparation_cache_root(),
+                storage_context.host_resource_db_path.as_deref(),
+            ) {
+                (false, Some(cache_root), Some(resource_db_path)) => {
+                    crate::storage::sweep_preparation_cache_for_roots_with_status(
+                        &main_root,
+                        &worktree_roots,
+                        &cache_root,
+                        resource_db_path,
+                        deadline,
+                    )
+                }
+                _ => crate::storage::PreparationCacheSweepReport {
+                    entries_removed: 0,
+                    bytes_reclaimed: 0,
+                    filesystem_entries_reclaimed: 0,
+                    complete: false,
+                },
+            };
+            preparation_entries_reclaimed = preparation_sweep.filesystem_entries_reclaimed;
+            scan_completed = preparation_sweep.complete;
+            if preparation_sweep.entries_removed > 0 {
                 let payload = serde_json::json!({
-                    "entries": cache_entries,
-                    "bytes": cache_bytes,
+                    "entries": preparation_sweep.entries_removed,
+                    "bytes": preparation_sweep.bytes_reclaimed,
                     "urgency": format!("{urgency:?}"),
+                    "complete": preparation_sweep.complete,
                 })
                 .to_string();
                 self.store().append_event(
@@ -2336,211 +3654,581 @@ impl Broker {
             }
         }
         let mut removed = Vec::new();
+        let mut entries_reclaimed = preparation_entries_reclaimed;
         let mut eligible_worktree_seen = false;
-        let mut scan_completed = true;
         let cursor = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let mut last_visited = cursor;
-        let mut all = self.store().cleaned_sessions()?;
+        let all = self.store().cleaned_sessions()?;
         let sessions = match closed_session_id {
             Some(session_id) => all
                 .iter()
                 .filter(|session| session.id == session_id)
                 .cloned()
                 .collect(),
-            None => {
-                // One id-ordered list, so the cursor resumes across both kinds.
-                all.extend(idle_open);
-                all.sort_by_key(|session| session.id);
-                sweep_order(&all, cursor, |session| session.id)
+            None => sweep_order(&all, cursor, |session| session.id),
+        };
+        let interrupted_value = self.artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?;
+        let mut interrupted_paths_valid = true;
+        let mut blocked_interrupted_paths = Vec::<BlockedInterruptedPath>::new();
+        let mut interrupted_paths = match decode_interrupted_paths(interrupted_value.as_deref()) {
+            Ok(paths) => paths,
+            Err(()) => {
+                // Preserve malformed or over-cap state as a durable blocker.
+                // Do not delete new trees while we cannot prove the queue has
+                // room to remember a partial removal.
+                interrupted_paths_valid = false;
+                scan_completed = false;
+                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                    path: None,
+                    reason: "queue_invalid_or_oversized",
+                });
+                Vec::new()
             }
         };
-        let mut idle_open_removed = 0usize;
-        // Forget a remembered tree that no longer exists, whoever removed it.
-        let mut interrupted_path = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?
-            .filter(|path| !path.is_empty() && is_real_directory(Path::new(path)));
+        let mut revoked_interrupted_paths = Vec::<RevokedInterruptedPath>::new();
+        if interrupted_paths_valid {
+            // A queued path containing `..` can never be a deletion witness.
+            // Retire it before checking liveness or touching the referenced
+            // filesystem path, so a malformed marker cannot poison recovery
+            // while its session remains open.
+            let structurally_revoked = interrupted_paths
+                .iter()
+                .filter(|path| has_parent_dir_component(Path::new(path)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !structurally_revoked.is_empty() {
+                let mut updated_paths = interrupted_paths.clone();
+                updated_paths.retain(|path| !structurally_revoked.contains(path));
+                if persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
+                    interrupted_paths = updated_paths;
+                    revoked_interrupted_paths.extend(structurally_revoked.into_iter().map(
+                        |path| RevokedInterruptedPath {
+                            path,
+                            reason: "unsafe_path_components",
+                            canonical_path: None,
+                        },
+                    ));
+                } else {
+                    interrupted_paths_valid = false;
+                    scan_completed = false;
+                    blocked_interrupted_paths.extend(structurally_revoked.into_iter().map(
+                        |path| BlockedInterruptedPath {
+                            path: Some(path),
+                            reason: "queue_update_unavailable",
+                        },
+                    ));
+                }
+            }
+        }
+        if interrupted_paths_valid {
+            let previous_paths = interrupted_paths.clone();
+            let unavailable = prune_absent_interrupted_paths(&mut interrupted_paths);
+            if !unavailable.is_empty() {
+                scan_completed = false;
+                blocked_interrupted_paths.extend(unavailable.into_iter().map(|path| {
+                    BlockedInterruptedPath {
+                        path: Some(path),
+                        reason: "metadata_unavailable",
+                    }
+                }));
+            }
+            if interrupted_paths != previous_paths
+                && !persist_interrupted_paths(self.store(), &namespace, &interrupted_paths)?
+            {
+                interrupted_paths_valid = false;
+                scan_completed = false;
+                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                    path: None,
+                    reason: "queue_update_unavailable",
+                });
+            }
+        }
+        blocked_interrupted_paths.extend(
+            interrupted_paths
+                .iter()
+                .filter(|path| {
+                    let path = Path::new(path);
+                    live_worktrees.iter().any(|root| path.starts_with(root))
+                })
+                .map(|path| BlockedInterruptedPath {
+                    path: Some(path.clone()),
+                    reason: "live_session",
+                }),
+        );
         let mut visited_any = false;
         for session in sessions {
             // Checked before the session is taken, so the cursor names the
             // last session actually visited and the next pass starts here.
             // The first session is always visited: a budget spent before the
             // loop must still buy ground, or a backlog never converges.
-            if visited_any && check_deadline(Some(deadline)) {
+            if visited_any && check_deadline(Some(discovery_deadline)) {
                 scan_completed = false;
                 break;
             }
             visited_any = true;
             last_visited = session.id;
-            let is_idle_open = idle_open_ids.contains(&session.id);
+            let mut session_scan_complete = true;
             let root = PathBuf::from(&session.worktree_path);
-            let sheltered = if is_idle_open {
-                // Its own row is live, so it must not shelter itself; every
-                // other live session still does.
-                let others = live_sessions
-                    .iter()
-                    .filter(|live| live.id != session.id)
-                    .map(|live| PathBuf::from(&live.worktree_path))
-                    .collect::<Vec<_>>();
-                overlaps_live_worktree(&root, &others)
-            } else {
-                if live.contains(&session.id) {
-                    continue;
-                }
-                let closed_at = session.closed_at.unwrap_or(session.updated_at);
-                if days_between(now, closed_at) < policy.artifact_reclaim_days {
-                    continue;
-                }
-                overlaps_live_worktree(&root, &live_worktrees)
-            };
-            if sheltered
-                || !is_real_directory(&root)
-                || !self.is_broker_owned_worktree(&session, &root)
-            {
+            if live.contains(&session.id) {
                 continue;
             }
-            let Ok(checkout) = GitRepo::discover(&root) else {
+            let closed_at = session.closed_at.unwrap_or(session.updated_at);
+            if days_between(now, closed_at) < policy.artifact_reclaim_days {
                 continue;
+            }
+            let sheltered = overlaps_live_worktree(&root, &live_worktrees);
+            if sheltered {
+                continue;
+            }
+            let root_is_directory = match std::fs::symlink_metadata(&root) {
+                Ok(metadata) if metadata.file_type().is_dir() => true,
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(root.to_string_lossy().into_owned()),
+                        reason: "worktree_metadata_unavailable",
+                    });
+                    scan_completed = false;
+                    continue;
+                }
+            };
+            if !root_is_directory {
+                let mut sweep_writer = ScopedArtifactSweepWriter {
+                    store: self.store(),
+                    namespace: &namespace,
+                };
+                if !revoke_interrupted_paths_under_root(
+                    &mut sweep_writer,
+                    &mut interrupted_paths,
+                    &mut interrupted_paths_valid,
+                    &root,
+                    "worktree_root_revoked",
+                    &mut revoked_interrupted_paths,
+                    &mut blocked_interrupted_paths,
+                )? {
+                    scan_completed = false;
+                }
+                continue;
+            }
+            let ownership = {
+                let _git_deadline = crate::git::limit_git_until(discovery_deadline);
+                self.is_broker_owned_worktree_checked(&session, &root)
+            };
+            match ownership {
+                Ok(true) => {}
+                Ok(false) => {
+                    let mut sweep_writer = ScopedArtifactSweepWriter {
+                        store: self.store(),
+                        namespace: &namespace,
+                    };
+                    if !revoke_interrupted_paths_under_root(
+                        &mut sweep_writer,
+                        &mut interrupted_paths,
+                        &mut interrupted_paths_valid,
+                        &root,
+                        "worktree_ownership_revoked",
+                        &mut revoked_interrupted_paths,
+                        &mut blocked_interrupted_paths,
+                    )? {
+                        scan_completed = false;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(root.to_string_lossy().into_owned()),
+                        reason: "worktree_ownership_unavailable",
+                    });
+                    scan_completed = false;
+                    continue;
+                }
+            }
+            let checkout_result = {
+                let _git_deadline = crate::git::limit_git_until(discovery_deadline);
+                GitRepo::discover(&root)
+            };
+            let checkout = match checkout_result {
+                Ok(checkout) => checkout,
+                Err(_) => {
+                    // Git discovery is part of the proof that the candidate
+                    // belongs to this checkout. A timeout or any other
+                    // failure leaves the session unclassified, so retain the
+                    // unfinished pass, then let later sessions make progress.
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(root.to_string_lossy().into_owned()),
+                        reason: "git_discovery_unavailable",
+                    });
+                    scan_completed = false;
+                    continue;
+                }
             };
             eligible_worktree_seen = true;
-            let mut found = Vec::new();
-            collect_artifact_dirs_with_extras(
+            let discovery = collect_artifact_dirs_bounded(
                 &root,
-                &root,
-                0,
                 &policy.artefact_directories,
-                &mut found,
+                discovery_deadline,
+                discovery_entry_budget,
             );
-            // The tree this sweep was part-way through goes first and is found
-            // by path: a cache witnessed only by being non-empty stops
-            // classifying once a paused removal has emptied it, and taking it
-            // first means a pause elsewhere can never replace -- and so forget
-            // -- the one remembered tree.
-            if let Some(path) = interrupted_path.as_deref().map(PathBuf::from)
-                && path.starts_with(&root)
+            let discovery_complete = discovery.complete;
+            let mut found = discovery.classified;
+            // Interrupted trees are injected ahead of newly discovered caches:
+            // after partial removal their original witness may be gone, but
+            // their exact path remains safe to resume after fresh validation.
+            let mut pending_in_worktree = Vec::new();
+            let mut revoked_in_worktree = Vec::new();
+            for path in interrupted_paths
+                .iter()
+                .map(|path| PathBuf::from(path.as_str()))
+                .filter(|path| path.starts_with(&root))
             {
-                if resumable_interrupted_tree(&root, &path, &policy.artefact_directories) {
-                    found.retain(|dir| dir != &path);
-                    found.insert(0, path);
-                } else {
-                    // Lexically claims this worktree but is not a build cache
-                    // inside it: never act on it, and stop remembering it.
-                    interrupted_path = None;
+                match interrupted_tree_state(&root, &path, &policy.artefact_directories) {
+                    InterruptedTreeState::Resume => pending_in_worktree.push(path),
+                    InterruptedTreeState::Revoked(reason) => {
+                        if interrupted_paths_valid {
+                            let path = path.to_string_lossy().into_owned();
+                            revoked_in_worktree.push(RevokedInterruptedPath {
+                                canonical_path: std::fs::canonicalize(&path).ok(),
+                                path,
+                                reason,
+                            });
+                        } else {
+                            blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                path: Some(path.to_string_lossy().into_owned()),
+                                reason: "queue_unavailable_for_revocation",
+                            });
+                            session_scan_complete = false;
+                        }
+                    }
+                    InterruptedTreeState::Unavailable(reason) => {
+                        // Without a trustworthy queue write, or when the
+                        // filesystem cannot be inspected, preserve the marker
+                        // and keep the pass incomplete.
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(path.to_string_lossy().into_owned()),
+                            reason,
+                        });
+                        session_scan_complete = false;
+                    }
                 }
             }
+            let revoked_targets = revoked_in_worktree
+                .iter()
+                .filter_map(|revoked| revoked.canonical_path.clone())
+                .collect::<BTreeSet<_>>();
+            if !revoked_in_worktree.is_empty() {
+                let revoked_paths = revoked_in_worktree
+                    .iter()
+                    .map(|revoked| revoked.path.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut updated_paths = interrupted_paths.clone();
+                updated_paths.retain(|path| !revoked_paths.contains(path.as_str()));
+                if persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
+                    interrupted_paths = updated_paths;
+                    revoked_interrupted_paths.extend(revoked_in_worktree);
+                } else {
+                    interrupted_paths_valid = false;
+                    session_scan_complete = false;
+                    blocked_interrupted_paths.extend(revoked_in_worktree.iter().map(|revoked| {
+                        BlockedInterruptedPath {
+                            path: Some(revoked.path.clone()),
+                            reason: "queue_update_unavailable",
+                        }
+                    }));
+                }
+            }
+            found.retain(|dir| !pending_in_worktree.contains(dir));
+            found.retain(|dir| {
+                std::fs::canonicalize(dir)
+                    .ok()
+                    .is_none_or(|canonical| !revoked_targets.contains(&canonical))
+            });
+            pending_in_worktree.extend(found);
+            let found = pending_in_worktree;
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(dir.to_string_lossy().into_owned()),
+                        reason: "path_not_repository_relative",
+                    });
+                    session_scan_complete = false;
                     continue;
                 };
-                if !checkout.path_is_ignored(&relative) {
+                let ignored = {
+                    let _git_deadline = crate::git::limit_git_until(discovery_deadline);
+                    checkout.path_is_ignored_checked(&relative)
+                };
+                let ignored = match ignored {
+                    Ok(ignored) => ignored,
+                    Err(_) => {
+                        // A Git failure (including a shorter configured Git
+                        // timeout) leaves this candidate unclassified. Do not
+                        // advance the recovery generation on that basis.
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir.to_string_lossy().into_owned()),
+                            reason: "git_ignore_check_unavailable",
+                        });
+                        session_scan_complete = false;
+                        break;
+                    }
+                };
+                let dir_key = dir.to_string_lossy().into_owned();
+                let resuming = interrupted_paths.iter().any(|path| path == &dir_key);
+                if !ignored {
+                    if resuming {
+                        if interrupted_paths_valid {
+                            let mut updated_paths = interrupted_paths.clone();
+                            updated_paths.retain(|path| path != &dir_key);
+                            if persist_interrupted_paths(self.store(), &namespace, &updated_paths)?
+                            {
+                                interrupted_paths = updated_paths;
+                                revoked_interrupted_paths.push(RevokedInterruptedPath {
+                                    canonical_path: std::fs::canonicalize(&dir).ok(),
+                                    path: dir_key,
+                                    reason: "no_longer_git_ignored",
+                                });
+                            } else {
+                                interrupted_paths_valid = false;
+                                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                    path: Some(dir_key),
+                                    reason: "queue_update_unavailable",
+                                });
+                                session_scan_complete = false;
+                            }
+                        } else {
+                            session_scan_complete = false;
+                        }
+                    }
                     continue;
                 }
-                // The session is open, and a quiet agent is not the only
-                // thing that writes build output: a dev server or a long
-                // build can outlive the agent's last commit. Output touched
-                // inside the idle window is still in use.
-                let dir_key = dir.to_string_lossy().into_owned();
-                let resuming = interrupted_path.as_deref() == Some(dir_key.as_str());
-                if is_idle_open && !resuming && modified_within(&dir, now, idle_window_ms) {
+                if !interrupted_paths_valid {
+                    session_scan_complete = false;
                     continue;
+                }
+                if !resuming {
+                    let mut updated_paths = interrupted_paths.clone();
+                    updated_paths.push(dir_key.clone());
+                    if encode_interrupted_paths(&updated_paths).is_none() {
+                        // The queue is deliberately finite. Leave this cache
+                        // intact and let a later pass retry after older paths
+                        // have completed; never unlink without a recovery key.
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "queue_capacity_exceeded",
+                        });
+                        session_scan_complete = false;
+                        continue;
+                    }
+                    if !persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "queue_update_unavailable",
+                        });
+                        session_scan_complete = false;
+                        continue;
+                    }
+                    interrupted_paths = updated_paths;
                 }
                 let deferrable =
                     artifact_witness_for_with_extras(&dir, &policy.artefact_directories)
                         .and_then(ArtifactWitness::deferrable_entry);
-                match remove_condemned_tree(&dir, deferrable, Some(deadline)) {
-                    Ok(TreeRemoval::Complete) => {
-                        if resuming {
-                            interrupted_path = None;
+                match remove_condemned_tree_with_progress(&dir, deferrable, Some(removal_deadline))
+                {
+                    Ok((TreeRemoval::Complete, count)) => {
+                        entries_reclaimed = entries_reclaimed.saturating_add(count);
+                        let mut updated_paths = interrupted_paths.clone();
+                        updated_paths.retain(|path| path != &dir_key);
+                        match persist_interrupted_paths(self.store(), &namespace, &updated_paths) {
+                            Ok(true) => interrupted_paths = updated_paths,
+                            Ok(false) | Err(_) => {
+                                // The cache is gone, but retain the old queue
+                                // entry and retry its absence proof next time.
+                                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                    path: Some(dir_key.clone()),
+                                    reason: "queue_update_unavailable",
+                                });
+                                session_scan_complete = false;
+                            }
                         }
                         removed.push(dir_key);
-                        if is_idle_open {
-                            idle_open_removed += 1;
-                        }
                     }
-                    // The budget stopped a removal partway. The directory is
-                    // still a recognisable build cache, so the next pass finds
-                    // it again and carries on -- and withholding the cadence
-                    // stamp below is what makes a next pass happen today
-                    // rather than after the interval.
-                    Ok(TreeRemoval::Interrupted) => {
-                        // One remembered tree at a time, and never replaced
-                        // before it is finished: the next pass starts after
-                        // this session, so a pause elsewhere would otherwise
-                        // overwrite it before it is resumed.
-                        if interrupted_path.is_none() {
-                            interrupted_path = Some(dir_key);
-                        }
-                        scan_completed = false;
+                    // The path was durably queued before any unlink. The next
+                    // pass will retry it even if removal consumed its witness.
+                    Ok((TreeRemoval::Interrupted, count)) => {
+                        entries_reclaimed = entries_reclaimed.saturating_add(count);
+                        session_scan_complete = false;
                     }
-                    Err(_) if closed_session_id.is_some() => scan_completed = false,
-                    Err(_) => {}
+                    Err(error) => {
+                        entries_reclaimed =
+                            entries_reclaimed.saturating_add(error.entries_reclaimed);
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "removal_unavailable",
+                        });
+                        session_scan_complete = false;
+                    }
                 }
-                if check_deadline(Some(deadline)) {
-                    scan_completed = false;
-                }
-                if !scan_completed {
+                if check_deadline(Some(discovery_deadline))
+                    || check_deadline(Some(removal_deadline))
+                {
+                    session_scan_complete = false;
                     break;
                 }
             }
-            if !scan_completed {
-                break;
+            if !discovery_complete {
+                // This worktree is not fully classified. Keep the pass
+                // explicitly incomplete, but rotate beyond it so a broad
+                // early session cannot starve every later closed session.
+                session_scan_complete = false;
+            }
+            if !session_scan_complete {
+                scan_completed = false;
             }
         }
-        // A full lap visited every eligible session, so a remembered tree it
-        // did not resume is no longer eligible; holding it would only stop
-        // the next pause from being remembered.
-        if scan_completed && closed_session_id.is_none() {
-            interrupted_path = None;
+        // A remembered path outside every known session root no longer has
+        // broker deletion authority. Retire just that marker; never follow or
+        // remove the external path itself. Include live roots so a cache that
+        // became active remains queued for a later closed-session pass.
+        if interrupted_paths_valid {
+            let known_worktrees = all
+                .iter()
+                .map(|session| PathBuf::from(&session.worktree_path))
+                .chain(live_worktrees.iter().cloned())
+                .collect::<Vec<_>>();
+            let outside_managed_worktrees = interrupted_paths
+                .iter()
+                .filter(|path| {
+                    let path = Path::new(path);
+                    !known_worktrees.iter().any(|root| path.starts_with(root))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !outside_managed_worktrees.is_empty() {
+                let mut updated_paths = interrupted_paths.clone();
+                updated_paths.retain(|path| !outside_managed_worktrees.contains(path));
+                if persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
+                    interrupted_paths = updated_paths;
+                    revoked_interrupted_paths.extend(outside_managed_worktrees.into_iter().map(
+                        |path| RevokedInterruptedPath {
+                            path,
+                            reason: "outside_managed_worktrees",
+                            canonical_path: None,
+                        },
+                    ));
+                } else {
+                    interrupted_paths_valid = false;
+                    scan_completed = false;
+                    blocked_interrupted_paths.extend(outside_managed_worktrees.iter().map(
+                        |path| BlockedInterruptedPath {
+                            path: Some(path.clone()),
+                            reason: "queue_update_unavailable",
+                        },
+                    ));
+                }
+            }
         }
-        match &interrupted_path {
-            Some(path) => self
-                .store()
-                .meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, path)?,
-            None => self.store().meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, "")?,
+        if !interrupted_paths.is_empty() {
+            // A full directory lap is not complete while a path remains
+            // blocked or incompletely removed, including a path from a
+            // session not visited in this bounded pass.
+            scan_completed = false;
         }
-        // Do not consume the cadence window before any closed worktree exists,
-        // and do not hide an unfinished backlog for a full interval. Removal
-        // failures do consume the window, preventing a broken path from
-        // slowing every broker command until an operator can inspect it.
+        if interrupted_paths_valid
+            && !persist_interrupted_paths(self.store(), &namespace, &interrupted_paths)?
+        {
+            scan_completed = false;
+        }
+        // Only a completed lap consumes the cadence window. Incomplete work
+        // keeps the durable request/cursor pending; inline spacing limits how
+        // often ordinary broker opens retry a blocked path.
         if let Some(session_id) = closed_session_id {
             if !scan_completed {
                 // Retry this session first on the next ordinary broker open.
-                self.store().meta_set(
+                self.artifact_sweep_meta_set(
                     ARTIFACT_SWEEP_CURSOR_KEY,
                     &session_id.saturating_sub(1).to_string(),
                 )?;
-                self.store().meta_set(ARTIFACT_SWEEP_STAMP_KEY, "0")?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_STAMP_KEY, "0")?;
             }
         } else {
             if eligible_worktree_seen && scan_completed {
-                self.store()
-                    .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
             }
             // A finished lap starts the next one from the top; an interrupted pass
             // remembers where it stopped so the next one advances instead of
             // re-walking what it already cleared, and when, so broker opens
             // space their continuations instead of each paying a budget.
             if scan_completed {
-                self.store().meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
-                self.store().meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")?;
             } else {
-                self.store()
-                    .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
-                self.store()
-                    .meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
             }
         }
-        if !removed.is_empty() {
+        blocked_interrupted_paths.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.reason.cmp(right.reason))
+        });
+        blocked_interrupted_paths.dedup();
+        let omitted_blocked_diagnostics = blocked_interrupted_paths.len()
+            > ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX.saturating_sub(1);
+        let mut blocked = blocked_interrupted_paths
+            .iter()
+            .take(ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX.saturating_sub(1))
+            .map(|blocked| {
+                serde_json::json!({
+                    "path": blocked.path.as_deref().map(bounded_artifact_diagnostic_path),
+                    "reason": blocked.reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        if omitted_blocked_diagnostics {
+            blocked.push(serde_json::json!({
+                "path": null,
+                "reason": "additional_blockers_omitted",
+            }));
+        }
+        let blocked_json = serde_json::Value::Array(blocked.clone()).to_string();
+        let blocked_state = if blocked_interrupted_paths.is_empty() {
+            String::new()
+        } else {
+            blocked_json.clone()
+        };
+        let previous_blocked_state =
+            self.artifact_sweep_meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)?;
+        let blocked_state_changed =
+            previous_blocked_state.as_deref().unwrap_or("") != blocked_state;
+        if !removed.is_empty() || !revoked_interrupted_paths.is_empty() || blocked_state_changed {
+            let mut revoked_interrupted_paths = revoked_interrupted_paths;
+            revoked_interrupted_paths.sort_by(|left, right| {
+                left.path
+                    .cmp(&right.path)
+                    .then_with(|| left.reason.cmp(right.reason))
+            });
+            revoked_interrupted_paths.dedup();
+            let revoked = revoked_interrupted_paths
+                .iter()
+                .map(|revoked| {
+                    serde_json::json!({
+                        "path": bounded_artifact_diagnostic_path(&revoked.path),
+                        "reason": revoked.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
             let payload = serde_json::json!({
                 "directories": removed.len(),
                 "idle_days": policy.artifact_reclaim_days,
-                "closed_session_directories": removed.len() - idle_open_removed,
-                "idle_open_session_directories": idle_open_removed,
+                "closed_session_directories": removed.len(),
+                "idle_open_session_directories": 0,
                 "idle_session_artifact_hours": policy.idle_session_artifact_hours,
+                "complete": scan_completed,
+                "revoked_interrupted_paths": revoked,
+                "blocked_interrupted_paths": blocked,
             })
             .to_string();
             self.store().append_event(
@@ -2549,20 +4237,26 @@ impl Broker {
                 Some(&payload),
             )?;
         }
+        if blocked_state_changed {
+            self.artifact_sweep_meta_set(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY, &blocked_state)?;
+        }
         // Whole checkouts go after their caches, under the same lock and
         // budget, and only on the general sweep: the targeted pass after a
         // close is about one session's build output (#588). Its failure must
         // not stop the sweep any more than the sweep's may stop a command.
-        let auto_cleanup = if closed_session_id.is_none() {
+        let auto_cleanup = if closed_session_id.is_none() && scope_runs_checkout_cleanup(scope) {
             self.auto_remove_disposable_checkouts(Some(deadline)).ok()
         } else {
             None
         };
-        Ok(ArtifactSweepOutcome {
-            directories_reclaimed: removed.len(),
-            complete: scan_completed,
-            auto_cleanup,
-        })
+        Ok((
+            ArtifactSweepOutcome {
+                directories_reclaimed: removed.len(),
+                complete: scan_completed,
+                auto_cleanup,
+            },
+            entries_reclaimed,
+        ))
     }
 
     /// Apply or resume an authorized plan. A budget is used by amortized
@@ -2996,7 +4690,17 @@ impl Broker {
             && !check_deadline(deadline)
         {
             let candidate = journal.remaining_gate_caches[0].clone();
-            match crate::gate_cache_gc::reclaim(&main_root, &candidate, deadline) {
+            let gate_storage = self.storage_context().gate_storage_locations();
+            let location = crate::gate_cache_gc::location_in(&main_root, &gate_storage);
+            let reclaim = match location.as_ref() {
+                Some(location) => {
+                    crate::gate_cache_gc::reclaim_in(&main_root, location, &candidate, deadline)
+                }
+                None => {
+                    Err("this repository's captured gate cache location cannot be resolved".into())
+                }
+            };
+            match reclaim {
                 Ok(crate::gate_cache_gc::GateCacheReclaim::Removed(bytes)) => {
                     journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(bytes);
                     journal.gate_caches_reclaimed.push(candidate.path);
@@ -3016,35 +4720,68 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
-        while !journal.remaining_orphans.is_empty() && !check_deadline(deadline) {
+        // Visit each candidate at most once per apply. A temporarily unreadable
+        // tree stays durable at the tail without starving healthy roots.
+        let orphan_visits = journal.remaining_orphans.len();
+        for _ in 0..orphan_visits {
+            if journal.remaining_orphans.is_empty() || check_deadline(deadline) {
+                break;
+            }
             let candidate = journal.remaining_orphans[0].clone();
             let root = PathBuf::from(&candidate.worktree_root);
-            if !is_real_directory(&root) {
+            let Some(fingerprint) = candidate.ownership_fingerprint.as_deref() else {
+                failures.push(format!("{}: legacy orphan authorization revoked; no deletion performed; review a fresh GC plan", candidate.worktree_root));
                 journal.remaining_orphans.remove(0);
                 write_journal(&journal_path, &journal)?;
                 continue;
-            }
-            // The owning repository reappearing revokes the whole premise --
-            // for this root, and for no other, so the run continues.
-            let safe = root.join(WORKTREE_ROOT_MARKER).is_file()
-                && !Path::new(&candidate.repository_root).exists();
-            if !safe {
-                failures.push(format!(
-                    "{}: orphan evidence changed; review a new GC plan",
-                    candidate.worktree_root
-                ));
+            };
+            let database = self.host_operation_database_path()?;
+            // Keep exclusion through every unlink and journal update. A busy
+            // registry or unavailable filesystem leaves durable work pending.
+            let mut removal_claim = match crate::worktree_registry::claim_for_removal(
+                &database,
+                &root,
+                fingerprint,
+            ) {
+                Ok(claim) => claim,
+                Err(crate::worktree_registry::ClaimError::Revoked(reason)) => {
+                    failures.push(format!("{}: orphan authorization revoked ({reason}); no deletion performed; review a fresh GC plan", candidate.worktree_root));
+                    journal.remaining_orphans.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+                Err(crate::worktree_registry::ClaimError::HistoryLost(reason)) => {
+                    failures.push(format!("{}: orphan authorization revoked ({reason}); no deletion performed. Saved history cannot safely authorize reclamation; a fresh plan may omit this root. Independently recover ownership before requesting its removal", candidate.worktree_root));
+                    journal.remaining_orphans.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+                Err(crate::worktree_registry::ClaimError::Unavailable(error)) => {
+                    failures.push(format!(
+                        "{}: orphan removal temporarily unavailable ({error}); retained in journal",
+                        candidate.worktree_root
+                    ));
+                    journal.remaining_orphans.rotate_left(1);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+            };
+            if removal_claim.already_absent {
                 journal.remaining_orphans.remove(0);
                 write_journal(&journal_path, &journal)?;
                 continue;
             }
             // The root marker is the orphan evidence, so it goes last for the
             // same reason a build cache's witness does.
-            match remove_condemned_tree(&root, Some(WORKTREE_ROOT_MARKER), deadline) {
+            match removal_claim.remove(deadline) {
                 Ok(TreeRemoval::Complete) => {}
                 Ok(TreeRemoval::Interrupted) => break,
                 Err(error) => {
-                    failures.push(format!("{}: {error}", candidate.worktree_root));
-                    journal.remaining_orphans.remove(0);
+                    failures.push(format!(
+                        "{}: orphan deletion unavailable ({error}); retained in journal",
+                        candidate.worktree_root
+                    ));
+                    journal.remaining_orphans.rotate_left(1);
                     write_journal(&journal_path, &journal)?;
                     continue;
                 }
@@ -3186,6 +4923,703 @@ mod tests {
     use super::*;
     use crate::disk_headroom::SweepUrgency;
 
+    fn test_worker_retry_pending(broker: &mut Broker, now: i64) -> Result<bool, BrokerOpError> {
+        let namespace = broker.ensure_artifact_sweep_namespace()?;
+        worker_retry_pending(broker.store(), &namespace, now)
+    }
+
+    #[test]
+    fn artifact_sweep_state_is_shared_by_linked_worktrees_but_isolated_by_storage_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let linked = temporary.path().join("linked-worktree");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let storage_a = crate::test_storage::TestStorage::new();
+        let mut root_broker = storage_a.open(&root).unwrap();
+        let root_namespace = root_broker.ensure_artifact_sweep_namespace().unwrap();
+        let interrupted_a = root.join("target").to_string_lossy().into_owned();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "41")
+            .unwrap();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "9")
+            .unwrap();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "4")
+            .unwrap();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &interrupted_a)
+            .unwrap();
+        let captured_cache_root = root_broker
+            .storage_context()
+            .preparation_cache_root()
+            .unwrap();
+        assert!(
+            root_broker
+                .artifact_sweep_budget_roots(ArtifactSweepScope::AutomaticContinuation)
+                .contains(&captured_cache_root)
+        );
+        drop(root_broker);
+
+        let mut linked_broker = storage_a.open(&linked).unwrap();
+        let expected_main_root = root.canonicalize().unwrap();
+        assert_eq!(linked_broker.main_root(), expected_main_root.as_path());
+        assert_eq!(
+            linked_broker.ensure_artifact_sweep_namespace().unwrap(),
+            root_namespace,
+            "a linked checkout in the same repository and storage context reuses its namespace"
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("41")
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("9")
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(interrupted_a.as_str())
+        );
+        let registered: Vec<String> = serde_json::from_str(
+            &linked_broker
+                .store()
+                .meta_get("gc.artifact_sweep.v2.context_registry")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registered,
+            vec![root_namespace.clone()],
+            "linked-worktree opens do not consume additional namespace slots"
+        );
+        drop(linked_broker);
+
+        let storage_b = crate::test_storage::TestStorage::new();
+        let mut broker_b = storage_b.open(&root).unwrap();
+        let namespace_b = broker_b.ensure_artifact_sweep_namespace().unwrap();
+        assert_ne!(root_namespace, namespace_b);
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "7")
+            .unwrap();
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "12")
+            .unwrap();
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "12")
+            .unwrap();
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, "")
+            .unwrap();
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        drop(broker_b);
+
+        let mut reopened_a = storage_a.open(&root).unwrap();
+        assert_eq!(
+            reopened_a.ensure_artifact_sweep_namespace().unwrap(),
+            root_namespace
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("41"),
+            "a second effective storage context cannot overwrite the first context's state"
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("9"),
+            "another context cannot overwrite an outstanding recovery generation"
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(interrupted_a.as_str()),
+            "another context cannot clear interrupted-path debt"
+        );
+    }
+
+    #[test]
+    fn legacy_artifact_sweep_state_is_reported_without_rewriting_raw_values() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let clear_values = [
+            (ARTIFACT_SWEEP_STAMP_KEY, "123"),
+            (ARTIFACT_SWEEP_CURSOR_KEY, "0"),
+            (ARTIFACT_SWEEP_PROGRESS_KEY, "0"),
+            (ARTIFACT_SWEEP_INTERRUPTED_KEY, ""),
+            (ARTIFACT_SWEEP_BLOCKED_PATHS_KEY, "[]"),
+            (ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "5"),
+            (ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "5"),
+            (ARTIFACT_SWEEP_RETRY_AFTER_KEY, "0"),
+            (
+                ARTIFACT_SWEEP_WORKER_STATUS_KEY,
+                "complete passes=1 entries=0",
+            ),
+        ];
+        for (key, value) in clear_values {
+            broker.store().meta_set(key, value).unwrap();
+        }
+
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::Clear,
+            "a positive old stamp or completed worker status alone is not pending work"
+        );
+        for (key, value) in clear_values {
+            assert_eq!(
+                broker.store().meta_get(key).unwrap().as_deref(),
+                Some(value)
+            );
+        }
+
+        let oversized_status = "x".repeat(ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES + 1);
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_WORKER_STATUS_KEY, &oversized_status)
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::UnknownPending,
+            "oversized legacy text is not loaded for status inspection"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(oversized_status.as_str()),
+            "oversized legacy text remains unchanged"
+        );
+        broker
+            .store()
+            .meta_set(
+                ARTIFACT_SWEEP_WORKER_STATUS_KEY,
+                "complete passes=1 entries=0",
+            )
+            .unwrap();
+
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::UnknownPending,
+            "an outstanding legacy request remains visible as unresolved"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "5")
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::Clear,
+            "the BLOB control begins with otherwise clear legacy state"
+        );
+
+        let blob = vec![0xff; 16];
+        broker
+            .store()
+            .connection_mut()
+            .execute(
+                "UPDATE meta SET value = ?2 WHERE key = ?1",
+                rusqlite::params![
+                    ARTIFACT_SWEEP_CURSOR_KEY,
+                    rusqlite::types::Value::Blob(blob.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::UnknownPending,
+            "unreadable legacy data is retained and reported as unresolved"
+        );
+        let raw_value: rusqlite::types::Value = broker
+            .store()
+            .connection()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [ARTIFACT_SWEEP_CURSOR_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_value, rusqlite::types::Value::Blob(blob));
+    }
+
+    const DETACHED_FIXTURE_MODE_ENV: &str = "AETHYME_TEST_DETACHED_GC_MODE";
+    const DETACHED_FIXTURE_ROOT_ENV: &str = "AETHYME_TEST_DETACHED_GC_ROOT";
+
+    fn detached_fixture_command(root: &Path, mode: &str) -> Command {
+        let executable = std::env::current_exe().unwrap();
+        assert_ne!(
+            executable.file_name().and_then(|name| name.to_str()),
+            Some("aethyme"),
+            "the subprocess fixture must use the test harness, never the installed broker"
+        );
+        let mut command = Command::new(executable);
+        let host_state =
+            std::fs::read_to_string(detached_fixture_marker(root, "host-state")).unwrap();
+        let host_cache =
+            std::fs::read_to_string(detached_fixture_marker(root, "host-cache")).unwrap();
+        command
+            .args([
+                "--exact",
+                "gc::tests::detached_artifact_worker_child_fixture",
+                "--nocapture",
+            ])
+            .env(DETACHED_FIXTURE_MODE_ENV, mode)
+            .env(DETACHED_FIXTURE_ROOT_ENV, root)
+            .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
+            .env("AETHYME_HOST_STATE_DIR", host_state.trim())
+            .env("AETHYME_HOST_CACHE_DIR", host_cache.trim())
+            .env_remove(crate::BROKER_DB_ENV)
+            .env_remove("AETHYME_TEST_DB_SUFFIX")
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+            .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+            .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+            .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+            .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
+            .env_remove(crate::disk_headroom::TEST_AVAILABLE_BYTES_ENV)
+            .env_remove(crate::disk_headroom::TEST_AVAILABLE_INODES_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    fn open_detached_fixture_broker(root: &Path) -> Broker {
+        let marker_path = |name| {
+            PathBuf::from(
+                std::fs::read_to_string(detached_fixture_marker(root, name))
+                    .unwrap()
+                    .trim(),
+            )
+        };
+        let state = marker_path("host-state");
+        let options = crate::BrokerOpenOptions::default()
+            .with_host_state_dir(&state)
+            .with_host_cache_dir(marker_path("host-cache"))
+            .with_host_operation_database(state.join("host-operations.db"))
+            .with_worktree_root(marker_path("worktree-root"))
+            .with_collaboration_state(state.join("collaboration"));
+        Broker::open_with_options(root, options).unwrap()
+    }
+
+    #[test]
+    fn incomplete_worker_keeps_request_and_a_new_pressure_request_retries_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                None,
+                None,
+                |_broker, _policy, _remaining| {
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 0,
+                            complete: false,
+                            auto_cleanup: None,
+                        },
+                        0,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7"),
+            "a stalled cache removal leaves its durable request pending"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+
+        broker.persist_artifact_sweep_recovery_request().unwrap();
+        let retry_generation = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(retry_generation.parse::<i64>().unwrap() > 7);
+        assert!(!test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                retry_generation.parse().unwrap(),
+                None,
+                None,
+                |_broker, _policy, _remaining| {
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 1,
+                            complete: true,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(retry_generation.as_str()),
+            "a subsequent eligible pass records the requested generation"
+        );
+        assert!(!test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+    }
+
+    #[test]
+    fn positive_partial_worker_progress_is_capped_and_later_retry_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let mut passes = 0;
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                Some(2),
+                None,
+                |_broker, _policy, _remaining| {
+                    passes += 1;
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 1,
+                            complete: false,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(passes, 2, "positive progress cannot bypass the pass cap");
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "partial work must not advance the completed request generation"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7"),
+            "the request remains durable across the bounded worker exit"
+        );
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("pass_limit passes=2 entries=2")
+        );
+
+        broker.persist_artifact_sweep_recovery_request().unwrap();
+        let retry_generation = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                retry_generation.parse().unwrap(),
+                Some(1),
+                None,
+                |_broker, _policy, _remaining| {
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 1,
+                            complete: true,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(retry_generation.as_str()),
+            "a later eligible pass completes the retained request"
+        );
+    }
+
+    #[test]
+    fn worker_wall_clock_limit_keeps_request_pending_after_positive_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "4")
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let mut passes = 0;
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                None,
+                Some(Duration::from_millis(1)),
+                |_broker, _policy, _remaining| {
+                    passes += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 0,
+                            complete: false,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            passes, 1,
+            "positive progress cannot exceed the time ceiling"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "partial work never advances the completed request generation"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("4"),
+            "the timeout preserves the cursor for a later worker"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("time_limit passes=1 entries=1")
+        );
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+    }
+
+    fn detached_fixture_store(root: &Path) -> crate::BrokerStore {
+        crate::BrokerStore::open(&root.join(".aethyme/broker.db")).unwrap()
+    }
+
+    fn detached_fixture_namespace(root: &Path) -> String {
+        let store = detached_fixture_store(root);
+        let registry = store
+            .meta_get("gc.artifact_sweep.v2.context_registry")
+            .unwrap()
+            .expect("the setup child registers its captured context");
+        let namespaces: Vec<String> = serde_json::from_str(&registry).unwrap();
+        assert_eq!(namespaces.len(), 1);
+        namespaces[0].clone()
+    }
+
+    #[test]
+    fn test_harness_executable_is_never_selected_as_the_detached_runtime() {
+        assert!(
+            artifact_worker_binaries().is_none(),
+            "Cargo test executables must never be launched as installed workers"
+        );
+    }
+
+    fn detached_fixture_marker(root: &Path, name: &str) -> PathBuf {
+        root.join(".aethyme/test-worker").join(name)
+    }
+
+    fn wait_for_fixture_marker(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.is_file() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        path.is_file()
+    }
+
+    #[cfg(unix)]
+    fn fixture_process_is_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only probes whether the supplied process exists.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
     fn git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -3197,6 +5631,156 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn broker_open_keeps_published_rotation_debt_pending_when_sweep_is_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root).unwrap();
+        let cache_root = broker
+            .storage_context()
+            .preparation_cache_root()
+            .expect("test storage has a captured preparation-cache root");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let repository = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let store = cache_root.join(repository);
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("payload"), b"preserve until verified recovery").unwrap();
+        let root_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+        let debt = crate::preparation::rotation_debt::RotationDebt::new(
+            repository,
+            &crate::preparation::rotation_debt::new_transaction_id(),
+            root_identity.clone(),
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        let resource_db_path = broker
+            .storage_context()
+            .host_resource_db_path
+            .clone()
+            .expect("the fixture captures its host-resource database");
+        let payload = crate::preparation::rotation_debt::encode(&debt).unwrap();
+        crate::preparation::rotation_journal::publish(
+            &resource_db_path,
+            &cache_root,
+            &root_identity.encode().unwrap(),
+            repository,
+            &payload,
+        )
+        .unwrap();
+        crate::preparation::rotation_debt::publish(&cache_root, debt).unwrap();
+        let retained = crate::preparation::rotation_debt::read(&cache_root, repository)
+            .unwrap()
+            .expect("the witness is published before the cache is retired");
+        crate::preparation::rotation_debt::retire_original_store(&cache_root, &retained).unwrap();
+        let retired = cache_root.join(format!("{repository}.retired"));
+        drop(broker);
+
+        // This is a normal startup path. No explicit maintenance call repairs
+        // the state: Broker::open must notice the published witness itself.
+        let mut reopened = storage.open(&root).unwrap();
+        let requested = reopened
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = reopened
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(
+            requested > completed,
+            "the recovered request remains pending"
+        );
+        assert!(
+            crate::preparation::rotation_debt::read(&cache_root, repository)
+                .unwrap()
+                .is_some(),
+            "zero-budget startup must retain the durable debt witness"
+        );
+        assert_eq!(
+            std::fs::read(retired.join("payload")).unwrap(),
+            b"preserve until verified recovery",
+            "zero-budget startup must not delete the old cache store"
+        );
+    }
+
+    #[test]
+    fn broker_open_keeps_missing_cache_parent_pending_with_positive_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 5000\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut first = storage.open(&root).unwrap();
+        let cache_root = first
+            .storage_context()
+            .preparation_cache_root()
+            .expect("test storage has a captured preparation-cache root");
+        let cache_parent = cache_root.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&cache_root).unwrap();
+        for key in [
+            ARTIFACT_SWEEP_STAMP_KEY,
+            ARTIFACT_SWEEP_PROGRESS_KEY,
+            ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+            ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY,
+            ARTIFACT_SWEEP_RETRY_AFTER_KEY,
+        ] {
+            first.store().meta_set(key, "").unwrap();
+        }
+        first
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "0")
+            .unwrap();
+        first
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "0")
+            .unwrap();
+        drop(first);
+        std::fs::remove_dir_all(&cache_parent).unwrap();
+
+        let mut reopened = storage.open(&root).unwrap();
+        let requested = reopened
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = reopened
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(
+            requested > completed,
+            "unknown cache location must remain pending"
+        );
+        assert!(
+            !cache_parent.exists(),
+            "a missing captured cache parent must not be recreated by maintenance"
+        );
     }
 
     /// On a repository with hundreds of retained worktrees the build-output
@@ -3218,7 +5802,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(tmp.path().join(".git/info/exclude"), "target/\n").unwrap();
-        let mut broker = Broker::open(tmp.path()).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(tmp.path()).unwrap();
         let session = broker.start_worktree("retained build", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
@@ -3300,6 +5885,918 @@ mod tests {
             artifact_sweep_budget_ms(100, ArtifactSweepScope::Inline, SweepUrgency::Pressured),
             100
         );
+        assert!(!scope_runs_checkout_cleanup(
+            ArtifactSweepScope::AutomaticContinuation
+        ));
+        assert!(scope_runs_checkout_cleanup(ArtifactSweepScope::Drain));
+        assert!(!scope_runs_checkout_cleanup(
+            ArtifactSweepScope::ClosedSession(1)
+        ));
+    }
+
+    #[test]
+    fn interrupted_tree_reports_entries_unlinked_before_its_cursor_stalls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("target");
+        // An expired budget may unlink one flat leaf, but must not descend
+        // into an arbitrary directory chain before checking that budget.
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("first"), b"first").unwrap();
+        std::fs::write(cache.join("second"), b"second").unwrap();
+
+        let (outcome, entries_reclaimed) =
+            remove_condemned_tree_with_progress(&cache, None, Some(Instant::now())).unwrap();
+
+        assert_eq!(outcome, TreeRemoval::Interrupted);
+        assert_eq!(
+            entries_reclaimed, 1,
+            "report the single successful unlink before the expired budget stops this pass"
+        );
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        assert!(cache.exists(), "the interrupted cache remains resumable");
+    }
+
+    #[test]
+    fn inline_partial_cache_removal_respects_spacing_and_resumes_afterward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(root, &["add", "README.md", ".gitignore"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+
+        let session = broker
+            .start_worktree("partial cache fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
+        git(&worktree, &["add", "landed.txt"]);
+        git(&worktree, &["commit", "-qm", "landed"]);
+        assert!(broker.submit(session.id).unwrap().promoted);
+        assert!(
+            broker
+                .finish_with_options(
+                    session.id,
+                    crate::FinishOptions {
+                        keep_worktree: true,
+                    },
+                )
+                .unwrap()
+                .closed
+        );
+
+        let cache = worktree.join("target");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("first"), b"first").unwrap();
+        std::fs::write(cache.join("second"), b"second").unwrap();
+        let cache_key = cache.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let (partial, entries_reclaimed) = broker
+            .sweep_artifacts_autonomously_with_test_deadlines(
+                &policy,
+                ArtifactSweepScope::Inline,
+                Instant::now() + Duration::from_secs(30),
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            !partial.complete,
+            "an interrupted removal is not a full lap"
+        );
+        assert_eq!(entries_reclaimed, 1);
+        assert!(cache.join("CACHEDIR.TAG").is_file(), "the witness remains");
+        let queued = decode_interrupted_paths(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+        )
+        .unwrap();
+        assert_eq!(queued, vec![cache_key.clone()]);
+        let partial_stamp = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
+            .unwrap()
+            .expect("the incomplete inline pass records its spacing stamp");
+        assert_ne!(partial_stamp, "0");
+
+        let entries_after_partial = std::fs::read_dir(&cache).unwrap().count();
+        let (_, spaced_entries) = broker
+            .sweep_artifacts_autonomously_with_test_deadlines(
+                &policy,
+                ArtifactSweepScope::Inline,
+                Instant::now() + Duration::from_secs(30),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(spaced_entries, 0, "spacing prevents an immediate retry");
+        assert_eq!(
+            std::fs::read_dir(&cache).unwrap().count(),
+            entries_after_partial,
+            "the queued cache is untouched inside the spacing interval"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(cache_key.as_str()),
+            "the partial path remains queued while the retry is spaced"
+        );
+
+        // Advance only the persisted schedule marker; the test deadlines keep
+        // the filesystem transition deterministic without sleeping.
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")
+            .unwrap();
+        let (resumed, resumed_entries) = broker
+            .sweep_artifacts_autonomously_with_test_deadlines(
+                &policy,
+                ArtifactSweepScope::Inline,
+                Instant::now() + Duration::from_secs(30),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(resumed.complete, "the eligible retry finishes the cache");
+        assert!(resumed_entries > 0);
+        assert!(!cache.exists());
+        assert!(
+            worktree.join("landed.txt").is_file(),
+            "the checkout remains"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "completion clears the durable interrupted-path queue"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn an_automatic_recovery_request_advances_its_durable_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        git(tmp.path(), &["add", "README.md"]);
+        git(tmp.path(), &["commit", "-qm", "init"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(tmp.path()).unwrap();
+
+        let prior_generation = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        broker.persist_artifact_sweep_recovery_request().unwrap();
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+        let first = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap();
+        let first_generation = first.as_ref().unwrap().parse::<i64>().unwrap();
+        assert!(
+            first_generation > prior_generation,
+            "a fresh request advances any generation produced during startup"
+        );
+        broker.persist_artifact_sweep_recovery_request().unwrap();
+        let second = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap();
+        let second_generation = second.unwrap().parse::<i64>().unwrap();
+        assert!(
+            second_generation > first_generation,
+            "a later pressure request must not be erased by a worker finishing an older lap"
+        );
+    }
+
+    /// This test-harness fixture is invoked in child processes by
+    /// `detached_worker_survives_its_launcher_and_resumes_after_a_crash`.
+    /// It deliberately exercises the real advisory lock, metadata store, and
+    /// cache-tree remover without resolving or launching an installed broker.
+    // The test-only launcher holds its owned process group until the parent
+    // tears it down. Its grandchild worker uses the same process-group setup
+    // as the installed continuation command and must survive that teardown.
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn detached_artifact_worker_child_fixture() {
+        let Ok(mode) = std::env::var(DETACHED_FIXTURE_MODE_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os(DETACHED_FIXTURE_ROOT_ENV).unwrap());
+        match mode.as_str() {
+            "setup" => {
+                let mut broker = open_detached_fixture_broker(&root);
+                broker.ensure_artifact_sweep_namespace().unwrap();
+                let closed = broker.start_worktree("closed cache fixture", None).unwrap();
+                let closed_worktree = PathBuf::from(&closed.worktree_path);
+                std::fs::write(closed_worktree.join("landed.txt"), "landed\n").unwrap();
+                git(&closed_worktree, &["add", "landed.txt"]);
+                git(&closed_worktree, &["commit", "-qm", "landed"]);
+                assert!(broker.submit(closed.id).unwrap().promoted);
+                assert!(
+                    broker
+                        .finish_with_options(
+                            closed.id,
+                            crate::FinishOptions {
+                                keep_worktree: true,
+                            },
+                        )
+                        .unwrap()
+                        .closed
+                );
+
+                let active = broker.start_worktree("active cache fixture", None).unwrap();
+                let active_worktree = PathBuf::from(&active.worktree_path);
+                let closed_cache = closed_worktree.join("target");
+                // Flat leaves make the deliberate zero-budget crash deterministic:
+                // one leaf is removed before interruption; directory descent
+                // remains forbidden after the deadline has already expired.
+                std::fs::create_dir_all(&closed_cache).unwrap();
+                std::fs::write(
+                    closed_cache.join("CACHEDIR.TAG"),
+                    "Signature: 8a477f597d28d172\n",
+                )
+                .unwrap();
+                for index in 0..128 {
+                    std::fs::write(
+                        closed_cache.join(format!("entry-{index:03}")),
+                        vec![b'x'; 4096],
+                    )
+                    .unwrap();
+                }
+                let active_cache = active_worktree.join("target");
+                std::fs::create_dir_all(active_cache.join("debug")).unwrap();
+                std::fs::write(
+                    active_cache.join("CACHEDIR.TAG"),
+                    "Signature: 8a477f597d28d172\n",
+                )
+                .unwrap();
+                std::fs::write(active_cache.join("debug/keep.txt"), "live cache\n").unwrap();
+                let idle = broker
+                    .start_worktree("idle open cache fixture", None)
+                    .unwrap();
+                let idle_worktree = PathBuf::from(&idle.worktree_path);
+                let idle_cache = idle_worktree.join("target");
+                let nested = idle_cache.join("debug/incremental/hash");
+                std::fs::create_dir_all(&nested).unwrap();
+                std::fs::write(
+                    idle_cache.join("CACHEDIR.TAG"),
+                    "Signature: 8a477f597d28d172\n",
+                )
+                .unwrap();
+                let old_time = SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+                let old_cache_paths = [
+                    idle_cache.clone(),
+                    idle_cache.join("CACHEDIR.TAG"),
+                    idle_cache.join("debug"),
+                ];
+                for path in &old_cache_paths {
+                    std::fs::File::open(path)
+                        .unwrap()
+                        .set_modified(old_time)
+                        .unwrap();
+                }
+                std::fs::write(nested.join("fresh.bin"), b"recent deep write").unwrap();
+                let quiet_since = now_ms() - 48 * 60 * 60 * 1000;
+                broker
+                    .store()
+                    .connection_mut()
+                    .execute(
+                        "UPDATE sessions SET created_at = ?2, last_activity_at = ?2 WHERE id = ?1",
+                        rusqlite::params![idle.id, quiet_since],
+                    )
+                    .unwrap();
+                if let Some(name) = idle_worktree.file_name() {
+                    for file in ["index", "HEAD"] {
+                        let path = root.join(".git/worktrees").join(name).join(file);
+                        if path.exists() {
+                            std::fs::File::open(path)
+                                .unwrap()
+                                .set_modified(old_time)
+                                .unwrap();
+                        }
+                    }
+                }
+                for (name, value) in [
+                    ("closed-worktree", closed.worktree_path.as_str()),
+                    ("active-worktree", active.worktree_path.as_str()),
+                    ("idle-worktree", idle.worktree_path.as_str()),
+                    ("closed-branch", closed.branch.as_str()),
+                ] {
+                    std::fs::write(detached_fixture_marker(&root, name), value).unwrap();
+                }
+                std::fs::write(
+                    detached_fixture_marker(&root, "closed-session-id"),
+                    closed.id.to_string(),
+                )
+                .unwrap();
+                drop(broker);
+            }
+            "contend" => {
+                assert!(
+                    try_artifact_sweep_worker_lock(&root).unwrap().is_none(),
+                    "a second process must not enter while the singleton lock is held"
+                );
+                std::fs::write(
+                    detached_fixture_marker(&root, "contender-blocked"),
+                    b"blocked",
+                )
+                .unwrap();
+            }
+            "launch-crash-child" => {
+                let mut command = detached_fixture_command(&root, "crash-child");
+                configure_artifact_worker_process_group(&mut command);
+                let mut child = command.spawn().unwrap();
+                std::fs::write(
+                    detached_fixture_marker(&root, "child-pid"),
+                    child.id().to_string(),
+                )
+                .unwrap();
+                if !wait_for_fixture_marker(
+                    &detached_fixture_marker(&root, "child-ready"),
+                    Duration::from_secs(10),
+                ) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("detached child did not acquire its worker lock");
+                }
+                // Keep this process, and therefore its process group, live
+                // until the parent test cancels that exact owned group. If
+                // the worker didn't get its own group, teardown kills it too.
+                #[cfg(unix)]
+                assert!(wait_for_fixture_marker(
+                    &detached_fixture_marker(&root, "launcher-release"),
+                    Duration::from_secs(20),
+                ));
+            }
+            "crash-child" => {
+                let lock = acquire_artifact_sweep_worker_lock(&root).unwrap();
+                let mut broker = open_detached_fixture_broker(&root);
+                std::fs::write(detached_fixture_marker(&root, "child-ready"), b"ready").unwrap();
+                assert!(wait_for_fixture_marker(
+                    &detached_fixture_marker(&root, "parent-exited"),
+                    Duration::from_secs(20),
+                ));
+
+                let closed_worktree = PathBuf::from(
+                    std::fs::read_to_string(detached_fixture_marker(&root, "closed-worktree"))
+                        .unwrap(),
+                );
+                let active_worktree = PathBuf::from(
+                    std::fs::read_to_string(detached_fixture_marker(&root, "active-worktree"))
+                        .unwrap(),
+                );
+                let idle_worktree = PathBuf::from(
+                    std::fs::read_to_string(detached_fixture_marker(&root, "idle-worktree"))
+                        .unwrap(),
+                );
+                let closed_session_id =
+                    std::fs::read_to_string(detached_fixture_marker(&root, "closed-session-id"))
+                        .unwrap()
+                        .trim()
+                        .parse::<i64>()
+                        .unwrap();
+                let cache = closed_worktree.join("target");
+                let active_cache = active_worktree.join("target");
+                let idle_cache = idle_worktree.join("target");
+                assert!(cache.is_dir());
+                assert!(active_cache.join("debug/keep.txt").is_file());
+                assert!(
+                    idle_cache
+                        .join("debug/incremental/hash/fresh.bin")
+                        .is_file()
+                );
+                let session = broker.store().session(closed_session_id).unwrap();
+                assert!(
+                    broker
+                        .store()
+                        .cleaned_sessions()
+                        .unwrap()
+                        .iter()
+                        .any(|closed| closed.id == closed_session_id)
+                );
+                assert!(broker.is_broker_owned_worktree(&session, &closed_worktree));
+                let policy = load_retention_policy(broker.main_root()).unwrap();
+                let mut entries_reclaimed: usize = 0;
+                broker
+                    .run_artifact_sweep_recovery_worker_loop(
+                        &policy,
+                        77,
+                        Some(1),
+                        None,
+                        |broker, policy, _remaining| {
+                            let result = broker.sweep_artifacts_autonomously_with_test_deadlines(
+                                policy,
+                                ArtifactSweepScope::AutomaticContinuation,
+                                Instant::now() + Duration::from_secs(5),
+                                Instant::now(),
+                            );
+                            if let Ok((_, count)) = &result {
+                                entries_reclaimed = *count;
+                            }
+                            result
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    entries_reclaimed > 0,
+                    "the detached cache-only child must make filesystem progress"
+                );
+                assert_eq!(
+                    broker
+                        .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some("0"),
+                    "an incomplete worker pass must not advance the completed generation"
+                );
+                assert!(
+                    cache.is_dir(),
+                    "partial cache deletion must remain resumable"
+                );
+                assert!(active_cache.is_dir(), "a live session cache is protected");
+                assert!(
+                    idle_cache
+                        .join("debug/incremental/hash/fresh.bin")
+                        .is_file(),
+                    "an idle open cache with a deep write stays protected"
+                );
+
+                std::fs::write(
+                    detached_fixture_marker(&root, "child-progress"),
+                    entries_reclaimed.to_string(),
+                )
+                .unwrap();
+                drop(broker);
+                drop(lock);
+                // Model a process crash after durable progress was recorded.
+                // The request and cursor intentionally remain outstanding.
+                std::process::exit(86);
+            }
+            "resume-child" => {
+                let lock = acquire_artifact_sweep_worker_lock(&root).unwrap();
+                let mut broker = open_detached_fixture_broker(&root);
+                let closed_worktree = PathBuf::from(
+                    std::fs::read_to_string(detached_fixture_marker(&root, "closed-worktree"))
+                        .unwrap(),
+                );
+                let active_worktree = PathBuf::from(
+                    std::fs::read_to_string(detached_fixture_marker(&root, "active-worktree"))
+                        .unwrap(),
+                );
+                let idle_worktree = PathBuf::from(
+                    std::fs::read_to_string(detached_fixture_marker(&root, "idle-worktree"))
+                        .unwrap(),
+                );
+                let closed_session_id =
+                    std::fs::read_to_string(detached_fixture_marker(&root, "closed-session-id"))
+                        .unwrap();
+                let cache = closed_worktree.join("target");
+                let active_cache = active_worktree.join("target");
+                let idle_cache = idle_worktree.join("target");
+                {
+                    let requested = broker
+                        .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(requested, "77");
+                    assert_eq!(
+                        broker
+                            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                            .unwrap()
+                            .as_deref(),
+                        Some(closed_session_id.trim()),
+                        "the restart must see the saved session cursor"
+                    );
+                    assert_eq!(
+                        broker
+                            .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                            .unwrap()
+                            .as_deref(),
+                        Some(cache.to_string_lossy().as_ref()),
+                        "the restart must see the interrupted cache path"
+                    );
+                }
+
+                let policy = load_retention_policy(broker.main_root()).unwrap();
+                let mut entries_reclaimed: usize = 0;
+                broker
+                    .run_artifact_sweep_recovery_worker_loop(
+                        &policy,
+                        77,
+                        None,
+                        None,
+                        |broker, policy, remaining| {
+                            let deadline = remaining.map(|remaining| Instant::now() + remaining);
+                            let result = broker.sweep_artifacts_autonomously_with_deadline(
+                                policy,
+                                ArtifactSweepScope::AutomaticContinuation,
+                                deadline,
+                            );
+                            if let Ok((_, count)) = &result {
+                                entries_reclaimed = entries_reclaimed.saturating_add(*count);
+                            }
+                            result
+                        },
+                    )
+                    .unwrap();
+                assert!(entries_reclaimed > 0);
+                assert!(!cache.exists(), "the closed session cache is reclaimed");
+                assert!(active_cache.join("debug/keep.txt").is_file());
+                assert!(
+                    idle_cache
+                        .join("debug/incremental/hash/fresh.bin")
+                        .is_file(),
+                    "the idle open cache remains protected after recovery"
+                );
+                assert!(closed_worktree.is_dir(), "the retained checkout survives");
+                assert!(GitRepo::discover(&closed_worktree).is_ok());
+                let branch =
+                    std::fs::read_to_string(detached_fixture_marker(&root, "closed-branch"))
+                        .unwrap();
+                assert!(
+                    std::process::Command::new("git")
+                        .args([
+                            "show-ref",
+                            "--verify",
+                            &format!("refs/heads/{}", branch.trim()),
+                        ])
+                        .current_dir(&root)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "cache-only continuation must preserve the closed session branch"
+                );
+                let requested = broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    broker
+                        .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some(requested.as_str()),
+                    "the worker loop advances the generation after a complete lap"
+                );
+                std::fs::write(
+                    detached_fixture_marker(&root, "child-resumed"),
+                    entries_reclaimed.to_string(),
+                )
+                .unwrap();
+                drop(broker);
+                drop(lock);
+            }
+            other => panic!("unknown detached worker fixture mode {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_worker_lock_refuses_hard_links_without_mutating_the_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let run = root.join(".aethyme/run");
+        std::fs::create_dir_all(&run).unwrap();
+        let protected = root.join("protected-data");
+        std::fs::write(&protected, b"keep this file intact\n").unwrap();
+        let lock_path = run.join("gc-artifact-worker.lock");
+        std::fs::hard_link(&protected, &lock_path).unwrap();
+
+        assert!(artifact_sweep_worker_lock_file(root).is_err());
+        assert_eq!(
+            std::fs::read(&protected).unwrap(),
+            b"keep this file intact\n",
+            "the worker must never truncate a hard-linked target"
+        );
+    }
+
+    #[test]
+    fn detached_worker_survives_its_launcher_and_resumes_after_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(root, &["add", "README.md", ".gitignore"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 24\nidle_session_artifact_hours = 24\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".aethyme/test-worker")).unwrap();
+
+        let worktree_root = tempfile::tempdir().unwrap();
+        let host_state = tempfile::tempdir().unwrap();
+        let host_cache = tempfile::tempdir().unwrap();
+        for (name, path) in [
+            ("worktree-root", worktree_root.path()),
+            ("host-state", host_state.path()),
+            ("host-cache", host_cache.path()),
+        ] {
+            std::fs::write(
+                detached_fixture_marker(root, name),
+                path.to_string_lossy().as_ref(),
+            )
+            .unwrap();
+        }
+        let setup = detached_fixture_command(root, "setup").status().unwrap();
+        assert!(setup.success());
+        let closed_worktree = PathBuf::from(
+            std::fs::read_to_string(detached_fixture_marker(root, "closed-worktree")).unwrap(),
+        );
+        let active_worktree = PathBuf::from(
+            std::fs::read_to_string(detached_fixture_marker(root, "active-worktree")).unwrap(),
+        );
+        let closed_cache = closed_worktree.join("target");
+        let active_cache = active_worktree.join("target");
+
+        {
+            let namespace = detached_fixture_namespace(root);
+            let store = detached_fixture_store(root);
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY),
+                    "77",
+                )
+                .unwrap();
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY),
+                    "0",
+                )
+                .unwrap();
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_CURSOR_KEY),
+                    "0",
+                )
+                .unwrap();
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_PROGRESS_KEY),
+                    "1",
+                )
+                .unwrap();
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_INTERRUPTED_KEY),
+                    "",
+                )
+                .unwrap();
+        }
+        let cache_entries_before = std::fs::read_dir(&closed_cache).unwrap().count();
+
+        // Hold the OS lock in this process and prove a separate test-binary
+        // process cannot enter its cache-only section.
+        let held_lock = acquire_artifact_sweep_worker_lock(root).unwrap();
+        let contender = detached_fixture_command(root, "contend").status().unwrap();
+        assert!(contender.success());
+        assert_eq!(
+            std::fs::read(detached_fixture_marker(root, "contender-blocked")).unwrap(),
+            b"blocked"
+        );
+        assert_eq!(
+            std::fs::read_dir(&closed_cache).unwrap().count(),
+            cache_entries_before
+        );
+        drop(held_lock);
+
+        // Run the worker launcher as a supervised user command. The real
+        // cleanup watcher tears down that owned group after the command and
+        // supervisor exit; the worker must use the production process-group
+        // configuration to survive it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let executable = std::env::current_exe().unwrap();
+            let command_text = "exec \"$AETHYME_TEST_DETACHED_GC_EXECUTABLE\" --exact gc::tests::detached_artifact_worker_child_fixture --nocapture --quiet";
+            let log_path = root.join(".aethyme/test-worker/agent-supervisor.log");
+            let log = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(log_path)
+                .unwrap();
+            let (mut supervisor_command, nonce) =
+                crate::agent_supervisor::process(command_text, root, &log, None).unwrap();
+            supervisor_command
+                .current_dir(root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(log)
+                .env(DETACHED_FIXTURE_MODE_ENV, "launch-crash-child")
+                .env(DETACHED_FIXTURE_ROOT_ENV, root)
+                .env("AETHYME_TEST_DETACHED_GC_EXECUTABLE", executable)
+                .process_group(0);
+            let mut supervisor = supervisor_command.spawn().unwrap();
+            let supervisor_group = i32::try_from(supervisor.id()).unwrap();
+            crate::agent_supervisor::await_ready(supervisor.stdout.as_mut().unwrap(), &nonce)
+                .unwrap();
+            supervisor.stdout.take();
+            writeln!(
+                supervisor.stdin.take().unwrap(),
+                "{}",
+                crate::agent_supervisor::GO
+            )
+            .unwrap();
+            assert!(wait_for_fixture_marker(
+                &detached_fixture_marker(root, "child-ready"),
+                Duration::from_secs(10),
+            ));
+            std::fs::write(
+                detached_fixture_marker(root, "launcher-release"),
+                b"release",
+            )
+            .unwrap();
+            assert!(supervisor.wait().unwrap().success());
+            let group_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                // SAFETY: signal zero only probes the captured positive child
+                // process-group ID and never delivers a signal after its leader
+                // is reaped. ESRCH proves teardown; unexpected errors refuse.
+                let result = unsafe { libc::kill(-supervisor_group, 0) };
+                if result == -1 {
+                    let error = std::io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::ESRCH) => break,
+                        Some(libc::EINTR) => {}
+                        _ => panic!("could not prove supervisor group teardown: {error}"),
+                    }
+                }
+                assert!(
+                    Instant::now() < group_deadline,
+                    "supervisor process group remained after its cleanup watcher completed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let launcher = detached_fixture_command(root, "launch-crash-child")
+                .status()
+                .unwrap();
+            assert!(launcher.success());
+        }
+        std::fs::write(detached_fixture_marker(root, "parent-exited"), b"exited").unwrap();
+        assert!(wait_for_fixture_marker(
+            &detached_fixture_marker(root, "child-progress"),
+            Duration::from_secs(10),
+        ));
+        assert!(wait_for_fixture_marker(
+            &detached_fixture_marker(root, "child-pid"),
+            Duration::from_secs(1),
+        ));
+        #[cfg(unix)]
+        let child_pid = std::fs::read_to_string(detached_fixture_marker(root, "child-pid"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+
+        // The crash marker is only written after SQLite progress is durable;
+        // wait for the child's advisory lock to be released before restart.
+        let lock_deadline = Instant::now() + Duration::from_secs(10);
+        let released_lock = loop {
+            if Instant::now() >= lock_deadline {
+                panic!("crashed worker did not release its singleton lock");
+            }
+            match try_artifact_sweep_worker_lock(root).unwrap() {
+                Some(lock) => break lock,
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        drop(released_lock);
+        #[cfg(unix)]
+        {
+            let exit_deadline = Instant::now() + Duration::from_secs(5);
+            while fixture_process_is_alive(child_pid) && Instant::now() < exit_deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !fixture_process_is_alive(child_pid),
+                "the interrupted worker must exit instead of remaining detached forever"
+            );
+        }
+        let partially_remaining = std::fs::read_dir(&closed_cache).unwrap().count();
+        assert!(partially_remaining < cache_entries_before && partially_remaining > 0);
+        assert!(active_cache.join("debug/keep.txt").is_file());
+        {
+            let namespace = detached_fixture_namespace(root);
+            let store = detached_fixture_store(root);
+            assert_eq!(
+                store
+                    .meta_get(&scoped_artifact_sweep_key(
+                        &namespace,
+                        ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+                    ))
+                    .unwrap()
+                    .as_deref(),
+                Some("77")
+            );
+            assert_eq!(
+                store
+                    .meta_get(&scoped_artifact_sweep_key(
+                        &namespace,
+                        ARTIFACT_SWEEP_CURSOR_KEY
+                    ))
+                    .unwrap()
+                    .as_deref(),
+                Some(
+                    std::fs::read_to_string(detached_fixture_marker(root, "closed-session-id",))
+                        .unwrap()
+                        .trim()
+                )
+            );
+            assert_eq!(
+                store
+                    .meta_get(&scoped_artifact_sweep_key(
+                        &namespace,
+                        ARTIFACT_SWEEP_INTERRUPTED_KEY,
+                    ))
+                    .unwrap()
+                    .as_deref(),
+                Some(closed_cache.to_string_lossy().as_ref())
+            );
+        }
+
+        let resumed = detached_fixture_command(root, "resume-child")
+            .status()
+            .unwrap();
+        assert!(resumed.success());
+        assert!(detached_fixture_marker(root, "child-resumed").is_file());
+        assert!(!closed_cache.exists());
+        assert!(active_cache.join("debug/keep.txt").is_file());
+        assert!(closed_worktree.is_dir());
+        assert!(GitRepo::discover(&closed_worktree).is_ok());
+        assert!(root.join("README.md").is_file());
+        assert!(root.join(".git/HEAD").is_file());
+        let namespace = detached_fixture_namespace(root);
+        let store = detached_fixture_store(root);
+        assert_eq!(
+            store
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+                ))
+                .unwrap()
+                .as_deref(),
+            Some("77"),
+            "the request is durable history; completion advances separately"
+        );
+        assert_eq!(
+            store
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY,
+                ))
+                .unwrap()
+                .as_deref(),
+            Some("77")
+        );
+        assert_eq!(
+            store
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_CURSOR_KEY
+                ))
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            store
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_INTERRUPTED_KEY,
+                ))
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
     }
 
     /// Each case is rejected by exactly one guard, so each guard is proved on
@@ -3318,61 +6815,62 @@ mod tests {
         std::fs::create_dir_all(root.join("real/node_modules")).unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("inner-link")).unwrap();
 
-        assert!(resumable_interrupted_tree(
-            root,
-            &root.join(".pnpm-store"),
-            &[]
-        ));
-        assert!(resumable_interrupted_tree(
-            root,
-            &root.join("web/node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join(".pnpm-store"), &[]),
+            InterruptedTreeState::Resume
+        );
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("web/node_modules"), &[]),
+            InterruptedTreeState::Resume
+        );
         // Component guard only: canonically inside root, no symlink, an
         // artefact name -- but it is spelled with `..`.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("a/../.pnpm-store"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("a/../.pnpm-store"), &[]),
+            InterruptedTreeState::Revoked("unsafe_path_components")
+        );
         // Name guard only: a real directory inside root, but not a cache.
-        assert!(!resumable_interrupted_tree(root, &root.join("src"), &[]));
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("src"),
-            &["src".to_string()]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("src"), &[]),
+            InterruptedTreeState::Revoked("not_unattended_artifact")
+        );
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("src"), &["src".to_string()]),
+            InterruptedTreeState::Revoked("not_unattended_artifact")
+        );
         std::fs::create_dir(root.join("custom-cache")).unwrap();
-        assert!(resumable_interrupted_tree(
-            root,
-            &root.join("custom-cache"),
-            &["custom-cache".to_string()]
-        ));
+        assert_eq!(
+            interrupted_tree_state(
+                root,
+                &root.join("custom-cache"),
+                &["custom-cache".to_string()]
+            ),
+            InterruptedTreeState::Resume
+        );
         // Symlink guard only: the link resolves inside root.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("inner-link/node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("inner-link/node_modules"), &[]),
+            InterruptedTreeState::Revoked("symlink_component")
+        );
         // A link leaving root.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("link/node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("link/node_modules"), &[]),
+            InterruptedTreeState::Revoked("symlink_component")
+        );
         // Not under root at all, and root itself.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &outside.path().join("node_modules"),
-            &[]
-        ));
-        assert!(!resumable_interrupted_tree(root, root, &[]));
+        assert_eq!(
+            interrupted_tree_state(root, &outside.path().join("node_modules"), &[]),
+            InterruptedTreeState::Revoked("outside_worktree")
+        );
+        assert_eq!(
+            interrupted_tree_state(root, root, &[]),
+            InterruptedTreeState::Revoked("unsafe_path_components")
+        );
         // Gone.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("node_modules"), &[]),
+            InterruptedTreeState::Revoked("path_missing")
+        );
     }
 
     /// Explicit reclaim commands keep the pressure-scaled policy budget.
@@ -3380,6 +6878,7 @@ mod tests {
     fn explicit_and_closed_session_sweeps_keep_the_pressure_scaled_budget() {
         for scope in [
             ArtifactSweepScope::Drain,
+            ArtifactSweepScope::AutomaticContinuation,
             ArtifactSweepScope::ClosedSession(7),
         ] {
             assert_eq!(
@@ -3422,6 +6921,312 @@ mod tests {
         assert!(parsed.remaining_publication_exposure_expiries.is_empty());
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn registered_orphan_fixture() -> (tempfile::TempDir, Broker, PathBuf, String) {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        std::fs::create_dir(repo.join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.join(".aethyme/broker.toml"),
+            "[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let database = fixture.path().join("host-state/host-operations.db");
+        // This constructor performs local migration/backfill, without startup
+        // maintenance, so host coordination is private before any GC work.
+        let mut broker = Broker::open_for_compatibility_backfill(&repo)
+            .unwrap()
+            .with_host_operation_database(&database)
+            .with_worktree_root(fixture.path().join("current-root"));
+        let origin = fixture.path().join("disappearing-origin");
+        let root = fixture.path().join("historical-placement/exact-root");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = crate::broker::WorktreeRootMarker {
+            schema_version: crate::broker::WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "historic-owned-root".into(),
+            repository_root: origin.clone(),
+        };
+        std::fs::write(
+            root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("retained.txt"),
+            "retained until reviewed deletion\n",
+        )
+        .unwrap();
+        crate::worktree_registry::register(
+            &database,
+            &root,
+            &marker,
+            crate::WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+        std::fs::remove_dir(&origin).unwrap();
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(
+            plan.orphans.len(),
+            1,
+            "historical placement must be discovered"
+        );
+        let digest = plan.digest.clone();
+        write_journal(
+            &repo.join(".aethyme/gc-journal.json"),
+            &GcJournal::from(plan),
+        )
+        .unwrap();
+        (fixture, broker, root.canonicalize().unwrap(), digest)
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_discovery_parent_alias_matches_one_registered_root_without_unknown_bytes() {
+        let (fixture, broker, root, _digest) = registered_orphan_fixture();
+        let alias = fixture.path().join("aliased-container");
+        std::os::unix::fs::symlink(root.parent().unwrap(), &alias).unwrap();
+        let mut broker = broker.with_worktree_root(alias.join(root.file_name().unwrap()));
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(plan.orphans.len(), 1, "aliased roots must be counted once");
+        assert_eq!(plan.orphans[0].worktree_root, root.to_string_lossy());
+        assert!(
+            !plan
+                .deferred_checks
+                .iter()
+                .any(|check| check == "orphan_scan"),
+            "a registered root reached through a parent alias has known ownership: {:?}",
+            plan.blockers
+        );
+        assert!(
+            !plan
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == "worktree_origin_uninspected")
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_busy_orphan_claim_stays_journaled_until_a_later_apply_reclaims_it() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let journal = load_journal(&journal_path).unwrap().unwrap();
+        let database = broker.host_operation_database_path().unwrap();
+        let held = crate::worktree_registry::claim_for_removal(
+            &database,
+            &root,
+            journal.remaining_orphans[0]
+                .ownership_fingerprint
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let blocked = broker.gc_apply(&digest).unwrap();
+        assert!(
+            !blocked.complete,
+            "contention must not be reported as completed deletion"
+        );
+        assert!(blocked.recovery_action.is_some());
+        assert!(root.join("retained.txt").is_file());
+        assert_eq!(
+            load_journal(&journal_path)
+                .unwrap()
+                .unwrap()
+                .remaining_orphans
+                .len(),
+            1
+        );
+        drop(held);
+        let completed = broker.gc_apply(&digest).unwrap();
+        assert!(completed.complete, "{completed:?}");
+        assert_eq!(
+            completed.orphans_removed,
+            vec![root.to_string_lossy().into_owned()]
+        );
+        assert!(!root.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn orphan_deletion_io_failure_stays_journaled_and_resumes_after_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+            }
+        }
+
+        // This regression must exercise a real permission failure, not pass
+        // vacuously under an identity that bypasses filesystem permissions.
+        assert_ne!(
+            // SAFETY: geteuid has no arguments or pointer preconditions.
+            unsafe { libc::geteuid() },
+            0,
+            "run this test as an unprivileged user"
+        );
+        let (fixture, mut broker, root, _digest) = registered_orphan_fixture();
+        let healthy = root.parent().unwrap().join("z-healthy-root");
+        let healthy_origin = fixture.path().join("healthy-origin");
+        std::fs::create_dir(&healthy).unwrap();
+        std::fs::create_dir(&healthy_origin).unwrap();
+        let marker = crate::broker::WorktreeRootMarker {
+            schema_version: crate::broker::WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "healthy-historic-root".into(),
+            repository_root: healthy_origin.clone(),
+        };
+        std::fs::write(
+            healthy.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(healthy.join("payload.txt"), "healthy payload").unwrap();
+        crate::worktree_registry::register(
+            &broker.host_operation_database_path().unwrap(),
+            &healthy,
+            &marker,
+            crate::WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+        std::fs::remove_dir(&healthy_origin).unwrap();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        std::fs::remove_file(&journal_path).unwrap();
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(plan.orphans.len(), 2);
+        assert_eq!(plan.orphans[0].worktree_root, root.to_string_lossy());
+        let digest = plan.digest.clone();
+        write_journal(&journal_path, &GcJournal::from(plan)).unwrap();
+        let child = root.join("temporarily-unreadable");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("retained.txt"), "recoverable payload").unwrap();
+        let restore = RestorePermissions(
+            child.clone(),
+            std::fs::metadata(&child).unwrap().permissions(),
+        );
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o0)).unwrap();
+        assert!(
+            std::fs::read_dir(&child).is_err(),
+            "permission denial must be real"
+        );
+
+        let blocked = broker.gc_apply(&digest).unwrap();
+        assert!(!blocked.complete, "{blocked:?}");
+        assert!(blocked.recovery_action.is_some());
+        assert_eq!(
+            blocked.orphans_removed,
+            vec![healthy.to_string_lossy().into_owned()],
+            "an unavailable root must not starve the healthy candidate behind it"
+        );
+        assert!(!healthy.exists());
+        assert!(
+            blocked
+                .failures
+                .iter()
+                .any(|reason| reason.contains("retained in journal"))
+        );
+        assert_eq!(
+            load_journal(&journal_path)
+                .unwrap()
+                .unwrap()
+                .remaining_orphans
+                .len(),
+            1
+        );
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+
+        drop(restore);
+        assert_eq!(
+            std::fs::read_to_string(child.join("retained.txt")).unwrap(),
+            "recoverable payload"
+        );
+        let completed = broker.gc_apply(&digest).unwrap();
+        assert!(completed.complete, "{completed:?}");
+        assert_eq!(
+            completed.orphans_removed,
+            vec![
+                healthy.to_string_lossy().into_owned(),
+                root.to_string_lossy().into_owned()
+            ]
+        );
+        assert!(!root.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_legacy_orphan_authorization_is_revoked_before_fresh_review_can_remove_it() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let path = broker.main_root().join(".aethyme/gc-journal.json");
+        let mut journal = load_journal(&path).unwrap().unwrap();
+        journal.remaining_orphans[0].ownership_fingerprint = None;
+        write_journal(&path, &journal).unwrap();
+        let revoked = broker.gc_apply(&digest).unwrap();
+        assert!(revoked.complete);
+        assert!(revoked.orphans_removed.is_empty());
+        assert!(
+            revoked
+                .failures
+                .iter()
+                .any(|reason| reason.contains("legacy orphan authorization revoked"))
+        );
+        assert!(root.join("retained.txt").is_file());
+        assert!(
+            !path.exists(),
+            "revoked authorization must not trap later reviewed plans"
+        );
+        let fresh = broker.gc_plan().unwrap();
+        assert_eq!(fresh.orphans.len(), 1);
+        let applied = broker.gc_apply(&fresh.digest).unwrap();
+        assert!(applied.complete);
+        assert_eq!(
+            applied.orphans_removed,
+            vec![root.to_string_lossy().into_owned()]
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn changed_orphan_evidence_revokes_only_the_old_authorization_and_allows_fresh_review() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let marker = crate::worktree_registry::read_marker(&root).unwrap();
+        std::fs::create_dir(&marker.repository_root).unwrap();
+        let revoked = broker.gc_apply(&digest).unwrap();
+        assert!(revoked.complete);
+        assert!(revoked.orphans_removed.is_empty());
+        assert!(
+            revoked
+                .failures
+                .iter()
+                .any(|reason| reason.contains("authorization revoked"))
+        );
+        assert!(root.join("retained.txt").is_file());
+        std::fs::remove_dir(&marker.repository_root).unwrap();
+        let fresh = broker.gc_plan().unwrap();
+        assert_eq!(fresh.orphans.len(), 1);
+        assert_eq!(
+            fresh.orphans[0].worktree_root,
+            root.to_string_lossy().as_ref()
+        );
+        // Authorization digests describe the candidate set, not the time of
+        // review. Restoring the same origin absence can reproduce that set.
+        // The revoked journal must be retired so a newly reviewed plan is
+        // independently revalidated instead of resuming stale authority.
+        assert!(!broker.main_root().join(".aethyme/gc-journal.json").exists());
+        let applied = broker.gc_apply(&fresh.digest).unwrap();
+        assert!(applied.complete);
+        assert!(!root.exists());
+    }
+
     /// One interrupted pass must advance the next one, and one uninterrupted
     /// pass must still be a full lap whatever the cursor was.
     #[test]
@@ -3440,6 +7245,295 @@ mod tests {
         assert_eq!(sweep_order(&sessions, 99, |id| *id), vec![1, 2, 3, 4, 5]);
 
         assert!(sweep_order(&[] as &[i64], 7, |id| *id).is_empty());
+    }
+
+    #[test]
+    fn interrupted_path_queue_reads_legacy_values_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp
+            .path()
+            .join("first/target")
+            .to_string_lossy()
+            .into_owned();
+        let second = tmp
+            .path()
+            .join("second/target")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            decode_interrupted_paths(Some(&first)).unwrap(),
+            vec![first.clone()]
+        );
+        let encoded = encode_interrupted_paths(&[first.clone(), second.clone()]).unwrap();
+        assert!(encoded.starts_with('['));
+        assert_eq!(
+            decode_interrupted_paths(Some(&encoded)).unwrap(),
+            vec![first.clone(), second]
+        );
+        assert_eq!(
+            encode_interrupted_paths(std::slice::from_ref(&first)).as_deref(),
+            Some(first.as_str())
+        );
+        assert!(decode_interrupted_paths(Some("relative/target")).is_err());
+
+        let too_many = (0..=ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX)
+            .map(|index| {
+                tmp.path()
+                    .join(format!("{index}/target"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(encode_interrupted_paths(&too_many).is_none());
+        let oversized = format!(
+            "{}/{}",
+            tmp.path().display(),
+            "x".repeat(ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES)
+        );
+        assert!(decode_interrupted_paths(Some(&oversized)).is_err());
+    }
+
+    #[test]
+    fn an_interrupted_path_blocks_completion_without_starving_other_closed_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(root, &["add", "README.md", ".gitignore"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+
+        let mut make_closed = |label: &str| {
+            let session = broker.start_worktree(label, None).unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            std::fs::write(worktree.join("landed.txt"), format!("{label}\n")).unwrap();
+            git(&worktree, &["add", "landed.txt"]);
+            git(&worktree, &["commit", "-qm", label]);
+            assert!(broker.submit(session.id).unwrap().promoted);
+            assert!(
+                broker
+                    .finish_with_options(
+                        session.id,
+                        crate::FinishOptions {
+                            keep_worktree: true,
+                        },
+                    )
+                    .unwrap()
+                    .closed
+            );
+            let cache = worktree.join("target");
+            std::fs::create_dir_all(cache.join("debug")).unwrap();
+            std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+            std::fs::write(cache.join("debug/build.bin"), vec![b'x'; 128]).unwrap();
+            (session.id, cache)
+        };
+
+        let (first_id, first_cache) = make_closed("first closed cache");
+        let (later_id, later_cache) = make_closed("later closed cache");
+        assert!(first_id < later_id);
+        let active = broker
+            .start_worktree("active-marker-blocker", None)
+            .unwrap();
+        let blocker = PathBuf::from(&active.worktree_path).join("target");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), b"active\n").unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, blocker.to_str().unwrap())
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let mut pass_complete = true;
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                Some(1),
+                Some(Duration::from_secs(10)),
+                |broker, policy, remaining| {
+                    let deadline = remaining.map(|remaining| Instant::now() + remaining);
+                    let result = broker.sweep_artifacts_autonomously_with_deadline(
+                        policy,
+                        ArtifactSweepScope::AutomaticContinuation,
+                        deadline,
+                    );
+                    if let Ok((outcome, _)) = &result {
+                        pass_complete = outcome.complete;
+                    }
+                    result
+                },
+            )
+            .unwrap();
+
+        assert!(
+            !pass_complete,
+            "an unresolved queue entry withholds completion"
+        );
+        assert!(!first_cache.exists());
+        assert!(
+            !later_cache.exists(),
+            "unrelated closed caches still make progress"
+        );
+        assert!(blocker.join("keep").exists(), "a live root stays untouched");
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(blocker.to_str().unwrap()),
+            "the unresolved path is preserved for later revalidation"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "the worker must not advance generation on an incomplete cache lap"
+        );
+        let blocked: serde_json::Value = serde_json::from_str(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)
+                .unwrap()
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(blocked.as_array().unwrap().len() <= ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX);
+        assert!(
+            blocked
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["reason"] == "live_session" && item["path"].is_string() })
+        );
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+    }
+
+    #[test]
+    fn an_incomplete_large_worktree_does_not_starve_later_closed_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(root, &["add", "README.md", ".gitignore"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+
+        let mut make_closed = |label: &str| {
+            let session = broker.start_worktree(label, None).unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            std::fs::write(worktree.join("landed.txt"), format!("{label}\n")).unwrap();
+            git(&worktree, &["add", "landed.txt"]);
+            git(&worktree, &["commit", "-qm", label]);
+            assert!(broker.submit(session.id).unwrap().promoted);
+            assert!(
+                broker
+                    .finish_with_options(
+                        session.id,
+                        crate::FinishOptions {
+                            keep_worktree: true,
+                        },
+                    )
+                    .unwrap()
+                    .closed
+            );
+            let cache = worktree.join("target");
+            std::fs::create_dir_all(cache.join("debug")).unwrap();
+            std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+            (session.id, worktree, cache)
+        };
+
+        let (large_id, large_worktree, large_cache) = make_closed("large first session");
+        for index in 0..32 {
+            std::fs::create_dir(large_worktree.join(format!("unclassified-{index:02}"))).unwrap();
+        }
+        let (later_id, later_worktree, later_cache) = make_closed("later session");
+        assert!(large_id < later_id);
+        assert!(large_cache.is_dir());
+        assert!(later_cache.is_dir());
+        let later_session = broker.store().session(later_id).unwrap();
+        assert!(broker.is_broker_owned_worktree(&later_session, &later_worktree));
+        assert!(
+            broker
+                .is_broker_owned_worktree_checked(&later_session, &later_worktree)
+                .unwrap()
+        );
+        assert!(
+            !broker
+                .is_broker_owned_worktree_checked(&later_session, root)
+                .unwrap()
+        );
+        let expired_ownership = {
+            let _deadline = crate::git::limit_git_until(Instant::now() - Duration::from_millis(1));
+            broker.is_broker_owned_worktree_checked(&later_session, &later_worktree)
+        };
+        assert!(matches!(
+            expired_ownership,
+            Err(crate::GitError::TimedOut { .. })
+        ));
+        let later_checkout = GitRepo::discover(&later_worktree).unwrap();
+        assert!(later_checkout.path_is_ignored_checked("target").unwrap());
+
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let (outcome, _) = broker
+            .sweep_artifacts_autonomously_with_test_discovery_budget(
+                &policy,
+                ArtifactSweepScope::AutomaticContinuation,
+                16,
+            )
+            .unwrap();
+
+        assert!(
+            !outcome.complete,
+            "the bounded first worktree remains an explicit incomplete pass"
+        );
+        let cursor = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+            .unwrap();
+        let expected_cursor = later_id.to_string();
+        assert_eq!(
+            cursor.as_deref(),
+            Some(expected_cursor.as_str()),
+            "the incomplete first worktree must not prevent visiting the later session"
+        );
+        assert!(
+            !later_cache.exists(),
+            "later closed sessions still get scanned after an earlier worktree exceeds the entry budget; reclaimed={}, cursor={cursor:?}",
+            outcome.directories_reclaimed
+        );
     }
 
     fn dir(root: &Path, relative: &str) -> PathBuf {
@@ -3571,6 +7665,50 @@ mod tests {
             found.is_empty(),
             "a directory below the scan depth must stay untouched: {found:?}"
         );
+        let bounded = collect_artifact_dirs_bounded(
+            root,
+            &[],
+            Instant::now() + Duration::from_secs(1),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        );
+        assert!(
+            !bounded.complete,
+            "a depth cap must not be reported as a complete cache lap"
+        );
+    }
+
+    #[test]
+    fn bounded_collection_reports_wide_tree_exhaustion_as_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for index in 0..32 {
+            dir(root, &format!("wide-{index:02}"));
+        }
+
+        let discovery =
+            collect_artifact_dirs_bounded(root, &[], Instant::now() + Duration::from_secs(1), 7);
+
+        assert!(
+            !discovery.complete,
+            "unvisited siblings must keep the lap open"
+        );
+        assert_eq!(discovery.entries_examined, 7);
+    }
+
+    #[test]
+    fn bounded_collection_reports_an_expired_deadline_as_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        dir(tmp.path(), "workspace");
+
+        let discovery = collect_artifact_dirs_bounded(
+            tmp.path(),
+            &[],
+            Instant::now() - Duration::from_millis(1),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        );
+
+        assert!(!discovery.complete);
+        assert_eq!(discovery.entries_examined, 0);
     }
 
     #[test]
@@ -3643,6 +7781,7 @@ mod tests {
     #[test]
     fn removing_what_is_already_gone_is_the_outcome_not_a_failure() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("rust")).unwrap();
         let missing = tmp.path().join("rust/target");
         assert_eq!(
             remove_condemned_tree(&missing, Some("CACHEDIR.TAG"), None).unwrap(),
@@ -3651,20 +7790,20 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_refilled_while_it_was_being_emptied_is_swept_again() {
+    fn pinned_removal_handles_nested_trees_and_missing_leaves() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = dir(tmp.path(), "target/debug");
         std::fs::write(nested.join(".DS_Store"), "finder\n").unwrap();
 
-        // Finder writes into directories as they are walked, so a directory
-        // can gain a file after the removal already emptied it. Reporting
-        // that as an error is what aborted the run; it is left for the retry
-        // that follows to collect.
-        assert!(remove_entry(&nested, true).is_ok());
-        assert!(nested.exists());
-        assert!(remove_entry(&tmp.path().join("target/absent"), false).is_ok());
-
-        // The retry is what actually finishes it.
+        assert_eq!(
+            remove_condemned_tree(&nested, None, None).unwrap(),
+            TreeRemoval::Complete
+        );
+        assert!(!nested.exists());
+        assert_eq!(
+            remove_condemned_tree(&tmp.path().join("target/absent"), None, None).unwrap(),
+            TreeRemoval::Complete
+        );
         assert_eq!(
             remove_condemned_tree(&tmp.path().join("target"), None, None).unwrap(),
             TreeRemoval::Complete

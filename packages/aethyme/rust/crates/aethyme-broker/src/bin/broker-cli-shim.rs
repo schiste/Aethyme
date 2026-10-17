@@ -10,6 +10,9 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = aethyme_broker::agent_supervisor::dispatch(&args) {
+        return ExitCode::from(code);
+    }
     let rest = match args.first().map(String::as_str) {
         Some("broker") => &args[1..],
         _ => &args[..],

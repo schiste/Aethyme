@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-08
+Last Updated: 2026-10-17
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -37,6 +37,59 @@ consumer. This file exists so that doesn't happen again.
    playground; it asserts a subset of the contracts below.
 
 ## Inventory
+
+### Detached automatic artifact continuation (#818)
+
+The broker starts the private `broker gc __continue-artifacts <canonical-main-root>` child only from the installed router paired with its sibling engine. The child requires `AETHYME_GC_ARTIFACT_SWEEP_WORKER=1`, a writable non-ephemeral main checkout, aligned router/engine build identities, and the OS advisory singleton lock before it opens broker state. The subprocess is cache-only: it may remove eligible ignored build caches, but never removes a checkout or branch. It records completion only after a full eligible cache lap; deadline, lease contention, deletion failure, or repeated no-progress leaves the generation pending with bounded backoff. A new pressure refusal clears that backoff. The command remains hidden from help and is invoked only by the paired installed runtime.
+
+Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
+
+The nine durable artifact-sweep keys are scoped by a SHA-256 namespace derived
+from the complete captured broker storage context. Linked worktrees in the
+same repository and using the same captured context share sweep state; a
+different effective host-storage configuration gets a separate cursor and
+worker generation. The repository-local namespace registry is transactional,
+append-only and capped at 64 entries. A full or invalid registry refuses the
+sweep without reading or changing scoped state; entries are never evicted.
+
+The nine pre-namespace keys are inspected with bounded, read-only checks and
+are never migrated or rewritten automatically. `gc sweep --json` adds
+`legacy_unscoped_state` (`clear` or `unknown_pending`), and the text output
+reports the same state. Malformed, non-text or oversized values, an unfinished
+request, a nonzero cursor/progress marker, interrupted or blocked paths, or a
+future retry time remain `unknown_pending`. A `clear` legacy value means no
+known old backlog; `complete` means only that the current captured-context lap
+was reported complete, not that every registered context or historical value
+is resolved.
+
+Consumers of the report must tolerate this additive field and must not treat a
+current-context completion as global cleanup completion.
+
+### Private spawned-agent supervision (#831)
+
+The router and broker shim dispatch the reserved
+`--aethyme-agent-supervisor-v1` and
+`--aethyme-agent-supervisor-cleanup-v1` modes before ordinary CLI parsing.
+They are paired internal process protocols, not operator commands. Launcher
+and child must agree on their version, storage context, exact executable and
+registration handshake; malformed or unsupported invocations refuse.
+
+Library embedders whose own executable does not implement these modes must
+select a compatible local runtime with
+`Broker::with_agent_supervisor_executable`. Selection resolves an exact file
+without PATH search; the caller chooses its trust and version policy. A
+missing, nonregular or nonexecutable selected file refuses agent start before
+allocating a checkout, session or log. A file passing those checks must still
+implement the paired private protocol; protocol failure follows transactional
+startup rollback. Unix supervision is required; unsupported platforms return
+an explicit error.
+
+Spawned-agent logs retain at most 16 MiB across stdout and stderr, with a
+bounded prefix and tail. They are diagnostic excerpts. Interrupted capture
+remains explicitly incomplete. Cleanup covers ordinary descendants in the
+owned process group; it is not containment of programs that deliberately
+escape that group. Consumers must preserve the private dispatch and exact
+runtime selection when changing entrypoints.
 
 ### Primary-checkout fast-forward (#232)
 
@@ -238,7 +291,7 @@ Before `status`, `start`, `sync`, `push`, `submit` or `finish` runs from the pri
 | `.github/workflows/product-performance.yml` (introduced 2026-10-08, #386) | Nightly and manual runs compare Criterion latency distributions for the current router and graph indexer against binaries built from the recorded reference product commit, using the same checked-in Playground fixture. The workflow reads the reference commit and fixture tree SHA from `docs/reports/product-performance-baseline-2026-10-08.md`, runs `scripts/bench-product-latency.sh`, and uploads Criterion results as a non-gating artifact. | Changing the report keys, benchmark command options, fixture identity, or executable pair can make revision comparisons invalid; the workflow intentionally reports estimates and does not enforce a noisy timing threshold. Coverage: `aethyme-cli/benches/product_latency.rs`, `scripts/bench-product-latency.sh`, and the workflow itself. |
 | `.github/workflows/cross-process-contract.yml` | Builds the router from the checkout (`cargo run … -p aethyme-cli --bin aethyme`) and runs `aethyme broker check-contract --base ... --pr-body ... --commit-messages`; the checker treats this document as the source of truth for protected entry-point strings. Native since python-retirement Phase 6 (2026-08-01). **Since 2026-10-04 (introduced: `--commit-messages`, `--merged-pr`)** the PR check and the `cross-process-contract` gate read the same decision sources: the gate passes `--commit-messages --merged-pr`, so on a main push it also reads the body of the pull request GitHub associates with HEAD (`gh api repos/{owner}/{repo}/commits/<sha>/pulls`), and a decision accepted on the PR is accepted on its merge commit. A refusal lists every source read; a lookup that cannot run is reported as unavailable with its cause and never passes. | PR contract check becomes stale if this registry misses a consumer or if the PR-template contract language changes without updating `aethyme-broker/src/contract_check.rs`. Breaks if the `broker check-contract` subcommand or the `aethyme` bin target is renamed. |
 | ~~`scripts/check-cross-process-contract.py`~~ (REMOVED 2026-08-01, retirement Phase 6) | The Python contract checker was ported to `aethyme-broker/src/contract_check.rs` and is now reached as `aethyme broker check-contract`. Behaviour is unchanged and was verified byte-identical (stdout, stderr, exit codes) against the Python implementation over the clean / undeclared-removal / declared-decision cases before deletion. Entry points at deletion: `.github/workflows/cross-process-contract.yml` and the `cross-process-contract` gate in `.aethyme/gates.toml` (both updated in the same commit); `tests/local/test_cross_process_contract_check.py` (replaced by unit tests inside the Rust module, including the two live-registry assertions). The port had to precede the `src/` deletion — otherwise the migration's largest removal would have landed with its own guard switched off. | Out-of-repo automation invoking `python scripts/check-cross-process-contract.py` gets "No such file". Migrate to `aethyme broker check-contract` (same `--base` / `--pr-body` flags, same exit codes; `--consumers-doc` added to override the registry path). |
-| Gate-result readers and harnesses nested in gates: `gates run --json` consumers, gate-log readers, and tests or tools a gate command spawns (introduced 2026-09-27, #361) | Each executed `gates run --json` result gains an additive `broker_database` object -- `path` (the disposable database), `kind` (`"disposable"`), `protected_repositories` (canonical roots whose shared `.aethyme/broker.db` the command is refused), `retention` (`"removed_on_gate_exit"`) -- omitted for cache hits and runs refused before the command. The same object is written to the gate log before any command output as one line, `aethyme gate environment: broker database <json>`. Inside a gate (`AETHYME_GATE_BROKER_DATABASES` set), resolution fails closed: a protected repository resolves to the disposable database even if `AETHYME_BROKER_DB` was removed or blanked, an `AETHYME_BROKER_DB` naming a protected shared database is refused, and an unreadable scope is refused rather than ignored. A protected database whose schema changes while the gate runs invalidates the run (`error`/`environment`, log line `aethyme invalidated this gate: ...`). | A harness that relied on removing `AETHYME_BROKER_DB` to reach the checkout's real database inside a gate now gets the disposable one; that path was the #361 hole. A wrapper that exports an unreadable scope now fails before any store opens. Renaming the log prefix or the JSON keys strands readers that audit which database a verdict could have written. Covered by `aethyme-broker/tests/gate_database_isolation.rs` and `gate_database.rs` unit tests. |
+| Gate-result readers and harnesses nested in gates: `gates run --json` consumers, gate-log readers, and tests or tools a gate command spawns (introduced 2026-09-27, #361; extended 2026-10-17, #827) | Each executed `gates run --json` result gains an additive `broker_database` object -- `path` (the disposable database), `kind` (`"disposable"`), `protected_repositories` (canonical roots whose shared `.aethyme/broker.db` the command is refused), `retention` (`"removed_on_gate_exit"`) -- omitted for cache hits and runs refused before the command. The same object is written to the gate log before any command output as one line, `aethyme gate environment: broker database <json>`. Inside a gate (`AETHYME_GATE_BROKER_DATABASES` set), resolution fails closed: a protected repository resolves to the disposable database even if `AETHYME_BROKER_DB` was removed or blanked, an `AETHYME_BROKER_DB` naming a protected shared database is refused, and an unreadable scope is refused rather than ignored. A protected database whose schema changes while the gate runs invalidates the run (`error`/`environment`, log line `aethyme invalidated this gate: ...`). Gate stdout/stderr logs retain at most 4 MiB; after that cap the broker continues draining both pipes and preserving classifier evidence from the complete drained stream. `output_bytes` counts bytes observed, including omitted bytes. | A harness that relied on removing `AETHYME_BROKER_DB` to reach the checkout's real database inside a gate now gets the disposable one; that path was the #361 hole. A wrapper that exports an unreadable scope now fails before any store opens. Renaming the log prefix or the JSON keys strands readers that audit which database a verdict could have written. Consumers must treat `log_path` as a bounded diagnostic excerpt, not a complete transcript; `output_bytes` is not the retained file length. Incomplete pipe drain after the 2-second grace is reported as `error`/`environment` with `host_fault: true`; host-resource renewal or log-storage failures are also host faults and may use `resource_contention`. Covered by `aethyme-broker/tests/gate_database_isolation.rs` and `gate_database.rs` unit tests. |
 | `.github/workflows/aethyme-gates.yml` | Runs on main/master pushes and the new manual `workflow_dispatch` surface (2026-09-18). Sets up Python for the self-provisioning `pytest-aethyme-eval` gate, builds the router with `cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme`, then runs `aethyme broker advanced gates run --all` from the repo root. This includes the full workspace suite and every configured gate. Emits only existing `gate.*` events. Since 2026-10-04 the job holds `pull-requests: read` and exports `GH_TOKEN` so the `cross-process-contract` gate can read the merged PR's body. | Breaks if the `broker advanced gates run --all` subcommand, the `aethyme` bin target, or `.aethyme/gates.toml` is renamed/moved. PR workspace coverage stays in OSS CI. Superseded runs are cancelled; release only from an exact tree with completed proof. |
 | `packages/aethyme/.github/workflows/*` (REMOVED 2026-07-09) | The package-level workflow set (`ci.yml`, `evals.yml`, `performance.yml`, `cd.yml`, `aethyme-example.yml`) and the `aethyme-scorecard` action were deleted in the Phase 0 truth cleanup. GitHub never executes workflows outside the repo-root `.github/workflows/`, `evals.yml`/`ci.yml` referenced test paths (`tests/evals/`, `tests/integration/`) that no longer exist, and the scorecard action ran `pip install aethyme-cli` — a PyPI name this repo does not publish. | Any external repository referencing `uses: .../packages/aethyme/.github/actions/aethyme-scorecard@main` was already broken by the wrong pip package name; such callers must pin an old commit or migrate to invoking `aethyme ai-ready` directly. |
 

@@ -41,6 +41,10 @@ const VERIFY_ONLY: &str = "schema = 1\n\n[promote]\nmode = \"verify-only\"\n";
 
 fn add_worktree(root: &Path, name: &str) -> PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
+    add_worktree_at(root, name, &path)
+}
+
+fn add_worktree_at(root: &Path, name: &str, path: &Path) -> PathBuf {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     sh(
         root,
@@ -54,7 +58,7 @@ fn add_worktree(root: &Path, name: &str) -> PathBuf {
             "main",
         ],
     );
-    path
+    path.to_path_buf()
 }
 
 fn now_ms() -> i64 {
@@ -234,8 +238,10 @@ fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path(), None);
     let mut broker = Broker::open(tmp.path()).unwrap();
+    let quiet_owner = tempfile::tempdir().unwrap();
+    let quiet_path = quiet_owner.path().join("quiet");
     let quiet = broker
-        .adopt(&add_worktree(tmp.path(), "quiet"), None)
+        .adopt(&add_worktree_at(tmp.path(), "quiet", &quiet_path), None)
         .unwrap();
     broker.claim_lease(quiet.id, "generated/", None).unwrap();
     make_stale(&mut broker, tmp.path(), quiet.id, "quiet");

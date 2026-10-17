@@ -656,10 +656,8 @@ pub(super) fn lowest_headroom_with(
 /// threshold, by which point every gate already refused.
 ///
 /// Both bands name `gc reclaim plan`. `gc plan` and `gc sweep` touch only
-/// closed sessions and sessions idle past `idle_session_artifact_hours`;
-/// build output in open sessions that are merely quiet -- the bulk of the
-/// 40 GiB reclaimed by hand that day -- is reachable only through the
-/// reviewed `gc reclaim` lane.
+/// closed sessions; build output in an open session is reachable only through
+/// the reviewed `gc reclaim` lane.
 ///
 /// Unknown headroom does not escalate, for the reason `refusal` fails open: a
 /// reading that could not be taken is not evidence of a full disk.
@@ -1769,6 +1767,30 @@ pub(super) fn worktree_activity_ms(main_root: &Path, session: &Session) -> Optio
         }
     }
     newest
+}
+
+/// Spawned agents own a process group whose id is their stored supervisor PID.
+/// Keep the session protected through detached descendant cleanup, including
+/// the interval after the supervisor is reaped. Legacy plain PIDs still use
+/// the ordinary process check first. An ambiguous group probe protects data.
+pub(crate) fn session_pid_alive(pid: i64) -> bool {
+    if pid <= 0 || i32::try_from(pid).is_err() {
+        return true; // Corrupt session ownership is unknown, never cleanup authority.
+    }
+    if pid_alive(pid) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: the validated positive process-group id is only probed with
+        // signal zero, which delivers no signal or mutates another process.
+        if unsafe { libc::killpg(pid as i32, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    false
 }
 
 /// True when the PID exists and is not a zombie (macOS/Linux — the v0

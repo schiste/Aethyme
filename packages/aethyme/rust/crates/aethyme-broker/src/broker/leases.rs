@@ -15,7 +15,7 @@ impl Broker {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
             let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
 
-            let pid_alive = session.pid.map(pid_alive);
+            let pid_alive = session.pid.map(session_pid_alive);
             let mut derived_status = session.status;
             if matches!(
                 session.status,
@@ -233,35 +233,6 @@ impl Broker {
             .unwrap_or(0)
     }
 
-    /// Open sessions whose agent has shown no evidence of work for `window_ms`.
-    ///
-    /// The rule is the one that closes abandoned sessions -- [`decide_abandonment`]
-    /// over the liveness [`Broker::agents_snapshot`] derives -- applied over a
-    /// caller-chosen window, so a live agent process is never included however
-    /// quiet it is. Read-only: nothing is closed and no event is written.
-    pub(crate) fn idle_open_sessions(
-        &self,
-        now_ms: i64,
-        window_ms: i64,
-    ) -> Result<Vec<Session>, BrokerOpError> {
-        Ok(self
-            .agents_snapshot(now_ms)?
-            .into_iter()
-            .filter(|view| !view.derived_status.is_closed())
-            .filter(|view| {
-                let activity = SessionActivity {
-                    session_id: view.session.id,
-                    last_activity_at: view.activity_at,
-                    created_at: view.session.created_at,
-                    agent_alive: view.pid_alive,
-                    closed: false,
-                };
-                decide_abandonment(&activity, now_ms, window_ms).is_abandoned()
-            })
-            .map(|view| view.session)
-            .collect())
-    }
-
     /// Derive current liveness without persisting status transitions. This is
     /// deliberately allowed to inspect PIDs and worktree metadata, but never
     /// changes a session row or appends an event.
@@ -271,7 +242,7 @@ impl Broker {
         for session in sessions {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
             let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
-            let pid_alive = session.pid.map(pid_alive);
+            let pid_alive = session.pid.map(session_pid_alive);
             let mut derived_status = session.status;
             if matches!(
                 session.status,
@@ -1520,10 +1491,170 @@ impl Broker {
         session_id: i64,
         command: &[String],
         environment: &[(String, String)],
-        mut heartbeat: F,
+        heartbeat: F,
     ) -> Result<GuardedExecReport, BrokerOpError>
     where
         F: FnMut() -> Result<(), BrokerOpError>,
+    {
+        let mut heartbeat = heartbeat;
+        self.guarded_exec_with_runner(session_id, command, move |session| {
+            let mut child = Command::new(&command[0]);
+            child
+                .args(&command[1..])
+                .current_dir(&session.worktree_path)
+                .env("AETHYME_BROKER_SESSION_ID", session_id.to_string())
+                .env("AETHYME_GATE_WORKER_ID", format!("s{session_id}-exec"))
+                .env("AETHYME_TEST_DB_SUFFIX", format!("s{session_id}-exec"));
+            for (name, value) in environment {
+                child.env(name, value);
+            }
+            let mut child = child.spawn().map_err(|source| BrokerOpError::Spawn {
+                command: command.join(" "),
+                source,
+            })?;
+            let status = loop {
+                if let Some(status) = child.try_wait().map_err(|source| BrokerOpError::Spawn {
+                    command: command.join(" "),
+                    source,
+                })? {
+                    break status;
+                }
+                if let Err(error) = heartbeat() {
+                    if let Err(cleanup_error) = child.kill() {
+                        crate::warn_unrecorded(
+                            "stop guarded command after heartbeat failure",
+                            Err::<(), _>(cleanup_error),
+                        );
+                    }
+                    if let Err(cleanup_error) = child.wait() {
+                        crate::warn_unrecorded(
+                            "reap guarded command after heartbeat failure",
+                            Err::<(), _>(cleanup_error),
+                        );
+                    }
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            };
+            Ok(GuardedCommandResult {
+                exit_code: status.code(),
+                succeeded: status.success(),
+            })
+        })
+    }
+
+    pub(crate) fn start_preparation_exec_supervisor(
+        &self,
+    ) -> Result<crate::inline_exec_supervisor::InlineExecSupervisor, BrokerOpError> {
+        let executable = crate::agent_supervisor::resolve_executable(
+            self.agent_supervisor_executable.as_deref(),
+        )
+        .map_err(|error| crate::PreparationError::SupervisorUnavailable {
+            reason: error.to_string(),
+        })?;
+        crate::inline_exec_supervisor::InlineExecSupervisor::start(&executable).map_err(|error| {
+            match error {
+                crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(reason) => {
+                    crate::PreparationError::SupervisorUnavailable {
+                        reason: format!("startup helper cleanup could not be verified: {reason}"),
+                    }
+                    .into()
+                }
+                crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(reason) => {
+                    crate::PreparationError::SupervisorUnavailable {
+                        reason: format!("unexpected startup-helper result state: {reason}"),
+                    }
+                    .into()
+                }
+                crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
+                crate::inline_exec_supervisor::InlineExecError::Setup(error) => {
+                    crate::PreparationError::SupervisorUnavailable {
+                        reason: error.to_string(),
+                    }
+                    .into()
+                }
+                crate::inline_exec_supervisor::InlineExecError::CommandStart(reason) => {
+                    crate::PreparationError::SupervisorUnavailable { reason }.into()
+                }
+            }
+        })
+    }
+
+    pub(crate) fn guarded_preparation_exec_with_supervisor<F>(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+        environment: &[(String, String)],
+        supervisor: crate::inline_exec_supervisor::InlineExecSupervisor,
+        heartbeat: F,
+    ) -> Result<GuardedExecReport, BrokerOpError>
+    where
+        F: FnMut() -> Result<(), BrokerOpError>,
+    {
+        if command.is_empty() {
+            return Err(BrokerOpError::MissingExecCommand);
+        }
+        let mut execution_environment = vec![
+            (
+                "AETHYME_BROKER_SESSION_ID".to_owned(),
+                session_id.to_string(),
+            ),
+            (
+                "AETHYME_GATE_WORKER_ID".to_owned(),
+                format!("s{session_id}-exec"),
+            ),
+            (
+                "AETHYME_TEST_DB_SUFFIX".to_owned(),
+                format!("s{session_id}-exec"),
+            ),
+        ];
+        execution_environment.extend_from_slice(environment);
+        self.guarded_exec_with_runner(session_id, command, move |session| {
+            let result = supervisor
+                .run(
+                    Path::new(&session.worktree_path),
+                    command,
+                    &execution_environment,
+                    heartbeat,
+                )
+                .map_err(|error| match error {
+                    crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(reason) => {
+                        crate::PreparationError::CleanupUnknown { session_id, reason }.into()
+                    }
+                    crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(
+                        reason,
+                    ) => {
+                        crate::PreparationError::CommandOutcomeUnknown { session_id, reason }.into()
+                    }
+                    crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
+                    crate::inline_exec_supervisor::InlineExecError::Setup(error) => {
+                        crate::PreparationError::SupervisorUnavailable {
+                            reason: error.to_string(),
+                        }
+                        .into()
+                    }
+                    crate::inline_exec_supervisor::InlineExecError::CommandStart(reason) => {
+                        BrokerOpError::Spawn {
+                            command: command.join(" "),
+                            source: std::io::Error::other(reason),
+                        }
+                    }
+                })?;
+            Ok(GuardedCommandResult {
+                exit_code: result.exit_code,
+                succeeded: result.succeeded,
+            })
+        })
+    }
+
+    fn guarded_exec_with_runner<F>(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+        run: F,
+    ) -> Result<GuardedExecReport, BrokerOpError>
+    where
+        F: FnOnce(&crate::types::Session) -> Result<GuardedCommandResult, BrokerOpError>,
     {
         if command.is_empty() {
             return Err(BrokerOpError::MissingExecCommand);
@@ -1540,34 +1671,7 @@ impl Broker {
             .collect::<std::collections::BTreeSet<_>>();
         let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
 
-        let mut child = Command::new(&command[0]);
-        child
-            .args(&command[1..])
-            .current_dir(&session.worktree_path)
-            .env("AETHYME_BROKER_SESSION_ID", session_id.to_string())
-            .env("AETHYME_GATE_WORKER_ID", format!("s{session_id}-exec"))
-            .env("AETHYME_TEST_DB_SUFFIX", format!("s{session_id}-exec"));
-        for (name, value) in environment {
-            child.env(name, value);
-        }
-        let mut child = child.spawn().map_err(|source| BrokerOpError::Spawn {
-            command: command.join(" "),
-            source,
-        })?;
-        let status = loop {
-            if let Some(status) = child.try_wait().map_err(|source| BrokerOpError::Spawn {
-                command: command.join(" "),
-                source,
-            })? {
-                break status;
-            }
-            if let Err(error) = heartbeat() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        };
+        let status = run(&session)?;
 
         let mut after_dirty = checkout.dirty_paths()?;
         after_dirty.sort();
@@ -1608,12 +1712,12 @@ impl Broker {
             false,
             false,
         )?;
-        let command_success = status.success();
+        let command_success = status.succeeded;
         let ok = command_success && audit.ok;
         let report = GuardedExecReport {
             session_id,
             command: command.to_vec(),
-            exit_code: status.code(),
+            exit_code: status.exit_code,
             command_success,
             before_dirty_paths: before_dirty,
             after_dirty_paths: after_dirty,
@@ -1645,6 +1749,12 @@ impl Broker {
         }
         Ok(report)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GuardedCommandResult {
+    exit_code: Option<i32>,
+    succeeded: bool,
 }
 
 /// The paths a lease refresh records as `session`'s implicit leases, or

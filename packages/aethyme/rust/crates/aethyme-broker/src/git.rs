@@ -1454,6 +1454,28 @@ impl GitRepo {
         run_git(&self.root, &["check-ignore", "--quiet", "--", path]).is_ok()
     }
 
+    /// Whether Git ignores `path`, preserving command failures separately
+    /// from Git's expected exit status 1 for a path that is not ignored.
+    /// Cleanup callers need the distinction: a timeout or malformed checkout
+    /// must leave discovery incomplete instead of treating the path as safe.
+    pub(crate) fn path_is_ignored_checked(&self, path: &str) -> Result<bool, GitError> {
+        let args = ["check-ignore", "--quiet", "--", path];
+        let mut command = Command::new(&git_program().program);
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
     /// Validate one fully-qualified destination ref with Git's own grammar.
     pub fn validate_push_destination(&self, destination: &str) -> Result<(), GitError> {
         run_git(&self.root, &["check-ref-format", destination]).map(|_| ())
@@ -3497,6 +3519,27 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Remove a worktree without recursively deleting its directory if Git refuses.
+    /// Rollback callers use this after proving the worktree identity and cleanliness;
+    /// any new or ambiguous contents must remain available for recovery.
+    pub(crate) fn worktree_remove_without_orphan_fallback(
+        &self,
+        worktree: &Path,
+    ) -> Result<(), GitError> {
+        // Match `worktree_remove`: release only a lock that the broker itself placed.
+        if self.worktree_lock_reason(worktree).as_deref() == Some(BROKER_WORKTREE_LOCK_REASON) {
+            run_git(
+                &self.root,
+                &["worktree", "unlock", worktree.to_str().unwrap_or_default()],
+            )?;
+        }
+        run_git(
+            &self.root,
+            &["worktree", "remove", worktree.to_str().unwrap_or_default()],
+        )?;
+        Ok(())
+    }
+
     /// Delete an exact local branch only when it still names the expected
     /// object. Used to roll back a just-created session worktree if its
     /// atomic database registration loses a planned-lease race.
@@ -4237,6 +4280,24 @@ mod subprocess_path_tests {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn checked_ignore_distinguishes_not_ignored_from_git_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        run_git(tmp.path(), &["init", "-q"]).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        let repo = GitRepo::discover(tmp.path()).unwrap();
+
+        assert!(repo.path_is_ignored_checked("target").unwrap());
+        assert!(!repo.path_is_ignored_checked("src").unwrap());
+
+        let _deadline = limit_git_until(Instant::now() - Duration::from_millis(1));
+        assert!(matches!(
+            repo.path_is_ignored_checked("target"),
+            Err(GitError::TimedOut { .. })
+        ));
+    }
 
     #[test]
     fn discovery_preserves_an_expired_deadline_instead_of_denying_the_repository() {

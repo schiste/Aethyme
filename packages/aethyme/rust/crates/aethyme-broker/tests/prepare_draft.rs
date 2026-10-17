@@ -131,6 +131,29 @@ fn every_drafted_config_is_accepted_by_the_real_reader() {
     }
 }
 
+/// Cache configuration must not promise deduplication or a write quota that
+/// the actual preparation runner does not enforce.
+#[test]
+fn storage_guidance_distinguishes_shared_stores_from_worktree_allocations() {
+    for (lockfile, contents) in [
+        ("pnpm-lock.yaml", "lockfileVersion: 9\n"),
+        ("package-lock.json", "{}\n"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "package.json", "{}\n");
+        touch(tmp.path(), lockfile, contents);
+        let draft = init::draft_prepare_config(tmp.path()).expect("node draft");
+        assert!(draft.contains("same filesystem"));
+        assert!(draft.contains("does not guarantee deduplication"));
+        assert!(draft.contains("The command must explicitly"));
+        assert!(draft.contains("separate copy per session"));
+        assert!(draft.contains("not a storage quota"));
+        assert!(draft.contains("a running install can exceed it"));
+        assert!(!draft.contains("difference between one copy on disk"));
+        assert!(!draft.contains("to cap it;"));
+    }
+}
+
 /// A step whose declared output its own command cannot create would report
 /// `failed` on every run. That is the failure mode this detector exists to
 /// avoid, so assert the absence directly rather than trusting the comment.
