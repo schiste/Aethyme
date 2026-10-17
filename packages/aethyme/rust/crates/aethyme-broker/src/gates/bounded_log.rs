@@ -448,7 +448,7 @@ struct PatternMatcher {
 impl PatternMatcher {
     fn feed(&mut self, bytes: &[u8]) {
         let dfa = classifier_dfa();
-        for byte in bytes.iter().copied() {
+        for byte in bytes {
             let folded = byte.to_ascii_lowercase();
             self.state = if folded.is_ascii() {
                 dfa.nodes[self.state as usize].transitions[folded as usize]

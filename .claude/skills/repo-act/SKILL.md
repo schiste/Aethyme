@@ -66,9 +66,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   switching between linked worktrees and advancing a branch. Verify freshness
   from Cargo output; correct embedded identity alone does not rule out forced
   recompilation on every invocation. Use a dependency-free fixture first.
-  Keep the oracle from changing watched inputs: `git describe --dirty` can
-  refresh the index even with optional locks disabled. Compare source metadata
-  before and after, or give the oracle a fixture-owned copy of its Git index.
+  Keep production probes and oracles from changing watched inputs: Git dirty
+  checks can refresh the index even with optional locks disabled. Trace Git
+  metadata before and after rather than inferring read-only behavior from flags.
+  An isolated index must also protect split-index backing files.
 - Run the fastest relevant test command first.
   Check the selected test names and a nonzero executed count before treating a
   focused run as evidence. Rust module aliases can differ from filenames; a
@@ -78,6 +79,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and sentinel absence, then remove only the call-site guard in a mutation run
   and verify that the sentinel assertion fails. A helper-only test cannot prove
   that the production path invokes the guard.
+- Automated focused-test runners should refuse a successful zero-test result;
+  preserve the process exit separately from that validation refusal.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
