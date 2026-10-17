@@ -4344,14 +4344,17 @@ mod tests {
         .expect("retired paths use the original writer identity");
         let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
         let grant = writer.acquire(&lease_request).unwrap();
-        let (removed_while_leased, _) = sweep_preparation_cache_at(
+        let leased_report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
-        assert_eq!(removed_while_leased, 0);
+        assert!(!leased_report.complete);
+        assert_eq!(leased_report.entries_removed, 0);
+        assert_eq!(leased_report.bytes_reclaimed, 0);
+        assert_eq!(leased_report.filesystem_entries_reclaimed, 0);
         assert!(retired_key.join("cache.bin").is_file());
         writer
             .release(
@@ -4361,15 +4364,17 @@ mod tests {
             )
             .unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
-        assert_eq!(removed, 1);
-        assert_eq!(bytes, b"retired store".len() as u64);
+        assert!(report.complete);
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(report.bytes_reclaimed, b"retired store".len() as u64);
+        assert!(report.filesystem_entries_reclaimed >= 2);
         assert!(!retired_path.exists());
     }
 
@@ -4532,7 +4537,7 @@ mod tests {
         let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
         let grant = writer.acquire(&request).unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let busy_report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4540,7 +4545,10 @@ mod tests {
             deadline,
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!busy_report.complete);
+        assert_eq!(busy_report.entries_removed, 0);
+        assert_eq!(busy_report.bytes_reclaimed, 0);
+        assert_eq!(busy_report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
         writer
             .release(
@@ -4550,14 +4558,17 @@ mod tests {
             )
             .unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let resumed_report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
-        assert_eq!((removed, bytes), (1, 16));
+        assert!(resumed_report.complete);
+        assert_eq!(resumed_report.entries_removed, 1);
+        assert_eq!(resumed_report.bytes_reclaimed, 16);
+        assert!(resumed_report.filesystem_entries_reclaimed >= 2);
         assert!(!entry.exists());
     }
 
@@ -4662,7 +4673,7 @@ mod tests {
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"keep until verified").unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4670,7 +4681,10 @@ mod tests {
             std::time::Instant::now() - Duration::from_millis(1),
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!report.complete);
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
     }
 
@@ -4689,7 +4703,7 @@ mod tests {
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"retain without lease registry").unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4697,7 +4711,10 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!report.complete);
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
         assert!(
             !resource_db_path.exists(),
@@ -4735,7 +4752,7 @@ mod tests {
         std::fs::write(entry.join("cache.bin"), b"retain on unknown liveness").unwrap();
         let resource_db_path = test_host_resource_db(tmp.path());
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4743,7 +4760,10 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!report.complete);
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
         assert!(unmarked_root.is_dir());
     }
@@ -4774,7 +4794,7 @@ mod tests {
         std::fs::write(entry.join("cache.bin"), b"dead").unwrap();
         let resource_db_path = test_host_resource_db(tmp.path());
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4782,8 +4802,10 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
-        assert_eq!(removed, 1);
-        assert_eq!(bytes, 4);
+        assert!(report.complete);
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(report.bytes_reclaimed, 4);
+        assert_eq!(report.filesystem_entries_reclaimed, 2);
         assert!(!entry.exists());
     }
 
