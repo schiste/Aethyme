@@ -116,6 +116,11 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             "AETHYME_BROKER_DB",
             "AETHYME_GATE_BROKER_DATABASES",
             "AETHYME_WORKTREE_ROOT",
+            "AETHYME_BROKER_STORAGE_CONTEXT_V1",
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
         ] {
             assert_eq!(env.get(OsStr::new(removed)), Some(&None), "{removed}");
         }
@@ -179,6 +184,9 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             poison_root.join("host-state"),
             poison_root.join("host-cache"),
             poison_root.join("broker.db"),
+            poison_root.join("host-operations.db"),
+            poison_root.join("private-worktrees"),
+            poison_root.join("collaboration"),
             poison_root.join("worktrees"),
         ] {
             assert!(
@@ -208,6 +216,23 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             poison_root.path().join("host-cache"),
         )
         .env("AETHYME_BROKER_DB", poison_root.path().join("broker.db"))
+        .env("AETHYME_BROKER_STORAGE_CONTEXT_V1", "poisoned-envelope")
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            poison_root.path().join("host-operations.db"),
+        )
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+            "poisoned-explicitness",
+        )
+        .env(
+            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+            poison_root.path().join("private-worktrees"),
+        )
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            poison_root.path().join("collaboration"),
+        )
         .env(
             "AETHYME_GATE_BROKER_DATABASES",
             "poisoned-gate-database-scope",

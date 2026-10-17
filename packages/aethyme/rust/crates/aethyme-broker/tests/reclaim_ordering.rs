@@ -14,6 +14,8 @@ use std::process::Command;
 
 use aethyme_broker::{Broker, FinishOptions, ReclaimOrder};
 
+mod common;
+
 const DAY_MS: i64 = 86_400_000;
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -55,15 +57,15 @@ fn write_policy(main_root: &Path, retained_bytes_budget: u64) {
     .unwrap();
 }
 
-fn fixture() -> (tempfile::TempDir, Broker) {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture() -> (common::FixtureRepository, Broker) {
+    let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
     write_policy(tmp.path(), 0);
-    let broker = Broker::open(tmp.path()).unwrap();
+    let broker = common::open_fixture_repository_broker(&tmp).unwrap();
     (tmp, broker)
 }
 
@@ -99,7 +101,7 @@ fn deliver(broker: &mut Broker, task: &str, payload_bytes: usize) -> i64 {
 ///
 /// Closing times are written directly because a test cannot wait a day, and
 /// the age policy is not what is under test.
-fn two_candidates(tmp: &tempfile::TempDir, broker: Broker) -> (Broker, i64, i64, i64, i64) {
+fn two_candidates(tmp: &common::FixtureRepository, broker: Broker) -> (Broker, i64, i64, i64, i64) {
     let mut broker = broker;
     let small = deliver(&mut broker, "small old delivery", 1_024);
     let large = deliver(&mut broker, "large new delivery", 512 * 1_024);
@@ -136,7 +138,7 @@ fn two_candidates(tmp: &tempfile::TempDir, broker: Broker) -> (Broker, i64, i64,
     }
     drop(db);
     (
-        Broker::open(tmp.path()).unwrap(),
+        common::open_fixture_repository_broker(tmp).unwrap(),
         small,
         large,
         blocked_old,
