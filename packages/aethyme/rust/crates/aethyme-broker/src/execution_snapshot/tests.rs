@@ -84,9 +84,9 @@ fn materialization_rejects_aggregate_file_count_across_roles() {
 
 #[test]
 fn materialization_rejects_file_limit_plus_one() {
-    let source = manifest((0..=MAX_MATERIALIZED_FILES).map(|index| format!("file-{index:04}.txt")));
+    let source = manifest((0..8_193).map(|index| format!("file-{index:04}.txt")));
 
-    assert_eq!(source.entries().len(), MAX_MATERIALIZED_FILES + 1);
+    assert_eq!(source.entries().len(), 8_193);
     assert!(matches!(
         validate_materialization_bounds(&[("source", &source)]),
         Err(SnapshotError::MaterializationLimit(
@@ -97,10 +97,11 @@ fn materialization_rejects_file_limit_plus_one() {
 
 #[test]
 fn materialization_rejects_excessive_path_depth() {
-    let path = std::iter::repeat_n("d", MAX_MATERIALIZED_PATH_DEPTH)
+    let path = std::iter::repeat_n("d", 64)
         .chain(["file.txt"])
         .collect::<Vec<_>>()
         .join("/");
+    assert_eq!(path.split('/').count(), 65);
     let source = manifest([path]);
 
     assert!(matches!(
@@ -113,10 +114,9 @@ fn materialization_rejects_excessive_path_depth() {
 
 #[test]
 fn materialization_rejects_excessive_component_length() {
-    let source = manifest([format!(
-        "{}.txt",
-        "x".repeat(MAX_MATERIALIZED_COMPONENT_BYTES - 3)
-    )]);
+    let path = format!("{}.txt", "x".repeat(252));
+    assert_eq!(path.len(), 256);
+    let source = manifest([path]);
 
     assert!(matches!(
         validate_materialization_bounds(&[("source", &source)]),
@@ -149,10 +149,7 @@ fn materialization_accepts_exact_aggregate_file_limit_across_roles() {
     let source = manifest((0..4_096).map(|index| format!("source-{index:04}.txt")));
     let harness = manifest((0..4_096).map(|index| format!("harness-{index:04}.txt")));
 
-    assert_eq!(
-        source.entries().len() + harness.entries().len(),
-        MAX_MATERIALIZED_FILES
-    );
+    assert_eq!(source.entries().len() + harness.entries().len(), 8_192);
     assert!(validate_materialization_bounds(&[("source", &source), ("harness", &harness)]).is_ok());
     assert!(portable(&source).is_ok());
     assert!(portable(&harness).is_ok());
@@ -160,11 +157,13 @@ fn materialization_accepts_exact_aggregate_file_limit_across_roles() {
 
 #[test]
 fn materialization_accepts_exact_path_depth_and_component_limits() {
-    let depth_path = std::iter::repeat_n("d", MAX_MATERIALIZED_PATH_DEPTH - 1)
+    let depth_path = std::iter::repeat_n("d", 63)
         .chain(["file.txt"])
         .collect::<Vec<_>>()
         .join("/");
-    let component_path = format!("{}.txt", "x".repeat(MAX_MATERIALIZED_COMPONENT_BYTES - 4));
+    let component_path = format!("{}.txt", "x".repeat(251));
+    assert_eq!(depth_path.split('/').count(), 64);
+    assert_eq!(component_path.len(), 255);
     let depth = manifest([depth_path]);
     let component = manifest([component_path]);
 
@@ -183,7 +182,7 @@ fn materialization_accepts_exact_aggregate_node_limit() {
     paths.push("directory-8190/b.txt".into());
     let source = manifest(paths);
 
-    assert_eq!(source.entries().len(), MAX_MATERIALIZED_FILES);
+    assert_eq!(source.entries().len(), 8_192);
     assert!(validate_materialization_bounds(&[("source", &source)]).is_ok());
     assert!(portable(&source).is_ok());
 }
@@ -191,11 +190,9 @@ fn materialization_accepts_exact_aggregate_node_limit() {
 #[test]
 fn materialization_rejects_aggregate_node_limit_plus_one() {
     // One role root + 8,192 unique directories + 8,192 files = 16,385 nodes.
-    let source = manifest(
-        (0..MAX_MATERIALIZED_FILES).map(|directory| format!("directory-{directory:04}/a.txt")),
-    );
+    let source = manifest((0..8_192).map(|directory| format!("directory-{directory:04}/a.txt")));
 
-    assert_eq!(source.entries().len(), MAX_MATERIALIZED_FILES);
+    assert_eq!(source.entries().len(), 8_192);
     assert!(matches!(
         validate_materialization_bounds(&[("source", &source)]),
         Err(SnapshotError::MaterializationLimit(
@@ -213,10 +210,11 @@ fn portable_accepts_shared_directory_prefixes() {
 
 #[test]
 fn portable_enforces_materialization_path_and_file_limits() {
-    let too_deep_path = std::iter::repeat_n("d", MAX_MATERIALIZED_PATH_DEPTH)
+    let too_deep_path = std::iter::repeat_n("d", 64)
         .chain(["file.txt"])
         .collect::<Vec<_>>()
         .join("/");
+    assert_eq!(too_deep_path.split('/').count(), 65);
     let too_deep = manifest([too_deep_path]);
     assert!(matches!(
         portable(&too_deep),
@@ -225,10 +223,9 @@ fn portable_enforces_materialization_path_and_file_limits() {
         ))
     ));
 
-    let too_wide = manifest([format!(
-        "{}.txt",
-        "x".repeat(MAX_MATERIALIZED_COMPONENT_BYTES - 3)
-    )]);
+    let too_wide_path = format!("{}.txt", "x".repeat(252));
+    assert_eq!(too_wide_path.len(), 256);
+    let too_wide = manifest([too_wide_path]);
     assert!(matches!(
         portable(&too_wide),
         Err(SnapshotError::MaterializationLimit(
@@ -236,8 +233,7 @@ fn portable_enforces_materialization_path_and_file_limits() {
         ))
     ));
 
-    let too_many =
-        manifest((0..=MAX_MATERIALIZED_FILES).map(|index| format!("file-{index:04}.txt")));
+    let too_many = manifest((0..8_193).map(|index| format!("file-{index:04}.txt")));
     assert!(matches!(
         portable(&too_many),
         Err(SnapshotError::MaterializationLimit(
@@ -248,10 +244,11 @@ fn portable_enforces_materialization_path_and_file_limits() {
 
 #[test]
 fn portable_rejects_node_overflow_before_prefix_allocation() {
-    // The leading backslash path makes portable() return immediately if it
-    // reaches path checks before the node preflight. This compact synthetic
-    // manifest avoids creating a large filesystem tree while checking the
-    // common boundary used by execution, generation, and artifact callers.
+    // The first raw-sorted path contains a backslash, so portable() returns
+    // immediately if it reaches path checks before the node preflight. This
+    // compact synthetic manifest avoids creating a large filesystem tree
+    // while checking the common boundary used by execution, generation, and
+    // artifact callers.
     let paths = std::iter::once("!bad\\dir/file.txt".to_owned()).chain((0..256).map(|file| {
         std::iter::once(format!("root-{file:03}"))
             .chain((0..62).map(|depth| format!("dir-{depth:02}-{file:03}")))
