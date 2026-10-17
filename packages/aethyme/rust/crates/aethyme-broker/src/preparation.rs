@@ -3771,9 +3771,8 @@ mod tests {
         assert!(plan.steps[0].shared_cache.is_none());
 
         let command_started = Cell::new(false);
-        let result = require_managed_storage_execution_ready(Some(&plan)).and_then(|()| {
+        let result = require_managed_storage_execution_ready(Some(&plan)).map(|()| {
             command_started.set(true);
-            Ok(())
         });
         assert!(matches!(
             result,
