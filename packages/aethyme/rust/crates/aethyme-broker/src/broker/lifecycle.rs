@@ -2289,6 +2289,10 @@ impl Broker {
         context: SessionContext,
         explicit_base: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
+        crate::agent_supervisor::ensure_supported().map_err(|source| BrokerOpError::Spawn {
+            command: command.to_owned(),
+            source,
+        })?;
         let context = self.session_context(context);
         let (slug, branch, start_base, worktree, worktree_placement) =
             self.create_session_worktree(task, explicit_base)?;
@@ -2341,19 +2345,20 @@ impl Broker {
             }
         };
 
-        let mut agent = match spawn_blocked_agent(command, &worktree_path, log_file, log_clone) {
-            Ok(agent) => agent,
-            Err(error) => {
-                return Err(start_agent_setup_failure(
-                    &self.repo,
-                    &worktree_path,
-                    &branch,
-                    &base,
-                    Some(&created_log),
-                    error,
-                ));
-            }
-        };
+        let mut agent =
+            match spawn_blocked_agent(command, &worktree_path, log_file, log_clone, Some(self)) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    return Err(start_agent_setup_failure(
+                        &self.repo,
+                        &worktree_path,
+                        &branch,
+                        &base,
+                        Some(&created_log),
+                        error,
+                    ));
+                }
+            };
         let pid = agent.pid();
         let worktree_path_string = worktree_path.to_string_lossy().into_owned();
         let log_path_string = log_path.to_string_lossy().into_owned();
@@ -3132,9 +3137,6 @@ impl Broker {
     }
 }
 
-const START_AGENT_GATE_TOKEN: &str = "AETHYME_START_AGENT_V1";
-const START_AGENT_GATE_SCRIPT: &str = "IFS= read -r token || exit 125; [ \"$token\" = \"AETHYME_START_AGENT_V1\" ] || exit 125; exec sh -c \"$1\"";
-
 #[derive(Debug)]
 pub(super) struct GatedAgent {
     child: std::process::Child,
@@ -3156,7 +3158,8 @@ impl GatedAgent {
                 "start-agent gate input is already closed",
             )
         })?;
-        stdin.write_all(format!("{START_AGENT_GATE_TOKEN}\n").as_bytes())?;
+        let token = crate::agent_supervisor::GO;
+        stdin.write_all(format!("{token}\n").as_bytes())?;
         self.stdin.take();
         self.released = true;
         Ok(())
@@ -3253,6 +3256,36 @@ impl Drop for GatedAgent {
                 self.abort(),
             );
         }
+        #[cfg(unix)]
+        if self.released {
+            // The Child handle is dropped immediately afterward and never
+            // waited elsewhere. Until this sole waiter reaps it, the PID cannot
+            // be recycled. No signals are issued by this best-effort reaper.
+            let pid = self.child.id() as libc::pid_t;
+            crate::warn_unrecorded(
+                "start released agent reaper",
+                std::thread::Builder::new()
+                    .name("aethyme-agent-reaper".into())
+                    .spawn(move || {
+                        loop {
+                            let mut status = 0;
+                            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+                            if result == pid {
+                                break;
+                            }
+                            let error = std::io::Error::last_os_error();
+                            if result < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            if result < 0 && error.raw_os_error() != Some(libc::ECHILD) {
+                                crate::warn_unrecorded("reap released agent", Err::<(), _>(error));
+                            }
+                            break;
+                        }
+                    })
+                    .map(|_| ()),
+            );
+        }
     }
 }
 
@@ -3261,21 +3294,28 @@ pub(super) fn spawn_blocked_agent(
     worktree: &Path,
     log: File,
     log_err: File,
+    broker: Option<&Broker>,
 ) -> Result<GatedAgent, BrokerOpError> {
-    let mut process = Command::new("sh");
+    let (mut process, nonce) =
+        crate::agent_supervisor::process(command, worktree, &log).map_err(|source| {
+            BrokerOpError::Spawn {
+                command: command.to_owned(),
+                source,
+            }
+        })?;
+    drop(log_err);
     process
-        .arg("-c")
-        .arg(START_AGENT_GATE_SCRIPT)
-        .arg("aethyme-start-agent-gate")
-        .arg(command)
         .current_dir(worktree)
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         process.process_group(0);
+    }
+    if let Some(broker) = broker {
+        broker.configure_storage_context_for_child(&mut process)?;
     }
     let child = process.spawn().map_err(|source| BrokerOpError::Spawn {
         command: command.to_string(),
@@ -3303,6 +3343,25 @@ pub(super) fn spawn_blocked_agent(
                     "gated shell pid {} did not stop/reap: {reason}",
                     agent.pid()
                 )],
+            },
+        });
+    }
+    let readiness = agent
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("missing supervisor readiness pipe"))
+        .and_then(|mut stdout| crate::agent_supervisor::await_ready(&mut stdout, &nonce));
+    if let Err(source) = readiness {
+        let error = BrokerOpError::Spawn {
+            command: command.to_owned(),
+            source,
+        };
+        return Err(match agent.abort() {
+            Ok(()) => error,
+            Err(reason) => BrokerOpError::StartAgentRollback {
+                primary: Box::new(error),
+                recovery: vec![reason],
             },
         });
     }

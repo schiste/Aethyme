@@ -217,6 +217,9 @@ fn eligible_pinned_session_contract(
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Some(code) = aethyme_broker::agent_supervisor::dispatch(&args) {
+        return ExitCode::from(code);
+    }
     if args.is_empty() {
         print_top_level_help(false);
         return ExitCode::from(2);

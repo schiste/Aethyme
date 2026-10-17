@@ -185,11 +185,13 @@ fn aborting_a_blocked_agent_signals_only_its_owned_process_group() {
     use std::os::unix::process::CommandExt as _;
 
     let temp = tempfile::tempdir().unwrap();
+    initialized_repo(temp.path());
     let sentinel = temp.path().join("must-not-run");
     let command = format!("printf ran > '{}'", sentinel.display());
     let output = std::fs::File::create(temp.path().join("blocked.log")).unwrap();
     let error = output.try_clone().unwrap();
-    let mut blocked = lifecycle::spawn_blocked_agent(&command, temp.path(), output, error).unwrap();
+    let mut blocked =
+        lifecycle::spawn_blocked_agent(&command, temp.path(), output, error, None).unwrap();
 
     let mut unrelated = Command::new("sh")
         .arg("-c")

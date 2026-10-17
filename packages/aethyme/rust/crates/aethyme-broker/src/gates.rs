@@ -36,7 +36,7 @@ use crate::git::GitRepo;
 use crate::store::BrokerStore;
 use crate::types::{GateEnvironment, GateFailureClass, GateStatus, NewGateResult};
 
-mod bounded_log;
+pub(crate) mod bounded_log;
 
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
 pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 3;

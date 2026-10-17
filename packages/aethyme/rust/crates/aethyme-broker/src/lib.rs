@@ -85,6 +85,7 @@ pub mod execution_snapshot;
 pub mod execution_supervisor;
 pub mod execution_verifier;
 mod gate_doctor;
+pub mod agent_supervisor;
 mod gates;
 mod gc;
 mod gh_ref_guard;
