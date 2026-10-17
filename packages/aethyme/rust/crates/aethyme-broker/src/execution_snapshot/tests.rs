@@ -154,6 +154,8 @@ fn materialization_accepts_exact_aggregate_file_limit_across_roles() {
         MAX_MATERIALIZED_FILES
     );
     assert!(validate_materialization_bounds(&[("source", &source), ("harness", &harness)]).is_ok());
+    assert!(portable(&source).is_ok());
+    assert!(portable(&harness).is_ok());
 }
 
 #[test]
@@ -168,6 +170,8 @@ fn materialization_accepts_exact_path_depth_and_component_limits() {
 
     assert!(validate_materialization_bounds(&[("source", &depth)]).is_ok());
     assert!(validate_materialization_bounds(&[("source", &component)]).is_ok());
+    assert!(portable(&depth).is_ok());
+    assert!(portable(&component).is_ok());
 }
 
 #[test]
@@ -181,6 +185,7 @@ fn materialization_accepts_exact_aggregate_node_limit() {
 
     assert_eq!(source.entries().len(), MAX_MATERIALIZED_FILES);
     assert!(validate_materialization_bounds(&[("source", &source)]).is_ok());
+    assert!(portable(&source).is_ok());
 }
 
 #[test]
@@ -206,15 +211,47 @@ fn portable_accepts_shared_directory_prefixes() {
     assert!(portable(&source).is_ok());
 }
 
-#[cfg(unix)]
 #[test]
-fn inspect_rejects_node_overflow_before_portability_prefix_allocation() {
+fn portable_enforces_materialization_path_and_file_limits() {
+    let too_deep_path = std::iter::repeat_n("d", MAX_MATERIALIZED_PATH_DEPTH)
+        .chain(["file.txt"])
+        .collect::<Vec<_>>()
+        .join("/");
+    let too_deep = manifest([too_deep_path]);
+    assert!(matches!(
+        portable(&too_deep),
+        Err(SnapshotError::MaterializationLimit(
+            "path depth exceeds 64 components"
+        ))
+    ));
+
+    let too_wide = manifest([format!(
+        "{}.txt",
+        "x".repeat(MAX_MATERIALIZED_COMPONENT_BYTES - 3)
+    )]);
+    assert!(matches!(
+        portable(&too_wide),
+        Err(SnapshotError::MaterializationLimit(
+            "path component exceeds 255 bytes"
+        ))
+    ));
+
+    let too_many =
+        manifest((0..=MAX_MATERIALIZED_FILES).map(|index| format!("file-{index:04}.txt")));
+    assert!(matches!(
+        portable(&too_many),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file count exceeds 8192"
+        ))
+    ));
+}
+
+#[test]
+fn portable_rejects_node_overflow_before_prefix_allocation() {
     // The leading backslash path makes portable() return immediately if it
-    // runs before the aggregate node preflight. Without that preflight this
-    // test reports Unsupported instead of the typed node-limit refusal.
-    let mut f = Fixture::new();
-    let repo = tempfile::tempdir().unwrap();
-    git(repo.path(), &["init", "-q", "-b", "main"]);
+    // reaches path checks before the node preflight. This compact synthetic
+    // manifest avoids creating a large filesystem tree while checking the
+    // common boundary used by execution, generation, and artifact callers.
     let paths = std::iter::once("!bad\\dir/file.txt".to_owned()).chain((0..256).map(|file| {
         std::iter::once(format!("root-{file:03}"))
             .chain((0..62).map(|depth| format!("dir-{depth:02}-{file:03}")))
@@ -222,21 +259,10 @@ fn inspect_rejects_node_overflow_before_portability_prefix_allocation() {
             .collect::<Vec<_>>()
             .join("/")
     }));
-    for path in paths {
-        let full = repo.path().join(path);
-        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(full, b"").unwrap();
-    }
-    git(repo.path(), &["add", "."]);
-    git(repo.path(), &["commit", "-qm", "oversized input"]);
-    let head = CommitOid::parse(&git(repo.path(), &["rev-parse", "HEAD"])).unwrap();
-    let id = archive::retain_snapshot(&mut f.store, repo.path(), &head)
-        .unwrap()
-        .snapshot_id;
-    let mut total = 0;
+    let source = manifest(paths);
 
     assert!(matches!(
-        inspect(&f.store, &id, &mut total),
+        portable(&source),
         Err(SnapshotError::MaterializationLimit(
             "aggregate file and directory node count exceeds 16384"
         ))

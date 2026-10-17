@@ -22,7 +22,7 @@ pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 // These bound broker-controlled logical output, not a physical disk quota.
 // Adding them does not change descriptor identity or rewrite older profiles;
-// a descriptor over these limits is refused when it is frozen or materialized.
+// portable-tree consumers refuse inputs over these limits before using them.
 const MAX_MATERIALIZED_FILES: usize = 8192;
 const MAX_MATERIALIZED_NODES: usize = 16_384;
 const MAX_MATERIALIZED_PATH_DEPTH: usize = 64;
@@ -382,10 +382,6 @@ fn inspect(
     if snapshot.entries().len() > MAX_FILES {
         return Err(SnapshotError::Limit);
     }
-    // Bound prefix-map growth before portability validation. The aggregate
-    // check in `inspect_roles` still accounts for every role together; this
-    // single-role preflight bounds the distinct prefixes `portable` may keep.
-    validate_materialization_bounds(&[("source", &snapshot)])?;
     portable(&snapshot)?;
     for entry in snapshot.entries() {
         let digest = ObjectDigest::from_bytes(*entry.content_sha256());
@@ -407,6 +403,10 @@ fn inspect(
     Ok(snapshot)
 }
 pub(crate) fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
+    // This is the common boundary for execution inputs, local generations,
+    // and parsed artifacts. Bound logical nodes and path sizes before building
+    // prefix keys; `inspect_roles` separately enforces the all-role total.
+    validate_materialization_bounds(&[("source", snapshot)])?;
     // Keep one owned folded key per distinct materialized node. Repeated long
     // directory prefixes are looked up by borrowing `folded`; cloning every
     // prefix for every file would multiply memory by file count × depth.
