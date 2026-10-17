@@ -27,7 +27,8 @@ fn routine_inventory_zero_budget_is_incomplete_and_cannot_authorize_cleanup() {
                 .success()
         );
     }
-    let mut broker = super::Broker::open(repo.path()).unwrap();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
     let session = broker.start_worktree("retained", None).unwrap();
     broker
         .store()
@@ -46,7 +47,8 @@ fn routine_inventory_zero_budget_is_incomplete_and_cannot_authorize_cleanup() {
 #[test]
 fn a_degraded_status_snapshot_keeps_git_refs_unknown_after_its_deadline() {
     let (repo, _) = landing_fixture();
-    let broker = super::Broker::open(repo.path()).unwrap();
+    let storage = crate::test_storage::TestStorage::new();
+    let broker = storage.open(repo.path()).unwrap();
     let _expired = crate::git::limit_git_until(
         std::time::Instant::now() - std::time::Duration::from_millis(1),
     );
@@ -99,7 +101,8 @@ fn an_integration_refresh_is_not_cut_off_by_the_status_deadline() {
     let upstream = git(&["rev-parse", "HEAD"]);
     git(&["push", "-q", "origin", "main"]);
     git(&["reset", "-q", "--hard", &local_main]);
-    let mut broker = super::Broker::open(repo.path()).unwrap();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
 
     let _expired = crate::git::limit_git_until(
         std::time::Instant::now() - std::time::Duration::from_millis(1),
@@ -169,7 +172,8 @@ fn a_merged_head_is_proved_by_ancestry_before_any_candidate_walk() {
     git(&["merge", "-q", "--no-ff", "-m", "merge feature", "feature"]);
     let merged = git(&["rev-parse", "HEAD"]);
 
-    let broker = super::Broker::open(repo.path()).unwrap();
+    let storage = crate::test_storage::TestStorage::new();
+    let broker = storage.open(repo.path()).unwrap();
     // An expired deadline turns any candidate walk into an error, so
     // success here proves none ran -- with the non-containing target
     // deliberately listed first.
@@ -197,7 +201,8 @@ fn a_squash_landing_still_reaches_the_deep_proof() {
     git(&["commit", "-qm", "squash feature"]);
     let squashed = git(&["rev-parse", "HEAD"]);
 
-    let broker = super::Broker::open(repo.path()).unwrap();
+    let storage = crate::test_storage::TestStorage::new();
+    let broker = storage.open(repo.path()).unwrap();
     let landed = broker
         .landing_on_delivery_targets(&head, std::slice::from_ref(&squashed))
         .unwrap()
@@ -259,15 +264,14 @@ fn a_worktree_directory_is_never_mistaken_for_broker_infrastructure() {
 #[test]
 fn verification_runtime_infrastructure_is_ignored_but_a_user_run_directory_is_visible() {
     let (repo, _) = landing_fixture();
-    let worktree_root = repo.path().join("external-worktrees");
+    let storage = crate::test_storage::TestStorage::new();
+    let worktree_root = storage.worktree_root();
     let runtime = worktree_root.join(".aethyme/run/merge-sim");
     let user_run = worktree_root.join("run");
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::create_dir_all(&user_run).unwrap();
 
-    let broker = super::Broker::open(repo.path())
-        .unwrap()
-        .with_worktree_root(worktree_root.clone());
+    let broker = storage.open(repo.path()).unwrap();
     let reconciliation = broker.reconcile_worktree_directories(false).unwrap();
 
     assert_eq!(reconciliation.unclaimed_count, 1);
