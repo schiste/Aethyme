@@ -50,7 +50,7 @@ pub fn open(repo: &Path) -> Broker {
         .with_host_cache_dir(root.join("host-cache"))
         .with_host_operation_database(host_state_dir.join("host-operations.db"))
         .with_worktree_root(worktree_root(repo))
-        .with_collaboration_state(host_state_dir);
+        .with_collaboration_state(host_state_dir.join("collaboration"));
     Broker::open_with_options(repo, options).unwrap()
 }
 

@@ -135,11 +135,6 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            fixture_state.join("host-operations.db").is_file(),
-            "fixture host operations were not written under {}",
-            fixture_state.display()
-        );
-        assert!(
             repo.path().join(".aethyme/broker.db").is_file(),
             "fixture broker state was not written in the repository"
         );
@@ -156,6 +151,11 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             "gate stdout={}\ngate stderr={}",
             String::from_utf8_lossy(&gate.stdout),
             String::from_utf8_lossy(&gate.stderr)
+        );
+        assert!(
+            fixture_state.join("host-resources.db").is_file(),
+            "gate resource state was not written under {}",
+            fixture_state.display()
         );
         let repositories: Vec<_> = std::fs::read_dir(fixture_cache.join("gates"))
             .unwrap()
