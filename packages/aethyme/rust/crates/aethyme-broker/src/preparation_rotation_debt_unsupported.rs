@@ -14,6 +14,14 @@ pub(crate) struct DebtInventory {
     pub(crate) block_legacy_retired: bool,
 }
 
+/// Fail-closed result for the bounded startup probe on unsupported platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebtProbe {
+    NoDebt,
+    Pending,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RecoveryProgress {
     pub(crate) found_debt: bool,
@@ -34,6 +42,10 @@ pub(crate) fn inventory(
     _deadline: Instant,
 ) -> io::Result<DebtInventory> {
     Err(unsupported())
+}
+
+pub(crate) fn probe(_cache_root: &Path, _max_entries: usize, _deadline: Instant) -> DebtProbe {
+    DebtProbe::Unknown
 }
 
 pub(crate) fn recover(

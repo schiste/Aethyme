@@ -16,7 +16,7 @@ use std::mem::{self, MaybeUninit};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -177,6 +177,75 @@ impl DebtInventory {
             block_legacy_retired: false,
         }
     }
+}
+
+/// Bounded, read-only signal used by ordinary broker open to notice a crash
+/// between publishing rotation debt and requesting the cache-only worker.
+/// `Unknown` is deliberately fail-closed: it wakes the existing recovery
+/// path but never grants mutation authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebtProbe {
+    NoDebt,
+    Pending,
+    Unknown,
+}
+
+pub(crate) fn probe(cache_root: &Path, max_entries: usize, deadline: Instant) -> DebtProbe {
+    if Instant::now() >= deadline {
+        return DebtProbe::Unknown;
+    }
+    match std::fs::symlink_metadata(cache_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let Some(parent) = cache_root.parent() else {
+                return DebtProbe::Unknown;
+            };
+            // An absent cache directory under an observed, real parent cannot
+            // contain a published witness. Missing or ambiguous ancestors can
+            // mean an unavailable mount, so they remain Unknown and keep the
+            // recovery request visible. This is a local path observation; it
+            // does not prove that the original filesystem is still mounted.
+            return match open_real_directory_chain(parent, deadline) {
+                Ok(_) => DebtProbe::NoDebt,
+                Err(_) => DebtProbe::Unknown,
+            };
+        }
+        Err(_) => return DebtProbe::Unknown,
+        Ok(_) => {}
+    }
+    let inventory = match inventory(cache_root, max_entries, deadline) {
+        Ok(inventory) => inventory,
+        Err(_) => return DebtProbe::Unknown,
+    };
+    if !inventory.repositories.is_empty() || !inventory.blocked_repositories.is_empty() {
+        DebtProbe::Pending
+    } else if inventory.complete && !inventory.block_legacy_retired {
+        DebtProbe::NoDebt
+    } else {
+        DebtProbe::Unknown
+    }
+}
+
+fn open_real_directory_chain(path: &Path, deadline: Instant) -> io::Result<File> {
+    let mut directory = open_directory(Path::new("/"))?;
+    let mut saw_root = false;
+    for component in path.components() {
+        if Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        match component {
+            Component::RootDir if !saw_root => saw_root = true,
+            Component::Normal(name) if saw_root => {
+                let name = CString::new(name.as_bytes())
+                    .map_err(|_| invalid_record("cache parent path contains NUL"))?;
+                directory = open_directory_at(directory.as_raw_fd(), &name)?;
+            }
+            _ => return Err(invalid_record("cache parent path is not canonical")),
+        }
+    }
+    if !saw_root {
+        return Err(invalid_record("cache parent path is not absolute"));
+    }
+    Ok(directory)
 }
 
 /// Exact progress from one repository's debt recovery. Rotation recovery does
@@ -1789,8 +1858,9 @@ fn invalid_record(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectoryIdentity, RECORD_PREFIX, RecoveryStep, RotationDebt, SCRATCH_SUFFIX,
-        classify_recovery, inventory, new_transaction_id, publish, read, recover, recovery_step,
+        DebtProbe, DirectoryIdentity, RECORD_PREFIX, RecoveryStep, RotationDebt, SCRATCH_SUFFIX,
+        classify_recovery, inventory, new_transaction_id, probe, publish, read, recover,
+        recovery_step,
     };
     use std::fs;
     use std::time::Instant;
@@ -1868,6 +1938,82 @@ mod tests {
         .expect_err("unwitnessed retired bytes are not deletion authority");
         assert!(!error.progress.complete);
         assert_eq!(fs::read(retired.join("payload")).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn bounded_probe_distinguishes_clear_pending_and_unknown_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("preparation-cache");
+        fs::create_dir(&cache_root).unwrap();
+        assert_eq!(
+            probe(
+                &cache_root,
+                100,
+                Instant::now() + std::time::Duration::from_secs(5),
+            ),
+            DebtProbe::NoDebt
+        );
+
+        let (_fixture, debt_root, debt) = fixture();
+        publish(&debt_root, debt).unwrap();
+        assert_eq!(
+            probe(
+                &debt_root,
+                100,
+                Instant::now() + std::time::Duration::from_secs(5),
+            ),
+            DebtProbe::Pending
+        );
+        assert_eq!(
+            probe(
+                &debt_root,
+                0,
+                Instant::now() + std::time::Duration::from_secs(5),
+            ),
+            DebtProbe::Unknown,
+            "an exhausted listing budget must not report a clear cache root"
+        );
+        assert_eq!(
+            probe(&debt_root, 100, Instant::now()),
+            DebtProbe::Unknown,
+            "an expired probe must not report a clear cache root"
+        );
+    }
+
+    #[test]
+    fn missing_cache_root_is_clear_only_under_an_observed_real_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        assert_eq!(
+            probe(
+                &parent.join("missing-cache"),
+                100,
+                Instant::now() + std::time::Duration::from_secs(5),
+            ),
+            DebtProbe::NoDebt
+        );
+        assert_eq!(
+            probe(
+                &parent.join("missing-parent/cache"),
+                100,
+                Instant::now() + std::time::Duration::from_secs(5),
+            ),
+            DebtProbe::Unknown
+        );
+
+        let alias = parent.join("parent-alias");
+        symlink(&parent, &alias).unwrap();
+        assert_eq!(
+            probe(
+                &alias.join("ambiguous-cache"),
+                100,
+                Instant::now() + std::time::Duration::from_secs(5),
+            ),
+            DebtProbe::Unknown,
+            "a symlinked ancestor cannot establish that the cache root is absent"
+        );
     }
 
     #[test]

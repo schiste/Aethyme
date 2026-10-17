@@ -108,6 +108,10 @@ const ARTIFACT_SWEEP_WORKER_MAX_PASSES: usize = 8;
 /// a later normal open when this deadline expires.
 const ARTIFACT_SWEEP_WORKER_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
+/// Broker open checks only for rotation-debt control entries. A small bound
+/// keeps this crash-gap probe cheap even when the shared cache root is wide.
+const PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES: usize = 512;
+const PREPARATION_ROTATION_DEBT_PROBE_BUDGET: Duration = Duration::from_millis(20);
 
 /// Most a broker open may spend on the artifact sweep, whatever the policy
 /// budget or disk pressure. Broker open runs before every command, including
@@ -2687,6 +2691,16 @@ impl Broker {
             // Broker::open before the worker's own scoped pass.
             return Ok(None);
         }
+        // Rotation publishes a durable witness before it changes the shared
+        // cache store, then requests the detached worker. A crash between
+        // those operations must not leave the retired store undiscoverable
+        // until another preparation writer runs. This bounded, read-only
+        // probe uses the Broker-captured cache root and only requests the
+        // existing cache-only continuation; it is never deletion authority.
+        crate::warn_unrecorded(
+            "record preparation-cache rotation recovery request",
+            self.request_recovery_for_rotation_debt(),
+        );
         let policy = load_retention_policy(self.main_root())?;
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let resumed = match load_journal(&journal_path)? {
@@ -2709,6 +2723,30 @@ impl Broker {
             self.maybe_start_artifact_sweep_worker(false),
         );
         Ok(resumed)
+    }
+
+    fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
+        let probe = self
+            .storage_context()
+            .preparation_cache_root()
+            .map(|cache_root| {
+                crate::preparation::rotation_debt::probe(
+                    &cache_root,
+                    PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES,
+                    Instant::now() + PREPARATION_ROTATION_DEBT_PROBE_BUDGET,
+                )
+            })
+            .unwrap_or(crate::preparation::rotation_debt::DebtProbe::Unknown);
+        if probe == crate::preparation::rotation_debt::DebtProbe::NoDebt
+            || self.artifact_sweep_recovery_requested()?
+        {
+            return Ok(());
+        }
+        // Keep one durable request pending while the root is Pending or
+        // Unknown. Do not bump its generation on every ordinary open: a
+        // previous worker may have intentionally set retry backoff after
+        // making no progress.
+        self.persist_artifact_sweep_recovery_request()
     }
 
     /// Run the autonomous artifact sweep now with the full policy budget,
@@ -4983,6 +5021,59 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn broker_open_keeps_rotation_debt_pending_when_sweep_is_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let cache_root = broker
+            .storage_context()
+            .preparation_cache_root()
+            .expect("test storage has a captured preparation-cache root");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let repository = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let retired = cache_root.join(format!("{repository}.retired"));
+        std::fs::create_dir(&retired).unwrap();
+        std::fs::write(retired.join("payload"), b"preserve until verified recovery").unwrap();
+
+        assert!(broker.resume_gc_maintenance().unwrap().is_none());
+
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+        let requested = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(
+            requested > completed,
+            "the recovery request remains pending"
+        );
+        assert_eq!(
+            std::fs::read(retired.join("payload")).unwrap(),
+            b"preserve until verified recovery",
+            "a disabled zero-budget sweep must not claim or perform recovery"
+        );
     }
 
     /// On a repository with hundreds of retained worktrees the build-output
