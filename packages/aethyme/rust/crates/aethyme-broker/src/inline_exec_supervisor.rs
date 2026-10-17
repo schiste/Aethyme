@@ -22,6 +22,7 @@ const GROUP_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 pub(crate) enum InlineExecError {
     Setup(io::Error),
     CommandStart(String),
+    CommandOutcomeUnknown(String),
     CleanupUnknown(String),
     Operation(crate::BrokerOpError),
 }
@@ -57,6 +58,7 @@ enum HelperFrame {
     Aborted,
     CommandStartFailed { reason: String },
     Failed { reason: String },
+    ExecutionUnknown { reason: String },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,13 +85,14 @@ pub(crate) struct InlineExecSupervisor;
 impl InlineExecSupervisor {
     #[cfg(unix)]
     pub(crate) fn start(executable: &Path) -> Result<Self, InlineExecError> {
-        Self::start_with_watcher_fault(executable, false)
+        Self::start_with_watcher_fault(executable, false, false)
     }
 
     #[cfg(unix)]
     fn start_with_watcher_fault(
         executable: &Path,
         fail_cleanup_watcher: bool,
+        _fail_after_launch: bool,
     ) -> Result<Self, InlineExecError> {
         use std::os::unix::process::CommandExt as _;
         use std::process::{Command, Stdio};
@@ -111,10 +114,7 @@ impl InlineExecSupervisor {
         let child_socket =
             move_control_fd_above_stdio(child_socket).map_err(InlineExecError::Setup)?;
         parent
-            .set_read_timeout(Some(READY_TIMEOUT))
-            .map_err(InlineExecError::Setup)?;
-        parent
-            .set_write_timeout(Some(READY_TIMEOUT))
+            .set_nonblocking(true)
             .map_err(InlineExecError::Setup)?;
         let child_fd = child_socket.as_raw_fd();
         let mut command = Command::new(executable);
@@ -135,6 +135,9 @@ impl InlineExecSupervisor {
                     .env("AETHYME_TEST_INLINE_EXEC_SUPERVISOR", "1");
                 if fail_cleanup_watcher {
                     command.env("AETHYME_TEST_INLINE_FAIL_CLEANUP_WATCHER", "1");
+                }
+                if _fail_after_launch {
+                    command.env("AETHYME_TEST_INLINE_FAIL_AFTER_LAUNCH", "1");
                 }
             } else {
                 if fail_cleanup_watcher {
@@ -251,7 +254,7 @@ impl InlineExecSupervisor {
     {
         use std::time::{Duration, Instant};
 
-        if command.is_empty() || command.iter().any(String::is_empty) {
+        if command.is_empty() || command[0].is_empty() {
             let cleanup = self.terminate_and_verify();
             return match cleanup {
                 Ok(()) => Err(InlineExecError::Setup(io::Error::new(
@@ -280,9 +283,10 @@ impl InlineExecSupervisor {
             command,
             environment,
         };
-        if let Err(error) = write_frame(
+        if let Err(error) = write_frame_until(
             self.control.as_mut().expect("control stream is present"),
             &request,
+            Instant::now() + READY_TIMEOUT,
         ) {
             let cleanup = self.terminate_and_verify();
             return match cleanup {
@@ -307,13 +311,16 @@ impl InlineExecSupervisor {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     if Instant::now() >= next_ping {
-                        if let Err(error) = write_frame(
+                        if let Err(error) = write_frame_until(
                             self.control.as_mut().expect("control stream is present"),
                             &ParentFrameRef::Ping,
+                            Instant::now() + Duration::from_secs(1),
                         ) {
                             let cleanup = self.terminate_and_verify();
                             return match cleanup {
-                                Ok(()) => Err(InlineExecError::Setup(error)),
+                                Ok(()) => Err(InlineExecError::CommandOutcomeUnknown(format!(
+                                    "could not keep the execution control channel alive: {error}"
+                                ))),
                                 Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
                             };
                         }
@@ -324,7 +331,9 @@ impl InlineExecSupervisor {
                 Err(error) => {
                     let cleanup = self.terminate_and_verify();
                     return match cleanup {
-                        Ok(()) => Err(InlineExecError::Setup(error)),
+                        Ok(()) => Err(InlineExecError::CommandOutcomeUnknown(format!(
+                            "could not read the command result after dispatch: {error}"
+                        ))),
                         Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
                     };
                 }
@@ -348,12 +357,17 @@ impl InlineExecSupervisor {
                         .map_err(InlineExecError::CleanupUnknown)?;
                     Err(InlineExecError::Setup(io::Error::other(reason)))
                 }
+                HelperFrame::ExecutionUnknown { reason } => {
+                    self.terminate_and_verify()
+                        .map_err(InlineExecError::CleanupUnknown)?;
+                    Err(InlineExecError::CommandOutcomeUnknown(reason))
+                }
                 HelperFrame::Aborted | HelperFrame::Ready => {
                     self.terminate_and_verify()
                         .map_err(InlineExecError::CleanupUnknown)?;
-                    Err(InlineExecError::Setup(io::Error::other(
-                        "helper returned an invalid command response",
-                    )))
+                    Err(InlineExecError::CommandOutcomeUnknown(
+                        "helper returned an invalid command response after dispatch".into(),
+                    ))
                 }
             };
         }
@@ -508,7 +522,34 @@ fn run_helper() -> io::Result<u8> {
         }
     }
     write_frame(&mut control, &HelperFrame::Ready)?;
-    let request = read_frame::<ParentFrame>(&mut control)?;
+    let request: ParentFrame = loop {
+        if !matches!(watcher.try_wait(), Ok(None)) {
+            write_frame(
+                &mut control,
+                &HelperFrame::Failed {
+                    reason: "cleanup watcher exited while awaiting command admission".into(),
+                },
+            )?;
+            return Ok(125);
+        }
+        match poll_control(control.as_raw_fd(), 100)? {
+            ControlPoll::Readable => {
+                break read_frame_until(&mut control, std::time::Instant::now() + READY_TIMEOUT)?;
+            }
+            ControlPoll::Closed => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "parent closed the command channel before admission",
+                ));
+            }
+            ControlPoll::Pending => {}
+            ControlPoll::Writable => {
+                return Err(io::Error::other(
+                    "command-channel read poll returned writable readiness",
+                ));
+            }
+        }
+    };
     let ParentFrame::Run {
         cwd,
         command,
@@ -524,7 +565,7 @@ fn run_helper() -> io::Result<u8> {
         return Ok(125);
     };
     if command.is_empty()
-        || command.iter().any(String::is_empty)
+        || command[0].is_empty()
         || !cwd.is_absolute()
         || validate_environment(&environment).is_err()
     {
@@ -592,12 +633,24 @@ fn run_helper() -> io::Result<u8> {
             return Ok(125);
         }
     };
+    #[cfg(test)]
+    if std::env::var_os("AETHYME_TEST_INLINE_FAIL_AFTER_LAUNCH").is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stop_owned_command(&mut child);
+        write_frame(
+            &mut control,
+            &HelperFrame::ExecutionUnknown {
+                reason: "injected post-launch result loss".into(),
+            },
+        )?;
+        return Ok(125);
+    }
     loop {
         if !matches!(watcher.try_wait(), Ok(None)) {
             stop_owned_command(&mut child);
             if let Err(error) = write_frame(
                 &mut control,
-                &HelperFrame::Failed {
+                &HelperFrame::ExecutionUnknown {
                     reason: "cleanup watcher exited before command cleanup was verified".into(),
                 },
             ) {
@@ -624,37 +677,36 @@ fn run_helper() -> io::Result<u8> {
                 stop_owned_command(&mut child);
                 write_frame(
                     &mut control,
-                    &HelperFrame::Failed {
+                    &HelperFrame::ExecutionUnknown {
                         reason: format!("cannot inspect command status: {error}"),
                     },
                 )?;
                 return Ok(125);
             }
         }
-        match poll_control(control.as_raw_fd(), 100)? {
-            ControlPoll::Readable => match read_frame::<ParentFrame>(&mut control) {
-                Ok(ParentFrame::Ping) => {}
-                Ok(ParentFrame::Abort) | Err(_) => {
+        match read_frame_timeout::<ParentFrame>(
+            &mut control,
+            std::time::Duration::from_millis(100),
+        )? {
+            Some(parent_frame) => match parent_frame {
+                ParentFrame::Ping => {}
+                ParentFrame::Abort => {
                     stop_owned_command(&mut child);
                     write_frame(&mut control, &HelperFrame::Aborted)?;
                     return Ok(125);
                 }
-                Ok(ParentFrame::Run { .. }) => {
+                ParentFrame::Run { .. } => {
                     stop_owned_command(&mut child);
                     write_frame(
                         &mut control,
-                        &HelperFrame::Failed {
+                        &HelperFrame::ExecutionUnknown {
                             reason: "received a second Run request".into(),
                         },
                     )?;
                     return Ok(125);
                 }
             },
-            ControlPoll::Closed => {
-                stop_owned_command(&mut child);
-                return Ok(125);
-            }
-            ControlPoll::Pending => {}
+            None => {}
         }
     }
 }
@@ -770,15 +822,26 @@ fn stop_owned_command(child: &mut std::process::Child) -> bool {
 #[cfg(unix)]
 enum ControlPoll {
     Readable,
+    Writable,
     Closed,
     Pending,
 }
 
 #[cfg(unix)]
 fn poll_control(fd: RawFd, timeout_ms: i32) -> io::Result<ControlPoll> {
+    poll_socket(fd, libc::POLLIN, timeout_ms)
+}
+
+#[cfg(unix)]
+fn poll_writable(fd: RawFd, timeout_ms: i32) -> io::Result<ControlPoll> {
+    poll_socket(fd, libc::POLLOUT, timeout_ms)
+}
+
+#[cfg(unix)]
+fn poll_socket(fd: RawFd, events: libc::c_short, timeout_ms: i32) -> io::Result<ControlPoll> {
     let mut descriptor = libc::pollfd {
         fd,
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
     // SAFETY: `descriptor` is a valid single-element array for the duration of
@@ -794,8 +857,12 @@ fn poll_control(fd: RawFd, timeout_ms: i32) -> io::Result<ControlPoll> {
     if result == 0 {
         return Ok(ControlPoll::Pending);
     }
-    if descriptor.revents & libc::POLLIN != 0 {
-        return Ok(ControlPoll::Readable);
+    if descriptor.revents & events != 0 {
+        return Ok(if events == libc::POLLIN {
+            ControlPoll::Readable
+        } else {
+            ControlPoll::Writable
+        });
     }
     if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
         return Ok(ControlPoll::Closed);
@@ -910,7 +977,26 @@ fn write_frame<T: serde::Serialize>(
     stream: &mut std::os::unix::net::UnixStream,
     value: &T,
 ) -> io::Result<()> {
-    use std::io::Write as _;
+    write_frame_until(stream, value, std::time::Instant::now() + READY_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn write_frame_until<T: serde::Serialize>(
+    stream: &mut std::os::unix::net::UnixStream,
+    value: &T,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    let payload = serialize_frame_payload(value)?;
+    let length = frame_length(&payload)?;
+    with_nonblocking(stream, |stream| {
+        write_all_until(stream, FRAME_MAGIC, deadline)?;
+        write_all_until(stream, &length.to_be_bytes(), deadline)?;
+        write_all_until(stream, &payload, deadline)
+    })
+}
+
+#[cfg(unix)]
+fn serialize_frame_payload<T: serde::Serialize>(value: &T) -> io::Result<Vec<u8>> {
     let mut payload = BoundedPayload {
         bytes: Vec::with_capacity(8 * 1024),
         limit: MAX_FRAME_BYTES,
@@ -922,15 +1008,17 @@ fn write_frame<T: serde::Serialize>(
             "inline helper frame is outside its size limit",
         ));
     }
-    let length = u32::try_from(payload.bytes.len()).map_err(|_| {
+    Ok(payload.bytes)
+}
+
+#[cfg(unix)]
+fn frame_length(payload: &[u8]) -> io::Result<u32> {
+    u32::try_from(payload.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "inline helper frame length does not fit its header",
         )
-    })?;
-    stream.write_all(FRAME_MAGIC)?;
-    stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(&payload.bytes)
+    })
 }
 
 #[cfg(unix)]
@@ -964,78 +1052,215 @@ impl io::Write for BoundedPayload {
 }
 
 #[cfg(unix)]
-fn read_frame<T: serde::de::DeserializeOwned>(
+fn read_frame_until<T: serde::de::DeserializeOwned>(
     stream: &mut std::os::unix::net::UnixStream,
+    deadline: std::time::Instant,
 ) -> io::Result<T> {
-    use std::io::Read as _;
-    let mut magic = [0u8; 4];
-    stream.read_exact(&mut magic)?;
-    if &magic != FRAME_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "inline helper frame has invalid version marker",
-        ));
-    }
-    let mut length = [0u8; 4];
-    stream.read_exact(&mut length)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > MAX_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "inline helper frame exceeds its size limit",
-        ));
-    }
-    let mut payload = vec![0; length];
-    stream.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload).map_err(io::Error::other)
+    read_frame_deadline(stream, deadline, false)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "inline helper frame timed out before its first byte",
+        )
+    })
 }
 
 #[cfg(unix)]
-fn read_frame_until(
+fn read_frame_timeout<T: serde::de::DeserializeOwned>(
+    stream: &mut std::os::unix::net::UnixStream,
+    timeout: std::time::Duration,
+) -> io::Result<Option<T>> {
+    read_frame_deadline(stream, std::time::Instant::now() + timeout, true)
+}
+
+#[cfg(unix)]
+fn read_frame_deadline<T: serde::de::DeserializeOwned>(
     stream: &mut std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
-) -> io::Result<HelperFrame> {
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
+    allow_empty_timeout: bool,
+) -> io::Result<Option<T>> {
+    with_nonblocking(stream, |stream| {
+        let mut received_any = false;
+        let mut magic = [0u8; 4];
+        if let Err(error) = read_exact_until(stream, &mut magic, deadline, &mut received_any) {
+            if allow_empty_timeout && !received_any && error.kind() == io::ErrorKind::TimedOut {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        if &magic != FRAME_MAGIC {
             return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "inline helper readiness timed out",
+                io::ErrorKind::InvalidData,
+                "inline helper frame has invalid version marker",
             ));
         }
-        stream.set_read_timeout(Some(remaining))?;
-        match poll_control(stream.as_raw_fd(), 50)? {
-            ControlPoll::Readable => return read_frame(stream),
+        let mut length = [0u8; 4];
+        read_exact_until(stream, &mut length, deadline, &mut received_any)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inline helper frame exceeds its size limit",
+            ));
+        }
+        let mut payload = vec![0; length];
+        read_exact_until(stream, &mut payload, deadline, &mut received_any)?;
+        serde_json::from_slice(&payload)
+            .map(Some)
+            .map_err(io::Error::other)
+    })
+}
+
+#[cfg(unix)]
+fn read_exact_until(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut remaining: &mut [u8],
+    deadline: std::time::Instant,
+    received_any: &mut bool,
+) -> io::Result<()> {
+    use std::io::Read as _;
+    while !remaining.is_empty() {
+        let timeout_ms = deadline_timeout_ms(deadline).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "inline helper frame deadline elapsed",
+            )
+        })?;
+        match poll_control(stream.as_raw_fd(), timeout_ms)? {
+            ControlPoll::Readable if std::time::Instant::now() < deadline => {
+                match stream.read(remaining) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "inline helper closed its control channel mid-frame",
+                        ));
+                    }
+                    Ok(count) => {
+                        *received_any = true;
+                        remaining = &mut remaining[count..];
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            ControlPoll::Readable => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "inline helper frame deadline elapsed",
+                ));
+            }
             ControlPoll::Closed => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "inline helper closed its control channel",
+                    "inline helper closed its control channel mid-frame",
                 ));
             }
-            ControlPoll::Pending if std::time::Instant::now() >= deadline => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "inline helper readiness timed out",
-                ));
+            ControlPoll::Writable => {
+                return Err(io::Error::other("read poll returned writable readiness"));
             }
             ControlPoll::Pending => {}
         }
     }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn read_frame_timeout(
+fn write_all_until(
     stream: &mut std::os::unix::net::UnixStream,
-    timeout: std::time::Duration,
-) -> io::Result<Option<HelperFrame>> {
-    stream.set_read_timeout(Some(timeout))?;
-    match poll_control(stream.as_raw_fd(), timeout.as_millis() as i32)? {
-        ControlPoll::Readable => read_frame(stream).map(Some),
-        ControlPoll::Closed => Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "inline helper closed its control channel before a result",
-        )),
-        ControlPoll::Pending => Ok(None),
+    mut remaining: &[u8],
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    use std::io::Write as _;
+    while !remaining.is_empty() {
+        let timeout_ms = deadline_timeout_ms(deadline).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "inline helper write deadline elapsed",
+            )
+        })?;
+        match poll_writable(stream.as_raw_fd(), timeout_ms)? {
+            ControlPoll::Writable if std::time::Instant::now() < deadline => {
+                match stream.write(remaining) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "inline helper control channel stopped accepting bytes",
+                        ));
+                    }
+                    Ok(count) => remaining = &remaining[count..],
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            ControlPoll::Writable => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "inline helper write deadline elapsed",
+                ));
+            }
+            ControlPoll::Closed => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "inline helper closed its control channel during a write",
+                ));
+            }
+            ControlPoll::Readable => {
+                return Err(io::Error::other("write poll returned readable readiness"));
+            }
+            ControlPoll::Pending => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn deadline_timeout_ms(deadline: std::time::Instant) -> Option<i32> {
+    let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    let milliseconds = remaining.as_millis();
+    let rounded = milliseconds
+        + if remaining.subsec_nanos() % 1_000_000 != 0 {
+            1
+        } else {
+            0
+        };
+    Some(rounded.clamp(1, i32::MAX as u128) as i32)
+}
+
+#[cfg(unix)]
+fn with_nonblocking<T>(
+    stream: &mut std::os::unix::net::UnixStream,
+    operation: impl FnOnce(&mut std::os::unix::net::UnixStream) -> io::Result<T>,
+) -> io::Result<T> {
+    // SAFETY: F_GETFL reads the status flags of the owned UnixStream descriptor.
+    let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let was_nonblocking = flags & libc::O_NONBLOCK != 0;
+    if !was_nonblocking {
+        stream.set_nonblocking(true)?;
+    }
+    let result = operation(stream);
+    let restore = if was_nonblocking {
+        Ok(())
+    } else {
+        stream.set_nonblocking(false)
+    };
+    match (result, restore) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(restore_error)) => {
+            crate::warn_unrecorded(
+                "restore inline helper socket mode",
+                Err::<(), _>(restore_error),
+            );
+            Err(error)
+        }
     }
 }
 
@@ -1063,8 +1288,21 @@ mod tests {
     }
 
     fn start_helper_with_watcher_failure() -> InlineExecSupervisor {
-        InlineExecSupervisor::start_with_watcher_fault(&std::env::current_exe().unwrap(), true)
-            .unwrap()
+        InlineExecSupervisor::start_with_watcher_fault(
+            &std::env::current_exe().unwrap(),
+            true,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn start_helper_with_post_launch_failure() -> InlineExecSupervisor {
+        InlineExecSupervisor::start_with_watcher_fault(
+            &std::env::current_exe().unwrap(),
+            false,
+            true,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1078,8 +1316,9 @@ mod tests {
                 &[
                     "/bin/sh".into(),
                     "-c".into(),
-                    "printf '%s:%s:%s' \"$FIRST_ARG\" \"$SECOND_ARG\" \"$1\" > \"$OUTPUT_PATH\"; exit 7".into(),
+                    "printf '%s:%s:%s:%s' \"$FIRST_ARG\" \"$SECOND_ARG\" \"$1\" \"$2\" > \"$OUTPUT_PATH\"; exit 7".into(),
                     "shell-name".into(),
+                    "".into(),
                     "literal\nargument".into(),
                 ],
                 &[
@@ -1098,7 +1337,7 @@ mod tests {
         assert!(!result.succeeded);
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
-            "one two:three:literal\nargument"
+            "one two:three::literal\nargument"
         );
     }
 
@@ -1108,15 +1347,19 @@ mod tests {
 
         let owner = tempfile::tempdir().unwrap();
         let output = owner.path().join("descendant.txt");
+        let ready = owner.path().join("descendant-ready");
         let result = start_helper()
             .run(
                 owner.path(),
                 &[
                     "/bin/sh".into(),
                     "-c".into(),
-                    "(while :; do printf x >> \"$OUTPUT_PATH\"; sleep 0.01; done) & exit 0".into(),
+                    "(printf x >> \"$OUTPUT_PATH\"; : > \"$READY_PATH\"; i=0; while [ \"$i\" -lt 500 ]; do printf x >> \"$OUTPUT_PATH\"; sleep 0.02; i=$((i + 1)); done) & i=0; while [ ! -e \"$READY_PATH\" ] && [ \"$i\" -lt 100 ]; do sleep 0.01; i=$((i + 1)); done; exit 0".into(),
                 ],
-                &[("OUTPUT_PATH".into(), output.to_string_lossy().into_owned())],
+                &[
+                    ("OUTPUT_PATH".into(), output.to_string_lossy().into_owned()),
+                    ("READY_PATH".into(), ready.to_string_lossy().into_owned()),
+                ],
                 || Ok(()),
             )
             .unwrap();
@@ -1154,26 +1397,91 @@ mod tests {
     }
 
     #[test]
+    fn post_launch_result_loss_is_not_reported_as_setup_failure() {
+        let result = start_helper_with_post_launch_failure().run(
+            Path::new("/"),
+            &["/bin/sleep".into(), "30".into()],
+            &[],
+            || Ok(()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(InlineExecError::CommandOutcomeUnknown(_))
+        ));
+    }
+
+    #[test]
+    fn ready_helper_waits_past_startup_timeout_for_admission() {
+        use std::time::Duration;
+
+        let supervisor = start_helper();
+        std::thread::sleep(READY_TIMEOUT + Duration::from_millis(100));
+        let result = supervisor
+            .run(Path::new("/"), &["/bin/true".into()], &[], || Ok(()))
+            .unwrap();
+
+        assert!(result.succeeded);
+    }
+
+    #[test]
+    fn idle_parent_disconnect_exits_helper_and_reaps_watcher() {
+        use std::time::{Duration, Instant};
+
+        let mut supervisor = start_helper();
+        drop(supervisor.control.take());
+        let child = supervisor.child.as_mut().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => panic!("idle helper did not exit after parent disconnect"),
+                Err(error) => panic!("could not reap idle helper: {error}"),
+            }
+        }
+        supervisor.child.take();
+        wait_process_group_absent(supervisor.process_group).unwrap();
+        supervisor.terminalized = true;
+    }
+
+    #[test]
     fn control_disconnect_stops_command_and_waits_for_group_cleanup() {
         use std::time::{Duration, Instant};
 
         let owner = tempfile::tempdir().unwrap();
         let output = owner.path().join("disconnected-descendant.txt");
         let mut supervisor = start_helper();
-        write_frame(
+        write_frame_until(
             supervisor.control.as_mut().unwrap(),
             &ParentFrameRef::Run {
                 cwd: &owner.path().canonicalize().unwrap(),
                 command: &[
                     "/bin/sh".into(),
                     "-c".into(),
-                    "(while :; do printf x >> \"$OUTPUT_PATH\"; sleep 0.01; done) & wait".into(),
+                    "(i=0; while [ \"$i\" -lt 500 ]; do printf x >> \"$OUTPUT_PATH\"; sleep 0.02; i=$((i + 1)); done) & wait".into(),
                 ],
                 environment: &[("OUTPUT_PATH".into(), output.to_string_lossy().into_owned())],
             },
+            Instant::now() + READY_TIMEOUT,
         )
         .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::metadata(&output) {
+                Ok(metadata) if metadata.len() > 0 => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot inspect descendant output: {error}"),
+            }
+            assert!(
+                Instant::now() < start_deadline,
+                "descendant writer did not start before control disconnect"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(supervisor.control.take());
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1211,8 +1519,120 @@ mod tests {
     }
 
     #[test]
+    fn frame_deadlines_cover_partial_reads_and_blocked_writes() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        use std::time::{Duration, Instant};
+
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(10))
+                .unwrap()
+                .is_none()
+        );
+        let payload = serialize_frame_payload(&HelperFrame::Ready).unwrap();
+        let length = frame_length(&payload).unwrap();
+        let mut encoded = Vec::with_capacity(8 + payload.len());
+        encoded.extend_from_slice(FRAME_MAGIC);
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(&payload);
+        let dripper = std::thread::spawn(move || {
+            for byte in encoded {
+                match writer.write_all(&[byte]) {
+                    Ok(()) => std::thread::sleep(Duration::from_millis(15)),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        return;
+                    }
+                    Err(error) => panic!("drip writer failed unexpectedly: {error}"),
+                }
+            }
+        });
+        let started = Instant::now();
+        let error =
+            read_frame_until::<HelperFrame>(&mut reader, started + Duration::from_millis(60))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(reader);
+        dripper.join().unwrap();
+
+        let (mut blocked_writer, _receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        let send_buffer: libc::c_int = 4096;
+        // SAFETY: setsockopt reads the initialized integer and mutates only the
+        // sender socket's bounded send-buffer option.
+        let result = unsafe {
+            libc::setsockopt(
+                blocked_writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&send_buffer as *const libc::c_int).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "could not set deterministic socket send buffer");
+        let large_argument = "x".repeat(MAX_FRAME_BYTES - 256);
+        let command = ["/bin/true".to_owned(), large_argument];
+        let request = ParentFrameRef::Run {
+            cwd: Path::new("/"),
+            command: &command,
+            environment: &[],
+        };
+        let started = Instant::now();
+        let error = write_frame_until(
+            &mut blocked_writer,
+            &request,
+            started + Duration::from_millis(60),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        let (mut slow_writer, mut slow_reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: setsockopt reads the initialized integer and mutates only the
+        // sender socket's bounded send-buffer option.
+        let result = unsafe {
+            libc::setsockopt(
+                slow_writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&send_buffer as *const libc::c_int).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "could not set slow-reader send buffer");
+        let slow_drain = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut chunk = [0u8; 1024];
+            loop {
+                match slow_reader.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(_) => std::thread::sleep(Duration::from_millis(15)),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("slow frame reader failed unexpectedly: {error}"),
+                }
+            }
+        });
+        let started = Instant::now();
+        let error = write_frame_until(
+            &mut slow_writer,
+            &request,
+            started + Duration::from_millis(60),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(slow_writer);
+        slow_drain.join().unwrap();
+    }
+
+    #[test]
     fn heartbeat_failure_stops_descendant_writers_before_returning() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let owner = tempfile::tempdir().unwrap();
         let output = owner.path().join("heartbeat-descendant.txt");
@@ -1222,7 +1642,7 @@ mod tests {
             &[
                 "/bin/sh".into(),
                 "-c".into(),
-                "(while :; do printf x >> \"$OUTPUT_PATH\"; sleep 0.01; done) & wait".into(),
+                    "(i=0; while [ \"$i\" -lt 500 ]; do printf x >> \"$OUTPUT_PATH\"; sleep 0.02; i=$((i + 1)); done) & wait".into(),
             ],
             &[("OUTPUT_PATH".into(), output.to_string_lossy().into_owned())],
             || {
@@ -1230,6 +1650,19 @@ mod tests {
                 if ticks == 1 {
                     Ok(())
                 } else {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        match std::fs::metadata(&output) {
+                            Ok(metadata) if metadata.len() > 0 => break,
+                            Ok(_) => {}
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => panic!("cannot inspect heartbeat output: {error}"),
+                        }
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     Err(crate::PreparationError::LivenessDeadlineElapsed.into())
                 }
             },

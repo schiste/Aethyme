@@ -98,6 +98,10 @@ pub enum PreparationError {
     )]
     SupervisorUnavailable { reason: String },
     #[error(
+        "preparation command result for session {session_id} could not be confirmed after dispatch: {reason}; process cleanup was verified, but command effects may have occurred. Inspect the worktree before retrying"
+    )]
+    CommandOutcomeUnknown { session_id: i64, reason: String },
+    #[error(
         "preparation for session {session_id} could not verify process cleanup: {reason}; its state remains in progress and any shared-cache lease was not released"
     )]
     CleanupUnknown { session_id: i64, reason: String },
@@ -926,7 +930,7 @@ fn validate_name_and_command(
             "{kind} name must be 1..=128 printable bytes"
         )));
     }
-    if command.is_empty() || command.iter().any(|part| part.is_empty()) {
+    if command.is_empty() || command[0].is_empty() {
         return Err(invalid_config(format!(
             "{kind} {name:?} command must not be empty"
         )));
@@ -2229,6 +2233,14 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_argv_preserves_empty_arguments_but_rejects_empty_program() {
+        assert!(
+            validate_name_and_command("step", "build", &["/bin/echo".into(), "".into()]).is_ok()
+        );
+        assert!(validate_name_and_command("step", "build", &["".into(), "arg".into()]).is_err());
+    }
 
     #[test]
     fn storage_heartbeat_checks_before_the_first_and_between_renewals() {

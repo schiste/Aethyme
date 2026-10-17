@@ -1560,6 +1560,12 @@ impl Broker {
                     }
                     .into()
                 }
+                crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(reason) => {
+                    crate::PreparationError::SupervisorUnavailable {
+                        reason: format!("unexpected startup-helper result state: {reason}"),
+                    }
+                    .into()
+                }
                 crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
                 crate::inline_exec_supervisor::InlineExecError::Setup(error) => {
                     crate::PreparationError::SupervisorUnavailable {
@@ -1614,6 +1620,11 @@ impl Broker {
                 .map_err(|error| match error {
                     crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(reason) => {
                         crate::PreparationError::CleanupUnknown { session_id, reason }.into()
+                    }
+                    crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(
+                        reason,
+                    ) => {
+                        crate::PreparationError::CommandOutcomeUnknown { session_id, reason }.into()
                     }
                     crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
                     crate::inline_exec_supervisor::InlineExecError::Setup(error) => {
