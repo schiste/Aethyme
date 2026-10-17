@@ -4,7 +4,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{AdoptMode, Broker};
+mod common;
+
+use aethyme_broker::AdoptMode;
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -25,9 +28,9 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 /// A repo where one promoted session has already moved `plugins/old/tool.py`
 /// to `plugins/new/tool.py`, and a second session still targets the old path.
-fn fixture(rename: bool) -> (tempfile::TempDir, std::path::PathBuf, i64) {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
+fn fixture(rename: bool) -> (FixtureRepository, std::path::PathBuf, i64) {
+    let fixture = FixtureRepository::new();
+    let repo = fixture.path().to_path_buf();
     std::fs::create_dir_all(repo.join("plugins/old")).unwrap();
     sh(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
@@ -39,7 +42,7 @@ fn fixture(rename: bool) -> (tempfile::TempDir, std::path::PathBuf, i64) {
     sh(&repo, &["add", "-A"]);
     sh(&repo, &["commit", "-qm", "init"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
 
     // The session that still targets the old path, branched before the move.
     let stale = broker.start_worktree("edit the old path", None).unwrap();
@@ -70,13 +73,13 @@ fn fixture(rename: bool) -> (tempfile::TempDir, std::path::PathBuf, i64) {
     sh(&mover_worktree, &["commit", "-qm", "generalize the plugin"]);
     assert!(broker.submit(mover.id).unwrap().promoted);
 
-    (tmp, repo, stale.id)
+    (fixture, repo, stale.id)
 }
 
 #[test]
 fn a_renamed_target_is_named_with_its_new_path_and_owning_entry() {
-    let (_tmp, repo, stale_id) = fixture(true);
-    let mut broker = Broker::open(&repo).unwrap();
+    let (fixture, _repo, stale_id) = fixture(true);
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
 
     let renamed = broker.session_renamed_targets(stale_id).unwrap();
     assert_eq!(renamed.len(), 1, "expected one renamed target: {renamed:?}");
@@ -92,8 +95,8 @@ fn a_renamed_target_is_named_with_its_new_path_and_owning_entry() {
 /// the operator to a path that does not exist.
 #[test]
 fn a_genuine_deletion_is_not_reported_as_a_rename() {
-    let (_tmp, repo, stale_id) = fixture(false);
-    let mut broker = Broker::open(&repo).unwrap();
+    let (fixture, _repo, stale_id) = fixture(false);
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     assert!(
         broker.session_renamed_targets(stale_id).unwrap().is_empty(),
         "a deleted path must not be reported as renamed"
@@ -103,16 +106,15 @@ fn a_genuine_deletion_is_not_reported_as_a_rename() {
 /// Nothing is reported when the session's paths still exist.
 #[test]
 fn an_unaffected_session_reports_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
+    let fixture = FixtureRepository::new();
+    let repo = fixture.path();
     sh(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("keep.txt"), "stable\n").unwrap();
     sh(&repo, &["add", "-A"]);
     sh(&repo, &["commit", "-qm", "init"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let session = broker.start_worktree("ordinary work", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("keep.txt"), "edited\n").unwrap();
@@ -130,8 +132,8 @@ fn an_unaffected_session_reports_nothing() {
 /// The advisory reaches the operator at adopt, before a replay is attempted.
 #[test]
 fn adopt_surfaces_the_rename_before_a_replay_is_attempted() {
-    let (_tmp, repo, _) = fixture(true);
-    let mut broker = Broker::open(&repo).unwrap();
+    let (fixture, repo, _) = fixture(true);
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
 
     // A hand-made worktree that still targets the old path.
     let manual = repo.parent().unwrap().join("manual");
