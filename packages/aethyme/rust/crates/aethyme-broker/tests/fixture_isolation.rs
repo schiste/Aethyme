@@ -73,7 +73,7 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
         }
         let captured_root = command
             .get_envs()
-            .find(|(key, _)| key == "AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+            .find(|(key, _)| *key == "AETHYME_BROKER_OPEN_WORKTREE_ROOT")
             .and_then(|(_, value)| value)
             .map(PathBuf::from)
             .expect("child receives exact fixture worktree root");
