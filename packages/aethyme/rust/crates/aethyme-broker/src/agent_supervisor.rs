@@ -840,11 +840,12 @@ mod tests {
         let repo = temp.path().join("repo");
         initialized_repo(&repo);
         // A failed cleanup guard must still leave a finite, fixture-owned
-        // writer: TempDir teardown removes its stop sentinel, even on panic.
+        // writer: teardown removes its stop sentinel on panic. The write cap
+        // also bounds output if the test runner itself is killed.
         std::fs::write(repo.join("writer-alive"), b"fixture-owned writer lifetime").unwrap();
         let log = temp.path().join("agent.log");
         let mut child = spawn(
-            "sh -c 'while [ -f writer-alive ]; do printf x >> background-writes; sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15; printf foreground-done",
+            "sh -c 'n=0; while [ -f writer-alive ] && [ $n -lt 3000 ]; do printf x >> background-writes; n=$((n + 1)); sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15; printf foreground-done",
             &repo,
             &log,
         );
@@ -865,11 +866,12 @@ mod tests {
         let repo = temp.path().join("repo");
         initialized_repo(&repo);
         // A failed cleanup guard must still leave a finite, fixture-owned
-        // writer: TempDir teardown removes its stop sentinel, even on panic.
+        // writer: teardown removes its stop sentinel on panic. The write cap
+        // also bounds output if the test runner itself is killed.
         std::fs::write(repo.join("writer-alive"), b"fixture-owned writer lifetime").unwrap();
         let log = temp.path().join("agent.log");
         let mut child = spawn_configured(
-            "while [ -f writer-alive ]; do printf x >> background-writes; sleep 0.02; done",
+            "n=0; while [ -f writer-alive ] && [ $n -lt 3000 ]; do printf x >> background-writes; n=$((n + 1)); sleep 0.02; done",
             &repo,
             &log,
             true,
@@ -894,13 +896,14 @@ mod tests {
         let repo = temp.path().join("repo");
         initialized_repo(&repo);
         // A failed cleanup guard must still leave a finite, fixture-owned
-        // writer: TempDir teardown removes its stop sentinel, even on panic.
+        // writer: teardown removes its stop sentinel on panic. The write cap
+        // also bounds output if the test runner itself is killed.
         std::fs::write(repo.join("writer-alive"), b"fixture-owned writer lifetime").unwrap();
         let log = temp.path().join("agent.log");
         let hold = temp.path().join("hold-cleanup");
         std::fs::write(&hold, b"test-owned barrier").unwrap();
         let mut child = spawn_configured(
-            "sh -c 'while [ -f writer-alive ]; do printf x >> background-writes; sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15",
+            "sh -c 'n=0; while [ -f writer-alive ] && [ $n -lt 3000 ]; do printf x >> background-writes; n=$((n + 1)); sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15",
             &repo,
             &log,
             false,
