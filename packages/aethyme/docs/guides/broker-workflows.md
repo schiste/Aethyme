@@ -1290,11 +1290,12 @@ below the gate headroom -- is spent by commands that exist to reclaim disk:
 this split, a repository whose backlog outlasted one budget paid the full
 budget -- a minute under pressure -- on every command.
 
-The sweep also reaches sessions that are still open once their agent has been
-quiet for `[retention].idle_session_artifact_hours` (default 24). The session
-stays open with its checkout and branch; only its witnessed build caches go,
-and a cache written to within the window is left for whatever is still
-writing it.
+Autonomous sweeps operate on closed sessions only. Quiet-agent time and shallow
+directory timestamps cannot prove a deeply nested cache is no longer being
+written by a build or development process. Use the reviewed `gc reclaim` plan
+and apply flow for build output in an open session. The legacy
+`idle_session_artifact_hours` setting is accepted for older configurations but
+does not authorize autonomous removal from open sessions.
 
 `gc apply` re-proves each build cache before removing it, and a cache that no
 longer qualifies — a session live again, a directory no longer carrying its

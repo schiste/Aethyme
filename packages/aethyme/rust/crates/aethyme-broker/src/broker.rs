@@ -99,6 +99,8 @@ pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
+    #[error("invalid captured broker storage context: {reason}")]
+    InvalidStorageContext { reason: Box<str> },
     /// The repository opted into the push lane and the session holds commits
     /// no remote has, so closing it would leave the only copy in a worktree
     /// the broker is about to stop tracking.
@@ -395,6 +397,35 @@ pub enum BrokerOpError {
     Spawn {
         command: String,
         source: std::io::Error,
+    },
+    #[error(
+        "start-agent setup failed: {primary}; rollback was incomplete, so inspect the retained artifacts: {recovery:?}"
+    )]
+    StartAgentRollback {
+        #[source]
+        primary: Box<BrokerOpError>,
+        recovery: Vec<String>,
+    },
+    #[error(
+        "session {session_id} was registered for agent pid {pid}, but its start handshake failed: {reason}; the command was not released, and the session/worktree/log were retained for inspection ({worktree_path}; {log_path}){cleanup}"
+    )]
+    StartAgentRelease {
+        session_id: i64,
+        pid: u32,
+        worktree_path: Box<str>,
+        log_path: Box<str>,
+        reason: String,
+        cleanup: String,
+    },
+    #[error(
+        "start-agent registration outcome is uncertain after {registration_error}; no command was released, and the gated process/artifacts were retained (pid {pid}, worktree {worktree_path}, log {log_path}){cleanup}"
+    )]
+    StartAgentRegistrationUncertain {
+        registration_error: String,
+        pid: u32,
+        worktree_path: String,
+        log_path: String,
+        cleanup: String,
     },
     #[error("cannot select a safe base for broker start: {reason}")]
     StartBaseUnavailable { reason: String },
@@ -982,6 +1013,80 @@ pub struct WorktreeRootPlan {
     /// the `[worktrees]` configuration was ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_unavailable_reason: Option<String>,
+    /// A captured storage context cannot be used for this repository. Unlike
+    /// ordinary unavailable-root reasons, this is a fail-closed planning
+    /// refusal: callers must not try another root or allocate a slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_context_refusal: Option<String>,
+}
+
+/// Storage locations selected before broker startup maintenance runs.
+///
+/// These options let embedded callers isolate a broker's host-scoped state
+/// without changing process-wide environment variables. They are applied
+/// before recovery, reconciliation, and GC maintenance; the older `with_*`
+/// builders remain useful for configuring operations on an already-open
+/// broker, but cannot affect work already done during open.
+#[derive(Debug, Clone, Default)]
+pub struct BrokerOpenOptions {
+    pub(crate) host_state_dir: Option<PathBuf>,
+    pub(crate) host_cache_dir: Option<PathBuf>,
+    pub(crate) host_operation_db_path: Option<PathBuf>,
+    pub(crate) worktree_root: Option<PathBuf>,
+    pub(crate) collaboration_state_dir: Option<PathBuf>,
+}
+
+impl BrokerOpenOptions {
+    /// Use a private host-state directory. Its `host-resources.db` file also
+    /// coordinates preparation-cache reclamation and gate-cache liveness.
+    pub fn with_host_state_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.host_state_dir = Some(path.into());
+        self
+    }
+
+    /// Use a private host-cache directory for managed gate caches.
+    pub fn with_host_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.host_cache_dir = Some(path.into());
+        self
+    }
+
+    /// Override the host-operation database used by this broker.
+    pub fn with_host_operation_database(mut self, path: impl Into<PathBuf>) -> Self {
+        self.host_operation_db_path = Some(path.into());
+        self
+    }
+
+    /// Use this exact per-repository worktree root, without appending a
+    /// repository key. Environment overrides keep their existing container
+    /// semantics and are captured separately when the broker opens.
+    pub fn with_worktree_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.worktree_root = Some(path.into());
+        self
+    }
+
+    /// Use this exact collaboration-state root for the opened broker.
+    pub fn with_collaboration_state(mut self, path: impl Into<PathBuf>) -> Self {
+        self.collaboration_state_dir = Some(path.into());
+        self
+    }
+}
+
+/// The exact host paths captured for one broker handle. Detached maintenance
+/// workers receive this context explicitly so their environment cannot send
+/// them to a different host database or cache.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BrokerStorageContext {
+    pub(crate) repository_root: Option<PathBuf>,
+    pub(crate) git_common_dir: Option<PathBuf>,
+    pub(crate) host_state_dir: Option<PathBuf>,
+    pub(crate) host_resource_db_path: Option<PathBuf>,
+    pub(crate) host_cache_dir: Option<PathBuf>,
+    pub(crate) host_operation_db_path: Option<PathBuf>,
+    pub(crate) worktree_root_override: Option<PathBuf>,
+    pub(crate) worktree_root_environment_override: Option<PathBuf>,
+    pub(crate) collaboration_state_dir: Option<PathBuf>,
+    pub(crate) host_state_dir_is_explicit: bool,
+    pub(crate) capture_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -3032,6 +3137,7 @@ pub struct Broker {
     store: BrokerStore,
     main_root: PathBuf,
     graph_impact_provider: Box<dyn GraphImpactProvider>,
+    storage_context: BrokerStorageContext,
     host_operation_db_path: Option<PathBuf>,
     worktree_root_override: Option<PathBuf>,
     /// Test-only host state directory for collaboration state (#660).
@@ -3061,5 +3167,7 @@ pub(super) use status_helpers::*;
 
 #[cfg(test)]
 mod pid_liveness_tests;
+#[cfg(test)]
+mod start_agent_tests;
 #[cfg(test)]
 mod tests;

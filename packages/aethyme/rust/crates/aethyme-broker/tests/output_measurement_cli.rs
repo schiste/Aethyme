@@ -24,7 +24,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn run(repo: &Path, measure: Option<&str>, args: &[&str]) -> Output {
-    let mut cmd = common::broker_cli(CLI, args);
+    let mut cmd = common::broker_cli_for_fixture(CLI, args, repo);
     cmd.current_dir(repo);
     match measure {
         Some(value) => cmd.env("AETHYME_MEASURE_OUTPUT", value),

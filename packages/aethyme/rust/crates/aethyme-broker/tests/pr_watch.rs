@@ -3,12 +3,15 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
+mod common;
+
 use aethyme_broker::{
     Broker, BrokerOpError, DeliveryCompletion, DeliveryPolicy, DeliveryStatus, NewSession,
     PullRequestActivityKind, PullRequestActivityMetadata, PullRequestBatchAckOutcome,
     PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatchError, PullRequestWatchProvider,
     PullRequestWatchRequest, PullRequestWatchStatus, SessionOrigin,
 };
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -27,13 +30,13 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-fn broker_fixture() -> (tempfile::TempDir, Broker, i64) {
-    let root = tempfile::tempdir().unwrap();
+fn broker_fixture() -> (FixtureRepository, common::FixtureBroker, i64) {
+    let root = FixtureRepository::new();
     git(root.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(root.path().join("README.md"), "test\n").unwrap();
     git(root.path(), &["add", "README.md"]);
     git(root.path(), &["commit", "-qm", "initial"]);
-    let mut broker = Broker::open(root.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&root).unwrap();
     let session = broker
         .store()
         .register_session(&NewSession {
@@ -606,13 +609,15 @@ fn a_delivery_that_is_always_deferred_is_eventually_dead_lettered() {
 fn an_empty_delivery_poll_records_no_command_telemetry() {
     const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
     let (root, mut broker, session_id) = broker_fixture();
-    let run = |args: &[&str]| {
-        Command::new(CLI)
-            .args(args)
+    let run = |broker: &Broker, args: &[&str]| {
+        let mut command = common::broker_cli(CLI, args);
+        command
             .current_dir(root.path())
-            .env_remove("AETHYME_MEASURE_OUTPUT")
-            .output()
-            .unwrap()
+            .env_remove("AETHYME_MEASURE_OUTPUT");
+        broker
+            .configure_storage_context_for_child(&mut command)
+            .unwrap();
+        command.output().unwrap()
     };
     let metrics_path = root.path().join(".aethyme/logs/command-metrics.jsonl");
     let metric_lines = || {
@@ -657,7 +662,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
     ];
 
     for args in [&claim[..], &dispatch[..]] {
-        let output = run(args);
+        let output = run(&broker, args);
         assert!(
             output.status.success(),
             "{}",
@@ -668,7 +673,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
                 || String::from_utf8_lossy(&output.stdout).contains("\"claimed\":false")
         );
     }
-    let listed = run(&["advanced", "deliveries", "list", "--json"]);
+    let listed = run(&broker, &["advanced", "deliveries", "list", "--json"]);
     assert!(listed.status.success());
     assert_eq!(
         metric_lines(),

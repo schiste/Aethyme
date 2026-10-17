@@ -832,8 +832,10 @@ fn require_explicit_trust(
     broker: &Broker,
     policy: &crate::broker::gate_trust::GatePolicy,
 ) -> Result<(), NativeGateError> {
-    use crate::broker::gate_trust::{TrustDecision, assess_trusted};
-    match assess_trusted(&broker.main_root_path(), policy, None)? {
+    use crate::broker::gate_trust::{TrustDecision, assess_trusted_for_host_state};
+    let main_root = broker.main_root_path();
+    let host_state_dir = broker.storage_context().host_state_dir.clone();
+    match assess_trusted_for_host_state(&main_root, host_state_dir.as_deref(), policy, None)? {
         TrustDecision::Trusted | TrustDecision::NoCommands => Ok(()),
         TrustDecision::Grandfathered | TrustDecision::TestEscape => {
             Err(NativeGateError::Unsupported(
@@ -1107,13 +1109,15 @@ fn run_inner(
         // Same gate engine used by merge.rs. No separate gate definitions,
         // runner, cache implementation, queue replay or promotion path.
         let main = broker.main_root_path();
-        let outcomes = crate::gates::run_affected_bounded(
+        let storage = broker.storage_context().gate_storage_locations();
+        let outcomes = crate::gates::run_affected_bounded_in(
             broker.store(),
             &main,
             &checkout.repo,
             &p.gates,
             &changed,
             Duration::from_secs(job.spec.execution_allowance_seconds),
+            storage,
         )?;
         let status = if !p.present {
             "no_configuration"

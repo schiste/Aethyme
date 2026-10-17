@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
+mod common;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const DAY_MS: i64 = 86_400_000;
@@ -29,11 +29,14 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
+    let broker = common::open_fixture_repository_path_broker(repo).unwrap();
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(repo);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    drop(broker);
+    command.output().unwrap()
 }
 
 fn json(output: &Output) -> serde_json::Value {
@@ -46,14 +49,14 @@ fn json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn repo() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
-    git(tmp.path(), &["add", "-A"]);
-    git(tmp.path(), &["commit", "-qm", "init"]);
-    tmp
+fn repo() -> common::FixtureRepository {
+    let fixture = common::FixtureRepository::new();
+    git(fixture.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(fixture.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(fixture.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+    git(fixture.path(), &["add", "-A"]);
+    git(fixture.path(), &["commit", "-qm", "init"]);
+    fixture
 }
 
 fn archive_root(repo: &Path) -> PathBuf {
@@ -64,7 +67,7 @@ fn archive_root(repo: &Path) -> PathBuf {
 /// uncommitted edit; archive it through the reviewed resolve path.
 fn archived_session(repo: &Path, name: &str, dirty: bool) -> (i64, String, PathBuf) {
     let session = {
-        let mut broker = Broker::open(repo).unwrap();
+        let mut broker = common::open_fixture_repository_path_broker(repo).unwrap();
         let session = broker.start_worktree(name, None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         std::fs::write(worktree.join(format!("{name}.txt")), "work\n").unwrap();

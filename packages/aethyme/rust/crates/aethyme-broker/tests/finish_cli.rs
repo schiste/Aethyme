@@ -1,7 +1,10 @@
+#[path = "common/isolation.rs"]
+mod isolation;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, GateStatus, NewGateResult, events};
+use aethyme_broker::{GateStatus, NewGateResult, events};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -24,22 +27,18 @@ fn git(repo: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
+    isolation::command(CLI, repo, args).output().unwrap()
 }
 
-fn promoted_fixture() -> (tempfile::TempDir, i64, std::path::PathBuf, String) {
-    let tmp = tempfile::tempdir().unwrap();
+fn promoted_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
+    let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let session = broker.start_worktree("finish CLI fixture", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
@@ -134,7 +133,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
             .starts_with("aethyme broker advanced ship plan --entry ")
     );
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let event = broker
         .store()
         .events_after(0, i64::MAX)
@@ -152,13 +151,13 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
 fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let session = broker.start_worktree("slow finish check", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     let session_id = session.id;
@@ -184,7 +183,7 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     paths.extend(std::env::split_paths(&original_path));
     let path = std::env::join_paths(paths).unwrap();
     let session_arg = session_id.to_string();
-    let output = Command::new(CLI)
+    let output = isolation::command(CLI, tmp.path(), &[])
         .args(["finish", "--session", &session_arg, "--timeout", "1"])
         .current_dir(tmp.path())
         .env("PATH", path)
@@ -224,13 +223,13 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
 fn finish_timeout_does_not_kill_worktree_removal_after_the_session_closes() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let session = broker
         .start_worktree("slow worktree removal", None)
         .unwrap();
@@ -259,7 +258,7 @@ fn finish_timeout_does_not_kill_worktree_removal_after_the_session_closes() {
     paths.extend(std::env::split_paths(&original_path));
     let path = std::env::join_paths(paths).unwrap();
     let session_arg = session_id.to_string();
-    let output = Command::new(CLI)
+    let output = isolation::command(CLI, tmp.path(), &[])
         .args([
             "finish",
             "--session",
@@ -425,11 +424,15 @@ fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
 
 #[test]
 fn finish_cli_can_remove_its_current_worktree_after_the_command_starts() {
-    let (_tmp, session_id, worktree, _) = promoted_fixture();
-    let output = run(
-        &worktree,
+    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let output = isolation::command(
+        CLI,
+        tmp.path(),
         &["finish", "--session", &session_id.to_string(), "--json"],
-    );
+    )
+    .current_dir(&worktree)
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",

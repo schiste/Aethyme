@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -26,16 +28,17 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
+fn run(fixture: &common::FixtureRepository, args: &[&str]) -> Output {
+    let broker = common::open_fixture_repository_broker(fixture).unwrap();
+    let mut command = common::broker_cli(CLI, args);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    command.current_dir(fixture.path()).output().unwrap()
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture() -> common::FixtureRepository {
+    let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
@@ -74,7 +77,9 @@ fn record_conflict(broker: &mut Broker, session_id: i64, sequence: i64, paths: &
 #[test]
 fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
     let tmp = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(tmp.path(), Some("advisory fixture")).unwrap();
     let head = git(tmp.path(), &["rev-parse", "HEAD"]);
     let entry = broker.store().submit(session.id, &head, &head).unwrap();
@@ -102,7 +107,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
     );
     let event_count_before_reads = broker.store().events_after(0, i64::MAX).unwrap().len();
 
-    let listed = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
+    let listed = run(&tmp, &["advanced", "advisories", "list", "--json"]);
     assert!(
         listed.status.success(),
         "{}",
@@ -117,7 +122,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
     assert_eq!(listed["advisories"][0]["integration_sha"], "a".repeat(40));
 
     let id = created.id.to_string();
-    let shown = run(tmp.path(), &["advanced", "advisories", "show", &id]);
+    let shown = run(&tmp, &["advanced", "advisories", "show", &id]);
     let shown_text = String::from_utf8_lossy(&shown.stdout);
     assert!(shown.status.success());
     assert!(shown_text.contains("integration-drift:fixture"));
@@ -128,7 +133,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
         "content-free delivery correlation must not expand event history"
     );
 
-    let metrics = run(tmp.path(), &["advanced", "advisories", "metrics", "--json"]);
+    let metrics = run(&tmp, &["advanced", "advisories", "metrics", "--json"]);
     assert!(metrics.status.success());
     let metrics_text = String::from_utf8(metrics.stdout).unwrap();
     let metrics_json: serde_json::Value = serde_json::from_str(&metrics_text).unwrap();
@@ -146,10 +151,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
         assert!(!metrics_text.contains(forbidden), "leaked {forbidden:?}");
     }
 
-    let acknowledged = run(
-        tmp.path(),
-        &["advanced", "advisories", "ack", &id, "--json"],
-    );
+    let acknowledged = run(&tmp, &["advanced", "advisories", "ack", &id, "--json"]);
     assert!(
         acknowledged.status.success(),
         "{}",
@@ -170,10 +172,7 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
         AdvisoryResolutionState::Acknowledged
     );
 
-    let all = run(
-        tmp.path(),
-        &["advanced", "advisories", "list", "--all", "--json"],
-    );
+    let all = run(&tmp, &["advanced", "advisories", "list", "--all", "--json"]);
     let all: serde_json::Value = serde_json::from_slice(&all.stdout).unwrap();
     assert_eq!(all["outstanding_count"], 0);
     assert_eq!(all["includes_acknowledged"], true);
@@ -184,7 +183,9 @@ fn list_show_and_ack_keep_database_authoritative_and_projection_current() {
 #[test]
 fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     let tmp = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(tmp.path(), Some("private task text")).unwrap();
     for sequence in 1..=3 {
         record_conflict(
@@ -196,7 +197,7 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     }
     drop(broker);
 
-    let initial = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
+    let initial = run(&tmp, &["advanced", "advisories", "list", "--json"]);
     assert!(initial.status.success());
     let initial: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
     let advisories = initial["advisories"].as_array().unwrap();
@@ -225,13 +226,15 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
 
     assert!(
         run(
-            tmp.path(),
+            &tmp,
             &["advanced", "advisories", "ack", &reopen_id.to_string()]
         )
         .status
         .success()
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let unrelated = broker
         .store()
         .submit(session.id, &format!("{:040x}", 4), &format!("{:040x}", 4))
@@ -241,7 +244,7 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
         .set_merge_status(unrelated.id, MergeStatus::Rejected, None, None)
         .unwrap();
     drop(broker);
-    let unchanged = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
+    let unchanged = run(&tmp, &["advanced", "advisories", "list", "--json"]);
     let unchanged: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
     assert!(
         unchanged["advisories"]
@@ -252,10 +255,12 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
         "unrelated history must not reopen acknowledged evidence"
     );
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     record_conflict(&mut broker, session.id, 5, &["src/reopen.rs"]);
     drop(broker);
-    let reopened = run(tmp.path(), &["advanced", "advisories", "list", "--json"]);
+    let reopened = run(&tmp, &["advanced", "advisories", "list", "--json"]);
     let reopened: serde_json::Value = serde_json::from_slice(&reopened.stdout).unwrap();
     assert_eq!(
         reopened["advisories"]
@@ -269,13 +274,15 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
 
     assert!(
         run(
-            tmp.path(),
+            &tmp,
             &["advanced", "advisories", "suppress", &reopen_id.to_string()]
         )
         .status
         .success()
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     record_conflict(&mut broker, session.id, 6, &["src/reopen.rs"]);
     for sequence in 7..=206 {
         let head = format!("{sequence:040x}");
@@ -287,10 +294,7 @@ fn maintainer_recommendations_reopen_suppress_and_resolve_deterministically() {
     }
     drop(broker);
 
-    let refreshed = run(
-        tmp.path(),
-        &["advanced", "advisories", "list", "--all", "--json"],
-    );
+    let refreshed = run(&tmp, &["advanced", "advisories", "list", "--all", "--json"]);
     assert!(
         refreshed.status.success(),
         "{}",
@@ -316,7 +320,9 @@ fn projection_failure_does_not_erase_authoritative_advisory_state() {
     let tmp = fixture();
     let projection = tmp.path().join(BROKER_ADVISORY_RELPATH);
     std::fs::create_dir_all(&projection).unwrap();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let result = broker.persist_advisory(sample("projection-failure", None, None));
     assert!(result.is_err());
@@ -336,7 +342,9 @@ fn projection_failure_does_not_erase_authoritative_advisory_state() {
 #[test]
 fn maintainer_advisories_stay_out_of_session_projection() {
     let tmp = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let mut recommendation = sample("history:conflict:src-lib", None, None);
     recommendation.audience = AdvisoryAudience::Maintainer;
     recommendation.producer = AdvisoryProducer::ConflictHistory;
@@ -357,16 +365,21 @@ fn maintainer_advisories_stay_out_of_session_projection() {
 fn concurrent_producers_leave_one_complete_authoritative_projection() {
     let tmp = fixture();
     let root = tmp.path().to_path_buf();
-    Broker::open(&root).unwrap();
+    let fixture_owner = tmp.owner_path().to_path_buf();
+    common::open_fixture_broker(&root, &fixture_owner)
+        .unwrap()
+        .into_broker();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let mut workers = Vec::new();
     for identity in ["concurrent:first", "concurrent:second"] {
         let root = root.clone();
+        let fixture_owner = fixture_owner.clone();
         let barrier = barrier.clone();
         workers.push(std::thread::spawn(move || {
             barrier.wait();
-            Broker::open(&root)
+            common::open_fixture_broker(&root, &fixture_owner)
                 .unwrap()
+                .into_broker()
                 .persist_advisory(sample(identity, None, None))
                 .unwrap();
         }));
@@ -376,7 +389,9 @@ fn concurrent_producers_leave_one_complete_authoritative_projection() {
         worker.join().unwrap();
     }
 
-    let broker = Broker::open(&root).unwrap();
+    let broker = common::open_fixture_broker(&root, &fixture_owner)
+        .unwrap()
+        .into_broker();
     assert_eq!(broker.advisories(false).unwrap().len(), 2);
     let projection = std::fs::read_to_string(root.join(BROKER_ADVISORY_RELPATH)).unwrap();
     assert!(projection.contains("concurrent:first"));
@@ -387,8 +402,9 @@ fn concurrent_producers_leave_one_complete_authoritative_projection() {
 #[test]
 fn advisory_cli_rejects_missing_invalid_and_unknown_ids() {
     let tmp = fixture();
-    let session_advisory = Broker::open(tmp.path())
+    let session_advisory = common::open_fixture_repository_broker(&tmp)
         .unwrap()
+        .into_broker()
         .persist_advisory(sample("session-cannot-be-suppressed", None, None))
         .unwrap();
     for args in [
@@ -398,11 +414,11 @@ fn advisory_cli_rejects_missing_invalid_and_unknown_ids() {
         &["advanced", "advisories", "ack", "999"][..],
         &["advanced", "advisories", "suppress", "999"][..],
     ] {
-        let output = run(tmp.path(), args);
+        let output = run(&tmp, args);
         assert!(!output.status.success(), "unexpected success for {args:?}");
     }
     let suppression = run(
-        tmp.path(),
+        &tmp,
         &[
             "advanced",
             "advisories",
@@ -417,7 +433,9 @@ fn advisory_cli_rejects_missing_invalid_and_unknown_ids() {
 #[test]
 fn session_commands_surface_notices_without_corrupting_json() {
     let tmp = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(tmp.path(), Some("notice target")).unwrap();
     let mut advisory = sample("promotion-session-notice", Some(session.id), None);
     advisory.evidence.push(AdvisoryEvidence {
@@ -428,7 +446,7 @@ fn session_commands_surface_notices_without_corrupting_json() {
 
     let session_id = session.id.to_string();
     let command = run(
-        tmp.path(),
+        &tmp,
         &[
             "advanced",
             "leases",
@@ -447,7 +465,7 @@ fn session_commands_surface_notices_without_corrupting_json() {
     assert!(stderr.contains(&"a".repeat(40)));
     assert!(stderr.contains("safe next action: aethyme broker status --json"));
 
-    let status = run(tmp.path(), &["status", "--json"]);
+    let status = run(&tmp, &["status", "--json"]);
     assert!(status.status.success());
     let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status_json["outstanding_advisories"][0]["id"], advisory.id);
@@ -459,7 +477,7 @@ fn session_commands_surface_notices_without_corrupting_json() {
 
     broker.acknowledge_advisory(advisory.id).unwrap();
     let quiet = run(
-        tmp.path(),
+        &tmp,
         &[
             "advanced",
             "leases",

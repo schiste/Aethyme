@@ -5,6 +5,7 @@
 //! and records nothing. Its own binary: it removes the suite's trust escape
 //! part-way, which is only sound with no other test in the process.
 
+mod common;
 use std::path::Path;
 use std::process::Command;
 
@@ -46,14 +47,9 @@ fn files(dir: &Path) -> Vec<std::path::PathBuf> {
 
 #[test]
 fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
-    let host_state = tempfile::tempdir().unwrap();
-    // SAFETY: the only test in this binary, so no other thread reads the
-    // environment concurrently.
-    unsafe {
-        std::env::set_var("AETHYME_HOST_STATE_DIR", host_state.path());
-    }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
+    let host_state = common::fixture_host_state_dir(tmp.owner_path());
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(
@@ -74,7 +70,9 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     std::fs::write(root.join("README.md"), "fixture\n").unwrap();
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
-    let mut broker = Broker::open(root).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     // Gate history, built under the suite's escape, with no trust record.
     let first = broker.start_worktree("first", None).unwrap();
@@ -86,7 +84,7 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     assert!(outcome.promoted, "{outcome:?}");
     assert!(!outcome.gate_outcomes.is_empty(), "the gate ran");
     assert!(
-        files(host_state.path())
+        files(&host_state)
             .iter()
             .all(|path| !path.to_string_lossy().contains("trust"))
     );
@@ -114,7 +112,7 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
             .filter(|path| path.to_string_lossy().contains("trust"))
             .collect::<Vec<_>>()
     };
-    assert!(trust_files(host_state.path()).is_empty());
+    assert!(trust_files(&host_state).is_empty());
 
     // Submit grandfathers, then gates and promotes the same tree.
     let submitted = broker.submit(session.id).unwrap();
@@ -123,8 +121,5 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
         submitted.entry.merged_tree.as_deref(),
         Some(candidate.tree.as_str())
     );
-    assert!(
-        !trust_files(host_state.path()).is_empty(),
-        "submit grandfathered"
-    );
+    assert!(!trust_files(&host_state).is_empty(), "submit grandfathered");
 }

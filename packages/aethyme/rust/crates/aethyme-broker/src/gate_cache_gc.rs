@@ -40,16 +40,31 @@ pub(crate) struct GateCacheLocation {
     pub(crate) registry: Option<PathBuf>,
 }
 
-/// Resolve the location exactly as a gate does: the same repository key
-/// (from the main checkout, #170) under the same per-user cache directory.
-pub(crate) fn location(main_root: &Path) -> Option<GateCacheLocation> {
+/// Resolve the location using the paths captured by an owning Broker handle.
+pub(crate) fn location_in(
+    main_root: &Path,
+    storage: &crate::gates::GateStorageLocations,
+) -> Option<GateCacheLocation> {
     let repo = GitRepo::discover(main_root).ok()?;
     let repository_key = crate::gates::repository_key(&repo).0;
-    let cache = crate::host_state::default_host_cache_dir()?;
+    let (cache, registry) = match storage {
+        crate::gates::GateStorageLocations::Defaults => (
+            crate::host_state::default_host_cache_dir()?,
+            crate::default_host_resource_db_path().ok(),
+        ),
+        crate::gates::GateStorageLocations::Captured {
+            host_cache_dir: Some(cache),
+            host_resource_db_path,
+        } => (cache.clone(), host_resource_db_path.clone()),
+        crate::gates::GateStorageLocations::Captured {
+            host_cache_dir: None,
+            ..
+        } => return None,
+    };
     Some(GateCacheLocation {
         root: cache.join("gates").join(&repository_key),
         repository_key,
-        registry: crate::default_host_resource_db_path().ok(),
+        registry,
     })
 }
 
@@ -490,8 +505,8 @@ pub(crate) enum GateCacheReclaim {
     Interrupted,
 }
 
-/// Remove one reviewed candidate, re-proving at the moment of removal that no
-/// gate is using it.
+/// Remove one reviewed candidate using an explicit location and registry,
+/// re-proving at the moment of removal that no gate is using it.
 ///
 /// The plan may be minutes old. So the entry's own lease is *taken* -- a gate
 /// that starts now waits for it rather than racing the removal -- and the
@@ -499,17 +514,6 @@ pub(crate) enum GateCacheReclaim {
 /// renamed aside, exactly as a gate rotates an oversized cache, and the lease
 /// is released before the slow part: the next gate gets a fresh directory at
 /// once instead of waiting minutes for an unlink.
-pub(crate) fn reclaim(
-    main_root: &Path,
-    candidate: &GcGateCacheCandidate,
-    deadline: Option<Instant>,
-) -> Result<GateCacheReclaim, String> {
-    let location = location(main_root)
-        .ok_or_else(|| "this repository's gate cache location cannot be resolved".to_string())?;
-    reclaim_in(main_root, &location, candidate, deadline)
-}
-
-/// [`reclaim`] against an explicit location and registry.
 pub(crate) fn reclaim_in(
     main_root: &Path,
     location: &GateCacheLocation,

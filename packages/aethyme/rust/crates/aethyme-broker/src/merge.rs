@@ -1187,7 +1187,8 @@ impl Broker {
         let configured_gates = gates.len();
         // A stale or unverifiable graph is recorded above and reported with
         // the submission; it never stops the gates or the promotion (#280).
-        let gate_outcomes = crate::gates::run_affected_for_submit(
+        let storage = self.storage_context().gate_storage_locations();
+        let gate_outcomes = crate::gates::run_affected_for_submit_in(
             self.store(),
             &main_root,
             &sim_worktree,
@@ -1196,6 +1197,7 @@ impl Broker {
             Some(entry.session_id),
             cache_policy,
             progress,
+            storage,
         );
         verification_slot.cleanup();
         // Promotion may re-simulate another in-flight entry, and a stale

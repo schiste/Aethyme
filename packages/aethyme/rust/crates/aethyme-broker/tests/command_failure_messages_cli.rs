@@ -5,7 +5,9 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, NewSession, SessionOrigin};
+use aethyme_broker::{NewSession, SessionOrigin};
+
+mod common;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -33,23 +35,26 @@ fn init_repo(repo: &Path) {
     git(repo, &["commit", "-qm", "init"]);
 }
 
-fn host_state_dir(repo: &Path) -> std::path::PathBuf {
-    repo.join(".aethyme/test-host-state")
-}
-
-fn test_broker(repo: &Path) -> Broker {
-    Broker::open(repo)
-        .unwrap()
-        .with_host_operation_database(host_state_dir(repo).join("host-operations.db"))
+fn test_broker(repo: &Path) -> common::FixtureBroker {
+    common::open_fixture_repository_path_broker(repo).unwrap()
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .env("AETHYME_HOST_STATE_DIR", host_state_dir(repo))
-        .output()
-        .unwrap()
+    run_with_env(repo, args, &[])
+}
+
+fn run_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
+    let broker = test_broker(repo);
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(repo);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    drop(broker);
+    command.output().unwrap()
 }
 
 /// Payloads of every `broker.command.failed` event, oldest first.
@@ -64,11 +69,11 @@ fn failed_payloads(repo: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    drop(test_broker(tmp.path()));
-    tmp
+fn fixture() -> common::FixtureRepository {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    drop(test_broker(fixture.path()));
+    fixture
 }
 
 fn last_failure_message(repo: &Path) -> String {
@@ -265,13 +270,11 @@ fn an_unbounded_read_ends_at_its_default_budget_with_a_diagnostic() {
     let session_id = session.id.to_string();
     let started = std::time::Instant::now();
     // No --queue-timeout and no --no-wait: the caller asked for no bound.
-    let output = Command::new(CLI)
-        .args(["advanced", "git", "--session", &session_id, "--", "status"])
-        .current_dir(tmp.path())
-        .env("AETHYME_HOST_STATE_DIR", host_state_dir(tmp.path()))
-        .env("AETHYME_BROKER_READ_BUDGET_SECS", "1")
-        .output()
-        .unwrap();
+    let output = run_with_env(
+        tmp.path(),
+        &["advanced", "git", "--session", &session_id, "--", "status"],
+        &[("AETHYME_BROKER_READ_BUDGET_SECS", "1")],
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(5),
         "the read outlived its budget: {:?}",

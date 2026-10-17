@@ -3,7 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{Broker, FinishOptions, MergeStatus};
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -25,15 +28,15 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 /// A repository with one promoted entry, then the promotion record erased the
 /// way an interrupted promotion erases it: status reverted, commit detail lost.
-fn fixture() -> (tempfile::TempDir, Broker, i64, String) {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    git(tmp.path(), &["add", "-A"]);
-    git(tmp.path(), &["commit", "-qm", "init"]);
+fn fixture() -> (FixtureRepository, common::FixtureBroker, i64, String) {
+    let fixture = FixtureRepository::new();
+    git(fixture.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(fixture.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(fixture.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(fixture.path(), &["add", "-A"]);
+    git(fixture.path(), &["commit", "-qm", "init"]);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let session = broker.start_worktree("delivered work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
@@ -42,7 +45,10 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, String) {
     let outcome = broker.submit(session.id).unwrap();
     assert!(outcome.promoted, "fixture requires a promoted entry");
     let entry_id = outcome.entry.id;
-    let promotion = git(tmp.path(), &["rev-parse", "refs/heads/aethyme/integration"]);
+    let promotion = git(
+        fixture.path(),
+        &["rev-parse", "refs/heads/aethyme/integration"],
+    );
     broker
         .finish_with_options(
             session.id,
@@ -51,7 +57,7 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, String) {
             },
         )
         .unwrap();
-    (tmp, broker, entry_id, promotion)
+    (fixture, broker, entry_id, promotion)
 }
 
 /// Erase the promotion record exactly as an interrupted promotion does: the
@@ -71,11 +77,11 @@ fn erase_record(repo: &Path, entry_id: i64) {
 
 #[test]
 fn a_lost_promotion_record_is_recovered_from_its_merge_tree() {
-    let (tmp, broker, entry_id, promotion) = fixture();
+    let (fixture, broker, entry_id, promotion) = fixture();
     drop(broker); // close the fixture connection before reopening
-    erase_record(tmp.path(), entry_id);
+    erase_record(fixture.path(), entry_id);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let plan = broker.promotion_record_plan().unwrap();
     let recoverable: Vec<_> = plan.recoverable().collect();
     assert_eq!(recoverable.len(), 1, "expected one recoverable commit");
@@ -110,15 +116,15 @@ fn a_lost_promotion_record_is_recovered_from_its_merge_tree() {
     let after = broker.promotion_record_plan().unwrap();
     assert_eq!(after.recoverable().count(), 0);
     drop(broker);
-    drop(tmp);
+    drop(fixture);
 }
 
 #[test]
 fn a_stale_digest_is_refused() {
-    let (tmp, b, entry_id, _p) = fixture();
+    let (fixture, b, entry_id, _p) = fixture();
     drop(b);
-    erase_record(tmp.path(), entry_id);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    erase_record(fixture.path(), entry_id);
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let err = broker
         .promotion_record_apply(&"0".repeat(64))
         .expect_err("a digest that does not match the current plan must be refused");
@@ -139,9 +145,9 @@ fn a_stale_digest_is_refused() {
 
 #[test]
 fn a_healthy_repository_has_nothing_to_recover() {
-    let (tmp, b, _e, _p) = fixture();
+    let (fixture, b, _e, _p) = fixture();
     drop(b);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let plan = broker.promotion_record_plan().unwrap();
     assert_eq!(
         plan.recoverable().count(),
@@ -152,11 +158,11 @@ fn a_healthy_repository_has_nothing_to_recover() {
 
 #[test]
 fn an_unmatched_commit_is_reported_but_never_repaired() {
-    let (tmp, b, entry_id, _p) = fixture();
+    let (fixture, b, entry_id, _p) = fixture();
     drop(b);
-    erase_record(tmp.path(), entry_id);
+    erase_record(fixture.path(), entry_id);
     // Destroy the one piece of load-bearing evidence.
-    let conn = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    let conn = rusqlite::Connection::open(fixture.path().join(".aethyme/broker.db")).unwrap();
     conn.execute(
         "UPDATE merge_queue SET merged_tree=NULL WHERE id=?1",
         [entry_id],
@@ -164,7 +170,7 @@ fn an_unmatched_commit_is_reported_but_never_repaired() {
     .unwrap();
     drop(conn);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let plan = broker.promotion_record_plan().unwrap();
     assert_eq!(
         plan.recoverable().count(),
