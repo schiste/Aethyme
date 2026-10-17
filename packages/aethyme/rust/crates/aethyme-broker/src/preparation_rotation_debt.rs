@@ -557,8 +557,10 @@ pub(crate) fn recover(
                     }
                 }
             }
-            RecoveryStep::CreateFreshStore => create_fresh_store(cache_root, &retained)
-                .map_err(|source| recovery_error(progress, source))?,
+            RecoveryStep::CreateFreshStore => {
+                create_fresh_store(cache_root, &retained)
+                    .map_err(|source| recovery_error(progress, source))?;
+            }
             RecoveryStep::ClearCompletedDebt => {
                 clear_completed(cache_root, &retained)
                     .map_err(|source| recovery_error(progress, source))?;
@@ -1485,7 +1487,7 @@ fn create_regular_exclusive(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
                 | libc::O_NOFOLLOW
                 | libc::O_CLOEXEC
                 | libc::O_NONBLOCK,
-            0o600 as libc::mode_t,
+            0o600 as libc::mode_t as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -2019,7 +2021,7 @@ mod tests {
     #[test]
     fn debt_witness_is_bounded_canonical_and_never_overwritten() {
         let (_temp, cache_root, debt) = fixture();
-        let published = publish(&cache_root, debt.clone()).unwrap();
+        publish(&cache_root, debt.clone()).unwrap();
         assert_eq!(read(&cache_root, REPOSITORY).unwrap().unwrap().debt, debt);
 
         let different = RotationDebt::new(
