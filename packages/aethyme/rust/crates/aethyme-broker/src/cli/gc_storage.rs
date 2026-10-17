@@ -1060,6 +1060,18 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
     } else {
         out!("  paused at the budget; run `aethyme broker gc sweep` again to continue");
     }
+    match report.legacy_unscoped_state {
+        crate::ArtifactSweepLegacyUnscopedState::Clear => {
+            out!(
+                "  legacy unscoped artifact-sweep state: clear; this lap covers only the current storage context"
+            );
+        }
+        crate::ArtifactSweepLegacyUnscopedState::UnknownPending => {
+            out!(
+                "  legacy unscoped artifact-sweep state: unknown and still pending; this lap covers only the current storage context"
+            );
+        }
+    }
 }
 
 /// `broker storage`.

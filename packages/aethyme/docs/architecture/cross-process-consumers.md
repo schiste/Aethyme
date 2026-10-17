@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-08
+Last Updated: 2026-10-17
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -43,6 +43,27 @@ consumer. This file exists so that doesn't happen again.
 The broker starts the private `broker gc __continue-artifacts <canonical-main-root>` child only from the installed router paired with its sibling engine. The child requires `AETHYME_GC_ARTIFACT_SWEEP_WORKER=1`, a writable non-ephemeral main checkout, aligned router/engine build identities, and the OS advisory singleton lock before it opens broker state. The subprocess is cache-only: it may remove eligible ignored build caches, but never removes a checkout or branch. It records completion only after a full eligible cache lap; deadline, lease contention, deletion failure, or repeated no-progress leaves the generation pending with bounded backoff. A new pressure refusal clears that backoff. The command remains hidden from help and is invoked only by the paired installed runtime.
 
 Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
+
+The nine durable artifact-sweep keys are scoped by a SHA-256 namespace derived
+from the complete captured broker storage context. Linked worktrees in the
+same repository and using the same captured context share sweep state; a
+different effective host-storage configuration gets a separate cursor and
+worker generation. The repository-local namespace registry is transactional,
+append-only and capped at 64 entries. A full or invalid registry refuses the
+sweep without reading or changing scoped state; entries are never evicted.
+
+The nine pre-namespace keys are inspected with bounded, read-only checks and
+are never migrated or rewritten automatically. `gc sweep --json` adds
+`legacy_unscoped_state` (`clear` or `unknown_pending`), and the text output
+reports the same state. Malformed, non-text or oversized values, an unfinished
+request, a nonzero cursor/progress marker, interrupted or blocked paths, or a
+future retry time remain `unknown_pending`. A `clear` legacy value means no
+known old backlog; `complete` means only that the current captured-context lap
+was reported complete, not that every registered context or historical value
+is resolved.
+
+Consumers of the report must tolerate this additive field and must not treat a
+current-context completion as global cleanup completion.
 
 ### Private spawned-agent supervision (#831)
 
