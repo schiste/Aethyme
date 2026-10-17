@@ -73,6 +73,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Check the selected test names and a nonzero executed count before treating a
   focused run as evidence. Rust module aliases can differ from filenames; a
   successful build with zero matching tests does not validate the change.
+- For a production guard that must prevent side effects, test the real entrypoint
+  with a fixture command that writes a unique sentinel. Assert the typed refusal
+  and sentinel absence, then remove only the call-site guard in a mutation run
+  and verify that the sentinel assertion fails. A helper-only test cannot prove
+  that the production path invokes the guard.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.

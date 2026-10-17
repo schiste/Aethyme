@@ -110,6 +110,32 @@ Cache writers and preparation-cache reclamation use the
 same root resolver and lease key. These controls reduce avoidable allocation
 and protect data during cleanup.
 
+The opt-in `managed_storage` profile currently describes intended preparation
+growth but does not enforce a bound. A minimal worktree-local declaration is:
+
+```toml
+schema_version = 1
+
+[[steps]]
+name = "deps"
+command = ["tool", "install"]
+outputs = ["vendor/"]
+required_for_hooks = false
+
+[managed_storage.steps.deps.output_growth_bytes]
+"vendor/" = 4096
+```
+
+The broker validates exact step and output coverage, positive byte bounds,
+non-overlapping paths, and the captured worktree/cache roots. Until reservation,
+existing-root adoption and old-writer fencing are integrated, an otherwise
+valid, trusted `prepare_session` request with an enabled profile returns typed
+`ManagedStorageNotReady` before starting a preparation command, including this
+valid example. This is an explicit fail-closed staging contract, not a quota or
+an active reservation. The preparation tests pin the real broker call path with
+a command-created sentinel and a guard-removal mutation; see
+`preparation::tests::prepare_session_opt_in_guard_prevents_command_start`.
+
 They do not impose a host-wide disk quota. A free-space observation reserves no
 bytes, concurrent commands can outgrow their estimates, and arbitrary processes
 can write after admission. Open sessions also retain protected source and
