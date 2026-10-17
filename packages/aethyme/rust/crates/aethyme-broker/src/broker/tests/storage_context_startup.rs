@@ -122,6 +122,8 @@ fn relative_storage_options_are_anchored_before_child_cwd_changes() {
     let worker_cwd = capsule.path().join("worker-cwd");
     std::fs::create_dir_all(&capture_cwd).expect("capture cwd");
     std::fs::create_dir_all(&worker_cwd).expect("worker cwd");
+    let capture_cwd = capture_cwd.canonicalize().expect("canonical capture cwd");
+    let worker_cwd = worker_cwd.canonicalize().expect("canonical worker cwd");
 
     let output = Command::new(std::env::current_exe().expect("test executable"))
         .args([
@@ -166,7 +168,9 @@ fn relative_storage_options_are_anchored_before_child_cwd_changes() {
 }
 
 fn run_relative_context_parent() {
-    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"));
+    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"))
+        .canonicalize()
+        .expect("canonicalize relative-context repository");
     let capture_cwd = PathBuf::from(
         std::env::var_os("AETHYME_TEST_STORAGE_CONTEXT_CAPTURE_CWD").expect("capture cwd path"),
     );
@@ -229,7 +233,9 @@ fn run_relative_context_parent() {
 }
 
 fn run_relative_context_worker() {
-    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"));
+    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"))
+        .canonicalize()
+        .expect("canonicalize relative-context repository");
     let capture_cwd = PathBuf::from(
         std::env::var_os("AETHYME_TEST_STORAGE_CONTEXT_CAPTURE_CWD").expect("capture cwd path"),
     );
@@ -660,7 +666,9 @@ fn malformed_private_storage_context_fails_before_open_maintenance() {
 }
 
 fn run_absent_context_parent() {
-    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"));
+    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"))
+        .canonicalize()
+        .expect("canonicalize absent-context repository");
     let poisoned_state = PathBuf::from(
         std::env::var_os("AETHYME_TEST_STORAGE_CONTEXT_POISONED_STATE")
             .expect("poisoned state path"),
@@ -733,7 +741,9 @@ fn run_absent_context_parent() {
 }
 
 fn run_absent_context_worker() {
-    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"));
+    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"))
+        .canonicalize()
+        .expect("canonicalize absent-context repository");
     let poisoned_state = PathBuf::from(
         std::env::var_os("AETHYME_TEST_STORAGE_CONTEXT_POISONED_STATE")
             .expect("poisoned state path"),
@@ -825,7 +835,9 @@ fn run_captured_startup_child() {
     let var_path = |name: &str| {
         PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("missing {name}")))
     };
-    let repository = var_path("AETHYME_TEST_STORAGE_CONTEXT_REPOSITORY");
+    let repository = var_path("AETHYME_TEST_STORAGE_CONTEXT_REPOSITORY")
+        .canonicalize()
+        .expect("canonicalize captured-context repository");
     let private_state = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_STATE");
     let private_cache = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_CACHE");
     let private_worktrees = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_WORKTREES");
@@ -853,33 +865,7 @@ fn run_captured_startup_child() {
     )
     .expect("write private worktree marker");
 
-    let options = BrokerOpenOptions::default()
-        .with_host_state_dir(private_state.clone())
-        .with_host_cache_dir(private_cache.clone())
-        .with_host_operation_database(private_state.join("host-operations.db"))
-        .with_worktree_root(private_worktrees.clone());
-    let broker = Broker::open_with_options(&repository, options).expect("open broker");
-    let context = broker.storage_context();
-    assert_eq!(
-        context.host_state_dir.as_deref(),
-        Some(private_state.as_path())
-    );
-    assert_eq!(
-        context.host_cache_dir.as_deref(),
-        Some(private_cache.as_path())
-    );
-    assert_eq!(
-        broker
-            .worktree_root_plan()
-            .expect("captured worktree plan")
-            .preferred_root,
-        Some(private_worktrees.clone())
-    );
-    assert!(private_state.join("host-resources.db").is_file());
-    assert!(!private_entry.exists());
-    let repository_git =
-        crate::GitRepo::discover(&repository).expect("discover captured-context fixture");
-    let repository_fingerprint = crate::gates::git_origin_fingerprint(&repository_git);
+    let repository_fingerprint = crate::gates::git_origin_fingerprint(&repo_handle);
     let (private_lease_id, private_lease_generation) = seed_quarantined_resource_lease(
         &private_state.join("host-resources.db"),
         &repository_fingerprint,
@@ -906,6 +892,31 @@ fn run_captured_startup_child() {
         "fixture",
     )
     .expect("seed trust in the poison host state");
+
+    let options = BrokerOpenOptions::default()
+        .with_host_state_dir(private_state.clone())
+        .with_host_cache_dir(private_cache.clone())
+        .with_host_operation_database(private_state.join("host-operations.db"))
+        .with_worktree_root(private_worktrees.clone());
+    let broker = Broker::open_with_options(&repository, options).expect("open broker");
+    let context = broker.storage_context();
+    assert_eq!(
+        context.host_state_dir.as_deref(),
+        Some(private_state.as_path())
+    );
+    assert_eq!(
+        context.host_cache_dir.as_deref(),
+        Some(private_cache.as_path())
+    );
+    assert_eq!(
+        broker
+            .worktree_root_plan()
+            .expect("captured worktree plan")
+            .preferred_root,
+        Some(private_worktrees.clone())
+    );
+    assert!(private_state.join("host-resources.db").is_file());
+    assert!(!private_entry.exists());
     assert!(
         preparation_entry(&poisoned_state).join("payload").is_file(),
         "startup maintenance must not sweep poisoned host state"
