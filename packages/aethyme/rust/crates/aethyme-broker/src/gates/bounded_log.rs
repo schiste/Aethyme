@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -16,13 +16,14 @@ use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub(super) const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
-pub(super) const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const AGENT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Serialize a broker-owned header value without constructing an unbounded
 /// intermediate string. The JSON writer keeps only the bounded prefix; the
 /// normal log header writer will add its truncation marker if needed.
-pub(super) fn bounded_json<T: serde::Serialize>(value: &T) -> io::Result<(Vec<u8>, bool)> {
+pub(crate) fn bounded_json<T: serde::Serialize>(value: &T) -> io::Result<(Vec<u8>, bool)> {
     let mut writer = CappedHeaderBuffer {
         bytes: Vec::with_capacity(MAX_HEADER_BYTES),
         truncated: false,
@@ -49,11 +50,12 @@ impl Write for CappedHeaderBuffer {
         Ok(())
     }
 }
-pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_NOTE_BYTES: usize = 16 * 1024;
 const MAX_TAIL_BYTES: usize = 512 * 1024;
 const FOOTER_RESERVE_BYTES: usize = 4 * 1024;
 const FINAL_NOTE_RESERVE_BYTES: usize = 2 * 1024;
+#[cfg(test)]
 const PREFIX_BUDGET_BYTES: usize = MAX_LOG_BYTES as usize
     - MAX_HEADER_BYTES
     - MAX_NOTE_BYTES
@@ -100,15 +102,18 @@ const CLASSIFIER_PATTERNS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct CaptureSummary {
+pub(crate) struct CaptureSummary {
     pub output_bytes: u64,
     pub incomplete: bool,
 }
 
 /// One shared append-only log sink for the two pipe readers and broker notes.
-pub(super) struct BoundedGateLog {
+pub(crate) struct BoundedGateLog {
     file: File,
     file_bytes: usize,
+    max_log_bytes: usize,
+    prefix_budget_bytes: usize,
+    output_kind: &'static str,
     header_bytes: usize,
     note_bytes: usize,
     prefix_buffer: Vec<u8>,
@@ -121,10 +126,48 @@ pub(super) struct BoundedGateLog {
 }
 
 impl BoundedGateLog {
-    pub(super) fn create(path: &Path) -> io::Result<Self> {
+    pub(crate) fn create(path: &Path) -> io::Result<Self> {
+        Self::create_with_cap(path, MAX_LOG_BYTES, "gate")
+    }
+
+    pub(crate) fn create_with_cap(
+        path: &Path,
+        max_log_bytes: u64,
+        output_kind: &'static str,
+    ) -> io::Result<Self> {
+        Self::from_file(File::create(path)?, max_log_bytes, output_kind)
+    }
+
+    pub(crate) fn from_file(
+        mut file: File,
+        max_log_bytes: u64,
+        output_kind: &'static str,
+    ) -> io::Result<Self> {
+        let max_log_bytes = usize::try_from(max_log_bytes)
+            .map_err(|_| io::Error::other("bounded log cap does not fit this platform"))?;
+        let reserved_bytes = MAX_HEADER_BYTES
+            .saturating_add(MAX_NOTE_BYTES)
+            .saturating_add(MAX_TAIL_BYTES)
+            .saturating_add(FOOTER_RESERVE_BYTES)
+            .saturating_add(FINAL_NOTE_RESERVE_BYTES);
+        if max_log_bytes < reserved_bytes {
+            return Err(io::Error::other(
+                "bounded log cap is smaller than its fixed header, note, tail, and footer reserves",
+            ));
+        }
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != 0 || file.stream_position()? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded capture requires an empty regular file positioned at its beginning",
+            ));
+        }
         Ok(Self {
-            file: File::create(path)?,
+            file,
             file_bytes: 0,
+            max_log_bytes,
+            prefix_budget_bytes: max_log_bytes - reserved_bytes,
+            output_kind,
             header_bytes: 0,
             note_bytes: 0,
             prefix_buffer: Vec::with_capacity(WRITE_BUFFER_BYTES),
@@ -137,11 +180,11 @@ impl BoundedGateLog {
         })
     }
 
-    pub(super) fn header_remaining(&self) -> usize {
+    pub(crate) fn header_remaining(&self) -> usize {
         MAX_HEADER_BYTES.saturating_sub(self.header_bytes)
     }
 
-    pub(super) fn write_header(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_header(&mut self, bytes: &[u8]) -> io::Result<()> {
         const TRUNCATED: &[u8] = b"aethyme: gate log header truncated at 64 KiB\n";
         let remaining = MAX_HEADER_BYTES.saturating_sub(self.header_bytes);
         let truncated = bytes.len() > remaining;
@@ -161,7 +204,7 @@ impl BoundedGateLog {
     }
 
     /// Append a bounded broker diagnostic while the child may still be alive.
-    pub(super) fn write_note(&mut self, bytes: &[u8]) {
+    pub(crate) fn write_note(&mut self, bytes: &[u8]) {
         self.flush_prefix_buffer();
         if self.write_error.is_some() || self.note_bytes >= MAX_NOTE_BYTES {
             return;
@@ -177,7 +220,9 @@ impl BoundedGateLog {
         self.matcher.feed(bytes);
         let mut overflow = bytes;
         if self.write_error.is_none() {
-            let output_room = PREFIX_BUDGET_BYTES.saturating_sub(self.output_prefix_bytes);
+            let output_room = self
+                .prefix_budget_bytes
+                .saturating_sub(self.output_prefix_bytes);
             let keep = bytes.len().min(output_room);
             if keep > 0 {
                 self.prefix_buffer.extend_from_slice(&bytes[..keep]);
@@ -219,7 +264,7 @@ impl BoundedGateLog {
         if bytes.is_empty() || self.write_error.is_some() {
             return;
         }
-        let room = (MAX_LOG_BYTES as usize).saturating_sub(self.file_bytes);
+        let room = self.max_log_bytes.saturating_sub(self.file_bytes);
         let keep = bytes.len().min(room);
         if keep == 0 {
             return;
@@ -231,7 +276,7 @@ impl BoundedGateLog {
     }
 
     fn write_file_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if bytes.len() > MAX_LOG_BYTES as usize - self.file_bytes {
+        if bytes.len() > self.max_log_bytes.saturating_sub(self.file_bytes) {
             return Err(io::Error::other("bounded gate log header exceeds file cap"));
         }
         self.file.write_all(bytes)?;
@@ -239,7 +284,7 @@ impl BoundedGateLog {
         Ok(())
     }
 
-    pub(super) fn finish(&mut self) -> CaptureSummary {
+    pub(crate) fn finish(&mut self) -> CaptureSummary {
         if self.finished {
             return CaptureSummary {
                 output_bytes: self.output_bytes,
@@ -256,12 +301,14 @@ impl BoundedGateLog {
                 .saturating_sub(self.output_prefix_bytes as u64)
                 .saturating_sub(tail_bytes as u64);
             let mut footer = format!(
-                "\naethyme: gate output capture truncated; observed {} bytes; retained {} prefix and {} tail bytes; omitted {} middle bytes\n",
-                self.output_bytes, self.output_prefix_bytes, tail_bytes, omitted
+                "\naethyme: {} output capture truncated; observed {} bytes; retained {} prefix and {} tail bytes; omitted {} middle bytes\n",
+                self.output_kind, self.output_bytes, self.output_prefix_bytes, tail_bytes, omitted
             );
             let matched = self.matcher.matched_patterns();
             if !matched.is_empty() {
-                footer.push_str("aethyme: classifier evidence observed in complete gate stream: ");
+                footer.push_str("aethyme: classifier evidence observed in complete ");
+                footer.push_str(self.output_kind);
+                footer.push_str(" stream: ");
                 footer.push_str(&matched.join("; "));
                 footer.push('\n');
             }
@@ -285,7 +332,7 @@ impl BoundedGateLog {
         }
     }
 
-    pub(super) fn append_note_after_finish(&mut self, bytes: &[u8]) {
+    pub(crate) fn append_note_after_finish(&mut self, bytes: &[u8]) {
         if !self.finished {
             self.write_note(bytes);
             return;
@@ -294,8 +341,16 @@ impl BoundedGateLog {
         self.try_write_file_bytes(&bytes[..reserve]);
     }
 
-    pub(super) fn write_error(&self) -> Option<&str> {
+    pub(crate) fn write_error(&self) -> Option<&str> {
         self.write_error.as_deref()
+    }
+
+    pub(crate) fn sync_data(&mut self) -> io::Result<()> {
+        self.flush_prefix_buffer();
+        if let Some(error) = &self.write_error {
+            return Err(io::Error::other(error.clone()));
+        }
+        self.file.sync_data()
     }
 }
 
@@ -341,7 +396,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[cfg(unix)]
-pub(super) fn set_nonblocking<R: AsRawFd>(reader: &R) -> io::Result<()> {
+pub(crate) fn set_nonblocking<R: AsRawFd>(reader: &R) -> io::Result<()> {
     let fd = reader.as_raw_fd();
     // SAFETY: fcntl reads and updates flags on this live pipe descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -357,12 +412,12 @@ pub(super) fn set_nonblocking<R: AsRawFd>(reader: &R) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(super) fn set_nonblocking<R>(_reader: &R) -> io::Result<()> {
+pub(crate) fn set_nonblocking<R>(_reader: &R) -> io::Result<()> {
     Err(unsupported_pipe_capture())
 }
 
 #[cfg(unix)]
-pub(super) fn drain_pipe<R: Read + AsRawFd + Send + 'static>(
+pub(crate) fn drain_pipe<R: Read + AsRawFd + Send + 'static>(
     mut reader: R,
     collector: Arc<Mutex<BoundedGateLog>>,
     stop: Arc<AtomicBool>,
@@ -427,7 +482,7 @@ pub(super) fn drain_pipe<R: Read + AsRawFd + Send + 'static>(
 }
 
 #[cfg(not(unix))]
-pub(super) fn drain_pipe<R: Read + Send + 'static>(
+pub(crate) fn drain_pipe<R: Read + Send + 'static>(
     _reader: R,
     _collector: Arc<Mutex<BoundedGateLog>>,
     _stop: Arc<AtomicBool>,
@@ -461,6 +516,50 @@ fn record_drain_error(failed: &AtomicBool, slot: &Mutex<Option<String>>, error: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_capture_caps_header_output_and_footer_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent.log");
+        let file = File::create(&path).unwrap();
+        let mut log = BoundedGateLog::from_file(file, AGENT_LOG_MAX_BYTES, "agent").unwrap();
+        log.write_header(b"aethyme: agent output capture INCOMPLETE until finalized\n")
+            .unwrap();
+        log.sync_data().unwrap();
+        assert!(
+            std::fs::read(&path)
+                .unwrap()
+                .starts_with(b"aethyme: agent output capture INCOMPLETE")
+        );
+        let block = [b'x'; 64 * 1024];
+        for _ in 0..300 {
+            log.record_output(&block);
+        }
+        log.record_output(b"final agent tail");
+        let summary = log.finish();
+        log.sync_data().unwrap();
+        assert_eq!(summary.output_bytes, 300 * 64 * 1024 + 16);
+        assert!(!summary.incomplete);
+        let saved = std::fs::read(&path).unwrap();
+        assert!(saved.len() <= 16 * 1024 * 1024);
+        assert!(saved.windows(16).any(|bytes| bytes == b"final agent tail"));
+        let text = String::from_utf8_lossy(&saved);
+        assert!(text.contains("agent output capture truncated"));
+    }
+
+    #[test]
+    fn inherited_capture_refuses_existing_bytes_or_a_nonzero_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("existing.log");
+        std::fs::write(&path, b"preserve").unwrap();
+        let file = File::options().write(true).open(&path).unwrap();
+        assert!(BoundedGateLog::from_file(file, AGENT_LOG_MAX_BYTES, "agent").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+        let mut file = File::create(&path).unwrap();
+        file.seek(io::SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        assert!(BoundedGateLog::from_file(file, AGENT_LOG_MAX_BYTES, "agent").is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
 
     #[test]
     fn retains_bounded_prefix_tail_and_classifier_evidence() {
