@@ -121,22 +121,42 @@ impl PinnedTreeRemoval {
     /// rewrite the witness after validation.
     pub(crate) fn remove_verified_witness<F>(
         self,
+        witness_name: &str,
+        deadline: Option<Instant>,
+        validate: F,
+    ) -> io::Result<TreeRemoval>
+    where
+        F: FnOnce(&[u8]) -> io::Result<()>,
+    {
+        self.remove_verified_witness_with_progress(witness_name, deadline, validate)
+            .map(|(outcome, _entries_reclaimed)| outcome)
+            .map_err(|error| error.source)
+    }
+
+    /// Validate the witness and preserve successful unlink counts on every
+    /// outcome, including interruption and later failure. A refused witness
+    /// reports zero progress because validation precedes every mutation.
+    pub(crate) fn remove_verified_witness_with_progress<F>(
+        self,
         _witness_name: &str,
         _deadline: Option<Instant>,
         _validate: F,
-    ) -> io::Result<TreeRemoval>
+    ) -> Result<(TreeRemoval, usize), TreeRemovalError>
     where
         F: FnOnce(&[u8]) -> io::Result<()>,
     {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             self.0
-                .remove_verified_witness(_witness_name, _deadline, _validate)
+                .remove_verified_witness_with_progress(_witness_name, _deadline, _validate)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _self = self;
-            Err(unsupported_platform())
+            Err(TreeRemovalError {
+                source: unsupported_platform(),
+                entries_reclaimed: 0,
+            })
         }
     }
 }
@@ -315,12 +335,12 @@ mod unix {
             )
         }
 
-        pub(super) fn remove_verified_witness<F>(
+        pub(super) fn remove_verified_witness_with_progress<F>(
             self,
             witness_name: &str,
             deadline: Option<Instant>,
             validate: F,
-        ) -> io::Result<TreeRemoval>
+        ) -> Result<(TreeRemoval, usize), super::TreeRemovalError>
         where
             F: FnOnce(&[u8]) -> io::Result<()>,
         {
@@ -331,8 +351,6 @@ mod unix {
                 &mut || Ok(()),
                 validate,
             )
-            .map(|(outcome, _entries_reclaimed)| outcome)
-            .map_err(|error| error.source)
         }
 
         #[cfg(test)]
@@ -1313,6 +1331,65 @@ mod unix {
                 b"preserve after marker edit"
             );
             assert_eq!(fs::read(witness).unwrap(), b"forged owner marker!");
+        }
+
+        #[test]
+        fn verified_witness_removal_reports_interruption_and_resume_progress() {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("witness"), b"recorded owner").unwrap();
+            fs::write(root.join("payload"), b"remove once").unwrap();
+
+            let (outcome, entries_reclaimed) = PublicPinnedTreeRemoval::open(&root)
+                .unwrap()
+                .remove_verified_witness_with_progress("witness", Some(Instant::now()), |bytes| {
+                    assert_eq!(bytes, b"recorded owner");
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(outcome, TreeRemoval::Interrupted);
+            assert_eq!(entries_reclaimed, 1);
+            assert!(!root.join("payload").exists());
+            assert_eq!(fs::read(root.join("witness")).unwrap(), b"recorded owner");
+
+            let (outcome, entries_reclaimed) = PublicPinnedTreeRemoval::open(&root)
+                .unwrap()
+                .remove_verified_witness_with_progress("witness", None, |bytes| {
+                    assert_eq!(bytes, b"recorded owner");
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(outcome, TreeRemoval::Complete);
+            // Only the retained witness and root remain after the first pass.
+            assert_eq!(entries_reclaimed, 2);
+            assert!(!root.exists());
+        }
+
+        #[test]
+        fn refused_verified_witness_reports_zero_progress_and_preserves_payload() {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("witness"), b"different owner").unwrap();
+            fs::write(root.join("payload"), b"preserve").unwrap();
+
+            let error = PublicPinnedTreeRemoval::open(&root)
+                .unwrap()
+                .remove_verified_witness_with_progress("witness", None, |_bytes| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "owner mismatch",
+                    ))
+                })
+                .unwrap_err();
+
+            assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.entries_reclaimed, 0);
+            assert_eq!(fs::read(root.join("witness")).unwrap(), b"different owner");
+            assert_eq!(fs::read(root.join("payload")).unwrap(), b"preserve");
         }
 
         #[test]
