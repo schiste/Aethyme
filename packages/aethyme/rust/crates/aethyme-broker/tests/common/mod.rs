@@ -228,3 +228,16 @@ pub fn open_fixture_repository_broker(
 ) -> Result<FixtureBroker, BrokerOpError> {
     open_fixture_broker(fixture.path(), fixture.owner_path())
 }
+
+/// Open a repository whose owner is its immediate parent directory. The
+/// caller must retain that owner for the lifetime of this broker and any
+/// reopened handles.
+#[allow(dead_code)]
+pub fn open_fixture_repository_path_broker(
+    repository: &Path,
+) -> Result<FixtureBroker, BrokerOpError> {
+    let owner = repository
+        .parent()
+        .expect("fixture repository has an owning parent directory");
+    open_fixture_broker(repository, owner)
+}
