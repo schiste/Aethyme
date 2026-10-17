@@ -427,8 +427,41 @@ pub(crate) fn recover_with_journal(
     if Instant::now() >= deadline {
         return Err(recovery_error(progress, deadline_error()));
     }
-    let root_identity = DirectoryIdentity::capture(cache_root)
-        .map_err(|source| recovery_error(progress, source))?;
+    let root_identity = match DirectoryIdentity::capture(cache_root) {
+        Ok(identity) => identity,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            let root_is_absent = match cache_root_absent_under_observed_parent(cache_root, deadline)
+            {
+                Ok(absent) => absent,
+                Err(source) => return Err(recovery_error(progress, source)),
+            };
+            if !root_is_absent {
+                return Err(recovery_error(
+                    progress,
+                    invalid_record("cache root changed while verifying its absence"),
+                ));
+            }
+            match super::rotation_journal::probe(resource_db, cache_root, None) {
+                Ok(None) | Ok(Some(super::rotation_journal::JournalProbe::NoDebt)) => {
+                    return Ok(RecoveryProgress {
+                        complete: true,
+                        ..RecoveryProgress::default()
+                    });
+                }
+                Ok(Some(super::rotation_journal::JournalProbe::Pending))
+                | Ok(Some(super::rotation_journal::JournalProbe::Unknown)) => {
+                    return Err(recovery_error(
+                        progress,
+                        invalid_record(
+                            "cache root is absent while durable rotation debt is pending",
+                        ),
+                    ));
+                }
+                Err(source) => return Err(recovery_error(progress, source)),
+            }
+        }
+        Err(source) => return Err(recovery_error(progress, source)),
+    };
     let root_identity_bytes = root_identity
         .encode()
         .map_err(|source| recovery_error(progress, source))?;

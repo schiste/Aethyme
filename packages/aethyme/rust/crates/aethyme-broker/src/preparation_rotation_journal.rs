@@ -1177,6 +1177,75 @@ mod tests {
     }
 
     #[test]
+    fn first_recovery_with_an_absent_cache_root_is_a_noop_without_creating_state() {
+        let fixture = Fixture::new();
+        std::fs::remove_dir(&fixture.cache_root).unwrap();
+
+        let result = crate::preparation::shared_cache_budget_at_with_resource_db(
+            None,
+            &fixture.cache_root,
+            &fixture.resource_db,
+            REPOSITORY_A,
+            "test-digest",
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(!fixture.cache_root.exists());
+        assert!(!path_for_resource_db(&fixture.resource_db).unwrap().exists());
+    }
+
+    #[test]
+    fn missing_cache_root_with_a_published_debt_remains_unknown_and_untouched() {
+        let fixture = Fixture::new();
+        let store = fixture.cache_root.join(REPOSITORY_A);
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("payload"), b"must remain pending").unwrap();
+        let root_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&fixture.cache_root)
+                .unwrap();
+        let debt = crate::preparation::rotation_debt::RotationDebt::new(
+            REPOSITORY_A,
+            &crate::preparation::rotation_debt::new_transaction_id(),
+            root_identity.clone(),
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        let payload = crate::preparation::rotation_debt::encode(&debt).unwrap();
+        publish(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            &root_identity.encode().unwrap(),
+            REPOSITORY_A,
+            &payload,
+        )
+        .unwrap();
+        let moved_root = fixture
+            ._directory
+            .path()
+            .join("cache-root-with-pending-debt");
+        std::fs::rename(&fixture.cache_root, &moved_root).unwrap();
+
+        let result = crate::preparation::rotation_debt::recover_with_journal(
+            &fixture.cache_root,
+            &fixture.resource_db,
+            REPOSITORY_A,
+            std::time::Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(result.is_err());
+        assert!(!fixture.cache_root.exists());
+        assert_eq!(
+            std::fs::read(moved_root.join(REPOSITORY_A).join("payload")).unwrap(),
+            b"must remain pending"
+        );
+        assert_eq!(
+            probe(&fixture.resource_db, &fixture.cache_root, None).unwrap(),
+            Some(JournalProbe::Unknown)
+        );
+    }
+
+    #[test]
     fn publish_is_atomic_idempotent_and_discoverable_after_reopen() {
         let fixture = Fixture::new();
         fixture.publish(REPOSITORY_A, b"debt-a");
@@ -1223,9 +1292,9 @@ mod tests {
             first
                 .entries
                 .iter()
-                .map(|entry| entry.repository.as_str())
+                .map(|entry| entry.repository.as_deref())
                 .collect::<Vec<_>>(),
-            vec![REPOSITORY_A, REPOSITORY_B]
+            vec![Some(REPOSITORY_A), Some(REPOSITORY_B)]
         );
         mark_lap_incomplete(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
         let second =
@@ -1294,7 +1363,10 @@ mod tests {
         let retry =
             next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 1)
                 .unwrap();
-        assert_eq!(retry.entries[0].repository, Some(low_key));
+        assert_eq!(
+            retry.entries[0].repository.as_deref(),
+            Some(low_key.as_str())
+        );
         complete(
             &fixture.resource_db,
             &fixture.cache_root,

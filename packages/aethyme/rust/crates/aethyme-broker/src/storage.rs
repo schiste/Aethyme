@@ -1345,7 +1345,7 @@ impl PreparationRotationJournalLap {
             Err(error) => {
                 crate::warn_unrecorded(
                     "acknowledge completed preparation rotation journal lap",
-                    Err(error),
+                    Err::<(), _>(error),
                 );
                 self.keep_incomplete();
                 self.finished = true;
