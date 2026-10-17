@@ -66,6 +66,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   switching between linked worktrees and advancing a branch. Verify freshness
   from Cargo output; correct embedded identity alone does not rule out forced
   recompilation on every invocation. Use a dependency-free fixture first.
+  Keep the oracle from changing watched inputs: `git describe --dirty` can
+  refresh the index even with optional locks disabled. Compare source metadata
+  before and after, or give the oracle a fixture-owned copy of its Git index.
 - Run the fastest relevant test command first.
   Check the selected test names and a nonzero executed count before treating a
   focused run as evidence. Rust module aliases can differ from filenames; a
