@@ -1,5 +1,6 @@
 use super::*;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 const BROKER_OPEN_HOST_OPERATION_DB_ENV: &str = "AETHYME_BROKER_OPEN_HOST_OPERATION_DB";
 const BROKER_OPEN_HOST_STATE_EXPLICIT_ENV: &str = "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT";
@@ -7,9 +8,12 @@ const BROKER_OPEN_WORKTREE_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_WORKTREE_ROOT";
 const BROKER_OPEN_COLLABORATION_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_COLLABORATION_ROOT";
 // Keep the private transport key stable; the payload version rejects old children explicitly.
 const BROKER_OPEN_STORAGE_CONTEXT_ENV: &str = "AETHYME_BROKER_STORAGE_CONTEXT_V1";
-const BROKER_OPEN_STORAGE_CONTEXT_VERSION: u32 = 2;
+const PREPARATION_CACHE_ROOT_ENV: &str = "AETHYME_PREPARATION_CACHE_ROOT";
+const BROKER_OPEN_STORAGE_CONTEXT_LEGACY_VERSION: u32 = 2;
+const BROKER_OPEN_STORAGE_CONTEXT_V4_VERSION: u32 = 4;
 const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
-const ARTIFACT_SWEEP_NAMESPACE_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v2\0";
+const ARTIFACT_SWEEP_NAMESPACE_V2_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v2\0";
+const ARTIFACT_SWEEP_NAMESPACE_V4_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v4\0";
 
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
@@ -45,6 +49,13 @@ struct CapturedBrokerStorageContextV2 {
 impl CapturedBrokerStorageContextV2 {
     fn from_context(context: &BrokerStorageContext) -> Result<Self, String> {
         context.ensure_absolute_paths()?;
+        if context.preparation_cache_root_override.is_some()
+            || context.preparation_cache_root_identity.is_some()
+            || context.preparation_cache_root_state.is_some()
+            || context.preparation_cache_root_handle.is_some()
+        {
+            return Err("the legacy V2 context cannot encode a preparation-cache override".into());
+        }
         let repository_root = context
             .repository_root
             .clone()
@@ -54,7 +65,7 @@ impl CapturedBrokerStorageContextV2 {
             .clone()
             .ok_or_else(|| "child context has no Git common-directory binding".to_string())?;
         Ok(Self {
-            version: BROKER_OPEN_STORAGE_CONTEXT_VERSION,
+            version: BROKER_OPEN_STORAGE_CONTEXT_LEGACY_VERSION,
             repository_root,
             git_common_dir,
             host_state_dir: context.host_state_dir.clone(),
@@ -69,10 +80,10 @@ impl CapturedBrokerStorageContextV2 {
     }
 
     fn into_context(self) -> Result<BrokerStorageContext, String> {
-        if self.version != BROKER_OPEN_STORAGE_CONTEXT_VERSION {
+        if self.version != BROKER_OPEN_STORAGE_CONTEXT_LEGACY_VERSION {
             return Err(format!(
                 "unsupported child-context version {}; expected {}",
-                self.version, BROKER_OPEN_STORAGE_CONTEXT_VERSION
+                self.version, BROKER_OPEN_STORAGE_CONTEXT_LEGACY_VERSION
             ));
         }
         let context = BrokerStorageContext {
@@ -85,6 +96,10 @@ impl CapturedBrokerStorageContextV2 {
             worktree_root_override: self.worktree_root_override,
             worktree_root_environment_override: self.worktree_root_environment_override,
             collaboration_state_dir: self.collaboration_state_dir,
+            preparation_cache_root_override: None,
+            preparation_cache_root_identity: None,
+            preparation_cache_root_state: None,
+            preparation_cache_root_handle: None,
             host_state_dir_is_explicit: self.host_state_dir_is_explicit,
             capture_error: None,
         };
@@ -125,15 +140,217 @@ impl CapturedBrokerStorageContextV2 {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedBrokerStorageContextV4 {
+    version: u32,
+    repository_root: PathBuf,
+    git_common_dir: PathBuf,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_state_dir: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_resource_db_path: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_cache_dir: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_operation_db_path: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    worktree_root_override: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    worktree_root_environment_override: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    collaboration_state_dir: Option<PathBuf>,
+    preparation_cache_root: PathBuf,
+    preparation_cache_root_identity: Vec<u8>,
+    preparation_cache_nonce: String,
+    preparation_cache_namespace_identity: Vec<u8>,
+    preparation_cache_coordinator_db_path: PathBuf,
+    host_state_dir_is_explicit: bool,
+}
+
+impl CapturedBrokerStorageContextV4 {
+    fn from_context(context: &BrokerStorageContext) -> Result<Self, String> {
+        context
+            .ensure_absolute_paths()
+            .map_err(|error| error.to_string())?;
+        context
+            .validate_preparation_cache_root_override()
+            .map_err(|error| error.to_string())?;
+        let repository_root = context
+            .repository_root
+            .clone()
+            .ok_or_else(|| "child context has no repository root binding".to_string())?;
+        let git_common_dir = context
+            .git_common_dir
+            .clone()
+            .ok_or_else(|| "child context has no Git common-directory binding".to_string())?;
+        let root = context
+            .preparation_cache_root_override
+            .clone()
+            .ok_or_else(|| "V4 child context has no preparation-cache override".to_string())?;
+        let root_identity = context
+            .preparation_cache_root_identity
+            .clone()
+            .ok_or_else(|| "V4 child context has no captured root identity".to_string())?;
+        let cache_identity = match context.preparation_cache_root_state.as_ref() {
+            Some(crate::broker::PreparationCacheRootState::Marked {
+                coordinator_db_path,
+                nonce,
+                cache_root_identity: Some(identity),
+            }) => {
+                let captured_resource_db =
+                    context.host_resource_db_path.as_deref().ok_or_else(|| {
+                        "V4 child context has no captured host-resource database".to_string()
+                    })?;
+                let canonical = canonical_coordinator_db_path(captured_resource_db)?;
+                if &canonical != coordinator_db_path {
+                    return Err("V4 child context host-resource database differs from the preparation-cache root binding".into());
+                }
+                (nonce.clone(), identity.clone(), coordinator_db_path.clone())
+            }
+            _ => {
+                return Err(
+                    "an uninitialized or incomplete preparation-cache root cannot be sent to a child"
+                        .into(),
+                );
+            }
+        };
+        if context.preparation_cache_root_handle.is_none() {
+            return Err("V4 child context has no retained preparation-cache root handle".into());
+        }
+        Ok(Self {
+            version: BROKER_OPEN_STORAGE_CONTEXT_V4_VERSION,
+            repository_root,
+            git_common_dir,
+            host_state_dir: context.host_state_dir.clone(),
+            host_resource_db_path: context.host_resource_db_path.clone(),
+            host_cache_dir: context.host_cache_dir.clone(),
+            host_operation_db_path: context.host_operation_db_path.clone(),
+            worktree_root_override: context.worktree_root_override.clone(),
+            worktree_root_environment_override: context.worktree_root_environment_override.clone(),
+            collaboration_state_dir: context.collaboration_state_dir.clone(),
+            preparation_cache_root: root,
+            preparation_cache_root_identity: root_identity,
+            preparation_cache_nonce: cache_identity.0,
+            preparation_cache_namespace_identity: cache_identity.1,
+            preparation_cache_coordinator_db_path: cache_identity.2,
+            host_state_dir_is_explicit: context.host_state_dir_is_explicit,
+        })
+    }
+
+    fn into_context(self) -> Result<BrokerStorageContext, String> {
+        if self.version != BROKER_OPEN_STORAGE_CONTEXT_V4_VERSION {
+            return Err(format!(
+                "unsupported child-context version {}; expected {}",
+                self.version, BROKER_OPEN_STORAGE_CONTEXT_V4_VERSION
+            ));
+        }
+        let (canonical, root_identity, state, directory) =
+            capture_preparation_cache_root(&self.preparation_cache_root)?;
+        if canonical != self.preparation_cache_root
+            || root_identity != self.preparation_cache_root_identity
+        {
+            return Err("V4 child context preparation-cache root identity changed".into());
+        }
+        match &state {
+            crate::broker::PreparationCacheRootState::Marked {
+                coordinator_db_path,
+                nonce,
+                cache_root_identity: Some(identity),
+            } if nonce == &self.preparation_cache_nonce
+                && identity == &self.preparation_cache_namespace_identity
+                && coordinator_db_path == &self.preparation_cache_coordinator_db_path => {}
+            _ => {
+                return Err(
+                    "V4 child context marker or nonce namespace is missing or changed".into(),
+                );
+            }
+        }
+        let context = BrokerStorageContext {
+            repository_root: Some(self.repository_root),
+            git_common_dir: Some(self.git_common_dir),
+            host_state_dir: self.host_state_dir,
+            host_resource_db_path: self.host_resource_db_path,
+            host_cache_dir: self.host_cache_dir,
+            host_operation_db_path: self.host_operation_db_path,
+            worktree_root_override: self.worktree_root_override,
+            worktree_root_environment_override: self.worktree_root_environment_override,
+            collaboration_state_dir: self.collaboration_state_dir,
+            preparation_cache_root_override: Some(canonical),
+            preparation_cache_root_identity: Some(root_identity),
+            preparation_cache_root_state: Some(state),
+            preparation_cache_root_handle: Some(directory),
+            host_state_dir_is_explicit: self.host_state_dir_is_explicit,
+            capture_error: None,
+        };
+        context.ensure_absolute_paths()?;
+        if context.worktree_root_override.is_some()
+            && context.worktree_root_environment_override.is_some()
+        {
+            return Err("child context contains both exact and environment worktree roots".into());
+        }
+        let expected_resource_db = context
+            .host_state_dir
+            .as_deref()
+            .map(|directory| directory.join("host-resources.db"));
+        if context.host_resource_db_path != expected_resource_db {
+            return Err(
+                "child context host resource database does not match its state root".into(),
+            );
+        }
+        let captured_resource_db = context
+            .host_resource_db_path
+            .as_deref()
+            .ok_or_else(|| "V4 child context has no captured host-resource database".to_string())?;
+        if canonical_coordinator_db_path(captured_resource_db)?
+            != self.preparation_cache_coordinator_db_path
+        {
+            return Err(
+                "V4 child context host-resource database binding does not match its captured path"
+                    .into(),
+            );
+        }
+        context
+            .validate_preparation_cache_root_override()
+            .map_err(|error| error.to_string())?;
+        Ok(context)
+    }
+
+    fn encode(context: &BrokerStorageContext) -> Result<String, BrokerOpError> {
+        let payload =
+            Self::from_context(context).map_err(|reason| BrokerOpError::InvalidStorageContext {
+                reason: reason.into_boxed_str(),
+            })?;
+        let encoded = serde_json::to_string(&payload).map_err(|error| {
+            BrokerOpError::InvalidStorageContext {
+                reason: format!("cannot encode child context: {error}").into_boxed_str(),
+            }
+        })?;
+        if encoded.len() > BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "child context exceeds its size bound".into(),
+            });
+        }
+        Ok(encoded)
+    }
+}
+
 impl BrokerStorageContext {
     /// Stable identifier for maintenance state owned by this exact captured
-    /// storage context. The encoded payload is the same bounded V2 contract
-    /// sent to detached children, including all effective path overrides.
+    /// storage context. The legacy context remains byte-for-byte stable when
+    /// the separate preparation-cache root is unset.
     pub(crate) fn artifact_sweep_namespace(&self) -> Result<String, BrokerOpError> {
         self.ensure_valid()?;
+        if self.preparation_cache_root_override.is_some() {
+            let encoded = CapturedBrokerStorageContextV4::encode(self)?;
+            let mut digest = Sha256::new();
+            digest.update(ARTIFACT_SWEEP_NAMESPACE_V4_DOMAIN);
+            digest.update(encoded.as_bytes());
+            return Ok(format!("{:x}", digest.finalize()));
+        }
         let encoded = CapturedBrokerStorageContextV2::encode(self)?;
         let mut digest = Sha256::new();
-        digest.update(ARTIFACT_SWEEP_NAMESPACE_DOMAIN);
+        digest.update(ARTIFACT_SWEEP_NAMESPACE_V2_DOMAIN);
         digest.update(encoded.as_bytes());
         Ok(format!("{:x}", digest.finalize()))
     }
@@ -145,6 +362,7 @@ impl BrokerStorageContext {
                 || options.host_operation_db_path.is_some()
                 || options.worktree_root.is_some()
                 || options.collaboration_state_dir.is_some()
+                || options.preparation_cache_root.is_some()
             {
                 return Self::invalid(
                     "an explicit BrokerOpenOptions value cannot be combined with a child context",
@@ -156,13 +374,31 @@ impl BrokerStorageContext {
             if encoded.len() > BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES {
                 return Self::invalid("child context exceeds its size bound");
             }
-            let decoded = match serde_json::from_str::<CapturedBrokerStorageContextV2>(encoded) {
-                Ok(decoded) => decoded,
+            let payload = match serde_json::from_str::<serde_json::Value>(encoded) {
+                Ok(payload) => payload,
                 Err(error) => {
                     return Self::invalid(format!("child context is malformed: {error}"));
                 }
             };
-            return decoded.into_context().unwrap_or_else(Self::invalid);
+            let version = match payload.get("version").and_then(serde_json::Value::as_u64) {
+                Some(version) => version,
+                None => return Self::invalid("child context has no supported version"),
+            };
+            return match version {
+                value if value == u64::from(BROKER_OPEN_STORAGE_CONTEXT_LEGACY_VERSION) => {
+                    match serde_json::from_str::<CapturedBrokerStorageContextV2>(encoded) {
+                        Ok(decoded) => decoded.into_context().unwrap_or_else(Self::invalid),
+                        Err(error) => Self::invalid(format!("child context is malformed: {error}")),
+                    }
+                }
+                value if value == u64::from(BROKER_OPEN_STORAGE_CONTEXT_V4_VERSION) => {
+                    match serde_json::from_str::<CapturedBrokerStorageContextV4>(encoded) {
+                        Ok(decoded) => decoded.into_context().unwrap_or_else(Self::invalid),
+                        Err(error) => Self::invalid(format!("child context is malformed: {error}")),
+                    }
+                }
+                _ => Self::invalid(format!("unsupported child-context version {version}")),
+            };
         }
 
         let explicit_host_state_dir = options.host_state_dir.is_some();
@@ -175,6 +411,26 @@ impl BrokerStorageContext {
                 Some("false") => false,
                 _ => crate::host_state::host_state_dir_is_explicit(),
             };
+        let preparation_cache_root_override = options
+            .preparation_cache_root
+            .or_else(|| environment_path(PREPARATION_CACHE_ROOT_ENV));
+        let (
+            preparation_cache_root_override,
+            preparation_cache_root_identity,
+            preparation_cache_root_state,
+            preparation_cache_root_handle,
+        ) = match preparation_cache_root_override {
+            Some(path) => match capture_preparation_cache_root(&path) {
+                Ok((canonical, identity, state, directory)) => (
+                    Some(canonical),
+                    Some(identity),
+                    Some(state),
+                    Some(directory),
+                ),
+                Err(reason) => return Self::invalid(reason),
+            },
+            None => (None, None, None, None),
+        };
         let host_state_dir = options
             .host_state_dir
             .or_else(crate::host_state::default_host_state_dir);
@@ -213,11 +469,18 @@ impl BrokerStorageContext {
             worktree_root_override,
             worktree_root_environment_override,
             collaboration_state_dir,
+            preparation_cache_root_override,
+            preparation_cache_root_identity,
+            preparation_cache_root_state,
+            preparation_cache_root_handle,
             capture_error: None,
             ..Self::default()
         };
         if let Err(reason) = context.anchor_relative_paths() {
             return Self::invalid(reason);
+        }
+        if let Err(error) = context.validate_preparation_cache_root_override() {
+            return Self::invalid(error.to_string());
         }
         context
     }
@@ -319,6 +582,10 @@ impl BrokerStorageContext {
             (
                 "collaboration state directory",
                 self.collaboration_state_dir.as_deref(),
+            ),
+            (
+                "preparation-cache root override",
+                self.preparation_cache_root_override.as_deref(),
             ),
         ] {
             if let Some(path) = path
@@ -501,11 +768,267 @@ impl BrokerStorageContext {
         }
     }
 
-    pub(crate) fn preparation_cache_root(&self) -> Option<PathBuf> {
-        self.host_resource_db_path
+    fn initialize_preparation_cache_root(&mut self, repo: &GitRepo) -> Result<(), BrokerOpError> {
+        let Some(root) = self.preparation_cache_root_override.clone() else {
+            return Ok(());
+        };
+        self.validate_preparation_cache_root_override()?;
+        if matches!(
+            self.preparation_cache_root_state.as_ref(),
+            Some(crate::broker::PreparationCacheRootState::Marked {
+                cache_root_identity: Some(_),
+                ..
+            })
+        ) {
+            return self.validate_preparation_cache_root_override();
+        }
+        let root_identity = self
+            .preparation_cache_root_identity
+            .clone()
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "preparation-cache root identity is unavailable".into(),
+            })?;
+        let root_handle = self
+            .preparation_cache_root_handle
+            .as_deref()
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "preparation-cache root handle is unavailable".into(),
+            })?;
+        let resource_db = self
+            .host_resource_db_path
+            .as_deref()
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "captured host-resource database is unavailable for preparation-cache initialization"
+                    .into(),
+            })?;
+        let repository = crate::preparation::repository_identity_for_repo(repo);
+        let request_id = preparation_root_request_id();
+        let fingerprint = hex_digest(root.as_os_str().as_encoded_bytes());
+        let request = crate::HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: request_id.clone(),
+            repository: repository.clone(),
+            worktree_fingerprint: fingerprint,
+            run_id: request_id,
+            ttl_seconds: 30,
+            holder_pid: Some(std::process::id()),
+            resources: vec![crate::HostResourceRequirement {
+                key: "preparation_cache".into(),
+                resource: crate::HostResourceKind::ExclusiveKey {
+                    name: crate::preparation::preparation_cache_lease_name(&repository),
+                },
+            }],
+        };
+        let mut coordinator = crate::HostResourceCoordinator::open(resource_db).map_err(|error| {
+            BrokerOpError::InvalidStorageContext {
+                reason: format!(
+                    "cannot open captured host-resource DB for preparation-cache initialization: {error}"
+                )
+                .into_boxed_str(),
+            }
+        })?;
+        let canonical_resource_db =
+            canonical_coordinator_db_path(resource_db).map_err(|reason| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: reason.into_boxed_str(),
+                }
+            })?;
+        let grant = coordinator
+            .acquire_with_wait(&request, Duration::ZERO, |_| {})
+            .map_err(|error| BrokerOpError::InvalidStorageContext {
+                reason: format!(
+                    "cannot acquire the repository preparation-cache lease for root initialization: {error}"
+                )
+                .into_boxed_str(),
+            })?;
+        let initialize = crate::preparation::rotation_debt::initialize_preparation_cache_root(
+            &root,
+            &root_identity,
+            root_handle,
+            &canonical_resource_db,
+            || preparation_cache_journal_has_rows(resource_db, &root),
+        );
+        let release = coordinator
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .and_then(|released| {
+                if released.lease_id == grant.lease.lease_id
+                    && released.generation == grant.lease.generation
+                    && released.state == crate::HostLeaseState::Released
+                {
+                    Ok(())
+                } else {
+                    Err(crate::HostResourceError::InvalidRequest(
+                        "preparation-cache lease release returned a mismatched or unreleased lease"
+                            .into(),
+                    ))
+                }
+            });
+        let initialized = match (initialize, release) {
+            (Ok(initialized), Ok(())) => initialized,
+            (Err(operation), Ok(())) => {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: format!("cannot initialize preparation-cache root: {operation}")
+                        .into_boxed_str(),
+                });
+            }
+            (Ok(_), Err(release)) => {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: format!(
+                        "preparation-cache root initialization completed but its host-resource lease release is uncertain: {release}"
+                    )
+                    .into_boxed_str(),
+                });
+            }
+            (Err(operation), Err(release)) => {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: format!(
+                        "preparation-cache root initialization failed ({operation}) and its host-resource lease release is uncertain ({release})"
+                    )
+                    .into_boxed_str(),
+                });
+            }
+        };
+        if initialized.root_identity != root_identity {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "preparation-cache root identity changed during initialization".into(),
+            });
+        }
+        self.preparation_cache_root_state =
+            Some(crate::broker::PreparationCacheRootState::Marked {
+                coordinator_db_path: initialized.coordinator_db_path.clone(),
+                nonce: initialized.nonce,
+                cache_root_identity: Some(initialized.cache_root_identity),
+            });
+        self.validate_preparation_cache_root_override()
+    }
+
+    fn validate_preparation_cache_root_override(&self) -> Result<(), BrokerOpError> {
+        match (
+            self.preparation_cache_root_override.as_deref(),
+            self.preparation_cache_root_identity.as_deref(),
+            self.preparation_cache_root_state.as_ref(),
+            self.preparation_cache_root_handle.as_deref(),
+        ) {
+            (None, None, None, None) => Ok(()),
+            (Some(root), Some(identity), Some(state), Some(directory)) => {
+                validate_captured_preparation_cache_root(
+                    root,
+                    identity,
+                    state,
+                    self.host_resource_db_path.as_deref(),
+                    directory,
+                )
+            }
+            _ => Err(BrokerOpError::InvalidStorageContext {
+                reason: "captured preparation-cache root state is incomplete".into(),
+            }),
+        }?;
+        if let Some(crate::broker::PreparationCacheRootState::Marked {
+            coordinator_db_path,
+            ..
+        }) = self.preparation_cache_root_state.as_ref()
+        {
+            let captured_resource_db = self.host_resource_db_path.as_deref().ok_or_else(|| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: "marked preparation-cache root has no captured host-resource database"
+                        .into(),
+                }
+            })?;
+            let canonical =
+                canonical_coordinator_db_path(captured_resource_db).map_err(|reason| {
+                    BrokerOpError::InvalidStorageContext {
+                        reason: reason.into_boxed_str(),
+                    }
+                })?;
+            if &canonical != coordinator_db_path {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: "captured host-resource database differs from the preparation-cache root binding"
+                        .into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preparation_cache_root_binding(
+        &self,
+    ) -> Result<Option<crate::broker::PreparationCacheRootBinding>, BrokerOpError> {
+        self.ensure_valid()?;
+        self.validate_preparation_cache_root_override()?;
+        if let Some(root) = &self.preparation_cache_root_override {
+            let (nonce, identity) = match self.preparation_cache_root_state.as_ref() {
+                Some(crate::broker::PreparationCacheRootState::Marked {
+                    coordinator_db_path: _,
+                    nonce,
+                    cache_root_identity: Some(identity),
+                }) => (nonce.clone(), identity.clone()),
+                Some(crate::broker::PreparationCacheRootState::Uninitialized)
+                | Some(crate::broker::PreparationCacheRootState::Marked {
+                    cache_root_identity: None,
+                    ..
+                }) => {
+                    return Err(BrokerOpError::InvalidStorageContext {
+                        reason: "preparation-cache root has not completed writable initialization"
+                            .into(),
+                    });
+                }
+                None => {
+                    return Err(BrokerOpError::InvalidStorageContext {
+                        reason: "preparation-cache root state is unavailable".into(),
+                    });
+                }
+            };
+            return Ok(Some(crate::broker::PreparationCacheRootBinding {
+                path: preparation_cache_namespace_path(root, &nonce)?,
+                identity: Some(identity),
+                instance_nonce: Some(nonce),
+                root_guard: Some(crate::broker::PreparationCacheRootGuard {
+                    root_path: root.clone(),
+                    root_identity: self.preparation_cache_root_identity.clone().ok_or_else(
+                        || BrokerOpError::InvalidStorageContext {
+                            reason: "captured preparation-cache root identity is unavailable"
+                                .into(),
+                        },
+                    )?,
+                    state: self.preparation_cache_root_state.clone().ok_or_else(|| {
+                        BrokerOpError::InvalidStorageContext {
+                            reason: "captured preparation-cache root state is unavailable".into(),
+                        }
+                    })?,
+                    captured_resource_db_path: self.host_resource_db_path.clone().ok_or_else(
+                        || BrokerOpError::InvalidStorageContext {
+                            reason: "captured host-resource database is unavailable".into(),
+                        },
+                    )?,
+                    root_handle: self.preparation_cache_root_handle.clone().ok_or_else(|| {
+                        BrokerOpError::InvalidStorageContext {
+                            reason: "captured preparation-cache root handle is unavailable".into(),
+                        }
+                    })?,
+                }),
+            }));
+        }
+        Ok(self
+            .host_resource_db_path
             .as_deref()
             .and_then(Path::parent)
-            .map(|parent| parent.join("preparation-cache"))
+            .map(|parent| crate::broker::PreparationCacheRootBinding {
+                path: parent.join("preparation-cache"),
+                identity: None,
+                instance_nonce: None,
+                root_guard: None,
+            }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preparation_cache_root(&self) -> Result<Option<PathBuf>, BrokerOpError> {
+        Ok(self
+            .preparation_cache_root_binding()?
+            .map(|binding| binding.path))
     }
 
     pub(crate) fn gate_storage_locations(&self) -> crate::gates::GateStorageLocations {
@@ -527,6 +1050,224 @@ impl BrokerStorageContext {
         }
         None
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn preparation_cache_journal_has_rows(resource_db: &Path, root: &Path) -> std::io::Result<bool> {
+    crate::preparation::rotation_journal::has_rows_at_or_below_root(resource_db, root)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn preparation_cache_journal_has_rows(_resource_db: &Path, _root: &Path) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "preparation-cache journal inspection is unsupported on this platform",
+    ))
+}
+
+fn capture_preparation_cache_root(
+    path: &Path,
+) -> Result<
+    (
+        PathBuf,
+        Vec<u8>,
+        crate::broker::PreparationCacheRootState,
+        std::sync::Arc<File>,
+    ),
+    String,
+> {
+    if !path.is_absolute() || path.to_str().is_none() {
+        return Err("preparation-cache root override must be an absolute UTF-8 path".into());
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "cannot canonicalize preparation-cache root {}: {error}",
+            path.display()
+        )
+    })?;
+    if canonical != path {
+        return Err("preparation-cache root override must already be canonical".into());
+    }
+    let capture = crate::preparation::rotation_debt::capture_preparation_cache_root(path).map_err(
+        |error| {
+            format!(
+                "cannot capture preparation-cache root {}: {error}",
+                path.display()
+            )
+        },
+    )?;
+    let state = match capture.state {
+        crate::preparation::rotation_debt::PreparationCacheRootCaptureState::Uninitialized => {
+            crate::broker::PreparationCacheRootState::Uninitialized
+        }
+        crate::preparation::rotation_debt::PreparationCacheRootCaptureState::Marked {
+            coordinator_db_path,
+            nonce,
+            cache_root_identity,
+        } => crate::broker::PreparationCacheRootState::Marked {
+            coordinator_db_path,
+            nonce,
+            cache_root_identity,
+        },
+    };
+    Ok((
+        canonical,
+        capture.identity,
+        state,
+        std::sync::Arc::new(capture.directory),
+    ))
+}
+
+fn validate_captured_preparation_cache_root(
+    path: &Path,
+    expected_identity: &[u8],
+    expected_state: &crate::broker::PreparationCacheRootState,
+    captured_resource_db_path: Option<&Path>,
+    pinned_directory: &File,
+) -> Result<(), BrokerOpError> {
+    crate::preparation::rotation_debt::validate_preparation_cache_root_handle(
+        path,
+        pinned_directory,
+        expected_identity,
+    )
+    .map_err(|error| BrokerOpError::InvalidStorageContext {
+        reason: format!(
+            "captured preparation-cache root {} no longer matches its pinned identity: {error}",
+            path.display()
+        )
+        .into_boxed_str(),
+    })?;
+    let capture = crate::preparation::rotation_debt::capture_preparation_cache_root(path).map_err(
+        |error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot recheck captured preparation-cache root {}: {error}",
+                path.display()
+            )
+            .into_boxed_str(),
+        },
+    )?;
+    if capture.identity != expected_identity
+        || !matches_capture_state(expected_state, &capture.state)
+    {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "captured preparation-cache root {} has changed marker or namespace state",
+                path.display()
+            )
+            .into_boxed_str(),
+        });
+    }
+    if let crate::broker::PreparationCacheRootState::Marked {
+        coordinator_db_path,
+        ..
+    } = expected_state
+    {
+        let captured_resource_db =
+            captured_resource_db_path.ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "marked preparation-cache root has no captured host-resource database"
+                    .into(),
+            })?;
+        let canonical = canonical_coordinator_db_path(captured_resource_db).map_err(|reason| {
+            BrokerOpError::InvalidStorageContext {
+                reason: reason.into_boxed_str(),
+            }
+        })?;
+        if &canonical != coordinator_db_path {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "captured host-resource database differs from the preparation-cache root binding"
+                    .into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_preparation_cache_root_guard(
+    guard: &crate::broker::PreparationCacheRootGuard,
+) -> Result<(), BrokerOpError> {
+    validate_captured_preparation_cache_root(
+        &guard.root_path,
+        &guard.root_identity,
+        &guard.state,
+        Some(&guard.captured_resource_db_path),
+        &guard.root_handle,
+    )
+}
+
+fn matches_capture_state(
+    expected: &crate::broker::PreparationCacheRootState,
+    actual: &crate::preparation::rotation_debt::PreparationCacheRootCaptureState,
+) -> bool {
+    match (expected, actual) {
+        (
+            crate::broker::PreparationCacheRootState::Uninitialized,
+            crate::preparation::rotation_debt::PreparationCacheRootCaptureState::Uninitialized,
+        ) => true,
+        (
+            crate::broker::PreparationCacheRootState::Marked {
+                coordinator_db_path: expected_db,
+                nonce: expected_nonce,
+                cache_root_identity: expected_identity,
+            },
+            crate::preparation::rotation_debt::PreparationCacheRootCaptureState::Marked {
+                coordinator_db_path: actual_db,
+                nonce: actual_nonce,
+                cache_root_identity: actual_identity,
+            },
+        ) => {
+            expected_db == actual_db
+                && expected_nonce == actual_nonce
+                && expected_identity == actual_identity
+        }
+        _ => false,
+    }
+}
+
+fn canonical_coordinator_db_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || path.to_str().is_none() || path.as_os_str().len() > 4096 {
+        return Err(
+            "captured host-resource database path must be absolute, UTF-8, and bounded".into(),
+        );
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "cannot resolve captured host-resource database {}: {error}",
+            path.display()
+        )
+    })?;
+    if !std::fs::metadata(&canonical)
+        .map_err(|error| format!("cannot inspect captured host-resource database: {error}"))?
+        .is_file()
+    {
+        return Err("captured host-resource database does not resolve to a regular file".into());
+    }
+    Ok(canonical)
+}
+
+fn preparation_cache_namespace_path(root: &Path, nonce: &str) -> Result<PathBuf, BrokerOpError> {
+    if nonce.len() != 64
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: "preparation-cache root nonce is malformed".into(),
+        });
+    }
+    Ok(root.join(format!(".aethyme-preparation-cache-{nonce}")))
+}
+
+fn preparation_root_request_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("prep-cache-root-init-{}-{nanos}", std::process::id())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn environment_path(name: &str) -> Option<PathBuf> {
@@ -987,6 +1728,7 @@ impl Broker {
         let repo = GitRepo::discover(&main_root)?;
         storage_context.bind_repository(&repo)?;
         let store = BrokerStore::open_in_repo(&main_root)?;
+        storage_context.initialize_preparation_cache_root(&repo)?;
         let mut broker = Self {
             repo,
             store,
@@ -1032,6 +1774,7 @@ impl Broker {
         let repo = GitRepo::discover(&main_root)?;
         storage_context.bind_repository(&repo)?;
         let store = BrokerStore::open_in_repo(&main_root)?;
+        storage_context.initialize_preparation_cache_root(&repo)?;
         let mut broker = Self {
             repo,
             store,
@@ -1278,6 +2021,13 @@ impl Broker {
             "AETHYME_HOST_CACHE_DIR",
             self.storage_context.host_cache_dir.as_deref(),
         );
+        set_command_path(
+            command,
+            PREPARATION_CACHE_ROOT_ENV,
+            self.storage_context
+                .preparation_cache_root_override
+                .as_deref(),
+        );
         let broker_database_path = self.store.db_path();
         if !broker_database_path.is_absolute() {
             return Err(BrokerOpError::InvalidStorageContext {
@@ -1348,7 +2098,11 @@ impl Broker {
             collaboration_root.as_deref(),
         );
         child_context.collaboration_state_dir = collaboration_root;
-        let encoded = CapturedBrokerStorageContextV2::encode(&child_context)?;
+        let encoded = if child_context.preparation_cache_root_override.is_some() {
+            CapturedBrokerStorageContextV4::encode(&child_context)?
+        } else {
+            CapturedBrokerStorageContextV2::encode(&child_context)?
+        };
         command.env(BROKER_OPEN_STORAGE_CONTEXT_ENV, encoded);
         Ok(())
     }
@@ -4014,6 +4768,10 @@ mod artifact_sweep_namespace_tests {
             worktree_root_override: Some(temporary.path().join("worktrees")),
             worktree_root_environment_override: None,
             collaboration_state_dir: Some(temporary.path().join("collaboration")),
+            preparation_cache_root_override: None,
+            preparation_cache_root_identity: None,
+            preparation_cache_root_state: None,
+            preparation_cache_root_handle: None,
             host_state_dir_is_explicit: true,
             capture_error: None,
         };
@@ -4038,6 +4796,252 @@ mod artifact_sweep_namespace_tests {
             BrokerStorageContext::default()
                 .artifact_sweep_namespace()
                 .is_err()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn separate_cache_root_requires_writable_init_and_uses_v4_namespace() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("separate-cache");
+        std::fs::create_dir(&root).unwrap();
+        let host_state_dir = temporary.path().join("host-state");
+        std::fs::create_dir(&host_state_dir).unwrap();
+        let host_resource_db_path = host_state_dir.join("host-resources.db");
+        std::fs::File::create(&host_resource_db_path).unwrap();
+        let host_resource_db_path = host_resource_db_path.canonicalize().unwrap();
+        let (canonical, root_identity, state, handle) =
+            capture_preparation_cache_root(&root).unwrap();
+        let uninitialized = BrokerStorageContext {
+            repository_root: Some(temporary.path().join("repo")),
+            git_common_dir: Some(temporary.path().join("repo/.git")),
+            host_state_dir: Some(host_state_dir.clone()),
+            host_resource_db_path: Some(host_resource_db_path.clone()),
+            preparation_cache_root_override: Some(canonical.clone()),
+            preparation_cache_root_identity: Some(root_identity.clone()),
+            preparation_cache_root_state: Some(state),
+            preparation_cache_root_handle: Some(handle.clone()),
+            ..BrokerStorageContext::default()
+        };
+        assert!(uninitialized.preparation_cache_root_binding().is_err());
+        assert!(CapturedBrokerStorageContextV4::encode(&uninitialized).is_err());
+        assert!(CapturedBrokerStorageContextV2::encode(&uninitialized).is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        let initialized = crate::preparation::rotation_debt::initialize_preparation_cache_root(
+            &canonical,
+            &root_identity,
+            &handle,
+            &host_resource_db_path,
+            || Ok(false),
+        )
+        .unwrap();
+        let (canonical, root_identity, state, handle) =
+            capture_preparation_cache_root(&root).unwrap();
+        let mut marked = uninitialized.clone();
+        marked.preparation_cache_root_override = Some(canonical.clone());
+        marked.preparation_cache_root_identity = Some(root_identity);
+        marked.preparation_cache_root_state = Some(state);
+        marked.preparation_cache_root_handle = Some(handle);
+        let binding = marked.preparation_cache_root_binding().unwrap().unwrap();
+        assert_eq!(
+            binding.instance_nonce.as_deref(),
+            Some(initialized.nonce.as_str())
+        );
+        assert_eq!(
+            binding.path,
+            canonical.join(format!(".aethyme-preparation-cache-{}", initialized.nonce))
+        );
+
+        let encoded = CapturedBrokerStorageContextV4::encode(&marked).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            value.get("version").and_then(serde_json::Value::as_u64),
+            Some(u64::from(BROKER_OPEN_STORAGE_CONTEXT_V4_VERSION))
+        );
+        let decoded = serde_json::from_str::<CapturedBrokerStorageContextV4>(&encoded)
+            .unwrap()
+            .into_context()
+            .unwrap();
+        let decoded_binding = decoded.preparation_cache_root_binding().unwrap().unwrap();
+        assert_eq!(decoded_binding.path, binding.path);
+        assert_eq!(decoded_binding.identity, binding.identity);
+        assert_eq!(decoded_binding.instance_nonce, binding.instance_nonce);
+        decoded_binding.validate().unwrap();
+        let decoded_guard = decoded_binding.root_guard.as_ref().unwrap();
+        let expected_guard = binding.root_guard.as_ref().unwrap();
+        assert_eq!(decoded_guard.root_path, expected_guard.root_path);
+        assert_eq!(decoded_guard.root_identity, expected_guard.root_identity);
+        assert_eq!(
+            decoded_guard.captured_resource_db_path,
+            expected_guard.captured_resource_db_path
+        );
+        let decoded_handle_metadata = decoded_guard.root_handle.metadata().unwrap();
+        let expected_handle_metadata = expected_guard.root_handle.metadata().unwrap();
+        assert_eq!(
+            (decoded_handle_metadata.dev(), decoded_handle_metadata.ino()),
+            (
+                expected_handle_metadata.dev(),
+                expected_handle_metadata.ino()
+            )
+        );
+        assert_eq!(
+            decoded.artifact_sweep_namespace().unwrap(),
+            marked.artifact_sweep_namespace().unwrap()
+        );
+
+        let other_state = temporary.path().join("other-host-state");
+        std::fs::create_dir(&other_state).unwrap();
+        let other_db = other_state.join("host-resources.db");
+        std::fs::File::create(&other_db).unwrap();
+        let other_db = other_db.canonicalize().unwrap();
+        let cache_entry = binding.path.join("entry");
+        std::fs::create_dir(&cache_entry).unwrap();
+        let cache_sentinel = cache_entry.join("payload");
+        std::fs::write(&cache_sentinel, b"retain this cache").unwrap();
+        let marker_path = canonical.join(".aethyme-preparation-cache-root-v2");
+        let marker_before = std::fs::read(&marker_path).unwrap();
+
+        assert!(
+            crate::preparation::rotation_debt::initialize_preparation_cache_root(
+                &canonical,
+                marked.preparation_cache_root_identity.as_deref().unwrap(),
+                marked.preparation_cache_root_handle.as_deref().unwrap(),
+                &other_db,
+                || panic!("a mismatched coordinator must be rejected before debt lookup"),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker_before);
+        assert_eq!(
+            std::fs::read(&cache_sentinel).unwrap(),
+            b"retain this cache"
+        );
+
+        let mut forged = value.clone();
+        forged["preparation_cache_coordinator_db_path"] =
+            serde_json::Value::from(other_db.to_string_lossy().into_owned());
+        assert!(
+            serde_json::from_value::<CapturedBrokerStorageContextV4>(forged)
+                .unwrap()
+                .into_context()
+                .is_err(),
+            "a V4 payload cannot rebind a cache root to another coordinator"
+        );
+
+        let host_state_alias = temporary.path().join("host-state-alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&host_state_dir, &host_state_alias).unwrap();
+        let mut alias_context = marked.clone();
+        alias_context.host_state_dir = Some(host_state_alias.clone());
+        alias_context.host_resource_db_path = Some(host_state_alias.join("host-resources.db"));
+        let alias_payload = CapturedBrokerStorageContextV4::encode(&alias_context).unwrap();
+        let alias_decoded = serde_json::from_str::<CapturedBrokerStorageContextV4>(&alias_payload)
+            .unwrap()
+            .into_context()
+            .unwrap();
+        assert_eq!(
+            alias_decoded
+                .preparation_cache_root_binding()
+                .unwrap()
+                .unwrap()
+                .path,
+            binding.path,
+            "canonical aliases of the bound coordinator DB retain the same cache binding"
+        );
+
+        let mut changed_marker: serde_json::Value = serde_json::from_slice(&marker_before).unwrap();
+        changed_marker["coordinator_db_path"] =
+            serde_json::Value::from(other_db.to_string_lossy().into_owned());
+        std::fs::write(&marker_path, serde_json::to_vec(&changed_marker).unwrap()).unwrap();
+        assert!(binding.validate().is_err());
+        let sweep = crate::storage::sweep_preparation_cache_for_roots_with_binding(
+            &temporary.path().join("repo"),
+            &[temporary.path().join("worktrees")],
+            &binding,
+            &host_resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(1),
+        );
+        assert!(
+            !sweep.complete,
+            "marker changes make cache cleanup incomplete"
+        );
+        assert_eq!(
+            std::fs::read(&cache_sentinel).unwrap(),
+            b"retain this cache"
+        );
+        std::fs::write(&marker_path, &marker_before).unwrap();
+
+        let mut legacy = marked.clone();
+        legacy.preparation_cache_root_override = None;
+        legacy.preparation_cache_root_identity = None;
+        legacy.preparation_cache_root_state = None;
+        legacy.preparation_cache_root_handle = None;
+        assert_ne!(
+            marked.artifact_sweep_namespace().unwrap(),
+            legacy.artifact_sweep_namespace().unwrap()
+        );
+
+        let old_root = temporary.path().join("moved-cache");
+        std::fs::rename(&canonical, &old_root).unwrap();
+        std::fs::create_dir(&canonical).unwrap();
+        assert!(marked.preparation_cache_root_binding().is_err());
+        assert!(CapturedBrokerStorageContextV4::encode(&marked).is_err());
+        assert!(
+            old_root
+                .join(format!(".aethyme-preparation-cache-{}", initialized.nonce))
+                .is_dir()
+        );
+        assert_eq!(std::fs::read_dir(&canonical).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn default_artifact_context_keeps_the_legacy_v2_payload_and_digest() {
+        let context = BrokerStorageContext {
+            repository_root: Some(PathBuf::from("/repo")),
+            git_common_dir: Some(PathBuf::from("/repo/.git")),
+            host_state_dir: Some(PathBuf::from("/state")),
+            host_resource_db_path: Some(PathBuf::from("/state/host-resources.db")),
+            host_cache_dir: Some(PathBuf::from("/cache")),
+            host_operation_db_path: Some(PathBuf::from("/state/operations.db")),
+            worktree_root_override: Some(PathBuf::from("/worktrees")),
+            worktree_root_environment_override: None,
+            collaboration_state_dir: Some(PathBuf::from("/collaboration")),
+            preparation_cache_root_override: None,
+            preparation_cache_root_identity: None,
+            preparation_cache_root_state: None,
+            preparation_cache_root_handle: None,
+            host_state_dir_is_explicit: true,
+            capture_error: None,
+        };
+        assert_eq!(
+            CapturedBrokerStorageContextV2::encode(&context).unwrap(),
+            r#"{"version":2,"repository_root":"/repo","git_common_dir":"/repo/.git","host_state_dir":"/state","host_resource_db_path":"/state/host-resources.db","host_cache_dir":"/cache","host_operation_db_path":"/state/operations.db","worktree_root_override":"/worktrees","worktree_root_environment_override":null,"collaboration_state_dir":"/collaboration","host_state_dir_is_explicit":true}"#
+        );
+        assert_eq!(
+            context.artifact_sweep_namespace().unwrap(),
+            "9020ef2f465ead9b87ebab4d29e42afe260cc3cd0cf1f5f23ec38678b983acc6"
+        );
+    }
+
+    #[test]
+    fn separate_cache_root_rejects_relative_and_missing_paths() {
+        let relative = PathBuf::from("relative-cache-root");
+        let context = BrokerStorageContext::capture(
+            BrokerOpenOptions::default().with_preparation_cache_root(relative),
+        );
+        assert!(context.ensure_valid().is_err());
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("not-created");
+        let context = BrokerStorageContext::capture(
+            BrokerOpenOptions::default().with_preparation_cache_root(missing.clone()),
+        );
+        assert!(context.ensure_valid().is_err());
+        assert!(
+            !missing.exists(),
+            "capture must not create the override root"
         );
     }
 }

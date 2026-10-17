@@ -583,9 +583,15 @@ impl Broker {
             .steps
             .iter()
             .any(|step| step.cache == PreparationCachePolicy::RepositoryShared);
-        let cache_dir = shared
-            .then(|| preparation_cache_dir(self, &digest))
+        let cache_root_binding = shared
+            .then(|| preparation_cache_root_binding_for_broker(self))
             .transpose()?;
+        let cache_dir = cache_root_binding.as_ref().map(|binding| {
+            binding
+                .path
+                .join(repository_identity(self))
+                .join(&digest[..12])
+        });
         let resource_db_path = if shared {
             Some(
                 self.storage_context()
@@ -607,7 +613,11 @@ impl Broker {
         if let Some(resource_db_path) = &resource_db_path {
             storage_paths.push(resource_db_path.clone());
         }
-        if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
+        if let Err(error) = require_preparation_storage_with_cache_root(
+            self.main_root(),
+            &storage_paths,
+            cache_root_binding.as_ref(),
+        ) {
             let error = BrokerOpError::from(error);
             self.recover_storage_refusal(&error);
             return Err(error);
@@ -634,7 +644,11 @@ impl Broker {
         };
         // A shared-cache lease may have waited while another process filled
         // either volume. Recheck before rotation, state writes or commands.
-        if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
+        if let Err(error) = require_preparation_storage_with_cache_root(
+            self.main_root(),
+            &storage_paths,
+            cache_root_binding.as_ref(),
+        ) {
             let error = BrokerOpError::from(error);
             let recovery_persisted = self.persist_storage_refusal(&error);
             let lease_released = release_grant_best_effort(&mut coordinator, &mut grant);
@@ -656,18 +670,31 @@ impl Broker {
         };
         let rotation =
             self.release_grant_after_error(rotation_result, &mut coordinator, &mut grant, || {
-                require_preparation_storage(&storage_root, &storage_paths)
+                require_preparation_storage_with_cache_root(
+                    &storage_root,
+                    &storage_paths,
+                    cache_root_binding.as_ref(),
+                )
             })?;
         if let Some(cache_dir) = &cache_dir {
-            self.release_grant_after_error(
+            let create_cache_dir = require_preparation_storage_with_cache_root(
+                &storage_root,
+                &storage_paths,
+                cache_root_binding.as_ref(),
+            )
+            .and_then(|()| {
                 fs::create_dir_all(cache_dir).map_err(|source| PreparationError::Io {
                     path: cache_dir.clone(),
                     source,
-                }),
-                &mut coordinator,
-                &mut grant,
-                || require_preparation_storage(&storage_root, &storage_paths),
-            )?;
+                })
+            });
+            self.release_grant_after_error(create_cache_dir, &mut coordinator, &mut grant, || {
+                require_preparation_storage_with_cache_root(
+                    &storage_root,
+                    &storage_paths,
+                    cache_root_binding.as_ref(),
+                )
+            })?;
         }
 
         let started_at = now_ms();
@@ -689,7 +716,13 @@ impl Broker {
             write_record(&state_path, &record),
             &mut coordinator,
             &mut grant,
-            || require_preparation_storage(&storage_root, &storage_paths),
+            || {
+                require_preparation_storage_with_cache_root(
+                    &storage_root,
+                    &storage_paths,
+                    cache_root_binding.as_ref(),
+                )
+            },
         )?;
 
         let environment = cache_dir
@@ -712,41 +745,51 @@ impl Broker {
             } else {
                 &step.command
             };
-            let report = match require_preparation_storage(&main_root, &storage_paths)
-                .map_err(BrokerOpError::from)
-                .and_then(|()| {
-                    let supervisor = match next_supervisor.take() {
-                        Some(supervisor) => supervisor,
-                        None => self.start_preparation_exec_supervisor()?,
-                    };
-                    self.guarded_preparation_exec_with_supervisor(
-                        session_id,
-                        command,
-                        &environment,
-                        supervisor,
-                        || {
-                            heartbeat.tick(
-                                Instant::now(),
-                                || require_preparation_storage(&main_root, &storage_paths),
-                                || {
-                                    if let (Some(coordinator), Some(grant)) =
-                                        (coordinator.as_mut(), grant.as_mut())
-                                    {
-                                        grant.lease = coordinator
-                                            .renew(
-                                                &grant.lease.lease_id,
-                                                grant.lease.generation,
-                                                &grant.ownership_token,
-                                                PREPARATION_LEASE_TTL_SECONDS,
-                                            )
-                                            .map_err(PreparationError::from)?;
-                                    }
-                                    Ok(())
-                                },
-                            )
-                        },
-                    )
-                }) {
+            let report = match require_preparation_storage_with_cache_root(
+                &main_root,
+                &storage_paths,
+                cache_root_binding.as_ref(),
+            )
+            .map_err(BrokerOpError::from)
+            .and_then(|()| {
+                let supervisor = match next_supervisor.take() {
+                    Some(supervisor) => supervisor,
+                    None => self.start_preparation_exec_supervisor()?,
+                };
+                self.guarded_preparation_exec_with_supervisor(
+                    session_id,
+                    command,
+                    &environment,
+                    supervisor,
+                    || {
+                        heartbeat.tick(
+                            Instant::now(),
+                            || {
+                                require_preparation_storage_with_cache_root(
+                                    &main_root,
+                                    &storage_paths,
+                                    cache_root_binding.as_ref(),
+                                )
+                            },
+                            || {
+                                if let (Some(coordinator), Some(grant)) =
+                                    (coordinator.as_mut(), grant.as_mut())
+                                {
+                                    grant.lease = coordinator
+                                        .renew(
+                                            &grant.lease.lease_id,
+                                            grant.lease.generation,
+                                            &grant.ownership_token,
+                                            PREPARATION_LEASE_TTL_SECONDS,
+                                        )
+                                        .map_err(PreparationError::from)?;
+                                }
+                                Ok(())
+                            },
+                        )
+                    },
+                )
+            }) {
                 Ok(report) => report,
                 Err(error) => {
                     if matches!(
@@ -759,9 +802,13 @@ impl Broker {
                         quarantine_grant_best_effort(&mut coordinator, &mut grant);
                         return Err(error);
                     }
-                    let recovery_persisted = self
-                        .recover_storage_pressure_after_command_failure(&error, || {
-                            require_preparation_storage(&main_root, &storage_paths)
+                    let recovery_persisted =
+                        self.recover_storage_pressure_after_command_failure(&error, || {
+                            require_preparation_storage_with_cache_root(
+                                &main_root,
+                                &storage_paths,
+                                cache_root_binding.as_ref(),
+                            )
                         });
                     record.state = PreparationState::Failed;
                     record.failed_step = Some(step.name.clone());
@@ -788,9 +835,38 @@ impl Broker {
                     session_id,
                 };
                 let error = BrokerOpError::from(error);
-                let recovery_persisted = self
-                    .recover_storage_pressure_after_command_failure(&error, || {
-                        require_preparation_storage(&main_root, &storage_paths)
+                let recovery_persisted =
+                    self.recover_storage_pressure_after_command_failure(&error, || {
+                        require_preparation_storage_with_cache_root(
+                            &main_root,
+                            &storage_paths,
+                            cache_root_binding.as_ref(),
+                        )
+                    });
+                record.state = PreparationState::Failed;
+                record.failed_step = Some(step.name.clone());
+                record.exit_code = report.exit_code;
+                record.completed_at = Some(now_ms());
+                let lease_released = best_effort_failed_preparation_cleanup(
+                    || write_record(&state_path, &record),
+                    || release_grant(&mut coordinator, &mut grant),
+                );
+                if recovery_persisted && lease_released {
+                    self.start_storage_recovery_worker();
+                }
+                return Err(error);
+            }
+            if let Err(cache_error) =
+                ensure_preparation_cache_root_binding(cache_root_binding.as_ref())
+            {
+                let error = BrokerOpError::from(cache_error);
+                let recovery_persisted =
+                    self.recover_storage_pressure_after_command_failure(&error, || {
+                        require_preparation_storage_with_cache_root(
+                            &main_root,
+                            &storage_paths,
+                            cache_root_binding.as_ref(),
+                        )
                     });
                 record.state = PreparationState::Failed;
                 record.failed_step = Some(step.name.clone());
@@ -842,7 +918,13 @@ impl Broker {
             write_record(&state_path, &record),
             &mut coordinator,
             &mut grant,
-            || require_preparation_storage(&storage_root, &storage_paths),
+            || {
+                require_preparation_storage_with_cache_root(
+                    &storage_root,
+                    &storage_paths,
+                    cache_root_binding.as_ref(),
+                )
+            },
         )?;
         Ok(PreparationReport {
             schema_version: PREPARATION_SCHEMA_VERSION,
@@ -1572,12 +1654,22 @@ fn shared_cache_budget(
     digest: &str,
     broker: &Broker,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
-    let cache_root = broker
+    let cache_root_binding = broker
         .storage_context()
-        .preparation_cache_root()
-        .ok_or_else(|| {
-            invalid_config("the broker's captured host resource database path is unavailable")
+        .preparation_cache_root_binding()
+        .map_err(|error| PreparationError::StorageUnavailable {
+            path: broker
+                .storage_context()
+                .preparation_cache_root_override
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("preparation-cache")),
+            reason: format!("captured preparation-cache root is unavailable: {error}"),
+        })?
+        .ok_or_else(|| PreparationError::StorageUnavailable {
+            path: PathBuf::from("preparation-cache"),
+            reason: "the broker's captured host resource database path is unavailable".into(),
         })?;
+    let cache_root = cache_root_binding.path.clone();
     let resource_db_path = broker
         .storage_context()
         .host_resource_db_path
@@ -1586,12 +1678,14 @@ fn shared_cache_budget(
             path: cache_root.clone(),
             reason: "the broker's captured host resource database path is unavailable".into(),
         })?;
-    shared_cache_budget_at_with_resource_db(
+    shared_cache_budget_at_with_resource_db_and_identity_and_binding(
         budget.filter(|budget| budget.max_bytes > 0),
         &cache_root,
         resource_db_path,
         &repository_identity(broker),
         digest,
+        cache_root_binding.identity.as_deref(),
+        Some(&cache_root_binding),
     )
 }
 
@@ -1621,6 +1715,7 @@ fn shared_cache_budget_at(
     )
 }
 
+#[cfg(test)]
 fn shared_cache_budget_at_with_resource_db(
     budget: Option<&SharedCacheBudget>,
     cache_root: &Path,
@@ -1628,8 +1723,55 @@ fn shared_cache_budget_at_with_resource_db(
     repository: &str,
     digest: &str,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    shared_cache_budget_at_with_resource_db_and_identity(
+        budget,
+        cache_root,
+        resource_db_path,
+        repository,
+        digest,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn shared_cache_budget_at_with_resource_db_and_identity(
+    budget: Option<&SharedCacheBudget>,
+    cache_root: &Path,
+    resource_db_path: &Path,
+    repository: &str,
+    digest: &str,
+    expected_root_identity: Option<&[u8]>,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    shared_cache_budget_at_with_resource_db_and_identity_and_binding(
+        budget,
+        cache_root,
+        resource_db_path,
+        repository,
+        digest,
+        expected_root_identity,
+        None,
+    )
+}
+
+fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
+    budget: Option<&SharedCacheBudget>,
+    cache_root: &Path,
+    resource_db_path: &Path,
+    repository: &str,
+    digest: &str,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    ensure_preparation_cache_root_binding(root_binding)?;
+    ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    recover_rotation_debt(resource_db_path, cache_root, repository)?;
+    recover_rotation_debt(
+        resource_db_path,
+        cache_root,
+        repository,
+        expected_root_identity,
+        root_binding,
+    )?;
 
     let Some(budget) = budget.filter(|budget| budget.max_bytes > 0) else {
         return Ok(None);
@@ -1638,6 +1780,8 @@ fn shared_cache_budget_at_with_resource_db(
     let Some(bytes) = directory_bytes(&store)? else {
         return Ok(None);
     };
+    ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
+    ensure_preparation_cache_root_binding(root_binding)?;
     if bytes <= budget.max_bytes {
         return Ok(None);
     }
@@ -1680,12 +1824,21 @@ fn shared_cache_budget_at_with_resource_db(
                 reason: format!("cannot encode shared-cache root identity: {source}"),
             }
         })?;
+        ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
+        if expected_root_identity.is_some_and(|expected| expected != root_identity_bytes) {
+            return Err(PreparationError::StorageUnavailable {
+                path: cache_root.to_path_buf(),
+                reason: "preparation-cache root differs from the broker's captured identity".into(),
+            });
+        }
         let payload = rotation_debt::encode(&debt).map_err(|source| {
             PreparationError::StorageUnavailable {
                 path: store.clone(),
                 reason: format!("cannot encode shared-cache rotation intent: {source}"),
             }
         })?;
+        ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
+        ensure_preparation_cache_root_binding(root_binding)?;
         rotation_journal::publish(
             resource_db_path,
             cache_root,
@@ -1697,13 +1850,22 @@ fn shared_cache_budget_at_with_resource_db(
             path: store.clone(),
             reason: format!("cannot durably journal shared-cache rotation intent: {source}"),
         })?;
-        rotation_debt::publish(cache_root, debt).map_err(|source| {
-            PreparationError::StorageUnavailable {
-                path: store.clone(),
-                reason: format!("cannot publish shared-cache rotation intent: {source}"),
-            }
+        ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
+        ensure_preparation_cache_root_binding(root_binding)?;
+        rotation_debt::publish_with_root_guard(cache_root, debt, &mut || {
+            validate_preparation_cache_binding_for_recovery(root_binding)
+        })
+        .map_err(|source| PreparationError::StorageUnavailable {
+            path: store.clone(),
+            reason: format!("cannot publish shared-cache rotation intent: {source}"),
         })?;
-        let progress = recover_rotation_debt(resource_db_path, cache_root, repository)?;
+        let progress = recover_rotation_debt(
+            resource_db_path,
+            cache_root,
+            repository,
+            expected_root_identity,
+            root_binding,
+        )?;
         if !progress.found_debt || !progress.complete {
             return Err(PreparationError::StorageUnavailable {
                 path: store.clone(),
@@ -1723,27 +1885,70 @@ fn shared_cache_budget_at_with_resource_db(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn recover_rotation_debt_for_cache_sweep(
+pub(crate) fn recover_rotation_debt_for_cache_sweep_with_binding(
     cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
     resource_db_path: &Path,
     repository: &str,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
     deadline: Instant,
 ) -> Result<rotation_debt::RecoveryProgress, rotation_debt::RecoveryError> {
-    rotation_debt::recover_with_journal(cache_root, resource_db_path, repository, deadline)
+    if !preparation_cache_root_identity_matches(cache_root, expected_root_identity) {
+        return Err(rotation_debt::RecoveryError {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "preparation-cache root differs from the broker's captured identity",
+            ),
+            progress: rotation_debt::RecoveryProgress::default(),
+        });
+    }
+    validate_preparation_cache_binding_for_recovery(root_binding).map_err(|source| {
+        rotation_debt::RecoveryError {
+            source,
+            progress: rotation_debt::RecoveryProgress::default(),
+        }
+    })?;
+    rotation_debt::recover_with_journal_and_root_guard(
+        cache_root,
+        resource_db_path,
+        repository,
+        deadline,
+        || validate_preparation_cache_binding_for_recovery(root_binding),
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn recover_rotation_debt_for_cache_sweep(
+pub(crate) fn recover_rotation_debt_for_cache_sweep_with_binding(
     cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
     _resource_db_path: &Path,
     repository: &str,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
     deadline: Instant,
 ) -> Result<rotation_debt::RecoveryProgress, rotation_debt::RecoveryError> {
-    rotation_debt::recover(cache_root, repository, deadline)
+    if !preparation_cache_root_identity_matches(cache_root, expected_root_identity) {
+        return Err(rotation_debt::RecoveryError {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "preparation-cache root differs from the broker's captured identity",
+            ),
+            progress: rotation_debt::RecoveryProgress::default(),
+        });
+    }
+    validate_preparation_cache_binding_for_recovery(root_binding).map_err(|source| {
+        rotation_debt::RecoveryError {
+            source,
+            progress: rotation_debt::RecoveryProgress::default(),
+        }
+    })?;
+    rotation_debt::recover_with_root_guard(cache_root, repository, deadline, || {
+        validate_preparation_cache_binding_for_recovery(root_binding)
+    })
 }
 
 pub(crate) fn probe_rotation_recovery(
     _cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
     _resource_db_path: &Path,
     max_entries: usize,
     _deadline: Instant,
@@ -1767,6 +1972,9 @@ pub(crate) fn probe_rotation_recovery(
             }
             Err(_) => return rotation_debt::DebtProbe::Unknown,
         };
+        if !preparation_cache_root_identity_matches(_cache_root, expected_root_identity) {
+            return rotation_debt::DebtProbe::Unknown;
+        }
         let cache_probe = rotation_debt::probe(_cache_root, max_entries, _deadline);
         let journal_probe =
             match rotation_journal::probe(_resource_db_path, _cache_root, root_identity.as_deref())
@@ -1797,14 +2005,57 @@ pub(crate) fn probe_rotation_recovery(
     }
 }
 
+pub(crate) fn preparation_cache_root_identity_matches(
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+) -> bool {
+    let Some(expected) = expected_root_identity else {
+        return true;
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        rotation_debt::DirectoryIdentity::capture(cache_root)
+            .and_then(|identity| identity.encode())
+            .is_ok_and(|actual| actual == expected)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = cache_root;
+        false
+    }
+}
+
+fn ensure_preparation_cache_root_identity(
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+) -> Result<(), PreparationError> {
+    if preparation_cache_root_identity_matches(cache_root, expected_root_identity) {
+        return Ok(());
+    }
+    Err(PreparationError::StorageUnavailable {
+        path: cache_root.to_path_buf(),
+        reason: "preparation-cache root differs from the broker's captured identity".into(),
+    })
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recover_rotation_debt(
     resource_db_path: &Path,
     cache_root: &Path,
     repository: &str,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
 ) -> Result<rotation_debt::RecoveryProgress, PreparationError> {
+    ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
+    ensure_preparation_cache_root_binding(root_binding)?;
     let deadline = Instant::now() + SHARED_CACHE_RECOVERY_MAX_ELAPSED;
-    match rotation_debt::recover_with_journal(cache_root, resource_db_path, repository, deadline) {
+    match rotation_debt::recover_with_journal_and_root_guard(
+        cache_root,
+        resource_db_path,
+        repository,
+        deadline,
+        || validate_preparation_cache_binding_for_recovery(root_binding),
+    ) {
         Ok(progress) if progress.complete => Ok(progress),
         Ok(progress) => Err(PreparationError::StorageUnavailable {
             path: cache_root.join(repository),
@@ -1823,6 +2074,20 @@ fn recover_rotation_debt(
     }
 }
 
+fn validate_preparation_cache_binding_for_recovery(
+    binding: Option<&crate::broker::PreparationCacheRootBinding>,
+) -> std::io::Result<()> {
+    if let Some(binding) = binding {
+        binding.validate().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("captured preparation-cache root changed: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// What a rotation did, for the report and the event.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SharedCacheRotation {
@@ -1835,14 +2100,24 @@ pub struct SharedCacheRotation {
     pub removed: bool,
 }
 
-fn preparation_store_dir(broker: &Broker) -> Result<PathBuf, PreparationError> {
-    let root = broker
-        .storage_context()
-        .preparation_cache_root()
-        .ok_or_else(|| {
-            invalid_config("the broker's captured host resource database path is unavailable")
-        })?;
-    Ok(root.join(repository_identity(broker)))
+fn preparation_cache_root_binding_for_broker(
+    broker: &Broker,
+) -> Result<crate::broker::PreparationCacheRootBinding, PreparationError> {
+    let context = broker.storage_context();
+    let fallback = context
+        .preparation_cache_root_override
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("preparation-cache"));
+    context
+        .preparation_cache_root_binding()
+        .map_err(|error| PreparationError::StorageUnavailable {
+            path: fallback.clone(),
+            reason: format!("captured preparation-cache root is unavailable: {error}"),
+        })?
+        .ok_or_else(|| PreparationError::StorageUnavailable {
+            path: fallback,
+            reason: "the broker's captured host resource database path is unavailable".into(),
+        })
 }
 
 /// Resolve the default cache root for tests of legacy/default configuration.
@@ -2238,10 +2513,6 @@ fn shared_cache_scan_io_refusal(path: &Path, source: &std::io::Error) -> Prepara
     }
 }
 
-fn preparation_cache_dir(broker: &Broker, digest: &str) -> Result<PathBuf, PreparationError> {
-    Ok(preparation_store_dir(broker)?.join(&digest[..12]))
-}
-
 fn require_preparation_storage(
     main_root: &Path,
     paths: &[PathBuf],
@@ -2251,6 +2522,30 @@ fn require_preparation_storage(
         crate::verification::removable_volume_unavailable_reason,
         |path| crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
     )
+}
+
+fn ensure_preparation_cache_root_binding(
+    binding: Option<&crate::broker::PreparationCacheRootBinding>,
+) -> Result<(), PreparationError> {
+    if let Some(binding) = binding {
+        binding
+            .validate()
+            .map_err(|error| PreparationError::StorageUnavailable {
+                path: binding.path.clone(),
+                reason: format!("captured preparation-cache root changed: {error}"),
+            })?;
+        ensure_preparation_cache_root_identity(&binding.path, binding.identity.as_deref())?;
+    }
+    Ok(())
+}
+
+fn require_preparation_storage_with_cache_root(
+    main_root: &Path,
+    paths: &[PathBuf],
+    binding: Option<&crate::broker::PreparationCacheRootBinding>,
+) -> Result<(), PreparationError> {
+    require_preparation_storage(main_root, paths)?;
+    ensure_preparation_cache_root_binding(binding)
 }
 
 fn is_storage_unavailable(error: &BrokerOpError) -> bool {
@@ -2359,9 +2654,13 @@ fn preparation_storage_with(
 }
 
 fn repository_identity(broker: &Broker) -> String {
-    crate::resolve_remote_target(broker.repo_handle(), "origin", None)
+    repository_identity_for_repo(broker.repo_handle())
+}
+
+pub(crate) fn repository_identity_for_repo(repo: &crate::GitRepo) -> String {
+    crate::resolve_remote_target(repo, "origin", None)
         .map(|target| hash_text(&target.coordination_key))
-        .unwrap_or_else(|_| hash_text(&broker.main_root().to_string_lossy()))
+        .unwrap_or_else(|_| hash_text(&repo.root().to_string_lossy()))
 }
 
 fn release_grant(
@@ -2429,6 +2728,195 @@ mod tests {
 
     const SHARED_CACHE_TEST_REPOSITORY: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn initialized_cache_root_binding(
+        cache_root: &Path,
+        resource_db_path: &Path,
+    ) -> crate::broker::PreparationCacheRootBinding {
+        let captured = rotation_debt::capture_preparation_cache_root(cache_root).unwrap();
+        let initialized = rotation_debt::initialize_preparation_cache_root(
+            cache_root,
+            &captured.identity,
+            &captured.directory,
+            resource_db_path,
+            || Ok(false),
+        )
+        .unwrap();
+        let captured = rotation_debt::capture_preparation_cache_root(cache_root).unwrap();
+        let state = match captured.state {
+            rotation_debt::PreparationCacheRootCaptureState::Marked {
+                coordinator_db_path,
+                nonce,
+                cache_root_identity: Some(cache_root_identity),
+            } => crate::broker::PreparationCacheRootState::Marked {
+                coordinator_db_path,
+                nonce,
+                cache_root_identity: Some(cache_root_identity),
+            },
+            other => panic!("expected an initialized cache root, got {other:?}"),
+        };
+        crate::broker::PreparationCacheRootBinding {
+            path: cache_root.join(format!(".aethyme-preparation-cache-{}", initialized.nonce)),
+            identity: Some(initialized.cache_root_identity),
+            instance_nonce: Some(initialized.nonce),
+            root_guard: Some(crate::broker::PreparationCacheRootGuard {
+                root_path: cache_root.to_path_buf(),
+                root_identity: captured.identity,
+                state,
+                captured_resource_db_path: resource_db_path.to_path_buf(),
+                root_handle: std::sync::Arc::new(captured.directory),
+            }),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_recovery_revalidates_outer_binding_before_staging_mutation() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outer_root = tmp.path().join("preparation-cache-root");
+        let host_state = tmp.path().join("host-state");
+        std::fs::create_dir(&outer_root).unwrap();
+        std::fs::create_dir(&host_state).unwrap();
+        let resource_db = host_state.join("host-resources.db");
+        std::fs::File::create(&resource_db).unwrap();
+        let resource_db = resource_db.canonicalize().unwrap();
+        let binding = initialized_cache_root_binding(&outer_root, &resource_db);
+        let cache_root = binding.path.clone();
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("payload"), b"preserve during refusal").unwrap();
+
+        let root_identity = rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+        let store_identity = rotation_debt::DirectoryIdentity::capture(&store).unwrap();
+        let debt = rotation_debt::RotationDebt::new(
+            SHARED_CACHE_TEST_REPOSITORY,
+            &rotation_debt::new_transaction_id(),
+            root_identity.clone(),
+            store_identity,
+        )
+        .unwrap();
+        let payload = rotation_debt::encode(&debt).unwrap();
+        let root_identity_bytes = root_identity.encode().unwrap();
+        rotation_journal::publish(
+            &resource_db,
+            &cache_root,
+            &root_identity_bytes,
+            SHARED_CACHE_TEST_REPOSITORY,
+            &payload,
+        )
+        .unwrap();
+        rotation_debt::publish(&cache_root, debt.clone()).unwrap();
+        let entries_before: std::collections::BTreeSet<_> = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+
+        let marker_path = outer_root.join(".aethyme-preparation-cache-root-v2");
+        let mut validations = 0;
+        let error = rotation_debt::recover_with_journal_and_root_guard(
+            &cache_root,
+            &resource_db,
+            SHARED_CACHE_TEST_REPOSITORY,
+            Instant::now() + Duration::from_secs(5),
+            || {
+                validations += 1;
+                if validations == 2 {
+                    let mut marker: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&marker_path)?).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                    marker["coordinator_db_path"] = serde_json::Value::from(
+                        tmp.path()
+                            .join("replacement-host-state/host-resources.db")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    std::fs::write(
+                        &marker_path,
+                        serde_json::to_vec(&marker).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?,
+                    )?;
+                }
+                binding.validate().map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                })
+            },
+        )
+        .expect_err("recovery must stop when its captured root marker changes");
+
+        assert_eq!(validations, 2);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(store.join("payload")).unwrap(),
+            b"preserve during refusal"
+        );
+        let entries_after: std::collections::BTreeSet<_> = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries_after, entries_before);
+        let row = rotation_journal::load_record(
+            &resource_db,
+            &cache_root,
+            &root_identity_bytes,
+            SHARED_CACHE_TEST_REPOSITORY,
+        )
+        .unwrap()
+        .expect("the pending journal row remains available for recovery");
+        assert!(row.fresh_store_identity.is_none());
+        assert!(
+            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn preparation_writer_refuses_a_changed_cache_root_marker_before_measuring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("preparation-cache");
+        let host_state = tmp.path().join("host-state");
+        std::fs::create_dir(&cache_root).unwrap();
+        std::fs::create_dir(&host_state).unwrap();
+        let resource_db = host_state.join("host-resources.db");
+        std::fs::File::create(&resource_db).unwrap();
+        let resource_db = resource_db.canonicalize().unwrap();
+        let binding = initialized_cache_root_binding(&cache_root, &resource_db);
+        let store = binding
+            .path
+            .join(SHARED_CACHE_TEST_REPOSITORY)
+            .join("abcdef123456");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("payload"), b"keep after marker change").unwrap();
+
+        let marker_path = cache_root.join(".aethyme-preparation-cache-root-v2");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker["coordinator_db_path"] = serde_json::Value::from(
+            tmp.path()
+                .join("different-host-state/host-resources.db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let error = ensure_preparation_cache_root_binding(Some(&binding))
+            .expect_err("preparation refuses a changed outer-root marker");
+        assert!(
+            error
+                .to_string()
+                .contains("captured preparation-cache root changed")
+        );
+        assert_eq!(
+            std::fs::read(store.join("payload")).unwrap(),
+            b"keep after marker change"
+        );
+    }
 
     #[test]
     fn preparation_argv_preserves_empty_arguments_but_rejects_empty_program() {
@@ -2994,6 +3482,55 @@ mod tests {
             .is_none()
         );
         assert!(store.join("payload").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn preparation_writer_refuses_a_replaced_captured_cache_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("preparation-cache");
+        let original_store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        std::fs::create_dir_all(&original_store).unwrap();
+        std::fs::write(original_store.join("payload"), b"original").unwrap();
+        let root_identity = rotation_debt::DirectoryIdentity::capture(&cache_root)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let original_root = tmp.path().join("preparation-cache-original");
+        std::fs::rename(&cache_root, &original_root).unwrap();
+        let replacement_store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        std::fs::create_dir_all(&replacement_store).unwrap();
+        std::fs::write(replacement_store.join("payload"), b"replacement").unwrap();
+        let resource_db = tmp.path().join("host-state/host-resources.db");
+
+        let error = shared_cache_budget_at_with_resource_db_and_identity(
+            Some(&SharedCacheBudget { max_bytes: 1 }),
+            &cache_root,
+            &resource_db,
+            SHARED_CACHE_TEST_REPOSITORY,
+            "0123456789ab",
+            Some(&root_identity),
+        )
+        .expect_err("a replacement root must not receive preparation writes");
+
+        assert!(error.to_string().contains("captured identity"));
+        assert_eq!(
+            std::fs::read(replacement_store.join("payload")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(
+                original_root
+                    .join(SHARED_CACHE_TEST_REPOSITORY)
+                    .join("payload")
+            )
+            .unwrap(),
+            b"original"
+        );
+        assert!(
+            !resource_db.exists(),
+            "mismatch is rejected before debt journal creation"
+        );
     }
 
     /// The report must not disclose where the store lives: it is host state

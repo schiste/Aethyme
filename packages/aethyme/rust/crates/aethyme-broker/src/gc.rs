@@ -24,8 +24,8 @@ use crate::{
 
 mod tree_removal;
 pub(crate) use tree_removal::{
-    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, remove_condemned_tree,
-    remove_condemned_tree_with_progress,
+    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, TreeRemovalError, remove_condemned_tree,
+    remove_condemned_tree_with_progress, remove_condemned_tree_with_progress_and_guard,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -3009,13 +3009,15 @@ impl Broker {
 
     fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
         let storage = self.storage_context();
+        let cache_root_binding = storage.preparation_cache_root_binding()?;
         let probe = match (
-            storage.preparation_cache_root(),
+            cache_root_binding.as_ref(),
             storage.host_resource_db_path.as_deref(),
         ) {
             (Some(cache_root), Some(resource_db_path)) => {
                 crate::preparation::probe_rotation_recovery(
-                    &cache_root,
+                    &cache_root.path,
+                    cache_root.identity.as_deref(),
                     resource_db_path,
                     PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES,
                     Instant::now() + PREPARATION_ROTATION_DEBT_PROBE_BUDGET,
@@ -3429,8 +3431,8 @@ impl Broker {
                         .map(|session| PathBuf::from(session.worktree_path)),
                 );
             }
-            if let Some(cache_root) = self.storage_context().preparation_cache_root() {
-                roots.insert(cache_root);
+            if let Ok(Some(cache_root)) = self.storage_context().preparation_cache_root_binding() {
+                roots.insert(cache_root.path);
             }
         }
         roots
@@ -3615,16 +3617,17 @@ impl Broker {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let captured_cache_root = storage_context.preparation_cache_root_binding()?;
             let preparation_sweep = match (
                 worktree_roots.is_empty(),
-                storage_context.preparation_cache_root(),
+                captured_cache_root.as_ref(),
                 storage_context.host_resource_db_path.as_deref(),
             ) {
                 (false, Some(cache_root), Some(resource_db_path)) => {
-                    crate::storage::sweep_preparation_cache_for_roots_with_status(
+                    crate::storage::sweep_preparation_cache_for_roots_with_binding(
                         &main_root,
                         &worktree_roots,
-                        &cache_root,
+                        cache_root,
                         resource_db_path,
                         deadline,
                     )
@@ -4974,6 +4977,7 @@ mod tests {
         let captured_cache_root = root_broker
             .storage_context()
             .preparation_cache_root()
+            .unwrap()
             .unwrap();
         assert!(
             root_broker
@@ -5654,7 +5658,8 @@ mod tests {
         let cache_root = broker
             .storage_context()
             .preparation_cache_root()
-            .expect("test storage has a captured preparation-cache root");
+            .expect("test storage has a captured preparation-cache root")
+            .expect("captured cache root exists");
         std::fs::create_dir_all(&cache_root).unwrap();
         let repository = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let store = cache_root.join(repository);
@@ -5741,7 +5746,8 @@ mod tests {
         let cache_root = first
             .storage_context()
             .preparation_cache_root()
-            .expect("test storage has a captured preparation-cache root");
+            .expect("test storage has a captured preparation-cache root")
+            .expect("captured cache root exists");
         let cache_parent = cache_root.parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&cache_root).unwrap();
         for key in [

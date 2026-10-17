@@ -67,6 +67,73 @@ pub(crate) enum JournalProbe {
     Unknown,
 }
 
+/// Return true if the exact override-root path or any component-bounded child
+/// has journal history. The query is literal byte-prefix matching, not SQL
+/// LIKE, so wildcard bytes and sibling path prefixes cannot broaden it.
+pub(crate) fn has_rows_at_or_below_root(resource_db: &Path, cache_root: &Path) -> io::Result<bool> {
+    let root = root_path_bytes(cache_root)?;
+    let mut prefix = Vec::with_capacity(root.len() + 1);
+    prefix.extend_from_slice(root);
+    prefix.push(b'/');
+
+    let path = path_for_resource_db(resource_db)?;
+    let Some(connection) = open_reader(&path)? else {
+        return Ok(false);
+    };
+    if !ensure_schema(&connection, false)? {
+        return Err(invalid_data("rotation journal schema is unsupported"));
+    }
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if version != 2 && version != SCHEMA_VERSION {
+        return Err(invalid_data("rotation journal schema is unsupported"));
+    }
+
+    // A normal root row is the usual case, but a malformed database can hold
+    // orphan debt rows with foreign-key checks disabled. Check both tables so
+    // orphaned history also blocks initialization of a reused path. The table
+    // names are static and every scan is capped before the caller trusts a
+    // negative result.
+    for (table, row_cap) in [
+        ("rotation_root", MAX_ROOT_ROWS),
+        ("rotation_debt", MAX_DEBT_ROWS),
+    ] {
+        let sql = format!(
+            "SELECT length(root_path), \
+             CASE WHEN length(root_path) BETWEEN 1 AND ?1 THEN root_path ELSE NULL END \
+             FROM {table} LIMIT ?2"
+        );
+        let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+        let mut rows = statement
+            .query(params![MAX_ROOT_BYTES as i64, row_cap + 1])
+            .map_err(sqlite_error)?;
+        let mut count = 0_i64;
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            count += 1;
+            if count > row_cap {
+                return Err(invalid_data(
+                    "rotation journal root-path row cap is exceeded",
+                ));
+            }
+            let length: i64 = row.get(0).map_err(sqlite_error)?;
+            if !(1..=MAX_ROOT_BYTES as i64).contains(&length) {
+                return Err(invalid_data(
+                    "rotation journal root path exceeds its size bound",
+                ));
+            }
+            let recorded: Vec<u8> = row
+                .get::<_, Option<Vec<u8>>>(1)
+                .map_err(sqlite_error)?
+                .ok_or_else(|| invalid_data("rotation journal root path is unavailable"))?;
+            if recorded.as_slice() == root || recorded.starts_with(&prefix) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 struct RotationRootRow {
     root_identity: Vec<u8>,
     generation: i64,
@@ -2366,5 +2433,82 @@ mod tests {
             .is_err()
         );
         assert!(check_database_size(&path_for_resource_db(&fixture.resource_db).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn cache_root_journal_probe_is_literal_and_component_bounded() {
+        let fixture = Fixture::new();
+        let parent = fixture._directory.path();
+        let root = parent.join("cache%_literal");
+        let child = root.join("nested");
+        let sibling = parent.join("cache%_literal-sibling");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        publish(
+            &fixture.resource_db,
+            &child,
+            ROOT_IDENTITY,
+            REPOSITORY_A,
+            b"nested debt",
+        )
+        .unwrap();
+        publish(
+            &fixture.resource_db,
+            &sibling,
+            ROOT_IDENTITY,
+            REPOSITORY_B,
+            b"sibling debt",
+        )
+        .unwrap();
+
+        assert!(has_rows_at_or_below_root(&fixture.resource_db, &root).unwrap());
+        assert!(has_rows_at_or_below_root(&fixture.resource_db, &child).unwrap());
+        assert!(!has_rows_at_or_below_root(&fixture.resource_db, &sibling.join("child")).unwrap());
+        let no_match = parent.join("cache%_literal-sibling-extra");
+        std::fs::create_dir(&no_match).unwrap();
+        assert!(!has_rows_at_or_below_root(&fixture.resource_db, &no_match).unwrap());
+    }
+
+    #[test]
+    fn cache_root_journal_probe_finds_orphan_debt_rows() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"seed schema");
+        let orphan_root = fixture._directory.path().join("orphan-cache");
+        std::fs::create_dir(&orphan_root).unwrap();
+        let path = path_for_resource_db(&fixture.resource_db).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rotation_debt(root_path, repository, payload, protocol_version, fresh_store_identity) \
+                 VALUES (?1, ?2, ?3, 3, NULL)",
+                params![
+                    orphan_root.as_os_str().as_bytes(),
+                    REPOSITORY_B,
+                    b"orphan debt".as_slice()
+                ],
+            )
+            .unwrap();
+        let root_rows: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rotation_root WHERE root_path=?1",
+                params![orphan_root.as_os_str().as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_rows, 0);
+        drop(connection);
+
+        assert!(has_rows_at_or_below_root(&fixture.resource_db, &orphan_root).unwrap());
+        assert!(
+            !has_rows_at_or_below_root(
+                &fixture.resource_db,
+                &fixture._directory.path().join("other-cache")
+            )
+            .unwrap()
+        );
     }
 }

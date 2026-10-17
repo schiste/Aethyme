@@ -7,6 +7,7 @@ const NONE_MODE: &str = "AETHYME_TEST_STORAGE_CONTEXT_NONE_MODE";
 const SLOT_IDENTITY_MODE: &str = "AETHYME_TEST_STORAGE_CONTEXT_SLOT_IDENTITY_MODE";
 const RELATIVE_MODE: &str = "AETHYME_TEST_STORAGE_CONTEXT_RELATIVE_MODE";
 const TEST_REPOSITORY: &str = "AETHYME_TEST_STORAGE_CONTEXT_REPOSITORY";
+const RESTRICTIVE_UMASK_CHILD: &str = "AETHYME_TEST_PREPARATION_CACHE_UMASK_CHILD";
 const PRIVATE_LEASE_ID: &str = "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_LEASE_ID";
 const PRIVATE_LEASE_GENERATION: &str = "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_LEASE_GENERATION";
 const POISONED_LEASE_ID: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_LEASE_ID";
@@ -36,6 +37,8 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
     let capsule = tempfile::tempdir().expect("private fixture capsule");
     let private_state = capsule.path().join("private-host-state");
     let private_cache = capsule.path().join("private-host-cache");
+    let private_preparation_root = capsule.path().join("private-preparation-cache");
+    std::fs::create_dir(&private_preparation_root).expect("private preparation-cache root");
     let private_worktrees = capsule.path().join("private-worktrees");
     let poisoned_state = capsule.path().join("poisoned-host-state");
     let poisoned_cache = capsule.path().join("poisoned-host-cache");
@@ -43,7 +46,41 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
     let poisoned_xdg_state = capsule.path().join("poisoned-xdg-state");
     let poisoned_xdg_cache = capsule.path().join("poisoned-xdg-cache");
     let poisoned_home = capsule.path().join("poisoned-home");
-    let private_entry = preparation_entry(&private_state);
+
+    // First writable open initializes the opt-in root while it is empty. The
+    // test payload is placed only inside the resulting nonce-scoped namespace.
+    let initialized = Broker::open_with_options(
+        repo.path(),
+        BrokerOpenOptions::default()
+            .with_host_state_dir(private_state.clone())
+            .with_host_cache_dir(private_cache.clone())
+            .with_host_operation_database(private_state.join("host-operations.db"))
+            .with_worktree_root(private_worktrees.clone())
+            .with_preparation_cache_root(private_preparation_root.clone()),
+    )
+    .expect("initialize the separate preparation-cache root");
+    let private_effective_root = initialized
+        .storage_context()
+        .preparation_cache_root()
+        .expect("initialized preparation-cache path")
+        .expect("separate preparation-cache root");
+    let mut configured_child = Command::new(std::env::current_exe().expect("test executable"));
+    initialized
+        .configure_storage_context_for_child(&mut configured_child)
+        .expect("configure an actual override child");
+    let override_payload = configured_child
+        .get_envs()
+        .find_map(|(name, value)| {
+            (name == "AETHYME_BROKER_STORAGE_CONTEXT_V1")
+                .then(|| value.and_then(|value| value.to_str()))
+                .flatten()
+        })
+        .expect("the configured child receives its captured context");
+    let override_json: serde_json::Value = serde_json::from_str(override_payload).unwrap();
+    assert_eq!(override_json["version"], 4);
+    assert!(override_json["preparation_cache_coordinator_db_path"].is_string());
+
+    let private_entry = preparation_entry_under(&private_effective_root);
     let poisoned_entry = preparation_entry(&poisoned_state);
     for entry in [&private_entry, &poisoned_entry] {
         std::fs::create_dir_all(entry).expect("cache entry directory");
@@ -60,6 +97,14 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
         .env("AETHYME_TEST_STORAGE_CONTEXT_REPOSITORY", repo.path())
         .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_STATE", &private_state)
         .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_CACHE", &private_cache)
+        .env(
+            "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_PREPARATION_ROOT",
+            &private_preparation_root,
+        )
+        .env(
+            "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_EFFECTIVE_ROOT",
+            &private_effective_root,
+        )
         .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_WORKTREES", &private_worktrees)
         .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_ENTRY", &private_entry)
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_STATE", &poisoned_state)
@@ -71,6 +116,10 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
         .env("AETHYME_HOST_STATE_DIR", &poisoned_state)
         .env("AETHYME_HOST_CACHE_DIR", &poisoned_cache)
         .env("AETHYME_WORKTREE_ROOT", &poisoned_worktrees)
+        .env(
+            "AETHYME_PREPARATION_CACHE_ROOT",
+            poisoned_state.join("preparation-cache"),
+        )
         .env_remove("AETHYME_BROKER_DB")
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
         .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
@@ -97,6 +146,142 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
         poisoned_entry.exists(),
         "poisoned ambient host state must remain untouched"
     );
+
+    let protected = private_effective_root.join("marker-change-sentinel");
+    std::fs::write(&protected, b"keep after marker change").unwrap();
+    let marker_path = private_preparation_root.join(".aethyme-preparation-cache-root-v2");
+    let marker_before = std::fs::read(&marker_path).unwrap();
+    let mut marker: serde_json::Value = serde_json::from_slice(&marker_before).unwrap();
+    marker["coordinator_db_path"] = serde_json::Value::from(
+        poisoned_state
+            .join("host-resources.db")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    let mut changed_child = Command::new("not-launched-after-invalid-binding");
+    assert!(
+        initialized
+            .configure_storage_context_for_child(&mut changed_child)
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(&protected).unwrap(),
+        b"keep after marker change"
+    );
+}
+
+#[test]
+fn default_child_context_uses_the_legacy_v2_payload() {
+    let (repo, _) = super::landing_fixture();
+    let host_state = tempfile::tempdir().expect("private host-state fixture");
+    let broker = Broker::open_with_options(
+        repo.path(),
+        BrokerOpenOptions::default().with_host_state_dir(host_state.path()),
+    )
+    .expect("open isolated broker");
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .expect("configure the real child command");
+
+    let payload = command
+        .get_envs()
+        .find_map(|(name, value)| {
+            (name == "AETHYME_BROKER_STORAGE_CONTEXT_V1")
+                .then(|| value.and_then(|value| value.to_str()))
+                .flatten()
+        })
+        .expect("the real child environment carries its captured context");
+    let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed["version"], 2);
+    assert!(parsed.get("preparation_cache_root").is_none());
+    assert!(
+        parsed
+            .get("preparation_cache_coordinator_db_path")
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn separate_cache_root_modes_survive_a_restrictive_process_umask() {
+    if std::env::var(RESTRICTIVE_UMASK_CHILD).as_deref() == Ok("1") {
+        initialize_cache_root_in_restrictive_umask_child();
+        return;
+    }
+
+    let capsule = tempfile::tempdir().expect("fixture capsule");
+    let root = capsule.path().join("preparation-cache");
+    let host_state = capsule.path().join("host-state");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&host_state).unwrap();
+    let resource_db = host_state.join("host-resources.db");
+    std::fs::File::create(&resource_db).unwrap();
+    let resource_db = resource_db.canonicalize().unwrap();
+
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "broker::tests::storage_context_startup::separate_cache_root_modes_survive_a_restrictive_process_umask",
+            "--nocapture",
+        ])
+        .env(RESTRICTIVE_UMASK_CHILD, "1")
+        .env("AETHYME_TEST_PREPARATION_CACHE_ROOT", &root)
+        .env("AETHYME_TEST_PREPARATION_CACHE_RESOURCE_DB", &resource_db)
+        .output()
+        .expect("run restrictive-umask child");
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    use std::os::unix::fs::MetadataExt;
+    let marker_path = root.join(".aethyme-preparation-cache-root-v2");
+    let marker_mode = std::fs::symlink_metadata(&marker_path).unwrap().mode() & 0o777;
+    let lock_mode = std::fs::symlink_metadata(root.join(".aethyme-preparation-cache-root.lock"))
+        .unwrap()
+        .mode()
+        & 0o777;
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(marker_path).unwrap()).unwrap();
+    let nonce = marker["nonce"].as_str().unwrap();
+    let namespace_mode =
+        std::fs::symlink_metadata(root.join(format!(".aethyme-preparation-cache-{nonce}")))
+            .unwrap()
+            .mode()
+            & 0o777;
+    assert_eq!(lock_mode, 0o600);
+    assert_eq!(marker_mode, 0o600);
+    assert_eq!(namespace_mode, 0o700);
+}
+
+#[cfg(unix)]
+fn initialize_cache_root_in_restrictive_umask_child() {
+    let path = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_PREPARATION_CACHE_ROOT").expect("fixture cache root"),
+    );
+    let resource_db = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_PREPARATION_CACHE_RESOURCE_DB")
+            .expect("fixture coordinator database"),
+    );
+    let capture = crate::preparation::rotation_debt::capture_preparation_cache_root(&path)
+        .expect("capture existing empty root before umask change");
+    // SAFETY: this mutation is confined to the child test process, which exits
+    // immediately after initialization. The test runner process is untouched.
+    unsafe {
+        libc::umask(0o777);
+    }
+    crate::preparation::rotation_debt::initialize_preparation_cache_root(
+        &path,
+        &capture.identity,
+        &capture.directory,
+        &resource_db,
+        || Ok(false),
+    )
+    .expect("initialization normalizes modes on newly created owned entries");
 }
 
 /// Relative BrokerOpenOptions paths are captured against the opening
@@ -850,6 +1035,9 @@ fn run_captured_startup_child() {
         .expect("canonicalize captured-context repository");
     let private_state = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_STATE");
     let private_cache = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_CACHE");
+    let private_preparation_root =
+        var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_PREPARATION_ROOT");
+    let private_effective_root = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_EFFECTIVE_ROOT");
     let private_worktrees = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_WORKTREES");
     let private_entry = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_ENTRY");
     let poisoned_state = var_path("AETHYME_TEST_STORAGE_CONTEXT_POISONED_STATE");
@@ -907,7 +1095,8 @@ fn run_captured_startup_child() {
         .with_host_state_dir(private_state.clone())
         .with_host_cache_dir(private_cache.clone())
         .with_host_operation_database(private_state.join("host-operations.db"))
-        .with_worktree_root(private_worktrees.clone());
+        .with_worktree_root(private_worktrees.clone())
+        .with_preparation_cache_root(private_preparation_root.clone());
     let broker = Broker::open_with_options(&repository, options).expect("open broker");
     let context = broker.storage_context();
     assert_eq!(
@@ -917,6 +1106,12 @@ fn run_captured_startup_child() {
     assert_eq!(
         context.host_cache_dir.as_deref(),
         Some(private_cache.as_path())
+    );
+    assert_eq!(
+        context
+            .preparation_cache_root()
+            .expect("captured preparation root"),
+        Some(private_effective_root.clone())
     );
     assert_eq!(
         broker
@@ -931,6 +1126,9 @@ fn run_captured_startup_child() {
         preparation_entry(&poisoned_state).join("payload").is_file(),
         "startup maintenance must not sweep poisoned host state"
     );
+    std::fs::create_dir_all(&private_entry).expect("reseed captured preparation cache");
+    std::fs::write(private_entry.join("payload"), b"worker cache data")
+        .expect("seed worker cache entry");
     assert!(
         poisoned_state.join("host-resources.db").is_file(),
         "the poison resource database is a seeded sentinel"
@@ -952,6 +1150,15 @@ fn run_captured_startup_child() {
         .env(TEST_REPOSITORY, &repository)
         .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_STATE", &private_state)
         .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_CACHE", &private_cache)
+        .env(
+            "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_PREPARATION_ROOT",
+            &private_preparation_root,
+        )
+        .env(
+            "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_EFFECTIVE_ROOT",
+            &private_effective_root,
+        )
+        .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_ENTRY", &private_entry)
         .env("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_WORKTREES", &private_worktrees)
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_STATE", &poisoned_state)
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_CACHE", &poisoned_cache)
@@ -981,6 +1188,10 @@ fn run_captured_startup_child() {
     command
         .env("AETHYME_HOST_STATE_DIR", &poisoned_state)
         .env("AETHYME_HOST_CACHE_DIR", &poisoned_cache)
+        .env(
+            "AETHYME_PREPARATION_CACHE_ROOT",
+            poisoned_state.join("preparation-cache"),
+        )
         .env_remove(crate::broker::gate_trust::TEST_ESCAPE_ENV);
     let output = command
         .output()
@@ -1000,6 +1211,8 @@ fn run_captured_context_worker() {
     let repository = var_path(TEST_REPOSITORY);
     let private_state = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_STATE");
     let private_cache = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_CACHE");
+    let private_effective_root = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_EFFECTIVE_ROOT");
+    let private_entry = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_ENTRY");
     let private_worktrees = var_path("AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_WORKTREES");
     let poisoned_state = var_path("AETHYME_TEST_STORAGE_CONTEXT_POISONED_STATE");
     let poisoned_cache = var_path("AETHYME_TEST_STORAGE_CONTEXT_POISONED_CACHE");
@@ -1016,6 +1229,21 @@ fn run_captured_context_worker() {
     assert_eq!(
         broker.storage_context().host_cache_dir.as_deref(),
         Some(private_cache.as_path())
+    );
+    assert_eq!(
+        broker
+            .storage_context()
+            .preparation_cache_root()
+            .expect("worker captured preparation root"),
+        Some(private_effective_root.clone())
+    );
+    assert!(
+        !private_entry.exists(),
+        "worker must sweep only its captured cache root"
+    );
+    assert!(
+        preparation_entry(&poisoned_state).join("payload").is_file(),
+        "worker must not sweep the poisoned public cache-root override"
     );
     let expected_resource_db = private_state.join("host-resources.db");
     assert_eq!(
@@ -1115,8 +1343,11 @@ fn run_captured_context_worker() {
 }
 
 fn preparation_entry(host_state: &Path) -> PathBuf {
-    host_state
-        .join("preparation-cache")
+    preparation_entry_under(&host_state.join("preparation-cache"))
+}
+
+fn preparation_entry_under(cache_root: &Path) -> PathBuf {
+    cache_root
         .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .join("bbbbbbbbbbbb")
 }
