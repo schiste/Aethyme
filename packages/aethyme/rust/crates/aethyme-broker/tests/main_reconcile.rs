@@ -1,10 +1,13 @@
 //! Issue #143: reconciling a local default branch that carries work integration
 //! does not, without raw ref surgery.
 
+#[path = "common/isolation.rs"]
+mod isolation;
+
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, MainReconcileDisposition, MainReconcileStrategy};
+use aethyme_broker::{MainReconcileDisposition, MainReconcileStrategy};
 
 fn sh(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -44,7 +47,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     sh(&repo, &["push", "-qu", "origin", "main"]);
     sh(&repo, &["remote", "set-head", "origin", "main"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("seed integration", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("seed.txt"), "seed\n").unwrap();
@@ -60,7 +63,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
 #[test]
 fn content_already_on_integration_is_recognized_despite_a_different_sha() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     let integration = broker.main_reconcile_plan().unwrap().integration_sha;
 
     // Reproduce integration's content on main as an independent commit.
@@ -85,7 +88,7 @@ fn content_already_on_integration_is_recognized_despite_a_different_sha() {
 #[test]
 fn unrepresented_work_refuses_the_apply_and_says_what_is_missing() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("only-local.txt"), "never submitted\n").unwrap();
     sh(&repo, &["add", "-A"]);
@@ -115,7 +118,7 @@ fn unrepresented_work_refuses_the_apply_and_says_what_is_missing() {
 #[test]
 fn a_represented_branch_moves_and_keeps_a_preservation_ref() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
     sh(&repo, &["add", "-A"]);
@@ -158,7 +161,7 @@ fn a_represented_branch_moves_and_keeps_a_preservation_ref() {
 #[test]
 fn a_stale_confirmation_is_refused_with_guidance() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
     sh(&repo, &["add", "-A"]);
@@ -185,7 +188,7 @@ fn resolutions(json: &str) -> aethyme_broker::MainReconcileResolutionDocument {
 #[test]
 fn archiving_unrepresented_work_unblocks_the_apply() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("only-local.txt"), "never submitted\n").unwrap();
     sh(&repo, &["add", "-A"]);
@@ -233,7 +236,7 @@ fn archiving_unrepresented_work_unblocks_the_apply() {
 #[test]
 fn only_an_explicit_archive_decision_unblocks() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("only-local.txt"), "never submitted\n").unwrap();
     sh(&repo, &["add", "-A"]);
@@ -270,7 +273,7 @@ fn only_an_explicit_archive_decision_unblocks() {
 #[test]
 fn the_template_lists_only_commits_needing_a_decision() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("only-local.txt"), "never submitted\n").unwrap();
     sh(&repo, &["add", "-A"]);
@@ -307,7 +310,7 @@ fn rev(repo: &Path, reference: &str) -> String {
 #[test]
 fn a_clean_main_behind_integration_gets_an_exact_fast_forward() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
 
     let plan = broker.main_reconcile_plan().unwrap();
@@ -349,7 +352,7 @@ fn a_clean_main_behind_integration_gets_an_exact_fast_forward() {
 #[test]
 fn a_dirty_main_behind_integration_is_refused() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     std::fs::write(repo.join("src.txt"), "edited, uncommitted\n").unwrap();
 
@@ -376,7 +379,7 @@ fn a_dirty_main_behind_integration_is_refused() {
 #[test]
 fn a_checkout_on_another_branch_is_refused() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "-b", "feature", "main"]);
 
     let plan = broker.main_reconcile_plan().unwrap();
@@ -396,7 +399,7 @@ fn a_checkout_on_another_branch_is_refused() {
 #[test]
 fn a_fast_forward_plan_goes_stale_when_main_diverges() {
     let (_tmp, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     sh(&repo, &["checkout", "-q", "main"]);
     let plan = broker.main_reconcile_plan().unwrap();
     assert_eq!(plan.strategy, MainReconcileStrategy::FastForward);

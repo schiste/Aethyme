@@ -1272,6 +1272,14 @@ impl CollaborationRoot {
         }
     }
 
+    /// An exact collaboration-state root selected by an embedding broker.
+    pub(crate) fn at_path(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            source: RootSource::Explicit,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -110,14 +110,10 @@ pub enum PreparationCachePolicy {
 ///
 /// A shared cache is keyed by preparation digest, so a repository whose
 /// lockfile changes between branches accumulates one store directory per
-/// distinct input set. Without a ceiling that is the only unbounded growth
-/// path in the subsystem: dead entries are reclaimed by liveness, but a
-/// repository that keeps producing fresh digests grows faster than its own
-/// lockfile churn is noticed.
-///
-/// `0` disables the budget, which is the pre-existing behaviour and is never
-/// wrong for a single-clone developer. It becomes wrong exactly when many
-/// clones share the store, so the field exists rather than a heuristic.
+/// distinct input set. This setting is a pre-run rotation threshold, not a
+/// write quota: a preparation step can exceed it, and active entries remain
+/// protected while in use. Disabling the threshold preserves the historical
+/// behavior, but does not bound growth across distinct inputs or clones.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SharedCacheBudget {
@@ -525,19 +521,35 @@ impl Broker {
         let cache_dir = shared
             .then(|| preparation_cache_dir(self, &digest))
             .transpose()?;
+        let resource_db_path = if shared {
+            Some(
+                self.storage_context()
+                    .host_resource_db_path
+                    .clone()
+                    .ok_or_else(|| {
+                        invalid_config(
+                            "the broker's captured host resource database path is unavailable",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let mut storage_paths = vec![root.clone(), self.main_root().join(".aethyme")];
         if let Some(cache_dir) = &cache_dir {
             storage_paths.push(cache_dir.clone());
-            storage_paths
-                .push(crate::default_host_resource_db_path().map_err(PreparationError::from)?);
+        }
+        if let Some(resource_db_path) = &resource_db_path {
+            storage_paths.push(resource_db_path.clone());
         }
         if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
             let error = BrokerOpError::from(error);
             self.recover_storage_refusal(&error);
             return Err(error);
         }
-        let mut coordinator = shared
-            .then(HostResourceCoordinator::open_default)
+        let mut coordinator = resource_db_path
+            .as_deref()
+            .map(HostResourceCoordinator::open)
             .transpose()
             .map_err(PreparationError::from)?;
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
@@ -1549,7 +1561,13 @@ pub struct SharedCacheRotation {
 }
 
 fn preparation_store_dir(broker: &Broker) -> Result<PathBuf, PreparationError> {
-    Ok(preparation_cache_root()?.join(repository_identity(broker)))
+    let root = broker
+        .storage_context()
+        .preparation_cache_root()
+        .ok_or_else(|| {
+            invalid_config("the broker's captured host resource database path is unavailable")
+        })?;
+    Ok(root.join(repository_identity(broker)))
 }
 
 /// Shared by preparation and garbage collection. Worktree placement is

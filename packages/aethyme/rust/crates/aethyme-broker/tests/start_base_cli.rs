@@ -37,7 +37,7 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    common::broker_cli(CLI, args)
+    common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
         .output()
         .unwrap()

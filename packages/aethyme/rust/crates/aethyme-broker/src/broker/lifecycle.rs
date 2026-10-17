@@ -1,5 +1,526 @@
 use super::*;
 
+const BROKER_OPEN_HOST_OPERATION_DB_ENV: &str = "AETHYME_BROKER_OPEN_HOST_OPERATION_DB";
+const BROKER_OPEN_HOST_STATE_EXPLICIT_ENV: &str = "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT";
+const BROKER_OPEN_WORKTREE_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_WORKTREE_ROOT";
+const BROKER_OPEN_COLLABORATION_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_COLLABORATION_ROOT";
+// Keep the private transport key stable; the payload version rejects old children explicitly.
+const BROKER_OPEN_STORAGE_CONTEXT_ENV: &str = "AETHYME_BROKER_STORAGE_CONTEXT_V1";
+const BROKER_OPEN_STORAGE_CONTEXT_VERSION: u32 = 2;
+const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedBrokerStorageContextV2 {
+    version: u32,
+    repository_root: PathBuf,
+    git_common_dir: PathBuf,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_state_dir: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_resource_db_path: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_cache_dir: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    host_operation_db_path: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    worktree_root_override: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    worktree_root_environment_override: Option<PathBuf>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    collaboration_state_dir: Option<PathBuf>,
+    host_state_dir_is_explicit: bool,
+}
+
+impl CapturedBrokerStorageContextV2 {
+    fn from_context(context: &BrokerStorageContext) -> Result<Self, String> {
+        context.ensure_absolute_paths()?;
+        let repository_root = context
+            .repository_root
+            .clone()
+            .ok_or_else(|| "child context has no repository root binding".to_string())?;
+        let git_common_dir = context
+            .git_common_dir
+            .clone()
+            .ok_or_else(|| "child context has no Git common-directory binding".to_string())?;
+        Ok(Self {
+            version: BROKER_OPEN_STORAGE_CONTEXT_VERSION,
+            repository_root,
+            git_common_dir,
+            host_state_dir: context.host_state_dir.clone(),
+            host_resource_db_path: context.host_resource_db_path.clone(),
+            host_cache_dir: context.host_cache_dir.clone(),
+            host_operation_db_path: context.host_operation_db_path.clone(),
+            worktree_root_override: context.worktree_root_override.clone(),
+            worktree_root_environment_override: context.worktree_root_environment_override.clone(),
+            collaboration_state_dir: context.collaboration_state_dir.clone(),
+            host_state_dir_is_explicit: context.host_state_dir_is_explicit,
+        })
+    }
+
+    fn into_context(self) -> Result<BrokerStorageContext, String> {
+        if self.version != BROKER_OPEN_STORAGE_CONTEXT_VERSION {
+            return Err(format!(
+                "unsupported child-context version {}; expected {}",
+                self.version, BROKER_OPEN_STORAGE_CONTEXT_VERSION
+            ));
+        }
+        let context = BrokerStorageContext {
+            repository_root: Some(self.repository_root),
+            git_common_dir: Some(self.git_common_dir),
+            host_state_dir: self.host_state_dir,
+            host_resource_db_path: self.host_resource_db_path,
+            host_cache_dir: self.host_cache_dir,
+            host_operation_db_path: self.host_operation_db_path,
+            worktree_root_override: self.worktree_root_override,
+            worktree_root_environment_override: self.worktree_root_environment_override,
+            collaboration_state_dir: self.collaboration_state_dir,
+            host_state_dir_is_explicit: self.host_state_dir_is_explicit,
+            capture_error: None,
+        };
+        context.ensure_absolute_paths()?;
+        if context.worktree_root_override.is_some()
+            && context.worktree_root_environment_override.is_some()
+        {
+            return Err("child context contains both exact and environment worktree roots".into());
+        }
+        let expected_resource_db = context
+            .host_state_dir
+            .as_deref()
+            .map(|directory| directory.join("host-resources.db"));
+        if context.host_resource_db_path != expected_resource_db {
+            return Err(
+                "child context host resource database does not match its state root".into(),
+            );
+        }
+        Ok(context)
+    }
+
+    fn encode(context: &BrokerStorageContext) -> Result<String, BrokerOpError> {
+        let payload =
+            Self::from_context(context).map_err(|reason| BrokerOpError::InvalidStorageContext {
+                reason: reason.into_boxed_str(),
+            })?;
+        let encoded = serde_json::to_string(&payload).map_err(|error| {
+            BrokerOpError::InvalidStorageContext {
+                reason: format!("cannot encode child context: {error}").into_boxed_str(),
+            }
+        })?;
+        if encoded.len() > BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "child context exceeds its size bound".into(),
+            });
+        }
+        Ok(encoded)
+    }
+}
+
+impl BrokerStorageContext {
+    fn capture(options: BrokerOpenOptions) -> Self {
+        if let Some(encoded) = std::env::var_os(BROKER_OPEN_STORAGE_CONTEXT_ENV) {
+            if options.host_state_dir.is_some()
+                || options.host_cache_dir.is_some()
+                || options.host_operation_db_path.is_some()
+                || options.worktree_root.is_some()
+                || options.collaboration_state_dir.is_some()
+            {
+                return Self::invalid(
+                    "an explicit BrokerOpenOptions value cannot be combined with a child context",
+                );
+            }
+            let Some(encoded) = encoded.to_str() else {
+                return Self::invalid("child context is not valid UTF-8");
+            };
+            if encoded.len() > BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES {
+                return Self::invalid("child context exceeds its size bound");
+            }
+            let decoded = match serde_json::from_str::<CapturedBrokerStorageContextV2>(encoded) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    return Self::invalid(format!("child context is malformed: {error}"));
+                }
+            };
+            return decoded.into_context().unwrap_or_else(Self::invalid);
+        }
+
+        let explicit_host_state_dir = options.host_state_dir.is_some();
+        let inherited_explicit_host_state =
+            match std::env::var_os(BROKER_OPEN_HOST_STATE_EXPLICIT_ENV)
+                .and_then(|value| value.into_string().ok())
+                .as_deref()
+            {
+                Some("true") => true,
+                Some("false") => false,
+                _ => crate::host_state::host_state_dir_is_explicit(),
+            };
+        let host_state_dir = options
+            .host_state_dir
+            .or_else(crate::host_state::default_host_state_dir);
+        let host_resource_db_path = host_state_dir
+            .as_ref()
+            .map(|directory| directory.join("host-resources.db"));
+        let host_operation_db_path = options
+            .host_operation_db_path
+            .or_else(|| environment_path(BROKER_OPEN_HOST_OPERATION_DB_ENV))
+            .or_else(|| {
+                host_state_dir
+                    .as_ref()
+                    .map(|directory| directory.join("host-operations.db"))
+            });
+        let worktree_root_override = options
+            .worktree_root
+            .or_else(|| environment_path(BROKER_OPEN_WORKTREE_ROOT_ENV));
+        let worktree_root_environment_override = if worktree_root_override.is_none() {
+            environment_path("AETHYME_WORKTREE_ROOT")
+        } else {
+            None
+        };
+        let collaboration_state_dir = options
+            .collaboration_state_dir
+            .or_else(|| environment_path(BROKER_OPEN_COLLABORATION_ROOT_ENV));
+        let host_cache_dir = options
+            .host_cache_dir
+            .or_else(crate::host_state::default_host_cache_dir);
+
+        let mut context = Self {
+            host_state_dir_is_explicit: explicit_host_state_dir || inherited_explicit_host_state,
+            host_state_dir,
+            host_resource_db_path,
+            host_cache_dir,
+            host_operation_db_path,
+            worktree_root_override,
+            worktree_root_environment_override,
+            collaboration_state_dir,
+            capture_error: None,
+            ..Self::default()
+        };
+        if let Err(reason) = context.anchor_relative_paths() {
+            return Self::invalid(reason);
+        }
+        context
+    }
+
+    pub(crate) fn capture_for_repository(repo: &GitRepo) -> Result<Self, BrokerOpError> {
+        let mut context = Self::capture(BrokerOpenOptions::default());
+        context.ensure_valid()?;
+        context.bind_repository(repo)?;
+        Ok(context)
+    }
+
+    fn anchor_relative_paths(&mut self) -> Result<(), String> {
+        let needs_current_directory = self
+            .host_state_dir
+            .as_deref()
+            .is_some_and(|path| !path.is_absolute())
+            || self
+                .host_resource_db_path
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute())
+            || self
+                .host_cache_dir
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute())
+            || self
+                .host_operation_db_path
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute())
+            || self
+                .worktree_root_override
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute())
+            || self
+                .worktree_root_environment_override
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute())
+            || self
+                .collaboration_state_dir
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute());
+        if !needs_current_directory {
+            return Ok(());
+        }
+        let current_directory = std::env::current_dir().map_err(|error| {
+            format!("cannot anchor relative storage paths to the parent current directory: {error}")
+        })?;
+        for path in [
+            &mut self.host_state_dir,
+            &mut self.host_resource_db_path,
+            &mut self.host_cache_dir,
+            &mut self.host_operation_db_path,
+            &mut self.worktree_root_override,
+            &mut self.worktree_root_environment_override,
+            &mut self.collaboration_state_dir,
+        ] {
+            if let Some(path) = path
+                && !path.is_absolute()
+            {
+                *path = current_directory.join(&*path);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_absolute_paths(&self) -> Result<(), String> {
+        let repository_root = self
+            .repository_root
+            .as_deref()
+            .ok_or_else(|| "child context has no repository root binding".to_string())?;
+        if !repository_root.is_absolute() {
+            return Err("child context repository root must be absolute".into());
+        }
+        let git_common_dir = self
+            .git_common_dir
+            .as_deref()
+            .ok_or_else(|| "child context has no Git common-directory binding".to_string())?;
+        if !git_common_dir.is_absolute() {
+            return Err("child context Git common directory must be absolute".into());
+        }
+        for (name, path) in [
+            ("host state directory", self.host_state_dir.as_deref()),
+            (
+                "host resource database",
+                self.host_resource_db_path.as_deref(),
+            ),
+            ("host cache directory", self.host_cache_dir.as_deref()),
+            (
+                "host-operation database",
+                self.host_operation_db_path.as_deref(),
+            ),
+            (
+                "exact worktree root",
+                self.worktree_root_override.as_deref(),
+            ),
+            (
+                "worktree-root container",
+                self.worktree_root_environment_override.as_deref(),
+            ),
+            (
+                "collaboration state directory",
+                self.collaboration_state_dir.as_deref(),
+            ),
+        ] {
+            if let Some(path) = path
+                && !path.is_absolute()
+            {
+                return Err(format!("child context {name} must be absolute"));
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_repository(&mut self, repo: &GitRepo) -> Result<(), BrokerOpError> {
+        self.ensure_valid()?;
+        let repository_root =
+            std::fs::canonicalize(repo.root()).map_err(|source| BrokerOpError::Io {
+                path: repo.root().to_path_buf(),
+                source,
+            })?;
+        let git_common_dir = repo.git_common_dir()?;
+        let git_common_dir =
+            std::fs::canonicalize(&git_common_dir).map_err(|source| BrokerOpError::Io {
+                path: git_common_dir,
+                source,
+            })?;
+        Self::bind_identity_path(
+            &mut self.repository_root,
+            repository_root,
+            "repository root",
+        )?;
+        Self::bind_identity_path(
+            &mut self.git_common_dir,
+            git_common_dir,
+            "Git common directory",
+        )
+    }
+
+    fn bind_identity_path(
+        slot: &mut Option<PathBuf>,
+        actual: PathBuf,
+        label: &str,
+    ) -> Result<(), BrokerOpError> {
+        if let Some(expected) = slot {
+            if expected != &actual {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: format!(
+                        "child storage context is bound to a different {label}: {}",
+                        expected.display()
+                    )
+                    .into_boxed_str(),
+                });
+            }
+        } else {
+            *slot = Some(actual);
+        }
+        Ok(())
+    }
+
+    fn anchor_override_path(&mut self, label: &str, path: PathBuf) -> PathBuf {
+        if path.is_absolute() {
+            return path;
+        }
+        match std::env::current_dir() {
+            Ok(current_directory) => current_directory.join(path),
+            Err(error) => {
+                self.capture_error.get_or_insert_with(|| {
+                    format!(
+                        "cannot anchor relative {label} to the broker current directory: {error}"
+                    )
+                });
+                path
+            }
+        }
+    }
+
+    pub(crate) fn repository_binding_refusal(
+        &self,
+        main_root: &Path,
+        git_common_dir: Option<&Path>,
+    ) -> Option<String> {
+        if let Some(reason) = &self.capture_error {
+            return Some(format!(
+                "captured broker storage context is invalid: {reason}"
+            ));
+        }
+        if self.repository_root.is_none() && self.git_common_dir.is_none() {
+            return None;
+        }
+        let (Some(expected_root), Some(expected_common)) = (
+            self.repository_root.as_deref(),
+            self.git_common_dir.as_deref(),
+        ) else {
+            return Some(
+                "captured broker storage context has an incomplete repository identity binding"
+                    .into(),
+            );
+        };
+        let actual_root = match std::fs::canonicalize(main_root) {
+            Ok(root) => root,
+            Err(error) => {
+                return Some(format!(
+                    "cannot verify captured storage context repository root {}: {error}",
+                    main_root.display()
+                ));
+            }
+        };
+        let expected_root = match std::fs::canonicalize(expected_root) {
+            Ok(root) => root,
+            Err(error) => {
+                return Some(format!(
+                    "cannot verify captured storage context repository root {}: {error}",
+                    expected_root.display()
+                ));
+            }
+        };
+        if expected_root != actual_root {
+            return Some(format!(
+                "captured broker storage context is bound to a different repository root: {}",
+                expected_root.display()
+            ));
+        }
+        let actual_common = match git_common_dir.map(Path::to_path_buf) {
+            Some(path) => path,
+            None => match GitRepo::discover(main_root).and_then(|repo| repo.git_common_dir()) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Some(format!(
+                        "cannot verify captured storage context Git common directory: {error}"
+                    ));
+                }
+            },
+        };
+        let actual_common = match std::fs::canonicalize(&actual_common) {
+            Ok(path) => path,
+            Err(error) => {
+                return Some(format!(
+                    "cannot verify captured storage context Git common directory {}: {error}",
+                    actual_common.display()
+                ));
+            }
+        };
+        let expected_common = match std::fs::canonicalize(expected_common) {
+            Ok(path) => path,
+            Err(error) => {
+                return Some(format!(
+                    "cannot verify captured storage context Git common directory {}: {error}",
+                    expected_common.display()
+                ));
+            }
+        };
+        if expected_common != actual_common {
+            return Some(format!(
+                "captured broker storage context is bound to a different Git common directory: {}",
+                expected_common.display()
+            ));
+        }
+        None
+    }
+
+    fn invalid(reason: impl Into<String>) -> Self {
+        Self {
+            capture_error: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
+    fn ensure_valid(&self) -> Result<(), BrokerOpError> {
+        match &self.capture_error {
+            Some(reason) => Err(BrokerOpError::InvalidStorageContext {
+                reason: reason.clone().into_boxed_str(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn preparation_cache_root(&self) -> Option<PathBuf> {
+        self.host_resource_db_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|parent| parent.join("preparation-cache"))
+    }
+
+    pub(crate) fn gate_storage_locations(&self) -> crate::gates::GateStorageLocations {
+        crate::gates::GateStorageLocations::Captured {
+            host_resource_db_path: self.host_resource_db_path.clone(),
+            host_cache_dir: self.host_cache_dir.clone(),
+        }
+    }
+
+    fn collaboration_root(&self) -> Option<crate::collaboration_state::CollaborationRoot> {
+        if let Some(path) = &self.collaboration_state_dir {
+            return Some(crate::collaboration_state::CollaborationRoot::at_path(path));
+        }
+        if self.host_state_dir_is_explicit {
+            return self
+                .host_state_dir
+                .as_deref()
+                .map(crate::collaboration_state::CollaborationRoot::under_host_state);
+        }
+        None
+    }
+}
+
+fn environment_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn set_command_path(command: &mut Command, name: &str, path: Option<&Path>) {
+    if let Some(path) = path {
+        command.env(name, path);
+    } else {
+        command.env_remove(name);
+    }
+}
+
 /// The shared, read-only worktree-root choice used by both session placement
 /// and disposable exact-tree verification. `repository_key` is already
 /// appended to `preferred_root`; downstream storage must not add it again.
@@ -8,11 +529,68 @@ pub(crate) fn plan_worktree_root_for(
     git_common_dir: Option<&Path>,
     worktree_root_override: Option<&Path>,
 ) -> WorktreeRootPlan {
+    let mut context = BrokerStorageContext::capture(BrokerOpenOptions::default());
+    if let Some(root) = worktree_root_override {
+        context.worktree_root_override = Some(root.to_path_buf());
+        context.worktree_root_environment_override = None;
+    }
+    if let Some(reason) = context.repository_binding_refusal(main_root, git_common_dir) {
+        return refused_worktree_root_plan(main_root, git_common_dir, reason);
+    }
+    plan_worktree_root_with_context(main_root, git_common_dir, &context)
+}
+
+fn refused_worktree_root_plan(
+    main_root: &Path,
+    git_common_dir: Option<&Path>,
+    reason: String,
+) -> WorktreeRootPlan {
     let repository_key = crate::host_state::repository_key(main_root, git_common_dir);
-    let host_state_container = crate::host_state::default_host_state_dir()
+    WorktreeRootPlan {
+        schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+        repository_root: main_root.to_path_buf(),
+        repository_key,
+        preferred_root: None,
+        preferred_source: None,
+        root_container: None,
+        legacy_fallback_root: main_root.join(".aethyme/worktrees"),
+        preferred_outside_repository: false,
+        host_state_fallback_root: None,
+        preferred_unavailable_reason: Some(reason.clone()),
+        storage_context_refusal: Some(reason),
+    }
+}
+
+fn plan_worktree_root_with_context(
+    main_root: &Path,
+    git_common_dir: Option<&Path>,
+    context: &BrokerStorageContext,
+) -> WorktreeRootPlan {
+    let repository_key = crate::host_state::repository_key(main_root, git_common_dir);
+    if let Some(reason) = &context.capture_error {
+        return WorktreeRootPlan {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_root: main_root.to_path_buf(),
+            repository_key,
+            preferred_root: None,
+            preferred_source: None,
+            root_container: None,
+            legacy_fallback_root: main_root.join(".aethyme/worktrees"),
+            preferred_outside_repository: false,
+            host_state_fallback_root: None,
+            preferred_unavailable_reason: Some(format!(
+                "captured broker storage context is invalid: {reason}"
+            )),
+            storage_context_refusal: Some(format!(
+                "captured broker storage context is invalid: {reason}"
+            )),
+        };
+    }
+    let host_state_container = context
+        .host_state_dir
+        .clone()
         .filter(|_| {
-            crate::host_state::host_state_dir_is_explicit()
-                || !crate::host_state::path_is_ephemeral(main_root)
+            context.host_state_dir_is_explicit || !crate::host_state::path_is_ephemeral(main_root)
         })
         .map(|base| base.join("worktrees"));
     let mut preferred_unavailable_reason = None;
@@ -33,16 +611,14 @@ pub(crate) fn plan_worktree_root_for(
         }
     };
     let (preferred_root, preferred_source, root_container) =
-        if let Some(root) = worktree_root_override {
+        if let Some(root) = &context.worktree_root_override {
             (
                 Some(absolute_root(root)),
                 Some(WorktreeRootSource::LibraryOverride),
                 None,
             )
-        } else if let Some(base) =
-            std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
-        {
-            let container = absolute_root(Path::new(&base));
+        } else if let Some(base) = &context.worktree_root_environment_override {
+            let container = absolute_root(base);
             (
                 Some(container.join(&repository_key)),
                 Some(WorktreeRootSource::EnvironmentOverride),
@@ -82,6 +658,7 @@ pub(crate) fn plan_worktree_root_for(
         preferred_outside_repository,
         host_state_fallback_root,
         preferred_unavailable_reason,
+        storage_context_refusal: None,
     }
 }
 
@@ -93,6 +670,9 @@ pub(crate) fn plan_worktree_root_for(
 pub(crate) fn worktree_root_candidates_for(
     plan: &WorktreeRootPlan,
 ) -> Vec<(PathBuf, WorktreeRootSource)> {
+    if plan.storage_context_refusal.is_some() {
+        return Vec::new();
+    }
     let mut candidates = Vec::new();
     match plan.preferred_source {
         Some(WorktreeRootSource::RepositoryConfig) => {
@@ -326,7 +906,22 @@ fn prepare_worktree_root_directory(
 
 impl Broker {
     pub fn open(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
-        Self::open_with_graph_impact_provider(path_inside_repo, GraphStoreImpactProvider)
+        Self::open_with_options(path_inside_repo, BrokerOpenOptions::default())
+    }
+
+    /// Open a broker with storage locations captured before startup maintenance.
+    ///
+    /// The returned handle and its recovery, worktree, preparation-cache, and
+    /// gate-cache operations use the same host paths.
+    pub fn open_with_options(
+        path_inside_repo: &Path,
+        options: BrokerOpenOptions,
+    ) -> Result<Self, BrokerOpError> {
+        Self::open_with_graph_impact_provider_and_options(
+            path_inside_repo,
+            GraphStoreImpactProvider,
+            options,
+        )
     }
 
     /// Open a broker for compatibility diagnostics without changing the
@@ -334,15 +929,19 @@ impl Broker {
     /// Readable older storage is copied and migrated only in a temporary
     /// snapshot owned by this broker instance.
     pub fn open_snapshot(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        let mut storage_context = BrokerStorageContext::capture(BrokerOpenOptions::default());
+        storage_context.ensure_valid()?;
         let here = GitRepo::discover(path_inside_repo)?;
         let main_root = here.main_root()?;
         let repo = GitRepo::discover(&main_root)?;
+        storage_context.bind_repository(&repo)?;
         let store = BrokerStore::open_snapshot_in_repo(&main_root)?;
         Ok(Self {
             repo,
             store,
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
+            storage_context,
             host_operation_db_path: None,
             worktree_root_override: None,
             collaboration_state_override: None,
@@ -357,15 +956,19 @@ impl Broker {
     /// does not reconcile prepared shared operations before compatibility has
     /// authorized the command itself.
     pub fn open_for_compatibility_backfill(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        let mut storage_context = BrokerStorageContext::capture(BrokerOpenOptions::default());
+        storage_context.ensure_valid()?;
         let here = GitRepo::discover(path_inside_repo)?;
         let main_root = here.main_root()?;
         let repo = GitRepo::discover(&main_root)?;
+        storage_context.bind_repository(&repo)?;
         let store = BrokerStore::open_in_repo(&main_root)?;
         let mut broker = Self {
             repo,
             store,
             main_root,
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
+            storage_context,
             host_operation_db_path: None,
             worktree_root_override: None,
             collaboration_state_override: None,
@@ -382,15 +985,33 @@ impl Broker {
         path_inside_repo: &Path,
         graph_impact_provider: impl GraphImpactProvider + 'static,
     ) -> Result<Self, BrokerOpError> {
+        Self::open_with_graph_impact_provider_and_options(
+            path_inside_repo,
+            graph_impact_provider,
+            BrokerOpenOptions::default(),
+        )
+    }
+
+    /// Open a broker with an alternate read-only graph-impact provider and
+    /// explicit host storage locations captured before startup maintenance.
+    pub fn open_with_graph_impact_provider_and_options(
+        path_inside_repo: &Path,
+        graph_impact_provider: impl GraphImpactProvider + 'static,
+        options: BrokerOpenOptions,
+    ) -> Result<Self, BrokerOpError> {
+        let mut storage_context = BrokerStorageContext::capture(options);
+        storage_context.ensure_valid()?;
         let here = GitRepo::discover(path_inside_repo)?;
         let main_root = here.main_root()?;
         let repo = GitRepo::discover(&main_root)?;
+        storage_context.bind_repository(&repo)?;
         let store = BrokerStore::open_in_repo(&main_root)?;
         let mut broker = Self {
             repo,
             store,
             main_root,
             graph_impact_provider: Box::new(graph_impact_provider),
+            storage_context,
             host_operation_db_path: None,
             worktree_root_override: None,
             collaboration_state_override: None,
@@ -436,7 +1057,10 @@ impl Broker {
     /// environment variables shared by concurrent threads.
     #[doc(hidden)]
     pub fn with_host_operation_database(mut self, path: impl Into<PathBuf>) -> Self {
-        self.host_operation_db_path = Some(path.into());
+        self.host_operation_db_path = Some(
+            self.storage_context
+                .anchor_override_path("host-operation database", path.into()),
+        );
         self
     }
 
@@ -447,7 +1071,10 @@ impl Broker {
     /// process-wide environment variables.
     #[doc(hidden)]
     pub fn with_worktree_root(mut self, path: impl Into<PathBuf>) -> Self {
-        self.worktree_root_override = Some(path.into());
+        self.worktree_root_override = Some(
+            self.storage_context
+                .anchor_override_path("worktree root", path.into()),
+        );
         self
     }
 
@@ -455,7 +1082,10 @@ impl Broker {
     /// directory, so a test never touches the real one.
     #[doc(hidden)]
     pub fn with_collaboration_state(mut self, host_state: impl Into<PathBuf>) -> Self {
-        self.collaboration_state_override = Some(host_state.into());
+        self.collaboration_state_override = Some(
+            self.storage_context
+                .anchor_override_path("collaboration state directory", host_state.into()),
+        );
         self
     }
 
@@ -540,21 +1170,146 @@ impl Broker {
         crate::collaboration_state::CollaborationStore,
         crate::collaboration_state::CollaborationStateError,
     > {
-        match &self.collaboration_state_override {
-            Some(host_state) => crate::collaboration_state::CollaborationStore::open(
-                &crate::collaboration_state::CollaborationRoot::under_host_state(host_state),
+        if let Some(root) = self.collaboration_state_override.as_deref()
+            && !root.is_absolute()
+        {
+            return Err(
+                crate::collaboration_state::CollaborationStateError::RelativeRoot {
+                    root: root.to_path_buf(),
+                },
+            );
+        }
+        let root = self
+            .collaboration_state_override
+            .as_deref()
+            .map(crate::collaboration_state::CollaborationRoot::under_host_state)
+            .or_else(|| self.storage_context.collaboration_root());
+        match root {
+            Some(root) => crate::collaboration_state::CollaborationStore::open(
+                &root,
                 project,
                 &crate::collaboration_state::forbidden_roots(&self.main_root),
             ),
+            None if !self.storage_context.host_state_dir_is_explicit
+                && crate::host_state::path_is_ephemeral(&self.main_root) =>
+            {
+                Err(
+                    crate::collaboration_state::CollaborationStateError::EphemeralRepository {
+                        repository: self.main_root.clone(),
+                    },
+                )
+            }
             None => crate::collaboration_state::open_for_repository(&self.main_root, project),
         }
     }
 
-    pub(crate) fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {
-        self.host_operation_db_path
+    pub(crate) fn storage_context(&self) -> &BrokerStorageContext {
+        &self.storage_context
+    }
+
+    pub(crate) fn configure_storage_context_for_child(
+        &self,
+        command: &mut Command,
+    ) -> Result<(), BrokerOpError> {
+        self.storage_context.ensure_valid()?;
+        set_command_path(
+            command,
+            "AETHYME_HOST_STATE_DIR",
+            self.storage_context.host_state_dir.as_deref(),
+        );
+        set_command_path(
+            command,
+            "AETHYME_HOST_CACHE_DIR",
+            self.storage_context.host_cache_dir.as_deref(),
+        );
+        let broker_database_path = self.store.db_path();
+        if !broker_database_path.is_absolute() {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "broker database path for a child must be absolute".into(),
+            });
+        }
+        set_command_path(command, "AETHYME_BROKER_DB", Some(broker_database_path));
+        command.env(
+            BROKER_OPEN_HOST_STATE_EXPLICIT_ENV,
+            if self.storage_context.host_state_dir_is_explicit {
+                "true"
+            } else {
+                "false"
+            },
+        );
+
+        let mut child_context = self.storage_context.clone();
+        child_context.host_operation_db_path = self
+            .host_operation_db_path
             .clone()
-            .map(Ok)
-            .unwrap_or_else(|| crate::default_host_operation_db_path().map_err(Into::into))
+            .or(child_context.host_operation_db_path.clone());
+        set_command_path(
+            command,
+            BROKER_OPEN_HOST_OPERATION_DB_ENV,
+            child_context.host_operation_db_path.as_deref(),
+        );
+
+        if let Some(path) = &self.worktree_root_override {
+            command.env(BROKER_OPEN_WORKTREE_ROOT_ENV, path);
+            command.env_remove("AETHYME_WORKTREE_ROOT");
+            child_context.worktree_root_override = Some(path.clone());
+            child_context.worktree_root_environment_override = None;
+        } else if let Some(path) = &self.storage_context.worktree_root_override {
+            command.env(BROKER_OPEN_WORKTREE_ROOT_ENV, path);
+            command.env_remove("AETHYME_WORKTREE_ROOT");
+            child_context.worktree_root_override = Some(path.clone());
+            child_context.worktree_root_environment_override = None;
+        } else {
+            command.env_remove(BROKER_OPEN_WORKTREE_ROOT_ENV);
+            set_command_path(
+                command,
+                "AETHYME_WORKTREE_ROOT",
+                self.storage_context
+                    .worktree_root_environment_override
+                    .as_deref(),
+            );
+            child_context.worktree_root_override = None;
+        }
+
+        let collaboration_root = self
+            .collaboration_state_override
+            .as_deref()
+            .map(|host_state| host_state.join("collaboration"))
+            .or_else(|| self.storage_context.collaboration_state_dir.clone())
+            .or_else(|| {
+                (self.storage_context.host_state_dir_is_explicit)
+                    .then(|| {
+                        self.storage_context
+                            .host_state_dir
+                            .as_ref()
+                            .map(|path| path.join("collaboration"))
+                    })
+                    .flatten()
+            });
+        set_command_path(
+            command,
+            BROKER_OPEN_COLLABORATION_ROOT_ENV,
+            collaboration_root.as_deref(),
+        );
+        child_context.collaboration_state_dir = collaboration_root;
+        let encoded = CapturedBrokerStorageContextV2::encode(&child_context)?;
+        command.env(BROKER_OPEN_STORAGE_CONTEXT_ENV, encoded);
+        Ok(())
+    }
+
+    pub(crate) fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {
+        self.storage_context.ensure_valid()?;
+        let path = self
+            .host_operation_db_path
+            .clone()
+            .or_else(|| self.storage_context.host_operation_db_path.clone())
+            .ok_or_else(|| crate::HostOperationError::StateDirectoryUnavailable)?;
+        if !path.is_absolute() {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "host-operation database path must be absolute".into(),
+            });
+        }
+        Ok(path)
     }
 
     pub fn store(&mut self) -> &mut BrokerStore {
@@ -1763,11 +2518,17 @@ impl Broker {
     }
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
+        self.storage_context.ensure_valid()?;
         let git_common_dir = self.main_git_common_dir()?;
-        Ok(plan_worktree_root_for(
+        let mut context = self.storage_context.clone();
+        if let Some(root) = &self.worktree_root_override {
+            context.worktree_root_override = Some(root.clone());
+            context.worktree_root_environment_override = None;
+        }
+        Ok(plan_worktree_root_with_context(
             &self.main_root,
             Some(&git_common_dir),
-            self.worktree_root_override.as_deref(),
+            &context,
         ))
     }
 
@@ -2768,6 +3529,7 @@ mod worktree_root_candidate_tests {
             preferred_outside_repository: true,
             host_state_fallback_root: Some(PathBuf::from("/host/worktrees/repo-key")),
             preferred_unavailable_reason: unavailable.map(str::to_string),
+            storage_context_refusal: None,
         }
     }
 
