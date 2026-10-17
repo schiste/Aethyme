@@ -590,7 +590,7 @@ pub(crate) fn probe(
         lap_state,
     }) = state
     else {
-        return Ok(Some(if root_has_debt_rows(&connection, &root)? {
+        return Ok(Some(if root_has_debt_rows(&connection, root)? {
             JournalProbe::Unknown
         } else {
             JournalProbe::NoDebt

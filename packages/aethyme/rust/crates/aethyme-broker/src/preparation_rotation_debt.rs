@@ -51,7 +51,7 @@ impl DirectoryIdentity {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if !is_hex(&self.filesystem_id, 2, 128) || self.filesystem_id.len() % 2 != 0 {
+        if !is_hex(&self.filesystem_id, 2, 128) || !self.filesystem_id.len().is_multiple_of(2) {
             return Err(invalid_record("filesystem identity is malformed"));
         }
         Ok(())
@@ -1012,12 +1012,14 @@ fn prepare_tree_witness(
 
         if let Some(scratch) = scratch {
             promote_tree_witness(
-                &root,
-                retained,
-                step,
-                &store_name,
-                &directory,
-                &directory_identity,
+                TreeWitnessTarget {
+                    root: &root,
+                    retained,
+                    step,
+                    store_name: &store_name,
+                    directory: &directory,
+                    directory_identity: &directory_identity,
+                },
                 &scratch_name,
                 &witness_name,
                 &bytes,
@@ -1030,12 +1032,14 @@ fn prepare_tree_witness(
                 ));
             }
             publish_tree_witness(
-                &root,
-                retained,
-                step,
-                &store_name,
-                &directory,
-                &directory_identity,
+                TreeWitnessTarget {
+                    root: &root,
+                    retained,
+                    step,
+                    store_name: &store_name,
+                    directory: &directory,
+                    directory_identity: &directory_identity,
+                },
                 &scratch_name,
                 &witness_name,
                 &bytes,
@@ -1061,17 +1065,30 @@ fn prepare_tree_witness(
     })
 }
 
-fn publish_tree_witness(
-    root: &File,
-    retained: &RetainedRotationDebt,
+#[derive(Clone, Copy)]
+struct TreeWitnessTarget<'a> {
+    root: &'a File,
+    retained: &'a RetainedRotationDebt,
     step: RecoveryStep,
-    store_name: &CStr,
-    directory: &File,
-    directory_identity: &DirectoryIdentity,
+    store_name: &'a CStr,
+    directory: &'a File,
+    directory_identity: &'a DirectoryIdentity,
+}
+
+fn publish_tree_witness(
+    target: TreeWitnessTarget<'_>,
     scratch_name: &CStr,
     witness_name: &CStr,
     bytes: &[u8],
 ) -> io::Result<()> {
+    let TreeWitnessTarget {
+        root,
+        retained,
+        step,
+        store_name,
+        directory,
+        directory_identity,
+    } = target;
     verify_named_rotation_tree(root, retained, step, store_name, directory_identity)?;
     let mut scratch = create_regular_exclusive(directory.as_raw_fd(), scratch_name)?;
     scratch.write_all(bytes)?;
@@ -1107,17 +1124,20 @@ fn publish_tree_witness(
 }
 
 fn promote_tree_witness(
-    root: &File,
-    retained: &RetainedRotationDebt,
-    step: RecoveryStep,
-    store_name: &CStr,
-    directory: &File,
-    directory_identity: &DirectoryIdentity,
+    target: TreeWitnessTarget<'_>,
     scratch_name: &CStr,
     witness_name: &CStr,
     bytes: &[u8],
     expected: &ReadComponent,
 ) -> io::Result<()> {
+    let TreeWitnessTarget {
+        root,
+        retained,
+        step,
+        store_name,
+        directory,
+        directory_identity,
+    } = target;
     verify_named_rotation_tree(root, retained, step, store_name, directory_identity)?;
     let scratch = read_component(directory.as_raw_fd(), scratch_name)?
         .ok_or_else(|| invalid_record("retired-tree witness scratch disappeared"))?;
