@@ -5024,7 +5024,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_open_keeps_rotation_debt_pending_when_sweep_is_disabled() {
+    fn broker_open_keeps_published_rotation_debt_pending_when_sweep_is_disabled() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
@@ -5039,27 +5039,41 @@ mod tests {
         .unwrap();
 
         let storage = crate::test_storage::TestStorage::new();
-        let mut broker = storage.open(root).unwrap();
+        let broker = storage.open(root).unwrap();
         let cache_root = broker
             .storage_context()
             .preparation_cache_root()
             .expect("test storage has a captured preparation-cache root");
         std::fs::create_dir_all(&cache_root).unwrap();
         let repository = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let store = cache_root.join(repository);
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("payload"), b"preserve until verified recovery").unwrap();
+        let debt = crate::preparation::rotation_debt::RotationDebt::new(
+            repository,
+            &crate::preparation::rotation_debt::new_transaction_id(),
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap(),
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        crate::preparation::rotation_debt::publish(&cache_root, debt).unwrap();
+        let retained = crate::preparation::rotation_debt::read(&cache_root, repository)
+            .unwrap()
+            .expect("the witness is published before the cache is retired");
+        crate::preparation::rotation_debt::retire_original_store(&cache_root, &retained).unwrap();
         let retired = cache_root.join(format!("{repository}.retired"));
-        std::fs::create_dir(&retired).unwrap();
-        std::fs::write(retired.join("payload"), b"preserve until verified recovery").unwrap();
+        drop(broker);
 
-        assert!(broker.resume_gc_maintenance().unwrap().is_none());
-
-        assert!(broker.artifact_sweep_recovery_requested().unwrap());
-        let requested = broker
+        // This is a normal startup path. No explicit maintenance call repairs
+        // the state: Broker::open must notice the published witness itself.
+        let mut reopened = storage.open(root).unwrap();
+        let requested = reopened
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        let completed = broker
+        let completed = reopened
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
             .unwrap()
@@ -5067,12 +5081,84 @@ mod tests {
             .unwrap_or(0);
         assert!(
             requested > completed,
-            "the recovery request remains pending"
+            "the recovered request remains pending"
+        );
+        assert!(
+            crate::preparation::rotation_debt::read(&cache_root, repository)
+                .unwrap()
+                .is_some(),
+            "zero-budget startup must retain the durable debt witness"
         );
         assert_eq!(
             std::fs::read(retired.join("payload")).unwrap(),
             b"preserve until verified recovery",
-            "a disabled zero-budget sweep must not claim or perform recovery"
+            "zero-budget startup must not delete the old cache store"
+        );
+    }
+
+    #[test]
+    fn broker_open_keeps_missing_cache_parent_pending_with_positive_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 5000\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut first = storage.open(root).unwrap();
+        let cache_root = first
+            .storage_context()
+            .preparation_cache_root()
+            .expect("test storage has a captured preparation-cache root");
+        let cache_parent = cache_root.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&cache_root).unwrap();
+        for key in [
+            ARTIFACT_SWEEP_STAMP_KEY,
+            ARTIFACT_SWEEP_PROGRESS_KEY,
+            ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+            ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY,
+            ARTIFACT_SWEEP_RETRY_AFTER_KEY,
+        ] {
+            first.store().meta_set(key, "").unwrap();
+        }
+        first
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "0")
+            .unwrap();
+        first
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "0")
+            .unwrap();
+        drop(first);
+        std::fs::remove_dir_all(&cache_parent).unwrap();
+
+        let mut reopened = storage.open(root).unwrap();
+        let requested = reopened
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = reopened
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(
+            requested > completed,
+            "unknown cache location must remain pending"
+        );
+        assert!(
+            !cache_parent.exists(),
+            "a missing captured cache parent must not be recreated by maintenance"
         );
     }
 

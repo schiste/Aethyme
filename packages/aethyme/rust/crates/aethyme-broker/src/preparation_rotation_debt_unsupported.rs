@@ -48,6 +48,13 @@ pub(crate) fn probe(_cache_root: &Path, _max_entries: usize, _deadline: Instant)
     DebtProbe::Unknown
 }
 
+pub(crate) fn cache_root_absent_under_observed_parent(
+    _cache_root: &Path,
+    _deadline: Instant,
+) -> io::Result<bool> {
+    Err(unsupported())
+}
+
 pub(crate) fn recover(
     _cache_root: &Path,
     _repository: &str,

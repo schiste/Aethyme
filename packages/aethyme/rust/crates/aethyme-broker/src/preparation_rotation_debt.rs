@@ -248,6 +248,29 @@ fn open_real_directory_chain(path: &Path, deadline: Instant) -> io::Result<File>
     Ok(directory)
 }
 
+/// Return true only when the cache-root entry is absent under a pinned, real
+/// parent directory. A missing or ambiguous ancestor is an error, not proof
+/// that the cache is clear; in particular, a detached or unavailable mount
+/// must keep recovery pending.
+pub(crate) fn cache_root_absent_under_observed_parent(
+    cache_root: &Path,
+    deadline: Instant,
+) -> io::Result<bool> {
+    if Instant::now() >= deadline {
+        return Err(deadline_error());
+    }
+    let parent = cache_root
+        .parent()
+        .ok_or_else(|| invalid_record("cache root has no parent directory"))?;
+    let name = cache_root
+        .file_name()
+        .ok_or_else(|| invalid_record("cache root has no final component"))?;
+    let parent = open_real_directory_chain(parent, deadline)?;
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| invalid_record("cache root component contains NUL"))?;
+    Ok(!entry_exists(parent.as_raw_fd(), &name)?)
+}
+
 /// Exact progress from one repository's debt recovery. Rotation recovery does
 /// not guess bytes from paths; `bytes_reclaimed` remains zero unless a caller
 /// has an independent measured count. Entry counts come from successful
@@ -396,7 +419,12 @@ pub(crate) fn inventory(
     let root = match open_cache_root(cache_root) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(DebtInventory::empty());
+            if cache_root_absent_under_observed_parent(cache_root, deadline)? {
+                return Ok(DebtInventory::empty());
+            }
+            return Err(invalid_record(
+                "preparation cache root changed while absence was being verified",
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -1940,6 +1968,41 @@ mod tests {
         .expect_err("unwitnessed retired bytes are not deletion authority");
         assert!(!error.progress.complete);
         assert_eq!(fs::read(retired.join("payload")).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn inventory_requires_a_real_observed_parent_for_absent_cache_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let absent = inventory(
+            &parent.join("missing-cache"),
+            100,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(absent.complete);
+        assert!(absent.repositories.is_empty());
+
+        let missing_parent = inventory(
+            &parent.join("missing-parent/cache"),
+            100,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect_err("a missing ancestor cannot prove the cache root is clear");
+        assert_eq!(missing_parent.kind(), std::io::ErrorKind::NotFound);
+
+        let alias = parent.join("parent-alias");
+        symlink(&parent, &alias).unwrap();
+        assert!(
+            inventory(
+                &alias.join("ambiguous-cache"),
+                100,
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1516,11 +1516,18 @@ fn sweep_preparation_cache_with_discovery(
     let cache_metadata = match std::fs::symlink_metadata(cache_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let root_absent =
+                crate::preparation::rotation_debt::cache_root_absent_under_observed_parent(
+                    cache_root, deadline,
+                )
+                .unwrap_or(false);
+            let no_inventory_debt =
+                inventory.repositories.is_empty() && inventory.blocked_repositories.is_empty();
             return preparation_cache_sweep_report(
                 removed,
                 bytes,
                 filesystem_entries_reclaimed,
-                complete,
+                complete && no_inventory_debt && root_absent,
             );
         }
         Err(_) => {
@@ -4829,6 +4836,33 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn preparation_cache_sweep_does_not_complete_when_cache_parent_disappears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let cache_parent = tmp.path().join("host-cache");
+        let cache_root = cache_parent.join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+
+        let report = sweep_preparation_cache_with_discovery(
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            |_| {
+                std::fs::remove_dir(&cache_root).unwrap();
+                std::fs::remove_dir(&cache_parent).unwrap();
+                Ok(vec![main_root.clone()])
+            },
+        );
+
+        assert!(!report.complete);
+        assert!(!cache_root.exists());
+        assert!(!cache_parent.exists());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
