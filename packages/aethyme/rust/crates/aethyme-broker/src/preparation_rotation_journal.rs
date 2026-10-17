@@ -26,6 +26,7 @@ const MAX_ROOT_ROWS: i64 = 32;
 const MAX_PAGE_ROWS: i64 = 32;
 const MAX_PAGE_COUNT: i64 = 512;
 const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_ROLLBACK_JOURNAL_BYTES: u64 = 2 * MAX_DATABASE_BYTES;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(150);
 const LAP_IDLE: i64 = 0;
 const LAP_ACTIVE: i64 = 1;
@@ -665,6 +666,7 @@ fn valid_repository(repository: &str) -> bool {
 fn open_writer(path: &Path) -> io::Result<Connection> {
     validate_parent(path)?;
     validate_existing_file(path)?;
+    validate_sqlite_sidecars(path, true)?;
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -673,6 +675,17 @@ fn open_writer(path: &Path) -> io::Result<Connection> {
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(sqlite_error)?;
+
+    // Refuse unknown schemas before chmod, page-limit changes, or journal-mode
+    // conversion. SQLite may first perform its own bounded rollback recovery.
+    validate_schema_before_writer(&connection)?;
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(invalid_data("rotation journal is not in DELETE mode"));
+    }
+
     tighten_database_permissions(path)?;
     connection
         .pragma_update(None, "page_size", 4096_i64)
@@ -686,12 +699,6 @@ fn open_writer(path: &Path) -> io::Result<Connection> {
     connection
         .pragma_update(None, "journal_mode", "DELETE")
         .map_err(sqlite_error)?;
-    let journal_mode: String = connection
-        .pragma_query_value(None, "journal_mode", |row| row.get(0))
-        .map_err(sqlite_error)?;
-    if !journal_mode.eq_ignore_ascii_case("delete") {
-        return Err(invalid_data("rotation journal is not in DELETE mode"));
-    }
     connection
         .pragma_update(None, "synchronous", "FULL")
         .map_err(sqlite_error)?;
@@ -707,6 +714,7 @@ fn open_writer(path: &Path) -> io::Result<Connection> {
     connection
         .pragma_update(None, "max_page_count", MAX_PAGE_COUNT)
         .map_err(sqlite_error)?;
+    validate_sqlite_sidecars(path, false)?;
     Ok(connection)
 }
 
@@ -718,6 +726,15 @@ fn open_reader(path: &Path) -> io::Result<Option<Connection>> {
         Ok(_) => {}
     }
     validate_existing_file(path)?;
+    validate_sqlite_sidecars(path, true)?;
+    if has_rollback_journal(path)? {
+        // Read-only SQLite cannot safely recover a hot rollback journal. Run
+        // the same bounded/schema-checked writer open once, then reopen read
+        // only after SQLite has completed recovery and removed the sidecar.
+        drop(open_writer(path)?);
+        check_database_size(path)?;
+    }
+    validate_sqlite_sidecars(path, false)?;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
@@ -725,6 +742,12 @@ fn open_reader(path: &Path) -> io::Result<Option<Connection>> {
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(sqlite_error)?;
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(invalid_data("rotation journal is not in DELETE mode"));
+    }
     connection
         .pragma_update(None, "query_only", "ON")
         .map_err(sqlite_error)?;
@@ -783,6 +806,80 @@ fn tighten_database_permissions(path: &Path) -> io::Result<()> {
     }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+fn validate_schema_before_writer(connection: &Connection) -> io::Result<()> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if version == SCHEMA_VERSION {
+        if ensure_schema(connection, false)? {
+            return Ok(());
+        }
+        return Err(invalid_data("rotation journal schema is unsupported"));
+    }
+    if version != 0 {
+        return Err(invalid_data(
+            "rotation journal schema version is unsupported",
+        ));
+    }
+    let tables: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if tables != 0 {
+        return Err(invalid_data("unversioned rotation journal is not empty"));
+    }
+    Ok(())
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn has_rollback_journal(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(sidecar_path(path, "-journal")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn require_sidecar_absent(path: &Path, suffix: &str) -> io::Result<()> {
+    match std::fs::symlink_metadata(sidecar_path(path, suffix)) {
+        Ok(_) => Err(invalid_data("unexpected rotation journal SQLite sidecar")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_sqlite_sidecars(path: &Path, allow_rollback_journal: bool) -> io::Result<()> {
+    let rollback = sidecar_path(path, "-journal");
+    match std::fs::symlink_metadata(&rollback) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(metadata) => {
+            if !allow_rollback_journal
+                || metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != effective_uid()
+                || metadata.mode() & 0o077 != 0
+                || metadata.len() > MAX_ROLLBACK_JOURNAL_BYTES
+            {
+                return Err(invalid_data(
+                    "rotation journal rollback sidecar identity or size is unsafe",
+                ));
+            }
+        }
+    }
+    require_sidecar_absent(path, "-wal")?;
+    require_sidecar_absent(path, "-shm")
 }
 
 fn effective_uid() -> u32 {
@@ -1000,11 +1097,13 @@ fn check_database_size(path: &Path) -> io::Result<()> {
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.nlink() != 1
+        || metadata.uid() != effective_uid()
+        || metadata.mode() & 0o077 != 0
         || metadata.len() > MAX_DATABASE_BYTES
     {
         return Err(invalid_data("rotation journal exceeded its file bound"));
     }
-    Ok(())
+    validate_sqlite_sidecars(path, false)
 }
 
 fn sqlite_error(error: rusqlite::Error) -> io::Error {
@@ -1400,6 +1499,107 @@ mod tests {
         assert_eq!(generation, 1);
         assert_eq!(debt_count, 1);
         assert_eq!(payload, b"debt-a");
+    }
+
+    #[test]
+    fn future_schema_refusal_preserves_database_bytes_and_permissions() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"debt-a");
+        let path = path_for_resource_db(&fixture.resource_db).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        let original = std::fs::read(&path).unwrap();
+        let original_mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+
+        assert!(
+            publish(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                REPOSITORY_B,
+                b"debt-b"
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mode() & 0o777,
+            original_mode
+        );
+    }
+
+    #[test]
+    fn wal_database_and_sidecar_are_refused_without_mutation() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"debt-a");
+        let path = path_for_resource_db(&fixture.resource_db).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        let mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert!(mode.eq_ignore_ascii_case("wal"));
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE rotation_root SET generation=generation+1 WHERE root_path=?1",
+                params![fixture.cache_root.as_os_str().as_bytes()],
+            )
+            .unwrap();
+        let wal_path = sidecar_path(&path, "-wal");
+        let wal_bytes = std::fs::read(&wal_path).unwrap();
+        assert!(!wal_bytes.is_empty());
+        let main_bytes = std::fs::read(&path).unwrap();
+        let original_mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+
+        assert!(
+            publish(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                REPOSITORY_B,
+                b"debt-b"
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), main_bytes);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().mode() & 0o777,
+            original_mode
+        );
+        drop(connection);
+    }
+
+    #[test]
+    fn oversized_rollback_sidecar_is_refused_without_mutation() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"debt-a");
+        let path = path_for_resource_db(&fixture.resource_db).unwrap();
+        let rollback = sidecar_path(&path, "-journal");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&rollback)
+            .unwrap();
+        file.set_len(MAX_ROLLBACK_JOURNAL_BYTES + 1).unwrap();
+        drop(file);
+        let original = std::fs::read(&path).unwrap();
+
+        assert!(begin_lap(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&rollback).unwrap().len(),
+            MAX_ROLLBACK_JOURNAL_BYTES + 1
+        );
     }
 
     #[test]
