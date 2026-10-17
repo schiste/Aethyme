@@ -6,8 +6,9 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
 use aethyme_broker::hooks::{HooksPathProblem, inspect_hooks_path};
+
+mod common;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -28,8 +29,8 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture() -> common::FixtureRepository {
+    let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "README.md"]);
@@ -48,17 +49,10 @@ fn make_executable(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn host_state_dir(repo: &Path) -> std::path::PathBuf {
-    repo.join(".aethyme/test-host-state")
-}
-
-fn doctor_json(repo: &Path, global_config: &Path) -> serde_json::Value {
-    drop(
-        Broker::open(repo)
-            .unwrap()
-            .with_host_operation_database(host_state_dir(repo).join("host-operations.db")),
-    );
-    let output = run(repo, global_config, &["status", "doctor", "--json"]);
+fn doctor_json(fixture: &common::FixtureRepository, global_config: &Path) -> serde_json::Value {
+    let broker = common::open_fixture_repository_broker(fixture).unwrap();
+    drop(broker);
+    let output = run(fixture, global_config, &["status", "doctor", "--json"]);
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
             "doctor --json: {error}: {}",
@@ -67,14 +61,17 @@ fn doctor_json(repo: &Path, global_config: &Path) -> serde_json::Value {
     })
 }
 
-fn run(repo: &Path, global_config: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .env("AETHYME_HOST_STATE_DIR", host_state_dir(repo))
-        .env("GIT_CONFIG_GLOBAL", global_config)
-        .output()
-        .unwrap()
+fn run(fixture: &common::FixtureRepository, global_config: &Path, args: &[&str]) -> Output {
+    let broker = common::open_fixture_repository_broker(fixture).unwrap();
+    let mut command = common::broker_cli(CLI, args);
+    command
+        .current_dir(fixture.path())
+        .env("GIT_CONFIG_GLOBAL", global_config);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    drop(broker);
+    command.output().unwrap()
 }
 
 #[test]
@@ -182,7 +179,7 @@ fn doctor_reports_a_global_hooks_path_with_its_scope_and_fix() {
     )
     .unwrap();
 
-    let report = doctor_json(tmp.path(), &global);
+    let report = doctor_json(&tmp, &global);
     let finding = &report["hooks_path"];
     assert_eq!(finding["problem"], "missing", "{report}");
     assert_eq!(finding["scope"], "global", "{report}");
@@ -191,8 +188,8 @@ fn doctor_reports_a_global_hooks_path_with_its_scope_and_fix() {
         "{report}"
     );
 
-    let text = String::from_utf8_lossy(&run(tmp.path(), &global, &["status", "doctor"]).stdout)
-        .into_owned();
+    let text =
+        String::from_utf8_lossy(&run(&tmp, &global, &["status", "doctor"]).stdout).into_owned();
     assert!(
         text.contains("git hooks: core.hooksPath")
             && text.contains("does not exist")
@@ -213,6 +210,6 @@ fn doctor_omits_the_section_when_hooks_path_is_healthy() {
     let tmp = fixture();
     let global = tmp.path().join("global.gitconfig");
     std::fs::write(&global, "").unwrap();
-    let report = doctor_json(tmp.path(), &global);
+    let report = doctor_json(&tmp, &global);
     assert!(report.get("hooks_path").is_none(), "{report}");
 }
