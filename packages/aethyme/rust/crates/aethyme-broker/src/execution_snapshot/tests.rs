@@ -200,6 +200,14 @@ fn materialization_rejects_aggregate_node_limit_plus_one() {
 }
 
 #[test]
+fn portable_accepts_shared_directory_prefixes() {
+    let source = manifest(["shared/a.txt".into(), "shared/nested/b.txt".into()]);
+
+    assert!(portable(&source).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
 fn inspect_rejects_node_overflow_before_portability_prefix_allocation() {
     // The leading backslash path makes portable() return immediately if it
     // runs before the aggregate node preflight. Without that preflight this

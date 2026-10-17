@@ -384,8 +384,7 @@ fn inspect(
     }
     // Bound prefix-map growth before portability validation. The aggregate
     // check in `inspect_roles` still accounts for every role together; this
-    // single-role preflight prevents one manifest from making `portable`
-    // allocate an unbounded number of path prefixes first.
+    // single-role preflight bounds the distinct prefixes `portable` may keep.
     validate_materialization_bounds(&[("source", &snapshot)])?;
     portable(&snapshot)?;
     for entry in snapshot.entries() {
