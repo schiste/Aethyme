@@ -1,5 +1,7 @@
 # Broker worktree storage lifecycle
 
+Last Updated: 2026-10-17
+
 The broker must account for worktree storage after its repository or placement
 configuration disappears. A placement rule alone is insufficient: temporary
 origins and changes between configured, host-state and fallback locations can
@@ -26,6 +28,23 @@ inventory pages and a bounded SQLite file. Maintenance saves its rotating
 cursor even when capacity prevents admission, so a full index can recover
 without repeatedly inspecting only its first page. Missing records are pruned
 only when absence is established on the recorded mounted filesystem.
+
+Admission checks that exact history domain and its capacity before creating a
+worktree root, then holds the registry lock through root creation and recording.
+A failed placement may use the reported repository fallback while history is
+available. Unavailable history refuses new allocation; it never selects another
+coordination domain. Git checkout, session registration and agent launch wait
+for the root record to succeed. A crash or late I/O failure before that record
+can leave an empty directory or ownership marker outside the index; this is
+control debris, and is not a promise of atomic filesystem admission. No checkout
+or cache payload is allocated in that window.
+
+Reusing a canonical pathname cannot replace an older filesystem proof. An
+existing row must still match the root, origin and ownership marker before
+admission, and is rechecked before recording. Changed or unknown evidence is
+retained and refuses replacement. On platforms without filesystem identity,
+only byte-identical idempotent reuse is allowed; that opaque history remains
+protected from automatic reclamation.
 
 ## Reclamation authority
 

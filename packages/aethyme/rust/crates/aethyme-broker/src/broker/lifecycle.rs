@@ -1878,6 +1878,32 @@ impl Broker {
         require_external: bool,
     ) -> Result<PathBuf, BrokerOpError> {
         let min_free_bytes = self.configured_worktree_minimum(source)?;
+        // Verify the write volume before creating even the registry's control
+        // state. Hold its capacity exclusion through root creation/recording;
+        // a full or unavailable history must not strand another external root.
+        preflight_worktree_root(
+            &self.main_root,
+            path,
+            source,
+            require_external,
+            min_free_bytes,
+            crate::verification::removable_volume_unavailable_reason,
+            |candidate| {
+                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
+                    .map(|headroom| headroom.bytes)
+            },
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: path.to_path_buf(),
+            reason,
+        })?;
+        let admission =
+            crate::worktree_registry::admit(&self.host_operation_database_path()?, path).map_err(
+                |error| BrokerOpError::WorktreeRootUnavailable {
+                    path: path.to_path_buf(),
+                    reason: format!("cannot retain worktree storage discovery: {error}"),
+                },
+            )?;
         let root = prepare_worktree_root_directory(
             &self.main_root,
             path,
@@ -1911,20 +1937,20 @@ impl Broker {
             }
         })?;
         self.write_or_verify_worktree_root_marker(&root)?;
-        crate::worktree_registry::register(
-            &self.host_operation_database_path()?,
-            &root,
-            &WorktreeRootMarker {
-                schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
-                repository_key: self.repository_worktree_key()?,
-                repository_root: self.main_root.clone(),
-            },
-            source,
-        )
-        .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
-            path: root.clone(),
-            reason: format!("cannot retain worktree storage discovery: {error}"),
-        })?;
+        admission
+            .record(
+                &root,
+                &WorktreeRootMarker {
+                    schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+                    repository_key: self.repository_worktree_key()?,
+                    repository_root: self.main_root.clone(),
+                },
+                source,
+            )
+            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot retain worktree storage discovery: {error}"),
+            })?;
         // Best effort on purpose: this is a disk-hygiene default, and failing
         // to start a session over one is a far worse outcome than building a
         // worktree the way cargo would have anyway.

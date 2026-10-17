@@ -173,16 +173,19 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
 }
 
 #[test]
-fn unavailable_host_state_uses_reported_legacy_fallback() {
+fn unavailable_host_placement_uses_reported_registered_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("project");
-    let blocked_state = tmp.path().join("not-a-directory");
+    let state = tmp.path().join("state");
     fixture_at(&repo);
-    std::fs::write(&blocked_state, "blocked\n").unwrap();
+    std::fs::create_dir(&state).unwrap();
+    // Placement can fail while its independent coordination domain remains
+    // healthy. Losing the entire host-state domain is a different failure.
+    std::fs::write(state.join("worktrees"), "blocked\n").unwrap();
 
     let started = json(run(
         &repo,
-        &blocked_state,
+        &state,
         &["start", "--task", "fallback", "--json"],
     ));
     let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
@@ -199,6 +202,91 @@ fn unavailable_host_state_uses_reported_legacy_fallback() {
             .unwrap()
             .contains("cannot prepare broker worktree root")
     );
+    let registry = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("worktree-roots-")
+        })
+        .unwrap()
+        .join("registry.sqlite3");
+    let history =
+        rusqlite::Connection::open_with_flags(registry, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let payload: String = history
+        .query_row("SELECT payload FROM roots", [], |row| row.get(0))
+        .unwrap();
+    let retained: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        retained["root"],
+        worktree.parent().unwrap().to_str().unwrap()
+    );
+    assert_eq!(retained["source"], "repository_fallback");
+}
+
+#[test]
+fn unavailable_history_refuses_before_fallback_root_checkout_or_agent_creation() {
+    for agent in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("project");
+        let blocked_state = tmp.path().join("not-a-directory");
+        let sentinel = tmp.path().join("agent-ran");
+        fixture_at(&repo);
+        std::fs::write(&blocked_state, "preserve blocker\n").unwrap();
+        let args = if agent {
+            vec![
+                "start",
+                "--task",
+                "unavailable history",
+                "--cmd",
+                "printf ran > \"$AETHYME_TEST_AGENT_SENTINEL\"",
+                "--json",
+            ]
+        } else {
+            vec!["start", "--task", "unavailable history", "--json"]
+        };
+        let output = common::broker_cli(CLI, &args)
+            .current_dir(&repo)
+            .env("AETHYME_HOST_STATE_DIR", &blocked_state)
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            .env("AETHYME_TEST_AGENT_SENTINEL", &sentinel)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("cannot retain worktree storage discovery"),
+            "{error}"
+        );
+        assert!(
+            !repo.join(".aethyme/worktrees").exists(),
+            "history refusal must precede root creation"
+        );
+        assert!(!sentinel.exists(), "unadmitted agent executed");
+        assert_eq!(
+            std::fs::read_to_string(&blocked_state).unwrap(),
+            "preserve blocker\n"
+        );
+        let branches = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(branches.status.success());
+        assert!(branches.stdout.is_empty(), "unadmitted branch was created");
+        let database = rusqlite::Connection::open_with_flags(
+            repo.join(".aethyme/broker.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let sessions: u64 = database
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 0, "unadmitted session was registered");
+    }
 }
 
 #[test]

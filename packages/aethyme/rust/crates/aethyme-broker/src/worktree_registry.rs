@@ -418,8 +418,172 @@ fn page(connection: &Connection, after: &str) -> io::Result<Vec<(String, String)
     Ok(result)
 }
 
-/// Called before admitting a worktree. Registry failure refuses admission;
-/// silently creating undiscoverable storage would recreate the original leak.
+/// Holds the host-domain exclusion from capacity admission until the exact
+/// created root has been recorded. Git checkout/session allocation must wait
+/// for `record` to succeed.
+pub(crate) struct RegistrationAdmission {
+    root: PathBuf,
+    existing_payload: Option<String>,
+    connection: Connection,
+    _exclusion: crate::file_lock::ExclusiveFileLock,
+}
+
+pub(crate) fn admit(
+    host_database: &Path,
+    planned_root: &Path,
+) -> io::Result<RegistrationAdmission> {
+    admit_with_limit(host_database, planned_root, MAX_RECORDS)
+}
+
+fn admit_with_limit(
+    host_database: &Path,
+    planned_root: &Path,
+    limit: usize,
+) -> io::Result<RegistrationAdmission> {
+    let root = crate::broker::lifecycle::canonical_prefix(planned_root).map_err(invalid)?;
+    registry_outside_root(host_database, &root)?;
+    let exclusion = registry_lock(host_database, true)?;
+    let mut connection = open_registry(host_database, true)?;
+    maintain_capacity(&mut connection, &record_key(&root), limit)?;
+    let existing_payload = retained_registration(&connection, &root)?;
+    if let Some(payload) = &existing_payload {
+        validate_retained_registration(&root, payload)?;
+    }
+    Ok(RegistrationAdmission {
+        root,
+        existing_payload,
+        connection,
+        _exclusion: exclusion,
+    })
+}
+
+impl RegistrationAdmission {
+    pub(crate) fn record(
+        mut self,
+        root: &Path,
+        marker: &WorktreeRootMarker,
+        source: WorktreeRootSource,
+    ) -> io::Result<()> {
+        let root = fs::canonicalize(root)?;
+        if root != self.root {
+            return Err(invalid("worktree root changed after storage admission"));
+        }
+        let actual = read_marker(&root)?;
+        if actual.schema_version != marker.schema_version
+            || actual.repository_key != marker.repository_key
+            || actual.repository_root != marker.repository_root
+        {
+            return Err(invalid("worktree marker differs from admission owner"));
+        }
+        let record = RootRecord {
+            schema_version: 1,
+            root: root.clone(),
+            repository_key: marker.repository_key.clone(),
+            repository_root: marker.repository_root.clone(),
+            source,
+            identity: directory_identity(&root, &real_directory(&root)?)?,
+            origin_identity: directory_identity(
+                &marker.repository_root,
+                &real_directory(&marker.repository_root)?,
+            )?,
+        };
+        let payload = serde_json::to_string(&record).map_err(invalid)?;
+        if payload.len() > MAX_RECORD_BYTES {
+            return Err(invalid(
+                "worktree root identity exceeds registry byte limit",
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(invalid)?;
+        if retained_registration(&transaction, &root)? != self.existing_payload {
+            return Err(invalid("retained root history changed after admission"));
+        }
+        if let Some(previous) = &self.existing_payload {
+            let retained = validate_retained_registration(&root, previous)?;
+            if record.identity != retained.identity
+                || record.origin_identity != retained.origin_identity
+                || record.repository_key != retained.repository_key
+                || record.repository_root != retained.repository_root
+            {
+                return Err(invalid(
+                    "new root observation differs from retained identity or owner",
+                ));
+            }
+            if (retained.identity.is_none() || retained.origin_identity.is_none())
+                && previous != &payload
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unsupported filesystem identity permits only unchanged retained history",
+                ));
+            }
+        }
+        marker_matches(&record)?;
+        if directory_identity(&root, &real_directory(&root)?)? != record.identity {
+            return Err(invalid("root changed during registration"));
+        }
+        match self.existing_payload {
+            Some(previous) if previous == payload => {}
+            Some(previous) => {
+                let updated = transaction
+                    .execute(
+                        "UPDATE roots SET payload=?1 WHERE key=?2 AND payload=?3",
+                        params![payload, record_key(&root), previous],
+                    )
+                    .map_err(invalid)?;
+                if updated != 1 {
+                    return Err(invalid("retained root history changed before update"));
+                }
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO roots(key,payload) VALUES(?1,?2)",
+                        params![record_key(&root), payload],
+                    )
+                    .map_err(invalid)?;
+            }
+        }
+        transaction.commit().map_err(invalid)
+    }
+}
+
+fn retained_registration(connection: &Connection, root: &Path) -> io::Result<Option<String>> {
+    let payload: Option<Option<String>> = connection.query_row(
+        "SELECT CASE WHEN length(CAST(payload AS BLOB)) <= 8192 THEN payload ELSE NULL END FROM roots WHERE key=?1",
+        [record_key(root)], |row| row.get(0),
+    ).optional().map_err(invalid)?;
+    match payload {
+        Some(Some(payload)) => Ok(Some(payload)),
+        Some(None) => Err(invalid("oversized retained root history")),
+        None => Ok(None),
+    }
+}
+
+fn validate_retained_registration(root: &Path, payload: &str) -> io::Result<RootRecord> {
+    let retained = decode(&record_key(root), payload)?;
+    marker_matches(&retained)?;
+    if directory_identity(root, &real_directory(root)?)? != retained.identity {
+        return Err(invalid(
+            "registered root object or filesystem changed; retained history was preserved",
+        ));
+    }
+    if directory_identity(
+        &retained.repository_root,
+        &real_directory(&retained.repository_root)?,
+    )? != retained.origin_identity
+    {
+        return Err(invalid(
+            "registered origin object or filesystem changed; retained history was preserved",
+        ));
+    }
+    Ok(retained)
+}
+
+// Legacy fixture helpers exercise the same pre-creation admission boundary.
+#[cfg(test)]
 pub(crate) fn register(
     host_database: &Path,
     root: &Path,
@@ -429,6 +593,7 @@ pub(crate) fn register(
     register_with_limit(host_database, root, marker, source, MAX_RECORDS)
 }
 
+#[cfg(test)]
 fn register_with_limit(
     host_database: &Path,
     root: &Path,
@@ -436,35 +601,10 @@ fn register_with_limit(
     source: WorktreeRootSource,
     limit: usize,
 ) -> io::Result<()> {
-    let root = fs::canonicalize(root)?;
-    registry_outside_root(host_database, &root)?;
-    let _admission = registry_lock(host_database, true)?;
-    let actual = read_marker(&root)?;
-    if actual.schema_version != marker.schema_version
-        || actual.repository_key != marker.repository_key
-        || actual.repository_root != marker.repository_root
-    {
-        return Err(invalid("worktree marker differs from admission owner"));
-    }
-    let record = RootRecord {
-        schema_version: 1,
-        root: root.clone(),
-        repository_key: marker.repository_key.clone(),
-        repository_root: marker.repository_root.clone(),
-        source,
-        identity: directory_identity(&root, &real_directory(&root)?)?,
-        origin_identity: directory_identity(
-            &marker.repository_root,
-            &real_directory(&marker.repository_root)?,
-        )?,
-    };
-    let payload = serde_json::to_string(&record).map_err(invalid)?;
-    if payload.len() > MAX_RECORD_BYTES {
-        return Err(invalid(
-            "worktree root identity exceeds registry byte limit",
-        ));
-    }
-    let mut connection = open_registry(host_database, true)?;
+    admit_with_limit(host_database, root, limit)?.record(root, marker, source)
+}
+
+fn maintain_capacity(connection: &mut Connection, key: &str, limit: usize) -> io::Result<()> {
     let cursor: String = connection
         .query_row(
             "SELECT value FROM registry_meta WHERE key='prune_cursor'",
@@ -474,9 +614,9 @@ fn register_with_limit(
         .optional()
         .map_err(invalid)?
         .unwrap_or_default();
-    let mut entries = page(&connection, &cursor)?;
+    let mut entries = page(connection, &cursor)?;
     if entries.is_empty() && !cursor.is_empty() {
-        entries = page(&connection, "")?;
+        entries = page(connection, "")?;
     }
     let removable: Vec<_> = entries
         .iter()
@@ -502,14 +642,13 @@ fn register_with_limit(
                 .map_err(invalid)?;
         }
     }
-    let key = record_key(&root);
     let count: usize = transaction
         .query_row("SELECT count(*) FROM roots", [], |row| row.get(0))
         .map_err(invalid)?;
     let exists: bool = transaction
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM roots WHERE key=?1)",
-            [&key],
+            [key],
             |row| row.get(0),
         )
         .map_err(invalid)?;
@@ -523,11 +662,6 @@ fn register_with_limit(
             "worktree registry is full; retry bounded maintenance or inspect retained root history before admitting more storage",
         ));
     }
-    marker_matches(&record)?;
-    if directory_identity(&root, &real_directory(&root)?)? != record.identity {
-        return Err(invalid("root changed during registration"));
-    }
-    transaction.execute("INSERT INTO roots(key,payload) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload", params![key, payload]).map_err(invalid)?;
     transaction.commit().map_err(invalid)
 }
 
@@ -882,6 +1016,200 @@ mod tests {
     }
 
     #[test]
+    fn full_history_refuses_admission_before_creating_the_planned_root() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("existing");
+        register_with_limit(
+            &fixture.database,
+            &root,
+            &owner,
+            WorktreeRootSource::LibraryOverride,
+            1,
+        )
+        .unwrap();
+        let planned = fixture._owned.path().join("must-not-create");
+        let error = admit_with_limit(&fixture.database, &planned, 1)
+            .err()
+            .expect("full history must refuse");
+        assert!(error.to_string().contains("registry is full"));
+        assert!(!planned.exists());
+        let existing = admit_with_limit(&fixture.database, &root, 1).unwrap();
+        existing
+            .record(&root, &owner, WorktreeRootSource::LibraryOverride)
+            .unwrap();
+        assert_eq!(inventory(&fixture.database, None).roots.len(), 1);
+    }
+
+    #[test]
+    fn admission_holds_exclusion_until_the_exact_created_root_is_recorded() {
+        let fixture = Fixture::new();
+        let planned = fixture._owned.path().join("admitted");
+        let admission = admit_with_limit(&fixture.database, &planned, 1).unwrap();
+        assert!(
+            !planned.exists(),
+            "admission must not create its checkout root"
+        );
+        let contender = fixture._owned.path().join("contender");
+        let error = admit_with_limit(&fixture.database, &contender, 1)
+            .err()
+            .expect("exclusion must stay held");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let (root, owner) = fixture.root("admitted");
+        admission
+            .record(&root, &owner, WorktreeRootSource::LibraryOverride)
+            .unwrap();
+        let error = admit_with_limit(&fixture.database, &contender, 1)
+            .err()
+            .expect("the recorded root consumes capacity");
+        assert!(error.to_string().contains("registry is full"));
+        assert!(!contender.exists());
+    }
+
+    #[test]
+    fn admission_cannot_record_a_different_root() {
+        let fixture = Fixture::new();
+        let planned = fixture._owned.path().join("planned");
+        let admission = admit_with_limit(&fixture.database, &planned, 1).unwrap();
+        let (other, owner) = fixture.root("other");
+        fs::write(other.join("preserve.txt"), "unrelated data").unwrap();
+        assert!(
+            admission
+                .record(&other, &owner, WorktreeRootSource::LibraryOverride)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(other.join("preserve.txt")).unwrap(),
+            "unrelated data"
+        );
+        assert!(!planned.exists());
+        assert!(inventory(&fixture.database, None).roots.is_empty());
+    }
+
+    #[test]
+    fn same_path_root_replacement_preserves_the_previous_filesystem_history() {
+        for replace_after_admission in [false, true] {
+            let fixture = Fixture::new();
+            let (root, owner) = fixture.root("root");
+            fs::write(root.join("original.txt"), "preserve original").unwrap();
+            fixture.register(&root, &owner);
+            let previous =
+                retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                    .unwrap();
+            let admission =
+                replace_after_admission.then(|| admit(&fixture.database, &root).unwrap());
+            let held = root.with_extension("held");
+            fs::rename(&root, &held).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::write(
+                root.join(WORKTREE_ROOT_MARKER),
+                serde_json::to_vec(&owner).unwrap(),
+            )
+            .unwrap();
+            fs::write(root.join("replacement.txt"), "preserve replacement").unwrap();
+            if let Some(admission) = admission {
+                assert!(
+                    admission
+                        .record(&root, &owner, WorktreeRootSource::LibraryOverride)
+                        .is_err()
+                );
+            } else {
+                assert!(admit(&fixture.database, &root).is_err());
+            }
+            assert_eq!(
+                retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                    .unwrap(),
+                previous
+            );
+            assert_eq!(
+                fs::read_to_string(held.join("original.txt")).unwrap(),
+                "preserve original"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("replacement.txt")).unwrap(),
+                "preserve replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn same_path_origin_replacement_cannot_refresh_old_root_history() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let previous =
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap();
+        fs::rename(&fixture.origin, fixture.origin.with_extension("held")).unwrap();
+        fs::create_dir(&fixture.origin).unwrap();
+        assert!(admit(&fixture.database, &root).is_err());
+        assert_eq!(
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap(),
+            previous
+        );
+    }
+
+    #[test]
+    fn origin_replacement_after_admission_cannot_rewrite_saved_history() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fs::write(fixture.origin.join("original.txt"), b"original origin").unwrap();
+        fixture.register(&root, &owner);
+        let previous =
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap();
+        let admission = admit(&fixture.database, &root).unwrap();
+        let held = fixture.origin.with_extension("held");
+        fs::rename(&fixture.origin, &held).unwrap();
+        fs::create_dir(&fixture.origin).unwrap();
+        fs::write(
+            fixture.origin.join("replacement.txt"),
+            b"replacement origin",
+        )
+        .unwrap();
+
+        assert!(
+            admission
+                .record(&root, &owner, WorktreeRootSource::LibraryOverride)
+                .is_err()
+        );
+        assert_eq!(
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap(),
+            previous
+        );
+        assert_eq!(
+            fs::read(held.join("original.txt")).unwrap(),
+            b"original origin"
+        );
+        assert_eq!(
+            fs::read(fixture.origin.join("replacement.txt")).unwrap(),
+            b"replacement origin"
+        );
+    }
+
+    #[test]
+    fn unknown_saved_filesystem_identity_is_preserved_without_a_fresh_proof() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let connection = open_registry(&fixture.database, true).unwrap();
+        let mut retained = inventory(&fixture.database, None).roots.remove(0);
+        retained.identity = None;
+        let unknown = serde_json::to_string(&retained).unwrap();
+        connection
+            .execute("UPDATE roots SET payload=?1", [&unknown])
+            .unwrap();
+        drop(connection);
+        assert!(admit(&fixture.database, &root).is_err());
+        assert_eq!(
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap(),
+            Some(unknown)
+        );
+    }
+
+    #[test]
     fn marker_edits_after_claim_are_validated_from_the_pinned_witness_before_deletion() {
         use std::os::unix::fs::MetadataExt;
 
@@ -1007,7 +1335,13 @@ mod tests {
             )
             .is_err()
         );
-        assert!(!registry_path(&fixture.database).unwrap().exists());
+        // Admission initializes its private coordination database before root
+        // creation. An unverified marker must never acquire a history row.
+        assert!(inventory(&fixture.database, None).roots.is_empty());
+        assert_eq!(
+            fs::read(root.join("held-marker")).unwrap(),
+            serde_json::to_vec(&owner).unwrap()
+        );
         fs::remove_file(root.join(WORKTREE_ROOT_MARKER)).unwrap();
         fs::write(
             root.join(WORKTREE_ROOT_MARKER),
@@ -1182,13 +1516,14 @@ mod tests {
         let fixture = Fixture::new();
         let (root, owner) = fixture.root("root");
         fixture.register(&root, &owner);
-        fs::remove_dir(&fixture.origin).unwrap();
+        let held_origin = fixture.origin.with_extension("held");
+        fs::rename(&fixture.origin, &held_origin).unwrap();
         let record = inventory(&fixture.database, None).roots.remove(0);
         let fingerprint = ownership_fingerprint(&record).unwrap();
         let claim = claim_for_removal(&fixture.database, &root, &fingerprint).unwrap();
-        // Reappearance would otherwise permit a valid admission. Pause after
-        // GC's proof check and let another process attempt precisely that.
-        fs::create_dir(&fixture.origin).unwrap();
+        // Restore the same directory: a replacement origin is independently
+        // refused even after exclusion ends. This case isolates the lock.
+        fs::rename(&held_origin, &fixture.origin).unwrap();
         let child = |blocked| {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command

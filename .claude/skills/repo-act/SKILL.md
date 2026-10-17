@@ -30,6 +30,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   process-wide environment mutation in parallel tests.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+- For storage ownership and reclamation changes, test replacement of a root and
+  its origin at the same pathname, both before admission and before recording.
+  A canonical path locates an object; it does not prove the object or filesystem
+  is unchanged. Refusal must preserve the previous identity record and data.
 - Run the fastest relevant test command first.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
