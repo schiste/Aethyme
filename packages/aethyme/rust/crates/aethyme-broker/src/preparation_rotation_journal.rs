@@ -2243,7 +2243,7 @@ mod tests {
         let root = fixture.cache_root.as_os_str().as_bytes();
         transaction
             .execute(
-                "INSERT INTO rotation_debt(root_path, repository, payload) VALUES (?1, ?2, ?3)",
+                "INSERT INTO rotation_debt(root_path, repository, payload, protocol_version, fresh_store_identity) VALUES (?1, ?2, ?3, 2, NULL)",
                 params![root, "!".repeat(64), b"malformed".as_slice()],
             )
             .unwrap();
