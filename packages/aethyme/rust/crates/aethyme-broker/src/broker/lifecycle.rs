@@ -318,17 +318,25 @@ impl BrokerStorageContext {
 
     fn bind_repository(&mut self, repo: &GitRepo) -> Result<(), BrokerOpError> {
         self.ensure_valid()?;
-        let repository_root =
-            std::fs::canonicalize(repo.root()).map_err(|source| BrokerOpError::Io {
-                path: repo.root().to_path_buf(),
-                source,
-            })?;
+        let repository_root = std::fs::canonicalize(repo.root()).map_err(|source| {
+            BrokerOpError::InvalidStorageContext {
+                reason: format!(
+                    "cannot canonicalize repository root {}: {source}",
+                    repo.root().display()
+                )
+                .into_boxed_str(),
+            }
+        })?;
         let git_common_dir = repo.git_common_dir()?;
-        let git_common_dir =
-            std::fs::canonicalize(&git_common_dir).map_err(|source| BrokerOpError::Io {
-                path: git_common_dir,
-                source,
-            })?;
+        let git_common_dir = std::fs::canonicalize(&git_common_dir).map_err(|source| {
+            BrokerOpError::InvalidStorageContext {
+                reason: format!(
+                    "cannot canonicalize Git common directory {}: {source}",
+                    git_common_dir.display()
+                )
+                .into_boxed_str(),
+            }
+        })?;
         Self::bind_identity_path(
             &mut self.repository_root,
             repository_root,
@@ -1207,7 +1215,13 @@ impl Broker {
         &self.storage_context
     }
 
-    pub(crate) fn configure_storage_context_for_child(
+    /// Bind a child command to the storage context captured by this broker.
+    ///
+    /// Call this before spawning a child that will operate on the same
+    /// repository. The child receives a versioned, repository-bound context
+    /// and rejects it if it cannot validate that context; this method does not
+    /// grant permissions or create a child process.
+    pub fn configure_storage_context_for_child(
         &self,
         command: &mut Command,
     ) -> Result<(), BrokerOpError> {

@@ -1254,8 +1254,8 @@ fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
 pub(crate) struct PreparationCacheSweepReport {
     pub(crate) entries_removed: usize,
     pub(crate) bytes_reclaimed: u64,
-    /// Individual filesystem entries actually unlinked, including partial
-    /// cache removals that need to resume at the same tree next pass.
+    /// Filesystem entries actually unlinked, including partial progress from
+    /// interrupted or failed removals that must resume at the same tree.
     pub(crate) filesystem_entries_reclaimed: usize,
     pub(crate) complete: bool,
 }
@@ -1342,13 +1342,9 @@ fn sweep_preparation_cache_at_with_status(
     resource_db_path: &Path,
     deadline: std::time::Instant,
 ) -> PreparationCacheSweepReport {
-    sweep_preparation_cache_with_discovery(
-        main_root,
-        cache_root,
-        resource_db_path,
-        deadline,
-        |deadline| discover_preparation_live_roots(main_root, storage_root, deadline),
-    )
+    sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
+        discover_preparation_live_roots(main_root, storage_root, deadline)
+    })
 }
 
 /// Sweep using the exact worktree roots selected by one Broker instance.
@@ -1362,13 +1358,9 @@ pub(crate) fn sweep_preparation_cache_for_roots_with_status(
     if check_preparation_sweep_deadline(deadline).is_err() || worktree_roots.is_empty() {
         return PreparationCacheSweepReport::incomplete_empty();
     }
-    sweep_preparation_cache_with_discovery(
-        main_root,
-        cache_root,
-        resource_db_path,
-        deadline,
-        |deadline| discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline),
-    )
+    sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
+        discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline)
+    })
 }
 
 /// Compatibility wrapper for callers that need only fully removed entries.
@@ -1390,7 +1382,6 @@ pub(crate) fn sweep_preparation_cache_for_roots(
 }
 
 fn sweep_preparation_cache_with_discovery(
-    main_root: &Path,
     cache_root: &Path,
     resource_db_path: &Path,
     deadline: std::time::Instant,
@@ -4033,6 +4024,138 @@ mod tests {
         crate::HostResourceCoordinator::open(&path)
             .expect("initialize isolated host resource state");
         path
+    }
+
+    fn preparation_sweep_status_fixture(
+        root: &Path,
+        payload: &[u8],
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let main_root = root.join("main");
+        let worktree_root = root.join("worktrees");
+        let cache_root = root.join("preparation-cache");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("cccccccccccc");
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), payload).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "repository".into(),
+            repository_root: main_root.clone(),
+        };
+        std::fs::write(
+            worktree_root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let resource_db_path = test_host_resource_db(root);
+        (
+            main_root,
+            worktree_root,
+            cache_root,
+            entry,
+            resource_db_path,
+        )
+    }
+
+    #[test]
+    fn captured_preparation_sweep_status_counts_a_fully_removed_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = b"manually counted cache payload";
+        let (main_root, worktree_root, cache_root, entry, resource_db_path) =
+            preparation_sweep_status_fixture(tmp.path(), payload);
+
+        let report = sweep_preparation_cache_for_roots_with_status(
+            &main_root,
+            &[worktree_root],
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(report.bytes_reclaimed, payload.len() as u64);
+        // The private fixture tree has exactly the candidate directory and
+        // cache.bin beneath it.
+        assert_eq!(report.filesystem_entries_reclaimed, 2);
+        assert!(report.complete);
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn captured_preparation_sweep_status_is_incomplete_on_busy_or_bad_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main_root, worktree_root, cache_root, entry, resource_db_path) =
+            preparation_sweep_status_fixture(tmp.path(), b"retain on incomplete");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let request =
+            preparation_cache_lease_request(TEST_PREPARATION_REPOSITORY, &cache_root, deadline)
+                .unwrap();
+        let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
+        let grant = writer.acquire(&request).unwrap();
+
+        let busy = sweep_preparation_cache_for_roots_with_status(
+            &main_root,
+            std::slice::from_ref(&worktree_root),
+            &cache_root,
+            &resource_db_path,
+            deadline,
+        );
+        assert!(!busy.complete);
+        assert_eq!(busy.entries_removed, 0);
+        assert!(entry.join("cache.bin").is_file());
+        writer
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+
+        let empty_roots = sweep_preparation_cache_for_roots_with_status(
+            &main_root,
+            &[],
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!empty_roots.complete);
+        assert!(entry.join("cache.bin").is_file());
+
+        let invalid_root = tmp.path().join("not-a-worktree-root");
+        std::fs::write(&invalid_root, b"not a root directory").unwrap();
+        let failed_discovery = sweep_preparation_cache_for_roots_with_status(
+            &main_root,
+            &[invalid_root],
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!failed_discovery.complete);
+        assert!(entry.join("cache.bin").is_file());
+    }
+
+    #[test]
+    fn captured_preparation_sweep_status_is_incomplete_after_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main_root, worktree_root, cache_root, entry, resource_db_path) =
+            preparation_sweep_status_fixture(tmp.path(), b"retain after deadline");
+
+        let report = sweep_preparation_cache_for_roots_with_status(
+            &main_root,
+            &[worktree_root],
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() - Duration::from_secs(1),
+        );
+
+        assert!(!report.complete);
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
+        assert!(entry.join("cache.bin").is_file());
     }
 
     /// The live set is the keys checkouts would recompute, so an entry is dead
