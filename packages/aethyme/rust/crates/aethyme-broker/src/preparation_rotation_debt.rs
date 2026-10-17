@@ -691,6 +691,9 @@ pub(crate) fn recover_with_journal(
                     invalid_record("journaled fresh-store identity differs from its root proof"),
                 ));
             }
+            proof
+                .validate(&debt)
+                .map_err(|source| recovery_error(progress, source))?;
             validate_fresh_stage_state(&root, &proof)
                 .map_err(|source| recovery_error(progress, source))?;
             proof
@@ -724,7 +727,9 @@ pub(crate) fn recover_with_journal(
                 invalid_record("in-cache rotation witness differs from its journal row"),
             ));
         }
-    } else {
+    } else if recovery_step(cache_root, &debt).map_err(|source| recovery_error(progress, source))?
+        != RecoveryStep::ClearCompletedDebt
+    {
         restore_from_journal(cache_root, &debt)
             .map_err(|source| recovery_error(progress, source))?;
     }
@@ -3176,6 +3181,82 @@ mod tests {
         (temp, cache_root, debt)
     }
 
+    fn completed_journal_rotation_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        RotationDebt,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        use crate::gc::{PinnedTreeRemoval, TreeRemoval};
+
+        let (temp, cache_root, debt) = fixture();
+        let resource_db = temp.path().join("host-resources.db");
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        let payload = super::encode(&debt).unwrap();
+        let root_identity = debt.cache_root.encode().unwrap();
+        super::rotation_journal::publish(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+            &payload,
+        )
+        .unwrap();
+
+        let proof = super::ensure_fresh_stage(&cache_root, &debt, false).unwrap();
+        let fresh_store_identity = proof.fresh_store.encode().unwrap();
+        super::rotation_journal::record_fresh_store_identity(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+            &payload,
+            &fresh_store_identity,
+        )
+        .unwrap();
+
+        super::retire_original_store(&cache_root, &retained).unwrap();
+        let witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        let retired_path = cache_root.join(debt.retired_component());
+        let pinned = PinnedTreeRemoval::open(&retired_path).unwrap();
+        assert_eq!(
+            pinned
+                .remove_verified_witness(witness.component().unwrap(), None, |bytes| {
+                    witness.validate_bytes(bytes)
+                })
+                .unwrap(),
+            TreeRemoval::Complete
+        );
+        super::create_fresh_store(&cache_root, &retained).unwrap();
+        super::clear_completed(&cache_root, &retained).unwrap();
+
+        assert!(super::read(&cache_root, REPOSITORY).unwrap().is_none());
+        assert!(cache_root.join(REPOSITORY).is_dir());
+        assert_eq!(
+            fs::read_dir(cache_root.join(REPOSITORY)).unwrap().count(),
+            0
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        (
+            temp,
+            cache_root,
+            resource_db,
+            debt,
+            payload,
+            fresh_store_identity,
+        )
+    }
+
     #[test]
     fn inventory_and_recovery_finish_a_committed_rotation() {
         let (_temp, cache_root, debt) = fixture();
@@ -3205,6 +3286,122 @@ mod tests {
             0
         );
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn journal_recovery_finishes_when_sidecar_was_cleared_before_row_completion() {
+        let (_temp, cache_root, resource_db, debt, payload, fresh_identity) =
+            completed_journal_rotation_fixture();
+        let root_identity = debt.cache_root.encode().unwrap();
+
+        let row = super::rotation_journal::load_record(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+        )
+        .unwrap()
+        .expect("the first crash cut keeps the journal row");
+        assert_eq!(row.payload, payload);
+        assert_eq!(
+            row.fresh_store_identity.as_deref(),
+            Some(fresh_identity.as_slice())
+        );
+
+        let progress = super::recover_with_journal(
+            &cache_root,
+            &resource_db,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.found_debt);
+        assert!(progress.complete);
+        assert!(
+            super::rotation_journal::load_record(
+                &resource_db,
+                &cache_root,
+                &root_identity,
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn journal_recovery_rediscovers_proof_after_row_completion_before_proof_removal() {
+        let (_temp, cache_root, resource_db, debt, payload, fresh_identity) =
+            completed_journal_rotation_fixture();
+        let root_identity = debt.cache_root.encode().unwrap();
+
+        // Model a crash after the external row was removed but before the
+        // root-level fresh-store proof could be removed.
+        super::rotation_journal::complete_verified(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+            &payload,
+            &fresh_identity,
+        )
+        .unwrap();
+        assert!(
+            super::rotation_journal::load_record(
+                &resource_db,
+                &cache_root,
+                &root_identity,
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        let progress = super::recover_with_journal(
+            &cache_root,
+            &resource_db,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.found_debt);
+        assert!(progress.complete);
+        assert!(
+            super::rotation_journal::load_record(
+                &resource_db,
+                &cache_root,
+                &root_identity,
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
