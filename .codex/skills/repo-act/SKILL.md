@@ -39,6 +39,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   is unchanged. Refusal must preserve the previous identity record and data.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Preserve earlier outputs before retrying.
+  Freeze source for each invocation and record the exact head and dirty-state
+  hashes before and after it. If relevant source changes during a run, retain
+  that run as diagnostic evidence and rerun the committed source.
+- For runtime rollout and dogfooding, resolve the executable actually selected
+  by PATH and compare its version with the repository runtime pointer. Pin the
+  verified executable for subsequent commands; the pointer alone does not prove
+  that the shell is using the deployed build.
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
