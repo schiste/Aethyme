@@ -463,13 +463,17 @@ fn auto_promotion_releases_the_verification_slot_before_requeue() {
         "[promote]\nmode = \"auto\"\n",
     )
     .unwrap();
+    let child_session = a.id.to_string();
+    let mut child_command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["submit", "--session", &child_session],
+    );
+    broker
+        .configure_storage_context_for_child(&mut child_command)
+        .unwrap();
     drop(broker);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
-        .args(["submit", "--session", &a.id.to_string()])
-        .current_dir(tmp.path())
-        .spawn()
-        .unwrap();
+    let mut child = child_command.current_dir(tmp.path()).spawn().unwrap();
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -725,12 +729,16 @@ fn contract_tracked_repo(root: &Path, name: &str) -> (Broker, i64, std::path::Pa
     (broker, session.id, worktree)
 }
 
-fn cli_submit(root: &Path, session: i64) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
-        .args(["submit", "--session", &session.to_string()])
-        .current_dir(root)
-        .output()
-        .unwrap()
+fn cli_submit_command(broker: &Broker, root: &Path, session: i64) -> Command {
+    let session = session.to_string();
+    let mut command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["submit", "--session", &session],
+    );
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    command.current_dir(root)
 }
 
 // #418: the contract decision is checked before the gates start, against the
@@ -740,9 +748,10 @@ fn submit_refuses_an_undeclared_tracked_removal_before_any_gate_runs() {
     let tmp = common::FixtureRepository::new();
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "undeclared");
     commit_edit(&worktree, "src/a.py", "a = 2\n");
+    let command = cli_submit_command(&broker, tmp.path(), session);
     drop(broker);
 
-    let output = cli_submit(tmp.path(), session);
+    let output = command.output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(
@@ -771,9 +780,10 @@ fn submit_preflight_ignores_uncommitted_tracked_removals() {
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "uncommitted");
     commit_edit(&worktree, "src/b.py", "b = 2\n");
     std::fs::write(worktree.join("src/a.py"), "a = 2\n").unwrap();
+    let command = cli_submit_command(&broker, tmp.path(), session);
     drop(broker);
 
-    let output = cli_submit(tmp.path(), session);
+    let output = command.output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
@@ -1052,18 +1062,22 @@ fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_foll
     );
     assert_eq!(plan.pending_commits, vec![followup_head.clone()]);
     assert_eq!(plan.digest.len(), 64);
-    let cli = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
-        .args([
+    let session_id = session.id.to_string();
+    let mut cli_command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &[
             "advanced",
             "checkpoint",
             "plan",
             "--session",
-            &session.id.to_string(),
+            &session_id,
             "--json",
-        ])
-        .current_dir(&worktree)
-        .output()
+        ],
+    );
+    broker
+        .configure_storage_context_for_child(&mut cli_command)
         .unwrap();
+    let cli = cli_command.current_dir(&worktree).output().unwrap();
     assert!(
         cli.status.success(),
         "{}",
