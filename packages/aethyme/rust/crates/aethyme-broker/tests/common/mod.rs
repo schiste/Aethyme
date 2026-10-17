@@ -130,6 +130,7 @@ pub fn broker_cli_for_fixture(binary: &str, args: &[&str], fixture_root: &Path) 
 pub struct FixtureRepository {
     owner: tempfile::TempDir,
     repository: PathBuf,
+    _repository_owner: Option<tempfile::TempDir>,
 }
 
 #[allow(dead_code)]
@@ -138,7 +139,23 @@ impl FixtureRepository {
         let owner = tempfile::tempdir().expect("create fixture owner");
         let repository = owner.path().join("repo");
         std::fs::create_dir_all(&repository).expect("create fixture repository");
-        Self { owner, repository }
+        Self {
+            owner,
+            repository,
+            _repository_owner: None,
+        }
+    }
+
+    /// Adopt an existing temporary directory as the repository while keeping
+    /// broker worktrees and host state under a separate fixture-owned root.
+    pub fn from_tempdir(repository_owner: tempfile::TempDir) -> Self {
+        let repository = repository_owner.path().to_path_buf();
+        let owner = tempfile::tempdir().expect("create fixture storage owner");
+        Self {
+            owner,
+            repository,
+            _repository_owner: Some(repository_owner),
+        }
     }
 
     pub fn path(&self) -> &Path {
