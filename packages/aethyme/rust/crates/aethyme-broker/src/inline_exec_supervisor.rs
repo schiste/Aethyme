@@ -476,7 +476,7 @@ pub(crate) fn dispatch(args: &[String]) -> Option<u8> {
     }
     #[cfg(unix)]
     {
-        return Some(run_helper().unwrap_or(125));
+        Some(run_helper().unwrap_or(125))
     }
     #[cfg(not(unix))]
     Some(125)
@@ -684,11 +684,10 @@ fn run_helper() -> io::Result<u8> {
                 return Ok(125);
             }
         }
-        match read_frame_timeout::<ParentFrame>(
-            &mut control,
-            std::time::Duration::from_millis(100),
-        )? {
-            Some(parent_frame) => match parent_frame {
+        if let Some(parent_frame) =
+            read_frame_timeout::<ParentFrame>(&mut control, std::time::Duration::from_millis(100))?
+        {
+            match parent_frame {
                 ParentFrame::Ping => {}
                 ParentFrame::Abort => {
                     stop_owned_command(&mut child);
@@ -705,18 +704,17 @@ fn run_helper() -> io::Result<u8> {
                     )?;
                     return Ok(125);
                 }
-            },
-            None => {}
+            }
         }
     }
 }
 
 #[cfg(unix)]
 fn validate_control_socket(fd: RawFd) -> io::Result<()> {
-    // SAFETY: getsockopt only writes to these initialized stack values; the fd
-    // is checked before it is ever assumed to be a UnixStream.
     let mut socket_type: libc::c_int = 0;
     let mut type_length = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    // SAFETY: these pointers reference initialized, writable stack values and
+    // type_length gives the exact socket_type buffer size for getsockopt.
     if unsafe {
         libc::getsockopt(
             fd,
@@ -735,10 +733,12 @@ fn validate_control_socket(fd: RawFd) -> io::Result<()> {
             "inline helper control descriptor is not a stream socket",
         ));
     }
-    // SAFETY: getpeername initializes the bounded sockaddr_storage before the
-    // family field is read. It also verifies the descriptor is connected.
+    // SAFETY: sockaddr_storage contains only integer fields and padding, for
+    // which the all-zero bit pattern is valid. Initialize it before the call.
     let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut peer_length = std::mem::size_of_val(&peer) as libc::socklen_t;
+    // SAFETY: peer and peer_length are writable stack values; peer_length
+    // supplies the complete buffer capacity. getpeername also checks connection.
     if unsafe {
         libc::getpeername(
             fd,
@@ -886,7 +886,7 @@ fn close_unrelated_descriptors(control_fd: RawFd) -> io::Result<()> {
     {
         let mut entries = std::fs::read_dir(directory)?;
         let mut descriptors = Vec::new();
-        while let Some(entry) = entries.next() {
+        for entry in entries.by_ref() {
             let entry = entry?;
             if let Some(number) = entry
                 .file_name()
