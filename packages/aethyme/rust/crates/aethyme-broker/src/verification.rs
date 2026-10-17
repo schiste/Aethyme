@@ -632,24 +632,119 @@ impl ExactTreeVerificationSlot {
         repository: &GitRepo,
         commit: &str,
     ) -> Result<GitRepo, BrokerOpError> {
+        self.materialize_using(commit, |path, commit| {
+            repository.worktree_add_detached(path, commit)
+        })
+    }
+
+    fn materialize_using(
+        &mut self,
+        commit: &str,
+        add_worktree: impl FnOnce(&Path, &str) -> Result<GitRepo, crate::GitError>,
+    ) -> Result<GitRepo, BrokerOpError> {
         ensure_slot_storage_available(&self.repository_root, &self.path).map_err(|source| {
             BrokerError::Io {
                 path: self.path.clone(),
                 source,
             }
         })?;
-        self.cleanup();
-        Ok(repository.worktree_add_detached(&self.path, commit)?)
+        self.cleanup_checked()?;
+        Ok(add_worktree(&self.path, commit)?)
     }
 
+    /// Best-effort cleanup for explicit completion and Drop. A retained slot is
+    /// reported; the next materialization must pass the checked path below.
     pub(crate) fn cleanup(&mut self) {
-        // Always try Git-level removal. After a crash, the common Git
-        // directory can retain a registration created by another process.
-        if let Ok(repository) = GitRepo::discover(&self.repository_root) {
-            let _ = repository.worktree_remove(&self.path, true);
-        }
-        let _ = std::fs::remove_dir_all(&self.path);
+        crate::warn_unrecorded(
+            "remove exact-tree verification slot",
+            self.cleanup_checked(),
+        );
     }
+
+    fn cleanup_checked(&mut self) -> Result<(), BrokerOpError> {
+        if let Some(reason) = removable_volume_unavailable_reason(&self.path) {
+            return Err(BrokerError::Io {
+                path: self.path.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, reason),
+            }
+            .into());
+        }
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(BrokerError::Io {
+                    path: self.path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "verification slot is not a directory; retained for inspection",
+                    ),
+                }
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(BrokerError::Io {
+                    path: self.path.clone(),
+                    source,
+                }
+                .into());
+            }
+        }
+        let repository = GitRepo::discover(&self.repository_root)?;
+        // Inventory includes absent/prunable registrations. Unknown inventory
+        // must not be treated as permission for a recursive filesystem delete.
+        let target = cleanup_path_identity(&self.path)?;
+        let mut registered = false;
+        for entry in repository.worktree_inventory()? {
+            if cleanup_path_identity(&entry.path)? == target {
+                registered = true;
+                break;
+            }
+        }
+        if registered {
+            // A Git refusal (including another owner's lock) is authoritative.
+            // Never bypass it with remove_dir_all or an orphan fallback.
+            repository.worktree_remove_registered(&self.path, true)?;
+        } else {
+            match std::fs::remove_dir_all(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(BrokerError::Io {
+                        path: self.path.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            }
+        }
+        match std::fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(BrokerError::Io {
+                path: self.path.clone(),
+                source,
+            }
+            .into()),
+            Ok(_) => Err(BrokerError::Io {
+                path: self.path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::DirectoryNotEmpty,
+                    "verification slot survived cleanup; retained for inspection",
+                ),
+            }
+            .into()),
+        }
+    }
+}
+
+fn cleanup_path_identity(path: &Path) -> Result<PathBuf, BrokerOpError> {
+    crate::broker::lifecycle::canonical_prefix(path).map_err(|reason| {
+        BrokerError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, reason),
+        }
+        .into()
+    })
 }
 
 fn ensure_slot_storage_available(main_root: &Path, path: &Path) -> Result<(), std::io::Error> {
@@ -1171,5 +1266,89 @@ mod tests {
 
         let second = ExactTreeVerificationSlot::acquire_at(&fx.main, plan()).unwrap();
         assert_eq!(second.path, expected);
+    }
+
+    #[test]
+    fn slot_cleanup_preserves_a_git_refusal_and_blocks_materialization() {
+        let fx = fixture();
+        let placement = plan_slot_placement_in(&fx.main, "merge-sim", Some(&fx.host), &fx.temp);
+        let mut slot = ExactTreeVerificationSlot::acquire_at(&fx.main, placement).unwrap();
+        let repository = GitRepo::discover(&fx.main).unwrap();
+        let commit = repository.head_commit().unwrap();
+        slot.materialize(&repository, &commit).unwrap();
+        let sentinel = slot.path.join("retained-output");
+        std::fs::write(&sentinel, "must remain").unwrap();
+        let path = slot.path.to_str().unwrap().to_owned();
+        git(
+            &fx.main,
+            &["worktree", "lock", "--reason", "keep for inspection", &path],
+        );
+        assert!(slot.cleanup_checked().is_err());
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "must remain");
+        assert!(slot.materialize(&repository, &commit).is_err());
+        let mut add_dispatched = false;
+        assert!(
+            slot.materialize_using(&commit, |_, _| {
+                add_dispatched = true;
+                GitRepo::discover(&fx.main)
+            })
+            .is_err()
+        );
+        assert!(
+            !add_dispatched,
+            "cleanup refusal must stop before dispatching worktree creation"
+        );
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "must remain");
+        assert!(
+            repository
+                .worktree_inventory()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == slot.path && entry.locked)
+        );
+        git(&fx.main, &["worktree", "unlock", &path]);
+        slot.cleanup_checked().unwrap();
+        assert!(!slot.path.exists());
+    }
+
+    #[test]
+    fn slot_cleanup_reports_an_unexpected_file_without_removing_it() {
+        let fx = fixture();
+        let placement = plan_slot_placement_in(&fx.main, "merge-sim", Some(&fx.host), &fx.temp);
+        let mut slot = ExactTreeVerificationSlot::acquire_at(&fx.main, placement).unwrap();
+        std::fs::write(&slot.path, "preserve unexpected data").unwrap();
+        let error = slot.cleanup_checked().unwrap_err();
+        assert!(error.to_string().contains("retained for inspection"));
+        assert_eq!(
+            std::fs::read_to_string(&slot.path).unwrap(),
+            "preserve unexpected data"
+        );
+        std::fs::remove_file(&slot.path).unwrap();
+        slot.cleanup_checked().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_cleanup_does_not_follow_a_replacement_symlink() {
+        let fx = fixture();
+        let placement = plan_slot_placement_in(&fx.main, "merge-sim", Some(&fx.host), &fx.temp);
+        let mut slot = ExactTreeVerificationSlot::acquire_at(&fx.main, placement).unwrap();
+        let other = fx._root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("source"), "preserve source").unwrap();
+        std::os::unix::fs::symlink(&other, &slot.path).unwrap();
+        assert!(slot.cleanup_checked().is_err());
+        assert!(
+            slot.path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.join("source")).unwrap(),
+            "preserve source"
+        );
+        std::fs::remove_file(&slot.path).unwrap();
     }
 }

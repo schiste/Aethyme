@@ -3482,24 +3482,7 @@ impl GitRepo {
     }
 
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {
-        // A locked worktree refuses removal. Release only the lock the broker
-        // itself placed on a removable root; a lock someone else set is their
-        // protection, and the removal must keep failing on it.
-        if self.worktree_lock_reason(worktree).as_deref() == Some(BROKER_WORKTREE_LOCK_REASON) {
-            // The removal below cannot succeed on a locked worktree, so a
-            // failed unlock is the error to report, not a detail to drop.
-            run_git(
-                &self.root,
-                &["worktree", "unlock", worktree.to_str().unwrap_or_default()],
-            )?;
-        }
-        let path = worktree.to_str().unwrap_or_default();
-        let args: Vec<&str> = if force {
-            vec!["worktree", "remove", "--force", path]
-        } else {
-            vec!["worktree", "remove", path]
-        };
-        let Err(error) = run_git(&self.root, &args) else {
+        let Err(error) = self.worktree_remove_registered(worktree, force) else {
             return Ok(());
         };
         if !crate::broker::is_orphaned_worktree_directory(worktree) {
@@ -3526,17 +3509,35 @@ impl GitRepo {
         &self,
         worktree: &Path,
     ) -> Result<(), GitError> {
-        // Match `worktree_remove`: release only a lock that the broker itself placed.
+        self.worktree_remove_registered(worktree, false)
+    }
+
+    /// Remove only through Git, preserving every refusal and registration.
+    /// Callers that own disposable checkouts can request force without opting
+    /// into the orphan-directory fallback used by ordinary session cleanup.
+    pub(crate) fn worktree_remove_registered(
+        &self,
+        worktree: &Path,
+        force: bool,
+    ) -> Result<(), GitError> {
+        // A locked worktree refuses removal. Release only the lock the broker
+        // itself placed on a removable root; a lock someone else set is their
+        // protection, and the removal must keep failing on it.
         if self.worktree_lock_reason(worktree).as_deref() == Some(BROKER_WORKTREE_LOCK_REASON) {
+            // The removal below cannot succeed on a locked worktree, so a
+            // failed unlock is the error to report, not a detail to drop.
             run_git(
                 &self.root,
                 &["worktree", "unlock", worktree.to_str().unwrap_or_default()],
             )?;
         }
-        run_git(
-            &self.root,
-            &["worktree", "remove", worktree.to_str().unwrap_or_default()],
-        )?;
+        let path = worktree.to_str().unwrap_or_default();
+        let args: Vec<&str> = if force {
+            vec!["worktree", "remove", "--force", path]
+        } else {
+            vec!["worktree", "remove", path]
+        };
+        run_git(&self.root, &args)?;
         Ok(())
     }
 
