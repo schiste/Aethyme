@@ -1,0 +1,222 @@
+{
+  "command": "cargo run -q -p aethyme-contracts --example check_brief -- <brief.json> (using isolated PR #708 source snapshot)",
+  "result": "24/24 ok",
+  "rows": [
+    {
+      "task_id": "H01",
+      "variant": "absent",
+      "tokens": 9,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H01/briefs/absent.json: ok, 9 of 150 tokens (aethyme-brief-tokens/v0), record sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de"
+    },
+    {
+      "task_id": "H01",
+      "variant": "correct",
+      "tokens": 85,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:a525de8a0faae60baf62296f2a830bcab7faf38baa4132dc49d0d5038b9b1a1c",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H01/briefs/correct.json: ok, 85 of 150 tokens (aethyme-brief-tokens/v0), record sha256:a525de8a0faae60baf62296f2a830bcab7faf38baa4132dc49d0d5038b9b1a1c"
+    },
+    {
+      "task_id": "H01",
+      "variant": "incomplete",
+      "tokens": 88,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:582b9f750d95b7424d0fda7fb2c87b351aca4bd375142e435f89b0d7c8b7e7b2",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H01/briefs/incomplete.json: ok, 88 of 150 tokens (aethyme-brief-tokens/v0), record sha256:582b9f750d95b7424d0fda7fb2c87b351aca4bd375142e435f89b0d7c8b7e7b2"
+    },
+    {
+      "task_id": "H01",
+      "variant": "misleading",
+      "tokens": 95,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:6ac37c2ad67f1b35c23a4757af39192e87a9f5773d77ec59c102d220b41216d5",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H01/briefs/misleading.json: ok, 95 of 150 tokens (aethyme-brief-tokens/v0), record sha256:6ac37c2ad67f1b35c23a4757af39192e87a9f5773d77ec59c102d220b41216d5"
+    },
+    {
+      "task_id": "H02",
+      "variant": "absent",
+      "tokens": 9,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H02/briefs/absent.json: ok, 9 of 150 tokens (aethyme-brief-tokens/v0), record sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de"
+    },
+    {
+      "task_id": "H02",
+      "variant": "correct",
+      "tokens": 84,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:d4238bc105117f91f851051136261e42e19acc40686401427d84b4391c55e28a",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H02/briefs/correct.json: ok, 84 of 150 tokens (aethyme-brief-tokens/v0), record sha256:d4238bc105117f91f851051136261e42e19acc40686401427d84b4391c55e28a"
+    },
+    {
+      "task_id": "H02",
+      "variant": "incomplete",
+      "tokens": 92,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:94f4edb411b47b1bac5e990f7da971bdcd956433262603d75ad1714be54e292f",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H02/briefs/incomplete.json: ok, 92 of 150 tokens (aethyme-brief-tokens/v0), record sha256:94f4edb411b47b1bac5e990f7da971bdcd956433262603d75ad1714be54e292f"
+    },
+    {
+      "task_id": "H02",
+      "variant": "misleading",
+      "tokens": 90,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:243b5dc1465c269aab817addc8be81cf9cf255355d0b7eb61fc498c5f6e90ec9",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/H02/briefs/misleading.json: ok, 90 of 150 tokens (aethyme-brief-tokens/v0), record sha256:243b5dc1465c269aab817addc8be81cf9cf255355d0b7eb61fc498c5f6e90ec9"
+    },
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "tokens": 9,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P01/briefs/absent.json: ok, 9 of 150 tokens (aethyme-brief-tokens/v0), record sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de"
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "tokens": 89,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:5010ab10be7c9db3ad2467679e039ad591cc3b0c580af8718c6f15c15ae11e1b",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P01/briefs/correct.json: ok, 89 of 150 tokens (aethyme-brief-tokens/v0), record sha256:5010ab10be7c9db3ad2467679e039ad591cc3b0c580af8718c6f15c15ae11e1b"
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "tokens": 88,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:76e78b565afcb0fb677bf84ab7104bd73c76a4c975c30deb4af407445b27bb4c",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P01/briefs/incomplete.json: ok, 88 of 150 tokens (aethyme-brief-tokens/v0), record sha256:76e78b565afcb0fb677bf84ab7104bd73c76a4c975c30deb4af407445b27bb4c"
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "tokens": 97,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:e393b28ab9c082dbdc5d442c8286be483094009eb2ada6d7a25fa8fd645b2c49",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P01/briefs/misleading.json: ok, 97 of 150 tokens (aethyme-brief-tokens/v0), record sha256:e393b28ab9c082dbdc5d442c8286be483094009eb2ada6d7a25fa8fd645b2c49"
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "tokens": 9,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P02/briefs/absent.json: ok, 9 of 150 tokens (aethyme-brief-tokens/v0), record sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de"
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "tokens": 107,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:41ac946ddc347bd71261d47925e4ee026995abd7ce18b5b444c3d11ade2f435e",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P02/briefs/correct.json: ok, 107 of 150 tokens (aethyme-brief-tokens/v0), record sha256:41ac946ddc347bd71261d47925e4ee026995abd7ce18b5b444c3d11ade2f435e"
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "tokens": 101,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:3b0bbf932e7bbd520ae00ea6e76e223720616611419418e03feaf734ecdf45f1",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P02/briefs/incomplete.json: ok, 101 of 150 tokens (aethyme-brief-tokens/v0), record sha256:3b0bbf932e7bbd520ae00ea6e76e223720616611419418e03feaf734ecdf45f1"
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "tokens": 98,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:f147816a4a6b2ea4e99c921627af84271130ecc49ca0b0529cebe2b525b6a144",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P02/briefs/misleading.json: ok, 98 of 150 tokens (aethyme-brief-tokens/v0), record sha256:f147816a4a6b2ea4e99c921627af84271130ecc49ca0b0529cebe2b525b6a144"
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "tokens": 9,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P03/briefs/absent.json: ok, 9 of 150 tokens (aethyme-brief-tokens/v0), record sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de"
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "tokens": 107,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:d16c218f0e0b9dbd01ba29a9f790fa3c0cd1032fe597261f08dae4505949f856",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P03/briefs/correct.json: ok, 107 of 150 tokens (aethyme-brief-tokens/v0), record sha256:d16c218f0e0b9dbd01ba29a9f790fa3c0cd1032fe597261f08dae4505949f856"
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "tokens": 100,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:fb2c93ff3b7f0c17030097915ca77a10a0a79fdcc69f1dd3e9afa5bef6ce5dd0",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P03/briefs/incomplete.json: ok, 100 of 150 tokens (aethyme-brief-tokens/v0), record sha256:fb2c93ff3b7f0c17030097915ca77a10a0a79fdcc69f1dd3e9afa5bef6ce5dd0"
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "tokens": 110,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:95d2e7ea2192fb0e8982d877d8a6001750ed7edab0c5e69ff55463ed60af789a",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P03/briefs/misleading.json: ok, 110 of 150 tokens (aethyme-brief-tokens/v0), record sha256:95d2e7ea2192fb0e8982d877d8a6001750ed7edab0c5e69ff55463ed60af789a"
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "tokens": 9,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P04/briefs/absent.json: ok, 9 of 150 tokens (aethyme-brief-tokens/v0), record sha256:3813693b0460135d54645d381d1515b6933419447d6c97310aea7dbf7644e9de"
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "tokens": 89,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:e3316e769a4c424a16133e33d238f0dc020622913842132a3bf1525dc17930a2",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P04/briefs/correct.json: ok, 89 of 150 tokens (aethyme-brief-tokens/v0), record sha256:e3316e769a4c424a16133e33d238f0dc020622913842132a3bf1525dc17930a2"
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "tokens": 85,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:9c05fed5c3782b6ce86b496d3b602454409829d4b4251e5fae3defee5d82934c",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P04/briefs/incomplete.json: ok, 85 of 150 tokens (aethyme-brief-tokens/v0), record sha256:9c05fed5c3782b6ce86b496d3b602454409829d4b4251e5fae3defee5d82934c"
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "tokens": 89,
+      "limit": 150,
+      "token_profile": "aethyme-brief-tokens/v0",
+      "record_id": "sha256:f689656cc7de8c13deac40275374ee9926fb8e3414799a43a2891325cb333ad6",
+      "checker_output": "/private/tmp/fx08-playground-v2/tasks/P04/briefs/misleading.json: ok, 89 of 150 tokens (aethyme-brief-tokens/v0), record sha256:f689656cc7de8c13deac40275374ee9926fb8e3414799a43a2891325cb333ad6"
+    }
+  ]
+}

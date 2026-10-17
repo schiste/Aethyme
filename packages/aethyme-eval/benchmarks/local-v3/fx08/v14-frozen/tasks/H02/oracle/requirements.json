@@ -1,0 +1,11 @@
+{
+  "task_id": "H02",
+  "task_checks": [
+    "arrow keys move focus or the active descendant between plans",
+    "selected state is exposed accessibly",
+    "the order summary tracks the active plan and navigation wraps"
+  ],
+  "decision_checks": [
+    "data-selected-plan remains the summary contract"
+  ]
+}
