@@ -83,6 +83,19 @@ fn materialization_rejects_aggregate_file_count_across_roles() {
 }
 
 #[test]
+fn materialization_rejects_file_limit_plus_one() {
+    let source = manifest((0..=MAX_MATERIALIZED_FILES).map(|index| format!("file-{index:04}.txt")));
+
+    assert_eq!(source.entries().len(), MAX_MATERIALIZED_FILES + 1);
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source)]),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file count exceeds 8192"
+        ))
+    ));
+}
+
+#[test]
 fn materialization_rejects_excessive_path_depth() {
     let path = std::iter::repeat_n("d", MAX_MATERIALIZED_PATH_DEPTH)
         .chain(["file.txt"])
@@ -100,7 +113,10 @@ fn materialization_rejects_excessive_path_depth() {
 
 #[test]
 fn materialization_rejects_excessive_component_length() {
-    let source = manifest([format!("{}.txt", "x".repeat(256))]);
+    let source = manifest([format!(
+        "{}.txt",
+        "x".repeat(MAX_MATERIALIZED_COMPONENT_BYTES - 3)
+    )]);
 
     assert!(matches!(
         validate_materialization_bounds(&[("source", &source)]),
@@ -165,6 +181,58 @@ fn materialization_accepts_exact_aggregate_node_limit() {
 
     assert_eq!(source.entries().len(), MAX_MATERIALIZED_FILES);
     assert!(validate_materialization_bounds(&[("source", &source)]).is_ok());
+}
+
+#[test]
+fn materialization_rejects_aggregate_node_limit_plus_one() {
+    // One role root + 8,192 unique directories + 8,192 files = 16,385 nodes.
+    let source = manifest(
+        (0..MAX_MATERIALIZED_FILES).map(|directory| format!("directory-{directory:04}/a.txt")),
+    );
+
+    assert_eq!(source.entries().len(), MAX_MATERIALIZED_FILES);
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source)]),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file and directory node count exceeds 16384"
+        ))
+    ));
+}
+
+#[test]
+fn inspect_rejects_node_overflow_before_portability_prefix_allocation() {
+    // The leading backslash path makes portable() return immediately if it
+    // runs before the aggregate node preflight. Without that preflight this
+    // test reports Unsupported instead of the typed node-limit refusal.
+    let mut f = Fixture::new();
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    let paths = std::iter::once("!bad\\dir/file.txt".to_owned()).chain((0..256).map(|file| {
+        std::iter::once(format!("root-{file:03}"))
+            .chain((0..62).map(|depth| format!("dir-{depth:02}-{file:03}")))
+            .chain([format!("file-{file:03}.txt")])
+            .collect::<Vec<_>>()
+            .join("/")
+    }));
+    for path in paths {
+        let full = repo.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, b"").unwrap();
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "oversized input"]);
+    let head = CommitOid::parse(&git(repo.path(), &["rev-parse", "HEAD"])).unwrap();
+    let id = archive::retain_snapshot(&mut f.store, repo.path(), &head)
+        .unwrap()
+        .snapshot_id;
+    let mut total = 0;
+
+    assert!(matches!(
+        inspect(&f.store, &id, &mut total),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file and directory node count exceeds 16384"
+        ))
+    ));
 }
 
 #[test]

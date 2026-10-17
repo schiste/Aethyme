@@ -11,7 +11,7 @@ use aethyme_contracts::experimental_v0::{
     FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceSnapshot, SourceSnapshotId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
@@ -382,7 +382,11 @@ fn inspect(
     if snapshot.entries().len() > MAX_FILES {
         return Err(SnapshotError::Limit);
     }
-    validate_materialization_paths(&snapshot)?;
+    // Bound prefix-map growth before portability validation. The aggregate
+    // check in `inspect_roles` still accounts for every role together; this
+    // single-role preflight prevents one manifest from making `portable`
+    // allocate an unbounded number of path prefixes first.
+    validate_materialization_bounds(&[("source", &snapshot)])?;
     portable(&snapshot)?;
     for entry in snapshot.entries() {
         let digest = ObjectDigest::from_bytes(*entry.content_sha256());
@@ -404,8 +408,10 @@ fn inspect(
     Ok(snapshot)
 }
 pub(crate) fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
-    let mut prefixes = BTreeMap::new();
-    let mut files = BTreeSet::new();
+    // Keep one owned folded key per distinct materialized node. Repeated long
+    // directory prefixes are looked up by borrowing `folded`; cloning every
+    // prefix for every file would multiply memory by file count × depth.
+    let mut prefixes: BTreeMap<String, (&str, bool)> = BTreeMap::new();
     for entry in snapshot.entries() {
         let path = std::str::from_utf8(entry.path())
             .map_err(|_| SnapshotError::Unsupported("non-UTF-8 path".into()))?;
@@ -417,23 +423,24 @@ pub(crate) fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
         // Refuse both exact filesystem collisions and folded directory aliases.
         let components: Vec<_> = path.split('/').collect();
         let mut folded = String::new();
-        let mut original = String::new();
+        let mut original_end = 0;
         for (index, component) in components.iter().enumerate() {
-            if !folded.is_empty() {
+            if index > 0 {
                 folded.push('/');
-                original.push('/');
+                original_end += 1;
             }
             folded.extend(component.nfc().flat_map(char::to_lowercase));
-            original.push_str(component);
-            if files.contains(&folded)
-                || prefixes.get(&folded).is_some_and(|old| old != &original)
-                || (index + 1 == components.len() && prefixes.contains_key(&folded))
-            {
-                return Err(SnapshotError::Unsupported("folded path collision".into()));
+            original_end += component.len();
+            let original = &path[..original_end];
+            let is_file = index + 1 == components.len();
+            if let Some((old_original, old_is_file)) = prefixes.get(folded.as_str()) {
+                if *old_original != original || *old_is_file || is_file {
+                    return Err(SnapshotError::Unsupported("folded path collision".into()));
+                }
+            } else {
+                prefixes.insert(folded.clone(), (original, is_file));
             }
-            prefixes.insert(folded.clone(), original.clone());
         }
-        files.insert(folded);
     }
     Ok(())
 }
