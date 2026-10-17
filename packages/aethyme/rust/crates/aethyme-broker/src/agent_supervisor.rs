@@ -29,6 +29,9 @@ struct Launch {
 /// Dispatch before normal CLI parsing, compatibility checks or broker opens.
 /// Unknown reserved protocol versions fail closed rather than becoming commands.
 pub fn dispatch(args: &[String]) -> Option<u8> {
+    if let Some(code) = crate::inline_exec_supervisor::dispatch(args) {
+        return Some(code);
+    }
     if !args.first()?.starts_with("--aethyme-agent-supervisor") {
         return None;
     }
@@ -563,6 +566,11 @@ fn cleanup_watcher(expected: &str) -> io::Result<u8> {
         return Err(io::Error::last_os_error());
     }
     Ok(125) // SIGKILL includes this watcher; reaching here is nonconclusive.
+}
+
+#[cfg(unix)]
+pub(crate) fn start_cleanup_watcher_for_inline() -> io::Result<std::process::Child> {
+    start_cleanup_watcher()
 }
 
 #[cfg(unix)]

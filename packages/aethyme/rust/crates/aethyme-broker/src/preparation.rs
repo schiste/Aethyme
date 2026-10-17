@@ -94,6 +94,18 @@ pub enum PreparationError {
         session_id: i64,
     },
     #[error(
+        "preparation command supervision is unavailable: {reason}; no repository command was started"
+    )]
+    SupervisorUnavailable { reason: String },
+    #[error(
+        "preparation for session {session_id} could not verify process cleanup: {reason}; its state remains in progress and any shared-cache lease was not released"
+    )]
+    CleanupUnknown { session_id: i64, reason: String },
+    #[error(
+        "preparation for session {session_id} is already in progress or has unresolved cleanup; inspect its preparation status and host lease before retrying"
+    )]
+    PriorPreparationIncomplete { session_id: i64 },
+    #[error(
         "preparation step {step:?} did not produce declared outputs: {paths}; retry after fixing the repository command"
     )]
     MissingOutputs { step: String, paths: String },
@@ -528,6 +540,9 @@ impl Broker {
                 next_action: "dependencies are already current".into(),
             });
         }
+        if status.state == PreparationState::InProgress {
+            return Err(PreparationError::PriorPreparationIncomplete { session_id }.into());
+        }
         // Everything below runs the repository's own commands. The policy is
         // this worktree's: its gates and the preparation just loaded.
         let gates = match crate::gates::load_gates(&root) {
@@ -582,6 +597,11 @@ impl Broker {
             self.recover_storage_refusal(&error);
             return Err(error);
         }
+        // Resolve the exact trusted helper and complete its readiness handshake
+        // before opening the host resource DB, acquiring a grant, rotating a
+        // cache, or writing preparation state. A library embedder without the
+        // compatible broker executable fails here, before admission effects.
+        let mut next_supervisor = Some(self.start_preparation_exec_supervisor()?);
         let mut coordinator = resource_db_path
             .as_deref()
             .map(HostResourceCoordinator::open)
@@ -676,10 +696,15 @@ impl Broker {
             let report = match require_preparation_storage(&main_root, &storage_paths)
                 .map_err(BrokerOpError::from)
                 .and_then(|()| {
-                    self.guarded_exec_with_env_and_heartbeat(
+                    let supervisor = match next_supervisor.take() {
+                        Some(supervisor) => supervisor,
+                        None => self.start_preparation_exec_supervisor()?,
+                    };
+                    self.guarded_preparation_exec_with_supervisor(
                         session_id,
                         command,
                         &environment,
+                        supervisor,
                         || {
                             heartbeat.tick(
                                 Instant::now(),
@@ -705,6 +730,16 @@ impl Broker {
                 }) {
                 Ok(report) => report,
                 Err(error) => {
+                    if matches!(
+                        &error,
+                        BrokerOpError::Preparation(PreparationError::CleanupUnknown { .. })
+                    ) {
+                        // The command may still be writing. Keep both the
+                        // in-progress preparation record and its named shared
+                        // cache allocation until an operator can verify cleanup.
+                        quarantine_grant_best_effort(&mut coordinator, &mut grant);
+                        return Err(error);
+                    }
                     let recovery_persisted = self
                         .recover_storage_pressure_after_command_failure(&error, || {
                             require_preparation_storage(&main_root, &storage_paths)
@@ -2057,6 +2092,46 @@ fn release_grant_best_effort(
     }
 }
 
+fn quarantine_grant_best_effort(
+    coordinator: &mut Option<HostResourceCoordinator>,
+    grant: &mut Option<crate::HostResourceGrant>,
+) -> bool {
+    let (Some(coordinator), Some(grant_ref)) = (coordinator.as_mut(), grant.as_ref()) else {
+        if grant.is_some() {
+            warn_preparation_cleanup_failure(
+                "quarantine host resource lease after unverified process cleanup",
+                &"coordinator is unavailable",
+            );
+            return false;
+        }
+        return true;
+    };
+    match coordinator.quarantine(
+        &grant_ref.lease.lease_id,
+        grant_ref.lease.generation,
+        &grant_ref.ownership_token,
+    ) {
+        Ok(lease) if lease.state == crate::HostLeaseState::Quarantined => {
+            grant.take();
+            true
+        }
+        Ok(lease) => {
+            warn_preparation_cleanup_failure(
+                "quarantine host resource lease after unverified process cleanup",
+                &format!("lease returned in unexpected state {:?}", lease.state),
+            );
+            false
+        }
+        Err(error) => {
+            warn_preparation_cleanup_failure(
+                "quarantine host resource lease after unverified process cleanup",
+                &error,
+            );
+            false
+        }
+    }
+}
+
 fn warn_preparation_cleanup_failure(action: &str, error: &impl std::fmt::Display) {
     eprintln!("warning: could not {action} after preparation refusal: {error}");
 }
@@ -2345,6 +2420,51 @@ mod tests {
         );
 
         assert!(released.get());
+    }
+
+    #[test]
+    fn unverified_process_cleanup_quarantines_and_retains_the_named_cache_lease() {
+        let owner = tempfile::tempdir().unwrap();
+        let mut coordinator =
+            Some(HostResourceCoordinator::open(&owner.path().join("host-resources.db")).unwrap());
+        let request = HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: "cleanup-unknown-request".into(),
+            repository: "fixture-repository".into(),
+            worktree_fingerprint: "a".repeat(64),
+            run_id: "cleanup-unknown-run".into(),
+            ttl_seconds: PREPARATION_LEASE_TTL_SECONDS,
+            holder_pid: Some(std::process::id()),
+            resources: vec![HostResourceRequirement {
+                key: "preparation_cache".into(),
+                resource: HostResourceKind::ExclusiveKey {
+                    name: preparation_cache_lease_name("fixture-repository"),
+                },
+            }],
+        };
+        let grant = coordinator.as_mut().unwrap().acquire(&request).unwrap();
+        let lease_id = grant.lease.lease_id.clone();
+        let mut grant = Some(grant);
+
+        assert!(quarantine_grant_best_effort(&mut coordinator, &mut grant));
+        assert!(grant.is_none());
+        let retained = coordinator
+            .as_ref()
+            .unwrap()
+            .list(true)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == lease_id)
+            .unwrap();
+        assert_eq!(retained.state, crate::HostLeaseState::Quarantined);
+
+        let mut retry = request;
+        retry.request_id = "cleanup-unknown-retry".into();
+        retry.run_id = "cleanup-unknown-retry".into();
+        assert!(matches!(
+            coordinator.as_mut().unwrap().acquire(&retry),
+            Err(crate::HostResourceError::Conflict { .. })
+        ));
     }
 
     #[test]

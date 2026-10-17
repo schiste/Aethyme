@@ -79,13 +79,13 @@ pub use gate_debris::{
     DebrisPlan, DebrisRemoval, DebrisRuntime, GATE_LABELS_ENV, GATE_RUN_ID_ENV, GateRunLabels,
     RuntimeResource, RuntimeResourceKind,
 };
+pub mod agent_supervisor;
 mod auto_cleanup;
 pub mod execution_resources;
 pub mod execution_snapshot;
 pub mod execution_supervisor;
 pub mod execution_verifier;
 mod gate_doctor;
-pub mod agent_supervisor;
 mod gates;
 mod gc;
 mod gh_ref_guard;
@@ -99,6 +99,7 @@ pub mod hooks;
 mod host_operations;
 mod host_state;
 pub mod init;
+pub(crate) mod inline_exec_supervisor;
 pub mod insights;
 pub mod install_health;
 pub mod install_replacement;
