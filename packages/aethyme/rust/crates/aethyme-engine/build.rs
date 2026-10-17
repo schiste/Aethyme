@@ -2,7 +2,7 @@
 //! the exact checkout used to build the library.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -11,6 +11,8 @@ const ALWAYS_RECHECK: &str = ".aethyme-source-identity-always-recheck";
 const MAX_TRACKED_LIST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRACKED_PATHS: usize = 32_768;
 const MAX_WATCH_DIRECTIVE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GIT_ADMIN_ENTRIES: usize = 4_096;
+const MAX_GIT_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 
 fn manifest_dir() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
@@ -52,6 +54,122 @@ fn git_output(manifest_dir: &Path, args: &[&str]) -> Option<String> {
     let text = String::from_utf8(output.stdout).ok()?;
     let trimmed = text.trim_end_matches(['\r', '\n']);
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+struct TemporaryGitIndex {
+    path: PathBuf,
+}
+
+impl Drop for TemporaryGitIndex {
+    fn drop(&mut self) {
+        let mut lock_path = self.path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let _remove_lock_result = fs::remove_file(PathBuf::from(lock_path));
+        let _remove_index_result = fs::remove_file(&self.path);
+    }
+}
+
+fn copied_git_index_for_diff(manifest_dir: &Path) -> Option<TemporaryGitIndex> {
+    // A split index links to sharedindex.* in the real Git directory. Do not
+    // ask Git to resolve that link: reading it can refresh watched metadata.
+    // Rebuild conservatively until a non-split index is available.
+    let git_dir = canonical_git_directory(manifest_dir, &["rev-parse", "--absolute-git-dir"])?;
+    let mut git_admin_entries = 0usize;
+    for entry in fs::read_dir(&git_dir).ok()? {
+        let entry = entry.ok()?;
+        git_admin_entries = git_admin_entries.checked_add(1)?;
+        if git_admin_entries > MAX_GIT_ADMIN_ENTRIES {
+            return None;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sharedindex.")
+        {
+            return None;
+        }
+    }
+
+    let source_index_path = git_dir.join("index");
+    if !fs::symlink_metadata(&source_index_path)
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
+    let source = fs::File::open(source_index_path).ok()?;
+    let source_metadata = source.metadata().ok()?;
+    if !source_metadata.is_file() || source_metadata.len() > MAX_GIT_INDEX_BYTES {
+        return None;
+    }
+
+    let out_dir = fs::canonicalize(PathBuf::from(std::env::var_os("OUT_DIR")?)).ok()?;
+    let path = out_dir.join(format!(
+        ".aethyme-source-identity-index-{}",
+        std::process::id()
+    ));
+    let mut copied_index = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    let temporary_index = TemporaryGitIndex { path };
+    let mut limited_source = source.take(MAX_GIT_INDEX_BYTES + 1);
+    let copy_result = std::io::copy(&mut limited_source, &mut copied_index);
+    drop(copied_index);
+    let copied_bytes = copy_result.ok()?;
+    if copied_bytes != source_metadata.len() || copied_bytes > MAX_GIT_INDEX_BYTES {
+        return None;
+    }
+    Some(temporary_index)
+}
+
+fn git_exit_code(manifest_dir: &Path, args: &[&str], index_file: &Path) -> Option<i32> {
+    let mut command = Command::new("git");
+    clear_git_environment(&mut command);
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_INDEX_FILE", index_file)
+        .current_dir(manifest_dir)
+        .args(args);
+    command.output().ok()?.status.code()
+}
+
+fn git_describe(manifest_dir: Option<&Path>) -> (String, bool) {
+    let Some(manifest_dir) = manifest_dir else {
+        return (String::new(), true);
+    };
+    let Some(describe) = git_output(manifest_dir, &["describe", "--tags", "--always"]) else {
+        return (String::new(), true);
+    };
+
+    // Keep Git's exact diff semantics without allowing its stat-only index
+    // refresh to mutate the real checkout watched by Cargo. Fail closed for
+    // split indexes and any copy or Git error.
+    let Some(index_file) = copied_git_index_for_diff(manifest_dir) else {
+        return (format!("{describe}-dirty"), true);
+    };
+    match git_exit_code(
+        manifest_dir,
+        &[
+            "-c",
+            "core.splitIndex=false",
+            "diff",
+            "--no-ext-diff",
+            "--quiet",
+            "HEAD",
+            "--",
+        ],
+        &index_file.path,
+    ) {
+        Some(0) => (describe, false),
+        Some(1) => (format!("{describe}-dirty"), false),
+        // Exit codes other than 0 (clean) and 1 (differences), or failure to
+        // start Git, leave dirty state unknown. Report conservatively and make
+        // Cargo recheck the build script on the next invocation.
+        _ => (format!("{describe}-dirty"), true),
+    }
 }
 
 fn git_stdout_bounded(manifest_dir: &Path, args: &[&str], limit: usize) -> Option<Vec<u8>> {
@@ -202,8 +320,12 @@ fn source_identity_watch_paths(manifest_dir: &Path) -> Option<Vec<PathBuf>> {
     Some(watches.into_iter().collect())
 }
 
-fn emit_source_identity_reruns(manifest_dir: Option<&Path>) {
+fn emit_source_identity_reruns(manifest_dir: Option<&Path>, identity_uncertain: bool) {
     println!("cargo:rerun-if-changed=build.rs");
+    if identity_uncertain {
+        println!("cargo:rerun-if-changed={ALWAYS_RECHECK}");
+        return;
+    }
     match manifest_dir.and_then(source_identity_watch_paths) {
         Some(paths) => {
             for path in paths {
@@ -214,17 +336,30 @@ fn emit_source_identity_reruns(manifest_dir: Option<&Path>) {
     }
 }
 
+fn build_date() -> String {
+    let output = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8(output.stdout)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        _ => "unknown".to_owned(),
+    }
+}
+
 fn main() {
     let manifest_dir = manifest_dir();
-    let describe = manifest_dir
-        .as_deref()
-        .and_then(|directory| git_output(directory, &["describe", "--tags", "--always", "--dirty"]))
-        .unwrap_or_default();
+    let (describe, identity_uncertain) = git_describe(manifest_dir.as_deref());
     let commit = manifest_dir
         .as_deref()
-        .and_then(|directory| git_output(directory, &["rev-parse", "HEAD"]))
-        .unwrap_or_default();
+        .and_then(|directory| git_output(directory, &["rev-parse", "HEAD"]));
+    let identity_uncertain = identity_uncertain || commit.is_none();
+    let commit = commit.unwrap_or_default();
+    println!("cargo:rustc-env=AETHYME_BUILD_DATE={}", build_date());
     println!("cargo:rustc-env=AETHYME_GIT_DESCRIBE={describe}");
     println!("cargo:rustc-env=AETHYME_GIT_COMMIT={commit}");
-    emit_source_identity_reruns(manifest_dir.as_deref());
+    emit_source_identity_reruns(manifest_dir.as_deref(), identity_uncertain);
 }

@@ -1,7 +1,7 @@
 //! Real Cargo builds of tiny synthetic packages using the production scripts.
 //! No product binary or real-repository mutation is needed for this regression.
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn checked(command: &mut Command) -> String {
@@ -27,6 +27,9 @@ fn clear_git_environment(command: &mut Command) {
     for name in inherited_git_variables {
         command.env_remove(name);
     }
+    // Match build-script Git calls while suppressing optional index refreshes.
+    // `describe --dirty` still refreshes, so its oracle uses a copied index below.
+    command.env("GIT_OPTIONAL_LOCKS", "0");
 }
 
 fn git_with_environment(root: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
@@ -40,6 +43,48 @@ fn git_with_environment(root: &Path, args: &[&str], environment: &[(&str, &str)]
         command.env(name, value);
     }
     command.output().expect("spawn fixture Git")
+}
+
+fn git_with_copied_index(root: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
+    // `git describe --dirty` refreshes index stat data even with
+    // GIT_OPTIONAL_LOCKS=0. Run it against a copy so the oracle cannot change
+    // the fixture's watched `.git` directory before the Cargo probe.
+    let index = PathBuf::from(git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    ));
+    let temp = aethyme_testkit::tmp_dir();
+    let copied_index = temp.path().join("index");
+    fs::copy(&index, &copied_index).expect("copy fixture Git index");
+    let index_dir = index.parent().expect("fixture Git index parent");
+    for entry in fs::read_dir(index_dir).expect("read fixture Git index directory") {
+        let entry = entry.expect("read fixture Git index entry");
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sharedindex.")
+        {
+            fs::copy(entry.path(), temp.path().join(entry.file_name()))
+                .expect("copy fixture split index");
+        }
+    }
+    let copied_index = copied_index.to_str().expect("copied Git index UTF-8 path");
+    let mut isolated_environment = environment.to_vec();
+    isolated_environment.push(("GIT_INDEX_FILE", copied_index));
+    git_with_environment(root, args, &isolated_environment)
+}
+
+fn git_describe_dirty(root: &Path) -> String {
+    let output = git_with_copied_index(root, &["describe", "--tags", "--always", "--dirty"], &[]);
+    assert!(
+        output.status.success(),
+        "Git describe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("fixture Git describe UTF-8")
+        .trim()
+        .to_owned()
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
@@ -100,15 +145,24 @@ fn run_probe_with_environment(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let diagnostics = String::from_utf8_lossy(&output.stderr).into_owned();
-    let build_script_ran = diagnostics
+    let stdout = String::from_utf8(output.stdout).expect("fixture output UTF-8");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let identities = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("AETHYME_PROBE_IDENTITY:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities.len(),
+        1,
+        "expected exactly one identity record: {stdout}"
+    );
+    let identity = identities[0].to_owned();
+    let diagnostics = format!("{stdout}\n{stderr}");
+    let build_script_ran = stderr
         .lines()
         .any(|line| line.contains("Running") && line.contains("build-script-build"));
     ProbeRun {
-        identity: String::from_utf8(output.stdout)
-            .expect("fixture output UTF-8")
-            .trim()
-            .to_owned(),
+        identity,
         build_script_ran,
         diagnostics,
     }
@@ -152,6 +206,102 @@ fn assert_nonregular_entry_falls_back(run: &ProbeRun, entry: &Path, context: &st
         "nonregular tracked entry was emitted as a recursive Cargo input ({context}); Cargo diagnostics:\n{}",
         run.diagnostics
     );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IndexSnapshot {
+    bytes: Vec<u8>,
+    len: u64,
+    modified: std::time::SystemTime,
+    readonly: bool,
+    #[cfg(unix)]
+    identity: (u64, u64, u32),
+}
+
+fn snapshot_index(path: &Path) -> IndexSnapshot {
+    let bytes = fs::read(path).expect("read fixture Git index snapshot");
+    let metadata = fs::metadata(path).expect("stat fixture Git index snapshot");
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino(), metadata.mode())
+    };
+    IndexSnapshot {
+        bytes,
+        len: metadata.len(),
+        modified: metadata
+            .modified()
+            .expect("fixture index modification time"),
+        readonly: metadata.permissions().readonly(),
+        #[cfg(unix)]
+        identity,
+    }
+}
+
+fn snapshot_index_family(git_dir: &Path, index: &Path) -> Vec<(PathBuf, IndexSnapshot)> {
+    let mut paths = vec![index.to_path_buf()];
+    for entry in fs::read_dir(git_dir).expect("read fixture Git admin directory") {
+        let entry = entry.expect("read fixture Git admin entry");
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sharedindex.")
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let snapshot = snapshot_index(&path);
+            (path, snapshot)
+        })
+        .collect()
+}
+
+fn assert_conservative_index_fallback(run: &ProbeRun, context: &str) {
+    let rerun_directives = run
+        .diagnostics
+        .lines()
+        .filter(|line| line.contains("cargo:rerun-if-changed="))
+        .collect::<Vec<_>>();
+    assert!(
+        rerun_directives.iter().any(|line| {
+            line.contains("cargo:rerun-if-changed=.aethyme-source-identity-always-recheck")
+        }),
+        "index uncertainty did not select conservative fallback ({context}); Cargo diagnostics:\n{}",
+        run.diagnostics
+    );
+    assert!(
+        !rerun_directives
+            .iter()
+            .any(|line| line.contains("/.git") || line.contains("sharedindex.")),
+        "uncertain index emitted a recursive Git-admin watch ({context}); Cargo diagnostics:\n{}",
+        run.diagnostics
+    );
+}
+
+fn assert_no_private_index_copies(target: &Path, context: &str) {
+    let build_dir = target.join("debug/build");
+    for package in fs::read_dir(&build_dir).expect("read fixture Cargo build directory") {
+        let out_dir = package
+            .expect("read fixture Cargo package output")
+            .path()
+            .join("out");
+        if !out_dir.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&out_dir).expect("read fixture OUT_DIR") {
+            let entry = entry.expect("read fixture OUT_DIR entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".aethyme-source-identity-index-"),
+                "private index copy was left in OUT_DIR for {context}: {}",
+                entry.path().display()
+            );
+        }
+    }
 }
 
 #[test]
@@ -200,7 +350,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         fs::write(
             package_root.join("src/main.rs"),
             format!(
-                "fn main() {{ println!(\"{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
+                "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
             ),
         )
         .unwrap();
@@ -240,12 +390,12 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
 
         for (tree, expected) in [(&repo, &second), (&older, &first), (&repo, &second)] {
             let run = run_probe(&tree.join(package).join("Cargo.toml"), &target, temp.path());
-            let describe = git(tree, &["describe", "--tags", "--always", "--dirty"]);
+            let describe = git_describe_dirty(tree);
             assert_identity(&run, expected, &describe, name);
             assert_script_ran(&run, "switching source worktree");
         }
         let warm = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let stable_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let stable_describe = git_describe_dirty(&repo);
         assert_identity(&warm, &second, &stable_describe, name);
         assert_script_fresh(&warm, "same linked worktree and source state");
 
@@ -255,13 +405,13 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         let original = fs::read(&marker).unwrap();
         fs::write(&marker, "tracked edit\n").unwrap();
         let dirty = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let dirty_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let dirty_describe = git_describe_dirty(&repo);
         assert!(dirty_describe.ends_with("-dirty"));
         assert_identity(&dirty, &second, &dirty_describe, "tracked edit");
         assert_script_ran(&dirty, "tracked worktree edit");
         fs::write(&marker, original).unwrap();
         let clean = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let clean_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let clean_describe = git_describe_dirty(&repo);
         assert_identity(&clean, &second, &clean_describe, "tracked edit restored");
         assert_script_ran(&clean, "tracked edit restoration");
 
@@ -270,7 +420,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         let untracked = repo.join("untracked-marker");
         fs::write(&untracked, "untracked\n").unwrap();
         let untracked_run = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let untracked_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let untracked_describe = git_describe_dirty(&repo);
         assert_eq!(untracked_describe, clean_describe);
         assert_identity(&untracked_run, &second, &clean_describe, "untracked file");
         assert_script_fresh(&untracked_run, "untracked file");
@@ -294,7 +444,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         // Detached HEAD identity changes live in the per-worktree HEAD file.
         git(&repo, &["checkout", "--detach", &first]);
         let detached = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let detached_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let detached_describe = git_describe_dirty(&repo);
         assert_identity(&detached, &first, &detached_describe, "detached HEAD");
         assert_script_ran(&detached, "detached HEAD changed");
         let detached_warm = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
@@ -311,9 +461,17 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         // raw Git output, then verify Cargo's build script still sees the real
         // checkout after clearing all inherited GIT_* variables.
         git(&repo, &["checkout", "--detach", &second]);
-        git(&repo, &["replace", "--graft", &second]);
-        let expected_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
-        let no_replace = git_with_environment(
+        // An exact tag on HEAD makes parent traversal irrelevant to describe.
+        // Put the tagged commit behind a clean child so the replacement must
+        // change Git's independently derived description.
+        git(
+            &repo,
+            &["commit", "--allow-empty", "-m", "replacement fixture child"],
+        );
+        let replacement_head = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["replace", "--graft", &replacement_head]);
+        let expected_describe = git_describe_dirty(&repo);
+        let no_replace = git_with_copied_index(
             &repo,
             &["describe", "--tags", "--always", "--dirty"],
             &[("GIT_NO_REPLACE_OBJECTS", "1")],
@@ -324,7 +482,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
             expected_describe,
             "GIT_NO_REPLACE_OBJECTS must alter describe in the replacement fixture"
         );
-        let short_abbrev = git_with_environment(
+        let short_abbrev = git_with_copied_index(
             &repo,
             &["describe", "--tags", "--always", "--dirty"],
             &[
@@ -357,7 +515,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         );
         assert_identity(
             &poisoned_identity,
-            &second,
+            &replacement_head,
             &expected_describe,
             "poisoned Git config and replacement environment",
         );
@@ -374,7 +532,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
             &["update-index", "--add", "--cacheinfo", &gitlink_cache_info],
         );
         let gitlink_run = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let gitlink_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let gitlink_describe = git_describe_dirty(&repo);
         assert_identity(
             &gitlink_run,
             &first,
@@ -399,7 +557,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
             git(&repo, &["add", "tracked-directory-symlink"]);
             let symlink_run =
                 run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-            let symlink_describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+            let symlink_describe = git_describe_dirty(&repo);
             assert_identity(
                 &symlink_run,
                 &first,
@@ -409,6 +567,81 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
             assert_script_ran(&symlink_run, "tracked directory symlink");
             assert_nonregular_entry_falls_back(&symlink_run, &symlink, "tracked directory symlink");
         }
+
+        // Exercise both private-index-copy gates through each actual production
+        // build script from `scripts`. Reset the fixture so the safety cases
+        // start from a clean worktree and do not inherit the symlink fallback.
+        git(&repo, &["reset", "--hard", &first]);
+        let symlink = repo.join("tracked-directory-symlink");
+        if fs::symlink_metadata(&symlink).is_ok() {
+            fs::remove_file(&symlink).unwrap();
+        }
+        let symlink_target = repo.join("symlink-target");
+        if symlink_target.exists() {
+            fs::remove_dir_all(&symlink_target).unwrap();
+        }
+        let index = PathBuf::from(git(
+            &repo,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        ));
+        let git_dir = PathBuf::from(git(&repo, &["rev-parse", "--absolute-git-dir"]));
+        let fallback_describe = git(&repo, &["describe", "--tags", "--always"]);
+
+        // A split index is detected through its sharedindex entry before the
+        // primary index is opened for a private copy.
+        git(&repo, &["update-index", "--split-index"]);
+        let split_before = snapshot_index_family(&git_dir, &index);
+        assert!(
+            split_before.len() > 1,
+            "fixture did not create a split index"
+        );
+        let split_run = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_script_ran(&split_run, "split-index fallback");
+        assert_identity(
+            &split_run,
+            &first,
+            &format!("{fallback_describe}-dirty"),
+            "split-index conservative identity",
+        );
+        assert_conservative_index_fallback(&split_run, "split index");
+        assert_eq!(snapshot_index_family(&git_dir, &index), split_before);
+        assert_no_private_index_copies(&target, "split index");
+
+        // Return to a full index, remove obsolete shared-index files, and make
+        // the primary index just over the 16 MiB copy cap. The guard must
+        // refuse before creating an OUT_DIR copy or changing the source file.
+        git(&repo, &["update-index", "--no-split-index"]);
+        for entry in fs::read_dir(&git_dir).expect("read fixture Git admin directory") {
+            let entry = entry.expect("read fixture Git admin entry");
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("sharedindex.")
+            {
+                fs::remove_file(entry.path()).expect("remove unused shared index");
+            }
+        }
+        const INDEX_COPY_LIMIT: u64 = 16 * 1024 * 1024;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&index)
+            .expect("open fixture Git index for oversize boundary")
+            .set_len(INDEX_COPY_LIMIT + 1)
+            .expect("extend fixture index past private-copy cap");
+        let oversized_before = snapshot_index_family(&git_dir, &index);
+        assert_eq!(oversized_before.len(), 1, "fixture still has a split index");
+        assert_eq!(oversized_before[0].1.len, INDEX_COPY_LIMIT + 1);
+        let oversized_run = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_script_ran(&oversized_run, "oversized-index fallback");
+        assert_identity(
+            &oversized_run,
+            &first,
+            &format!("{fallback_describe}-dirty"),
+            "oversized-index conservative identity",
+        );
+        assert_conservative_index_fallback(&oversized_run, "oversized index");
+        assert_eq!(snapshot_index_family(&git_dir, &index), oversized_before);
+        assert_no_private_index_copies(&target, "oversized index");
     }
 }
 
@@ -455,7 +688,7 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
         fs::write(
             package_root.join("src/main.rs"),
             format!(
-                "fn main() {{ println!(\"{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
+                "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
             ),
         )
         .unwrap();
@@ -482,7 +715,7 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
         );
 
         let initial = run_probe(&package_root.join("Cargo.toml"), &target, temp.path());
-        let expected_before = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let expected_before = git_describe_dirty(&repo);
         assert_identity(&initial, &head, &expected_before, name);
         assert_script_ran(&initial, "initial shallow fixture build");
 
@@ -507,7 +740,7 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
             refs
         );
         let shallow_run = run_probe(&package_root.join("Cargo.toml"), &target, temp.path());
-        let expected_after = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let expected_after = git_describe_dirty(&repo);
         assert_ne!(
             expected_before, expected_after,
             "shallow boundary must change describe"
@@ -571,7 +804,7 @@ fn symlinked_tracked_ancestor_uses_fallback_without_watching_its_target() {
         fs::write(
             package_root.join("src/main.rs"),
             format!(
-                "fn main() {{ println!(\"{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
+                "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
             ),
         )
         .unwrap();
@@ -592,7 +825,7 @@ fn symlinked_tracked_ancestor_uses_fallback_without_watching_its_target() {
         std::os::unix::fs::symlink(&external, repo.join("tracked-parent")).unwrap();
 
         let run = run_probe(&package_root.join("Cargo.toml"), &target, temp.path());
-        let describe = git(&repo, &["describe", "--tags", "--always", "--dirty"]);
+        let describe = git_describe_dirty(&repo);
         assert_identity(&run, &commit, &describe, name);
         assert_script_ran(&run, "tracked path gained a symlinked ancestor");
         assert_nonregular_entry_falls_back(
@@ -672,6 +905,14 @@ fn build_scripts_keep_empty_identity_exports_when_git_is_unavailable() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8(output.stdout).expect("build script output UTF-8");
+        if name != "broker-no-git" {
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == "cargo:rustc-env=AETHYME_BUILD_DATE=unknown"),
+                "router and engine must retain their build-date export even without date or Git ({name}): {stdout}"
+            );
+        }
         assert!(
             stdout
                 .lines()
