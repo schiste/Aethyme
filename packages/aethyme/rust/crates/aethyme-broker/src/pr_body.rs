@@ -262,7 +262,7 @@ fn render_body(
     body.push_str("Commits:\n");
     body.push_str(commit_list);
     if details_omitted {
-        body.push_str("\n");
+        body.push('\n');
         body.push_str(BODY_TRUNCATION_NOTICE);
         body.push('\n');
     }
@@ -469,7 +469,7 @@ fn fill_template(
     // contract line still reaches the check.
     let mut prefix = String::new();
     if !placed[0] && !summary.is_empty() {
-        prefix.push_str(&summary);
+        prefix.push_str(summary);
         prefix.push_str("\n\n");
     }
     if !placed[1] && !validation.is_empty() {
