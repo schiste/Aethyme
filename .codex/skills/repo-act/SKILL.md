@@ -67,6 +67,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   from Cargo output; correct embedded identity alone does not rule out forced
   recompilation on every invocation. Use a dependency-free fixture first.
 - Run the fastest relevant test command first.
+  Check the selected test names and a nonzero executed count before treating a
+  focused run as evidence. Rust module aliases can differ from filenames; a
+  successful build with zero matching tests does not validate the change.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
