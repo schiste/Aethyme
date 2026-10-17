@@ -140,7 +140,9 @@ fn two_candidates(tmp: &common::FixtureRepository, broker: Broker) -> (Broker, i
     }
     drop(db);
     (
-        common::open_fixture_repository_broker(tmp).unwrap(),
+        common::open_fixture_repository_broker(tmp)
+            .unwrap()
+            .into_broker(),
         small,
         large,
         blocked_old,

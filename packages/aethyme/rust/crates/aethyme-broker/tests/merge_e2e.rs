@@ -738,7 +738,8 @@ fn cli_submit_command(broker: &Broker, root: &Path, session: i64) -> Command {
     broker
         .configure_storage_context_for_child(&mut command)
         .unwrap();
-    command.current_dir(root)
+    command.current_dir(root);
+    command
 }
 
 // #418: the contract decision is checked before the gates start, against the
@@ -748,7 +749,7 @@ fn submit_refuses_an_undeclared_tracked_removal_before_any_gate_runs() {
     let tmp = common::FixtureRepository::new();
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "undeclared");
     commit_edit(&worktree, "src/a.py", "a = 2\n");
-    let command = cli_submit_command(&broker, tmp.path(), session);
+    let mut command = cli_submit_command(&broker, tmp.path(), session);
     drop(broker);
 
     let output = command.output().unwrap();
@@ -780,7 +781,7 @@ fn submit_preflight_ignores_uncommitted_tracked_removals() {
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "uncommitted");
     commit_edit(&worktree, "src/b.py", "b = 2\n");
     std::fs::write(worktree.join("src/a.py"), "a = 2\n").unwrap();
-    let command = cli_submit_command(&broker, tmp.path(), session);
+    let mut command = cli_submit_command(&broker, tmp.path(), session);
     drop(broker);
 
     let output = command.output().unwrap();
@@ -1883,7 +1884,7 @@ fn normalized_replay_refuses_missing_baseline() {
 }
 
 fn owned_merge_fixture() -> (
-    tempfile::TempDir,
+    common::FixtureRepository,
     Broker,
     std::path::PathBuf,
     aethyme_broker::Session,
