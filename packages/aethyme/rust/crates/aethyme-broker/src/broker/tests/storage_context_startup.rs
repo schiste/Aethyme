@@ -374,6 +374,42 @@ fn run_slot_identity_worker() {
         root_plan_a.storage_context_refusal
     );
 
+    let broker = Broker::open_with_options(&repo_a, BrokerOpenOptions::default())
+        .expect("open repo A under its captured storage context");
+    let storage_plan_a =
+        crate::storage::storage_plan_with_context(&repo_a, broker.storage_context())
+            .expect("plan repo A with its captured context");
+    assert_eq!(storage_plan_a.storage_root, private_worktrees);
+    let unbound_context = crate::broker::BrokerStorageContext::default();
+    let unbound_error = crate::storage::storage_plan_with_context(&repo_a, &unbound_context)
+        .expect_err("storage planning requires a repository-bound context");
+    assert!(
+        unbound_error.to_string().contains("repository-bound"),
+        "unexpected unbound context refusal: {unbound_error}"
+    );
+    let storage_plan_error =
+        crate::storage::storage_plan_with_context(&repo_b, broker.storage_context())
+            .expect_err("repo A context must not plan storage for repo B");
+    assert!(
+        storage_plan_error
+            .to_string()
+            .contains("different repository root"),
+        "unexpected storage-plan refusal: {storage_plan_error}"
+    );
+    let confirmation = "a".repeat(64);
+    let storage_apply_error = crate::storage::storage_apply_with_context(
+        &repo_b,
+        &confirmation,
+        broker.storage_context(),
+    )
+    .expect_err("repo A context must not apply storage for repo B");
+    assert!(
+        storage_apply_error
+            .to_string()
+            .contains("different repository root"),
+        "unexpected storage-apply refusal: {storage_apply_error}"
+    );
+
     let stale_plan_placement = crate::verification::plan_slot_placement_with_worktree_root_plan(
         &repo_b,
         "captured-context-mismatch",
@@ -409,7 +445,7 @@ fn run_slot_identity_worker() {
         placement.blocking_refusal
     );
     assert!(!placement.directory.exists());
-    assert!(!repo_b.path().join(".aethyme/run").exists());
+    assert!(!repo_b.join(".aethyme/run").exists());
     assert!(!private_worktrees.join(".aethyme/run").exists());
 }
 
@@ -543,42 +579,6 @@ fn malformed_private_storage_context_fails_before_open_maintenance() {
     let entry = preparation_entry(&poisoned_state);
     std::fs::create_dir_all(&entry).expect("poisoned preparation entry");
     std::fs::write(entry.join("payload"), b"keep me").expect("poisoned payload");
-
-    let broker = Broker::open_with_options(&repo_a, BrokerOpenOptions::default())
-        .expect("open repo A under its captured storage context");
-    let storage_plan_a =
-        crate::storage::storage_plan_with_context(&repo_a, broker.storage_context())
-            .expect("plan repo A with its captured context");
-    assert_eq!(storage_plan_a.storage_root, private_worktrees);
-    let unbound_context = crate::broker::BrokerStorageContext::default();
-    let unbound_error = crate::storage::storage_plan_with_context(&repo_a, &unbound_context)
-        .expect_err("storage planning requires a repository-bound context");
-    assert!(
-        unbound_error.to_string().contains("repository-bound"),
-        "unexpected unbound context refusal: {unbound_error}"
-    );
-    let storage_plan_error =
-        crate::storage::storage_plan_with_context(&repo_b, broker.storage_context())
-            .expect_err("repo A context must not plan storage for repo B");
-    assert!(
-        storage_plan_error
-            .to_string()
-            .contains("different repository root"),
-        "unexpected storage-plan refusal: {storage_plan_error}"
-    );
-    let confirmation = "a".repeat(64);
-    let storage_apply_error = crate::storage::storage_apply_with_context(
-        &repo_b,
-        &confirmation,
-        broker.storage_context(),
-    )
-    .expect_err("repo A context must not apply storage for repo B");
-    assert!(
-        storage_apply_error
-            .to_string()
-            .contains("different repository root"),
-        "unexpected storage-apply refusal: {storage_apply_error}"
-    );
 
     let repo_git = crate::GitRepo::discover(repo.path()).expect("discover fixture repository");
     let main_root = repo_git.main_root().expect("resolve main repository");
@@ -873,7 +873,7 @@ fn run_captured_startup_child() {
             .worktree_root_plan()
             .expect("captured worktree plan")
             .preferred_root,
-        Some(private_worktrees)
+        Some(private_worktrees.clone())
     );
     assert!(private_state.join("host-resources.db").is_file());
     assert!(!private_entry.exists());

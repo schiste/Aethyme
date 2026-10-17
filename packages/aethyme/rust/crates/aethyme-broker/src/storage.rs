@@ -1225,68 +1225,89 @@ fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
         .any(|entry| entry.metadata().as_ref().map(recent).unwrap_or(true))
 }
 
-/// Result of a bounded preparation-cache sweep.
+/// Inventory the shared preparation cache, and decide which entries are dead.
 ///
-/// Counts include only cache entries removed completely. `complete` is false
-/// when discovery, liveness verification, locking, or deletion could not be
-/// completed; callers must not treat an incomplete report as a drained cache.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// An entry is named after the key its repository computed: a content hash of
+/// the declared inputs, the config and the platform. So the live set is not a
+/// guess -- it is exactly the keys the checkouts on this host would recompute
+/// now. Anything else is a key nobody will ask for again, because the inputs
+/// that produced it have changed.
+///
+/// `live_roots` are the checkouts entitled to keep an entry alive. A checkout
+/// that declares no shared step contributes no key and keeps nothing, which is
+/// correct: it never populated the cache either.
+/// Reclaim dead preparation-cache entries without an operator present.
+///
+/// The manual lane exists so a human can review before deleting. That review
+/// is the right default for worktrees, which hold work; it is the wrong
+/// default for a content-addressed cache, whose entries are named after the
+/// inputs that produced them. An entry no checkout computes will never be read
+/// again no matter how long it is kept, so waiting for someone to type a
+/// command only trades disk for nothing. Measured here: 13.3 GB reclaimed by
+/// hand came back as 15 GB in three days, because nothing reclaimed it.
+///
+/// Result of one bounded preparation-cache sweep. `complete` is false when
+/// discovery, the deadline, a lease, or deletion prevented the sweep from
+/// deciding every eligible entry. A caller may report progress while keeping
+/// its durable recovery request pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreparationCacheSweepReport {
-    /// Cache repository/key directories fully removed by this pass.
-    pub entries_removed: usize,
-    /// Logical bytes measured immediately before fully removed directories.
-    pub bytes_reclaimed: u64,
-    /// Filesystem objects counted below fully removed directories.
-    ///
-    /// This is a conservative measured count. Objects created during removal
-    /// are not included, and interrupted or failed trees are not counted.
-    pub filesystem_entries_reclaimed: u64,
-    /// Whether discovery and every required verification/removal completed.
-    ///
-    /// This is false when no worktree roots were supplied, or when any
-    /// discovery, deadline, lease, verification, or removal step was
-    /// incomplete. It does not mean arbitrary unrecognized paths are safe to
-    /// reclaim; those remain untouched and make the report incomplete.
-    pub complete: bool,
+    pub(crate) entries_removed: usize,
+    pub(crate) bytes_reclaimed: u64,
+    /// Filesystem entries actually unlinked, including partial progress from
+    /// interrupted or failed removals that must resume at the same tree.
+    pub(crate) filesystem_entries_reclaimed: usize,
+    pub(crate) complete: bool,
 }
 
 impl PreparationCacheSweepReport {
-    fn legacy_counts(self) -> (usize, u64) {
-        (self.entries_removed, self.bytes_reclaimed)
+    fn complete_empty() -> Self {
+        Self {
+            entries_removed: 0,
+            bytes_reclaimed: 0,
+            filesystem_entries_reclaimed: 0,
+            complete: true,
+        }
+    }
+
+    fn incomplete_empty() -> Self {
+        Self {
+            complete: false,
+            ..Self::complete_empty()
+        }
     }
 }
 
-/// Reclaim entries from the shared preparation cache when no live checkout
-/// computes their content-addressed keys.
-///
-/// The deadline is checked between filesystem operations and streamed hash
-/// chunks. Filesystem calls themselves cannot be cancelled, so a stalled OS
-/// call can outlive the deadline. Counts include only fully removed entries;
-/// an interrupted entry may already be partly drained.
+/// Checks `deadline` between filesystem operations and streamed hash chunks.
+/// Filesystem calls themselves cannot be cancelled, so a stalled OS call can
+/// outlive the deadline. Entries are independent, making a partial sweep safe.
+/// Returns fully removed entries and their measured bytes; an interrupted
+/// entry may already be partly drained, so these totals can conservatively
+/// undercount bytes removed during that pass.
 pub(crate) fn sweep_preparation_cache(
     main_root: &Path,
     _orphan_worktree_roots_days: u32,
     deadline: std::time::Instant,
-) -> (usize, u64) {
+) -> PreparationCacheSweepReport {
     if check_preparation_sweep_deadline(deadline).is_err() {
-        return (0, 0);
+        return PreparationCacheSweepReport::incomplete_empty();
     }
     let Ok(context) = capture_storage_context_for_path(main_root) else {
-        return (0, 0);
+        return PreparationCacheSweepReport::incomplete_empty();
     };
     let Some(cache_root) = context.preparation_cache_root() else {
-        return (0, 0);
+        return PreparationCacheSweepReport::incomplete_empty();
     };
     let Some(resource_db_path) = context.host_resource_db_path.as_deref() else {
-        return (0, 0);
+        return PreparationCacheSweepReport::incomplete_empty();
     };
     let Ok(storage_root) = storage_container_with_context(main_root, &context) else {
-        return (0, 0);
+        return PreparationCacheSweepReport::incomplete_empty();
     };
     if check_preparation_sweep_deadline(deadline).is_err() {
-        return (0, 0);
+        return PreparationCacheSweepReport::incomplete_empty();
     }
-    sweep_preparation_cache_at(
+    sweep_preparation_cache_at_with_status(
         main_root,
         &storage_root,
         &cache_root,
@@ -1295,9 +1316,8 @@ pub(crate) fn sweep_preparation_cache(
     )
 }
 
-/// The inline lane deliberately does not build a storage plan: that plan
-/// reconciles Git and broker ledgers for every storage class. Cache liveness
-/// needs only the checkout roots and their declared preparation inputs.
+/// Test adapter retaining the historical tuple result for fixture assertions.
+#[cfg(test)]
 fn sweep_preparation_cache_at(
     main_root: &Path,
     storage_root: &Path,
@@ -1305,35 +1325,29 @@ fn sweep_preparation_cache_at(
     resource_db_path: &Path,
     deadline: std::time::Instant,
 ) -> (usize, u64) {
-    sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
-        discover_preparation_live_roots(main_root, storage_root, deadline)
-    })
-    .legacy_counts()
-}
-
-/// The Broker-backed sweep uses the root candidates captured by that Broker
-/// rather than re-reading the process environment during startup maintenance.
-pub(crate) fn sweep_preparation_cache_for_roots(
-    main_root: &Path,
-    worktree_roots: &[PathBuf],
-    cache_root: &Path,
-    resource_db_path: &Path,
-    deadline: std::time::Instant,
-) -> (usize, u64) {
-    sweep_preparation_cache_for_roots_with_status(
+    let report = sweep_preparation_cache_at_with_status(
         main_root,
-        worktree_roots,
+        storage_root,
         cache_root,
         resource_db_path,
         deadline,
-    )
-    .legacy_counts()
+    );
+    (report.entries_removed, report.bytes_reclaimed)
 }
 
-/// Broker-backed preparation-cache sweep with explicit completeness status.
-///
-/// The status-bearing API is used by the durable worker, which must not report
-/// a successful drain when discovery, locking, or deletion was incomplete.
+fn sweep_preparation_cache_at_with_status(
+    main_root: &Path,
+    storage_root: &Path,
+    cache_root: &Path,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+) -> PreparationCacheSweepReport {
+    sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
+        discover_preparation_live_roots(main_root, storage_root, deadline)
+    })
+}
+
+/// Sweep using the exact worktree roots selected by one Broker instance.
 pub(crate) fn sweep_preparation_cache_for_roots_with_status(
     main_root: &Path,
     worktree_roots: &[PathBuf],
@@ -1342,11 +1356,29 @@ pub(crate) fn sweep_preparation_cache_for_roots_with_status(
     deadline: std::time::Instant,
 ) -> PreparationCacheSweepReport {
     if check_preparation_sweep_deadline(deadline).is_err() || worktree_roots.is_empty() {
-        return PreparationCacheSweepReport::default();
+        return PreparationCacheSweepReport::incomplete_empty();
     }
     sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
         discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline)
     })
+}
+
+/// Compatibility wrapper for callers that need only fully removed entries.
+pub(crate) fn sweep_preparation_cache_for_roots(
+    main_root: &Path,
+    worktree_roots: &[PathBuf],
+    cache_root: &Path,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+) -> (usize, u64) {
+    let report = sweep_preparation_cache_for_roots_with_status(
+        main_root,
+        worktree_roots,
+        cache_root,
+        resource_db_path,
+        deadline,
+    );
+    (report.entries_removed, report.bytes_reclaimed)
 }
 
 fn sweep_preparation_cache_with_discovery(
@@ -1357,73 +1389,74 @@ fn sweep_preparation_cache_with_discovery(
 ) -> PreparationCacheSweepReport {
     let live_roots = match discover_live_roots(deadline) {
         Ok(roots) => roots,
-        Err(_) => return PreparationCacheSweepReport::default(),
+        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
     };
     if live_roots.is_empty() {
-        return PreparationCacheSweepReport::default();
+        return PreparationCacheSweepReport::incomplete_empty();
     }
     let live_keys = match current_preparation_keys(&live_roots, deadline) {
         Ok(keys) => keys,
-        Err(_) => return PreparationCacheSweepReport::default(),
+        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
     };
     if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::default();
+        return PreparationCacheSweepReport::incomplete_empty();
     }
     let cache_metadata = match std::fs::symlink_metadata(cache_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return PreparationCacheSweepReport {
-                complete: true,
-                ..PreparationCacheSweepReport::default()
-            };
+            return PreparationCacheSweepReport::complete_empty();
         }
-        Err(_) => return PreparationCacheSweepReport::default(),
+        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
     };
     if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
-        return PreparationCacheSweepReport::default();
+        return PreparationCacheSweepReport::incomplete_empty();
     }
     if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::default();
+        return PreparationCacheSweepReport::incomplete_empty();
     }
     let repositories = match std::fs::read_dir(cache_root) {
         Ok(entries) => entries,
-        Err(_) => return PreparationCacheSweepReport::default(),
+        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
     };
     if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::default();
+        return PreparationCacheSweepReport::incomplete_empty();
     }
-    let mut report = PreparationCacheSweepReport {
-        complete: true,
-        ..PreparationCacheSweepReport::default()
-    };
+    let mut removed = 0_usize;
+    let mut bytes = 0_u64;
+    let mut filesystem_entries_reclaimed = 0_usize;
+    let mut complete = true;
     let mut coordinator = None;
     for repository in repositories {
         if check_preparation_sweep_deadline(deadline).is_err() {
-            report.complete = false;
+            complete = false;
             break;
         }
         let Ok(repository) = repository else {
-            report.complete = false;
+            complete = false;
             break;
         };
         let repository_path = repository.path();
         let Ok(repository_type) = repository.file_type() else {
-            report.complete = false;
+            complete = false;
             break;
         };
         if repository_type.is_symlink() || !repository_type.is_dir() {
-            report.complete = false;
+            complete = false;
             continue;
         }
         let Some(repository_name) = repository_path.file_name().and_then(|name| name.to_str())
         else {
-            report.complete = false;
-            continue;
+            return PreparationCacheSweepReport {
+                entries_removed: removed,
+                bytes_reclaimed: bytes,
+                filesystem_entries_reclaimed,
+                complete: false,
+            };
         };
         let Some((lease_repository, retired)) =
             preparation_cache_repository_identity(repository_name)
         else {
-            report.complete = false;
+            complete = false;
             continue;
         };
         if retired {
@@ -1436,16 +1469,24 @@ fn sweep_preparation_cache_with_discovery(
             ) {
                 Ok(grant) => grant,
                 Err(PreparationCacheLeaseError::Busy) => {
-                    report.complete = false;
+                    complete = false;
                     continue;
                 }
                 Err(PreparationCacheLeaseError::Deadline) => {
-                    report.complete = false;
-                    return report;
+                    return PreparationCacheSweepReport {
+                        entries_removed: removed,
+                        bytes_reclaimed: bytes,
+                        filesystem_entries_reclaimed,
+                        complete: false,
+                    };
                 }
                 Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
-                    report.complete = false;
-                    return report;
+                    return PreparationCacheSweepReport {
+                        entries_removed: removed,
+                        bytes_reclaimed: bytes,
+                        filesystem_entries_reclaimed,
+                        complete: false,
+                    };
                 }
             };
             // The budget rotator renames a complete repository store while
@@ -1455,56 +1496,72 @@ fn sweep_preparation_cache_with_discovery(
             let outcome = (|| {
                 let current_roots = match discover_live_roots(deadline) {
                     Ok(roots) => roots,
-                    Err(_) => return PreparationCacheSweepOutcome::Stop,
+                    Err(_) => return PreparationCacheSweepOutcome::Stop(0),
                 };
                 if current_preparation_keys(&current_roots, deadline).is_err() {
-                    return PreparationCacheSweepOutcome::Stop;
+                    return PreparationCacheSweepOutcome::Stop(0);
                 }
                 if repository_path.parent() != Some(cache_root)
                     || !is_real_directory(cache_root)
                     || !retired_preparation_store_layout(&repository_path, Some(deadline))
                 {
-                    return PreparationCacheSweepOutcome::Incomplete;
+                    return PreparationCacheSweepOutcome::Protected;
                 }
                 let usage =
                     match crate::disk_headroom::directory_usage_bounded(&repository_path, deadline)
                     {
                         Some(usage) => usage,
-                        None => return PreparationCacheSweepOutcome::Stop,
+                        None => return PreparationCacheSweepOutcome::Stop(0),
                     };
                 if check_preparation_sweep_deadline(deadline).is_err()
                     || repository_path.parent() != Some(cache_root)
                     || !is_real_directory(cache_root)
                     || !retired_preparation_store_layout(&repository_path, Some(deadline))
                 {
-                    return PreparationCacheSweepOutcome::Stop;
+                    return PreparationCacheSweepOutcome::Stop(0);
                 }
-                match remove_condemned_tree(&repository_path, None, Some(deadline)) {
-                    Ok(TreeRemoval::Complete) => PreparationCacheSweepOutcome::Removed {
-                        bytes: usage.bytes,
-                        filesystem_entries: usage.inodes,
-                    },
-                    Ok(TreeRemoval::Interrupted) => PreparationCacheSweepOutcome::Stop,
-                    Err(_) => PreparationCacheSweepOutcome::Incomplete,
+                match crate::gc::remove_condemned_tree_with_progress(
+                    &repository_path,
+                    None,
+                    Some(deadline),
+                ) {
+                    Ok((TreeRemoval::Complete, count)) => {
+                        PreparationCacheSweepOutcome::Removed(usage.bytes, count)
+                    }
+                    Ok((TreeRemoval::Interrupted, count)) => {
+                        PreparationCacheSweepOutcome::Stop(count)
+                    }
+                    Err(error) => PreparationCacheSweepOutcome::Failed(error.entries_reclaimed),
                 }
             })();
-            release_preparation_cache_lease(&mut coordinator, &grant);
+            if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                complete = false;
+            }
             match outcome {
-                PreparationCacheSweepOutcome::Removed {
-                    bytes,
-                    filesystem_entries,
-                } => {
-                    report.entries_removed += 1;
-                    report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
-                    report.filesystem_entries_reclaimed = report
-                        .filesystem_entries_reclaimed
-                        .saturating_add(filesystem_entries);
+                PreparationCacheSweepOutcome::Removed(reclaimed, count) => {
+                    removed += 1;
+                    bytes = bytes.saturating_add(reclaimed);
+                    filesystem_entries_reclaimed =
+                        filesystem_entries_reclaimed.saturating_add(count);
                 }
-                PreparationCacheSweepOutcome::RetainedLive => continue,
-                PreparationCacheSweepOutcome::Incomplete => report.complete = false,
-                PreparationCacheSweepOutcome::Stop => {
-                    report.complete = false;
-                    return report;
+                PreparationCacheSweepOutcome::Protected => {
+                    complete = false;
+                    continue;
+                }
+                PreparationCacheSweepOutcome::Failed(count) => {
+                    filesystem_entries_reclaimed =
+                        filesystem_entries_reclaimed.saturating_add(count);
+                    complete = false;
+                }
+                PreparationCacheSweepOutcome::Stop(count) => {
+                    filesystem_entries_reclaimed =
+                        filesystem_entries_reclaimed.saturating_add(count);
+                    return PreparationCacheSweepReport {
+                        entries_removed: removed,
+                        bytes_reclaimed: bytes,
+                        filesystem_entries_reclaimed,
+                        complete: false,
+                    };
                 }
             }
             continue;
@@ -1512,30 +1569,42 @@ fn sweep_preparation_cache_with_discovery(
         let entries = match std::fs::read_dir(&repository_path) {
             Ok(entries) => entries,
             Err(_) => {
-                report.complete = false;
+                complete = false;
                 break;
             }
         };
         for entry in entries {
             if check_preparation_sweep_deadline(deadline).is_err() {
-                report.complete = false;
-                return report;
+                return PreparationCacheSweepReport {
+                    entries_removed: removed,
+                    bytes_reclaimed: bytes,
+                    filesystem_entries_reclaimed,
+                    complete: false,
+                };
             }
             let Ok(entry) = entry else {
-                report.complete = false;
-                return report;
+                return PreparationCacheSweepReport {
+                    entries_removed: removed,
+                    bytes_reclaimed: bytes,
+                    filesystem_entries_reclaimed,
+                    complete: false,
+                };
             };
             let Ok(file_type) = entry.file_type() else {
-                report.complete = false;
-                return report;
+                return PreparationCacheSweepReport {
+                    entries_removed: removed,
+                    bytes_reclaimed: bytes,
+                    filesystem_entries_reclaimed,
+                    complete: false,
+                };
             };
             if file_type.is_symlink() || !file_type.is_dir() {
-                report.complete = false;
+                complete = false;
                 continue;
             }
             let key = entry.file_name().to_string_lossy().into_owned();
             if !is_preparation_cache_key(&key) {
-                report.complete = false;
+                complete = false;
                 continue;
             }
             if live_keys.contains(&key) {
@@ -1552,16 +1621,24 @@ fn sweep_preparation_cache_with_discovery(
             ) {
                 Ok(grant) => grant,
                 Err(PreparationCacheLeaseError::Busy) => {
-                    report.complete = false;
+                    complete = false;
                     continue;
                 }
                 Err(PreparationCacheLeaseError::Deadline) => {
-                    report.complete = false;
-                    return report;
+                    return PreparationCacheSweepReport {
+                        entries_removed: removed,
+                        bytes_reclaimed: bytes,
+                        filesystem_entries_reclaimed,
+                        complete: false,
+                    };
                 }
                 Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
-                    report.complete = false;
-                    return report;
+                    return PreparationCacheSweepReport {
+                        entries_removed: removed,
+                        bytes_reclaimed: bytes,
+                        filesystem_entries_reclaimed,
+                        complete: false,
+                    };
                 }
             };
 
@@ -1572,82 +1649,103 @@ fn sweep_preparation_cache_with_discovery(
             let outcome = (|| {
                 let current_roots = match discover_live_roots(deadline) {
                     Ok(roots) => roots,
-                    Err(_) => return PreparationCacheSweepOutcome::Stop,
+                    Err(_) => return PreparationCacheSweepOutcome::Stop(0),
                 };
                 let current_keys = match current_preparation_keys(&current_roots, deadline) {
                     Ok(keys) => keys,
-                    Err(_) => return PreparationCacheSweepOutcome::Stop,
+                    Err(_) => return PreparationCacheSweepOutcome::Stop(0),
                 };
                 if current_keys.contains(&key) {
-                    return PreparationCacheSweepOutcome::RetainedLive;
+                    return PreparationCacheSweepOutcome::Protected;
                 }
                 if candidate_path.parent() != Some(repository_path.as_path())
                     || repository_path.parent() != Some(cache_root)
                     || !is_real_directory(cache_root)
                     || !is_real_directory(&repository_path)
                 {
-                    return PreparationCacheSweepOutcome::Incomplete;
+                    return PreparationCacheSweepOutcome::Stop(0);
                 }
                 if check_preparation_sweep_deadline(deadline).is_err()
                     || !is_real_directory(&candidate_path)
                 {
-                    return PreparationCacheSweepOutcome::Stop;
+                    return PreparationCacheSweepOutcome::Stop(0);
                 }
                 let usage = match crate::disk_headroom::directory_usage_bounded(
                     &candidate_path,
                     deadline,
                 ) {
                     Some(usage) => usage,
-                    None => return PreparationCacheSweepOutcome::Stop,
+                    None => return PreparationCacheSweepOutcome::Stop(0),
                 };
                 if check_preparation_sweep_deadline(deadline).is_err()
                     || !is_real_directory(cache_root)
                     || !is_real_directory(&repository_path)
                     || !is_real_directory(&candidate_path)
                 {
-                    return PreparationCacheSweepOutcome::Incomplete;
+                    return PreparationCacheSweepOutcome::Stop(0);
                 }
-                match remove_condemned_tree(&candidate_path, None, Some(deadline)) {
-                    Ok(TreeRemoval::Complete) => PreparationCacheSweepOutcome::Removed {
-                        bytes: usage.bytes,
-                        filesystem_entries: usage.inodes,
-                    },
+                match crate::gc::remove_condemned_tree_with_progress(
+                    &candidate_path,
+                    None,
+                    Some(deadline),
+                ) {
+                    Ok((TreeRemoval::Complete, count)) => {
+                        PreparationCacheSweepOutcome::Removed(usage.bytes, count)
+                    }
                     // Count only a fully removed cache entry. The interrupted
                     // entry can already have lost files, so `bytes` remains a
                     // conservative lower bound for this pass.
-                    Ok(TreeRemoval::Interrupted) => PreparationCacheSweepOutcome::Stop,
-                    Err(_) => PreparationCacheSweepOutcome::Incomplete,
+                    Ok((TreeRemoval::Interrupted, count)) => {
+                        PreparationCacheSweepOutcome::Stop(count)
+                    }
+                    Err(error) => PreparationCacheSweepOutcome::Failed(error.entries_reclaimed),
                 }
             })();
-            release_preparation_cache_lease(&mut coordinator, &grant);
+            if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                complete = false;
+            }
             match outcome {
-                PreparationCacheSweepOutcome::Removed {
-                    bytes,
-                    filesystem_entries,
-                } => {
-                    report.entries_removed += 1;
-                    report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(bytes);
-                    report.filesystem_entries_reclaimed = report
-                        .filesystem_entries_reclaimed
-                        .saturating_add(filesystem_entries);
+                PreparationCacheSweepOutcome::Removed(reclaimed, count) => {
+                    removed += 1;
+                    bytes = bytes.saturating_add(reclaimed);
+                    filesystem_entries_reclaimed =
+                        filesystem_entries_reclaimed.saturating_add(count);
                 }
-                PreparationCacheSweepOutcome::RetainedLive => continue,
-                PreparationCacheSweepOutcome::Incomplete => report.complete = false,
-                PreparationCacheSweepOutcome::Stop => {
-                    report.complete = false;
-                    return report;
+                PreparationCacheSweepOutcome::Protected => {
+                    complete = false;
+                    continue;
+                }
+                PreparationCacheSweepOutcome::Failed(count) => {
+                    filesystem_entries_reclaimed =
+                        filesystem_entries_reclaimed.saturating_add(count);
+                    complete = false;
+                }
+                PreparationCacheSweepOutcome::Stop(count) => {
+                    filesystem_entries_reclaimed =
+                        filesystem_entries_reclaimed.saturating_add(count);
+                    return PreparationCacheSweepReport {
+                        entries_removed: removed,
+                        bytes_reclaimed: bytes,
+                        filesystem_entries_reclaimed,
+                        complete: false,
+                    };
                 }
             }
         }
     }
-    report
+    PreparationCacheSweepReport {
+        entries_removed: removed,
+        bytes_reclaimed: bytes,
+        filesystem_entries_reclaimed,
+        complete,
+    }
 }
 
 enum PreparationCacheSweepOutcome {
-    Removed { bytes: u64, filesystem_entries: u64 },
-    RetainedLive,
-    Incomplete,
-    Stop,
+    Removed(u64, usize),
+    Protected,
+    Failed(usize),
+    Stop(usize),
 }
 
 #[derive(Debug)]
@@ -1767,7 +1865,7 @@ fn preparation_cache_lease_request(
 fn release_preparation_cache_lease(
     coordinator: &mut Option<crate::HostResourceCoordinator>,
     grant: &crate::HostResourceGrant,
-) {
+) -> bool {
     let result = coordinator
         .as_mut()
         .expect("a grant must have an open coordinator")
@@ -1776,7 +1874,9 @@ fn release_preparation_cache_lease(
             grant.lease.generation,
             &grant.ownership_token,
         );
+    let released = result.is_ok();
     crate::warn_unrecorded("release preparation-cache storage lease", result);
+    released
 }
 
 fn check_preparation_sweep_deadline(deadline: std::time::Instant) -> Result<(), StorageError> {
@@ -4244,14 +4344,17 @@ mod tests {
         .expect("retired paths use the original writer identity");
         let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
         let grant = writer.acquire(&lease_request).unwrap();
-        let (removed_while_leased, _) = sweep_preparation_cache_at(
+        let leased_report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
-        assert_eq!(removed_while_leased, 0);
+        assert!(!leased_report.complete);
+        assert_eq!(leased_report.entries_removed, 0);
+        assert_eq!(leased_report.bytes_reclaimed, 0);
+        assert_eq!(leased_report.filesystem_entries_reclaimed, 0);
         assert!(retired_key.join("cache.bin").is_file());
         writer
             .release(
@@ -4261,15 +4364,17 @@ mod tests {
             )
             .unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
-        assert_eq!(removed, 1);
-        assert_eq!(bytes, b"retired store".len() as u64);
+        assert!(report.complete);
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(report.bytes_reclaimed, b"retired store".len() as u64);
+        assert!(report.filesystem_entries_reclaimed >= 2);
         assert!(!retired_path.exists());
     }
 
@@ -4432,7 +4537,7 @@ mod tests {
         let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
         let grant = writer.acquire(&request).unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let busy_report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4440,7 +4545,10 @@ mod tests {
             deadline,
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!busy_report.complete);
+        assert_eq!(busy_report.entries_removed, 0);
+        assert_eq!(busy_report.bytes_reclaimed, 0);
+        assert_eq!(busy_report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
         writer
             .release(
@@ -4450,14 +4558,17 @@ mod tests {
             )
             .unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let resumed_report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
-        assert_eq!((removed, bytes), (1, 16));
+        assert!(resumed_report.complete);
+        assert_eq!(resumed_report.entries_removed, 1);
+        assert_eq!(resumed_report.bytes_reclaimed, 16);
+        assert!(resumed_report.filesystem_entries_reclaimed >= 2);
         assert!(!entry.exists());
     }
 
@@ -4562,7 +4673,7 @@ mod tests {
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"keep until verified").unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4570,7 +4681,10 @@ mod tests {
             std::time::Instant::now() - Duration::from_millis(1),
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!report.complete);
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
     }
 
@@ -4589,7 +4703,7 @@ mod tests {
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"retain without lease registry").unwrap();
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4597,7 +4711,10 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!report.complete);
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
         assert!(
             !resource_db_path.exists(),
@@ -4635,7 +4752,7 @@ mod tests {
         std::fs::write(entry.join("cache.bin"), b"retain on unknown liveness").unwrap();
         let resource_db_path = test_host_resource_db(tmp.path());
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4643,7 +4760,10 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
-        assert_eq!((removed, bytes), (0, 0));
+        assert!(!report.complete);
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
         assert!(entry.join("cache.bin").exists());
         assert!(unmarked_root.is_dir());
     }
@@ -4674,7 +4794,7 @@ mod tests {
         std::fs::write(entry.join("cache.bin"), b"dead").unwrap();
         let resource_db_path = test_host_resource_db(tmp.path());
 
-        let (removed, bytes) = sweep_preparation_cache_at(
+        let report = sweep_preparation_cache_at_with_status(
             &main_root,
             &storage_root,
             &cache_root,
@@ -4682,8 +4802,10 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
-        assert_eq!(removed, 1);
-        assert_eq!(bytes, 4);
+        assert!(report.complete);
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(report.bytes_reclaimed, 4);
+        assert_eq!(report.filesystem_entries_reclaimed, 2);
         assert!(!entry.exists());
     }
 

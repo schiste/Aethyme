@@ -6,6 +6,13 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::{CStr, CString};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::MetadataExt;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -19,6 +26,11 @@ pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
 const PREPARATION_LEASE_TTL_SECONDS: u64 = 30;
 const PREPARATION_CACHE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
 const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
+// The scanner checks the deadline between filesystem operations. Individual
+// filesystem calls are not interruptible by this cooperative time limit.
+const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 100_000;
+const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
+const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreparationError {
@@ -209,6 +221,79 @@ struct PreparationRecord {
 }
 
 impl Broker {
+    fn recover_storage_refusal(&mut self, error: &BrokerOpError) {
+        let persisted = self.persist_storage_refusal(error);
+        if persisted {
+            self.start_storage_recovery_worker();
+        }
+    }
+
+    /// Persist a recovery generation without launching the worker. A caller
+    /// holding the shared preparation lease must release it before launch.
+    fn persist_storage_refusal(&mut self, error: &BrokerOpError) -> bool {
+        if !is_storage_unavailable(error) {
+            return false;
+        }
+        self.persist_storage_recovery_request()
+    }
+
+    fn persist_storage_recovery_request(&mut self) -> bool {
+        match self.persist_artifact_sweep_recovery_request() {
+            Ok(()) => true,
+            Err(recovery_error) => {
+                warn_preparation_cleanup_failure("persist cache recovery request", &recovery_error);
+                false
+            }
+        }
+    }
+
+    fn start_storage_recovery_worker(&mut self) {
+        if let Err(recovery_error) = self.start_artifact_sweep_recovery_worker() {
+            warn_preparation_cleanup_failure("start cache recovery worker", &recovery_error);
+        }
+    }
+
+    fn release_grant_after_error<T>(
+        &mut self,
+        result: Result<T, PreparationError>,
+        coordinator: &mut Option<HostResourceCoordinator>,
+        grant: &mut Option<crate::HostResourceGrant>,
+        recheck: impl FnOnce() -> Result<(), PreparationError>,
+    ) -> Result<T, PreparationError> {
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let storage_refused = match &error {
+            PreparationError::StorageUnavailable { .. } => true,
+            _ => matches!(recheck(), Err(PreparationError::StorageUnavailable { .. })),
+        };
+        let recovery_persisted = storage_refused && self.persist_storage_recovery_request();
+        let lease_released = release_grant_best_effort(coordinator, grant);
+        if recovery_persisted && lease_released {
+            self.start_storage_recovery_worker();
+        }
+        Err(error)
+    }
+
+    /// A package-manager command may fill its volume after preflight and then
+    /// fail with an ordinary exit status. Recheck only the already-known write
+    /// volumes on failure; this is an admission signal for later recovery, not
+    /// a quota or a way to interrupt the command while it runs.
+    fn recover_storage_pressure_after_command_failure(
+        &mut self,
+        error: &BrokerOpError,
+        recheck: impl FnOnce() -> Result<(), PreparationError>,
+    ) -> bool {
+        if is_storage_unavailable(error) {
+            return self.persist_storage_refusal(error);
+        }
+        if let Err(pressure @ PreparationError::StorageUnavailable { .. }) = recheck() {
+            return self.persist_storage_refusal(&pressure.into());
+        }
+        false
+    }
+
     /// Git-ignored top-level directories that exist in the primary checkout but
     /// not in this worktree.
     ///
@@ -457,7 +542,11 @@ impl Broker {
         if let Some(resource_db_path) = &resource_db_path {
             storage_paths.push(resource_db_path.clone());
         }
-        require_preparation_storage(self.main_root(), &storage_paths)?;
+        if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
+            let error = BrokerOpError::from(error);
+            self.recover_storage_refusal(&error);
+            return Err(error);
+        }
         let mut coordinator = resource_db_path
             .as_deref()
             .map(HostResourceCoordinator::open)
@@ -476,20 +565,35 @@ impl Broker {
         // A shared-cache lease may have waited while another process filled
         // either volume. Recheck before rotation, state writes or commands.
         if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
-            release_grant(&mut coordinator, &mut grant)?;
-            return Err(error.into());
+            let error = BrokerOpError::from(error);
+            let recovery_persisted = self.persist_storage_refusal(&error);
+            let lease_released = release_grant_best_effort(&mut coordinator, &mut grant);
+            if recovery_persisted && lease_released {
+                self.start_storage_recovery_worker();
+            }
+            return Err(error);
         }
+        let storage_root = self.main_root().to_path_buf();
         // Enforce the budget while the exclusive lease is held, never after
         // release: rotation removes a store other worktrees may be reading, so
         // it has to be inside the same critical section that granted access.
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
-        let rotation = shared_cache_budget(config.shared_cache.as_ref(), &digest, self)?;
-        if let Some(cache_dir) = &cache_dir {
-            fs::create_dir_all(cache_dir).map_err(|source| PreparationError::Io {
-                path: cache_dir.clone(),
-                source,
+        let rotation_result = shared_cache_budget(config.shared_cache.as_ref(), &digest, self);
+        let rotation =
+            self.release_grant_after_error(rotation_result, &mut coordinator, &mut grant, || {
+                require_preparation_storage(&storage_root, &storage_paths)
             })?;
+        if let Some(cache_dir) = &cache_dir {
+            self.release_grant_after_error(
+                fs::create_dir_all(cache_dir).map_err(|source| PreparationError::Io {
+                    path: cache_dir.clone(),
+                    source,
+                }),
+                &mut coordinator,
+                &mut grant,
+                || require_preparation_storage(&storage_root, &storage_paths),
+            )?;
         }
 
         let started_at = now_ms();
@@ -507,7 +611,12 @@ impl Broker {
             host_lease_generation: grant.as_ref().map(|grant| grant.lease.generation),
         };
         let state_path = record_path(self.main_root(), session_id);
-        write_record(&state_path, &record)?;
+        self.release_grant_after_error(
+            write_record(&state_path, &record),
+            &mut coordinator,
+            &mut grant,
+            || require_preparation_storage(&storage_root, &storage_paths),
+        )?;
 
         let environment = cache_dir
             .as_ref()
@@ -561,11 +670,20 @@ impl Broker {
                 }) {
                 Ok(report) => report,
                 Err(error) => {
+                    let recovery_persisted = self
+                        .recover_storage_pressure_after_command_failure(&error, || {
+                            require_preparation_storage(&main_root, &storage_paths)
+                        });
                     record.state = PreparationState::Failed;
                     record.failed_step = Some(step.name.clone());
                     record.completed_at = Some(now_ms());
-                    write_record(&state_path, &record)?;
-                    release_grant(&mut coordinator, &mut grant)?;
+                    let lease_released = best_effort_failed_preparation_cleanup(
+                        || write_record(&state_path, &record),
+                        || release_grant(&mut coordinator, &mut grant),
+                    );
+                    if recovery_persisted && lease_released {
+                        self.start_storage_recovery_worker();
+                    }
                     return Err(error);
                 }
             };
@@ -575,18 +693,28 @@ impl Broker {
                 succeeded: report.ok,
             });
             if !report.ok {
+                let error = PreparationError::StepFailed {
+                    step: step.name.clone(),
+                    exit_code: report.exit_code,
+                    session_id,
+                };
+                let error = BrokerOpError::from(error);
+                let recovery_persisted = self
+                    .recover_storage_pressure_after_command_failure(&error, || {
+                        require_preparation_storage(&main_root, &storage_paths)
+                    });
                 record.state = PreparationState::Failed;
                 record.failed_step = Some(step.name.clone());
                 record.exit_code = report.exit_code;
                 record.completed_at = Some(now_ms());
-                write_record(&state_path, &record)?;
-                release_grant(&mut coordinator, &mut grant)?;
-                return Err(PreparationError::StepFailed {
-                    step: step.name.clone(),
-                    exit_code: report.exit_code,
-                    session_id,
+                let lease_released = best_effort_failed_preparation_cleanup(
+                    || write_record(&state_path, &record),
+                    || release_grant(&mut coordinator, &mut grant),
+                );
+                if recovery_persisted && lease_released {
+                    self.start_storage_recovery_worker();
                 }
-                .into());
+                return Err(error);
             }
             let absent = match missing_step_outputs(&root, step) {
                 Ok(absent) => absent,
@@ -594,8 +722,10 @@ impl Broker {
                     record.state = PreparationState::Failed;
                     record.failed_step = Some(step.name.clone());
                     record.completed_at = Some(now_ms());
-                    write_record(&state_path, &record)?;
-                    release_grant(&mut coordinator, &mut grant)?;
+                    best_effort_failed_preparation_cleanup(
+                        || write_record(&state_path, &record),
+                        || release_grant(&mut coordinator, &mut grant),
+                    );
                     return Err(error.into());
                 }
             };
@@ -603,8 +733,10 @@ impl Broker {
                 record.state = PreparationState::Failed;
                 record.failed_step = Some(step.name.clone());
                 record.completed_at = Some(now_ms());
-                write_record(&state_path, &record)?;
-                release_grant(&mut coordinator, &mut grant)?;
+                best_effort_failed_preparation_cleanup(
+                    || write_record(&state_path, &record),
+                    || release_grant(&mut coordinator, &mut grant),
+                );
                 return Err(PreparationError::MissingOutputs {
                     step: step.name.clone(),
                     paths: absent.join(", "),
@@ -617,7 +749,12 @@ impl Broker {
         record.completed_at = Some(now_ms());
         record.host_lease_id = None;
         record.host_lease_generation = None;
-        write_record(&state_path, &record)?;
+        self.release_grant_after_error(
+            write_record(&state_path, &record),
+            &mut coordinator,
+            &mut grant,
+            || require_preparation_storage(&storage_root, &storage_paths),
+        )?;
         Ok(PreparationReport {
             schema_version: PREPARATION_SCHEMA_VERSION,
             session_id,
@@ -1377,10 +1514,12 @@ fn shared_cache_budget_at(
     store: &Path,
     digest: &str,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
-    if budget.max_bytes == 0 || !store.is_dir() {
+    if budget.max_bytes == 0 {
         return Ok(None);
     }
-    let bytes = directory_bytes(store);
+    let Some(bytes) = directory_bytes(store)? else {
+        return Ok(None);
+    };
     if bytes <= budget.max_bytes {
         return Ok(None);
     }
@@ -1442,25 +1581,387 @@ pub(crate) fn preparation_cache_root() -> Result<PathBuf, PreparationError> {
     Ok(parent.join("preparation-cache"))
 }
 
-fn directory_bytes(path: &Path) -> u64 {
+#[derive(Clone, Copy)]
+struct SharedCacheScanLimits {
+    max_entries: usize,
+    max_depth: usize,
+    max_elapsed: Duration,
+}
+
+impl Default for SharedCacheScanLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: SHARED_CACHE_SCAN_MAX_ENTRIES,
+            max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+            max_elapsed: SHARED_CACHE_SCAN_MAX_ELAPSED,
+        }
+    }
+}
+
+fn directory_bytes(path: &Path) -> Result<Option<u64>, PreparationError> {
+    directory_bytes_with_limits(path, SharedCacheScanLimits::default())
+}
+
+#[cfg(target_os = "linux")]
+fn shared_cache_stat_device(device: libc::dev_t) -> Option<u64> {
+    Some(device)
+}
+
+#[cfg(target_os = "macos")]
+fn shared_cache_stat_device(device: libc::dev_t) -> Option<u64> {
+    u64::try_from(device).ok()
+}
+
+fn directory_bytes_with_limits(
+    path: &Path,
+    _limits: SharedCacheScanLimits,
+) -> Result<Option<u64>, PreparationError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        directory_bytes_fd_relative(path, _limits)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(shared_cache_scan_refusal(
+            path,
+            "bounded no-follow inventory is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SharedCacheDirectoryStream(*mut libc::DIR);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl SharedCacheDirectoryStream {
+    fn from_owned_fd(fd: libc::c_int, path: &Path) -> Result<Self, PreparationError> {
+        // SAFETY: fd is an open directory descriptor and ownership transfers to
+        // fdopendir on success. The stream is closed by Drop.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let source = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so it did not take ownership of fd.
+            unsafe { libc::close(fd) };
+            return Err(shared_cache_scan_io_refusal(path, &source));
+        }
+        Ok(Self(stream))
+    }
+
+    fn fd(&self, path: &Path) -> Result<libc::c_int, PreparationError> {
+        // SAFETY: self owns a live DIR stream until Drop.
+        let fd = unsafe { libc::dirfd(self.0) };
+        if fd < 0 {
+            return Err(shared_cache_scan_io_refusal(
+                path,
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(fd)
+    }
+
+    fn next_name(&mut self, path: &Path) -> Result<Option<CString>, PreparationError> {
+        // readdir reports end-of-directory and errors with the same null
+        // pointer, so clear errno before each call and inspect it afterwards.
+        // SAFETY: the platform-specific errno accessor points to this thread's
+        // errno slot.
+        unsafe { *shared_cache_errno_location() = 0 };
+        // SAFETY: self owns a live DIR stream; readdir's pointer is copied
+        // before another call can invalidate it.
+        let entry = unsafe { libc::readdir(self.0) };
+        if entry.is_null() {
+            // SAFETY: errno was initialized above and readdir ran on this
+            // thread.
+            let errno = unsafe { *shared_cache_errno_location() };
+            if errno == 0 {
+                return Ok(None);
+            }
+            return Err(shared_cache_scan_io_refusal(
+                path,
+                &std::io::Error::from_raw_os_error(errno),
+            ));
+        }
+        // SAFETY: POSIX dirent::d_name is a NUL-terminated name valid until
+        // the next readdir call. CString copies the bytes now.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        CString::new(name)
+            .map(Some)
+            .map_err(|_| shared_cache_scan_refusal(path, "directory entry name is invalid"))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for SharedCacheDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this stream uniquely owns the DIR pointer from fdopendir.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn shared_cache_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno slot.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn shared_cache_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno slot.
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SharedCacheDirectoryFrame {
+    stream: SharedCacheDirectoryStream,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum SharedCacheScanOpenTarget {
+    Root,
+    Child,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_bytes_fd_relative(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+) -> Result<Option<u64>, PreparationError> {
+    directory_bytes_fd_relative_with_hook(path, limits, |_| {})
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_bytes_fd_relative_with_hook<F>(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+    mut before_open: F,
+) -> Result<Option<u64>, PreparationError>
+where
+    F: FnMut(SharedCacheScanOpenTarget),
+{
+    use std::mem::MaybeUninit;
+
+    let started = Instant::now();
+    let root_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(shared_cache_scan_io_refusal(path, &source)),
+    };
+    if root_metadata.file_type().is_symlink() {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache store root is a symlink",
+        ));
+    }
+    if !root_metadata.is_dir() {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache store root is not a directory",
+        ));
+    }
+    if limits.max_entries == 0 || limits.max_depth == 0 {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache inventory limit was exceeded",
+        ));
+    }
+    check_shared_cache_scan_deadline(path, started, limits)?;
+
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| shared_cache_scan_refusal(path, "cache store path is invalid"))?;
+    let flags =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    before_open(SharedCacheScanOpenTarget::Root);
+    // SAFETY: path_c is NUL-terminated and flags request a directory without
+    // following the final path component if it is a symlink.
+    let root_fd = unsafe { libc::open(path_c.as_ptr(), flags) };
+    if root_fd < 0 {
+        let source = std::io::Error::last_os_error();
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(shared_cache_scan_io_refusal(path, &source));
+    }
+
+    let mut root_stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: root_fd is open and root_stat is writable storage for stat.
+    if unsafe { libc::fstat(root_fd, root_stat.as_mut_ptr()) } != 0 {
+        let source = std::io::Error::last_os_error();
+        // SAFETY: fd was opened above and has not transferred to fdopendir.
+        unsafe { libc::close(root_fd) };
+        return Err(shared_cache_scan_io_refusal(path, &source));
+    }
+    // SAFETY: successful fstat initialized the structure.
+    let root_stat = unsafe { root_stat.assume_init() };
+    if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || shared_cache_stat_device(root_stat.st_dev) != Some(root_metadata.dev())
+        || root_stat.st_ino != root_metadata.ino()
+    {
+        // SAFETY: fd was opened above and has not transferred to fdopendir.
+        unsafe { libc::close(root_fd) };
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache store root changed during inventory",
+        ));
+    }
+    let root_device = root_stat.st_dev;
+    let root_stream = SharedCacheDirectoryStream::from_owned_fd(root_fd, path)?;
+    let mut pending = vec![SharedCacheDirectoryFrame {
+        stream: root_stream,
+    }];
+    let mut visited_entries = 0_usize;
     let mut bytes = 0_u64;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(directory) else {
+
+    loop {
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        let Some(frame) = pending.last_mut() else {
+            break;
+        };
+        let name = frame.stream.next_name(path)?;
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        let Some(name) = name else {
+            pending.pop();
             continue;
         };
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else {
-                bytes = bytes.saturating_add(metadata.len());
+        if name.as_bytes() == b"." || name.as_bytes() == b".." {
+            continue;
+        }
+        visited_entries = visited_entries.checked_add(1).ok_or_else(|| {
+            shared_cache_scan_refusal(path, "cache inventory entry count overflowed")
+        })?;
+        if visited_entries > limits.max_entries {
+            return Err(shared_cache_scan_refusal(
+                path,
+                "cache inventory entry limit was exceeded",
+            ));
+        }
+
+        let parent_fd = pending
+            .last()
+            .expect("nonempty directory stack")
+            .stream
+            .fd(path)?;
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        let mut entry_stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: parent_fd is owned by the live stream, name is NUL-terminated,
+        // and entry_stat is writable storage. AT_SYMLINK_NOFOLLOW classifies
+        // links without opening their target.
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                entry_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(shared_cache_scan_io_refusal(
+                path,
+                &std::io::Error::last_os_error(),
+            ));
+        }
+        check_shared_cache_scan_deadline(path, started, limits)?;
+        // SAFETY: successful fstatat initialized the structure.
+        let entry_stat = unsafe { entry_stat.assume_init() };
+        if entry_stat.st_dev != root_device {
+            return Err(shared_cache_scan_refusal(
+                path,
+                "cache inventory crossed a filesystem boundary",
+            ));
+        }
+        let entry_type = entry_stat.st_mode & libc::S_IFMT;
+        match entry_type {
+            libc::S_IFDIR => {
+                if pending.len() >= limits.max_depth {
+                    return Err(shared_cache_scan_refusal(
+                        path,
+                        "cache inventory directory depth limit was exceeded",
+                    ));
+                }
+                check_shared_cache_scan_deadline(path, started, limits)?;
+                before_open(SharedCacheScanOpenTarget::Child);
+                // SAFETY: name is NUL-terminated and parent_fd remains live.
+                let child_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+                if child_fd < 0 {
+                    return Err(shared_cache_scan_io_refusal(
+                        path,
+                        &std::io::Error::last_os_error(),
+                    ));
+                }
+                let mut child_stat = MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: child_fd is open and child_stat is writable storage.
+                if unsafe { libc::fstat(child_fd, child_stat.as_mut_ptr()) } != 0 {
+                    let source = std::io::Error::last_os_error();
+                    // SAFETY: child_fd remains owned here because fdopendir was
+                    // not called after the failed fstat.
+                    unsafe { libc::close(child_fd) };
+                    return Err(shared_cache_scan_io_refusal(path, &source));
+                }
+                // SAFETY: successful fstat initialized the structure.
+                let child_stat = unsafe { child_stat.assume_init() };
+                if child_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+                    || child_stat.st_dev != root_device
+                    || child_stat.st_dev != entry_stat.st_dev
+                    || child_stat.st_ino != entry_stat.st_ino
+                {
+                    // SAFETY: child_fd remains owned here because fdopendir was
+                    // not called after validation failed.
+                    unsafe { libc::close(child_fd) };
+                    return Err(shared_cache_scan_refusal(
+                        path,
+                        "cache directory changed or crossed a filesystem boundary",
+                    ));
+                }
+                let child = SharedCacheDirectoryStream::from_owned_fd(child_fd, path)?;
+                check_shared_cache_scan_deadline(path, started, limits)?;
+                pending.push(SharedCacheDirectoryFrame { stream: child });
+            }
+            libc::S_IFREG | libc::S_IFLNK => {
+                let size = u64::try_from(entry_stat.st_size).map_err(|_| {
+                    shared_cache_scan_refusal(path, "cache entry has an invalid size")
+                })?;
+                bytes = bytes.checked_add(size).ok_or_else(|| {
+                    shared_cache_scan_refusal(path, "cache inventory byte count overflowed")
+                })?;
+            }
+            _ => {
+                return Err(shared_cache_scan_refusal(
+                    path,
+                    "cache inventory contains a special file",
+                ));
             }
         }
     }
-    bytes
+
+    Ok(Some(bytes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_shared_cache_scan_deadline(
+    path: &Path,
+    started: Instant,
+    limits: SharedCacheScanLimits,
+) -> Result<(), PreparationError> {
+    if started.elapsed() >= limits.max_elapsed {
+        return Err(shared_cache_scan_refusal(
+            path,
+            "cache inventory time limit was exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn shared_cache_scan_refusal(path: &Path, reason: &str) -> PreparationError {
+    PreparationError::StorageUnavailable {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn shared_cache_scan_io_refusal(path: &Path, source: &std::io::Error) -> PreparationError {
+    PreparationError::StorageUnavailable {
+        path: path.to_path_buf(),
+        reason: format!("cache inventory could not be read ({:?})", source.kind()),
+    }
 }
 
 fn epoch_ms() -> u128 {
@@ -1483,6 +1984,46 @@ fn require_preparation_storage(
         crate::verification::removable_volume_unavailable_reason,
         |path| crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
     )
+}
+
+fn is_storage_unavailable(error: &BrokerOpError) -> bool {
+    matches!(
+        error,
+        BrokerOpError::Preparation(PreparationError::StorageUnavailable { .. })
+    )
+}
+
+fn best_effort_failed_preparation_cleanup(
+    write_state: impl FnOnce() -> Result<(), PreparationError>,
+    release_lease: impl FnOnce() -> Result<(), PreparationError>,
+) -> bool {
+    if let Err(error) = write_state() {
+        warn_preparation_cleanup_failure("write failed preparation state", &error);
+    }
+    match release_lease() {
+        Ok(()) => true,
+        Err(error) => {
+            warn_preparation_cleanup_failure("release host resource lease", &error);
+            false
+        }
+    }
+}
+
+fn release_grant_best_effort(
+    coordinator: &mut Option<HostResourceCoordinator>,
+    grant: &mut Option<crate::HostResourceGrant>,
+) -> bool {
+    match release_grant(coordinator, grant) {
+        Ok(()) => true,
+        Err(error) => {
+            warn_preparation_cleanup_failure("release host resource lease", &error);
+            false
+        }
+    }
+}
+
+fn warn_preparation_cleanup_failure(action: &str, error: &impl std::fmt::Display) {
+    eprintln!("warning: could not {action} after preparation refusal: {error}");
 }
 
 fn preparation_storage_with(
@@ -1520,12 +2061,21 @@ fn release_grant(
     coordinator: &mut Option<HostResourceCoordinator>,
     grant: &mut Option<crate::HostResourceGrant>,
 ) -> Result<(), PreparationError> {
-    if let (Some(coordinator), Some(grant)) = (coordinator.as_mut(), grant.take()) {
-        coordinator.release(
-            &grant.lease.lease_id,
-            grant.lease.generation,
-            &grant.ownership_token,
-        )?;
+    match (coordinator.as_mut(), grant.as_ref()) {
+        (Some(coordinator), Some(leased_grant)) => {
+            let lease_id = leased_grant.lease.lease_id.clone();
+            let generation = leased_grant.lease.generation;
+            let ownership_token = leased_grant.ownership_token.clone();
+            coordinator.release(&lease_id, generation, &ownership_token)?;
+            grant.take();
+        }
+        (Some(_), None) | (None, None) => {}
+        (None, Some(_)) => {
+            return Err(PreparationError::InvalidState {
+                path: "host-resource lease".into(),
+                reason: "coordinator and acquired grant are inconsistent".into(),
+            });
+        }
     }
     Ok(())
 }
@@ -1569,6 +2119,149 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_storage_refusal_persists_a_cache_recovery_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-qm", "fixture"]);
+
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let unrelated = BrokerOpError::from(PreparationError::StepFailed {
+            step: "deps".into(),
+            exit_code: Some(1),
+            session_id: 1,
+        });
+        broker.recover_storage_pressure_after_command_failure(&unrelated, || Ok(()));
+        assert!(!broker.artifact_sweep_recovery_requested().unwrap());
+
+        broker.recover_storage_pressure_after_command_failure(&unrelated, || {
+            Err(PreparationError::InvalidConfig {
+                path: PREPARATION_CONFIG_RELPATH.into(),
+                reason: "injected non-storage recheck error".into(),
+            })
+        });
+        assert!(!broker.artifact_sweep_recovery_requested().unwrap());
+
+        broker.recover_storage_pressure_after_command_failure(&unrelated, || {
+            Err(PreparationError::StorageUnavailable {
+                path: tmp.path().join("target"),
+                reason: "injected post-command pressure".into(),
+            })
+        });
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+
+        let refusal = BrokerOpError::from(PreparationError::StorageUnavailable {
+            path: tmp.path().join("target"),
+            reason: "injected test refusal".into(),
+        });
+
+        let checked = std::cell::Cell::new(false);
+        broker.recover_storage_pressure_after_command_failure(&refusal, || {
+            checked.set(true);
+            Ok(())
+        });
+        assert!(
+            !checked.get(),
+            "typed storage refusals need no second probe"
+        );
+
+        assert!(matches!(
+            refusal,
+            BrokerOpError::Preparation(PreparationError::StorageUnavailable { .. })
+        ));
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+    }
+
+    #[test]
+    fn a_failed_state_write_does_not_skip_host_lease_release() {
+        use std::cell::Cell;
+
+        let released = Cell::new(false);
+        best_effort_failed_preparation_cleanup(
+            || {
+                Err(PreparationError::InvalidState {
+                    path: ".aethyme/test-state.json".into(),
+                    reason: "injected write failure".into(),
+                })
+            },
+            || {
+                released.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(released.get());
+    }
+
+    #[test]
+    fn an_initial_preparation_state_write_error_releases_the_acquired_host_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-qm", "fixture"]);
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let resource_db = tmp.path().join("host-state/host-resources.db");
+        let mut coordinator = Some(HostResourceCoordinator::open(&resource_db).unwrap());
+        let request =
+            preparation_resource_request(&broker, 7, tmp.path(), &"a".repeat(64)).unwrap();
+        let acquired = coordinator.as_mut().unwrap().acquire(&request).unwrap();
+        let lease_id = acquired.lease.lease_id.clone();
+        let mut grant = Some(acquired);
+
+        let result: Result<(), PreparationError> = broker.release_grant_after_error(
+            Err(PreparationError::InvalidState {
+                path: ".aethyme/preparation/7.json".into(),
+                reason: "injected initial state write failure".into(),
+            }),
+            &mut coordinator,
+            &mut grant,
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(grant.is_none());
+        assert_eq!(
+            coordinator
+                .as_ref()
+                .unwrap()
+                .list(true)
+                .unwrap()
+                .into_iter()
+                .find(|lease| lease.lease_id == lease_id)
+                .unwrap()
+                .state,
+            crate::HostLeaseState::Released,
+            "the original state-write failure must not strand the acquired lease"
+        );
+    }
 
     #[test]
     fn preparation_checks_every_write_volume_and_inode_reserve() {
@@ -1712,15 +2405,31 @@ mod tests {
         assert!(store.join("big").exists(), "the store must be untouched");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_missing_shared_store_is_not_created_by_budget_measurement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("missing-store");
+
+        assert_eq!(directory_bytes(&store).unwrap(), None);
+        assert!(
+            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.exists());
+    }
+
     /// Over budget rotates the store and leaves a usable one behind; under
     /// budget measures and does nothing.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn an_over_budget_shared_store_is_rotated_while_under_budget_is_not() {
         let tmp = tempfile::tempdir().unwrap();
         let store = tmp.path().join("store");
         std::fs::create_dir_all(store.join("nested")).unwrap();
         std::fs::write(store.join("nested/payload"), vec![0_u8; 8192]).unwrap();
-        let bytes = directory_bytes(&store);
+        let bytes = directory_bytes(&store).unwrap().unwrap();
         assert!(bytes >= 8192);
 
         let budget = SharedCacheBudget {
@@ -1750,6 +2459,7 @@ mod tests {
 
     /// The report must not disclose where the store lives: it is host state
     /// outside the repository, and this record reaches JSON output.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_rotation_report_carries_no_host_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1766,6 +2476,227 @@ mod tests {
             "rotation report leaked a host path: {json}"
         );
         assert!(!json.contains("preparation-cache"), "{json}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_counts_links_without_following_targets_or_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(store.join("nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(store.join("nested/payload"), b"inside-data").unwrap();
+        fs::write(outside.join("large"), vec![0_u8; 128 * 1024]).unwrap();
+        symlink(&outside, store.join("external")).unwrap();
+        symlink(&store, store.join("cycle")).unwrap();
+
+        let expected = b"inside-data".len() as u64
+            + fs::symlink_metadata(store.join("external")).unwrap().len()
+            + fs::symlink_metadata(store.join("cycle")).unwrap().len();
+        assert_eq!(directory_bytes(&store).unwrap(), Some(expected));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_refuses_a_symlink_root_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("store");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("payload"), b"preserve me").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(matches!(
+            directory_bytes(&link),
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(target.join("payload")).unwrap(), b"preserve me");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_rejects_root_replaced_after_metadata_check() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("cache");
+        let original = temporary.path().join("cache-original");
+        fs::create_dir(&store).unwrap();
+        fs::write(store.join("original"), b"x").unwrap();
+        let mut replaced = false;
+
+        let result = directory_bytes_fd_relative_with_hook(
+            &store,
+            SharedCacheScanLimits::default(),
+            |target| {
+                if matches!(target, SharedCacheScanOpenTarget::Root) && !replaced {
+                    fs::rename(&store, &original).unwrap();
+                    fs::create_dir(&store).unwrap();
+                    fs::write(store.join("replacement"), [0_u8; 64]).unwrap();
+                    replaced = true;
+                }
+            },
+        );
+
+        assert!(replaced);
+        assert!(matches!(
+            result,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(original.join("original")).unwrap(), b"x");
+        assert_eq!(fs::metadata(store.join("replacement")).unwrap().len(), 64);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_rejects_child_replaced_after_lstat() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("cache");
+        let child = store.join("child");
+        let original = store.join("child-original");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("original"), b"x").unwrap();
+        let mut replaced = false;
+
+        let result = directory_bytes_fd_relative_with_hook(
+            &store,
+            SharedCacheScanLimits::default(),
+            |target| {
+                if matches!(target, SharedCacheScanOpenTarget::Child) && !replaced {
+                    fs::rename(&child, &original).unwrap();
+                    fs::create_dir(&child).unwrap();
+                    fs::write(child.join("replacement"), [0_u8; 64]).unwrap();
+                    replaced = true;
+                }
+            },
+        );
+
+        assert!(replaced);
+        assert!(matches!(
+            result,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(original.join("original")).unwrap(), b"x");
+        assert_eq!(fs::metadata(child.join("replacement")).unwrap().len(), 64);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_refuses_entry_and_depth_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(store.join("nested/deeper")).unwrap();
+        fs::write(store.join("one"), b"1").unwrap();
+        fs::write(store.join("two"), b"2").unwrap();
+        fs::write(store.join("nested/deeper/three"), b"3").unwrap();
+        let base = SharedCacheScanLimits {
+            max_entries: 100,
+            max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+            max_elapsed: Duration::from_secs(5),
+        };
+
+        let entry_limited = directory_bytes_with_limits(
+            &store,
+            SharedCacheScanLimits {
+                max_entries: 2,
+                ..base
+            },
+        );
+        assert!(matches!(
+            entry_limited,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+
+        let depth_limited = directory_bytes_with_limits(
+            &store,
+            SharedCacheScanLimits {
+                max_depth: 1,
+                ..base
+            },
+        );
+        assert!(matches!(
+            depth_limited,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+
+        let time_limited = directory_bytes_with_limits(
+            &store,
+            SharedCacheScanLimits {
+                max_elapsed: Duration::ZERO,
+                ..base
+            },
+        );
+        assert!(matches!(
+            time_limited,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_fails_closed_on_permission_denied_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let denied = store.join("denied");
+        fs::create_dir_all(&denied).unwrap();
+        fs::write(denied.join("payload"), b"not readable").unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = directory_bytes(&store);
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // SAFETY: geteuid reads the calling process's effective user ID.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root can bypass mode bits; the production scan still fails
+            // closed on the same openat error under an unprivileged caller.
+            return;
+        }
+        assert!(matches!(
+            result,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_refuses_special_files_without_opening_them() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("keep"), b"preserve me").unwrap();
+        let fifo = store.join("blocked-pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        assert!(matches!(
+            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456"),
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(store.join("keep")).unwrap(), b"preserve me");
+        assert!(fifo.exists());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn shared_cache_budget_fails_closed_on_unsupported_platforms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("keep"), b"keep").unwrap();
+
+        assert!(matches!(
+            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456"),
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(store.join("keep")).unwrap(), b"keep");
     }
 
     #[test]

@@ -124,6 +124,7 @@ mod operation_stats;
 mod operations;
 mod overlap_pairs;
 mod ownership;
+mod worktree_registry;
 pub use ownership::{
     MAX_OWNERSHIP_CLAIM_NAME_CHARS, OwnershipClaim, OwnershipClaimReport, OwnershipClaimView,
 };
@@ -145,6 +146,8 @@ pub mod lease_liveness;
 pub mod lease_requests;
 pub mod session_guidance;
 pub mod session_holder;
+#[cfg(test)]
+mod test_storage;
 mod text_redaction;
 mod unpushed;
 pub mod worktree_location;
