@@ -26,8 +26,9 @@ struct Launch {
     log_inode: u64,
 }
 
-/// Dispatch before normal CLI parsing, compatibility checks or broker opens.
-/// Unknown reserved protocol versions fail closed rather than becoming commands.
+/// Dispatch the inline-exec, agent-start and agent-cleanup protocols before
+/// normal CLI parsing, compatibility checks or broker opens. Unknown reserved
+/// protocol versions fail closed rather than becoming commands.
 pub fn dispatch(args: &[String]) -> Option<u8> {
     if let Some(code) = crate::inline_exec_supervisor::dispatch(args) {
         return Some(code);

@@ -91,6 +91,47 @@ owned process group; it is not containment of programs that deliberately
 escape that group. Consumers must preserve the private dispatch and exact
 runtime selection when changing entrypoints.
 
+### Generic guarded-command supervision
+
+`Broker::guarded_exec` and its environment/heartbeat variants supervise the
+command on macOS and Linux when opening `/dev/tty` confirms there is no
+controlling terminal (`ENXIO`). The helper preserves argv, cwd, environment
+override order, inherited stdin/stdout/stderr, and the existing ownership
+snapshot/audit. Preparation continues to start its helper with null stdin; the
+generic guarded command inherits the broker's stdin, including a pipe.
+
+The noninteractive path requires an executable that implements Aethyme's
+private inline-exec protocol. A CLI uses its own executable by default; a
+library embedder must forward `agent_supervisor::dispatch` before normal
+argument parsing (it dispatches inline-exec and agent protocols), or configure
+`Broker::with_agent_supervisor_executable` with a compatible local executable.
+Resolution is exact and does not search PATH.
+An unavailable or incompatible helper refuses before the command request is
+sent; the broker never retries through direct spawn after helper failure.
+
+The inline-exec wire protocol uses the reserved
+--aethyme-inline-exec-supervisor-v2 entrypoint and AIX2 frame marker. A v1
+helper rejects the v2 entrypoint during readiness, before it can receive a
+command request. The spawn-failure frame carries a stable tag for known std::io::ErrorKind
+values plus an optional raw OS error code, preserving NotFound,
+PermissionDenied, InvalidInput, and the underlying OS code. A kind without a
+stable wire tag is sent with an explicit diagnostic; the receiver reconstructs
+it from a raw OS code when available, or maps it conservatively to Other
+without one. An unknown wire tag fails closed as an uncertain command result.
+
+When a controlling terminal is present, its probe is inconclusive, or the OS
+is unsupported, the broker preserves the legacy direct runner and prints a
+degraded-mode warning. Descendant cleanup is not verified on that path, so it
+is not suitable as evidence of process quiescence or managed-storage admission.
+`GuardedExecOutcomeUnknown` means the helper verified cleanup but could not
+recover the command result; ownership audit was skipped. If the command result
+is known but the heartbeat or another broker callback fails, verified cleanup
+returns that original typed error and also skips the ownership audit.
+`GuardedExecCleanupUnknown` means cleanup could not be verified and ownership
+audit was skipped. Unknown states require inspecting the worktree before
+retrying. Downstream exhaustive matches on public `BrokerOpError` must handle
+the new unknown-state variants.
+
 ### Primary-checkout fast-forward (#232)
 
 Before `status`, `start`, `sync`, `push`, `submit` or `finish` runs from the primary checkout (hooks and advanced commands never move it), the broker checks the current branch against its configured, already-fetched tracking ref. With no tracked or non-ignored untracked changes, no unique commits, no Git operation in progress (merge, cherry-pick, revert, bisect, rebase, a held index lock) and no live broker session working in that checkout, a strictly-behind checkout advances by fast-forward (a compare-and-swap of the branch ref, then the index and worktree) and records `broker.checkout.fast_forwarded` with `trigger` (`broker.<command>`), `branch`, `upstream_ref`, `from` and `to`. This check does not fetch. Success prints `Updated main checkout: <branch> fast-forwarded from <from> to <to> (<upstream_ref>).` to stderr. Dirty, ahead, diverged, detached or unprovable states remain unchanged and print `warning: left the main checkout unchanged: <reason>. Run: <shell-quoted-command>` to stderr. Compatibility read-only snapshots and linked session worktrees are never moved; session worktrees use `broker sync --session <id>`. Standard output is unchanged, so JSON reports stay parseable.

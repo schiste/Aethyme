@@ -1106,13 +1106,15 @@ impl Broker {
         self
     }
 
-    /// Select an exact executable implementing the private agent-supervisor protocol.
+    /// Select an exact executable implementing Aethyme's private supervisor protocols.
     ///
     /// CLI callers use their current executable by default. Library embedders
-    /// must either forward [`crate::agent_supervisor::dispatch`] before ordinary
-    /// argument parsing in their executable, or supply a compatible Aethyme
-    /// executable here. No PATH search or installed-runtime fallback is used.
-    /// The path is anchored and validated now, and revalidated before allocation.
+    /// using generic guarded exec must either forward
+    /// [`crate::agent_supervisor::dispatch`] before ordinary argument parsing
+    /// (it dispatches both inline-exec and agent protocols), or supply a
+    /// compatible Aethyme executable here. No PATH search or installed-runtime
+    /// fallback is used. The path is anchored and validated now, and revalidated
+    /// before allocation.
     pub fn with_agent_supervisor_executable(
         mut self,
         path: impl AsRef<Path>,

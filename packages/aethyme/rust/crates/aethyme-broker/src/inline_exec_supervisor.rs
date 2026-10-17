@@ -1,9 +1,10 @@
-//! Private process-group supervision for noninteractive preparation commands.
+//! Private process-group supervision for noninteractive broker commands.
 //!
 //! This is a lifecycle guard, not a sandbox: a command that deliberately leaves
 //! its process group is outside the guarantee. The caller preserves the
-//! repository command's argv and inherited stdout/stderr, and gives it null
-//! stdin. A normal in-group descendant is stopped when the helper exits.
+//! repository command's argv and inherited stdio. Preparation starts the helper
+//! with null stdin; generic guarded execution preserves inherited stdin. A normal
+//! in-group descendant is stopped when the helper exits.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,8 +12,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 
-const FLAG: &str = "--aethyme-inline-exec-supervisor-v1";
-const FRAME_MAGIC: &[u8; 4] = b"AIX1";
+const FLAG: &str = "--aethyme-inline-exec-supervisor-v2";
+const FRAME_MAGIC: &[u8; 4] = b"AIX2";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const HELPER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -21,7 +22,7 @@ const GROUP_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 #[derive(Debug)]
 pub(crate) enum InlineExecError {
     Setup(io::Error),
-    CommandStart(String),
+    CommandStart(io::Error),
     CommandOutcomeUnknown(String),
     CleanupUnknown(String),
     Operation(crate::BrokerOpError),
@@ -56,9 +57,214 @@ enum HelperFrame {
     Ready,
     Exited { code: Option<i32> },
     Aborted,
-    CommandStartFailed { reason: String },
+    CommandStartFailed { error: WireCommandStartError },
     Failed { reason: String },
     ExecutionUnknown { reason: String },
+}
+
+// Keep these tags independent of Rust's Debug formatting. If an ErrorKind
+// has no stable wire tag, encode its name explicitly so the receiver can
+// preserve a diagnostic while mapping it conservatively when no OS code exists.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireIoErrorKind {
+    NotFound,
+    PermissionDenied,
+    ConnectionRefused,
+    ConnectionReset,
+    HostUnreachable,
+    NetworkUnreachable,
+    ConnectionAborted,
+    NotConnected,
+    AddrInUse,
+    AddrNotAvailable,
+    NetworkDown,
+    BrokenPipe,
+    AlreadyExists,
+    WouldBlock,
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    ReadOnlyFilesystem,
+    StaleNetworkFileHandle,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    WriteZero,
+    StorageFull,
+    NotSeekable,
+    QuotaExceeded,
+    FileTooLarge,
+    ResourceBusy,
+    ExecutableFileBusy,
+    Deadlock,
+    CrossesDevices,
+    TooManyLinks,
+    InvalidFilename,
+    ArgumentListTooLong,
+    Interrupted,
+    Unsupported,
+    UnexpectedEof,
+    OutOfMemory,
+    Other,
+    Unknown { debug_name: String },
+}
+
+impl WireIoErrorKind {
+    fn from_io(kind: io::ErrorKind) -> Self {
+        use io::ErrorKind as K;
+
+        match kind {
+            K::NotFound => Self::NotFound,
+            K::PermissionDenied => Self::PermissionDenied,
+            K::ConnectionRefused => Self::ConnectionRefused,
+            K::ConnectionReset => Self::ConnectionReset,
+            K::HostUnreachable => Self::HostUnreachable,
+            K::NetworkUnreachable => Self::NetworkUnreachable,
+            K::ConnectionAborted => Self::ConnectionAborted,
+            K::NotConnected => Self::NotConnected,
+            K::AddrInUse => Self::AddrInUse,
+            K::AddrNotAvailable => Self::AddrNotAvailable,
+            K::NetworkDown => Self::NetworkDown,
+            K::BrokenPipe => Self::BrokenPipe,
+            K::AlreadyExists => Self::AlreadyExists,
+            K::WouldBlock => Self::WouldBlock,
+            K::NotADirectory => Self::NotADirectory,
+            K::IsADirectory => Self::IsADirectory,
+            K::DirectoryNotEmpty => Self::DirectoryNotEmpty,
+            K::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
+            K::StaleNetworkFileHandle => Self::StaleNetworkFileHandle,
+            K::InvalidInput => Self::InvalidInput,
+            K::InvalidData => Self::InvalidData,
+            K::TimedOut => Self::TimedOut,
+            K::WriteZero => Self::WriteZero,
+            K::StorageFull => Self::StorageFull,
+            K::NotSeekable => Self::NotSeekable,
+            K::QuotaExceeded => Self::QuotaExceeded,
+            K::FileTooLarge => Self::FileTooLarge,
+            K::ResourceBusy => Self::ResourceBusy,
+            K::ExecutableFileBusy => Self::ExecutableFileBusy,
+            K::Deadlock => Self::Deadlock,
+            K::CrossesDevices => Self::CrossesDevices,
+            K::TooManyLinks => Self::TooManyLinks,
+            K::InvalidFilename => Self::InvalidFilename,
+            K::ArgumentListTooLong => Self::ArgumentListTooLong,
+            K::Interrupted => Self::Interrupted,
+            K::Unsupported => Self::Unsupported,
+            K::UnexpectedEof => Self::UnexpectedEof,
+            K::OutOfMemory => Self::OutOfMemory,
+            K::Other => Self::Other,
+            other => Self::Unknown {
+                debug_name: format!("{other:?}"),
+            },
+        }
+    }
+
+    fn as_io_kind(&self) -> Option<io::ErrorKind> {
+        use io::ErrorKind as K;
+
+        Some(match self {
+            Self::NotFound => K::NotFound,
+            Self::PermissionDenied => K::PermissionDenied,
+            Self::ConnectionRefused => K::ConnectionRefused,
+            Self::ConnectionReset => K::ConnectionReset,
+            Self::HostUnreachable => K::HostUnreachable,
+            Self::NetworkUnreachable => K::NetworkUnreachable,
+            Self::ConnectionAborted => K::ConnectionAborted,
+            Self::NotConnected => K::NotConnected,
+            Self::AddrInUse => K::AddrInUse,
+            Self::AddrNotAvailable => K::AddrNotAvailable,
+            Self::NetworkDown => K::NetworkDown,
+            Self::BrokenPipe => K::BrokenPipe,
+            Self::AlreadyExists => K::AlreadyExists,
+            Self::WouldBlock => K::WouldBlock,
+            Self::NotADirectory => K::NotADirectory,
+            Self::IsADirectory => K::IsADirectory,
+            Self::DirectoryNotEmpty => K::DirectoryNotEmpty,
+            Self::ReadOnlyFilesystem => K::ReadOnlyFilesystem,
+            Self::StaleNetworkFileHandle => K::StaleNetworkFileHandle,
+            Self::InvalidInput => K::InvalidInput,
+            Self::InvalidData => K::InvalidData,
+            Self::TimedOut => K::TimedOut,
+            Self::WriteZero => K::WriteZero,
+            Self::StorageFull => K::StorageFull,
+            Self::NotSeekable => K::NotSeekable,
+            Self::QuotaExceeded => K::QuotaExceeded,
+            Self::FileTooLarge => K::FileTooLarge,
+            Self::ResourceBusy => K::ResourceBusy,
+            Self::ExecutableFileBusy => K::ExecutableFileBusy,
+            Self::Deadlock => K::Deadlock,
+            Self::CrossesDevices => K::CrossesDevices,
+            Self::TooManyLinks => K::TooManyLinks,
+            Self::InvalidFilename => K::InvalidFilename,
+            Self::ArgumentListTooLong => K::ArgumentListTooLong,
+            Self::Interrupted => K::Interrupted,
+            Self::Unsupported => K::Unsupported,
+            Self::UnexpectedEof => K::UnexpectedEof,
+            Self::OutOfMemory => K::OutOfMemory,
+            Self::Other => K::Other,
+            Self::Unknown { .. } => return None,
+        })
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireCommandStartError {
+    kind: WireIoErrorKind,
+    raw_os_error: Option<i32>,
+    message: String,
+}
+
+impl WireCommandStartError {
+    fn capture(error: io::Error) -> Self {
+        Self {
+            kind: WireIoErrorKind::from_io(error.kind()),
+            raw_os_error: error.raw_os_error(),
+            message: error.to_string(),
+        }
+    }
+
+    fn into_io_error(self) -> io::Result<io::Error> {
+        if let Some(raw_os_error) = self.raw_os_error {
+            let error = io::Error::from_raw_os_error(raw_os_error);
+            if let Some(expected_kind) = self.kind.as_io_kind()
+                && error.kind() != expected_kind
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "helper spawn error kind {:?} disagrees with raw OS error {raw_os_error} ({:?})",
+                        expected_kind,
+                        error.kind()
+                    ),
+                ));
+            }
+            if let WireIoErrorKind::Unknown { debug_name } = self.kind {
+                crate::warn_unrecorded(
+                    "preserve raw spawn error with unknown remote io::ErrorKind",
+                    Err::<(), _>(io::Error::other(format!(
+                        "unmapped remote io::ErrorKind {debug_name}; raw OS error {raw_os_error}"
+                    ))),
+                );
+            }
+            return Ok(error);
+        }
+
+        match self.kind {
+            WireIoErrorKind::Unknown { debug_name } => Ok(io::Error::other(format!(
+                "unmapped remote std::io::ErrorKind {debug_name}: {}",
+                self.message
+            ))),
+            kind => match kind.as_io_kind() {
+                Some(kind) => Ok(io::Error::new(kind, self.message)),
+                None => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "known wire io::ErrorKind did not map to std::io::ErrorKind",
+                )),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,10 +273,56 @@ pub(crate) struct CommandResult {
     pub succeeded: bool,
 }
 
-/// An exact helper that is ready to run one command. The first instance is
-/// created before preparation opens/acquires its shared resource grant or
-/// writes cache/state paths. Later preparation steps create another instance
-/// immediately before their command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GenericExecMode {
+    Supervised,
+    Legacy(String),
+}
+
+fn select_generic_exec_mode(
+    supported_platform: bool,
+    controlling_terminal: Result<bool, String>,
+) -> GenericExecMode {
+    if !supported_platform {
+        return GenericExecMode::Legacy(
+            "process-group supervision supports only macOS and Linux".into(),
+        );
+    }
+    match controlling_terminal {
+        Ok(false) => GenericExecMode::Supervised,
+        Ok(true) => GenericExecMode::Legacy("a controlling terminal is available".into()),
+        Err(reason) => GenericExecMode::Legacy(format!(
+            "could not determine whether a controlling terminal is available: {reason}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn generic_exec_mode() -> GenericExecMode {
+    let supported_platform = cfg!(any(target_os = "linux", target_os = "macos"));
+    if !supported_platform {
+        return select_generic_exec_mode(false, Ok(false));
+    }
+    let controlling_terminal = match std::fs::File::open("/dev/tty") {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    };
+    select_generic_exec_mode(supported_platform, controlling_terminal)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn generic_exec_mode() -> GenericExecMode {
+    select_generic_exec_mode(
+        false,
+        Err("controlling-terminal probe is unavailable".into()),
+    )
+}
+
+/// An exact helper that is ready to run one command. Preparation starts one
+/// before opening its shared resource grant or writing cache/state paths; both
+/// preparation and generic guarded execution create an instance immediately
+/// before each command.
 #[cfg(unix)]
 pub(crate) struct InlineExecSupervisor {
     child: Option<std::process::Child>,
@@ -85,12 +337,32 @@ pub(crate) struct InlineExecSupervisor;
 impl InlineExecSupervisor {
     #[cfg(unix)]
     pub(crate) fn start(executable: &Path) -> Result<Self, InlineExecError> {
-        Self::start_with_watcher_fault(executable, false, false)
+        Self::start_with_stdin(executable, std::process::Stdio::null(), false, false)
     }
 
     #[cfg(unix)]
+    pub(crate) fn start_inheriting_stdin(executable: &Path) -> Result<Self, InlineExecError> {
+        Self::start_with_stdin(executable, std::process::Stdio::inherit(), false, false)
+    }
+
+    #[cfg(all(unix, test))]
     fn start_with_watcher_fault(
         executable: &Path,
+        fail_cleanup_watcher: bool,
+        fail_after_launch: bool,
+    ) -> Result<Self, InlineExecError> {
+        Self::start_with_stdin(
+            executable,
+            std::process::Stdio::null(),
+            fail_cleanup_watcher,
+            fail_after_launch,
+        )
+    }
+
+    #[cfg(unix)]
+    fn start_with_stdin(
+        executable: &Path,
+        stdin: std::process::Stdio,
         fail_cleanup_watcher: bool,
         _fail_after_launch: bool,
     ) -> Result<Self, InlineExecError> {
@@ -101,7 +373,7 @@ impl InlineExecSupervisor {
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return Err(InlineExecError::Setup(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "preparation process supervision supports only macOS and Linux",
+                "process supervision supports only macOS and Linux",
             )));
         }
 
@@ -160,7 +432,7 @@ impl InlineExecSupervisor {
             command.arg(FLAG);
         }
         command
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .process_group(0);
@@ -237,8 +509,13 @@ impl InlineExecSupervisor {
     pub(crate) fn start(_: &Path) -> Result<Self, InlineExecError> {
         Err(InlineExecError::Setup(io::Error::new(
             io::ErrorKind::Unsupported,
-            "preparation process-group supervision requires a supported Unix platform",
+            "process-group supervision requires a supported Unix platform",
         )))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn start_inheriting_stdin(executable: &Path) -> Result<Self, InlineExecError> {
+        Self::start(executable)
     }
 
     #[cfg(unix)]
@@ -259,7 +536,7 @@ impl InlineExecSupervisor {
             return match cleanup {
                 Ok(()) => Err(InlineExecError::Setup(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "preparation command argv is empty",
+                    "supervised command argv is empty",
                 ))),
                 Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
             };
@@ -347,10 +624,15 @@ impl InlineExecSupervisor {
                         succeeded: code == Some(0),
                     })
                 }
-                HelperFrame::CommandStartFailed { reason } => {
+                HelperFrame::CommandStartFailed { error } => {
                     self.terminate_and_verify()
                         .map_err(InlineExecError::CleanupUnknown)?;
-                    Err(InlineExecError::CommandStart(reason))
+                    match error.into_io_error() {
+                        Ok(error) => Err(InlineExecError::CommandStart(error)),
+                        Err(error) => Err(InlineExecError::CommandOutcomeUnknown(format!(
+                            "helper returned invalid command-start error details: {error}"
+                        ))),
+                    }
                 }
                 HelperFrame::Failed { reason } => {
                     self.terminate_and_verify()
@@ -386,7 +668,7 @@ impl InlineExecSupervisor {
     {
         Err(InlineExecError::Setup(io::Error::new(
             io::ErrorKind::Unsupported,
-            "preparation process-group supervision requires a supported Unix platform",
+            "process-group supervision requires a supported Unix platform",
         )))
     }
 
@@ -395,7 +677,7 @@ impl InlineExecSupervisor {
         if let Some(control) = self.control.as_mut()
             && let Err(error) = write_frame(control, &ParentFrameRef::Abort)
         {
-            crate::warn_unrecorded("send preparation supervisor abort", Err::<(), _>(error));
+            crate::warn_unrecorded("send process supervisor abort", Err::<(), _>(error));
         }
         self.terminate_and_verify()
     }
@@ -457,7 +739,7 @@ impl Drop for InlineExecSupervisor {
             && let Err(reason) = self.terminate_and_verify()
         {
             crate::warn_unrecorded(
-                "clean up preparation helper during drop",
+                "clean up process supervisor during drop",
                 Err::<(), _>(io::Error::other(reason)),
             );
         }
@@ -509,16 +791,10 @@ fn run_helper() -> io::Result<u8> {
     #[cfg(test)]
     if std::env::var_os("AETHYME_TEST_INLINE_FAIL_CLEANUP_WATCHER").is_some() {
         if let Err(error) = watcher.kill() {
-            crate::warn_unrecorded(
-                "stop injected preparation cleanup watcher",
-                Err::<(), _>(error),
-            );
+            crate::warn_unrecorded("stop injected process cleanup watcher", Err::<(), _>(error));
         }
         if let Err(error) = watcher.wait() {
-            crate::warn_unrecorded(
-                "reap injected preparation cleanup watcher",
-                Err::<(), _>(error),
-            );
+            crate::warn_unrecorded("reap injected process cleanup watcher", Err::<(), _>(error));
         }
     }
     write_frame(&mut control, &HelperFrame::Ready)?;
@@ -602,7 +878,7 @@ fn run_helper() -> io::Result<u8> {
     child_command
         .args(&command[1..])
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .envs(
@@ -627,7 +903,7 @@ fn run_helper() -> io::Result<u8> {
             write_frame(
                 &mut control,
                 &HelperFrame::CommandStartFailed {
-                    reason: error.to_string(),
+                    error: WireCommandStartError::capture(error),
                 },
             )?;
             return Ok(125);
@@ -655,7 +931,7 @@ fn run_helper() -> io::Result<u8> {
                 },
             ) {
                 crate::warn_unrecorded(
-                    "report preparation cleanup watcher failure",
+                    "report process cleanup watcher failure",
                     Err::<(), _>(error),
                 );
             }
@@ -784,14 +1060,14 @@ fn stop_owned_command(child: &mut std::process::Child) -> bool {
         Ok(None) => {}
         Err(error) => {
             crate::warn_unrecorded(
-                "inspect preparation command before stop",
+                "inspect supervised command before stop",
                 Err::<(), _>(error),
             );
             return false;
         }
     }
     if let Err(error) = child.kill() {
-        crate::warn_unrecorded("stop preparation command", Err::<(), _>(error));
+        crate::warn_unrecorded("stop supervised command", Err::<(), _>(error));
         return false;
     }
     let deadline = Instant::now() + Duration::from_millis(500);
@@ -803,7 +1079,7 @@ fn stop_owned_command(child: &mut std::process::Child) -> bool {
             }
             Ok(None) => {
                 crate::warn_unrecorded(
-                    "preparation command reap remains incomplete",
+                    "supervised command reap remains incomplete",
                     Err::<(), _>(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "owned command did not reap before cleanup deadline",
@@ -812,7 +1088,7 @@ fn stop_owned_command(child: &mut std::process::Child) -> bool {
                 return false;
             }
             Err(error) => {
-                crate::warn_unrecorded("poll preparation command reap", Err::<(), _>(error));
+                crate::warn_unrecorded("poll supervised command reap", Err::<(), _>(error));
                 return false;
             }
         }
@@ -879,7 +1155,7 @@ fn close_unrelated_descriptors(control_fd: RawFd) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "inline preparation helper supports only macOS and Linux descriptor enumeration",
+        "inline helper supports only macOS and Linux descriptor enumeration",
     ));
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -970,7 +1246,7 @@ fn validate_environment(environment: &[(String, String)]) -> io::Result<()> {
         if name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "preparation environment contains an invalid variable",
+                "supervisor environment contains an invalid variable",
             ));
         }
     }
@@ -1298,6 +1574,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generic_mode_supervises_only_supported_hosts_without_a_controlling_terminal() {
+        assert_eq!(
+            select_generic_exec_mode(true, Ok(false)),
+            GenericExecMode::Supervised
+        );
+        assert_eq!(
+            select_generic_exec_mode(false, Ok(false)),
+            GenericExecMode::Legacy(
+                "process-group supervision supports only macOS and Linux".into()
+            )
+        );
+        assert_eq!(
+            select_generic_exec_mode(true, Ok(true)),
+            GenericExecMode::Legacy("a controlling terminal is available".into())
+        );
+        assert_eq!(
+            select_generic_exec_mode(true, Err("permission denied".into())),
+            GenericExecMode::Legacy(
+                "could not determine whether a controlling terminal is available: permission denied".into()
+            )
+        );
+    }
+
+    #[test]
     fn inline_helper_child_fixture() {
         if std::env::var_os("AETHYME_TEST_INLINE_EXEC_SUPERVISOR").is_some() {
             std::process::exit(super::run_helper().unwrap_or(125).into());
@@ -1401,6 +1701,71 @@ mod tests {
             std::fs::read_to_string(output).unwrap(),
             "one two:three::literal\nargument"
         );
+    }
+
+    #[test]
+    fn inherited_pipe_stdin_reaches_the_supervised_command() {
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+        use std::process::Stdio;
+
+        let owner = tempfile::tempdir().unwrap();
+        let output = owner.path().join("stdin.txt");
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` points to two writable `c_int` slots for `pipe` to fill.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: successful `pipe` initialized `fds[0]` as an owned read fd;
+        // `File` takes responsibility for closing it exactly once.
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: successful `pipe` initialized `fds[1]` as an owned write fd;
+        // `File` takes responsibility for closing it exactly once.
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        writer.write_all(b"pipe payload\n").unwrap();
+        drop(writer);
+
+        let supervisor = InlineExecSupervisor::start_with_stdin(
+            &std::env::current_exe().unwrap(),
+            Stdio::from(reader),
+            false,
+            false,
+        )
+        .unwrap();
+        let result = supervisor
+            .run(
+                owner.path(),
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    r#"IFS= read -r value; printf '%s' "$value" > "$OUTPUT_PATH""#.into(),
+                ],
+                &[("OUTPUT_PATH".into(), output.to_string_lossy().into_owned())],
+                || Ok(()),
+            )
+            .unwrap();
+
+        assert!(result.succeeded);
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "pipe payload");
+    }
+
+    #[test]
+    fn preparation_start_keeps_child_stdin_null() {
+        let owner = tempfile::tempdir().unwrap();
+        let output = owner.path().join("stdin.txt");
+        let result = start_helper()
+            .run(
+                owner.path(),
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    r#"IFS= read -r value; printf 'eof:%s' "$?" > "$OUTPUT_PATH""#.into(),
+                ],
+                &[("OUTPUT_PATH".into(), output.to_string_lossy().into_owned())],
+                || Ok(()),
+            )
+            .unwrap();
+
+        assert!(result.succeeded);
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "eof:1");
     }
 
     #[test]
@@ -1578,11 +1943,45 @@ mod tests {
     #[test]
     fn malformed_reserved_protocol_fails_closed_before_routing() {
         assert_eq!(
-            dispatch(&["--aethyme-inline-exec-supervisor-v2".into()]),
+            dispatch(&["--aethyme-inline-exec-supervisor-v1".into()]),
+            Some(125)
+        );
+        assert_eq!(
+            dispatch(&["--aethyme-inline-exec-supervisor-v3".into()]),
             Some(125)
         );
         assert_eq!(dispatch(&[FLAG.into(), "extra".into()]), Some(125));
         assert_eq!(dispatch(&["status".into()]), None);
+    }
+
+    #[test]
+    fn command_start_wire_error_preserves_raw_os_and_non_os_details() {
+        let raw = WireCommandStartError::capture(io::Error::from_raw_os_error(libc::ENOENT));
+        let raw =
+            serde_json::from_slice::<WireCommandStartError>(&serde_json::to_vec(&raw).unwrap())
+                .unwrap()
+                .into_io_error()
+                .unwrap();
+        assert_eq!(raw.raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(raw.kind(), io::ErrorKind::NotFound);
+
+        let non_os = WireCommandStartError::capture(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "argument contains NUL",
+        ));
+        let non_os =
+            serde_json::from_slice::<WireCommandStartError>(&serde_json::to_vec(&non_os).unwrap())
+                .unwrap()
+                .into_io_error()
+                .unwrap();
+        assert_eq!(non_os.raw_os_error(), None);
+        assert_eq!(non_os.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(non_os.to_string(), "argument contains NUL");
+
+        assert!(
+            serde_json::from_str::<WireIoErrorKind>(r#"{"future_wire_tag":{}}"#).is_err(),
+            "unknown wire tags must fail closed"
+        );
     }
 
     #[test]
