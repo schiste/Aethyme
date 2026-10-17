@@ -27,6 +27,9 @@ const VERSION: u8 = 1;
 const MAX_RECORD_BYTES: u64 = 8 * 1024;
 const RECORD_PREFIX: &str = ".aethyme-preparation-rotation-";
 const SCRATCH_SUFFIX: &str = ".scratch";
+const FRESH_STAGE_PREFIX: &str = ".aethyme-preparation-stage-";
+const FRESH_STAGE_SCHEMA: &str = "aethyme.preparation-cache-fresh-stage";
+const FRESH_STAGE_VERSION: u8 = 1;
 const DIRECTORY_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
 
@@ -78,6 +81,107 @@ pub(crate) struct RotationDebt {
     cache_root: DirectoryIdentity,
     original_store: DirectoryIdentity,
     retired_component: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+enum FreshStageSource {
+    CanonicalOriginal,
+    RetiredOriginal,
+    LegacyAdoption,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FreshStageIntent {
+    schema: String,
+    version: u8,
+    debt: RotationDebt,
+    source: FreshStageSource,
+    adopted_identity: Option<DirectoryIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FreshStageProof {
+    schema: String,
+    version: u8,
+    debt: RotationDebt,
+    source: FreshStageSource,
+    fresh_store: DirectoryIdentity,
+}
+
+impl FreshStageIntent {
+    fn new(
+        debt: &RotationDebt,
+        source: FreshStageSource,
+        adopted_identity: Option<DirectoryIdentity>,
+    ) -> Self {
+        Self {
+            schema: FRESH_STAGE_SCHEMA.to_owned(),
+            version: FRESH_STAGE_VERSION,
+            debt: debt.clone(),
+            source,
+            adopted_identity,
+        }
+    }
+
+    fn validate(&self, expected: &RotationDebt) -> io::Result<()> {
+        self.debt.validate()?;
+        let adoption_is_valid = match (&self.source, &self.adopted_identity) {
+            (FreshStageSource::LegacyAdoption, Some(identity)) => {
+                identity.validate()?;
+                identity.same_filesystem(&self.debt.cache_root)
+            }
+            (FreshStageSource::CanonicalOriginal | FreshStageSource::RetiredOriginal, None) => true,
+            _ => false,
+        };
+        if self.schema != FRESH_STAGE_SCHEMA
+            || self.version != FRESH_STAGE_VERSION
+            || self.debt != *expected
+            || !adoption_is_valid
+        {
+            return Err(invalid_record("fresh-store stage intent is inconsistent"));
+        }
+        Ok(())
+    }
+}
+
+impl FreshStageProof {
+    fn new(intent: &FreshStageIntent, fresh_store: DirectoryIdentity) -> io::Result<Self> {
+        let proof = Self {
+            schema: FRESH_STAGE_SCHEMA.to_owned(),
+            version: FRESH_STAGE_VERSION,
+            debt: intent.debt.clone(),
+            source: intent.source.clone(),
+            fresh_store,
+        };
+        proof.validate(&intent.debt)?;
+        Ok(proof)
+    }
+
+    fn validate(&self, expected: &RotationDebt) -> io::Result<()> {
+        self.debt.validate()?;
+        self.fresh_store.validate()?;
+        if self.schema != FRESH_STAGE_SCHEMA
+            || self.version != FRESH_STAGE_VERSION
+            || self.debt != *expected
+            || !self.fresh_store.same_filesystem(&self.debt.cache_root)
+        {
+            return Err(invalid_record("fresh-store stage proof is inconsistent"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> io::Result<Vec<u8>> {
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            invalid_record(&format!("could not encode fresh-store proof: {error}"))
+        })?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(invalid_record("fresh-store proof exceeds its size limit"));
+        }
+        Ok(bytes)
+    }
 }
 
 impl RotationDebt {
@@ -167,6 +271,41 @@ impl RotationDebt {
             "{RECORD_PREFIX}{}-{}.witness{SCRATCH_SUFFIX}",
             self.repository, self.transaction
         ))
+    }
+
+    fn fresh_stage_component(repository: &str) -> io::Result<CString> {
+        if !is_hex(repository, 64, 64) {
+            return Err(invalid_record("repository identity is malformed"));
+        }
+        component(&format!("{FRESH_STAGE_PREFIX}{repository}"))
+    }
+
+    fn fresh_stage_intent_component(repository: &str) -> io::Result<CString> {
+        if !is_hex(repository, 64, 64) {
+            return Err(invalid_record("repository identity is malformed"));
+        }
+        component(&format!("{FRESH_STAGE_PREFIX}{repository}.intent"))
+    }
+
+    fn fresh_stage_intent_scratch_component(repository: &str) -> io::Result<CString> {
+        if !is_hex(repository, 64, 64) {
+            return Err(invalid_record("repository identity is malformed"));
+        }
+        component(&format!("{FRESH_STAGE_PREFIX}{repository}.intent.scratch"))
+    }
+
+    fn fresh_stage_proof_component(repository: &str) -> io::Result<CString> {
+        if !is_hex(repository, 64, 64) {
+            return Err(invalid_record("repository identity is malformed"));
+        }
+        component(&format!("{FRESH_STAGE_PREFIX}{repository}.proof"))
+    }
+
+    fn fresh_stage_proof_scratch_component(repository: &str) -> io::Result<CString> {
+        if !is_hex(repository, 64, 64) {
+            return Err(invalid_record("repository identity is malformed"));
+        }
+        component(&format!("{FRESH_STAGE_PREFIX}{repository}.proof.scratch"))
     }
 }
 
@@ -466,68 +605,153 @@ pub(crate) fn recover_with_journal(
         .encode()
         .map_err(|source| recovery_error(progress, source))?;
 
-    let journal_payload =
-        super::rotation_journal::load(resource_db, cache_root, &root_identity_bytes, repository)
-            .map_err(|source| recovery_error(progress, source))?;
-    let payload = match journal_payload {
-        Some(payload) => payload,
-        None => {
-            let retained =
-                read(cache_root, repository).map_err(|source| recovery_error(progress, source))?;
-            if let Some(retained) = retained {
-                let payload =
-                    encode(&retained.debt).map_err(|source| recovery_error(progress, source))?;
-                super::rotation_journal::publish(
-                    resource_db,
-                    cache_root,
-                    &root_identity_bytes,
-                    repository,
-                    &payload,
-                )
-                .map_err(|source| recovery_error(progress, source))?;
-                payload
-            } else {
-                if has_uncommitted_scratch(cache_root, repository)
-                    .map_err(|source| recovery_error(progress, source))?
-                {
-                    return Err(recovery_error(
-                        progress,
-                        invalid_record("unpublished rotation scratch has no durable journal row"),
-                    ));
-                }
-                return recover(cache_root, repository, deadline);
+    let mut journal_record = super::rotation_journal::load_record(
+        resource_db,
+        cache_root,
+        &root_identity_bytes,
+        repository,
+    )
+    .map_err(|source| recovery_error(progress, source))?;
+    if journal_record.is_none() {
+        let retained =
+            read(cache_root, repository).map_err(|source| recovery_error(progress, source))?;
+        let had_sidecar = retained.is_some();
+        let debt = match retained {
+            Some(retained) => Some(retained.debt),
+            None => stage_transaction_debt(cache_root, repository)
+                .map_err(|source| recovery_error(progress, source))?,
+        };
+        let Some(debt) = debt else {
+            if has_uncommitted_scratch(cache_root, repository)
+                .map_err(|source| recovery_error(progress, source))?
+            {
+                return Err(recovery_error(
+                    progress,
+                    invalid_record("unpublished rotation scratch has no durable journal row"),
+                ));
             }
+            return recover(cache_root, repository, deadline);
+        };
+        let payload = encode(&debt).map_err(|source| recovery_error(progress, source))?;
+        if had_sidecar {
+            super::rotation_journal::publish_legacy(
+                resource_db,
+                cache_root,
+                &root_identity_bytes,
+                repository,
+                &payload,
+            )
+        } else {
+            super::rotation_journal::publish(
+                resource_db,
+                cache_root,
+                &root_identity_bytes,
+                repository,
+                &payload,
+            )
+        }
+        .map_err(|source| recovery_error(progress, source))?;
+        journal_record = super::rotation_journal::load_record(
+            resource_db,
+            cache_root,
+            &root_identity_bytes,
+            repository,
+        )
+        .map_err(|source| recovery_error(progress, source))?;
+    }
+    let journal_record = journal_record.ok_or_else(|| {
+        recovery_error(progress, invalid_record("rotation journal row disappeared"))
+    })?;
+    let protocol_version = journal_record.protocol_version;
+    let fresh_store_identity = journal_record.fresh_store_identity;
+    let payload = journal_record.payload;
+    let debt = RotationDebt::from_journal_payload(cache_root, repository, &payload)
+        .map_err(|source| recovery_error(progress, source))?;
+
+    let proof = match fresh_store_identity.as_deref() {
+        Some(expected_identity) => {
+            let root =
+                open_cache_root(cache_root).map_err(|source| recovery_error(progress, source))?;
+            let proof = read_fresh_stage_proof(&root, repository)
+                .map_err(|source| recovery_error(progress, source))?
+                .ok_or_else(|| {
+                    recovery_error(
+                        progress,
+                        invalid_record("journaled fresh-store identity has no root proof"),
+                    )
+                })?;
+            if proof
+                .fresh_store
+                .encode()
+                .map_err(|source| recovery_error(progress, source))?
+                != expected_identity
+            {
+                return Err(recovery_error(
+                    progress,
+                    invalid_record("journaled fresh-store identity differs from its root proof"),
+                ));
+            }
+            proof
+                .validate(&debt)
+                .map_err(|source| recovery_error(progress, source))?;
+            validate_fresh_stage_state(&root, &proof)
+                .map_err(|source| recovery_error(progress, source))?;
+            proof
+        }
+        None => {
+            let proof = ensure_fresh_stage(cache_root, &debt, protocol_version == 2)
+                .map_err(|source| recovery_error(progress, source))?;
+            let identity = proof
+                .fresh_store
+                .encode()
+                .map_err(|source| recovery_error(progress, source))?;
+            super::rotation_journal::record_fresh_store_identity(
+                resource_db,
+                cache_root,
+                &root_identity_bytes,
+                repository,
+                &payload,
+                &identity,
+            )
+            .map_err(|source| recovery_error(progress, source))?;
+            proof
         }
     };
 
-    let debt = RotationDebt::from_journal_payload(cache_root, repository, &payload)
-        .map_err(|source| recovery_error(progress, source))?;
-    match recovery_step(cache_root, &debt).map_err(|source| recovery_error(progress, source))? {
-        RecoveryStep::Conflict => {
+    let retained =
+        read(cache_root, repository).map_err(|source| recovery_error(progress, source))?;
+    if let Some(retained) = retained {
+        if retained.debt != debt {
             return Err(recovery_error(
                 progress,
-                invalid_record("journal rotation debt conflicts with current cache state"),
+                invalid_record("in-cache rotation witness differs from its journal row"),
             ));
         }
-        RecoveryStep::ClearCompletedDebt => {}
-        RecoveryStep::RenameOriginalStore
-        | RecoveryStep::RemoveRetiredStore
-        | RecoveryStep::CreateFreshStore => {
-            restore_from_journal(cache_root, &debt)
-                .map_err(|source| recovery_error(progress, source))?;
-        }
+    } else if recovery_step(cache_root, &debt).map_err(|source| recovery_error(progress, source))?
+        != RecoveryStep::ClearCompletedDebt
+    {
+        restore_from_journal(cache_root, &debt)
+            .map_err(|source| recovery_error(progress, source))?;
     }
 
-    progress = recover(cache_root, repository, deadline)?;
+    progress = recover_inner(cache_root, repository, deadline, true)?;
     if progress.complete {
         progress.found_debt = true;
-        if let Err(source) = super::rotation_journal::complete(
+        if let Err(source) = super::rotation_journal::complete_verified(
             resource_db,
             cache_root,
             &root_identity_bytes,
             repository,
             &payload,
+            &proof
+                .fresh_store
+                .encode()
+                .map_err(|source| recovery_error(progress, source))?,
         ) {
+            progress.complete = false;
+            return Err(recovery_error(progress, source));
+        }
+        if let Err(source) = clear_fresh_stage_proof(cache_root, &proof) {
             progress.complete = false;
             return Err(recovery_error(progress, source));
         }
@@ -541,7 +765,17 @@ pub(crate) fn recover_with_journal(
 pub(crate) fn has_uncommitted_scratch(cache_root: &Path, repository: &str) -> io::Result<bool> {
     let root = open_cache_root(cache_root)?;
     let name = RotationDebt::scratch_component(repository)?;
-    Ok(read_component(root.as_raw_fd(), &name)?.is_some())
+    Ok(read_component(root.as_raw_fd(), &name)?.is_some()
+        || read_component(
+            root.as_raw_fd(),
+            &RotationDebt::fresh_stage_intent_scratch_component(repository)?,
+        )?
+        .is_some()
+        || read_component(
+            root.as_raw_fd(),
+            &RotationDebt::fresh_stage_proof_scratch_component(repository)?,
+        )?
+        .is_some())
 }
 
 /// Inspect the current and retired names with descriptor-relative no-follow
@@ -601,6 +835,37 @@ pub(crate) fn inventory(
             break;
         }
         let bytes = name.as_os_str().as_bytes();
+        if let Some(rest) = bytes.strip_prefix(FRESH_STAGE_PREFIX.as_bytes()) {
+            let Some(repository_bytes) = rest.get(..64) else {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+                continue;
+            };
+            let Ok(repository) = std::str::from_utf8(repository_bytes) else {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+                continue;
+            };
+            if !is_hex(repository, 64, 64) {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+                continue;
+            }
+            let suffix = &rest[64..];
+            if suffix != b""
+                && suffix != b".intent"
+                && suffix != b".intent.scratch"
+                && suffix != b".proof"
+                && suffix != b".proof.scratch"
+            {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+            }
+            let repository = repository.to_owned();
+            repositories.insert(repository.clone());
+            inventory.blocked_repositories.insert(repository);
+            continue;
+        }
         if let Some(rest) = bytes.strip_prefix(RECORD_PREFIX.as_bytes()) {
             let Some(repository_bytes) = rest.get(..64) else {
                 inventory.complete = false;
@@ -645,6 +910,591 @@ pub(crate) fn inventory(
     Ok(inventory)
 }
 
+/// Establish an inode-reuse-safe replacement before the old cache can move.
+/// A durable root-level intent precedes the fixed staging directory; the
+/// versioned proof binds the exact debt transaction to the staged directory.
+/// Both records use no-follow, descriptor-relative, no-replace publication.
+fn ensure_fresh_stage(
+    cache_root: &Path,
+    debt: &RotationDebt,
+    allow_legacy_adoption: bool,
+) -> io::Result<FreshStageProof> {
+    debt.validate()?;
+    let root = open_cache_root(cache_root)?;
+    let root_identity = identity_for_directory(&root)?;
+    if !root_identity.same_directory(&debt.cache_root) {
+        return Err(invalid_record(
+            "cache root changed before stage preparation",
+        ));
+    }
+
+    let stage_name = RotationDebt::fresh_stage_component(&debt.repository)?;
+    let intent_name = RotationDebt::fresh_stage_intent_component(&debt.repository)?;
+    let intent_scratch_name = RotationDebt::fresh_stage_intent_scratch_component(&debt.repository)?;
+    let proof_name = RotationDebt::fresh_stage_proof_component(&debt.repository)?;
+    let proof_scratch_name = RotationDebt::fresh_stage_proof_scratch_component(&debt.repository)?;
+
+    if let Some(proof_file) = read_component(root.as_raw_fd(), &proof_name)? {
+        let proof = decode_fresh_stage_proof(proof_file, debt)?;
+        validate_fresh_stage_state(&root, &proof)?;
+        if let Some(intent_file) = read_component(root.as_raw_fd(), &intent_name)? {
+            let intent = decode_fresh_stage_intent(intent_file, debt)?;
+            if intent.source != proof.source
+                || intent.adopted_identity.as_ref().is_some_and(|id| {
+                    proof.source != FreshStageSource::LegacyAdoption || id != &proof.fresh_store
+                })
+            {
+                return Err(invalid_record("fresh-stage intent differs from its proof"));
+            }
+            remove_control_file(
+                &root,
+                &intent_name,
+                &serde_json::to_vec(&intent).map_err(|error| {
+                    invalid_record(&format!("could not encode fresh-stage intent: {error}"))
+                })?,
+            )?;
+        }
+        if read_component(root.as_raw_fd(), &proof_scratch_name)?.is_some() {
+            return Err(invalid_record(
+                "fresh-stage proof has an unpublished scratch",
+            ));
+        }
+        return Ok(proof);
+    }
+
+    if let Some(proof_scratch) = read_component(root.as_raw_fd(), &proof_scratch_name)? {
+        let intent_file = read_component(root.as_raw_fd(), &intent_name)?
+            .ok_or_else(|| invalid_record("fresh-stage proof scratch has no durable intent"))?;
+        let intent = decode_fresh_stage_intent(intent_file, debt)?;
+        validate_fresh_stage_source(&root, &intent)?;
+        match intent.source {
+            FreshStageSource::LegacyAdoption => {}
+            FreshStageSource::CanonicalOriginal | FreshStageSource::RetiredOriginal => {
+                let stage = directory_identity_at(root.as_raw_fd(), &stage_name)?
+                    .ok_or_else(|| invalid_record("fresh-stage proof scratch has no stage"))?;
+                if !stage.same_filesystem(&debt.cache_root) {
+                    return Err(invalid_record("fresh-stage proof scratch stage is foreign"));
+                }
+                let directory = open_directory_at(root.as_raw_fd(), &stage_name)?;
+                if !is_owned_cache_directory(&directory.metadata()?)
+                    || !directory_is_empty(&directory)?
+                {
+                    return Err(invalid_record(
+                        "fresh-stage proof scratch stage is not an empty private directory",
+                    ));
+                }
+            }
+        }
+        remove_scratch(root.as_raw_fd(), &proof_scratch_name, &proof_scratch)?;
+        root.sync_all()?;
+    }
+    if let Some(intent_scratch) = read_component(root.as_raw_fd(), &intent_scratch_name)? {
+        // Intent publication happens before stage creation. With no committed
+        // intent or proof, this private partial record cannot authorize any
+        // filesystem transition and may be removed only while the stage name
+        // is still absent.
+        if entry_exists(root.as_raw_fd(), &stage_name)?
+            || entry_exists(root.as_raw_fd(), &intent_name)?
+        {
+            return Err(invalid_record(
+                "fresh-stage intent scratch conflicts with a staged directory",
+            ));
+        }
+        remove_scratch(root.as_raw_fd(), &intent_scratch_name, &intent_scratch)?;
+        root.sync_all()?;
+    }
+
+    let intent = match read_component(root.as_raw_fd(), &intent_name)? {
+        Some(file) => decode_fresh_stage_intent(file, debt)?,
+        None => {
+            if entry_exists(root.as_raw_fd(), &stage_name)? {
+                return Err(invalid_record(
+                    "unowned fresh-stage directory has no durable intent",
+                ));
+            }
+            let intent = select_fresh_stage_intent(&root, debt, allow_legacy_adoption)?;
+            validate_fresh_stage_source(&root, &intent)?;
+            let bytes = encode_fresh_stage_intent(&intent)?;
+            publish_control_file(&root, &intent_name, &intent_scratch_name, &bytes)?;
+            intent
+        }
+    };
+    validate_fresh_stage_source(&root, &intent)?;
+
+    let fresh_store = match (&intent.source, &intent.adopted_identity) {
+        (FreshStageSource::LegacyAdoption, Some(identity)) => {
+            if entry_exists(root.as_raw_fd(), &stage_name)? {
+                return Err(invalid_record(
+                    "legacy adopted cache conflicts with a staging directory",
+                ));
+            }
+            identity.clone()
+        }
+        (FreshStageSource::CanonicalOriginal | FreshStageSource::RetiredOriginal, None) => {
+            let stage = match directory_identity_at(root.as_raw_fd(), &stage_name)? {
+                Some(identity) => {
+                    let directory = open_directory_at(root.as_raw_fd(), &stage_name)?;
+                    if !is_owned_cache_directory(&directory.metadata()?)
+                        || !directory_is_empty(&directory)?
+                    {
+                        return Err(invalid_record(
+                            "staged replacement is not a private empty cache directory",
+                        ));
+                    }
+                    identity
+                }
+                None => {
+                    let mode = 0o700 as libc::mode_t;
+                    // SAFETY: root is a live directory descriptor and stage_name is a
+                    // validated single component. mkdirat cannot replace an entry.
+                    if unsafe { libc::mkdirat(root.as_raw_fd(), stage_name.as_ptr(), mode) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    root.sync_all()?;
+                    let directory = open_directory_at(root.as_raw_fd(), &stage_name)?;
+                    if !is_owned_cache_directory(&directory.metadata()?)
+                        || !directory_is_empty(&directory)?
+                    {
+                        return Err(invalid_record(
+                            "new staged replacement is not a private empty cache directory",
+                        ));
+                    }
+                    identity_for_directory(&directory)?
+                }
+            };
+            if stage.same_directory(&debt.original_store)
+                || !stage.same_filesystem(&debt.cache_root)
+            {
+                return Err(invalid_record(
+                    "staged replacement does not have a distinct recorded identity",
+                ));
+            }
+            stage
+        }
+        _ => return Err(invalid_record("fresh-stage intent has an invalid source")),
+    };
+
+    validate_fresh_stage_source(&root, &intent)?;
+    let proof = FreshStageProof::new(&intent, fresh_store)?;
+    let proof_bytes = proof.encode()?;
+    publish_control_file(&root, &proof_name, &proof_scratch_name, &proof_bytes)?;
+    validate_fresh_stage_state(&root, &proof)?;
+    if let Some(intent_file) = read_component(root.as_raw_fd(), &intent_name)? {
+        let current = decode_fresh_stage_intent(intent_file, debt)?;
+        if current != intent {
+            return Err(invalid_record("fresh-stage intent changed before removal"));
+        }
+        remove_control_file(&root, &intent_name, &encode_fresh_stage_intent(&intent)?)?;
+    }
+    Ok(proof)
+}
+
+fn select_fresh_stage_intent(
+    root: &File,
+    debt: &RotationDebt,
+    allow_legacy_adoption: bool,
+) -> io::Result<FreshStageIntent> {
+    let current_name = component(&debt.repository)?;
+    let retired_name = component(debt.retired_component())?;
+    let current = directory_identity_at(root.as_raw_fd(), &current_name)?;
+    let retired = directory_identity_at(root.as_raw_fd(), &retired_name)?;
+    let source = match (&current, &retired) {
+        (Some(current), None)
+            if current.same_directory(&debt.original_store)
+                && current.same_filesystem(&debt.cache_root) =>
+        {
+            if allow_legacy_adoption && !has_exact_tree_witness(root, debt)? {
+                return Err(invalid_record(
+                    "legacy same-identity cache has no committed original-tree proof",
+                ));
+            }
+            FreshStageSource::CanonicalOriginal
+        }
+        (None, Some(retired))
+            if retired.same_directory(&debt.original_store)
+                && retired.same_filesystem(&debt.cache_root) =>
+        {
+            FreshStageSource::RetiredOriginal
+        }
+        (Some(current), None)
+            if allow_legacy_adoption
+                && !current.same_directory(&debt.original_store)
+                && current.same_filesystem(&debt.cache_root) =>
+        {
+            let directory = open_directory_at(root.as_raw_fd(), &current_name)?;
+            if !directory_is_empty(&directory)? {
+                return Err(invalid_record(
+                    "legacy replacement cache is not an empty directory",
+                ));
+            }
+            let intent = FreshStageIntent::new(
+                debt,
+                FreshStageSource::LegacyAdoption,
+                Some(current.clone()),
+            );
+            intent.validate(debt)?;
+            return Ok(intent);
+        }
+        _ => {
+            return Err(invalid_record(
+                "rotation state is ambiguous before fresh-stage intent",
+            ));
+        }
+    };
+    let intent = FreshStageIntent::new(debt, source, None);
+    intent.validate(debt)?;
+    Ok(intent)
+}
+
+fn has_exact_tree_witness(root: &File, debt: &RotationDebt) -> io::Result<bool> {
+    let current_name = component(&debt.repository)?;
+    let current = open_directory_at(root.as_raw_fd(), &current_name)?;
+    let witness_name = debt.tree_witness_component()?;
+    let expected = encode(debt)?;
+    Ok(read_component(current.as_raw_fd(), &witness_name)?
+        .is_some_and(|witness| witness.bytes == expected))
+}
+
+fn validate_fresh_stage_source(root: &File, intent: &FreshStageIntent) -> io::Result<()> {
+    intent.validate(&intent.debt)?;
+    let stage_name = RotationDebt::fresh_stage_component(&intent.debt.repository)?;
+    let current_name = component(&intent.debt.repository)?;
+    let retired_name = component(intent.debt.retired_component())?;
+    let current = directory_identity_at(root.as_raw_fd(), &current_name)?;
+    let retired = directory_identity_at(root.as_raw_fd(), &retired_name)?;
+    match (&intent.source, &intent.adopted_identity, current, retired) {
+        (FreshStageSource::CanonicalOriginal, None, Some(current), None)
+            if current.same_directory(&intent.debt.original_store) => {}
+        (FreshStageSource::RetiredOriginal, None, None, Some(retired))
+            if retired.same_directory(&intent.debt.original_store) => {}
+        (FreshStageSource::LegacyAdoption, Some(expected), Some(current), None)
+            if current.same_directory(expected) =>
+        {
+            let directory = open_directory_at(root.as_raw_fd(), &current_name)?;
+            if !directory_is_empty(&directory)? {
+                return Err(invalid_record(
+                    "legacy replacement cache is no longer empty",
+                ));
+            }
+            if entry_exists(root.as_raw_fd(), &stage_name)? {
+                return Err(invalid_record("legacy replacement has an unexpected stage"));
+            }
+        }
+        _ => {
+            return Err(invalid_record(
+                "fresh-stage predecessor changed before staging",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fresh_stage_state(root: &File, proof: &FreshStageProof) -> io::Result<()> {
+    proof.validate(&proof.debt)?;
+    let stage_name = RotationDebt::fresh_stage_component(&proof.debt.repository)?;
+    let current_name = component(&proof.debt.repository)?;
+    let retired_name = component(proof.debt.retired_component())?;
+    let current = directory_identity_at(root.as_raw_fd(), &current_name)?;
+    let retired = directory_identity_at(root.as_raw_fd(), &retired_name)?;
+    let stage = directory_identity_at(root.as_raw_fd(), &stage_name)?;
+    match proof.source {
+        FreshStageSource::LegacyAdoption => {
+            if stage.is_some()
+                || retired.is_some()
+                || !current
+                    .as_ref()
+                    .is_some_and(|identity| identity.same_directory(&proof.fresh_store))
+            {
+                return Err(invalid_record(
+                    "adopted fresh-store proof no longer matches",
+                ));
+            }
+            let directory = open_directory_at(root.as_raw_fd(), &current_name)?;
+            if !directory_is_empty(&directory)? {
+                return Err(invalid_record("adopted fresh store is no longer empty"));
+            }
+        }
+        FreshStageSource::CanonicalOriginal | FreshStageSource::RetiredOriginal => {
+            match (current.as_ref(), retired.as_ref(), stage.as_ref()) {
+                (Some(current), None, Some(stage))
+                    if current.same_directory(&proof.debt.original_store)
+                        && stage.same_directory(&proof.fresh_store) =>
+                {
+                    let directory = open_directory_at(root.as_raw_fd(), &stage_name)?;
+                    if !directory_is_empty(&directory)? {
+                        return Err(invalid_record("staged replacement is not empty"));
+                    }
+                }
+                (None, Some(retired), Some(stage))
+                    if retired.same_directory(&proof.debt.original_store)
+                        && stage.same_directory(&proof.fresh_store) =>
+                {
+                    let directory = open_directory_at(root.as_raw_fd(), &stage_name)?;
+                    if !directory_is_empty(&directory)? {
+                        return Err(invalid_record("staged replacement is not empty"));
+                    }
+                }
+                (None, None, Some(stage)) if stage.same_directory(&proof.fresh_store) => {
+                    let directory = open_directory_at(root.as_raw_fd(), &stage_name)?;
+                    if !directory_is_empty(&directory)? {
+                        return Err(invalid_record("staged replacement is not empty"));
+                    }
+                }
+                (Some(current), None, None) if current.same_directory(&proof.fresh_store) => {
+                    let directory = open_directory_at(root.as_raw_fd(), &current_name)?;
+                    if !directory_is_empty(&directory)? {
+                        return Err(invalid_record("installed fresh cache is not empty"));
+                    }
+                }
+                _ => {
+                    return Err(invalid_record(
+                        "staged fresh-store proof conflicts with paths",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_fresh_stage_intent(root: &File, repository: &str) -> io::Result<Option<FreshStageIntent>> {
+    let name = RotationDebt::fresh_stage_intent_component(repository)?;
+    read_component(root.as_raw_fd(), &name)?
+        .map(|file| {
+            let intent: FreshStageIntent =
+                serde_json::from_slice(&file.bytes).map_err(|error| {
+                    invalid_record(&format!("fresh-stage intent is malformed: {error}"))
+                })?;
+            intent.validate(&intent.debt)?;
+            if encode_fresh_stage_intent(&intent)? != file.bytes {
+                return Err(invalid_record("fresh-stage intent is not canonical"));
+            }
+            Ok(intent)
+        })
+        .transpose()
+}
+
+fn read_fresh_stage_proof(root: &File, repository: &str) -> io::Result<Option<FreshStageProof>> {
+    let name = RotationDebt::fresh_stage_proof_component(repository)?;
+    read_component(root.as_raw_fd(), &name)?
+        .map(|file| {
+            let proof: FreshStageProof = serde_json::from_slice(&file.bytes).map_err(|error| {
+                invalid_record(&format!("fresh-stage proof is malformed: {error}"))
+            })?;
+            proof.validate(&proof.debt)?;
+            if proof.encode()? != file.bytes {
+                return Err(invalid_record("fresh-stage proof is not canonical"));
+            }
+            Ok(proof)
+        })
+        .transpose()
+}
+
+fn decode_fresh_stage_intent(
+    file: ReadComponent,
+    debt: &RotationDebt,
+) -> io::Result<FreshStageIntent> {
+    let intent: FreshStageIntent = serde_json::from_slice(&file.bytes)
+        .map_err(|error| invalid_record(&format!("fresh-stage intent is malformed: {error}")))?;
+    intent.validate(debt)?;
+    if encode_fresh_stage_intent(&intent)? != file.bytes {
+        return Err(invalid_record("fresh-stage intent is not canonical"));
+    }
+    Ok(intent)
+}
+
+fn decode_fresh_stage_proof(
+    file: ReadComponent,
+    debt: &RotationDebt,
+) -> io::Result<FreshStageProof> {
+    let proof: FreshStageProof = serde_json::from_slice(&file.bytes)
+        .map_err(|error| invalid_record(&format!("fresh-stage proof is malformed: {error}")))?;
+    proof.validate(debt)?;
+    if proof.encode()? != file.bytes {
+        return Err(invalid_record("fresh-stage proof is not canonical"));
+    }
+    Ok(proof)
+}
+
+fn encode_fresh_stage_intent(intent: &FreshStageIntent) -> io::Result<Vec<u8>> {
+    intent.validate(&intent.debt)?;
+    let bytes = serde_json::to_vec(intent).map_err(|error| {
+        invalid_record(&format!("could not encode fresh-stage intent: {error}"))
+    })?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(invalid_record("fresh-stage intent exceeds its size limit"));
+    }
+    Ok(bytes)
+}
+
+fn publish_control_file(
+    root: &File,
+    final_name: &CStr,
+    scratch_name: &CStr,
+    bytes: &[u8],
+) -> io::Result<FileIdentity> {
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(invalid_record(
+            "fresh-stage control record exceeds its size limit",
+        ));
+    }
+    if let Some(existing) = read_component(root.as_raw_fd(), final_name)? {
+        if existing.bytes != bytes {
+            return Err(invalid_record("fresh-stage control record already differs"));
+        }
+        return Ok(existing.identity);
+    }
+    if let Some(scratch) = read_component(root.as_raw_fd(), scratch_name)? {
+        if scratch.bytes == bytes {
+            ensure_component_identity(root.as_raw_fd(), scratch_name, scratch.identity)?;
+        } else {
+            remove_scratch(root.as_raw_fd(), scratch_name, &scratch)?;
+            root.sync_all()?;
+            return Err(invalid_record("fresh-stage control scratch was incomplete"));
+        }
+    } else {
+        let mut scratch = create_regular_exclusive(root.as_raw_fd(), scratch_name)?;
+        scratch.write_all(bytes)?;
+        scratch.sync_all()?;
+        let metadata = scratch.metadata()?;
+        if !is_private_owned_file(&metadata) || metadata.len() != bytes.len() as u64 {
+            return Err(invalid_record("fresh-stage control scratch is invalid"));
+        }
+        drop(scratch);
+    }
+    let scratch = read_component(root.as_raw_fd(), scratch_name)?
+        .ok_or_else(|| invalid_record("fresh-stage control scratch disappeared"))?;
+    if scratch.bytes != bytes {
+        return Err(invalid_record("fresh-stage control scratch changed"));
+    }
+    ensure_component_identity(root.as_raw_fd(), scratch_name, scratch.identity)?;
+    root.sync_all()?;
+    rename_noreplace(root.as_raw_fd(), scratch_name, root.as_raw_fd(), final_name)?;
+    root.sync_all()?;
+    let published = read_component(root.as_raw_fd(), final_name)?
+        .ok_or_else(|| invalid_record("fresh-stage control record disappeared"))?;
+    if published.bytes != bytes || published.identity != scratch.identity {
+        return Err(invalid_record("fresh-stage control record was replaced"));
+    }
+    Ok(published.identity)
+}
+
+fn remove_control_file(root: &File, name: &CStr, expected: &[u8]) -> io::Result<()> {
+    let current = read_component(root.as_raw_fd(), name)?
+        .ok_or_else(|| invalid_record("fresh-stage control record disappeared"))?;
+    if current.bytes != expected {
+        return Err(invalid_record("fresh-stage control record changed"));
+    }
+    ensure_component_identity(root.as_raw_fd(), name, current.identity)?;
+    unlink_component(root.as_raw_fd(), name)?;
+    root.sync_all()
+}
+
+fn clear_fresh_stage_proof(cache_root: &Path, proof: &FreshStageProof) -> io::Result<()> {
+    proof.validate(&proof.debt)?;
+    let root = open_cache_root(cache_root)?;
+    let root_identity = identity_for_directory(&root)?;
+    if !root_identity.same_directory(&proof.debt.cache_root) {
+        return Err(invalid_record(
+            "cache root changed before stage-proof removal",
+        ));
+    }
+    validate_fresh_stage_state(&root, proof)?;
+    let stage_name = RotationDebt::fresh_stage_component(&proof.debt.repository)?;
+    let intent_name = RotationDebt::fresh_stage_intent_component(&proof.debt.repository)?;
+    let intent_scratch_name =
+        RotationDebt::fresh_stage_intent_scratch_component(&proof.debt.repository)?;
+    let proof_name = RotationDebt::fresh_stage_proof_component(&proof.debt.repository)?;
+    let proof_scratch_name =
+        RotationDebt::fresh_stage_proof_scratch_component(&proof.debt.repository)?;
+    let current_name = component(&proof.debt.repository)?;
+    let retired_name = component(proof.debt.retired_component())?;
+    if entry_exists(root.as_raw_fd(), &stage_name)?
+        || entry_exists(root.as_raw_fd(), &retired_name)?
+        || entry_exists(root.as_raw_fd(), &intent_name)?
+        || entry_exists(root.as_raw_fd(), &intent_scratch_name)?
+        || entry_exists(root.as_raw_fd(), &proof_scratch_name)?
+        || read_component(
+            root.as_raw_fd(),
+            &RotationDebt::record_component(&proof.debt.repository)?,
+        )?
+        .is_some()
+        || read_component(
+            root.as_raw_fd(),
+            &RotationDebt::scratch_component(&proof.debt.repository)?,
+        )?
+        .is_some()
+    {
+        return Err(invalid_record(
+            "fresh-store proof is not ready for final removal",
+        ));
+    }
+    let current = open_directory_at(root.as_raw_fd(), &current_name)?;
+    let current_identity = identity_for_directory(&current)?;
+    if !current_identity.same_directory(&proof.fresh_store) || !directory_is_empty(&current)? {
+        return Err(invalid_record(
+            "installed fresh cache changed before proof removal",
+        ));
+    }
+    let proof_bytes = proof.encode()?;
+    let existing = read_component(root.as_raw_fd(), &proof_name)?
+        .ok_or_else(|| invalid_record("fresh-store proof disappeared before removal"))?;
+    if existing.bytes != proof_bytes {
+        return Err(invalid_record("fresh-store proof changed before removal"));
+    }
+    ensure_component_identity(root.as_raw_fd(), &proof_name, existing.identity)?;
+    unlink_component(root.as_raw_fd(), &proof_name)?;
+    root.sync_all()
+}
+
+fn stage_transaction_debt(cache_root: &Path, repository: &str) -> io::Result<Option<RotationDebt>> {
+    let root = open_cache_root(cache_root)?;
+    let root_identity = identity_for_directory(&root)?;
+    if read_component(
+        root.as_raw_fd(),
+        &RotationDebt::fresh_stage_intent_scratch_component(repository)?,
+    )?
+    .is_some()
+        || read_component(
+            root.as_raw_fd(),
+            &RotationDebt::fresh_stage_proof_scratch_component(repository)?,
+        )?
+        .is_some()
+    {
+        return Err(invalid_record(
+            "unpublished fresh-stage scratch has no durable journal row",
+        ));
+    }
+    if let Some(proof) = read_fresh_stage_proof(&root, repository)? {
+        if !proof.debt.cache_root.same_directory(&root_identity)
+            || proof.debt.repository != repository
+        {
+            return Err(invalid_record(
+                "fresh-stage proof does not match its location",
+            ));
+        }
+        validate_fresh_stage_state(&root, &proof)?;
+        return Ok(Some(proof.debt));
+    }
+    if let Some(intent) = read_fresh_stage_intent(&root, repository)? {
+        if !intent.debt.cache_root.same_directory(&root_identity)
+            || intent.debt.repository != repository
+        {
+            return Err(invalid_record(
+                "fresh-stage intent does not match its location",
+            ));
+        }
+        return Ok(Some(intent.debt));
+    }
+    let stage_name = RotationDebt::fresh_stage_component(repository)?;
+    if entry_exists(root.as_raw_fd(), &stage_name)? {
+        return Err(invalid_record(
+            "unowned fresh-stage directory has no durable intent",
+        ));
+    }
+    Ok(None)
+}
+
 /// Finish a committed rotation under the repository's existing exclusive
 /// preparation-cache lease. This operation is deliberately cache-only and
 /// does not consult current worktree liveness: the writer published the debt
@@ -653,6 +1503,15 @@ pub(crate) fn recover(
     cache_root: &Path,
     repository: &str,
     deadline: Instant,
+) -> Result<RecoveryProgress, RecoveryError> {
+    recover_inner(cache_root, repository, deadline, false)
+}
+
+fn recover_inner(
+    cache_root: &Path,
+    repository: &str,
+    deadline: Instant,
+    retain_fresh_proof_for_journal: bool,
 ) -> Result<RecoveryProgress, RecoveryError> {
     let mut progress = RecoveryProgress::default();
     if !is_hex(repository, 64, 64) {
@@ -668,20 +1527,58 @@ pub(crate) fn recover(
     let retained = match read_or_promote_scratch(cache_root, repository) {
         Ok(Some(retained)) => retained,
         Ok(None) => {
-            if has_fixed_retired_store(cache_root, repository)
+            match std::fs::symlink_metadata(cache_root) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    progress.complete = true;
+                    return Ok(progress);
+                }
+                Err(error) => return Err(recovery_error(progress, error)),
+                Ok(_) => {}
+            }
+            if let Some(debt) = stage_transaction_debt(cache_root, repository)
                 .map_err(|source| recovery_error(progress, source))?
             {
-                return Err(recovery_error(
-                    progress,
-                    invalid_record("fixed retired cache has no valid rotation witness"),
-                ));
+                let root = open_cache_root(cache_root)
+                    .map_err(|source| recovery_error(progress, source))?;
+                let proof = read_fresh_stage_proof(&root, repository)
+                    .map_err(|source| recovery_error(progress, source))?;
+                if let Some(proof) = proof {
+                    validate_fresh_stage_state(&root, &proof)
+                        .map_err(|source| recovery_error(progress, source))?;
+                    let step = recovery_step_at(&root, &debt)
+                        .map_err(|source| recovery_error(progress, source))?;
+                    if step == RecoveryStep::ClearCompletedDebt {
+                        progress.found_debt = true;
+                        progress.complete = true;
+                        if !retain_fresh_proof_for_journal {
+                            clear_fresh_stage_proof(cache_root, &proof)
+                                .map_err(|source| recovery_error(progress, source))?;
+                        }
+                        return Ok(progress);
+                    }
+                }
+                ensure_fresh_stage(cache_root, &debt, true)
+                    .map_err(|source| recovery_error(progress, source))?;
+                restore_from_journal(cache_root, &debt)
+                    .map_err(|source| recovery_error(progress, source))?
+            } else {
+                if has_fixed_retired_store(cache_root, repository)
+                    .map_err(|source| recovery_error(progress, source))?
+                {
+                    return Err(recovery_error(
+                        progress,
+                        invalid_record("fixed retired cache has no valid rotation witness"),
+                    ));
+                }
+                progress.complete = true;
+                return Ok(progress);
             }
-            progress.complete = true;
-            return Ok(progress);
         }
         Err(source) => return Err(recovery_error(progress, source)),
     };
     progress.found_debt = true;
+    let fresh_proof = ensure_fresh_stage(cache_root, &retained.debt, true)
+        .map_err(|source| recovery_error(progress, source))?;
 
     // A valid transition takes at most four steps. The larger hard bound also
     // makes unexpected state oscillation fail closed without an unbounded
@@ -750,6 +1647,10 @@ pub(crate) fn recover(
                 clear_completed(cache_root, &retained)
                     .map_err(|source| recovery_error(progress, source))?;
                 progress.complete = true;
+                if !retain_fresh_proof_for_journal {
+                    clear_fresh_stage_proof(cache_root, &fresh_proof)
+                        .map_err(|source| recovery_error(progress, source))?;
+                }
                 return Ok(progress);
             }
             RecoveryStep::Conflict => {
@@ -889,25 +1790,47 @@ pub(crate) fn create_fresh_store(
             "rotation is not ready for a fresh cache store",
         ));
     }
-
+    let proof = read_fresh_stage_proof(&root, &retained.debt.repository)?
+        .ok_or_else(|| invalid_record("fresh replacement has no durable stage proof"))?;
+    validate_fresh_stage_state(&root, &proof)?;
+    let stage_name = RotationDebt::fresh_stage_component(&retained.debt.repository)?;
     let current_name = component(&retained.debt.repository)?;
-    let mode = 0o700 as libc::mode_t;
-    // SAFETY: root is a live cache-root directory descriptor and current_name
-    // is one validated NUL-terminated component. mkdirat creates only this
-    // missing child and cannot replace an existing entry.
-    if unsafe { libc::mkdirat(root.as_raw_fd(), current_name.as_ptr(), mode) } != 0 {
-        return Err(io::Error::last_os_error());
+    let retired_name = component(retained.debt.retired_component())?;
+    if entry_exists(root.as_raw_fd(), &current_name)?
+        || entry_exists(root.as_raw_fd(), &retired_name)?
+    {
+        return Err(invalid_record(
+            "fresh replacement paths changed before installation",
+        ));
     }
+    let stage = open_directory_at(root.as_raw_fd(), &stage_name)?;
+    let stage_identity = identity_for_directory(&stage)?;
+    if !stage_identity.same_directory(&proof.fresh_store)
+        || !stage_identity.same_filesystem(&retained.debt.cache_root)
+        || !directory_is_empty(&stage)?
+    {
+        return Err(invalid_record(
+            "staged replacement changed before installation",
+        ));
+    }
+    validate_fresh_stage_state(&root, &proof)?;
+    rename_noreplace(
+        root.as_raw_fd(),
+        &stage_name,
+        root.as_raw_fd(),
+        &current_name,
+    )?;
     root.sync_all()?;
 
     let fresh = open_directory_at(root.as_raw_fd(), &current_name)?;
     let identity = identity_for_directory(&fresh)?;
-    if identity.same_directory(&retained.debt.original_store)
+    if !identity.same_directory(&proof.fresh_store)
         || !identity.same_filesystem(&retained.debt.cache_root)
         || !directory_is_empty(&fresh)?
+        || entry_exists(root.as_raw_fd(), &stage_name)?
     {
         return Err(invalid_record(
-            "new cache store is not a fresh empty directory on the recorded filesystem",
+            "installed cache store does not match its staged identity",
         ));
     }
     if recovery_step_at(&root, &retained.debt)? != RecoveryStep::ClearCompletedDebt {
@@ -930,6 +1853,26 @@ fn recovery_step_at(root: &File, debt: &RotationDebt) -> io::Result<RecoveryStep
     let retired_name = component(&debt.retired_component)?;
     let current = directory_identity_at(root.as_raw_fd(), &current_name)?;
     let retired = directory_identity_at(root.as_raw_fd(), &retired_name)?;
+    if let Some(proof) = read_fresh_stage_proof(root, &debt.repository)? {
+        validate_fresh_stage_state(root, &proof)?;
+        if current
+            .as_ref()
+            .is_some_and(|identity| identity.same_directory(&proof.fresh_store))
+            && retired.is_none()
+        {
+            return Ok(RecoveryStep::ClearCompletedDebt);
+        }
+        if current.is_none()
+            && retired.is_none()
+            && directory_identity_at(
+                root.as_raw_fd(),
+                &RotationDebt::fresh_stage_component(&debt.repository)?,
+            )?
+            .is_some()
+        {
+            return Ok(RecoveryStep::CreateFreshStore);
+        }
+    }
     let fresh_empty = match (&current, &retired) {
         (Some(identity), None)
             if !identity.same_directory(&debt.original_store)
@@ -1450,6 +2393,14 @@ pub(crate) fn publish(
                     &retired_name,
                     &committed_name,
                 )?;
+                ensure_fresh_stage(cache_root, &proposed, false)?;
+                ensure_original_source_unchanged(
+                    root.as_raw_fd(),
+                    &proposed,
+                    &current_name,
+                    &retired_name,
+                    &committed_name,
+                )?;
                 ensure_component_identity(root.as_raw_fd(), &scratch_name, scratch.identity)?;
                 rename_noreplace(
                     root.as_raw_fd(),
@@ -1482,6 +2433,14 @@ pub(crate) fn publish(
         }
     }
 
+    ensure_original_source_unchanged(
+        root.as_raw_fd(),
+        &proposed,
+        &current_name,
+        &retired_name,
+        &committed_name,
+    )?;
+    ensure_fresh_stage(cache_root, &proposed, false)?;
     ensure_original_source_unchanged(
         root.as_raw_fd(),
         &proposed,
@@ -1549,11 +2508,7 @@ pub(crate) fn restore_from_journal(
         return Err(invalid_record("cache root changed before journal recovery"));
     }
     match recovery_step_at(&root, debt)? {
-        RecoveryStep::ClearCompletedDebt => {
-            return Err(invalid_record(
-                "completed journal debt does not need an in-cache witness",
-            ));
-        }
+        RecoveryStep::ClearCompletedDebt => {}
         RecoveryStep::Conflict => {
             return Err(invalid_record(
                 "journal rotation debt conflicts with current cache state",
@@ -2226,6 +3181,108 @@ mod tests {
         (temp, cache_root, debt)
     }
 
+    fn completed_journal_rotation_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        RotationDebt,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        use crate::gc::{PinnedTreeRemoval, TreeRemoval};
+
+        let (temp, cache_root, debt) = fixture();
+        let resource_db = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("host-resources.db");
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        let payload = super::encode(&debt).unwrap();
+        let root_identity = debt.cache_root.encode().unwrap();
+        crate::preparation::rotation_journal::publish(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+            &payload,
+        )
+        .unwrap();
+
+        let proof = super::ensure_fresh_stage(&cache_root, &debt, false).unwrap();
+        let fresh_store_identity = proof.fresh_store.encode().unwrap();
+        crate::preparation::rotation_journal::record_fresh_store_identity(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+            &payload,
+            &fresh_store_identity,
+        )
+        .unwrap();
+
+        super::retire_original_store(&cache_root, &retained).unwrap();
+        let witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        let retired_path = cache_root.join(debt.retired_component());
+        let pinned = PinnedTreeRemoval::open(&retired_path).unwrap();
+        assert_eq!(
+            pinned
+                .remove_verified_witness(witness.component().unwrap(), None, |bytes| {
+                    witness.validate_bytes(bytes)
+                })
+                .unwrap(),
+            TreeRemoval::Complete
+        );
+        super::create_fresh_store(&cache_root, &retained).unwrap();
+        super::clear_completed(&cache_root, &retained).unwrap();
+
+        assert!(super::read(&cache_root, REPOSITORY).unwrap().is_none());
+        assert!(cache_root.join(REPOSITORY).is_dir());
+        assert_eq!(
+            fs::read_dir(cache_root.join(REPOSITORY)).unwrap().count(),
+            0
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        (
+            temp,
+            cache_root,
+            resource_db,
+            debt,
+            payload,
+            fresh_store_identity,
+        )
+    }
+
+    fn publish_stage_intent(cache_root: &std::path::Path, debt: &RotationDebt) {
+        let root = super::open_cache_root(cache_root).unwrap();
+        let intent = super::select_fresh_stage_intent(&root, debt, false).unwrap();
+        let intent_name = RotationDebt::fresh_stage_intent_component(&debt.repository).unwrap();
+        let scratch_name =
+            RotationDebt::fresh_stage_intent_scratch_component(&debt.repository).unwrap();
+        let bytes = super::encode_fresh_stage_intent(&intent).unwrap();
+        super::publish_control_file(&root, &intent_name, &scratch_name, &bytes).unwrap();
+    }
+
+    fn assert_rotation_inventory_blocked(cache_root: &std::path::Path) {
+        let inventory = inventory(
+            cache_root,
+            100,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(inventory.complete);
+        assert!(inventory.repositories.iter().any(|repo| repo == REPOSITORY));
+        assert!(inventory.blocked_repositories.contains(REPOSITORY));
+    }
+
     #[test]
     fn inventory_and_recovery_finish_a_committed_rotation() {
         let (_temp, cache_root, debt) = fixture();
@@ -2255,6 +3312,395 @@ mod tests {
             0
         );
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn journal_recovery_finishes_when_sidecar_was_cleared_before_row_completion() {
+        let (_temp, cache_root, resource_db, debt, payload, fresh_identity) =
+            completed_journal_rotation_fixture();
+        let root_identity = debt.cache_root.encode().unwrap();
+
+        let row = crate::preparation::rotation_journal::load_record(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+        )
+        .unwrap()
+        .expect("the first crash cut keeps the journal row");
+        assert_eq!(row.payload, payload);
+        assert_eq!(
+            row.fresh_store_identity.as_deref(),
+            Some(fresh_identity.as_slice())
+        );
+
+        let progress = super::recover_with_journal(
+            &cache_root,
+            &resource_db,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.found_debt);
+        assert!(progress.complete);
+        assert!(
+            crate::preparation::rotation_journal::load_record(
+                &resource_db,
+                &cache_root,
+                &root_identity,
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn journal_recovery_rediscovers_proof_after_row_completion_before_proof_removal() {
+        let (_temp, cache_root, resource_db, debt, payload, fresh_identity) =
+            completed_journal_rotation_fixture();
+        let root_identity = debt.cache_root.encode().unwrap();
+
+        // Model a crash after the external row was removed but before the
+        // root-level fresh-store proof could be removed.
+        crate::preparation::rotation_journal::complete_verified(
+            &resource_db,
+            &cache_root,
+            &root_identity,
+            REPOSITORY,
+            &payload,
+            &fresh_identity,
+        )
+        .unwrap();
+        assert!(
+            crate::preparation::rotation_journal::load_record(
+                &resource_db,
+                &cache_root,
+                &root_identity,
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_some()
+        );
+
+        let progress = super::recover_with_journal(
+            &cache_root,
+            &resource_db,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.found_debt);
+        assert!(progress.complete);
+        assert!(
+            crate::preparation::rotation_journal::load_record(
+                &resource_db,
+                &cache_root,
+                &root_identity,
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fresh_stage_proof_is_published_while_the_original_store_is_still_intact() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+
+        let proof = super::ensure_fresh_stage(&cache_root, &debt, false).unwrap();
+
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        let stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+        assert!(stage_identity.same_directory(&proof.fresh_store));
+        assert!(!proof.fresh_store.same_directory(&debt.original_store));
+        assert_eq!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            debt.original_store
+        );
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        super::validate_fresh_stage_state(&super::open_cache_root(&cache_root).unwrap(), &proof)
+            .unwrap();
+        assert_rotation_inventory_blocked(&cache_root);
+    }
+
+    #[test]
+    fn replacement_stage_is_refused_without_deleting_either_directory() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        let proof = super::ensure_fresh_stage(&cache_root, &debt, false).unwrap();
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        let held_stage = fs::File::open(&stage_path).unwrap();
+        let old_stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+        let moved_stage = cache_root.join("held-original-stage");
+
+        fs::rename(&stage_path, &moved_stage).unwrap();
+        fs::create_dir(&stage_path).unwrap();
+        let replacement_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+        assert_ne!(replacement_identity, old_stage_identity);
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, false).is_err());
+        assert!(
+            super::validate_fresh_stage_state(
+                &super::open_cache_root(&cache_root).unwrap(),
+                &proof,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            DirectoryIdentity::capture(&stage_path).unwrap(),
+            replacement_identity
+        );
+        assert_eq!(
+            DirectoryIdentity::capture(&moved_stage).unwrap(),
+            old_stage_identity
+        );
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_rotation_inventory_blocked(&cache_root);
+        drop(held_stage);
+    }
+
+    #[test]
+    fn foreign_transaction_intent_is_refused_without_touching_original_store() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        let foreign_debt = RotationDebt::new(
+            REPOSITORY,
+            "1123456789abcdef0123456789abcdef",
+            debt.cache_root.clone(),
+            debt.original_store.clone(),
+        )
+        .unwrap();
+        publish_stage_intent(&cache_root, &foreign_debt);
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, false).is_err());
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        assert!(!cache_root.join(stage_name.to_str().unwrap()).exists());
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        let intent = super::read_fresh_stage_intent(
+            &super::open_cache_root(&cache_root).unwrap(),
+            REPOSITORY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(intent.debt, foreign_debt);
+        assert_rotation_inventory_blocked(&cache_root);
+    }
+
+    #[test]
+    fn foreign_transaction_proof_is_refused_without_touching_original_store() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        let foreign_debt = RotationDebt::new(
+            REPOSITORY,
+            "2123456789abcdef0123456789abcdef",
+            debt.cache_root.clone(),
+            debt.original_store.clone(),
+        )
+        .unwrap();
+        let proof = super::ensure_fresh_stage(&cache_root, &foreign_debt, false).unwrap();
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        let stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, false).is_err());
+        assert_eq!(
+            DirectoryIdentity::capture(&stage_path).unwrap(),
+            stage_identity
+        );
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        let retained_proof = super::read_fresh_stage_proof(
+            &super::open_cache_root(&cache_root).unwrap(),
+            REPOSITORY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained_proof, proof);
+        assert_rotation_inventory_blocked(&cache_root);
+    }
+
+    #[test]
+    fn intent_only_crash_is_inventory_visible_and_recoverable() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        publish_stage_intent(&cache_root, &debt);
+
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        assert!(!stage_path.exists());
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_rotation_inventory_blocked(&cache_root);
+
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert_eq!(fs::read_dir(&original_path).unwrap().count(), 0);
+        assert_ne!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            debt.original_store
+        );
+        assert_ne!(
+            fs::read(original_path.join("package-index")).ok(),
+            Some(original_payload)
+        );
+        assert!(!stage_path.exists());
+        assert!(super::read(&cache_root, REPOSITORY).unwrap().is_none());
+        assert!(
+            super::read_fresh_stage_intent(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn staged_directory_before_proof_is_inventory_visible_and_recoverable() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        publish_stage_intent(&cache_root, &debt);
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        fs::create_dir(&stage_path).unwrap();
+        let stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_rotation_inventory_blocked(&cache_root);
+
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert_eq!(fs::read_dir(&original_path).unwrap().count(), 0);
+        assert_eq!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            stage_identity
+        );
+        assert_ne!(
+            fs::read(original_path.join("package-index")).ok(),
+            Some(original_payload)
+        );
+        assert!(!stage_path.exists());
+        assert!(super::read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_same_identity_empty_cache_without_tree_witness_is_refused() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        fs::remove_file(original_path.join("package-index")).unwrap();
+        assert_eq!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            debt.original_store
+        );
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, true).is_err());
+        assert!(
+            super::read_fresh_stage_intent(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(fs::read_dir(original_path).unwrap().next().is_none());
     }
 
     #[test]
@@ -2543,7 +3989,7 @@ mod tests {
         assert_eq!(fs::read(retired.join("package-index")).unwrap(), b"cached");
 
         fs::remove_dir_all(&retired).unwrap();
-        fs::create_dir(&store).unwrap();
+        super::create_fresh_store(&cache_root, &retained).unwrap();
         fs::write(store.join("unexpected"), b"preserve me").unwrap();
         assert!(super::clear_completed(&cache_root, &retained).is_err());
         assert_eq!(read(&cache_root, REPOSITORY).unwrap().unwrap().debt, debt);
@@ -2552,6 +3998,22 @@ mod tests {
         fs::remove_file(store.join("unexpected")).unwrap();
         super::clear_completed(&cache_root, &retained).unwrap();
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -2730,7 +4192,7 @@ mod tests {
         let retired = cache_root.join(debt.retired_component());
         fs::rename(&store, &retired).unwrap();
         fs::remove_dir_all(&retired).unwrap();
-        fs::create_dir(&store).unwrap();
+        super::create_fresh_store(&cache_root, &retained).unwrap();
 
         let injected = super::clear_completed_with_sync(&cache_root, &retained, |_| {
             Err(std::io::Error::other(
@@ -2745,6 +4207,23 @@ mod tests {
         assert!(!retired.exists());
         assert!(!store.join("package-index").exists());
         assert!(fs::read_dir(&store).unwrap().next().is_none());
+
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
 
         let next_debt = RotationDebt::new(
             REPOSITORY,
@@ -2775,13 +4254,29 @@ mod tests {
             recovery_step(&cache_root, &debt).unwrap(),
             RecoveryStep::CreateFreshStore
         );
-        fs::create_dir(&store).unwrap();
+        super::create_fresh_store(&cache_root, &retained).unwrap();
         assert_eq!(
             recovery_step(&cache_root, &debt).unwrap(),
             RecoveryStep::ClearCompletedDebt
         );
         super::clear_completed(&cache_root, &retained).unwrap();
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
         assert!(fs::read_dir(&cache_root).unwrap().all(|entry| {
             !entry
                 .unwrap()
