@@ -183,11 +183,19 @@ pub(crate) fn record_path(main_root: &Path) -> Result<PathBuf, BrokerOpError> {
             ),
         })
     })?;
+    record_path_for_host_state(main_root, &base)
+}
+
+/// The trust-record path under the host-state root captured by a Broker.
+pub(crate) fn record_path_for_host_state(
+    main_root: &Path,
+    host_state_dir: &Path,
+) -> Result<PathBuf, BrokerOpError> {
     let common = GitRepo::discover(main_root)
         .ok()
         .and_then(|repo| repo.git_common_dir().ok());
     let key = crate::host_state::repository_key(main_root, common.as_deref());
-    Ok(base.join(RECORD_DIR).join(format!("{key}.json")))
+    Ok(host_state_dir.join(RECORD_DIR).join(format!("{key}.json")))
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> BrokerOpError {
@@ -234,7 +242,28 @@ pub(crate) fn record_trust(
     source: &str,
 ) -> Result<PathBuf, BrokerOpError> {
     let path = record_path(main_root)?;
-    let mut record = read_record(&path)?.unwrap_or_default();
+    record_trust_at_path(main_root, &path, digests, source)
+}
+
+/// Record digests under an explicitly selected host-state root.
+#[cfg(test)]
+pub(crate) fn record_trust_for_host_state(
+    main_root: &Path,
+    host_state_dir: &Path,
+    digests: &[&str],
+    source: &str,
+) -> Result<PathBuf, BrokerOpError> {
+    let path = record_path_for_host_state(main_root, host_state_dir)?;
+    record_trust_at_path(main_root, &path, digests, source)
+}
+
+pub(crate) fn record_trust_at_path(
+    main_root: &Path,
+    path: &Path,
+    digests: &[&str],
+    source: &str,
+) -> Result<PathBuf, BrokerOpError> {
+    let mut record = read_record(path)?.unwrap_or_default();
     record.schema_version = RECORD_SCHEMA_VERSION;
     record.repository = main_root.to_string_lossy().into_owned();
     let now = now_ms();
@@ -250,8 +279,8 @@ pub(crate) fn record_trust(
     }
     let excess = record.trusted.len().saturating_sub(MAX_TRUSTED_POLICIES);
     record.trusted.drain(..excess);
-    write_record(&path, &record)?;
-    Ok(path)
+    write_record(path, &record)?;
+    Ok(path.to_path_buf())
 }
 
 /// Remove a repository's trust record. For disposable repositories that
@@ -325,19 +354,52 @@ pub(crate) fn require_trusted(
     store: Option<&mut BrokerStore>,
     session_id: Option<i64>,
 ) -> Result<TrustDecision, BrokerOpError> {
-    let decision = assess_trusted(main_root, policy, store.as_deref())?;
+    if !policy.runs_commands() {
+        return Ok(TrustDecision::NoCommands);
+    }
+    let path = record_path(main_root)?;
+    require_trusted_at_path(main_root, policy, store, session_id, &path)
+}
+
+/// Enforce trust using the host-state root captured by a Broker.
+///
+/// A captured absence is not permission to follow a later ambient HOME/XDG
+/// value. Policies without commands need no trust storage.
+pub(crate) fn require_trusted_for_host_state(
+    main_root: &Path,
+    host_state_dir: Option<&Path>,
+    policy: &GatePolicy,
+    store: Option<&mut BrokerStore>,
+    session_id: Option<i64>,
+) -> Result<TrustDecision, BrokerOpError> {
+    if !policy.runs_commands() {
+        return Ok(TrustDecision::NoCommands);
+    }
+    let host_state_dir = host_state_dir.ok_or_else(|| BrokerOpError::InvalidStorageContext {
+        reason: "captured host state directory is unavailable for gate trust".into(),
+    })?;
+    let path = record_path_for_host_state(main_root, host_state_dir)?;
+    require_trusted_at_path(main_root, policy, store, session_id, &path)
+}
+
+fn require_trusted_at_path(
+    main_root: &Path,
+    policy: &GatePolicy,
+    store: Option<&mut BrokerStore>,
+    session_id: Option<i64>,
+    path: &Path,
+) -> Result<TrustDecision, BrokerOpError> {
+    let decision = assess_trusted_at_path(main_root, policy, store.as_deref(), path)?;
     if decision == TrustDecision::Grandfathered
         && let Some(store) = store
     {
-        // Everything the repository visibly declares now is what it was
-        // already running: the policy being enforced, the main checkout's,
-        // and the integration tip's. Recording all of them keeps an existing
-        // repository working whichever path reaches the check first.
+        // The accepted history predates this check. Record all current policy
+        // digests at the same selected trust-record path.
         let mut digests = vec![policy.policy_sha256.clone()];
         digests.extend(current_policy_digests(main_root));
         digests.dedup();
         let refs = digests.iter().map(String::as_str).collect::<Vec<_>>();
-        record_trust(main_root, &refs, "grandfathered")?;
+        record_trust_at_path(main_root, path, &refs, "grandfathered")?;
         for digest in &digests {
             store.append_event(
                 crate::events::GATE_POLICY_TRUST_GRANDFATHERED,
@@ -352,9 +414,8 @@ pub(crate) fn require_trusted(
     Ok(decision)
 }
 
-/// The decision [`require_trusted`] would reach, without recording anything:
-/// `Grandfathered` means it would record trust and proceed. For callers that
-/// must not write, such as building a candidate for inspection (#663).
+/// The decision made without recording anything. Grandfathered means it would
+/// record trust and proceed. This is used by read-only policy inspection.
 pub(crate) fn assess_trusted(
     main_root: &Path,
     policy: &GatePolicy,
@@ -364,7 +425,33 @@ pub(crate) fn assess_trusted(
         return Ok(TrustDecision::NoCommands);
     }
     let path = record_path(main_root)?;
-    let record = read_record(&path)?;
+    assess_trusted_at_path(main_root, policy, store, &path)
+}
+
+/// Assess trust using the host-state root captured by a Broker.
+pub(crate) fn assess_trusted_for_host_state(
+    main_root: &Path,
+    host_state_dir: Option<&Path>,
+    policy: &GatePolicy,
+    store: Option<&BrokerStore>,
+) -> Result<TrustDecision, BrokerOpError> {
+    if !policy.runs_commands() {
+        return Ok(TrustDecision::NoCommands);
+    }
+    let host_state_dir = host_state_dir.ok_or_else(|| BrokerOpError::InvalidStorageContext {
+        reason: "captured host state directory is unavailable for gate trust".into(),
+    })?;
+    let path = record_path_for_host_state(main_root, host_state_dir)?;
+    assess_trusted_at_path(main_root, policy, store, &path)
+}
+
+fn assess_trusted_at_path(
+    main_root: &Path,
+    policy: &GatePolicy,
+    store: Option<&BrokerStore>,
+    path: &Path,
+) -> Result<TrustDecision, BrokerOpError> {
+    let record = read_record(path)?;
     let trusted = record.as_ref().map(|r| r.trusted.as_slice()).unwrap_or(&[]);
     if trusted
         .iter()
@@ -372,9 +459,6 @@ pub(crate) fn assess_trusted(
     {
         return Ok(TrustDecision::Trusted);
     }
-    // Before grandfathering: test fixtures build gate history in throwaway
-    // repositories, and recording trust for each of them would litter the
-    // host state directory.
     if test_escape_enabled() {
         return Ok(TrustDecision::TestEscape);
     }
@@ -393,8 +477,9 @@ pub(crate) fn assess_trusted(
     })
 }
 
-/// [`require_trusted`] for callers without an open broker: the hook and the
-/// gate doctor. Opens the repository's database only if it already exists.
+/// Standalone trust check for callers without an open Broker, such as hooks
+/// and the gate doctor. It opens the database only if it already exists.
+
 pub(crate) fn require_trusted_standalone(
     main_root: &Path,
     policy: &GatePolicy,

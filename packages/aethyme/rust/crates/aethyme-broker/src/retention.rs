@@ -105,18 +105,10 @@ pub struct RetentionPolicy {
     /// raising this trades disk against how long a dead session's disk is
     /// held -- never against whether committed work survives.
     pub session_abandoned_after_hours: u32,
-    /// Hours an *open* session may go without any evidence of a working agent
-    /// before the unattended sweep reclaims its regenerable build output. `0`
-    /// disables the lane.
-    ///
-    /// Judged by the same rule as `session_abandoned_after_hours` -- a live
-    /// agent process is never touched however quiet -- but with a shorter
-    /// window, because the two decisions cost different things when wrong.
-    /// Abandonment closes a session and makes its checkout a removal
-    /// candidate; this removes only witnessed, git-ignored build caches and
-    /// leaves the session, its checkout and its branch alone. Being wrong here
-    /// costs the returning agent a rebuild, so the build output of a quiet
-    /// session need not be held for the full abandonment window.
+    /// Legacy configuration field retained so older `.aethyme/broker.toml`
+    /// files continue to parse. Autonomous sweeps always preserve caches from
+    /// open sessions because quiet-agent time and shallow directory timestamps
+    /// cannot prove that a deep build output tree is unused.
     pub idle_session_artifact_hours: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
     pub artifact_sweep_budget_ms: u64,
@@ -674,6 +666,10 @@ pub struct GcOrphanCandidate {
     pub estimated_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_inodes: Option<u64>,
+    /// Binds the reviewed plan to a registered root object, owner marker and
+    /// saved filesystem identity. Older plans must be regenerated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_fingerprint: Option<String>,
     pub reason: String,
 }
 

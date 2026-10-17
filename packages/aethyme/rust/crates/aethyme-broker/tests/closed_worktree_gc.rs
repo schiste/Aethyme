@@ -12,6 +12,8 @@ use std::process::Command;
 
 use aethyme_broker::{Broker, BrokerOpError, SessionCleanupState};
 
+mod common;
+
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -44,8 +46,8 @@ impl Fixture {
         self.0.path().join("repo")
     }
 
-    fn open(&self) -> Broker {
-        Broker::open(&self.path())
+    fn open(&self) -> common::FixtureBroker {
+        common::open_fixture_broker(&self.path(), self.0.path())
             .unwrap()
             .with_worktree_root(self.0.path().join("worktrees"))
     }
@@ -53,7 +55,7 @@ impl Fixture {
 
 /// A repository whose closed worktrees have no grace period unless `grace`
 /// names one. `None` leaves the key out, so the shipped default applies.
-fn repository(grace_hours: Option<u32>) -> (Fixture, Broker) {
+fn repository(grace_hours: Option<u32>) -> (Fixture, common::FixtureBroker) {
     let tmp = Fixture(tempfile::tempdir().unwrap());
     let repo = tmp.path();
     std::fs::create_dir_all(&repo).unwrap();

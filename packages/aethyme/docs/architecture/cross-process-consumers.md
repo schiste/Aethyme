@@ -38,6 +38,12 @@ consumer. This file exists so that doesn't happen again.
 
 ## Inventory
 
+### Detached automatic artifact continuation (#818)
+
+The broker starts the private `broker gc __continue-artifacts <canonical-main-root>` child only from the installed router paired with its sibling engine. The child requires `AETHYME_GC_ARTIFACT_SWEEP_WORKER=1`, a writable non-ephemeral main checkout, aligned router/engine build identities, and the OS advisory singleton lock before it opens broker state. The subprocess is cache-only: it may remove eligible ignored build caches, but never removes a checkout or branch. It records completion only after a full eligible cache lap; deadline, lease contention, deletion failure, or repeated no-progress leaves the generation pending with bounded backoff. A new pressure refusal clears that backoff. The command remains hidden from help and is invoked only by the paired installed runtime.
+
+Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
+
 ### Primary-checkout fast-forward (#232)
 
 Before `status`, `start`, `sync`, `push`, `submit` or `finish` runs from the primary checkout (hooks and advanced commands never move it), the broker checks the current branch against its configured, already-fetched tracking ref. With no tracked or non-ignored untracked changes, no unique commits, no Git operation in progress (merge, cherry-pick, revert, bisect, rebase, a held index lock) and no live broker session working in that checkout, a strictly-behind checkout advances by fast-forward (a compare-and-swap of the branch ref, then the index and worktree) and records `broker.checkout.fast_forwarded` with `trigger` (`broker.<command>`), `branch`, `upstream_ref`, `from` and `to`. This check does not fetch. Success prints `Updated main checkout: <branch> fast-forwarded from <from> to <to> (<upstream_ref>).` to stderr. Dirty, ahead, diverged, detached or unprovable states remain unchanged and print `warning: left the main checkout unchanged: <reason>. Run: <shell-quoted-command>` to stderr. Compatibility read-only snapshots and linked session worktrees are never moved; session worktrees use `broker sync --session <id>`. Standard output is unchanged, so JSON reports stay parseable.

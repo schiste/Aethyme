@@ -30,11 +30,13 @@ fn failed_session_registration_never_releases_the_agent_command() {
     let worktree_root = temp.path().join("external-worktrees");
     let host_state = temp.path().join("host-state");
     initialized_repo(&repo_root);
-    let mut broker = Broker::open(&repo_root)
-        .unwrap()
+    let options = crate::BrokerOpenOptions::default()
+        .with_host_state_dir(&host_state)
+        .with_host_cache_dir(temp.path().join("host-cache"))
         .with_worktree_root(worktree_root.clone())
         .with_collaboration_state(host_state.clone())
-        .with_host_operation_database(host_state.join("host-resources.db"));
+        .with_host_operation_database(host_state.join("host-operations.db"));
+    let mut broker = Broker::open_with_options(&repo_root, options).unwrap();
     broker
         .store()
         .connection_mut()

@@ -43,13 +43,34 @@ pub(crate) struct GateCacheLocation {
 /// Resolve the location exactly as a gate does: the same repository key
 /// (from the main checkout, #170) under the same per-user cache directory.
 pub(crate) fn location(main_root: &Path) -> Option<GateCacheLocation> {
+    location_in(main_root, &crate::gates::GateStorageLocations::default())
+}
+
+/// [`location`] using the locations captured by an owning Broker handle.
+pub(crate) fn location_in(
+    main_root: &Path,
+    storage: &crate::gates::GateStorageLocations,
+) -> Option<GateCacheLocation> {
     let repo = GitRepo::discover(main_root).ok()?;
     let repository_key = crate::gates::repository_key(&repo).0;
-    let cache = crate::host_state::default_host_cache_dir()?;
+    let (cache, registry) = match storage {
+        crate::gates::GateStorageLocations::Defaults => (
+            crate::host_state::default_host_cache_dir()?,
+            crate::default_host_resource_db_path().ok(),
+        ),
+        crate::gates::GateStorageLocations::Captured {
+            host_cache_dir: Some(cache),
+            host_resource_db_path,
+        } => (cache.clone(), host_resource_db_path.clone()),
+        crate::gates::GateStorageLocations::Captured {
+            host_cache_dir: None,
+            ..
+        } => return None,
+    };
     Some(GateCacheLocation {
         root: cache.join("gates").join(&repository_key),
         repository_key,
-        registry: crate::default_host_resource_db_path().ok(),
+        registry,
     })
 }
 
