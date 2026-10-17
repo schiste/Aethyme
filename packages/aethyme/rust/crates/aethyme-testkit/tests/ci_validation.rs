@@ -285,10 +285,10 @@ fn workflow_only_changes_run_this_contract() {
     assert!(gate.contains("triggers = [\".github/workflows/**\"]"));
 }
 
-/// CI and a workstation run the workspace suite through one command
-/// (#598). A workflow that calls `cargo nextest run` directly, or a script
-/// that stops using the CI profile or starts allowing serial runs, would let
-/// the two drift apart again.
+/// CI and local commands share coverage selection while using profiles
+/// that fit their jobs. Workflows still require the explicit full CI profile;
+/// local defaults stay bounded even when changed paths require workspace
+/// coverage.
 #[test]
 fn ci_and_local_runs_share_one_test_command() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -311,12 +311,34 @@ fn ci_and_local_runs_share_one_test_command() {
     }
     let script =
         std::fs::read_to_string(root.join("packages/aethyme/scripts/test-like-ci.sh")).unwrap();
-    assert!(script.contains("cargo nextest run --locked --workspace --profile ci"));
+    assert!(script.contains("cargo nextest run --locked"));
+    assert!(script.contains("--profile ci"));
+    assert!(script.contains("test_command=(cargo nextest run --locked"));
+    assert!(script.contains("--no-tests fail"));
+    assert!(script.contains("--profile local"));
+    assert!(script.contains("selection=(-p \"$package\" --lib)"));
+    assert!(
+        script.contains("cargo build --locked --workspace --bins --jobs \"$local_build_jobs\"")
+    );
+    assert!(script.contains("export CARGO_BUILD_JOBS=\"$local_build_jobs\""));
+    assert!(script.contains("coverage=workspace"));
+    assert!(script.contains("Cargo.toml|Cargo.lock|.cargo/*"));
+    assert!(script.contains("coverage=focused"));
     assert!(script.contains("AETHYME_TESTKIT_PREBUILT_BINS=1"));
-    assert!(script.contains("--test-threads=1|--nocapture|--no-capture|-j1"));
+    assert!(script.contains("unset AETHYME_TESTKIT_PREBUILT_BINS"));
+    assert!(!script.contains("--test-threads=1|--nocapture|--no-capture|-j1"));
+    assert!(script.contains("|| status=$?"));
+    assert!(script.contains("exit \"$status\""));
     assert!(script.contains("unset AETHYME_WORKTREE_ROOT AETHYME_HOST_STATE_DIR XDG_STATE_HOME"));
+
     let nextest =
         std::fs::read_to_string(root.join("packages/aethyme/rust/.config/nextest.toml")).unwrap();
+    assert!(nextest.contains("[profile.local]"));
+    assert!(nextest.contains("test-threads = 2"));
+    assert!(nextest.contains("retries = 0"));
+    assert!(nextest.contains("fail-fast = true"));
+    assert!(nextest.contains("failure-output = \"final\""));
+    assert!(nextest.contains("status-level = \"fail\""));
     assert!(nextest.contains("[profile.ci]"));
     assert!(nextest.contains("[profile.ci.junit]"));
 }

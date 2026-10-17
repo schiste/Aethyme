@@ -65,6 +65,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   never present a partial walk as full-volume accounting. Measure free space
   before and after authorized cleanup, and record concurrent writers rather
   than claiming removed file sizes are physical bytes freed.
+- For broker worktree storage audits, retain bounded per-worktree records with
+  exact repository identity, path, and first-registration time alongside
+  aggregates. Join cleanup evidence by repository identity and exact path;
+  session IDs are only unique within a repository. Keep reported file bytes,
+  summed path allocation, deduplicated physical allocation, and observed
+  volume-free-space change distinct. Registration time does not establish
+  worktree creation or preparation time.
+- For guard-removal controls that temporarily mutate source, restore exact bytes
+  and verify the source hash, then refresh the owned source file's mtime before
+  the restored positive Cargo run. A `cp -p` restore can otherwise let Cargo
+  reuse output from the mutation build.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only
@@ -87,9 +98,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   from Cargo output; correct embedded identity alone does not rule out forced
   recompilation on every invocation. Use a dependency-free fixture first.
   Keep production probes and oracles from changing watched inputs: Git dirty
-  checks can refresh the index even with optional locks disabled. Trace Git
-  metadata before and after rather than inferring read-only behavior from flags.
-  An isolated index must also protect split-index backing files.
+  checks can refresh Cargo-watched index and split-index shared-index mtimes,
+  even with optional locks disabled. Trace those paths before and after rather
+  than inferring read-only behavior from flags; an isolated index must also
+  protect its split-index backing files.
 - Run the fastest relevant test command first.
   Check the selected test names and a nonzero executed count before treating a
   focused run as evidence. Rust module aliases can differ from filenames; a

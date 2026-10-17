@@ -16,15 +16,16 @@ use std::mem::{self, MaybeUninit};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 const SCHEMA: &str = "aethyme.preparation-cache-rotation-debt";
 const VERSION: u8 = 1;
 const MAX_RECORD_BYTES: u64 = 8 * 1024;
+const MAX_ROOT_IDENTITY_BYTES: usize = 512;
 const RECORD_PREFIX: &str = ".aethyme-preparation-rotation-";
 const SCRATCH_SUFFIX: &str = ".scratch";
 const FRESH_STAGE_PREFIX: &str = ".aethyme-preparation-stage-";
@@ -69,6 +70,516 @@ impl DirectoryIdentity {
     fn same_filesystem(&self, other: &Self) -> bool {
         self.device == other.device && self.filesystem_id == other.filesystem_id
     }
+}
+
+const PREPARATION_ROOT_MARKER: &str = ".aethyme-preparation-cache-root-v2";
+const PREPARATION_ROOT_LOCK: &str = ".aethyme-preparation-cache-root.lock";
+const PREPARATION_ROOT_MARKER_SCHEMA: &str = "aethyme.preparation-cache-root";
+const PREPARATION_ROOT_MARKER_VERSION: u8 = 2;
+const PREPARATION_ROOT_LOCK_WAIT: Duration = Duration::from_secs(5);
+const PREPARATION_ROOT_MAX_ENTRIES: usize = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PreparationCacheRootMarker {
+    schema: String,
+    version: u8,
+    root_path: PathBuf,
+    root_identity: DirectoryIdentity,
+    coordinator_db_path: PathBuf,
+    nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreparationCacheRootCaptureState {
+    Uninitialized,
+    Marked {
+        coordinator_db_path: PathBuf,
+        nonce: String,
+        cache_root_identity: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparationCacheRootCapture {
+    pub(crate) directory: File,
+    pub(crate) identity: Vec<u8>,
+    pub(crate) state: PreparationCacheRootCaptureState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InitializedPreparationCacheRoot {
+    pub(crate) nonce: String,
+    pub(crate) root_identity: Vec<u8>,
+    pub(crate) cache_root_identity: Vec<u8>,
+    pub(crate) coordinator_db_path: PathBuf,
+}
+
+/// Capture an existing, canonical directory without creating or repairing any
+/// state. A missing marker is represented as Uninitialized; callers may
+/// promote it only from an explicit writable open while holding the repository
+/// preparation-cache lease.
+pub(crate) fn capture_preparation_cache_root(
+    path: &Path,
+) -> io::Result<PreparationCacheRootCapture> {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path.to_str().is_none()
+        || path.as_os_str().as_bytes().len() > 4096
+    {
+        return Err(invalid_record(
+            "preparation-cache override must be a bounded absolute UTF-8 directory path",
+        ));
+    }
+    let canonical = std::fs::canonicalize(path)?;
+    if canonical != path {
+        return Err(invalid_record(
+            "preparation-cache override must already be canonical",
+        ));
+    }
+    let deadline = Instant::now() + PREPARATION_ROOT_LOCK_WAIT;
+    let directory = open_real_directory_chain(path, deadline)?;
+    let identity = identity_for_directory(&directory)?;
+    ensure_cache_root_path_identity(path, &directory, &identity, deadline)?;
+    let identity_bytes = identity.encode()?;
+    let lock_name = component(PREPARATION_ROOT_LOCK)?;
+    let lock = read_component(directory.as_raw_fd(), &lock_name)?;
+    if lock.as_ref().is_some_and(|lock| !lock.bytes.is_empty()) {
+        return Err(invalid_record("preparation-cache root lock is not empty"));
+    }
+
+    let marker_name = component(PREPARATION_ROOT_MARKER)?;
+    let marker_read = read_component(directory.as_raw_fd(), &marker_name)?;
+    let state = match marker_read {
+        None => {
+            let mut allowed = Vec::new();
+            if lock.is_some() {
+                allowed.push(PREPARATION_ROOT_LOCK.as_bytes());
+            }
+            if !preparation_root_contains_only_names(&directory, &allowed, deadline)? {
+                return Err(invalid_record(
+                    "uninitialized preparation-cache root contains unowned entries",
+                ));
+            }
+            PreparationCacheRootCaptureState::Uninitialized
+        }
+        Some(marker) => {
+            let parsed = decode_preparation_cache_root_marker(&marker.bytes, path, &identity)?;
+            if lock.is_none() {
+                return Err(invalid_record(
+                    "initialized preparation-cache root has no stable lock file",
+                ));
+            }
+            let child_name = preparation_cache_child_component(&parsed.nonce)?;
+            let child_identity = directory_identity_at(directory.as_raw_fd(), &child_name)?
+                .map(|child| child.encode())
+                .transpose()?;
+            let mut allowed = vec![
+                PREPARATION_ROOT_LOCK.as_bytes(),
+                PREPARATION_ROOT_MARKER.as_bytes(),
+            ];
+            if child_identity.is_some() {
+                allowed.push(child_name.to_bytes());
+            }
+            if !preparation_root_contains_only_names(&directory, &allowed, deadline)? {
+                return Err(invalid_record(
+                    "initialized preparation-cache root contains unknown entries",
+                ));
+            }
+            PreparationCacheRootCaptureState::Marked {
+                coordinator_db_path: parsed.coordinator_db_path,
+                nonce: parsed.nonce,
+                cache_root_identity: child_identity,
+            }
+        }
+    };
+    ensure_cache_root_path_identity(path, &directory, &identity, deadline)?;
+    Ok(PreparationCacheRootCapture {
+        directory,
+        identity: identity_bytes,
+        state,
+    })
+}
+
+/// Initialize only the opt-in root marker/nonce child. The caller must already
+/// hold the unchanged repository-scoped preparation lease. Journal inspection
+/// runs under the root lock and must use the captured host-resource DB.
+pub(crate) fn validate_preparation_cache_root_handle(
+    path: &Path,
+    pinned_directory: &File,
+    expected_root_identity: &[u8],
+) -> io::Result<()> {
+    let expected_identity = decode_directory_identity(expected_root_identity)?;
+    let deadline = Instant::now() + PREPARATION_ROOT_LOCK_WAIT;
+    ensure_cache_root_path_identity(path, pinned_directory, &expected_identity, deadline)
+}
+
+pub(crate) fn initialize_preparation_cache_root(
+    path: &Path,
+    expected_root_identity: &[u8],
+    pinned_directory: &File,
+    coordinator_db_path: &Path,
+    journal_has_rows_under_root: impl Fn() -> io::Result<bool>,
+) -> io::Result<InitializedPreparationCacheRoot> {
+    let deadline = Instant::now() + PREPARATION_ROOT_LOCK_WAIT;
+    let expected_identity = decode_directory_identity(expected_root_identity)?;
+    let pinned_identity = identity_for_directory(pinned_directory)?;
+    if !pinned_identity.same_directory(&expected_identity) {
+        return Err(invalid_record(
+            "pinned preparation-cache root identity changed before initialization",
+        ));
+    }
+    validate_coordinator_db_path(coordinator_db_path)?;
+    ensure_cache_root_path_identity(path, pinned_directory, &expected_identity, deadline)?;
+    let lock_name = component(PREPARATION_ROOT_LOCK)?;
+    let lock = open_or_create_preparation_root_lock(pinned_directory, &lock_name)?;
+    acquire_preparation_root_lock(&lock, deadline)?;
+    ensure_component_identity(
+        pinned_directory.as_raw_fd(),
+        &lock_name,
+        file_identity(&lock)?,
+    )?;
+    ensure_cache_root_path_identity(path, pinned_directory, &expected_identity, deadline)?;
+
+    let marker_name = component(PREPARATION_ROOT_MARKER)?;
+    let (marker, marker_before) = match read_component(pinned_directory.as_raw_fd(), &marker_name)?
+    {
+        Some(read) => {
+            let marker =
+                decode_preparation_cache_root_marker(&read.bytes, path, &expected_identity)?;
+            if marker.coordinator_db_path != coordinator_db_path {
+                return Err(invalid_record(
+                    "preparation-cache root is bound to a different host-resource database path",
+                ));
+            }
+            (marker, read)
+        }
+        None => {
+            if !preparation_root_contains_only_names(
+                pinned_directory,
+                &[PREPARATION_ROOT_LOCK.as_bytes()],
+                deadline,
+            )? {
+                return Err(invalid_record(
+                    "uninitialized preparation-cache root contains unowned entries",
+                ));
+            }
+            if journal_has_rows_under_root()? {
+                return Err(invalid_record(
+                    "uninitialized preparation-cache root has prior rotation journal state",
+                ));
+            }
+            ensure_cache_root_path_identity(path, pinned_directory, &expected_identity, deadline)?;
+            let marker = PreparationCacheRootMarker {
+                schema: PREPARATION_ROOT_MARKER_SCHEMA.to_owned(),
+                version: PREPARATION_ROOT_MARKER_VERSION,
+                root_path: path.to_path_buf(),
+                root_identity: expected_identity.clone(),
+                coordinator_db_path: coordinator_db_path.to_path_buf(),
+                nonce: random_nonce()?,
+            };
+            let bytes = serde_json::to_vec(&marker)
+                .map_err(|error| invalid_record(&format!("cannot encode root marker: {error}")))?;
+            if bytes.len() > MAX_RECORD_BYTES as usize {
+                return Err(invalid_record("preparation-cache root marker is too large"));
+            }
+            let mut file = create_regular_exclusive(pinned_directory.as_raw_fd(), &marker_name)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            pinned_directory.sync_all()?;
+            let read = read_component(pinned_directory.as_raw_fd(), &marker_name)?
+                .ok_or_else(|| invalid_record("preparation-cache root marker disappeared"))?;
+            if read.bytes != bytes {
+                return Err(invalid_record(
+                    "preparation-cache root marker changed after publication",
+                ));
+            }
+            (marker, read)
+        }
+    };
+
+    let child_name = preparation_cache_child_component(&marker.nonce)?;
+    let child = match directory_identity_at(pinned_directory.as_raw_fd(), &child_name)? {
+        Some(identity) => {
+            let directory = open_directory_at(pinned_directory.as_raw_fd(), &child_name)?;
+            let actual = identity_for_directory(&directory)?;
+            if !actual.same_directory(&identity) {
+                return Err(invalid_record(
+                    "preparation-cache namespace changed while opening",
+                ));
+            }
+            (directory, actual)
+        }
+        None => {
+            if journal_has_rows_under_root()? {
+                return Err(invalid_record(
+                    "preparation-cache namespace is absent while rotation journal state remains",
+                ));
+            }
+            let current_marker = read_component(pinned_directory.as_raw_fd(), &marker_name)?
+                .ok_or_else(|| invalid_record("preparation-cache root marker disappeared"))?;
+            if current_marker.identity != marker_before.identity
+                || current_marker.bytes != marker_before.bytes
+            {
+                return Err(invalid_record(
+                    "preparation-cache root marker changed before namespace creation",
+                ));
+            }
+            if !preparation_root_contains_only_names(
+                pinned_directory,
+                &[
+                    PREPARATION_ROOT_LOCK.as_bytes(),
+                    PREPARATION_ROOT_MARKER.as_bytes(),
+                ],
+                deadline,
+            )? {
+                return Err(invalid_record(
+                    "preparation-cache root contains unknown entries before namespace creation",
+                ));
+            }
+            ensure_cache_root_path_identity(path, pinned_directory, &expected_identity, deadline)?;
+            // SAFETY: pinned_directory is a live directory descriptor and
+            // child_name is a NUL-terminated single component.
+            if unsafe {
+                libc::mkdirat(
+                    pinned_directory.as_raw_fd(),
+                    child_name.as_ptr(),
+                    0o700 as libc::mode_t,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            normalize_created_directory_mode(
+                pinned_directory.as_raw_fd(),
+                &child_name,
+                0o700 as libc::mode_t,
+            )?;
+            pinned_directory.sync_all()?;
+            let directory = open_directory_at(pinned_directory.as_raw_fd(), &child_name)?;
+            let identity = identity_for_directory(&directory)?;
+            (directory, identity)
+        }
+    };
+    let child_identity = child.1.encode()?;
+    if !preparation_root_contains_only_names(
+        pinned_directory,
+        &[
+            PREPARATION_ROOT_LOCK.as_bytes(),
+            PREPARATION_ROOT_MARKER.as_bytes(),
+            child_name.to_bytes(),
+        ],
+        deadline,
+    )? {
+        return Err(invalid_record(
+            "initialized preparation-cache root contains unknown entries",
+        ));
+    }
+    let marker_after = read_component(pinned_directory.as_raw_fd(), &marker_name)?
+        .ok_or_else(|| invalid_record("preparation-cache root marker disappeared"))?;
+    let validated_after =
+        decode_preparation_cache_root_marker(&marker_after.bytes, path, &expected_identity)?;
+    if validated_after != marker || marker_before.identity != marker_after.identity {
+        return Err(invalid_record(
+            "preparation-cache root marker changed during initialization",
+        ));
+    }
+    ensure_cache_root_path_identity(path, pinned_directory, &expected_identity, deadline)?;
+    Ok(InitializedPreparationCacheRoot {
+        nonce: marker.nonce,
+        root_identity: expected_identity.encode()?,
+        cache_root_identity: child_identity,
+        coordinator_db_path: marker.coordinator_db_path,
+    })
+}
+
+fn validate_coordinator_db_path(path: &Path) -> io::Result<()> {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path.file_name().is_none()
+        || path.to_str().is_none()
+        || path.as_os_str().as_bytes().len() > 4096
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(invalid_record(
+            "captured host-resource database path is not canonical and bounded",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_directory_identity(bytes: &[u8]) -> io::Result<DirectoryIdentity> {
+    if bytes.is_empty() || bytes.len() > MAX_ROOT_IDENTITY_BYTES {
+        return Err(invalid_record(
+            "captured preparation-cache root identity is invalid",
+        ));
+    }
+    let identity: DirectoryIdentity = serde_json::from_slice(bytes).map_err(|error| {
+        invalid_record(&format!("captured root identity is malformed: {error}"))
+    })?;
+    identity.validate()?;
+    if identity.encode()? != bytes {
+        return Err(invalid_record(
+            "captured preparation-cache root identity is not canonical",
+        ));
+    }
+    Ok(identity)
+}
+
+fn decode_preparation_cache_root_marker(
+    bytes: &[u8],
+    expected_path: &Path,
+    expected_identity: &DirectoryIdentity,
+) -> io::Result<PreparationCacheRootMarker> {
+    if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES as usize {
+        return Err(invalid_record(
+            "preparation-cache root marker has invalid size",
+        ));
+    }
+    let marker: PreparationCacheRootMarker = serde_json::from_slice(bytes).map_err(|error| {
+        invalid_record(&format!(
+            "preparation-cache root marker is malformed: {error}"
+        ))
+    })?;
+    if marker.schema != PREPARATION_ROOT_MARKER_SCHEMA
+        || marker.version != PREPARATION_ROOT_MARKER_VERSION
+        || marker.root_path != expected_path
+        || !marker.root_identity.same_directory(expected_identity)
+        || !is_hex(&marker.nonce, 64, 64)
+        || serde_json::to_vec(&marker)
+            .map_err(|error| invalid_record(&format!("cannot validate root marker: {error}")))?
+            != bytes
+    {
+        return Err(invalid_record(
+            "preparation-cache root marker does not match its pinned directory",
+        ));
+    }
+    Ok(marker)
+}
+
+fn preparation_cache_child_component(nonce: &str) -> io::Result<CString> {
+    if !is_hex(nonce, 64, 64) {
+        return Err(invalid_record("preparation-cache root nonce is malformed"));
+    }
+    component(&format!(".aethyme-preparation-cache-{nonce}"))
+}
+
+fn random_nonce() -> io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(encode_hex(&bytes))
+}
+
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let metadata = file.metadata()?;
+    if !is_private_owned_file(&metadata) || metadata.len() != 0 {
+        return Err(invalid_record(
+            "preparation-cache root lock must be a private empty regular file",
+        ));
+    }
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn open_or_create_preparation_root_lock(directory: &File, name: &CStr) -> io::Result<File> {
+    // SAFETY: `directory` owns an open directory descriptor and `name` is a
+    // NUL-terminated component. O_NOFOLLOW prevents opening a symlink, and
+    // O_EXCL makes the create attempt fail rather than replace an existing file.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0o600 as libc::mode_t as libc::c_uint,
+        )
+    };
+    let (fd, created) = if fd >= 0 {
+        (fd, true)
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        // SAFETY: `directory` owns an open directory descriptor and `name` is a
+        // NUL-terminated component. O_NOFOLLOW rejects a symlink replacement.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        (fd, false)
+    };
+    // SAFETY: fd is the fresh descriptor returned by successful openat above.
+    let lock = unsafe { File::from_raw_fd(fd) };
+    if created {
+        normalize_created_file_mode(&lock, 0o600 as libc::mode_t)?;
+    }
+    let identity = file_identity(&lock)?;
+    ensure_component_identity(directory.as_raw_fd(), name, identity)?;
+    if created {
+        lock.sync_all()?;
+        directory.sync_all()?;
+    }
+    Ok(lock)
+}
+
+fn acquire_preparation_root_lock(lock: &File, deadline: Instant) -> io::Result<()> {
+    loop {
+        // SAFETY: flock operates on a live descriptor and does not dereference
+        // memory owned by this crate.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        let lock_busy = error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN);
+        if !lock_busy || Instant::now() >= deadline {
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn ensure_cache_root_path_identity(
+    path: &Path,
+    pinned_directory: &File,
+    expected_identity: &DirectoryIdentity,
+    deadline: Instant,
+) -> io::Result<()> {
+    if std::fs::canonicalize(path)? != path {
+        return Err(invalid_record(
+            "preparation-cache root path is no longer canonical",
+        ));
+    }
+    let path_directory = open_real_directory_chain(path, deadline)?;
+    let pinned_identity = identity_for_directory(pinned_directory)?;
+    let current_identity = identity_for_directory(&path_directory)?;
+    if !pinned_identity.same_directory(expected_identity)
+        || !current_identity.same_directory(expected_identity)
+    {
+        return Err(invalid_record(
+            "preparation-cache root path was replaced during initialization",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -556,13 +1067,28 @@ fn classify_recovery(
 /// its external journal row. The caller holds the same repository lease for
 /// this whole function; every journal transaction finishes before filesystem
 /// mutation starts.
+#[cfg(test)]
 pub(crate) fn recover_with_journal(
     cache_root: &Path,
     resource_db: &Path,
     repository: &str,
     deadline: Instant,
 ) -> Result<RecoveryProgress, RecoveryError> {
+    recover_with_journal_and_root_guard(cache_root, resource_db, repository, deadline, || Ok(()))
+}
+
+/// Recover one repository's rotation while revalidating the broker's captured
+/// cache-root binding immediately before every recovery mutation. The caller
+/// holds the repository-scoped preparation-cache lease for the full operation.
+pub(crate) fn recover_with_journal_and_root_guard(
+    cache_root: &Path,
+    resource_db: &Path,
+    repository: &str,
+    deadline: Instant,
+    mut validate_root: impl FnMut() -> io::Result<()>,
+) -> Result<RecoveryProgress, RecoveryError> {
     let mut progress = RecoveryProgress::default();
+    validate_root().map_err(|source| recovery_error(progress, source))?;
     if Instant::now() >= deadline {
         return Err(recovery_error(progress, deadline_error()));
     }
@@ -630,9 +1156,16 @@ pub(crate) fn recover_with_journal(
                     invalid_record("unpublished rotation scratch has no durable journal row"),
                 ));
             }
-            return recover(cache_root, repository, deadline);
+            return recover_inner_with_root_guard(
+                cache_root,
+                repository,
+                deadline,
+                false,
+                &mut validate_root,
+            );
         };
         let payload = encode(&debt).map_err(|source| recovery_error(progress, source))?;
+        validate_root().map_err(|source| recovery_error(progress, source))?;
         if had_sidecar {
             super::rotation_journal::publish_legacy(
                 resource_db,
@@ -699,12 +1232,18 @@ pub(crate) fn recover_with_journal(
             proof
         }
         None => {
-            let proof = ensure_fresh_stage(cache_root, &debt, protocol_version == 2)
-                .map_err(|source| recovery_error(progress, source))?;
+            let proof = ensure_fresh_stage_with_root_guard(
+                cache_root,
+                &debt,
+                protocol_version == 2,
+                &mut validate_root,
+            )
+            .map_err(|source| recovery_error(progress, source))?;
             let identity = proof
                 .fresh_store
                 .encode()
                 .map_err(|source| recovery_error(progress, source))?;
+            validate_root().map_err(|source| recovery_error(progress, source))?;
             super::rotation_journal::record_fresh_store_identity(
                 resource_db,
                 cache_root,
@@ -730,13 +1269,18 @@ pub(crate) fn recover_with_journal(
     } else if recovery_step(cache_root, &debt).map_err(|source| recovery_error(progress, source))?
         != RecoveryStep::ClearCompletedDebt
     {
-        restore_from_journal(cache_root, &debt)
+        restore_from_journal_with_root_guard(cache_root, &debt, &mut validate_root)
             .map_err(|source| recovery_error(progress, source))?;
     }
 
-    progress = recover_inner(cache_root, repository, deadline, true)?;
+    progress =
+        recover_inner_with_root_guard(cache_root, repository, deadline, true, &mut validate_root)?;
     if progress.complete {
         progress.found_debt = true;
+        if let Err(source) = validate_root() {
+            progress.complete = false;
+            return Err(recovery_error(progress, source));
+        }
         if let Err(source) = super::rotation_journal::complete_verified(
             resource_db,
             cache_root,
@@ -751,7 +1295,9 @@ pub(crate) fn recover_with_journal(
             progress.complete = false;
             return Err(recovery_error(progress, source));
         }
-        if let Err(source) = clear_fresh_stage_proof(cache_root, &proof) {
+        if let Err(source) =
+            clear_fresh_stage_proof_with_root_guard(cache_root, &proof, &mut validate_root)
+        {
             progress.complete = false;
             return Err(recovery_error(progress, source));
         }
@@ -914,12 +1460,23 @@ pub(crate) fn inventory(
 /// A durable root-level intent precedes the fixed staging directory; the
 /// versioned proof binds the exact debt transaction to the staged directory.
 /// Both records use no-follow, descriptor-relative, no-replace publication.
+#[cfg(test)]
 fn ensure_fresh_stage(
     cache_root: &Path,
     debt: &RotationDebt,
     allow_legacy_adoption: bool,
 ) -> io::Result<FreshStageProof> {
+    ensure_fresh_stage_with_root_guard(cache_root, debt, allow_legacy_adoption, &mut || Ok(()))
+}
+
+fn ensure_fresh_stage_with_root_guard(
+    cache_root: &Path,
+    debt: &RotationDebt,
+    allow_legacy_adoption: bool,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<FreshStageProof> {
     debt.validate()?;
+    validate_root()?;
     let root = open_cache_root(cache_root)?;
     let root_identity = identity_for_directory(&root)?;
     if !root_identity.same_directory(&debt.cache_root) {
@@ -946,6 +1503,7 @@ fn ensure_fresh_stage(
             {
                 return Err(invalid_record("fresh-stage intent differs from its proof"));
             }
+            validate_root()?;
             remove_control_file(
                 &root,
                 &intent_name,
@@ -985,6 +1543,7 @@ fn ensure_fresh_stage(
                 }
             }
         }
+        validate_root()?;
         remove_scratch(root.as_raw_fd(), &proof_scratch_name, &proof_scratch)?;
         root.sync_all()?;
     }
@@ -1000,6 +1559,7 @@ fn ensure_fresh_stage(
                 "fresh-stage intent scratch conflicts with a staged directory",
             ));
         }
+        validate_root()?;
         remove_scratch(root.as_raw_fd(), &intent_scratch_name, &intent_scratch)?;
         root.sync_all()?;
     }
@@ -1015,7 +1575,14 @@ fn ensure_fresh_stage(
             let intent = select_fresh_stage_intent(&root, debt, allow_legacy_adoption)?;
             validate_fresh_stage_source(&root, &intent)?;
             let bytes = encode_fresh_stage_intent(&intent)?;
-            publish_control_file(&root, &intent_name, &intent_scratch_name, &bytes)?;
+            validate_root()?;
+            publish_control_file_with_root_guard(
+                &root,
+                &intent_name,
+                &intent_scratch_name,
+                &bytes,
+                validate_root,
+            )?;
             intent
         }
     };
@@ -1045,6 +1612,7 @@ fn ensure_fresh_stage(
                 }
                 None => {
                     let mode = 0o700 as libc::mode_t;
+                    validate_root()?;
                     // SAFETY: root is a live directory descriptor and stage_name is a
                     // validated single component. mkdirat cannot replace an entry.
                     if unsafe { libc::mkdirat(root.as_raw_fd(), stage_name.as_ptr(), mode) } != 0 {
@@ -1077,13 +1645,21 @@ fn ensure_fresh_stage(
     validate_fresh_stage_source(&root, &intent)?;
     let proof = FreshStageProof::new(&intent, fresh_store)?;
     let proof_bytes = proof.encode()?;
-    publish_control_file(&root, &proof_name, &proof_scratch_name, &proof_bytes)?;
+    validate_root()?;
+    publish_control_file_with_root_guard(
+        &root,
+        &proof_name,
+        &proof_scratch_name,
+        &proof_bytes,
+        validate_root,
+    )?;
     validate_fresh_stage_state(&root, &proof)?;
     if let Some(intent_file) = read_component(root.as_raw_fd(), &intent_name)? {
         let current = decode_fresh_stage_intent(intent_file, debt)?;
         if current != intent {
             return Err(invalid_record("fresh-stage intent changed before removal"));
         }
+        validate_root()?;
         remove_control_file(&root, &intent_name, &encode_fresh_stage_intent(&intent)?)?;
     }
     Ok(proof)
@@ -1327,11 +1903,22 @@ fn encode_fresh_stage_intent(intent: &FreshStageIntent) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn publish_control_file(
     root: &File,
     final_name: &CStr,
     scratch_name: &CStr,
     bytes: &[u8],
+) -> io::Result<FileIdentity> {
+    publish_control_file_with_root_guard(root, final_name, scratch_name, bytes, &mut || Ok(()))
+}
+
+fn publish_control_file_with_root_guard(
+    root: &File,
+    final_name: &CStr,
+    scratch_name: &CStr,
+    bytes: &[u8],
+    validate_root: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<FileIdentity> {
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(invalid_record(
@@ -1348,12 +1935,15 @@ fn publish_control_file(
         if scratch.bytes == bytes {
             ensure_component_identity(root.as_raw_fd(), scratch_name, scratch.identity)?;
         } else {
+            validate_root()?;
             remove_scratch(root.as_raw_fd(), scratch_name, &scratch)?;
             root.sync_all()?;
             return Err(invalid_record("fresh-stage control scratch was incomplete"));
         }
     } else {
+        validate_root()?;
         let mut scratch = create_regular_exclusive(root.as_raw_fd(), scratch_name)?;
+        validate_root()?;
         scratch.write_all(bytes)?;
         scratch.sync_all()?;
         let metadata = scratch.metadata()?;
@@ -1369,6 +1959,7 @@ fn publish_control_file(
     }
     ensure_component_identity(root.as_raw_fd(), scratch_name, scratch.identity)?;
     root.sync_all()?;
+    validate_root()?;
     rename_noreplace(root.as_raw_fd(), scratch_name, root.as_raw_fd(), final_name)?;
     root.sync_all()?;
     let published = read_component(root.as_raw_fd(), final_name)?
@@ -1390,7 +1981,12 @@ fn remove_control_file(root: &File, name: &CStr, expected: &[u8]) -> io::Result<
     root.sync_all()
 }
 
-fn clear_fresh_stage_proof(cache_root: &Path, proof: &FreshStageProof) -> io::Result<()> {
+fn clear_fresh_stage_proof_with_root_guard(
+    cache_root: &Path,
+    proof: &FreshStageProof,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    validate_root()?;
     proof.validate(&proof.debt)?;
     let root = open_cache_root(cache_root)?;
     let root_identity = identity_for_directory(&root)?;
@@ -1443,6 +2039,7 @@ fn clear_fresh_stage_proof(cache_root: &Path, proof: &FreshStageProof) -> io::Re
         return Err(invalid_record("fresh-store proof changed before removal"));
     }
     ensure_component_identity(root.as_raw_fd(), &proof_name, existing.identity)?;
+    validate_root()?;
     unlink_component(root.as_raw_fd(), &proof_name)?;
     root.sync_all()
 }
@@ -1499,19 +2096,31 @@ fn stage_transaction_debt(cache_root: &Path, repository: &str) -> io::Result<Opt
 /// preparation-cache lease. This operation is deliberately cache-only and
 /// does not consult current worktree liveness: the writer published the debt
 /// before it could start any command that used the store.
+#[cfg(test)]
 pub(crate) fn recover(
     cache_root: &Path,
     repository: &str,
     deadline: Instant,
 ) -> Result<RecoveryProgress, RecoveryError> {
-    recover_inner(cache_root, repository, deadline, false)
+    recover_with_root_guard(cache_root, repository, deadline, || Ok(()))
 }
 
-fn recover_inner(
+#[cfg(test)]
+pub(crate) fn recover_with_root_guard(
+    cache_root: &Path,
+    repository: &str,
+    deadline: Instant,
+    mut validate_root: impl FnMut() -> io::Result<()>,
+) -> Result<RecoveryProgress, RecoveryError> {
+    recover_inner_with_root_guard(cache_root, repository, deadline, false, &mut validate_root)
+}
+
+fn recover_inner_with_root_guard(
     cache_root: &Path,
     repository: &str,
     deadline: Instant,
     retain_fresh_proof_for_journal: bool,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
 ) -> Result<RecoveryProgress, RecoveryError> {
     let mut progress = RecoveryProgress::default();
     if !is_hex(repository, 64, 64) {
@@ -1524,61 +2133,68 @@ fn recover_inner(
         return Err(recovery_error(progress, deadline_error()));
     }
 
-    let retained = match read_or_promote_scratch(cache_root, repository) {
-        Ok(Some(retained)) => retained,
-        Ok(None) => {
-            match std::fs::symlink_metadata(cache_root) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    validate_root().map_err(|source| recovery_error(progress, source))?;
+    let retained =
+        match read_or_promote_scratch_with_root_guard(cache_root, repository, validate_root) {
+            Ok(Some(retained)) => retained,
+            Ok(None) => {
+                match std::fs::symlink_metadata(cache_root) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        progress.complete = true;
+                        return Ok(progress);
+                    }
+                    Err(error) => return Err(recovery_error(progress, error)),
+                    Ok(_) => {}
+                }
+                if let Some(debt) = stage_transaction_debt(cache_root, repository)
+                    .map_err(|source| recovery_error(progress, source))?
+                {
+                    let root = open_cache_root(cache_root)
+                        .map_err(|source| recovery_error(progress, source))?;
+                    let proof = read_fresh_stage_proof(&root, repository)
+                        .map_err(|source| recovery_error(progress, source))?;
+                    if let Some(proof) = proof {
+                        validate_fresh_stage_state(&root, &proof)
+                            .map_err(|source| recovery_error(progress, source))?;
+                        let step = recovery_step_at(&root, &debt)
+                            .map_err(|source| recovery_error(progress, source))?;
+                        if step == RecoveryStep::ClearCompletedDebt {
+                            progress.found_debt = true;
+                            progress.complete = true;
+                            if !retain_fresh_proof_for_journal {
+                                clear_fresh_stage_proof_with_root_guard(
+                                    cache_root,
+                                    &proof,
+                                    validate_root,
+                                )
+                                .map_err(|source| recovery_error(progress, source))?;
+                            }
+                            return Ok(progress);
+                        }
+                    }
+                    ensure_fresh_stage_with_root_guard(cache_root, &debt, true, validate_root)
+                        .map_err(|source| recovery_error(progress, source))?;
+                    restore_from_journal_with_root_guard(cache_root, &debt, validate_root)
+                        .map_err(|source| recovery_error(progress, source))?
+                } else {
+                    if has_fixed_retired_store(cache_root, repository)
+                        .map_err(|source| recovery_error(progress, source))?
+                    {
+                        return Err(recovery_error(
+                            progress,
+                            invalid_record("fixed retired cache has no valid rotation witness"),
+                        ));
+                    }
                     progress.complete = true;
                     return Ok(progress);
                 }
-                Err(error) => return Err(recovery_error(progress, error)),
-                Ok(_) => {}
             }
-            if let Some(debt) = stage_transaction_debt(cache_root, repository)
-                .map_err(|source| recovery_error(progress, source))?
-            {
-                let root = open_cache_root(cache_root)
-                    .map_err(|source| recovery_error(progress, source))?;
-                let proof = read_fresh_stage_proof(&root, repository)
-                    .map_err(|source| recovery_error(progress, source))?;
-                if let Some(proof) = proof {
-                    validate_fresh_stage_state(&root, &proof)
-                        .map_err(|source| recovery_error(progress, source))?;
-                    let step = recovery_step_at(&root, &debt)
-                        .map_err(|source| recovery_error(progress, source))?;
-                    if step == RecoveryStep::ClearCompletedDebt {
-                        progress.found_debt = true;
-                        progress.complete = true;
-                        if !retain_fresh_proof_for_journal {
-                            clear_fresh_stage_proof(cache_root, &proof)
-                                .map_err(|source| recovery_error(progress, source))?;
-                        }
-                        return Ok(progress);
-                    }
-                }
-                ensure_fresh_stage(cache_root, &debt, true)
-                    .map_err(|source| recovery_error(progress, source))?;
-                restore_from_journal(cache_root, &debt)
-                    .map_err(|source| recovery_error(progress, source))?
-            } else {
-                if has_fixed_retired_store(cache_root, repository)
-                    .map_err(|source| recovery_error(progress, source))?
-                {
-                    return Err(recovery_error(
-                        progress,
-                        invalid_record("fixed retired cache has no valid rotation witness"),
-                    ));
-                }
-                progress.complete = true;
-                return Ok(progress);
-            }
-        }
-        Err(source) => return Err(recovery_error(progress, source)),
-    };
+            Err(source) => return Err(recovery_error(progress, source)),
+        };
     progress.found_debt = true;
-    let fresh_proof = ensure_fresh_stage(cache_root, &retained.debt, true)
-        .map_err(|source| recovery_error(progress, source))?;
+    let fresh_proof =
+        ensure_fresh_stage_with_root_guard(cache_root, &retained.debt, true, validate_root)
+            .map_err(|source| recovery_error(progress, source))?;
 
     // A valid transition takes at most four steps. The larger hard bound also
     // makes unexpected state oscillation fail closed without an unbounded
@@ -1590,11 +2206,17 @@ fn recover_inner(
         let step = recovery_step(cache_root, &retained.debt)
             .map_err(|source| recovery_error(progress, source))?;
         match step {
-            RecoveryStep::RenameOriginalStore => retire_original_store(cache_root, &retained)
-                .map_err(|source| recovery_error(progress, source))?,
+            RecoveryStep::RenameOriginalStore => {
+                retire_original_store_with_root_guard(cache_root, &retained, validate_root)
+                    .map_err(|source| recovery_error(progress, source))?
+            }
             RecoveryStep::RemoveRetiredStore => {
-                let witness = prepare_retired_store_removal(cache_root, &retained)
-                    .map_err(|source| recovery_error(progress, source))?;
+                let witness = prepare_retired_store_removal_with_root_guard(
+                    cache_root,
+                    &retained,
+                    validate_root,
+                )
+                .map_err(|source| recovery_error(progress, source))?;
                 let retired_path = cache_root.join(retained.debt.retired_component());
                 let pinned = crate::gc::PinnedTreeRemoval::open(&retired_path)
                     .map_err(|source| recovery_error(progress, source))?;
@@ -1617,10 +2239,20 @@ fn recover_inner(
                     .component()
                     .map_err(|source| recovery_error(progress, source))?
                     .to_owned();
-                match pinned.remove_verified_witness_with_progress(
+                validate_root().map_err(|source| recovery_error(progress, source))?;
+                let root_guard = std::cell::RefCell::new(&mut *validate_root);
+                match pinned.remove_verified_witness_with_progress_and_guard(
                     &witness_name,
                     Some(deadline),
-                    |bytes| witness.validate_bytes(bytes),
+                    |bytes| {
+                        let mut validate = root_guard.borrow_mut();
+                        validate()?;
+                        witness.validate_bytes(bytes)
+                    },
+                    || {
+                        let mut validate = root_guard.borrow_mut();
+                        validate()
+                    },
                 ) {
                     Ok((crate::gc::TreeRemoval::Complete, entries)) => {
                         progress.entries_reclaimed =
@@ -1640,16 +2272,20 @@ fn recover_inner(
                 }
             }
             RecoveryStep::CreateFreshStore => {
-                create_fresh_store(cache_root, &retained)
+                create_fresh_store_with_root_guard(cache_root, &retained, validate_root)
                     .map_err(|source| recovery_error(progress, source))?;
             }
             RecoveryStep::ClearCompletedDebt => {
-                clear_completed(cache_root, &retained)
+                clear_completed_with_root_guard(cache_root, &retained, validate_root)
                     .map_err(|source| recovery_error(progress, source))?;
                 progress.complete = true;
                 if !retain_fresh_proof_for_journal {
-                    clear_fresh_stage_proof(cache_root, &fresh_proof)
-                        .map_err(|source| recovery_error(progress, source))?;
+                    clear_fresh_stage_proof_with_root_guard(
+                        cache_root,
+                        &fresh_proof,
+                        validate_root,
+                    )
+                    .map_err(|source| recovery_error(progress, source))?;
                 }
                 return Ok(progress);
             }
@@ -1686,14 +2322,24 @@ fn deadline_error() -> io::Error {
 /// crash after the rename leaves the same witness inside the retired tree, so
 /// retry can verify the original inode before handing it to the common pinned
 /// deleter.
+#[cfg(test)]
 pub(crate) fn retire_original_store(
     cache_root: &Path,
     retained: &RetainedRotationDebt,
 ) -> io::Result<()> {
+    retire_original_store_with_root_guard(cache_root, retained, &mut || Ok(()))
+}
+
+fn retire_original_store_with_root_guard(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    validate_root()?;
     if recovery_step(cache_root, &retained.debt)? != RecoveryStep::RenameOriginalStore {
         return Err(invalid_record("original cache is not ready to be retired"));
     }
-    let witness = prepare_tree_witness(cache_root, retained)?;
+    let witness = prepare_tree_witness(cache_root, retained, validate_root)?;
     let root = open_cache_root(cache_root)?;
     verify_retained_sidecar(&root, retained)?;
     if recovery_step_at(&root, &retained.debt)? != RecoveryStep::RenameOriginalStore {
@@ -1736,6 +2382,7 @@ pub(crate) fn retire_original_store(
         ));
     }
     verify_tree_witness(&current_directory, retained, &witness)?;
+    validate_root()?;
     rename_noreplace(
         root.as_raw_fd(),
         &current_name,
@@ -1763,25 +2410,45 @@ pub(crate) fn retire_original_store(
 /// now-empty retired directory, this restores the witness only after a
 /// descriptor-relative emptiness check and exact root/filesystem validation.
 /// A missing witness in a nonempty retired tree is ambiguous and is refused.
+#[cfg(test)]
 pub(crate) fn prepare_retired_store_removal(
     cache_root: &Path,
     retained: &RetainedRotationDebt,
 ) -> io::Result<RetiredTreeWitness> {
+    prepare_retired_store_removal_with_root_guard(cache_root, retained, &mut || Ok(()))
+}
+
+fn prepare_retired_store_removal_with_root_guard(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<RetiredTreeWitness> {
+    validate_root()?;
     if recovery_step(cache_root, &retained.debt)? != RecoveryStep::RemoveRetiredStore {
         return Err(invalid_record(
             "no retired cache store is ready for removal",
         ));
     }
-    prepare_tree_witness(cache_root, retained)
+    prepare_tree_witness(cache_root, retained, validate_root)
 }
 
 /// Create the replacement cache directory only after the original retired
 /// store is absent. The caller must keep the repository-scoped lease through
 /// the creation and subsequent debt clearing.
+#[cfg(test)]
 pub(crate) fn create_fresh_store(
     cache_root: &Path,
     retained: &RetainedRotationDebt,
 ) -> io::Result<DirectoryIdentity> {
+    create_fresh_store_with_root_guard(cache_root, retained, &mut || Ok(()))
+}
+
+fn create_fresh_store_with_root_guard(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<DirectoryIdentity> {
+    validate_root()?;
     retained.debt.validate()?;
     let root = open_cache_root(cache_root)?;
     verify_retained_sidecar(&root, retained)?;
@@ -1814,6 +2481,7 @@ pub(crate) fn create_fresh_store(
         ));
     }
     validate_fresh_stage_state(&root, &proof)?;
+    validate_root()?;
     rename_noreplace(
         root.as_raw_fd(),
         &stage_name,
@@ -1893,7 +2561,9 @@ fn recovery_step_at(root: &File, debt: &RotationDebt) -> io::Result<RecoveryStep
 fn prepare_tree_witness(
     cache_root: &Path,
     retained: &RetainedRotationDebt,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<RetiredTreeWitness> {
+    validate_root()?;
     retained.debt.validate()?;
     let root = open_cache_root(cache_root)?;
     verify_retained_sidecar(&root, retained)?;
@@ -1943,6 +2613,7 @@ fn prepare_tree_witness(
                         &store_name,
                         &directory_identity,
                     )?;
+                    validate_root()?;
                     remove_scratch(directory.as_raw_fd(), &scratch_name, &scratch)?;
                     directory.sync_all()?;
                     None
@@ -1967,6 +2638,7 @@ fn prepare_tree_witness(
                 &witness_name,
                 &bytes,
                 &scratch,
+                validate_root,
             )?;
         } else {
             if !is_original_at_current && !directory_is_empty(&directory)? {
@@ -1986,6 +2658,7 @@ fn prepare_tree_witness(
                 &scratch_name,
                 &witness_name,
                 &bytes,
+                validate_root,
             )?;
         }
     }
@@ -2023,6 +2696,7 @@ fn publish_tree_witness(
     scratch_name: &CStr,
     witness_name: &CStr,
     bytes: &[u8],
+    validate_root: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let TreeWitnessTarget {
         root,
@@ -2033,7 +2707,9 @@ fn publish_tree_witness(
         directory_identity,
     } = target;
     verify_named_rotation_tree(root, retained, step, store_name, directory_identity)?;
+    validate_root()?;
     let mut scratch = create_regular_exclusive(directory.as_raw_fd(), scratch_name)?;
+    validate_root()?;
     scratch.write_all(bytes)?;
     scratch.sync_all()?;
     let metadata = scratch.metadata()?;
@@ -2056,6 +2732,7 @@ fn publish_tree_witness(
     }
     ensure_component_identity(directory.as_raw_fd(), scratch_name, identity)?;
     directory.sync_all()?;
+    validate_root()?;
     rename_noreplace(
         directory.as_raw_fd(),
         scratch_name,
@@ -2072,6 +2749,7 @@ fn promote_tree_witness(
     witness_name: &CStr,
     bytes: &[u8],
     expected: &ReadComponent,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let TreeWitnessTarget {
         root,
@@ -2089,6 +2767,7 @@ fn promote_tree_witness(
     }
     ensure_component_identity(directory.as_raw_fd(), scratch_name, scratch.identity)?;
     directory.sync_all()?;
+    validate_root()?;
     rename_noreplace(
         directory.as_raw_fd(),
         scratch_name,
@@ -2199,9 +2878,10 @@ pub(crate) fn read(
 /// scratch record. A malformed scratch may only be discarded by `publish`
 /// after it proves the original store is still at its exact source inode and
 /// no retired or committed state exists.
-fn read_or_promote_scratch(
+fn read_or_promote_scratch_with_root_guard(
     cache_root: &Path,
     repository: &str,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<Option<RetainedRotationDebt>> {
     match std::fs::symlink_metadata(cache_root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2234,7 +2914,8 @@ fn read_or_promote_scratch(
                     "scratch rotation witness does not match its cache root and repository",
                 ));
             }
-            publish(cache_root, debt).map(Some)
+            validate_root()?;
+            publish_with_root_guard(cache_root, debt, validate_root).map(Some)
         }
         Err(_) => {
             let store_name = component(repository)?;
@@ -2246,7 +2927,8 @@ fn read_or_promote_scratch(
                 root_identity,
                 original_store,
             )?;
-            publish(cache_root, proposed).map(Some)
+            validate_root()?;
+            publish_with_root_guard(cache_root, proposed, validate_root).map(Some)
         }
     }
 }
@@ -2328,11 +3010,21 @@ fn directory_names(
 ///
 /// The caller must hold the same repository-scoped preparation-cache lease
 /// across source validation, publication, and rotation.
+#[cfg(test)]
 pub(crate) fn publish(
     cache_root: &Path,
     proposed: RotationDebt,
 ) -> io::Result<RetainedRotationDebt> {
+    publish_with_root_guard(cache_root, proposed, &mut || Ok(()))
+}
+
+pub(crate) fn publish_with_root_guard(
+    cache_root: &Path,
+    proposed: RotationDebt,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<RetainedRotationDebt> {
     proposed.validate()?;
+    validate_root()?;
     let root = open_cache_root(cache_root)?;
     let root_identity = identity_for_directory(&root)?;
     if !root_identity.same_directory(&proposed.cache_root) {
@@ -2393,7 +3085,7 @@ pub(crate) fn publish(
                     &retired_name,
                     &committed_name,
                 )?;
-                ensure_fresh_stage(cache_root, &proposed, false)?;
+                ensure_fresh_stage_with_root_guard(cache_root, &proposed, false, validate_root)?;
                 ensure_original_source_unchanged(
                     root.as_raw_fd(),
                     &proposed,
@@ -2402,6 +3094,7 @@ pub(crate) fn publish(
                     &committed_name,
                 )?;
                 ensure_component_identity(root.as_raw_fd(), &scratch_name, scratch.identity)?;
+                validate_root()?;
                 rename_noreplace(
                     root.as_raw_fd(),
                     &scratch_name,
@@ -2427,6 +3120,7 @@ pub(crate) fn publish(
                     &retired_name,
                     &committed_name,
                 )?;
+                validate_root()?;
                 remove_scratch(root.as_raw_fd(), &scratch_name, &scratch)?;
                 root.sync_all()?;
             }
@@ -2440,7 +3134,7 @@ pub(crate) fn publish(
         &retired_name,
         &committed_name,
     )?;
-    ensure_fresh_stage(cache_root, &proposed, false)?;
+    ensure_fresh_stage_with_root_guard(cache_root, &proposed, false, validate_root)?;
     ensure_original_source_unchanged(
         root.as_raw_fd(),
         &proposed,
@@ -2452,7 +3146,9 @@ pub(crate) fn publish(
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(invalid_record("rotation debt exceeds its size limit"));
     }
+    validate_root()?;
     let mut scratch = create_regular_exclusive(root.as_raw_fd(), &scratch_name)?;
+    validate_root()?;
     scratch.write_all(&bytes)?;
     scratch.sync_all()?;
     let metadata = scratch.metadata()?;
@@ -2478,6 +3174,7 @@ pub(crate) fn publish(
         &committed_name,
     )?;
     ensure_component_identity(root.as_raw_fd(), &scratch_name, identity)?;
+    validate_root()?;
     rename_noreplace(
         root.as_raw_fd(),
         &scratch_name,
@@ -2497,11 +3194,13 @@ pub(crate) fn publish(
 /// journal row. The external row is the durable publication authority when a
 /// crash occurred before the in-cache witness was published or after it was
 /// cleared. The caller holds the repository's exclusive preparation lease.
-pub(crate) fn restore_from_journal(
+fn restore_from_journal_with_root_guard(
     cache_root: &Path,
     debt: &RotationDebt,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
 ) -> io::Result<RetainedRotationDebt> {
     debt.validate()?;
+    validate_root()?;
     let root = open_cache_root(cache_root)?;
     let root_identity = identity_for_directory(&root)?;
     if !root_identity.same_directory(&debt.cache_root) {
@@ -2550,6 +3249,7 @@ pub(crate) fn restore_from_journal(
                     "journal recovery state changed before scratch promotion",
                 ));
             }
+            validate_root()?;
             rename_noreplace(
                 root.as_raw_fd(),
                 &scratch_name,
@@ -2572,6 +3272,7 @@ pub(crate) fn restore_from_journal(
                 "journal recovery state changed before scratch cleanup",
             ));
         }
+        validate_root()?;
         remove_scratch(root.as_raw_fd(), &scratch_name, &scratch)?;
         root.sync_all()?;
     }
@@ -2585,7 +3286,9 @@ pub(crate) fn restore_from_journal(
             "journal recovery state changed before witness creation",
         ));
     }
+    validate_root()?;
     let mut scratch = create_regular_exclusive(root.as_raw_fd(), &scratch_name)?;
+    validate_root()?;
     scratch.write_all(&bytes)?;
     scratch.sync_all()?;
     let metadata = scratch.metadata()?;
@@ -2609,6 +3312,7 @@ pub(crate) fn restore_from_journal(
         ));
     }
     ensure_component_identity(root.as_raw_fd(), &scratch_name, identity)?;
+    validate_root()?;
     rename_noreplace(
         root.as_raw_fd(),
         &scratch_name,
@@ -2636,18 +3340,38 @@ pub(crate) fn restore_from_journal(
 /// tombstone step: after the old tree is gone, a crash after unlink but before
 /// directory sync can at worst leave an unnecessary witness, never hide old
 /// cache data or strand unbounded removal tombstones.
+#[cfg(test)]
 pub(crate) fn clear_completed(
     cache_root: &Path,
     retained: &RetainedRotationDebt,
 ) -> io::Result<()> {
-    clear_completed_with_sync(cache_root, retained, File::sync_all)
+    clear_completed_with_root_guard(cache_root, retained, &mut || Ok(()))
 }
 
+fn clear_completed_with_root_guard(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    clear_completed_with_sync_and_root_guard(cache_root, retained, File::sync_all, validate_root)
+}
+
+#[cfg(test)]
 fn clear_completed_with_sync(
     cache_root: &Path,
     retained: &RetainedRotationDebt,
     sync_root: impl FnOnce(&File) -> io::Result<()>,
 ) -> io::Result<()> {
+    clear_completed_with_sync_and_root_guard(cache_root, retained, sync_root, &mut || Ok(()))
+}
+
+fn clear_completed_with_sync_and_root_guard(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+    sync_root: impl FnOnce(&File) -> io::Result<()>,
+    validate_root: &mut impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    validate_root()?;
     retained.debt.validate()?;
     let root = open_cache_root(cache_root)?;
     let root_identity = identity_for_directory(&root)?;
@@ -2682,6 +3406,7 @@ fn clear_completed_with_sync(
         return Err(invalid_record("rotation witness changed before removal"));
     }
     ensure_component_identity(root.as_raw_fd(), &name, retained.marker)?;
+    validate_root()?;
     unlink_component(root.as_raw_fd(), &name)?;
     sync_root(&root)
 }
@@ -2791,6 +3516,7 @@ fn create_regular_exclusive(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
     // SAFETY: fd is the fresh descriptor returned by the successful openat
     // above; ownership is transferred to File exactly once.
     let file = unsafe { File::from_raw_fd(fd) };
+    normalize_created_file_mode(&file, 0o600 as libc::mode_t)?;
     let metadata = file.metadata()?;
     if !is_private_owned_file(&metadata) {
         return Err(invalid_record(
@@ -2798,6 +3524,69 @@ fn create_regular_exclusive(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+fn normalize_created_file_mode(file: &File, mode: libc::mode_t) -> io::Result<()> {
+    // SAFETY: file is a live descriptor for an entry created by this call.
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let metadata = file.metadata()?;
+    if !is_private_owned_file(&metadata) || u64::from(metadata.mode() & 0o777) != u64::from(mode) {
+        return Err(invalid_record(
+            "new private storage file did not retain its required owner mode",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_created_directory_mode(
+    parent_fd: RawFd,
+    name: &CStr,
+    mode: libc::mode_t,
+) -> io::Result<()> {
+    let before = stat_component(parent_fd, name)?;
+    if before.st_mode & libc::S_IFMT != libc::S_IFDIR || before.st_uid != current_effective_uid() {
+        return Err(invalid_record(
+            "new preparation-cache namespace is not an owner-controlled directory",
+        ));
+    }
+    // SAFETY: parent_fd is pinned and name is a single component. The
+    // no-follow flag prevents changing a replacement symlink target.
+    if unsafe { libc::fchmodat(parent_fd, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let after = stat_component(parent_fd, name)?;
+    if after.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || after.st_uid != current_effective_uid()
+        || after.st_dev != before.st_dev
+        || after.st_ino != before.st_ino
+        || after.st_mode & 0o777 != mode
+    {
+        return Err(invalid_record(
+            "new preparation-cache namespace identity or owner mode changed",
+        ));
+    }
+    Ok(())
+}
+
+fn stat_component(parent_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent_fd is live and name is a single NUL-terminated
+    // component; stat points to writable storage.
+    if unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat returned success and initialized the result.
+    Ok(unsafe { stat.assume_init() })
 }
 
 fn open_cache_root(path: &Path) -> io::Result<File> {
@@ -2854,6 +3643,79 @@ fn directory_is_empty(directory: &File) -> io::Result<bool> {
 /// single known component. The directory stream is opened relative to the
 /// retained descriptor so path replacement cannot redirect this check.
 fn directory_contains_only(directory: &File, allowed: Option<&CStr>) -> io::Result<bool> {
+    let allowed = allowed.map(CStr::to_bytes).into_iter().collect::<Vec<_>>();
+    directory_contains_only_names(directory, &allowed)
+}
+
+fn preparation_root_contains_only_names(
+    directory: &File,
+    allowed: &[&[u8]],
+    deadline: Instant,
+) -> io::Result<bool> {
+    if allowed.len() > PREPARATION_ROOT_MAX_ENTRIES {
+        return Err(invalid_record(
+            "preparation-cache root entry allowlist exceeds its bound",
+        ));
+    }
+    let dot = CString::new(".").expect("constant is a valid C string");
+    // SAFETY: directory is a live directory fd and dot is one component.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), dot.as_ptr(), DIRECTORY_FLAGS) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fdopendir takes ownership of the successfully opened fd.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed and did not consume fd.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    let mut found = Vec::<Vec<u8>>::with_capacity(allowed.len());
+    loop {
+        if Instant::now() >= deadline {
+            // SAFETY: stream is still live and is closed exactly once.
+            unsafe { libc::closedir(stream) };
+            return Err(deadline_error());
+        }
+        // SAFETY: errno is the current thread's writable error slot.
+        unsafe { *directory_errno_location() = 0 };
+        // SAFETY: stream is live and readdir returns storage owned by stream.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            // SAFETY: errno is the current thread's readable error slot.
+            let errno = unsafe { *directory_errno_location() };
+            // SAFETY: stream is live and is closed exactly once.
+            let close_result = unsafe { libc::closedir(stream) };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            if close_result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(true);
+        }
+        // SAFETY: d_name is NUL-terminated storage owned by the live stream.
+        let entry_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if entry_name == b"." || entry_name == b".." {
+            continue;
+        }
+        if found.len() >= allowed.len()
+            || !allowed.contains(&entry_name)
+            || found.iter().any(|known| known.as_slice() == entry_name)
+        {
+            // SAFETY: stream is live and is closed exactly once.
+            let close_result = unsafe { libc::closedir(stream) };
+            if close_result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(false);
+        }
+        found.push(entry_name.to_vec());
+    }
+}
+
+fn directory_contains_only_names(directory: &File, allowed: &[&[u8]]) -> io::Result<bool> {
     let dot = CString::new(".").expect("constant is a valid C string");
     // SAFETY: directory is a live directory descriptor and dot is a single
     // NUL-terminated component. openat returns an independent descriptor.
@@ -2890,14 +3752,11 @@ fn directory_contains_only(directory: &File, allowed: Option<&CStr>) -> io::Resu
         // SAFETY: entry points into stream-owned readdir storage and d_name is
         // NUL-terminated; the bytes are copied/inspected before the next call.
         let entry_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if entry_name != b"." && entry_name != b".." {
-            let expected = allowed.map(CStr::to_bytes);
-            if expected != Some(entry_name) {
-                // SAFETY: stream is the live DIR* returned by fdopendir and is
-                // closed exactly once here.
-                unsafe { libc::closedir(stream) };
-                return Ok(false);
-            }
+        if entry_name != b"." && entry_name != b".." && !allowed.contains(&entry_name) {
+            // SAFETY: stream is the live DIR* returned by fdopendir and is
+            // closed exactly once here.
+            unsafe { libc::closedir(stream) };
+            return Ok(false);
         }
     }
 }
@@ -3163,10 +4022,32 @@ mod tests {
         recovery_step,
     };
     use std::fs;
+    use std::path::Path;
     use std::time::Instant;
 
     const REPOSITORY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TRANSACTION: &str = "0123456789abcdef0123456789abcdef";
+
+    fn initialize_test_cache_root(
+        path: &Path,
+        expected_root_identity: &[u8],
+        pinned_directory: &std::fs::File,
+        journal_has_rows_under_root: impl Fn() -> std::io::Result<bool>,
+    ) -> std::io::Result<super::InitializedPreparationCacheRoot> {
+        let coordinator_db_path = path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing test parent")
+            })?
+            .join("host-resources.db");
+        super::initialize_preparation_cache_root(
+            path,
+            expected_root_identity,
+            pinned_directory,
+            &coordinator_db_path,
+            journal_has_rows_under_root,
+        )
+    }
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf, RotationDebt) {
         let temp = tempfile::tempdir().unwrap();
@@ -4388,5 +5269,174 @@ mod tests {
         );
         assert!(read(&cache_root, REPOSITORY).is_err());
         assert_eq!(debt.repository, REPOSITORY);
+    }
+
+    #[test]
+    fn cache_root_capture_is_read_only_and_writable_init_binds_a_nonce_child() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("separate-cache");
+        fs::create_dir(&root).unwrap();
+        let captured = super::capture_preparation_cache_root(&root).unwrap();
+        assert!(matches!(
+            captured.state,
+            super::PreparationCacheRootCaptureState::Uninitialized
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        let root_identity = captured.identity.clone();
+
+        let initialized =
+            initialize_test_cache_root(&root, &root_identity, &captured.directory, || Ok(false))
+                .unwrap();
+        assert_eq!(initialized.root_identity, root_identity);
+        assert_eq!(initialized.nonce.len(), 64);
+        let child = root.join(format!(".aethyme-preparation-cache-{}", initialized.nonce));
+        assert!(child.is_dir());
+        assert!(root.join(".aethyme-preparation-cache-root-v2").is_file());
+        assert!(root.join(".aethyme-preparation-cache-root.lock").is_file());
+
+        let reopened = super::capture_preparation_cache_root(&root).unwrap();
+        match reopened.state {
+            super::PreparationCacheRootCaptureState::Marked {
+                coordinator_db_path: _,
+                nonce,
+                cache_root_identity,
+            } => {
+                assert_eq!(nonce, initialized.nonce);
+                assert_eq!(
+                    cache_root_identity,
+                    Some(initialized.cache_root_identity.clone())
+                );
+            }
+            super::PreparationCacheRootCaptureState::Uninitialized => {
+                panic!("writable initialization must publish a marker")
+            }
+        }
+        let retried =
+            initialize_test_cache_root(&root, &root_identity, &captured.directory, || {
+                panic!("fully initialized root must not probe debt")
+            })
+            .unwrap();
+        assert_eq!(retried, initialized);
+    }
+
+    #[test]
+    fn cache_root_initialization_refuses_unowned_entries_and_prior_journal_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let unowned_root = temporary.path().join("unowned-cache");
+        fs::create_dir(&unowned_root).unwrap();
+        let capture = super::capture_preparation_cache_root(&unowned_root).unwrap();
+        let identity = capture.identity.clone();
+        let payload = unowned_root.join("keep-me");
+        fs::write(&payload, b"unowned bytes").unwrap();
+        assert!(
+            initialize_test_cache_root(&unowned_root, &identity, &capture.directory, || Ok(false),)
+                .is_err()
+        );
+        assert_eq!(fs::read(&payload).unwrap(), b"unowned bytes");
+        assert!(
+            !unowned_root
+                .join(".aethyme-preparation-cache-root-v2")
+                .exists()
+        );
+        assert_eq!(fs::read_dir(&unowned_root).unwrap().count(), 2);
+
+        let journal_root = temporary.path().join("journal-cache");
+        fs::create_dir(&journal_root).unwrap();
+        let journal_capture = super::capture_preparation_cache_root(&journal_root).unwrap();
+        let journal_identity = journal_capture.identity.clone();
+        assert!(
+            initialize_test_cache_root(
+                &journal_root,
+                &journal_identity,
+                &journal_capture.directory,
+                || Ok(true),
+            )
+            .is_err()
+        );
+        assert!(
+            !journal_root
+                .join(".aethyme-preparation-cache-root-v2")
+                .exists()
+        );
+        assert_eq!(fs::read_dir(&journal_root).unwrap().count(), 1);
+        assert!(matches!(
+            super::capture_preparation_cache_root(&journal_root)
+                .unwrap()
+                .state,
+            super::PreparationCacheRootCaptureState::Uninitialized
+        ));
+    }
+
+    #[test]
+    fn missing_nonce_child_is_completed_only_after_journal_preflight() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("cache-root");
+        fs::create_dir(&root).unwrap();
+        let captured = super::capture_preparation_cache_root(&root).unwrap();
+        let identity = captured.identity.clone();
+        let initialized =
+            initialize_test_cache_root(&root, &identity, &captured.directory, || Ok(false))
+                .unwrap();
+        let child = root.join(format!(".aethyme-preparation-cache-{}", initialized.nonce));
+        fs::remove_dir(&child).unwrap();
+        let marker_before = fs::read(root.join(".aethyme-preparation-cache-root-v2")).unwrap();
+        match super::capture_preparation_cache_root(&root).unwrap().state {
+            super::PreparationCacheRootCaptureState::Marked {
+                coordinator_db_path: _,
+                nonce,
+                cache_root_identity,
+            } => {
+                assert_eq!(nonce, initialized.nonce);
+                assert_eq!(cache_root_identity, None);
+            }
+            super::PreparationCacheRootCaptureState::Uninitialized => {
+                panic!("the committed marker remains authoritative")
+            }
+        }
+        assert!(
+            initialize_test_cache_root(&root, &identity, &captured.directory, || Ok(true),)
+                .is_err()
+        );
+        assert!(!child.exists());
+        assert_eq!(
+            fs::read(root.join(".aethyme-preparation-cache-root-v2")).unwrap(),
+            marker_before
+        );
+        let completed =
+            initialize_test_cache_root(&root, &identity, &captured.directory, || Ok(false))
+                .unwrap();
+        assert_eq!(completed.nonce, initialized.nonce);
+        assert!(child.is_dir());
+    }
+
+    #[test]
+    fn cache_root_capture_rejects_partial_marker_and_root_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let malformed_root = temporary.path().join("malformed-cache");
+        fs::create_dir(&malformed_root).unwrap();
+        fs::write(
+            malformed_root.join(".aethyme-preparation-cache-root-v2"),
+            b"{partial",
+        )
+        .unwrap();
+        assert!(super::capture_preparation_cache_root(&malformed_root).is_err());
+        assert_eq!(
+            fs::read(malformed_root.join(".aethyme-preparation-cache-root-v2")).unwrap(),
+            b"{partial"
+        );
+
+        let root = temporary.path().join("replaceable-cache");
+        fs::create_dir(&root).unwrap();
+        let captured = super::capture_preparation_cache_root(&root).unwrap();
+        let identity = captured.identity.clone();
+        let old_root = temporary.path().join("old-cache");
+        fs::rename(&root, &old_root).unwrap();
+        fs::create_dir(&root).unwrap();
+        assert!(
+            initialize_test_cache_root(&root, &identity, &captured.directory, || Ok(false),)
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&old_root).unwrap().count(), 0);
     }
 }

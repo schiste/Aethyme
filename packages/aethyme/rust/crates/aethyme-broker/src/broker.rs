@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::{
     fs::File,
     io::{Read, Write},
@@ -1044,6 +1045,7 @@ pub struct WorktreeRootPlan {
 pub struct BrokerOpenOptions {
     pub(crate) host_state_dir: Option<PathBuf>,
     pub(crate) host_cache_dir: Option<PathBuf>,
+    pub(crate) preparation_cache_root: Option<PathBuf>,
     pub(crate) host_operation_db_path: Option<PathBuf>,
     pub(crate) worktree_root: Option<PathBuf>,
     pub(crate) collaboration_state_dir: Option<PathBuf>,
@@ -1060,6 +1062,19 @@ impl BrokerOpenOptions {
     /// Use a private host-cache directory for managed gate caches.
     pub fn with_host_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.host_cache_dir = Some(path.into());
+        self
+    }
+
+    /// Use a pre-existing, empty preparation-cache root separate from host state.
+    ///
+    /// The path must be absolute and identify a real directory owned by this
+    /// user. A writable open initializes a durable marker and a nonce-scoped
+    /// child directory; capture and read-only planning do not create them. The
+    /// broker refuses cache writes or reclamation if the root is replaced or
+    /// its marker changes. Existing caches are not moved or deleted by selecting
+    /// this root.
+    pub fn with_preparation_cache_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.preparation_cache_root = Some(path.into());
         self
     }
 
@@ -1094,12 +1109,52 @@ pub(crate) struct BrokerStorageContext {
     pub(crate) host_state_dir: Option<PathBuf>,
     pub(crate) host_resource_db_path: Option<PathBuf>,
     pub(crate) host_cache_dir: Option<PathBuf>,
+    pub(crate) preparation_cache_root_override: Option<PathBuf>,
+    pub(crate) preparation_cache_root_identity: Option<Vec<u8>>,
+    pub(crate) preparation_cache_root_state: Option<PreparationCacheRootState>,
+    pub(crate) preparation_cache_root_handle: Option<Arc<File>>,
     pub(crate) host_operation_db_path: Option<PathBuf>,
     pub(crate) worktree_root_override: Option<PathBuf>,
     pub(crate) worktree_root_environment_override: Option<PathBuf>,
     pub(crate) collaboration_state_dir: Option<PathBuf>,
     pub(crate) host_state_dir_is_explicit: bool,
     pub(crate) capture_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PreparationCacheRootState {
+    Uninitialized,
+    Marked {
+        coordinator_db_path: PathBuf,
+        nonce: String,
+        cache_root_identity: Option<Vec<u8>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparationCacheRootGuard {
+    pub(crate) root_path: PathBuf,
+    pub(crate) root_identity: Vec<u8>,
+    pub(crate) state: PreparationCacheRootState,
+    pub(crate) captured_resource_db_path: PathBuf,
+    pub(crate) root_handle: Arc<File>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparationCacheRootBinding {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: Option<Vec<u8>>,
+    pub(crate) instance_nonce: Option<String>,
+    pub(crate) root_guard: Option<PreparationCacheRootGuard>,
+}
+
+impl PreparationCacheRootBinding {
+    pub(crate) fn validate(&self) -> Result<(), crate::BrokerOpError> {
+        match &self.root_guard {
+            Some(guard) => crate::broker::lifecycle::validate_preparation_cache_root_guard(guard),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last Updated: 2026-10-07
+Last Updated: 2026-10-17
 
 The suite is Rust. There is no database, no services, and no Python —
 `src/` was deleted on 2026-08-01 (python-retirement Phase 6) and the dev
@@ -9,25 +9,50 @@ whole test story.
 
 ## Running It
 
-Run the suite the way CI does:
+The default runs tests affected by changed crates with bounded local
+resources:
 
 ```bash
-packages/aethyme/scripts/test-like-ci.sh          # what your change affects
-packages/aethyme/scripts/test-like-ci.sh --full   # the whole workspace
+packages/aethyme/scripts/test-like-ci.sh
 ```
 
-The script is CI's own test step, and `ci_validation` keeps the two from
-drifting. It:
+It uses one Cargo build job, two nextest test workers, no retries, and stops
+after a failure. Passing test output stays quiet; failed test output appears
+in the final report, and compiler errors remain visible. These are defaults:
+set `CARGO_BUILD_JOBS` or pass nextest options after `--` to explicitly raise
+the resource limits.
 
-- runs `cargo nextest run --profile ci`: parallel, one retry, and FLAKY reported;
-- reproduces a runner: no agent process above the tests, no inherited broker
-  placement, and no git identity;
-- prints the ten slowest tests and the wall time.
+A repository-wide input such as `Cargo.lock`, a workflow, or nextest config
+requires workspace coverage. The default command runs that coverage with the
+same bounded local profile. It does not silently switch to CI concurrency.
+
+For a fast single-crate unit pass, select a package and its library target:
+
+```bash
+packages/aethyme/scripts/test-like-ci.sh --package aethyme-broker --lib
+```
+
+This skips the script's workspace-binary prebuild. A test helper may still
+build a binary it needs on demand, using the same Cargo job limit.
+
+Use `--full` to explicitly request the CI nextest profile and full workspace
+coverage:
+
+```bash
+packages/aethyme/scripts/test-like-ci.sh --full
+```
+
+That profile keeps CI's retry and failure-reporting behavior. CI also runs
+examples and doctests in separate steps. If a focused local run fails, choose
+a named test or broaden coverage deliberately; the script does not retry or
+launch a verbose second run automatically.
+
+The `ci_validation` contract keeps CI workflows on this script. `-j 1` is a
+nextest test-worker setting; Cargo compile parallelism is separately controlled
+with `--build-jobs` and `CARGO_BUILD_JOBS`.
 
 No venv, no `pip install`, no `pyproject.toml`.
 
-**Never run the suite serially.** `--test-threads=1`, `-j 1` and
-`--no-capture` are refused. If one test fails, re-run that test by name.
 
 ## Where The Time Goes
 

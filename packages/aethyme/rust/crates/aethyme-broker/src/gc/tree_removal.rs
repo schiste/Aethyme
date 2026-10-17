@@ -138,17 +138,40 @@ impl PinnedTreeRemoval {
     /// reports zero progress because validation precedes every mutation.
     pub(crate) fn remove_verified_witness_with_progress<F>(
         self,
-        _witness_name: &str,
-        _deadline: Option<Instant>,
-        _validate: F,
+        witness_name: &str,
+        deadline: Option<Instant>,
+        validate: F,
     ) -> Result<(TreeRemoval, usize), TreeRemovalError>
     where
         F: FnOnce(&[u8]) -> io::Result<()>,
     {
+        self.remove_verified_witness_with_progress_and_guard(
+            witness_name,
+            deadline,
+            validate,
+            || Ok(()),
+        )
+    }
+
+    pub(crate) fn remove_verified_witness_with_progress_and_guard<F, M>(
+        self,
+        _witness_name: &str,
+        _deadline: Option<Instant>,
+        _validate: F,
+        mut _before_mutation: M,
+    ) -> Result<(TreeRemoval, usize), TreeRemovalError>
+    where
+        F: FnOnce(&[u8]) -> io::Result<()>,
+        M: FnMut() -> io::Result<()>,
+    {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            self.0
-                .remove_verified_witness_with_progress(_witness_name, _deadline, _validate)
+            self.0.remove_verified_witness_with_progress_and_guard(
+                _witness_name,
+                _deadline,
+                _validate,
+                &mut _before_mutation,
+            )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -178,14 +201,30 @@ pub(crate) fn remove_condemned_tree(
 /// fails. A missing final leaf is complete with zero progress; an unavailable
 /// parent remains an error.
 pub(crate) fn remove_condemned_tree_with_progress(
+    dir: &Path,
+    keep_until_last: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<(TreeRemoval, usize), TreeRemovalError> {
+    remove_condemned_tree_with_progress_and_guard(dir, keep_until_last, deadline, || Ok(()))
+}
+
+pub(crate) fn remove_condemned_tree_with_progress_and_guard<M>(
     _dir: &Path,
     _keep_until_last: Option<&str>,
     _deadline: Option<Instant>,
-) -> Result<(TreeRemoval, usize), TreeRemovalError> {
+    mut _before_mutation: M,
+) -> Result<(TreeRemoval, usize), TreeRemovalError>
+where
+    M: FnMut() -> io::Result<()>,
+{
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         match unix::PinnedTreeRemoval::open_optional(_dir) {
-            Ok(Some(tree)) => tree.remove_with_progress(_keep_until_last, _deadline),
+            Ok(Some(tree)) => tree.remove_with_progress_and_guard(
+                _keep_until_last,
+                _deadline,
+                &mut _before_mutation,
+            ),
             Ok(None) => Ok((TreeRemoval::Complete, 0)),
             Err(source) => Err(TreeRemovalError {
                 source,
@@ -321,34 +360,42 @@ mod unix {
             )
         }
 
-        pub(super) fn remove_with_progress(
+        pub(super) fn remove_with_progress_and_guard<M>(
             self,
             keep_until_last: Option<&str>,
             deadline: Option<Instant>,
-        ) -> Result<(TreeRemoval, usize), super::TreeRemovalError> {
+            before_mutation: &mut M,
+        ) -> Result<(TreeRemoval, usize), super::TreeRemovalError>
+        where
+            M: FnMut() -> io::Result<()>,
+        {
             self.remove_with_hooks_and_progress(
                 keep_until_last,
                 deadline,
                 &mut || Ok(()),
                 &mut || Ok(()),
+                before_mutation,
                 |_| Ok(()),
             )
         }
 
-        pub(super) fn remove_verified_witness_with_progress<F>(
+        pub(super) fn remove_verified_witness_with_progress_and_guard<F, M>(
             self,
             witness_name: &str,
             deadline: Option<Instant>,
             validate: F,
+            before_mutation: &mut M,
         ) -> Result<(TreeRemoval, usize), super::TreeRemovalError>
         where
             F: FnOnce(&[u8]) -> io::Result<()>,
+            M: FnMut() -> io::Result<()>,
         {
             self.remove_with_hooks_and_progress(
                 Some(witness_name),
                 deadline,
                 &mut || Ok(()),
                 &mut || Ok(()),
+                before_mutation,
                 validate,
             )
         }
@@ -370,23 +417,26 @@ mod unix {
                 deadline,
                 before_directory_open,
                 after_witness_unlink,
+                &mut || Ok(()),
                 |_| Ok(()),
             )
             .map(|(outcome, _entries_reclaimed)| outcome)
             .map_err(|error| error.source)
         }
 
-        fn remove_with_hooks_and_progress<F, G, V>(
+        fn remove_with_hooks_and_progress<F, G, M, V>(
             self,
             keep_until_last: Option<&str>,
             deadline: Option<Instant>,
             before_directory_open: &mut F,
             after_witness_unlink: &mut G,
+            before_mutation: &mut M,
             validate_witness: V,
         ) -> Result<(TreeRemoval, usize), super::TreeRemovalError>
         where
             F: FnMut() -> io::Result<()>,
             G: FnMut() -> io::Result<()>,
+            M: FnMut() -> io::Result<()>,
             V: FnOnce(&[u8]) -> io::Result<()>,
         {
             let mut entries_reclaimed = 0;
@@ -423,6 +473,7 @@ mod unix {
                         keep.as_ref(),
                         deadline,
                         before_directory_open,
+                        before_mutation,
                         &mut entries_reclaimed,
                     ) {
                         Ok(TreeRemoval::Complete) => {}
@@ -434,6 +485,7 @@ mod unix {
                                     witness_backup
                                         .as_ref()
                                         .expect("removed witness has a backup"),
+                                    before_mutation,
                                 )?;
                             }
                             return Ok(TreeRemoval::Interrupted);
@@ -445,6 +497,7 @@ mod unix {
                                 self.root.as_raw_fd(),
                                 keep.as_ref(),
                                 witness_backup.as_ref(),
+                                before_mutation,
                             ));
                         }
                     }
@@ -453,12 +506,11 @@ mod unix {
                         (keep.as_ref(), witness_identity, witness_backup.as_ref())
                         && !witness_removed
                     {
+                        before_mutation()?;
                         self.ensure_root_binding()?;
                         ensure_named_regular_file(self.root.as_raw_fd(), witness, identity)?;
                         match unlink_at(self.root.as_raw_fd(), witness, false) {
-                            Ok(()) => {
-                                entries_reclaimed = entries_reclaimed.saturating_add(1);
-                            }
+                            Ok(()) => entries_reclaimed = entries_reclaimed.saturating_add(1),
                             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                                 witness_removed = true;
                                 return Err(restore_after_failure(
@@ -467,6 +519,7 @@ mod unix {
                                     self.root.as_raw_fd(),
                                     keep.as_ref(),
                                     Some(backup),
+                                    before_mutation,
                                 ));
                             }
                             Err(error) => return Err(error),
@@ -479,12 +532,13 @@ mod unix {
                                 self.root.as_raw_fd(),
                                 keep.as_ref(),
                                 Some(backup),
+                                before_mutation,
                             ));
                         }
                     }
 
-                    let final_unlink = self
-                        .ensure_root_binding()
+                    let final_unlink = before_mutation()
+                        .and_then(|()| self.ensure_root_binding())
                         .and_then(|()| unlink_at(self.parent.as_raw_fd(), &self.name, true));
                     match final_unlink {
                         Ok(()) => {
@@ -502,6 +556,7 @@ mod unix {
                                     witness_backup
                                         .as_ref()
                                         .expect("removed witness has a backup"),
+                                    before_mutation,
                                 )?);
                                 witness_removed = false;
                             }
@@ -513,6 +568,7 @@ mod unix {
                                 self.root.as_raw_fd(),
                                 keep.as_ref(),
                                 witness_backup.as_ref(),
+                                before_mutation,
                             ));
                         }
                     }
@@ -547,15 +603,17 @@ mod unix {
         entries: DirectoryEntries,
     }
 
-    fn drain_directory<F>(
+    fn drain_directory<F, M>(
         pinned: &PinnedTreeRemoval,
         keep_until_last: Option<&CString>,
         deadline: Option<Instant>,
         before_directory_open: &mut F,
+        before_mutation: &mut M,
         entries_reclaimed: &mut usize,
     ) -> io::Result<TreeRemoval>
     where
         F: FnMut() -> io::Result<()>,
+        M: FnMut() -> io::Result<()>,
     {
         let root_fd = pinned.root.as_raw_fd();
         let mut stack = vec![DirectoryFrame {
@@ -586,6 +644,7 @@ mod unix {
                     .last()
                     .expect("the root frame remains below each nested frame")
                     .directory_fd;
+                before_mutation()?;
                 ensure_bindings(pinned, &bindings)?;
                 ensure_named_directory(binding.parent_fd, &binding.name, binding.identity)?;
                 match unlink_at(parent_fd, &binding.name, true) {
@@ -661,6 +720,7 @@ mod unix {
                     entries,
                 });
             } else {
+                before_mutation()?;
                 ensure_bindings(pinned, &bindings)?;
                 ensure_named_entry(directory_fd, &c_name, observed.identity)?;
                 match unlink_at(directory_fd, &c_name, false) {
@@ -770,11 +830,16 @@ mod unix {
         })
     }
 
-    fn restore_witness(
+    fn restore_witness<M>(
         parent_fd: RawFd,
         name: &CString,
         backup: &WitnessBackup,
-    ) -> io::Result<TreeObjectIdentity> {
+        before_mutation: &mut M,
+    ) -> io::Result<TreeObjectIdentity>
+    where
+        M: FnMut() -> io::Result<()>,
+    {
+        before_mutation()?;
         let flags =
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         // O_EXCL is the final no-overwrite check: a writer-created replacement
@@ -788,12 +853,15 @@ mod unix {
         }
         // SAFETY: openat returned a fresh owned descriptor.
         let mut file = unsafe { File::from_raw_fd(fd) };
+        before_mutation()?;
         file.write_all(&backup.bytes)?;
-        // SAFETY: `file` owns a live descriptor for the newly created witness;
-        // the mode was captured from the original validated witness.
+        before_mutation()?;
+        // SAFETY: `file` owns a valid descriptor for the newly created witness.
+        // The retained mode is the mode read from the original validated file.
         if unsafe { libc::fchmod(file.as_raw_fd(), backup.mode as libc::mode_t) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        before_mutation()?;
         file.sync_all()?;
         let metadata = file.metadata()?;
         let identity = TreeObjectIdentity {
@@ -805,13 +873,17 @@ mod unix {
         Ok(identity)
     }
 
-    fn restore_after_failure(
+    fn restore_after_failure<M>(
         error: io::Error,
         witness_removed: bool,
         root_fd: RawFd,
         witness: Option<&CString>,
         backup: Option<&WitnessBackup>,
-    ) -> io::Error {
+        before_mutation: &mut M,
+    ) -> io::Error
+    where
+        M: FnMut() -> io::Result<()>,
+    {
         if !witness_removed {
             return error;
         }
@@ -821,7 +893,7 @@ mod unix {
                 format!("{error}; removed witness has no retained restore data"),
             );
         };
-        match restore_witness(root_fd, witness, backup) {
+        match restore_witness(root_fd, witness, backup, before_mutation) {
             Ok(_) => error,
             Err(restore_error) => io::Error::new(
                 error.kind(),
@@ -1152,7 +1224,7 @@ mod unix {
         use super::*;
         use crate::gc::{
             PinnedTreeRemoval as PublicPinnedTreeRemoval, remove_condemned_tree,
-            remove_condemned_tree_with_progress,
+            remove_condemned_tree_with_progress, remove_condemned_tree_with_progress_and_guard,
         };
 
         fn remove_with_hook<F>(
@@ -1271,6 +1343,100 @@ mod unix {
 
             assert_eq!(fs::read(moved.join("payload")).unwrap(), b"original");
             assert_eq!(fs::read(root.join("user-data")).unwrap(), b"preserve");
+        }
+
+        #[test]
+        fn repeated_guard_stops_after_the_first_payload_unlink() {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir(&root).unwrap();
+            let first = root.join("first");
+            let second = root.join("second");
+            fs::write(&first, b"first").unwrap();
+            fs::write(&second, b"second").unwrap();
+
+            let mut guard_calls = 0;
+            let mut before_mutation = || {
+                guard_calls += 1;
+                let remaining = [&first, &second]
+                    .into_iter()
+                    .filter(|path| path.exists())
+                    .count();
+                if remaining == 1 {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "captured root changed after the first unlink",
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            let error = remove_condemned_tree_with_progress_and_guard(
+                &root,
+                None,
+                None,
+                &mut before_mutation,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.entries_reclaimed, 1);
+            assert_eq!(
+                [&first, &second]
+                    .into_iter()
+                    .filter(|path| path.exists())
+                    .count(),
+                1
+            );
+            assert!(root.is_dir());
+        }
+
+        #[test]
+        fn changed_guard_prevents_witness_restore_and_final_root_unlink() {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            let witness = root.join("CACHEDIR.TAG");
+            fs::create_dir(&root).unwrap();
+            fs::write(&witness, b"captured root marker").unwrap();
+
+            let root_is_valid = std::cell::Cell::new(true);
+            let mut before_mutation = || {
+                if root_is_valid.get() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "captured root changed after witness unlink",
+                    ))
+                }
+            };
+            let mut after_witness_unlink = || {
+                root_is_valid.set(false);
+                Ok(())
+            };
+            let pinned = PinnedTreeRemoval::open(&root).unwrap();
+            let error = pinned
+                .remove_with_hooks_and_progress(
+                    Some("CACHEDIR.TAG"),
+                    None,
+                    &mut || Ok(()),
+                    &mut after_witness_unlink,
+                    &mut before_mutation,
+                    |bytes| {
+                        assert_eq!(bytes, b"captured root marker");
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+
+            assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.entries_reclaimed, 1);
+            assert!(root.is_dir());
+            assert!(
+                !witness.exists(),
+                "failed validation must not restore witness"
+            );
         }
 
         #[test]

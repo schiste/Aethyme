@@ -20,7 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
-use crate::gc::{TreeRemoval, remove_condemned_tree};
+use crate::gc::{
+    TreeRemoval, remove_condemned_tree, remove_condemned_tree_with_progress_and_guard,
+};
 use crate::reclaim::is_artefact_directory_with_extras;
 use crate::{BrokerStore, GitRepo};
 
@@ -500,16 +502,39 @@ pub(crate) fn storage_plan_with_context(
     let storage_root = storage_container_with_context(&main_root, context)?;
     let (policy, warnings) = host_policy(&main_root);
     let mut records = crate::measurement::load_size_records(&main_root);
-    let preparation_cache_root = context.preparation_cache_root();
+    let preparation_cache_root_binding =
+        context
+            .preparation_cache_root_binding()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!("captured preparation-cache root is unavailable: {error}"),
+            })?;
+    let preparation_cache_root = preparation_cache_root_binding
+        .as_ref()
+        .map(|binding| binding.path.as_path());
+    let preparation_cache_root_identity = preparation_cache_root_binding
+        .as_ref()
+        .and_then(|binding| binding.identity.as_deref());
+    let preparation_cache_root_nonce = preparation_cache_root_binding
+        .as_ref()
+        .and_then(|binding| binding.instance_nonce.as_deref());
     let plan = build_plan(
         &main_root,
         &storage_root,
-        preparation_cache_root.as_deref(),
+        preparation_cache_root,
+        preparation_cache_root_identity,
+        preparation_cache_root_nonce,
         policy.orphan_worktree_roots_days,
         warnings.clone(),
         crate::SizeScan::Recorded,
         &mut records,
     )?;
+    if let Some(binding) = preparation_cache_root_binding.as_ref() {
+        binding
+            .validate()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!("captured preparation-cache root changed during planning: {error}"),
+            })?;
+    }
     if warnings.is_empty() {
         warm_one_storage_size_record(&main_root, &plan, &policy, &mut records);
     }
@@ -570,16 +595,39 @@ pub(crate) fn storage_apply_with_context(
     let storage_root = storage_container_with_context(&main_root, context)?;
     let (policy, warnings) = host_policy(&main_root);
     let mut records = crate::measurement::load_size_records(&main_root);
-    let preparation_cache_root = context.preparation_cache_root();
+    let preparation_cache_root_binding =
+        context
+            .preparation_cache_root_binding()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!("captured preparation-cache root is unavailable: {error}"),
+            })?;
+    let preparation_cache_root = preparation_cache_root_binding
+        .as_ref()
+        .map(|binding| binding.path.clone());
     let plan = build_plan(
         &main_root,
         &storage_root,
         preparation_cache_root.as_deref(),
+        preparation_cache_root_binding
+            .as_ref()
+            .and_then(|binding| binding.identity.as_deref()),
+        preparation_cache_root_binding
+            .as_ref()
+            .and_then(|binding| binding.instance_nonce.as_deref()),
         policy.orphan_worktree_roots_days,
         warnings,
         crate::SizeScan::Measure,
         &mut records,
     )?;
+    if let Some(binding) = preparation_cache_root_binding.as_ref() {
+        binding
+            .validate()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!(
+                    "captured preparation-cache root changed during apply planning: {error}"
+                ),
+            })?;
+    }
     // The apply revalidation has already paid for a complete walk. Keep those
     // observations so the next routine plan can report them without paying
     // for the same trees again.
@@ -605,16 +653,26 @@ pub(crate) fn storage_apply_with_context(
         }
     }
     for candidate in &plan.preparation_candidates {
+        if let Some(binding) = preparation_cache_root_binding.as_ref()
+            && let Err(error) = binding.validate()
+        {
+            failures.push(StorageApplyFailure {
+                kind: StorageCandidateKind::PreparationEntry,
+                path: candidate.path.clone(),
+                reason: format!("captured preparation-cache root changed before removal: {error}"),
+            });
+            continue;
+        }
         let live_roots = preparation_live_roots(&main_root, &plan.primary_checkouts, &plan.roots);
         let result = match (
             preparation_cache_root.as_deref(),
             context.host_resource_db_path.as_deref(),
         ) {
-            (Some(cache_root), Some(resource_db_path)) => apply_preparation_candidate(
+            (Some(_cache_root), Some(resource_db_path)) => apply_preparation_candidate_with_binding(
                 candidate,
                 &live_roots,
                 resource_db_path,
-                cache_root,
+                preparation_cache_root_binding.as_ref().expect("cache root was matched"),
             ),
             _ => Err(
                 "the captured host resource database path is unavailable; the cache entry was retained"
@@ -663,10 +721,15 @@ pub(crate) fn storage_apply_with_context(
     })
 }
 
+// Keep the captured preparation-cache identity components explicit here: the
+// plan separately records the optional path, directory identity, and nonce.
+#[allow(clippy::too_many_arguments)]
 fn build_plan(
     main_root: &Path,
     storage_root: &Path,
     preparation_cache_root: Option<&Path>,
+    preparation_cache_root_identity: Option<&[u8]>,
+    preparation_cache_root_nonce: Option<&str>,
     orphan_worktree_roots_days: u32,
     mut warnings: Vec<String>,
     scan: crate::SizeScan,
@@ -758,6 +821,8 @@ fn build_plan(
     };
     let digest = decision_digest(
         &storage_root,
+        preparation_cache_root_identity,
+        preparation_cache_root_nonce,
         orphan_worktree_roots_days,
         &candidates,
         &primary_candidates,
@@ -1368,23 +1433,28 @@ impl Drop for PreparationRotationJournalLap {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn preparation_rotation_journal_root_identity(
     cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
     deadline: std::time::Instant,
 ) -> Result<Option<Vec<u8>>, ()> {
     if check_preparation_sweep_deadline(deadline).is_err() {
         return Err(());
     }
-    match crate::preparation::rotation_debt::DirectoryIdentity::capture(cache_root) {
-        Ok(identity) => identity.encode().map(Some).map_err(|_| ()),
+    let identity = match crate::preparation::rotation_debt::DirectoryIdentity::capture(cache_root) {
+        Ok(identity) => identity.encode().map(Some).map_err(|_| ())?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match crate::preparation::rotation_debt::cache_root_absent_under_observed_parent(
                 cache_root, deadline,
             ) {
-                Ok(true) => Ok(None),
-                _ => Err(()),
+                Ok(true) => None,
+                _ => return Err(()),
             }
         }
-        Err(_) => Err(()),
+        Err(_) => return Err(()),
+    };
+    if expected_root_identity.is_some_and(|expected| identity.as_deref() != Some(expected)) {
+        return Err(());
     }
+    Ok(identity)
 }
 
 /// Test adapter retaining the historical tuple result for fixture assertions.
@@ -1414,38 +1484,110 @@ fn sweep_preparation_cache_at_with_status(
     resource_db_path: &Path,
     deadline: std::time::Instant,
 ) -> PreparationCacheSweepReport {
-    sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
-        discover_preparation_live_roots(main_root, storage_root, deadline)
-    })
+    sweep_preparation_cache_with_discovery(
+        cache_root,
+        None,
+        None,
+        resource_db_path,
+        deadline,
+        |deadline| discover_preparation_live_roots(main_root, storage_root, deadline),
+    )
 }
 
 /// Sweep using the exact worktree roots selected by one Broker instance.
+#[cfg(test)]
 pub(crate) fn sweep_preparation_cache_for_roots_with_status(
     main_root: &Path,
     worktree_roots: &[PathBuf],
     cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
     resource_db_path: &Path,
     deadline: std::time::Instant,
 ) -> PreparationCacheSweepReport {
     if check_preparation_sweep_deadline(deadline).is_err() || worktree_roots.is_empty() {
         return PreparationCacheSweepReport::incomplete_empty();
     }
-    sweep_preparation_cache_with_discovery(cache_root, resource_db_path, deadline, |deadline| {
-        discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline)
-    })
+    sweep_preparation_cache_with_discovery(
+        cache_root,
+        expected_root_identity,
+        None,
+        resource_db_path,
+        deadline,
+        |deadline| discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline),
+    )
+}
+
+/// Sweep the captured preparation-cache namespace while retaining its outer
+/// root marker guard across discovery and every destructive step.
+pub(crate) fn sweep_preparation_cache_for_roots_with_binding(
+    main_root: &Path,
+    worktree_roots: &[PathBuf],
+    binding: &crate::broker::PreparationCacheRootBinding,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+) -> PreparationCacheSweepReport {
+    let cache_root = &binding.path;
+    let expected_root_identity = binding.identity.as_deref();
+    if check_preparation_sweep_deadline(deadline).is_err() || worktree_roots.is_empty() {
+        return PreparationCacheSweepReport::incomplete_empty();
+    }
+    if binding.validate().is_err() {
+        return PreparationCacheSweepReport::incomplete_empty();
+    }
+    sweep_preparation_cache_with_discovery(
+        cache_root,
+        expected_root_identity,
+        Some(binding),
+        resource_db_path,
+        deadline,
+        |deadline| discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline),
+    )
 }
 
 fn sweep_preparation_cache_with_discovery(
     cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+    discover_live_roots: impl FnMut(std::time::Instant) -> Result<Vec<PathBuf>, StorageError>,
+) -> PreparationCacheSweepReport {
+    sweep_preparation_cache_with_discovery_and_observer(
+        cache_root,
+        expected_root_identity,
+        root_binding,
+        resource_db_path,
+        deadline,
+        discover_live_roots,
+        &mut || Ok(()),
+    )
+}
+
+fn sweep_preparation_cache_with_discovery_and_observer(
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
     resource_db_path: &Path,
     deadline: std::time::Instant,
     mut discover_live_roots: impl FnMut(std::time::Instant) -> Result<Vec<PathBuf>, StorageError>,
+    before_mutation_observer: &mut impl FnMut() -> std::io::Result<()>,
 ) -> PreparationCacheSweepReport {
     let mut removed = 0_usize;
     let mut bytes = 0_u64;
     let mut filesystem_entries_reclaimed = 0_usize;
     let mut complete = true;
     let mut coordinator = None;
+    if let Some(binding) = root_binding
+        && binding.validate().is_err()
+    {
+        return PreparationCacheSweepReport::incomplete_empty();
+    }
+    if !crate::preparation::preparation_cache_root_identity_matches(
+        cache_root,
+        expected_root_identity,
+    ) {
+        return PreparationCacheSweepReport::incomplete_empty();
+    }
     let inventory = match crate::preparation::rotation_debt::inventory(
         cache_root,
         PREPARATION_ROTATION_DEBT_MAX_ENTRIES,
@@ -1457,18 +1599,21 @@ fn sweep_preparation_cache_with_discovery(
     complete &= inventory.complete;
     let mut blocked_repositories = inventory.blocked_repositories.clone();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let journal_root_identity =
-        match preparation_rotation_journal_root_identity(cache_root, deadline) {
-            Ok(identity) => identity,
-            Err(()) => {
-                return preparation_cache_sweep_report(
-                    removed,
-                    bytes,
-                    filesystem_entries_reclaimed,
-                    false,
-                );
-            }
-        };
+    let journal_root_identity = match preparation_rotation_journal_root_identity(
+        cache_root,
+        expected_root_identity,
+        deadline,
+    ) {
+        Ok(identity) => identity,
+        Err(()) => {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                false,
+            );
+        }
+    };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     match crate::preparation::rotation_journal::probe(
         resource_db_path,
@@ -1527,10 +1672,19 @@ fn sweep_preparation_cache_with_discovery(
                 continue;
             }
         };
-        let recovery = crate::preparation::recover_rotation_debt_for_cache_sweep(
+        if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+            complete = false;
+            if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                complete = false;
+            }
+            continue;
+        }
+        let recovery = crate::preparation::recover_rotation_debt_for_cache_sweep_with_binding(
             cache_root,
+            expected_root_identity,
             resource_db_path,
             repository,
+            root_binding,
             deadline,
         );
         let released = release_preparation_cache_lease(&mut coordinator, &grant);
@@ -1565,18 +1719,21 @@ fn sweep_preparation_cache_with_discovery(
     let mut rotation_journal_lap_active = false;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let current_identity =
-            match preparation_rotation_journal_root_identity(cache_root, deadline) {
-                Ok(identity) if identity == journal_root_identity => identity,
-                _ => {
-                    return preparation_cache_sweep_report(
-                        removed,
-                        bytes,
-                        filesystem_entries_reclaimed,
-                        false,
-                    );
-                }
-            };
+        let current_identity = match preparation_rotation_journal_root_identity(
+            cache_root,
+            expected_root_identity,
+            deadline,
+        ) {
+            Ok(identity) if identity == journal_root_identity => identity,
+            _ => {
+                return preparation_cache_sweep_report(
+                    removed,
+                    bytes,
+                    filesystem_entries_reclaimed,
+                    false,
+                );
+            }
+        };
         let signal = match crate::preparation::rotation_journal::probe(
             resource_db_path,
             cache_root,
@@ -1715,10 +1872,12 @@ fn sweep_preparation_cache_with_discovery(
                                     }
                                 };
                                 let recovery =
-                                    crate::preparation::recover_rotation_debt_for_cache_sweep(
+                                    crate::preparation::recover_rotation_debt_for_cache_sweep_with_binding(
                                         cache_root,
+                                        expected_root_identity,
                                         resource_db_path,
                                         &repository,
+                                        root_binding,
                                         deadline,
                                     );
                                 let released =
@@ -1852,6 +2011,14 @@ fn sweep_preparation_cache_with_discovery(
             complete = false;
             continue;
         };
+        if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                false,
+            );
+        }
         if retired {
             if inventory.block_legacy_retired || blocked_repositories.contains(lease_repository) {
                 complete = false;
@@ -1886,15 +2053,24 @@ fn sweep_preparation_cache_with_discovery(
                     };
                 }
             };
+            if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+                complete = false;
+                if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                    complete = false;
+                }
+                continue;
+            }
             // Inventory ran before this lease was acquired. A writer may
             // have published durable rotation debt in that gap, then crashed
             // and released the lease. Reclassify under the lease before the
             // generic retired-tree path can gain deletion authority.
             if !account_rotation_recovery(
-                crate::preparation::recover_rotation_debt_for_cache_sweep(
+                crate::preparation::recover_rotation_debt_for_cache_sweep_with_binding(
                     cache_root,
+                    expected_root_identity,
                     resource_db_path,
                     lease_repository,
+                    root_binding,
                     deadline,
                 ),
                 &mut removed,
@@ -1912,6 +2088,9 @@ fn sweep_preparation_cache_with_discovery(
             // longer used by writers, but the same lease prevents cleanup
             // from racing another rotation or active preparation command.
             let outcome = (|| {
+                if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+                    return PreparationCacheSweepOutcome::Stop(0);
+                }
                 let current_roots = match discover_live_roots(deadline) {
                     Ok(roots) => roots,
                     Err(_) => return PreparationCacheSweepOutcome::Stop(0),
@@ -1938,10 +2117,20 @@ fn sweep_preparation_cache_with_discovery(
                 {
                     return PreparationCacheSweepOutcome::Stop(0);
                 }
-                match crate::gc::remove_condemned_tree_with_progress(
+                if !crate::preparation::preparation_cache_root_identity_matches(
+                    cache_root,
+                    expected_root_identity,
+                ) {
+                    return PreparationCacheSweepOutcome::Stop(0);
+                }
+                if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+                    return PreparationCacheSweepOutcome::Stop(0);
+                }
+                match remove_preparation_cache_tree_with_binding_and_observer(
                     &repository_path,
-                    None,
                     Some(deadline),
+                    root_binding,
+                    before_mutation_observer,
                 ) {
                     Ok((TreeRemoval::Complete, count)) => {
                         PreparationCacheSweepOutcome::Removed(usage.bytes, count)
@@ -2063,15 +2252,24 @@ fn sweep_preparation_cache_with_discovery(
                     };
                 }
             };
+            if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+                complete = false;
+                if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                    complete = false;
+                }
+                continue;
+            }
 
             // Revalidate durable rotation intent after acquiring the writer's
             // exact lease. A sidecar published after the initial bounded
             // inventory must still take precedence over deleting a child key.
             if !account_rotation_recovery(
-                crate::preparation::recover_rotation_debt_for_cache_sweep(
+                crate::preparation::recover_rotation_debt_for_cache_sweep_with_binding(
                     cache_root,
+                    expected_root_identity,
                     resource_db_path,
                     lease_repository,
+                    root_binding,
                     deadline,
                 ),
                 &mut removed,
@@ -2090,6 +2288,9 @@ fn sweep_preparation_cache_with_discovery(
             // so preparation cannot start using the entry between the check
             // and delete.
             let outcome = (|| {
+                if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+                    return PreparationCacheSweepOutcome::Stop(0);
+                }
                 let current_roots = match discover_live_roots(deadline) {
                     Ok(roots) => roots,
                     Err(_) => return PreparationCacheSweepOutcome::Stop(0),
@@ -2127,10 +2328,20 @@ fn sweep_preparation_cache_with_discovery(
                 {
                     return PreparationCacheSweepOutcome::Stop(0);
                 }
-                match crate::gc::remove_condemned_tree_with_progress(
+                if !crate::preparation::preparation_cache_root_identity_matches(
+                    cache_root,
+                    expected_root_identity,
+                ) {
+                    return PreparationCacheSweepOutcome::Stop(0);
+                }
+                if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+                    return PreparationCacheSweepOutcome::Stop(0);
+                }
+                match remove_preparation_cache_tree_with_binding_and_observer(
                     &candidate_path,
-                    None,
                     Some(deadline),
+                    root_binding,
+                    before_mutation_observer,
                 ) {
                     Ok((TreeRemoval::Complete, count)) => {
                         PreparationCacheSweepOutcome::Removed(usage.bytes, count)
@@ -2917,28 +3128,153 @@ fn retired_preparation_store_layout(path: &Path, deadline: Option<std::time::Ins
     deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
 }
 
-/// Remove one dead cache entry, re-deciding at the moment of removal.
-///
-/// The plan may be minutes old and a checkout may have changed its lockfile
-/// since, so the key is re-tested against the live set rather than trusted
-/// from the digest that authorised the run.
-fn apply_preparation_candidate(
-    candidate: &StoragePreparationCandidate,
-    live_roots: &[PathBuf],
-    resource_db_path: &Path,
-    cache_root: &Path,
-) -> Result<u64, String> {
-    apply_preparation_candidate_with_lease_at(candidate, live_roots, resource_db_path, cache_root)
+/// Remove a preparation-cache tree while revalidating its captured root
+/// before every unlink and any witness restoration.
+fn remove_preparation_cache_tree_with_binding_and_observer(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    observer: &mut impl FnMut() -> std::io::Result<()>,
+) -> Result<(TreeRemoval, usize), crate::gc::TreeRemovalError> {
+    let validate_binding = || {
+        if let Some(binding) = root_binding {
+            binding.validate().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("captured preparation-cache root changed: {error}"),
+                )
+            })?;
+        }
+        Ok(())
+    };
+    validate_binding().map_err(|source| crate::gc::TreeRemovalError {
+        source,
+        entries_reclaimed: 0,
+    })?;
+    let result = remove_condemned_tree_with_progress_and_guard(path, None, deadline, || {
+        observer()?;
+        validate_binding()
+    });
+    match result {
+        Ok((outcome, entries_reclaimed)) => {
+            validate_binding().map_err(|source| crate::gc::TreeRemovalError {
+                source,
+                entries_reclaimed,
+            })?;
+            Ok((outcome, entries_reclaimed))
+        }
+        Err(error) => Err(error),
+    }
 }
 
+#[cfg(test)]
 fn apply_preparation_candidate_with_lease_at(
     candidate: &StoragePreparationCandidate,
     live_roots: &[PathBuf],
     resource_db_path: &Path,
     cache_root: &Path,
 ) -> Result<u64, String> {
+    apply_preparation_candidate_with_root_identity(
+        candidate,
+        live_roots,
+        resource_db_path,
+        cache_root,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn apply_preparation_candidate_with_root_identity(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+    resource_db_path: &Path,
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+) -> Result<u64, String> {
+    apply_preparation_candidate_with_optional_binding(
+        candidate,
+        live_roots,
+        resource_db_path,
+        cache_root,
+        expected_root_identity,
+        None,
+    )
+}
+
+fn apply_preparation_candidate_with_binding(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+    resource_db_path: &Path,
+    binding: &crate::broker::PreparationCacheRootBinding,
+) -> Result<u64, String> {
+    binding
+        .validate()
+        .map_err(|error| format!("captured preparation-cache root changed: {error}"))?;
+    apply_preparation_candidate_with_optional_binding(
+        candidate,
+        live_roots,
+        resource_db_path,
+        &binding.path,
+        binding.identity.as_deref(),
+        Some(binding),
+    )
+}
+
+fn apply_preparation_candidate_with_optional_binding(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+    resource_db_path: &Path,
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+) -> Result<u64, String> {
+    apply_preparation_candidate_with_optional_binding_and_observer(
+        candidate,
+        live_roots,
+        resource_db_path,
+        cache_root,
+        expected_root_identity,
+        root_binding,
+        &mut || Ok(()),
+    )
+}
+
+#[cfg(test)]
+fn apply_preparation_candidate_with_binding_and_observer(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+    resource_db_path: &Path,
+    binding: &crate::broker::PreparationCacheRootBinding,
+    observer: &mut impl FnMut() -> std::io::Result<()>,
+) -> Result<u64, String> {
+    apply_preparation_candidate_with_optional_binding_and_observer(
+        candidate,
+        live_roots,
+        resource_db_path,
+        &binding.path,
+        binding.identity.as_deref(),
+        Some(binding),
+        observer,
+    )
+}
+
+fn apply_preparation_candidate_with_optional_binding_and_observer(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+    resource_db_path: &Path,
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    observer: &mut impl FnMut() -> std::io::Result<()>,
+) -> Result<u64, String> {
     let deadline = std::time::Instant::now() + PREPARATION_APPLY_DEADLINE;
     let (lease_repository, retired) = validate_preparation_candidate_shape(candidate, cache_root)?;
+    if !crate::preparation::preparation_cache_root_identity_matches(
+        cache_root,
+        expected_root_identity,
+    ) {
+        return Err("captured preparation-cache root changed; review a fresh storage plan".into());
+    }
     let mut coordinator = None;
     let grant = acquire_preparation_cache_lease(
         &mut coordinator,
@@ -2958,20 +3294,49 @@ fn apply_preparation_candidate_with_lease_at(
             format!("cannot safely acquire preparation-cache lease: {reason}")
         }
     })?;
+    if let Some(binding) = root_binding {
+        binding
+            .validate()
+            .map_err(|error| format!("captured preparation-cache root changed: {error}"))?;
+    }
     let result = apply_preparation_candidate_under_lease(
-        candidate, live_roots, cache_root, deadline, retired,
+        candidate,
+        live_roots,
+        cache_root,
+        expected_root_identity,
+        deadline,
+        retired,
+        root_binding,
+        observer,
     );
     release_preparation_cache_lease(&mut coordinator, &grant);
     result
 }
 
+// The removal sequence keeps its validated roots, deadline, lease kind, and
+// observer explicit so each safety check remains visible at the call site.
+#[allow(clippy::too_many_arguments)]
 fn apply_preparation_candidate_under_lease(
     candidate: &StoragePreparationCandidate,
     live_roots: &[PathBuf],
     cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
     deadline: std::time::Instant,
     retired: bool,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    observer: &mut impl FnMut() -> std::io::Result<()>,
 ) -> Result<u64, String> {
+    if let Some(binding) = root_binding {
+        binding
+            .validate()
+            .map_err(|error| format!("captured preparation-cache root changed: {error}"))?;
+    }
+    if !crate::preparation::preparation_cache_root_identity_matches(
+        cache_root,
+        expected_root_identity,
+    ) {
+        return Err("captured preparation-cache root changed; review a fresh storage plan".into());
+    }
     let repository_path = cache_root.join(&candidate.repository);
     if retired {
         if candidate.path != repository_path
@@ -3003,14 +3368,29 @@ fn apply_preparation_candidate_under_lease(
         .ok_or_else(|| "cache entry size could not be verified before the deadline".to_string())?;
     if check_preparation_sweep_deadline(deadline).is_err()
         || !is_real_directory(cache_root)
+        || !crate::preparation::preparation_cache_root_identity_matches(
+            cache_root,
+            expected_root_identity,
+        )
         || !is_real_directory(&candidate.path)
         || (!retired && !is_real_directory(&repository_path))
         || (retired && !retired_preparation_store_layout(&candidate.path, Some(deadline)))
     {
         return Err("cache entry changed before removal; review a fresh storage plan".into());
     }
-    match remove_condemned_tree(&candidate.path, None, Some(deadline))
-        .map_err(|error| format!("cannot remove cache entry: {error}"))?
+    if let Some(binding) = root_binding {
+        binding.validate().map_err(|error| {
+            format!("captured preparation-cache root changed before removal: {error}")
+        })?;
+    }
+    match remove_preparation_cache_tree_with_binding_and_observer(
+        &candidate.path,
+        Some(deadline),
+        root_binding,
+        observer,
+    )
+    .map(|(outcome, _entries_reclaimed)| outcome)
+    .map_err(|error| format!("cannot remove cache entry: {}", error.source))?
     {
         TreeRemoval::Complete => Ok(usage.bytes),
         TreeRemoval::Interrupted => {
@@ -4357,6 +4737,8 @@ fn write_attributed_marker(root: &Path, this: &ThisRepository) -> std::io::Resul
 
 fn decision_digest(
     storage_root: &Path,
+    preparation_cache_root_identity: Option<&[u8]>,
+    preparation_cache_root_nonce: Option<&str>,
     orphan_worktree_roots_days: u32,
     candidates: &[StorageCandidate],
     primary_candidates: &[StoragePrimaryCandidate],
@@ -4375,6 +4757,10 @@ fn decision_digest(
     #[derive(serde::Serialize)]
     struct Decision<'a> {
         storage_root: &'a Path,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preparation_cache_root_identity: Option<&'a [u8]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preparation_cache_root_nonce: Option<&'a str>,
         orphan_worktree_roots_days: u32,
         candidates: Vec<DecisionCandidate<'a>>,
         primary_candidates: Vec<DecisionPrimaryCandidate<'a>>,
@@ -4395,6 +4781,8 @@ fn decision_digest(
     }
     let bytes = serde_json::to_vec(&Decision {
         storage_root,
+        preparation_cache_root_identity,
+        preparation_cache_root_nonce,
         orphan_worktree_roots_days,
         candidates: candidates
             .iter()
@@ -4553,6 +4941,82 @@ mod tests {
         path
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn initialized_storage_cache_root_binding(
+        cache_root: &Path,
+        resource_db_path: &Path,
+    ) -> crate::broker::PreparationCacheRootBinding {
+        use crate::preparation::rotation_debt::{
+            PreparationCacheRootCaptureState, capture_preparation_cache_root,
+            initialize_preparation_cache_root,
+        };
+
+        let resource_db_path = resource_db_path.canonicalize().unwrap();
+        let captured = capture_preparation_cache_root(cache_root).unwrap();
+        let initialized = initialize_preparation_cache_root(
+            cache_root,
+            &captured.identity,
+            &captured.directory,
+            &resource_db_path,
+            || Ok(false),
+        )
+        .unwrap();
+        let captured = capture_preparation_cache_root(cache_root).unwrap();
+        let state = match captured.state {
+            PreparationCacheRootCaptureState::Marked {
+                coordinator_db_path,
+                nonce,
+                cache_root_identity: Some(cache_root_identity),
+            } => crate::broker::PreparationCacheRootState::Marked {
+                coordinator_db_path,
+                nonce,
+                cache_root_identity: Some(cache_root_identity),
+            },
+            other => panic!("expected initialized marker, got {other:?}"),
+        };
+        crate::broker::PreparationCacheRootBinding {
+            path: cache_root.join(format!(".aethyme-preparation-cache-{}", initialized.nonce)),
+            identity: Some(initialized.cache_root_identity),
+            instance_nonce: Some(initialized.nonce),
+            root_guard: Some(crate::broker::PreparationCacheRootGuard {
+                root_path: cache_root.to_path_buf(),
+                root_identity: captured.identity,
+                state,
+                captured_resource_db_path: resource_db_path,
+                root_handle: std::sync::Arc::new(captured.directory),
+            }),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn change_cache_root_coordinator(binding: &crate::broker::PreparationCacheRootBinding) {
+        let root = &binding.root_guard.as_ref().unwrap().root_path;
+        let marker_path = root.join(".aethyme-preparation-cache-root-v2");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker["coordinator_db_path"] = serde_json::Value::from(
+            root.join("different-coordinator/host-resources.db")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn write_two_cache_payloads(entry: &Path) {
+        std::fs::create_dir_all(entry).unwrap();
+        std::fs::write(entry.join("payload-a"), b"first payload").unwrap();
+        std::fs::write(entry.join("payload-b"), b"second payload").unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn remaining_cache_payloads(entry: &Path) -> usize {
+        ["payload-a", "payload-b"]
+            .into_iter()
+            .filter(|name| entry.join(name).exists())
+            .count()
+    }
+
     fn preparation_sweep_status_fixture(
         root: &Path,
         payload: &[u8],
@@ -4598,6 +5062,7 @@ mod tests {
             &main_root,
             &[worktree_root],
             &cache_root,
+            None,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
@@ -4627,6 +5092,7 @@ mod tests {
             &main_root,
             std::slice::from_ref(&worktree_root),
             &cache_root,
+            None,
             &resource_db_path,
             deadline,
         );
@@ -4645,6 +5111,7 @@ mod tests {
             &main_root,
             &[],
             &cache_root,
+            None,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
@@ -4657,6 +5124,7 @@ mod tests {
             &main_root,
             &[invalid_root],
             &cache_root,
+            None,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
@@ -4674,6 +5142,7 @@ mod tests {
             &main_root,
             &[worktree_root],
             &cache_root,
+            None,
             &resource_db_path,
             std::time::Instant::now() - Duration::from_secs(1),
         );
@@ -5043,6 +5512,164 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn manual_preparation_cache_apply_refuses_a_replaced_captured_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("preparation-cache");
+        let original_entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("cccccccccccc");
+        std::fs::create_dir_all(&original_entry).unwrap();
+        let root_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root)
+                .unwrap()
+                .encode()
+                .unwrap();
+        let original_root = tmp.path().join("preparation-cache-original");
+        std::fs::rename(&cache_root, &original_root).unwrap();
+        let replacement_entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("cccccccccccc");
+        std::fs::create_dir_all(&replacement_entry).unwrap();
+        std::fs::write(replacement_entry.join("payload"), b"replacement").unwrap();
+        let candidate = StoragePreparationCandidate {
+            path: replacement_entry.clone(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
+            key: "cccccccccccc".into(),
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: "previously reviewed dead entry".into(),
+        };
+        let resource_db_path = tmp.path().join("host-state/host-resources.db");
+
+        let error = apply_preparation_candidate_with_root_identity(
+            &candidate,
+            &[],
+            &resource_db_path,
+            &cache_root,
+            Some(&root_identity),
+        )
+        .expect_err("a replacement root must not inherit stale deletion authority");
+
+        assert!(error.contains("captured preparation-cache root changed"));
+        assert_eq!(
+            std::fs::read(replacement_entry.join("payload")).unwrap(),
+            b"replacement"
+        );
+        assert!(
+            original_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("cccccccccccc")
+                .is_dir(),
+            "the original root remains intact"
+        );
+        assert!(
+            !resource_db_path.exists(),
+            "root mismatch is rejected before opening the lease database"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_sweep_revalidates_outer_binding_between_unlinks(retired: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer_root = tmp.path().join("preparation-cache-root");
+        let main_root = tmp.path().join("main");
+        std::fs::create_dir(&outer_root).unwrap();
+        std::fs::create_dir(&main_root).unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+        let binding = initialized_storage_cache_root_binding(&outer_root, &resource_db_path);
+        let store = if retired {
+            binding.path.join(format!(
+                "{TEST_PREPARATION_REPOSITORY}.retired-1700000000000-42"
+            ))
+        } else {
+            binding.path.join(TEST_PREPARATION_REPOSITORY)
+        };
+        let entry = store.join("cccccccccccc");
+        write_two_cache_payloads(&entry);
+
+        let mut marker_changed = false;
+        let mut observer = || {
+            if !marker_changed && remaining_cache_payloads(&entry) == 1 {
+                change_cache_root_coordinator(&binding);
+                marker_changed = true;
+            }
+            Ok(())
+        };
+        let report = sweep_preparation_cache_with_discovery_and_observer(
+            &binding.path,
+            binding.identity.as_deref(),
+            Some(&binding),
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            |_| Ok(vec![main_root.clone()]),
+            &mut observer,
+        );
+
+        assert!(marker_changed, "the test must alter the marker mid-delete");
+        assert!(!report.complete, "a changed outer binding stops the sweep");
+        assert!(entry.is_dir(), "the cache entry remains recoverable");
+        assert_eq!(remaining_cache_payloads(&entry), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn dead_cache_sweep_revalidates_outer_binding_before_each_unlink() {
+        assert_sweep_revalidates_outer_binding_between_unlinks(false);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn retired_cache_sweep_revalidates_outer_binding_before_each_unlink() {
+        assert_sweep_revalidates_outer_binding_between_unlinks(true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn manual_apply_revalidates_outer_binding_before_each_unlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer_root = tmp.path().join("preparation-cache-root");
+        std::fs::create_dir(&outer_root).unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+        let binding = initialized_storage_cache_root_binding(&outer_root, &resource_db_path);
+        let entry = binding
+            .path
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("cccccccccccc");
+        write_two_cache_payloads(&entry);
+        let candidate = StoragePreparationCandidate {
+            path: entry.clone(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
+            key: "cccccccccccc".into(),
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: "previously reviewed dead cache entry".into(),
+        };
+        let mut marker_changed = false;
+        let mut observer = || {
+            if !marker_changed && remaining_cache_payloads(&entry) == 1 {
+                change_cache_root_coordinator(&binding);
+                marker_changed = true;
+            }
+            Ok(())
+        };
+
+        let error = apply_preparation_candidate_with_binding_and_observer(
+            &candidate,
+            &[],
+            &resource_db_path,
+            &binding,
+            &mut observer,
+        )
+        .expect_err("manual apply must stop after the captured root marker changes");
+
+        assert!(marker_changed, "the test must alter the marker mid-delete");
+        assert!(error.contains("captured preparation-cache root changed"));
+        assert!(entry.is_dir());
+        assert_eq!(remaining_cache_payloads(&entry), 1);
+    }
+
     #[test]
     fn preparation_cache_sweep_skips_a_repository_with_an_active_writer_lease() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5132,6 +5759,8 @@ mod tests {
         let resource_db_path = test_host_resource_db(&root);
         let report = sweep_preparation_cache_with_discovery(
             &cache_root,
+            None,
+            None,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
             |_| Ok(vec![main_root.clone()]),
@@ -5197,6 +5826,8 @@ mod tests {
 
         let report = sweep_preparation_cache_with_discovery(
             &cache_root,
+            None,
+            None,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
             |_| Ok(vec![main_root.clone()]),
@@ -5244,6 +5875,8 @@ mod tests {
 
         let report = sweep_preparation_cache_with_discovery(
             &cache_root,
+            None,
+            None,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
             |_| {
@@ -5272,6 +5905,8 @@ mod tests {
 
         let report = sweep_preparation_cache_with_discovery(
             &cache_root,
+            None,
+            None,
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
             |_| Ok(vec![main_root.clone()]),
@@ -5710,8 +6345,8 @@ mod tests {
         changed.estimated_bytes = Some(100);
         changed.estimated_inodes = Some(99);
         assert_eq!(
-            decision_digest(Path::new("/storage"), 1, &[candidate], &[], &[]),
-            decision_digest(Path::new("/storage"), 1, &[changed], &[], &[])
+            decision_digest(Path::new("/storage"), None, None, 1, &[candidate], &[], &[]),
+            decision_digest(Path::new("/storage"), None, None, 1, &[changed], &[], &[])
         );
     }
 
@@ -5726,10 +6361,59 @@ mod tests {
             reason: "unused".into(),
         };
         let digest = |candidates: &[StoragePreparationCandidate]| {
-            decision_digest(Path::new("/storage"), 1, &[], &[], candidates)
+            decision_digest(Path::new("/storage"), None, None, 1, &[], &[], candidates)
         };
         let approved = digest(std::slice::from_ref(&candidate));
         assert_ne!(approved, digest(&[]));
+        let root_a = [1_u8, 2, 3];
+        let root_b = [1_u8, 2, 4];
+        assert_ne!(
+            decision_digest(
+                Path::new("/storage"),
+                Some(&root_a),
+                None,
+                1,
+                &[],
+                &[],
+                std::slice::from_ref(&candidate),
+            ),
+            decision_digest(
+                Path::new("/storage"),
+                Some(&root_b),
+                None,
+                1,
+                &[],
+                &[],
+                std::slice::from_ref(&candidate),
+            ),
+            "the confirmation must bind the captured cache-root instance",
+        );
+        assert_ne!(
+            decision_digest(
+                Path::new("/storage"),
+                Some(&root_a),
+                Some("a".repeat(64).as_str()),
+                1,
+                &[],
+                &[],
+                std::slice::from_ref(&candidate),
+            ),
+            decision_digest(
+                Path::new("/storage"),
+                Some(&root_a),
+                Some("b".repeat(64).as_str()),
+                1,
+                &[],
+                &[],
+                std::slice::from_ref(&candidate),
+            ),
+            "the confirmation must bind the cache-root instance nonce",
+        );
+        assert_eq!(
+            decision_digest(Path::new("/storage"), None, None, 1, &[], &[], &[]),
+            "0052d7a07108db59d67115eba0c2f99b6f277169e0dae7cdfbba91bc8168b415",
+            "absence of an override preserves the legacy decision payload",
+        );
         let mut measured = candidate.clone();
         measured.estimated_bytes = Some(999);
         measured.estimated_inodes = Some(999);

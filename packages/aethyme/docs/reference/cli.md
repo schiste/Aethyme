@@ -561,6 +561,24 @@ serialized in per-user host state by canonical remote identity, renewed while
 the command runs, and released afterward. The cache path and ownership token
 are absent from JSON and broker journals.
 
+By default, the broker derives the shared preparation cache from the captured
+host-resource database location. To place that cache on a separate volume, set
+`AETHYME_PREPARATION_CACHE_ROOT` to an existing, real, canonical absolute
+directory before opening the broker. Library embedders can set the same option
+with `BrokerOpenOptions::with_preparation_cache_root`. On first initialization,
+the directory must contain no unrelated entries; later opens reuse it only if
+its marker and cache namespace validate. This setting moves only the
+preparation cache; the host-resource database and coordination state stay at
+their captured locations. The first writable broker open initializes a marker
+and a nonce-scoped cache directory after checking rotation state. A capture or
+read-only plan does not create them. Keep the selected root and coordinator
+database stable: a different canonical database path refuses use of an
+initialized root, and replacing the database file at the same path while
+connections are live is outside the guarantee. Existing cache contents are
+not moved or deleted when selecting this option. It is a placement setting, not
+a disk quota. With no override, the existing default cache location and child
+context remain in effect.
+
 The digest changes with command definitions, input bytes, platform,
 architecture, or declared runtime executable identity. State is one of
 `not_configured`, `required`, `current`, `stale`, `in_progress`, `failed`, or
