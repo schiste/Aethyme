@@ -197,6 +197,28 @@ pub(crate) fn next_page(
     cache_root: &Path,
     root_identity: &[u8],
 ) -> io::Result<JournalPage> {
+    next_page_inner(resource_db, cache_root, root_identity, MAX_PAGE_ROWS)
+}
+
+#[cfg(test)]
+fn next_page_with_limit(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    page_rows: i64,
+) -> io::Result<JournalPage> {
+    next_page_inner(resource_db, cache_root, root_identity, page_rows)
+}
+
+fn next_page_inner(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    page_rows: i64,
+) -> io::Result<JournalPage> {
+    if !(1..=MAX_PAGE_ROWS).contains(&page_rows) {
+        return Err(invalid_input("rotation journal page size is invalid"));
+    }
     validate_root(cache_root, root_identity)?;
     let path = path_for_resource_db(resource_db)?;
     let mut connection = open_writer(&path)?;
@@ -241,7 +263,7 @@ pub(crate) fn next_page(
             )
             .map_err(sqlite_error)?;
         let rows = statement
-            .query_map(params![root, cursor, MAX_PAGE_ROWS], |row| {
+            .query_map(params![root, cursor, page_rows], |row| {
                 let sort_key: Vec<u8> = row.get(0)?;
                 let payload_length: i64 = row.get(1)?;
                 let repository = std::str::from_utf8(&sort_key)
@@ -710,27 +732,40 @@ fn ensure_root(
     root: &[u8],
     root_identity: &[u8],
 ) -> io::Result<u64> {
-    let existing: Option<(Vec<u8>, i64, i64, i64)> = transaction
+    let existing: Option<(Vec<u8>, i64, i64, i64, Option<Vec<u8>>, i64)> = transaction
         .query_row(
-            "SELECT root_identity, generation, completed_generation, lap_incomplete \
+            "SELECT root_identity, generation, completed_generation, lap_generation, cursor, lap_incomplete \
              FROM rotation_root WHERE root_path=?1",
             params![root],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )
         .optional()
         .map_err(sqlite_error)?;
     match existing {
-        Some((identity, generation, completed, incomplete)) if identity == root_identity => {
+        Some((identity, generation, completed, lap_generation, _cursor, incomplete))
+            if identity == root_identity =>
+        {
             if generation < 0
                 || completed < 0
                 || completed > generation
+                || lap_generation < 0
+                || lap_generation > generation
                 || !matches!(incomplete, 0 | 1)
             {
                 return Err(invalid_data("rotation journal state is malformed"));
             }
             u64::try_from(generation).map_err(|_| invalid_data("negative rotation generation"))
         }
-        Some((_identity, generation, completed, lap_generation, _cursor, incomplete)) => {
+        Some((_identity, generation, completed, lap_generation, cursor, incomplete)) => {
             let count: i64 = transaction
                 .query_row(
                     "SELECT count(*) FROM rotation_debt WHERE root_path=?1",
@@ -741,6 +776,7 @@ fn ensure_root(
             if count != 0
                 || generation != completed
                 || lap_generation != generation
+                || cursor.is_some()
                 || incomplete != 0
             {
                 return Err(invalid_data(
@@ -894,7 +930,9 @@ mod tests {
         fixture.publish(REPOSITORY_B, b"b");
         fixture.publish(REPOSITORY_C, b"c");
 
-        let first = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        let first =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
+                .unwrap();
         assert_eq!(
             first
                 .entries
@@ -904,13 +942,19 @@ mod tests {
             vec![REPOSITORY_A, REPOSITORY_B]
         );
         mark_lap_incomplete(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
-        let second = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        let second =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
+                .unwrap();
         assert_eq!(second.entries[0].repository.as_deref(), Some(REPOSITORY_C));
         assert!(!second.lap_complete);
-        let wrapped = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        let wrapped =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
+                .unwrap();
         assert!(wrapped.entries.is_empty());
         assert!(!wrapped.lap_complete);
-        let retry = next_page(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY).unwrap();
+        let retry =
+            next_page_with_limit(&fixture.resource_db, &fixture.cache_root, ROOT_IDENTITY, 2)
+                .unwrap();
         assert_eq!(retry.entries[0].repository.as_deref(), Some(REPOSITORY_A));
     }
 
