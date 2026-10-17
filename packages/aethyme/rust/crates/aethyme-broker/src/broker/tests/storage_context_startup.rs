@@ -7,6 +7,12 @@ const NONE_MODE: &str = "AETHYME_TEST_STORAGE_CONTEXT_NONE_MODE";
 const SLOT_IDENTITY_MODE: &str = "AETHYME_TEST_STORAGE_CONTEXT_SLOT_IDENTITY_MODE";
 const RELATIVE_MODE: &str = "AETHYME_TEST_STORAGE_CONTEXT_RELATIVE_MODE";
 const TEST_REPOSITORY: &str = "AETHYME_TEST_STORAGE_CONTEXT_REPOSITORY";
+const PRIVATE_LEASE_ID: &str = "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_LEASE_ID";
+const PRIVATE_LEASE_GENERATION: &str = "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_LEASE_GENERATION";
+const POISONED_LEASE_ID: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_LEASE_ID";
+const POISONED_LEASE_GENERATION: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_LEASE_GENERATION";
+const PRIVATE_POLICY_DIGEST: &str = "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_POLICY_DIGEST";
+const POISONED_POLICY_DIGEST: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_POLICY_DIGEST";
 
 /// Broker open runs maintenance before returning. A child process gives this
 /// test poisoned ambient paths without mutating process-wide environment in
@@ -466,8 +472,8 @@ fn child_context_preserves_captured_absence_after_xdg_changes() {
         "captured absence must not resolve a changed XDG state directory"
     );
     assert!(
-        !poisoned_state.join("host-resources.db").exists(),
-        "captured absence must not create an explicitly named host DB"
+        poisoned_state.join("host-resources.db").is_file(),
+        "the explicit poison database is a seeded sentinel and must remain available for checks"
     );
     assert!(
         !poisoned_cache.join("aethyme").exists(),
@@ -666,6 +672,23 @@ fn run_absent_context_parent() {
     let poisoned_home = PathBuf::from(
         std::env::var_os("AETHYME_TEST_STORAGE_CONTEXT_POISONED_HOME").expect("poisoned home path"),
     );
+    let poisoned_xdg_state = poisoned_state.join("xdg-state");
+    let repository_git =
+        crate::GitRepo::discover(&repository).expect("discover absent-context fixture");
+    let repository_fingerprint = crate::gates::git_origin_fingerprint(&repository_git);
+    let (poisoned_lease_id, poisoned_lease_generation) = seed_quarantined_resource_lease(
+        &poisoned_state.join("host-resources.db"),
+        &repository_fingerprint,
+        "absent-context",
+    );
+    let poisoned_policy_digest = "b".repeat(64);
+    crate::broker::gate_trust::record_trust_for_host_state(
+        &repository,
+        &poisoned_state,
+        &[poisoned_policy_digest.as_str()],
+        "fixture",
+    )
+    .expect("seed trust only in the poison host state");
 
     let broker = Broker::open_with_options(&repository, BrokerOpenOptions::default())
         .expect("open broker without host storage");
@@ -684,12 +707,22 @@ fn run_absent_context_parent() {
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_STATE", &poisoned_state)
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_CACHE", &poisoned_cache)
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_HOME", &poisoned_home)
-        .env("XDG_STATE_HOME", &poisoned_state)
+        .env(POISONED_LEASE_ID, &poisoned_lease_id)
+        .env(
+            POISONED_LEASE_GENERATION,
+            poisoned_lease_generation.to_string(),
+        )
+        .env(POISONED_POLICY_DIGEST, poisoned_policy_digest)
+        .env("XDG_STATE_HOME", &poisoned_xdg_state)
         .env("XDG_CACHE_HOME", &poisoned_cache)
         .env("HOME", &poisoned_home);
     broker
         .configure_storage_context_for_child(&mut command)
         .expect("serialize captured absent context");
+    command
+        .env("AETHYME_HOST_STATE_DIR", &poisoned_state)
+        .env("AETHYME_HOST_CACHE_DIR", &poisoned_cache)
+        .env_remove(crate::broker::gate_trust::TEST_ESCAPE_ENV);
     let output = command.output().expect("run worker with changed XDG/HOME");
     assert!(
         output.status.success(),
@@ -712,13 +745,74 @@ fn run_absent_context_worker() {
     let poisoned_home = PathBuf::from(
         std::env::var_os("AETHYME_TEST_STORAGE_CONTEXT_POISONED_HOME").expect("poisoned home path"),
     );
-    let broker = Broker::open_with_options(&repository, BrokerOpenOptions::default())
+    let mut broker = Broker::open_with_options(&repository, BrokerOpenOptions::default())
         .expect("open broker from captured child context");
     assert!(broker.storage_context().host_state_dir.is_none());
     assert!(broker.storage_context().host_resource_db_path.is_none());
     assert!(broker.storage_context().host_operation_db_path.is_none());
     assert!(broker.storage_context().host_cache_dir.is_none());
-    assert!(!poisoned_state.join("aethyme/host-resources.db").exists());
+    let poisoned_lease_id =
+        std::env::var(POISONED_LEASE_ID).expect("poisoned lease id from parent");
+    let poisoned_lease_generation =
+        std::env::var(POISONED_LEASE_GENERATION).expect("poisoned lease generation from parent");
+    let report = broker.blockers();
+    assert!(
+        report
+            .unavailable
+            .iter()
+            .any(|source| source.source == "host-resources.db"),
+        "missing captured DB must be reported unavailable, got {report:#?}"
+    );
+    assert!(
+        !report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.id == format!("resource:{poisoned_lease_id}")),
+        "a lease in ambient state must not be reported: {report:#?}"
+    );
+    assert!(
+        matches!(
+            broker.unblock(&crate::UnblockRequest {
+                id: format!("resource:{poisoned_lease_id}"),
+                confirm: Some(poisoned_lease_generation.clone()),
+                ..crate::UnblockRequest::default()
+            }),
+            Err(crate::BrokerOpError::InvalidStorageContext { .. })
+        ),
+        "unblock must refuse when the captured resource DB is absent"
+    );
+    let poisoned_policy_digest =
+        std::env::var(POISONED_POLICY_DIGEST).expect("poisoned policy digest from parent");
+    let trust_error = broker
+        .require_trusted_policy(&context_probe_policy(&poisoned_policy_digest), None)
+        .expect_err("ambient approval must not substitute for missing captured host state");
+    assert!(
+        matches!(
+            trust_error,
+            crate::BrokerOpError::InvalidStorageContext { .. }
+        ),
+        "unexpected trust result: {trust_error}"
+    );
+    assert_eq!(
+        broker
+            .recovery_archive_root()
+            .expect("repo-local archive fallback"),
+        repository.join(".aethyme/recovery-archives")
+    );
+    assert_eq!(
+        resource_lease_state(
+            &poisoned_state.join("host-resources.db"),
+            &poisoned_lease_id
+        ),
+        crate::HostLeaseState::Quarantined,
+        "failed absent-context unblock must leave the poison lease alone"
+    );
+    let poisoned_xdg_state = poisoned_state.join("xdg-state");
+    assert!(
+        !poisoned_xdg_state
+            .join("aethyme/host-resources.db")
+            .exists()
+    );
     assert!(!poisoned_cache.join("aethyme").exists());
     assert!(
         !poisoned_home
@@ -783,13 +877,42 @@ fn run_captured_startup_child() {
     );
     assert!(private_state.join("host-resources.db").is_file());
     assert!(!private_entry.exists());
+    let repository_git =
+        crate::GitRepo::discover(&repository).expect("discover captured-context fixture");
+    let repository_fingerprint = crate::gates::git_origin_fingerprint(&repository_git);
+    let (private_lease_id, private_lease_generation) = seed_quarantined_resource_lease(
+        &private_state.join("host-resources.db"),
+        &repository_fingerprint,
+        "captured-context",
+    );
+    let (poisoned_lease_id, poisoned_lease_generation) = seed_quarantined_resource_lease(
+        &poisoned_state.join("host-resources.db"),
+        &repository_fingerprint,
+        "poisoned-context",
+    );
+    let private_policy_digest = "a".repeat(64);
+    let poisoned_policy_digest = "b".repeat(64);
+    crate::broker::gate_trust::record_trust_for_host_state(
+        &repository,
+        &private_state,
+        &[private_policy_digest.as_str()],
+        "fixture",
+    )
+    .expect("seed trust in the captured host state");
+    crate::broker::gate_trust::record_trust_for_host_state(
+        &repository,
+        &poisoned_state,
+        &[poisoned_policy_digest.as_str()],
+        "fixture",
+    )
+    .expect("seed trust in the poison host state");
     assert!(
         preparation_entry(&poisoned_state).join("payload").is_file(),
         "startup maintenance must not sweep poisoned host state"
     );
     assert!(
-        !poisoned_state.join("host-resources.db").exists(),
-        "the captured sweep must not initialize the ambient resource database"
+        poisoned_state.join("host-resources.db").is_file(),
+        "the poison resource database is a seeded sentinel"
     );
     assert!(
         !poisoned_worktrees.exists(),
@@ -814,6 +937,18 @@ fn run_captured_startup_child() {
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_XDG_STATE", &poisoned_xdg_state)
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_XDG_CACHE", &poisoned_xdg_cache)
         .env("AETHYME_TEST_STORAGE_CONTEXT_POISONED_HOME", &poisoned_home)
+        .env(PRIVATE_LEASE_ID, &private_lease_id)
+        .env(
+            PRIVATE_LEASE_GENERATION,
+            private_lease_generation.to_string(),
+        )
+        .env(POISONED_LEASE_ID, &poisoned_lease_id)
+        .env(
+            POISONED_LEASE_GENERATION,
+            poisoned_lease_generation.to_string(),
+        )
+        .env(PRIVATE_POLICY_DIGEST, &private_policy_digest)
+        .env(POISONED_POLICY_DIGEST, &poisoned_policy_digest)
         .env("XDG_STATE_HOME", &poisoned_xdg_state)
         .env("XDG_CACHE_HOME", &poisoned_xdg_cache)
         .env("HOME", &poisoned_home);
@@ -824,7 +959,8 @@ fn run_captured_startup_child() {
     // changes the public host paths. Other child commands still see HOME/XDG.
     command
         .env("AETHYME_HOST_STATE_DIR", &poisoned_state)
-        .env("AETHYME_HOST_CACHE_DIR", &poisoned_cache);
+        .env("AETHYME_HOST_CACHE_DIR", &poisoned_cache)
+        .env_remove(crate::broker::gate_trust::TEST_ESCAPE_ENV);
     let output = command
         .output()
         .expect("run worker with changed host/XDG paths");
@@ -850,7 +986,7 @@ fn run_captured_context_worker() {
     let poisoned_xdg_cache = var_path("AETHYME_TEST_STORAGE_CONTEXT_POISONED_XDG_CACHE");
     let poisoned_home = var_path("AETHYME_TEST_STORAGE_CONTEXT_POISONED_HOME");
 
-    let broker = Broker::open_with_options(&repository, BrokerOpenOptions::default())
+    let mut broker = Broker::open_with_options(&repository, BrokerOpenOptions::default())
         .expect("open broker from captured child context");
     assert_eq!(
         broker.storage_context().host_state_dir.as_deref(),
@@ -876,7 +1012,6 @@ fn run_captured_context_worker() {
             .preferred_root,
         Some(private_worktrees)
     );
-    assert!(!poisoned_state.join("host-resources.db").exists());
     assert!(!poisoned_cache.exists());
     assert!(
         !poisoned_xdg_state
@@ -889,6 +1024,73 @@ fn run_captured_context_worker() {
             .join("Library/Application Support/Aethyme")
             .exists()
     );
+    let private_lease_id = std::env::var(PRIVATE_LEASE_ID).expect("private lease id from parent");
+    let private_lease_generation =
+        std::env::var(PRIVATE_LEASE_GENERATION).expect("private lease generation from parent");
+    let poisoned_lease_id =
+        std::env::var(POISONED_LEASE_ID).expect("poisoned lease id from parent");
+    let private_state_db = private_state.join("host-resources.db");
+    let report = broker.blockers();
+    assert!(
+        report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.id == format!("resource:{private_lease_id}")),
+        "the blocker reader must use the captured DB: {report:#?}"
+    );
+    assert!(
+        !report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.id == format!("resource:{poisoned_lease_id}")),
+        "the blocker reader must ignore the poison DB: {report:#?}"
+    );
+    let private_policy_digest =
+        std::env::var(PRIVATE_POLICY_DIGEST).expect("private policy digest from parent");
+    let poisoned_policy_digest =
+        std::env::var(POISONED_POLICY_DIGEST).expect("poisoned policy digest from parent");
+    broker
+        .require_trusted_policy(&context_probe_policy(&private_policy_digest), None)
+        .expect("trust recorded in captured host state is accepted");
+    let poison_trust_error = broker
+        .require_trusted_policy(&context_probe_policy(&poisoned_policy_digest), None)
+        .expect_err("trust in the poison host state must not be accepted");
+    assert!(
+        matches!(
+            poison_trust_error,
+            crate::BrokerOpError::GatePolicyUntrusted { .. }
+        ),
+        "unexpected trust result: {poison_trust_error}"
+    );
+    let repository_key = broker
+        .worktree_root_plan()
+        .expect("captured repository identity")
+        .repository_key;
+    assert_eq!(
+        broker
+            .recovery_archive_root()
+            .expect("captured archive root"),
+        private_state.join("recovery-archives").join(repository_key)
+    );
+    assert!(matches!(
+        broker.unblock(&crate::UnblockRequest {
+            id: format!("resource:{private_lease_id}"),
+            confirm: Some(private_lease_generation.clone()),
+            ..crate::UnblockRequest::default()
+        }),
+        Ok(crate::UnblockOutcome::Cleared(_))
+    ));
+    assert_eq!(
+        resource_lease_state(&private_state_db, &private_lease_id),
+        crate::HostLeaseState::Released
+    );
+    assert_eq!(
+        resource_lease_state(
+            &poisoned_state.join("host-resources.db"),
+            &poisoned_lease_id
+        ),
+        crate::HostLeaseState::Quarantined
+    );
 }
 
 fn preparation_entry(host_state: &Path) -> PathBuf {
@@ -896,4 +1098,60 @@ fn preparation_entry(host_state: &Path) -> PathBuf {
         .join("preparation-cache")
         .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .join("bbbbbbbbbbbb")
+}
+
+fn context_probe_policy(digest: &str) -> crate::broker::gate_trust::GatePolicy {
+    crate::broker::gate_trust::GatePolicy {
+        policy_sha256: digest.to_string(),
+        commands: vec![crate::broker::gate_trust::PolicyCommand {
+            source: "gate",
+            name: "captured-context-probe".into(),
+            command: "true".into(),
+        }],
+    }
+}
+
+fn seed_quarantined_resource_lease(
+    database: &Path,
+    repository: &str,
+    suffix: &str,
+) -> (String, u64) {
+    let mut coordinator =
+        crate::HostResourceCoordinator::open(database).expect("open sentinel resource database");
+    let grant = coordinator
+        .acquire(&crate::HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: format!("storage-context-{suffix}"),
+            repository: repository.into(),
+            worktree_fingerprint: format!("storage-context-worktree-{suffix}"),
+            run_id: format!("storage-context-run-{suffix}"),
+            ttl_seconds: 300,
+            holder_pid: None,
+            resources: vec![crate::HostResourceRequirement {
+                key: format!("storage-context-{suffix}"),
+                resource: crate::HostResourceKind::ExclusiveKey {
+                    name: format!("storage-context-{suffix}"),
+                },
+            }],
+        })
+        .expect("acquire sentinel resource lease");
+    let lease = coordinator
+        .quarantine(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .expect("quarantine sentinel resource lease");
+    (lease.lease_id, lease.generation)
+}
+
+fn resource_lease_state(database: &Path, lease_id: &str) -> crate::HostLeaseState {
+    crate::HostResourceCoordinator::open(database)
+        .expect("open sentinel resource database")
+        .list(true)
+        .expect("list sentinel resource database")
+        .into_iter()
+        .find(|lease| lease.lease_id == lease_id)
+        .expect("sentinel lease is present")
+        .state
 }

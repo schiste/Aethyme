@@ -330,8 +330,11 @@ impl Broker {
         let (baseline_source, base) = self.candidate_baseline()?;
 
         let policy = crate::broker::gate_trust::policy_at_commit(self.repo_handle(), &base)?;
-        match crate::broker::gate_trust::assess_trusted(
-            &self.main_root_path(),
+        let main_root = self.main_root_path();
+        let host_state_dir = self.storage_context().host_state_dir.clone();
+        match crate::broker::gate_trust::assess_trusted_for_host_state(
+            &main_root,
+            host_state_dir.as_deref(),
             &policy,
             Some(self.store_ref()),
         ) {
