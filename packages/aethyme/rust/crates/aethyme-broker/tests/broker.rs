@@ -810,7 +810,7 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
     let report = broker.doctor().unwrap();
     assert_eq!(report.integrity, "ok");
     assert_eq!(report.version.status, VersionDriftStatus::NotAethymeSource);
-    assert!(report.healthy());
+    assert!(report.healthy(), "{report:#?}");
 
     // A session whose worktree vanishes out-of-band is a finding.
     let wt = tmp.path().join("doomed-wt");
