@@ -142,13 +142,6 @@ impl<'a> ManagedStorageOwner<'a> {
         self.renew()?;
         let inventory = scan_complete(&self.root, &self.grant, request)?;
         self.renew()?;
-        let free_bytes =
-            crate::disk_headroom::available_bytes(&self.root.parent).ok_or_else(|| {
-                managed_storage_refusal(
-                    "managed_storage_free_bytes_unknown",
-                    "filesystem free space could not be measured; reservation is refused",
-                )
-            })?;
         if inventory.root_present || inventory.allocated_bytes != 0 {
             return Err(managed_storage_refusal(
                 "managed_storage_root_not_fresh",
@@ -156,10 +149,17 @@ impl<'a> ManagedStorageOwner<'a> {
             ));
         }
 
+        let free_space_root = self.root.parent.clone();
         match self
             .coordinator
-            .reserve_managed_storage(request, free_bytes)?
-        {
+            .reserve_managed_storage_with_probe(request, || {
+                crate::disk_headroom::available_bytes(&free_space_root).ok_or_else(|| {
+                    managed_storage_refusal(
+                        "managed_storage_free_bytes_unknown",
+                        "filesystem free space could not be measured; reservation is refused",
+                    )
+                })
+            })? {
             ManagedStorageReservationResult::Created(_) => Ok(
                 ManagedStorageAdmission::Materialize(ManagedStorageGrowthPermit {
                     request: request.clone(),
@@ -325,13 +325,7 @@ impl<'a> ManagedStorageOwner<'a> {
                 "the exact charged root no longer matches its measured baseline and instance",
             ));
         }
-        let free_bytes =
-            crate::disk_headroom::available_bytes(&self.root.parent).ok_or_else(|| {
-                managed_storage_refusal(
-                    "managed_storage_free_bytes_unknown",
-                    "filesystem free space could not be measured; mutation reservation is refused",
-                )
-            })?;
+        let free_space_root = self.root.parent.clone();
         let root_instance_id = lineage.root_instance_id.ok_or_else(|| {
             managed_storage_refusal(
                 "managed_storage_predecessor_unmeasured",
@@ -343,10 +337,18 @@ impl<'a> ManagedStorageOwner<'a> {
             measured_bytes: baseline_bytes,
             root_instance_id,
         };
-        match self
-            .coordinator
-            .reserve_managed_storage_mutation(request, free_bytes, baseline)?
-        {
+        match self.coordinator.reserve_managed_storage_mutation_with_probe(
+            request,
+            || {
+                crate::disk_headroom::available_bytes(&free_space_root).ok_or_else(|| {
+                    managed_storage_refusal(
+                        "managed_storage_free_bytes_unknown",
+                        "filesystem free space could not be measured; mutation reservation is refused",
+                    )
+                })
+            },
+            baseline,
+        )? {
             ManagedStorageReservationResult::Created(_) => Ok(
                 ManagedStorageAdmission::Materialize(ManagedStorageGrowthPermit {
                     request: request.clone(),
@@ -1269,8 +1271,9 @@ mod tests {
     use super::*;
     use crate::resources::{
         HostResourceKind, HostResourceRequest, HostResourceRequirement, ManagedStoragePolicy,
-        VerifiedManagedStorageRemoval,
+        VerifiedManagedStorageRemoval, load_managed_storage_lineage, managed_storage_i64,
     };
+    use rusqlite::params;
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
@@ -1590,6 +1593,19 @@ mod tests {
             first_lineage.superseded_by_claim_id.as_deref(),
             Some(second.claim_id.as_str())
         );
+        let second_lineage = load_managed_storage_lineage(
+            &owner.coordinator.conn,
+            &repository,
+            &filesystem_id,
+            &second.claim_id,
+        )
+        .unwrap()
+        .unwrap();
+        let root_instance_id = second_lineage
+            .root_instance_id
+            .clone()
+            .expect("present root should have a pinned instance");
+        let second_baseline = second_lineage.baseline_bytes;
 
         let cleanup = owner
             .coordinator
@@ -1604,11 +1620,108 @@ mod tests {
             filesystem_id.clone(),
             second.claim_id.clone(),
             root_identity,
+            Some(root_instance_id.clone()),
             "complete-chain-removal".into(),
             0,
             true,
         )
         .unwrap();
+        owner
+            .coordinator
+            .conn
+            .execute(
+                "UPDATE managed_storage_claim_lineage SET baseline_bytes=?4
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                params![
+                    repository,
+                    filesystem_id,
+                    second.claim_id,
+                    managed_storage_i64("baseline_bytes", second_baseline + 1).unwrap()
+                ],
+            )
+            .unwrap();
+        let inconsistent = owner
+            .coordinator
+            .release_managed_storage_claim(&receipt)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&inconsistent),
+            Some("managed_storage_lineage_invalid")
+        );
+        for (claim_id, expected_state) in [
+            (
+                &first.claim_id,
+                crate::resources::ManagedStorageClaimState::Charged,
+            ),
+            (
+                &second.claim_id,
+                crate::resources::ManagedStorageClaimState::CleanupPending,
+            ),
+        ] {
+            let unchanged = owner
+                .coordinator
+                .managed_storage_claim(&repository, &filesystem_id, claim_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(unchanged.state, expected_state);
+        }
+        owner
+            .coordinator
+            .conn
+            .execute(
+                "UPDATE managed_storage_claim_lineage SET baseline_bytes=?4
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                params![repository, filesystem_id, second.claim_id, second_baseline],
+            )
+            .unwrap();
+        owner
+            .coordinator
+            .conn
+            .execute(
+                "UPDATE managed_storage_claim_lineage SET root_instance_id=?4
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                params![
+                    repository,
+                    filesystem_id,
+                    first.claim_id,
+                    "mismatched-instance"
+                ],
+            )
+            .unwrap();
+        let inconsistent_instance = owner
+            .coordinator
+            .release_managed_storage_claim(&receipt)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&inconsistent_instance),
+            Some("managed_storage_lineage_invalid")
+        );
+        for (claim_id, expected_state) in [
+            (
+                &first.claim_id,
+                crate::resources::ManagedStorageClaimState::Charged,
+            ),
+            (
+                &second.claim_id,
+                crate::resources::ManagedStorageClaimState::CleanupPending,
+            ),
+        ] {
+            let unchanged = owner
+                .coordinator
+                .managed_storage_claim(&repository, &filesystem_id, claim_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(unchanged.state, expected_state);
+        }
+        owner
+            .coordinator
+            .conn
+            .execute(
+                "UPDATE managed_storage_claim_lineage SET root_instance_id=?4
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                params![repository, filesystem_id, first.claim_id, root_instance_id],
+            )
+            .unwrap();
         owner
             .coordinator
             .release_managed_storage_claim(&receipt)
@@ -1750,11 +1863,25 @@ mod tests {
         let first_permit = expect_permit(owner.reserve(&first).unwrap());
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("same"), vec![8_u8; 4_096]).unwrap();
-        owner.reconcile_new(first_permit).unwrap();
+        let first_charged = owner.reconcile_new(first_permit).unwrap();
+        let first_measured_bytes = first_charged.measured_bytes.unwrap();
+        let original_instance_id = load_managed_storage_lineage(
+            &owner.coordinator.conn,
+            &repository,
+            &filesystem_id,
+            &first.claim_id,
+        )
+        .unwrap()
+        .unwrap()
+        .root_instance_id
+        .unwrap();
 
         std::fs::rename(&root, &held_old).unwrap();
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("same"), vec![8_u8; 4_096]).unwrap();
+        let replacement_inventory = scan_complete(&owner.root, &owner.grant, &first).unwrap();
+        let replacement_instance_id = replacement_inventory.root_instance_id.unwrap();
+        assert_ne!(replacement_instance_id, original_instance_id);
         let error = owner
             .reserve_mutation(&second, &first.claim_id)
             .unwrap_err();
@@ -1768,6 +1895,68 @@ mod tests {
                 .managed_storage_claim(&repository, &filesystem_id, &second.claim_id)
                 .unwrap()
                 .is_none()
+        );
+
+        let cleanup = owner
+            .coordinator
+            .mark_managed_storage_cleanup_pending(&first)
+            .unwrap();
+        assert_eq!(
+            cleanup.state,
+            crate::resources::ManagedStorageClaimState::CleanupPending
+        );
+        std::fs::remove_file(root.join("same")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let replacement_receipt = VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+            repository.clone(),
+            filesystem_id.clone(),
+            first.claim_id.clone(),
+            first.root_identity.clone(),
+            Some(replacement_instance_id),
+            "removed-replacement-root".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        let release_error = owner
+            .coordinator
+            .release_managed_storage_claim(&replacement_receipt)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&release_error),
+            Some("managed_storage_root_instance_mismatch")
+        );
+        let retained = owner
+            .coordinator
+            .managed_storage_claim(&repository, &filesystem_id, &first.claim_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.state,
+            crate::resources::ManagedStorageClaimState::CleanupPending
+        );
+        assert_eq!(retained.measured_bytes, Some(first_measured_bytes));
+
+        std::fs::remove_file(held_old.join("same")).unwrap();
+        std::fs::remove_dir(&held_old).unwrap();
+        let original_receipt = VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+            repository.clone(),
+            filesystem_id.clone(),
+            first.claim_id.clone(),
+            first.root_identity.clone(),
+            Some(original_instance_id),
+            "removed-original-root".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            owner
+                .coordinator
+                .release_managed_storage_claim(&original_receipt)
+                .unwrap()
+                .state,
+            crate::resources::ManagedStorageClaimState::Released
         );
     }
 
