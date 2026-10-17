@@ -6500,7 +6500,11 @@ mod tests {
             fresh.orphans[0].worktree_root,
             root.to_string_lossy().as_ref()
         );
-        assert_ne!(fresh.digest, digest);
+        // Authorization digests describe the candidate set, not the time of
+        // review. Restoring the same origin absence can reproduce that set.
+        // The revoked journal must be retired so a newly reviewed plan is
+        // independently revalidated instead of resuming stale authority.
+        assert!(!broker.main_root().join(".aethyme/gc-journal.json").exists());
         let applied = broker.gc_apply(&fresh.digest).unwrap();
         assert!(applied.complete);
         assert!(!root.exists());
