@@ -1511,6 +1511,28 @@ pub(crate) fn run_all_in(
     )
 }
 
+/// Run every gate using the default storage paths and an injectable progress sink.
+pub(crate) fn run_all_with_progress(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    progress: &dyn GateProgressSink,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_all_with_progress_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        session_id,
+        cache_policy,
+        progress,
+        GateStorageLocations::default(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_all_with_progress_in(
     store: &mut BrokerStore,
