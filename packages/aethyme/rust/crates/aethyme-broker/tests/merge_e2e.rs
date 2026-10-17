@@ -17,6 +17,8 @@ use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, lin
 use aethyme_graph_storage::bootstrap_repo;
 use aethyme_graph_storage::write_graph_authority_manifest;
 
+mod common;
+
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -122,7 +124,7 @@ fn refresh_graph(root: &Path, repository: &str) {
 /// `broker status`.
 #[test]
 fn submit_advises_on_a_stale_authoritative_graph_and_still_promotes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
@@ -140,7 +142,9 @@ fn submit_advises_on_a_stale_authoritative_graph_and_still_promotes() {
     );
 
     let integration_before = resolve(tmp.path(), "aethyme/integration");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "stale-graph");
     let session = broker.adopt(&worktree, Some("change source")).unwrap();
     commit_edit(&worktree, "src/a.py", "a = 2\n");
@@ -241,7 +245,13 @@ fn unmerged_paths(worktree: &Path) -> Vec<String> {
 /// to own it.
 fn dual_identity_conflict_fixture(root: &Path) -> (Broker, std::path::PathBuf, i64, String) {
     init_repo(root);
-    let mut broker = Broker::open(root).unwrap();
+    let mut broker = common::open_fixture_broker(
+        root,
+        root.parent()
+            .expect("fixture repository has an owning temp directory"),
+    )
+    .unwrap()
+    .into_broker();
 
     let duplicate_on_integration = agent_worktree(root, "integration-duplicate");
     let duplicate_session = broker
@@ -287,7 +297,7 @@ fn dual_identity_conflict_fixture(root: &Path) -> (Broker, std::path::PathBuf, i
 
 #[test]
 fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     // Manual mode opt-in: this test exercises the explicit promote path
     // and requeue-on-base-move of already-verified entries.
@@ -296,7 +306,9 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
         "[promote]\nmode = \"manual\"\n",
     )
     .unwrap();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_a = agent_worktree(tmp.path(), "a");
     let wt_b = agent_worktree(tmp.path(), "b");
@@ -426,14 +438,16 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
 
 #[test]
 fn auto_promotion_releases_the_verification_slot_before_requeue() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
         "[promote]\nmode = \"manual\"\n",
     )
     .unwrap();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_a = agent_worktree(tmp.path(), "auto-a");
     let wt_b = agent_worktree(tmp.path(), "auto-b");
@@ -473,7 +487,9 @@ fn auto_promotion_releases_the_verification_slot_before_requeue() {
     };
     assert!(status.success(), "broker submit failed with {status}");
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let queue = broker.store().merge_queue().unwrap();
     assert_eq!(
         queue
@@ -503,14 +519,16 @@ fn auto_promotion_releases_the_verification_slot_before_requeue() {
 
 #[test]
 fn promotion_persists_one_non_blocking_advisory_per_affected_live_session() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
         "[promote]\nmode = \"manual\"\n",
     )
     .unwrap();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let affected_worktree = agent_worktree(tmp.path(), "affected");
     let affected = broker
@@ -695,7 +713,13 @@ fn contract_tracked_repo(root: &Path, name: &str) -> (Broker, i64, std::path::Pa
     std::fs::write(root.join("src/a.py"), "a = legacy_entry_point\n").unwrap();
     sh(root, &["add", "-A"]);
     sh(root, &["commit", "-qm", "track a consumer"]);
-    let mut broker = Broker::open(root).unwrap();
+    let mut broker = common::open_fixture_broker(
+        root,
+        root.parent()
+            .expect("fixture repository has an owning temp directory"),
+    )
+    .unwrap()
+    .into_broker();
     let worktree = agent_worktree(root, name);
     let session = broker.adopt(&worktree, Some(name)).unwrap();
     (broker, session.id, worktree)
@@ -713,7 +737,7 @@ fn cli_submit(root: &Path, session: i64) -> std::process::Output {
 // session's commits, which are all the broker's contract gate can see.
 #[test]
 fn submit_refuses_an_undeclared_tracked_removal_before_any_gate_runs() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "undeclared");
     commit_edit(&worktree, "src/a.py", "a = 2\n");
     drop(broker);
@@ -725,7 +749,9 @@ fn submit_refuses_an_undeclared_tracked_removal_before_any_gate_runs() {
         stderr.contains("contract-decision preflight failed before any gate ran"),
         "{stderr}"
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     assert!(
         broker
             .store()
@@ -741,7 +767,7 @@ fn submit_refuses_an_undeclared_tracked_removal_before_any_gate_runs() {
 // integrates, so it must not refuse a submission whose commits are clean.
 #[test]
 fn submit_preflight_ignores_uncommitted_tracked_removals() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "uncommitted");
     commit_edit(&worktree, "src/b.py", "b = 2\n");
     std::fs::write(worktree.join("src/a.py"), "a = 2\n").unwrap();
@@ -758,9 +784,11 @@ fn submit_preflight_ignores_uncommitted_tracked_removals() {
 
 #[test]
 fn verification_commit_preserves_only_the_owned_contract_decision() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "contract-decision");
     let session = broker
         .adopt(&worktree, Some("document an agent protocol"))
@@ -796,9 +824,11 @@ fn verification_commit_preserves_only_the_owned_contract_decision() {
 // reach it, or no truthful label can pass once the matcher fires.
 #[test]
 fn verification_commit_carries_the_contract_justification() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "contract-justification");
     let session = broker
         .adopt(&worktree, Some("remove generated data"))
@@ -837,9 +867,11 @@ fn verification_commit_carries_the_contract_justification() {
 
 #[test]
 fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "repeat");
     let session = broker.adopt(&worktree, Some("two contributions")).unwrap();
     let adopted_head = session.adopted_head.clone();
@@ -895,9 +927,11 @@ fn repeated_submission_uses_the_last_accepted_session_head_as_its_checkpoint() {
 
 #[test]
 fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "rewritten-follow-up");
     let session = broker.adopt(&worktree, Some("two contributions")).unwrap();
 
@@ -965,9 +999,11 @@ fn follow_up_refuses_to_replace_a_rewritten_accepted_checkpoint_with_integration
 
 #[test]
 fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_followup_work() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "checkpoint-recovery");
     let session = broker
         .adopt(&worktree, Some("recover rewritten checkpoint"))
@@ -1095,9 +1131,11 @@ fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_foll
 
 #[test]
 fn checkpoint_recovery_refuses_divergence_and_sessions_without_acceptance_proof() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let fresh_worktree = agent_worktree(tmp.path(), "no-checkpoint");
     let fresh = broker.adopt(&fresh_worktree, None).unwrap();
     let missing = broker.plan_session_checkpoint_recovery(fresh.id).unwrap();
@@ -1162,9 +1200,11 @@ fn checkpoint_recovery_refuses_divergence_and_sessions_without_acceptance_proof(
 
 #[test]
 fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_a = agent_worktree(tmp.path(), "a");
     let wt_b = agent_worktree(tmp.path(), "b");
@@ -1249,7 +1289,7 @@ fn conflicting_submission_rejected_pre_gate_with_instruction_drop() {
 
 #[test]
 fn normalized_replay_drops_dual_identity_noise_and_preserves_real_conflicts() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     let (mut broker, victim, victim_id, victim_baseline) =
         dual_identity_conflict_fixture(tmp.path());
 
@@ -1391,9 +1431,11 @@ fn normalized_replay_drops_dual_identity_noise_and_preserves_real_conflicts() {
 
 #[test]
 fn normalized_replay_handles_rebased_rename_binary_empty_and_stable_order() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let integration_worktree = agent_worktree(tmp.path(), "integration-base");
     let integration_session = broker.adopt(&integration_worktree, None).unwrap();
@@ -1481,9 +1523,11 @@ fn normalized_replay_handles_rebased_rename_binary_empty_and_stable_order() {
 
 #[test]
 fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let first = broker
         .start_worktree("land the product change", None)
         .unwrap();
@@ -1613,9 +1657,11 @@ fn repeated_reuse_after_rebase_preserves_owned_work_and_finish_truth() {
 
 #[test]
 fn submission_with_unchanged_result_is_a_truthful_noop() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "nothing-to-submit");
     let session = broker.adopt(&worktree, Some("inspect only")).unwrap();
     let submitted_head = resolve(&worktree, "HEAD");
@@ -1649,9 +1695,11 @@ fn submission_with_unchanged_result_is_a_truthful_noop() {
 
 #[test]
 fn patch_equivalent_supersession_checkpoints_the_submitted_head() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let duplicate = agent_worktree(tmp.path(), "duplicate-patch");
     let publisher = agent_worktree(tmp.path(), "patch-publisher");
     let duplicate_session = broker
@@ -1693,9 +1741,11 @@ fn patch_equivalent_supersession_checkpoints_the_submitted_head() {
 }
 
 fn exact_integration_sync_case(equal_parent_trees: bool) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let integration_builder = agent_worktree(tmp.path(), "integration-builder");
     if equal_parent_trees {
         sh(
@@ -1760,9 +1810,11 @@ fn exact_content_neutral_integration_merges_ignore_parent_tree_equality() {
 
 #[test]
 fn normalized_replay_refuses_missing_baseline() {
-    let missing_tmp = tempfile::tempdir().unwrap();
+    let missing_tmp = common::FixtureRepository::new();
     init_repo(missing_tmp.path());
-    let mut missing_broker = Broker::open(missing_tmp.path()).unwrap();
+    let mut missing_broker = common::open_fixture_repository_broker(&missing_tmp)
+        .unwrap()
+        .into_broker();
     let missing_worktree = agent_worktree(missing_tmp.path(), "missing-baseline");
     let missing_session = missing_broker
         .store()
@@ -1822,9 +1874,11 @@ fn owned_merge_fixture() -> (
     std::path::PathBuf,
     aethyme_broker::Session,
 ) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "merge-commit");
     let session = broker.adopt(&worktree, None).unwrap();
     let baseline = resolve(&worktree, "HEAD");
@@ -1892,9 +1946,11 @@ fn owned_merge_history_is_gated_exactly_and_preserved_without_ref_writes_during_
 
 #[test]
 fn owned_merge_history_preserves_manual_conflict_resolution_edits() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "resolved");
     let session = broker.adopt(&worktree, None).unwrap();
     sh(&worktree, &["branch", "side"]);
@@ -1926,14 +1982,16 @@ fn owned_merge_history_preserves_manual_conflict_resolution_edits() {
 
 #[test]
 fn owned_merge_history_promotes_the_pinned_snapshot_when_the_source_branch_advances() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
         "[promote]\nmode = \"manual\"\n",
     )
     .unwrap();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "pinned");
     let session = broker.adopt(&worktree, None).unwrap();
     sh(&worktree, &["branch", "side"]);
@@ -2000,9 +2058,11 @@ fn owned_merge_history_refuses_when_current_integration_is_not_an_ancestor() {
 
 #[test]
 fn base_gate_policy_judges_a_submission_that_weakens_or_deletes_its_gates() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     // The failing gate is committed at the base: submission policy comes from
     // the tree the change lands on, not from the session.
     std::fs::write(
@@ -2103,9 +2163,11 @@ fn base_gate_policy_judges_a_submission_that_weakens_or_deletes_its_gates() {
 
 #[test]
 fn promote_commit_credits_the_human_the_agent_and_the_broker() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let wt = agent_worktree(tmp.path(), "credited");
     let session = broker
         .adopt_with(
@@ -2159,9 +2221,11 @@ fn promote_commit_credits_the_human_the_agent_and_the_broker() {
 
 #[test]
 fn promote_commit_omits_an_agent_that_never_identified_itself() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let wt = agent_worktree(tmp.path(), "anonymous");
     // Plain `adopt` records no agent — the pre-attribution behaviour every
     // existing caller still gets.
@@ -2187,9 +2251,11 @@ fn promote_commit_omits_an_agent_that_never_identified_itself() {
 
 #[test]
 fn repo_without_gates_is_a_pure_conflict_manager() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     // Conflict-only mode is committed repository state at the base: a
     // session removing gates.toml on its own would not escape its gates.
@@ -2220,9 +2286,11 @@ fn repo_without_gates_is_a_pure_conflict_manager() {
 
 #[test]
 fn integration_follows_main_but_never_clobbers_unmerged_promotions() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     // Branch created at main HEAD; main then advances → integration
     // fast-forwards on the next touch (issue #40), with an event.
@@ -2263,9 +2331,11 @@ fn integration_follows_main_but_never_clobbers_unmerged_promotions() {
 
 #[test]
 fn main_checkout_submission_selects_gates_from_pre_refresh_base() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     // First submission from the main checkout creates the integration
     // branch at the session's own head — no earlier verified state exists,
@@ -2297,9 +2367,11 @@ fn main_checkout_submission_selects_gates_from_pre_refresh_base() {
 
 #[test]
 fn action_required_is_cleared_after_successful_promotion() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     // Session 1 promotes a change to src/a.py.
     let wt1 = agent_worktree(tmp.path(), "one");
@@ -2352,9 +2424,11 @@ fn action_required_is_cleared_after_successful_promotion() {
 
 #[test]
 fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_promoted = agent_worktree(tmp.path(), "promoted");
     let promoted = broker.adopt(&wt_promoted, Some("promoted")).unwrap();
@@ -2402,9 +2476,11 @@ fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
 
 #[test]
 fn integration_status_reports_pending_layer_entries_files_and_conflicts() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_promoted = agent_worktree(tmp.path(), "pending-promoted");
     let promoted = broker.adopt(&wt_promoted, Some("promoted layer")).unwrap();
@@ -2473,12 +2549,14 @@ fn integration_status_reports_pending_layer_entries_files_and_conflicts() {
 
 #[test]
 fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(tmp.path().join("src/a.py"), "a = 1\nmiddle = 1\nb = 1\n").unwrap();
     sh(tmp.path(), &["add", "-A"]);
     sh(tmp.path(), &["commit", "-qm", "make separate lines"]);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_promoted = agent_worktree(tmp.path(), "promoted-repair");
     let promoted = broker.adopt(&wt_promoted, Some("promoted")).unwrap();
@@ -2528,9 +2606,11 @@ fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
 
 #[test]
 fn session_161_rebase_submit_promote_continue_and_submit_again() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "session-161");
     let session = broker
         .adopt(&worktree, Some("session 161 sequence"))
@@ -2582,7 +2662,7 @@ fn session_161_rebase_submit_promote_continue_and_submit_again() {
 
 #[test]
 fn repair_replays_only_submission_plan_pending_commits_after_a_promotion() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(
         tmp.path().join("src/a.py"),
@@ -2591,7 +2671,9 @@ fn repair_replays_only_submission_plan_pending_commits_after_a_promotion() {
     .unwrap();
     sh(tmp.path(), &["add", "src/a.py"]);
     sh(tmp.path(), &["commit", "-qm", "separate repair lines"]);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let worktree = agent_worktree(tmp.path(), "checkpoint-repair");
     let session = broker.adopt(&worktree, Some("repair follow-up")).unwrap();
@@ -2670,9 +2752,11 @@ fn repair_replays_only_submission_plan_pending_commits_after_a_promotion() {
 
 #[test]
 fn unsafe_repair_guidance_preserves_pending_commits_before_any_reset() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "unsafe-repair");
     let session = broker
         .adopt(&worktree, Some("preserve pending work"))
@@ -2709,14 +2793,16 @@ fn unsafe_repair_guidance_preserves_pending_commits_before_any_reset() {
 
 #[test]
 fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
         "[promote]\nmode = \"manual\"\n",
     )
     .unwrap();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "promotion-checkpoint-recovery");
     let session = broker
         .adopt(&worktree, Some("recover promotion checkpoint"))
@@ -2749,7 +2835,9 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
     );
     drop(broker);
 
-    let mut recovered = Broker::open(tmp.path()).unwrap();
+    let mut recovered = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let persisted = recovered.store().session(session.id).unwrap();
     assert_eq!(
         persisted.accepted_session_head,
@@ -2795,9 +2883,11 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
 
 #[test]
 fn broker_open_backfills_exposure_for_a_pre_v17_promotion() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "legacy-promotion-exposure");
     let session = broker
         .adopt(&worktree, Some("legacy promoted entry"))
@@ -2817,7 +2907,9 @@ fn broker_open_backfills_exposure_for_a_pre_v17_promotion() {
         .unwrap();
     drop(database);
 
-    let mut reopened = Broker::open(tmp.path()).unwrap();
+    let mut reopened = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let exposure = reopened
         .store()
         .entry_path_exposure(outcome.entry.id)
@@ -2833,9 +2925,11 @@ fn broker_open_backfills_exposure_for_a_pre_v17_promotion() {
 /// candidate (#460); this pins that the batched answer still decides.
 #[test]
 fn reconcile_classifies_a_promotion_upstream_kept_by_ancestry() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "kept-upstream");
     let session = broker.adopt(&worktree, Some("land by merge")).unwrap();
     commit_edit(&worktree, "src/kept.py", "kept = 1\n");
@@ -2879,9 +2973,11 @@ fn reconcile_classifies_a_promotion_upstream_kept_by_ancestry() {
 
 #[test]
 fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_a = agent_worktree(tmp.path(), "reconcile-a");
     let wt_b = agent_worktree(tmp.path(), "reconcile-b");
@@ -3058,9 +3154,11 @@ fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
 
 #[test]
 fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let wt = agent_worktree(tmp.path(), "ambiguous-promotion");
     let session = broker.adopt(&wt, Some("ambiguous upstream")).unwrap();
     commit_edit(&wt, "src/a.py", "a = 2\n");
@@ -3111,9 +3209,11 @@ fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
 
 #[test]
 fn reconcile_accepts_commit_bound_operator_supersession_with_durable_audit() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let wt_a = agent_worktree(tmp.path(), "operator-resolution-a");
     let wt_b = agent_worktree(tmp.path(), "operator-resolution-b");
     let session_a = broker.adopt(&wt_a, Some("superseded a")).unwrap();
@@ -3278,9 +3378,11 @@ fn reconcile_accepts_commit_bound_operator_supersession_with_durable_audit() {
 
 #[test]
 fn broker_open_finishes_reconciliation_interrupted_after_ref_move() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let wt = agent_worktree(tmp.path(), "crash-recovery-promotion");
     let session = broker.adopt(&wt, Some("crash recovery proof")).unwrap();
     commit_edit(&wt, "src/a.py", "a = 2\n");
@@ -3360,7 +3462,9 @@ fn broker_open_finishes_reconciliation_interrupted_after_ref_move() {
     );
     drop(broker); // Simulate process death before phase-two SQLite commit.
 
-    let mut recovered = Broker::open(tmp.path()).unwrap();
+    let mut recovered = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let queue = recovered.store().merge_queue().unwrap();
     assert_eq!(
         queue
@@ -3383,9 +3487,11 @@ fn broker_open_finishes_reconciliation_interrupted_after_ref_move() {
 
 #[test]
 fn reconcile_refuses_to_discard_unrecorded_integration_commits() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     broker.integration_head().unwrap();
     sh(tmp.path(), &["switch", "aethyme/integration"]);
     std::fs::write(tmp.path().join("src/unrecorded.py"), "keep = 1\n").unwrap();
@@ -3417,9 +3523,11 @@ fn reconcile_refuses_to_discard_unrecorded_integration_commits() {
 
 #[test]
 fn promotion_does_not_resurrect_conflicts_from_cleaned_sessions() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let stale_a_wt = agent_worktree(tmp.path(), "cleaned-stale-a");
     let stale_b_wt = agent_worktree(tmp.path(), "cleaned-stale-b");
@@ -3504,9 +3612,11 @@ fn promotion_does_not_resurrect_conflicts_from_cleaned_sessions() {
 
 #[test]
 fn reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let stale_a_wt = agent_worktree(tmp.path(), "active-stale-a");
     let stale_b_wt = agent_worktree(tmp.path(), "active-stale-b");
@@ -3704,9 +3814,11 @@ fn reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries() {
 
 #[test]
 fn failed_reconciliation_rolls_back_ref_and_database() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let wt = agent_worktree(tmp.path(), "rollback-promotion");
     let session = broker.adopt(&wt, Some("rollback proof")).unwrap();
     commit_edit(&wt, "src/a.py", "a = 2\n");
@@ -3770,9 +3882,11 @@ fn failed_reconciliation_rolls_back_ref_and_database() {
 
 #[test]
 fn repair_refuses_when_session_baseline_is_newer_than_integration() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt_promoted = agent_worktree(tmp.path(), "older-integration");
     let promoted = broker.adopt(&wt_promoted, Some("older layer")).unwrap();
@@ -3806,7 +3920,7 @@ fn repair_refuses_when_session_baseline_is_newer_than_integration() {
 
 #[test]
 fn status_warns_on_the_first_external_main_movement() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     sh(tmp.path(), &["switch", "-qc", "status-upstream", "main"]);
     std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
@@ -3832,7 +3946,9 @@ fn status_warns_on_the_first_external_main_movement() {
         &["config", "branch.main.merge", "refs/heads/main"],
     );
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let status = broker.status(0).unwrap();
     let expected_upstream = resolve(tmp.path(), "origin/main");
     assert_eq!(status.main_head, resolve(tmp.path(), "main"));
@@ -3876,9 +3992,11 @@ fn status_warns_on_the_first_external_main_movement() {
 
 #[test]
 fn status_distinguishes_stale_landed_promotions_from_unresolved_drift() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "landed-promotion");
     let session = broker.adopt(&worktree, Some("land through pr")).unwrap();
     commit_edit(&worktree, "src/a.py", "a = 2\n");
@@ -3936,7 +4054,7 @@ fn status_distinguishes_stale_landed_promotions_from_unresolved_drift() {
 
 #[test]
 fn status_reports_both_local_and_upstream_only_counts_after_divergence() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     sh(tmp.path(), &["switch", "-qc", "upstream-history", "main"]);
     for index in 1..=2 {
@@ -3973,7 +4091,9 @@ fn status_reports_both_local_and_upstream_only_counts_after_divergence() {
         &["config", "branch.main.merge", "refs/heads/main"],
     );
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let status = broker.status(0).unwrap();
     assert_eq!(status.main_ahead_upstream_commits, 1);
     assert_eq!(status.main_behind_upstream_commits, 2);
@@ -3993,9 +4113,11 @@ fn status_reports_both_local_and_upstream_only_counts_after_divergence() {
 
 #[test]
 fn status_warns_when_local_and_upstream_main_move_together_beyond_integration() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     sh(tmp.path(), &["switch", "-qc", "promoted", "main"]);
     std::fs::write(tmp.path().join("src/b.py"), "b = 2\n").unwrap();
     sh(tmp.path(), &["add", "src/b.py"]);
@@ -4068,9 +4190,11 @@ fn status_warns_when_local_and_upstream_main_move_together_beyond_integration() 
 
 #[test]
 fn status_advice_warns_about_dirty_worktree_wip() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt = agent_worktree(tmp.path(), "dirty");
     let session = broker.adopt(&wt, Some("dirty wip")).unwrap();
@@ -4100,9 +4224,11 @@ fn status_advice_warns_about_dirty_worktree_wip() {
 
 #[test]
 fn status_reports_branch_drift_and_dirty_changes_in_an_adopted_primary_checkout() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker
         .adopt(tmp.path(), Some("adopt primary checkout"))
         .unwrap();
@@ -4140,9 +4266,11 @@ fn status_reports_branch_drift_and_dirty_changes_in_an_adopted_primary_checkout(
 
 #[test]
 fn submit_refuses_an_adopted_checkout_that_switched_branches_before_queueing() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker
         .adopt(tmp.path(), Some("submit branch guard"))
         .unwrap();
@@ -4184,10 +4312,12 @@ fn submit_accepts_a_session_adopted_on_a_detached_checkout() {
     // Routed reviews adopt a detached checkout, so the session records `HEAD`
     // as its branch. Staying detached is not drift; `refs/heads/HEAD` does
     // not exist and must not be required.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     sh(tmp.path(), &["checkout", "-q", "--detach"]);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(tmp.path(), Some("detached adoption")).unwrap();
     assert_eq!(session.branch, "HEAD");
     commit_edit(tmp.path(), "src/a.py", "a = 2\n");
@@ -4216,9 +4346,11 @@ fn submit_accepts_a_session_adopted_on_a_detached_checkout() {
 /// stale row from weeks earlier deferred cleanup after every merge (#268).
 #[test]
 fn a_rejected_entry_whose_commit_was_collected_does_not_abort_reconcile() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt = agent_worktree(tmp.path(), "reconcile-collected");
     let session = broker.adopt(&wt, Some("land real work")).unwrap();
@@ -4261,9 +4393,11 @@ fn a_rejected_entry_whose_commit_was_collected_does_not_abort_reconcile() {
 /// not occur, so it keeps failing loudly rather than being silently dropped.
 #[test]
 fn a_pending_entry_whose_commit_is_missing_still_fails_loudly() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let wt = agent_worktree(tmp.path(), "reconcile-pending-missing");
     let session = broker.adopt(&wt, Some("land real work")).unwrap();
@@ -4311,9 +4445,11 @@ fn commit_base_gate(root: &Path, gate_toml: &str) {
 /// be deferred forever.
 #[test]
 fn a_first_broker_timeout_defers_the_submission_and_a_repeat_rejects_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     commit_base_gate(
         tmp.path(),
         "[[gate]]\nname = \"slow\"\ncommand = \"sleep 5\"\ntimeout_seconds = 1\ntriggers = [\"**/*.py\"]\n",
@@ -4373,9 +4509,11 @@ fn a_first_broker_timeout_defers_the_submission_and_a_repeat_rejects_it() {
 /// code forever.
 #[test]
 fn test_output_that_looks_like_a_host_fault_is_still_a_rejection() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     commit_base_gate(
         tmp.path(),
         "[[gate]]\nname = \"flaky-net\"\ncommand = \"echo 'request timed out'; exit 1\"\ntriggers = [\"**/*.py\"]\n",
