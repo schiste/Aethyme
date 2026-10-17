@@ -1400,6 +1400,9 @@ fn sweep_preparation_cache_with_discovery(
         Ok(roots) => roots,
         Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
     };
+    if live_roots.is_empty() {
+        return PreparationCacheSweepReport::incomplete_empty();
+    }
     let live_keys = match current_preparation_keys(&live_roots, deadline) {
         Ok(keys) => keys,
         Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
@@ -1447,6 +1450,7 @@ fn sweep_preparation_cache_with_discovery(
             break;
         };
         if repository_type.is_symlink() || !repository_type.is_dir() {
+            complete = false;
             continue;
         }
         let Some(repository_name) = repository_path.file_name().and_then(|name| name.to_str())
@@ -1461,6 +1465,7 @@ fn sweep_preparation_cache_with_discovery(
         let Some((lease_repository, retired)) =
             preparation_cache_repository_identity(repository_name)
         else {
+            complete = false;
             continue;
         };
         if retired {
@@ -1548,7 +1553,10 @@ fn sweep_preparation_cache_with_discovery(
                     filesystem_entries_reclaimed =
                         filesystem_entries_reclaimed.saturating_add(count);
                 }
-                PreparationCacheSweepOutcome::Protected => continue,
+                PreparationCacheSweepOutcome::Protected => {
+                    complete = false;
+                    continue;
+                }
                 PreparationCacheSweepOutcome::Failed(count) => {
                     filesystem_entries_reclaimed =
                         filesystem_entries_reclaimed.saturating_add(count);
@@ -1600,10 +1608,12 @@ fn sweep_preparation_cache_with_discovery(
                 };
             };
             if file_type.is_symlink() || !file_type.is_dir() {
+                complete = false;
                 continue;
             }
             let key = entry.file_name().to_string_lossy().into_owned();
             if !is_preparation_cache_key(&key) {
+                complete = false;
                 continue;
             }
             if live_keys.contains(&key) {
@@ -1710,7 +1720,10 @@ fn sweep_preparation_cache_with_discovery(
                     filesystem_entries_reclaimed =
                         filesystem_entries_reclaimed.saturating_add(count);
                 }
-                PreparationCacheSweepOutcome::Protected => continue,
+                PreparationCacheSweepOutcome::Protected => {
+                    complete = false;
+                    continue;
+                }
                 PreparationCacheSweepOutcome::Failed(count) => {
                     filesystem_entries_reclaimed =
                         filesystem_entries_reclaimed.saturating_add(count);

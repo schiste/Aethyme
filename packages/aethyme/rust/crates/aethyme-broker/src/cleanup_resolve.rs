@@ -222,8 +222,9 @@ impl Broker {
     /// rule that keeps its worktrees out of durable host state.
     pub(crate) fn recovery_archive_root(&self) -> Result<PathBuf, BrokerOpError> {
         let key = self.worktree_root_plan()?.repository_key;
-        let durable = crate::host_state::default_host_state_dir().filter(|_| {
-            crate::host_state::host_state_dir_is_explicit()
+        let storage = self.storage_context();
+        let durable = storage.host_state_dir.as_ref().filter(|_| {
+            storage.host_state_dir_is_explicit
                 || !crate::host_state::path_is_ephemeral(self.main_root())
         });
         Ok(match durable {

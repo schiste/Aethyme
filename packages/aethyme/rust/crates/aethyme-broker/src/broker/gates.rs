@@ -1118,7 +1118,14 @@ impl Broker {
         session_id: Option<i64>,
     ) -> Result<(), BrokerOpError> {
         let main_root = self.main_root.clone();
-        gate_trust::require_trusted(&main_root, policy, Some(&mut self.store), session_id)?;
+        let host_state_dir = self.storage_context().host_state_dir.clone();
+        gate_trust::require_trusted_for_host_state(
+            &main_root,
+            host_state_dir.as_deref(),
+            policy,
+            Some(&mut self.store),
+            session_id,
+        )?;
         Ok(())
     }
 
