@@ -40,7 +40,55 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
     git(repo.path(), &["commit", "-qm", "init"]);
     std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
     std::fs::write(repo.path().join(".aethyme/broker.toml"), retention).unwrap();
+    discover_artifact_sweep_namespace(repo.path(), container.path());
     (repo, container)
+}
+
+/// Discover the namespace from the same CLI environment used by every test
+/// command. The empty fixture has no sweep candidates, so this bootstrap only
+/// registers its captured storage context; its per-context state is then
+/// removed to leave the fixture as an otherwise fresh sweep database.
+fn discover_artifact_sweep_namespace(repo: &Path, container: &Path) {
+    let config = repo.join(".aethyme/broker.toml");
+    let original = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
+    )
+    .unwrap();
+    let output = run(repo, container, &["gc", "sweep", "--json"]);
+    assert!(
+        output.status.success(),
+        "fixture namespace discovery: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let registry = raw_meta(repo, "gc.artifact_sweep.v2.context_registry")
+        .expect("the CLI sweep registers its captured storage context");
+    let namespaces: Vec<String> = serde_json::from_str(&registry).unwrap();
+    assert_eq!(
+        namespaces.len(),
+        1,
+        "a new CLI fixture must register exactly its one captured namespace"
+    );
+    let namespace = &namespaces[0];
+    assert!(
+        namespace.len() == 64
+            && namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "the fixture registry contains one canonical namespace"
+    );
+    let prefix = format!("gc.artifact_sweep.v2.{namespace}.");
+    rusqlite::Connection::open(repo.join(".aethyme/broker.db"))
+        .unwrap()
+        .execute(
+            "DELETE FROM meta WHERE substr(key, 1, ?1) = ?2",
+            rusqlite::params![prefix.len() as i64, prefix],
+        )
+        .unwrap();
+    std::fs::write(config, original).unwrap();
 }
 
 fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
@@ -837,13 +885,55 @@ fn sweep(repo: &Path, container: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn meta(repo: &Path, key: &str) -> Option<String> {
+fn raw_meta(repo: &Path, key: &str) -> Option<String> {
     rusqlite::Connection::open(repo.join(".aethyme/broker.db"))
         .unwrap()
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
             row.get(0)
         })
         .ok()
+}
+
+fn artifact_sweep_namespace(repo: &Path) -> String {
+    let registry = raw_meta(repo, "gc.artifact_sweep.v2.context_registry")
+        .expect("the fixture registered its captured storage context");
+    let namespaces: Vec<String> = serde_json::from_str(&registry).unwrap();
+    assert_eq!(
+        namespaces.len(),
+        1,
+        "the test must identify its exact namespace, never choose among multiple contexts"
+    );
+    namespaces.into_iter().next().unwrap()
+}
+
+fn scoped_meta_key(repo: &Path, key: &str) -> String {
+    let suffix = key
+        .strip_prefix("gc.artifact_sweep.")
+        .expect("artifact-sweep metadata keys use their known prefix");
+    format!(
+        "gc.artifact_sweep.v2.{}.{}",
+        artifact_sweep_namespace(repo),
+        suffix
+    )
+}
+
+fn meta(repo: &Path, key: &str) -> Option<String> {
+    raw_meta(repo, &scoped_meta_key(repo, key))
+}
+
+fn raw_meta_set(repo: &Path, key: &str, value: &str) {
+    rusqlite::Connection::open(repo.join(".aethyme/broker.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .unwrap();
+}
+
+fn scoped_meta_set(repo: &Path, key: &str, value: &str) {
+    raw_meta_set(repo, &scoped_meta_key(repo, key), value);
 }
 
 fn interrupted_paths(repo: &Path) -> Vec<String> {
@@ -858,7 +948,10 @@ fn interrupted_paths(repo: &Path) -> Vec<String> {
 fn clear_meta(repo: &Path, key: &str) {
     rusqlite::Connection::open(repo.join(".aethyme/broker.db"))
         .unwrap()
-        .execute("DELETE FROM meta WHERE key = ?1", [key])
+        .execute(
+            "DELETE FROM meta WHERE key = ?1",
+            [scoped_meta_key(repo, key)],
+        )
         .unwrap();
 }
 
@@ -1995,6 +2088,43 @@ fn gc_sweep_reports_the_pressure_scaled_budget_when_disk_is_low() {
     assert_eq!(pressured["disk_pressured"], true, "{pressured}");
 }
 
+#[test]
+fn gc_sweep_json_reports_unscoped_legacy_debt_without_rewriting_it() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    raw_meta_set(repo.path(), SWEEP_PARTIAL, "17");
+
+    let report = sweep(repo.path(), container.path());
+    assert_eq!(
+        report["legacy_unscoped_state"], "unknown_pending",
+        "{report}"
+    );
+    assert_eq!(raw_meta(repo.path(), SWEEP_PARTIAL).as_deref(), Some("17"));
+}
+
+#[test]
+fn gc_sweep_text_reports_unscoped_legacy_debt_without_rewriting_it() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    raw_meta_set(repo.path(), SWEEP_PARTIAL, "17");
+
+    let output = run(repo.path(), container.path(), &["gc", "sweep"]);
+    assert!(
+        output.status.success(),
+        "gc sweep: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(
+            "legacy unscoped artifact-sweep state: unknown and still pending; this lap covers only the current storage context"
+        ),
+        "text report explains unresolved legacy state: {text}"
+    );
+    assert_eq!(raw_meta(repo.path(), SWEEP_PARTIAL).as_deref(), Some("17"));
+}
+
 /// The drain broker opens no longer do is paid by an agent that is leaving.
 #[test]
 fn finish_continues_an_unfinished_sweep() {
@@ -2106,14 +2236,11 @@ fn an_emptied_store_left_by_a_paused_removal_is_still_finished() {
     std::fs::write(repo.path().join(".git/info/exclude"), ".pnpm-store/\n").unwrap();
     let store = worktree.join(".pnpm-store");
     std::fs::create_dir_all(&store).unwrap();
-    rusqlite::Connection::open(repo.path().join(".aethyme/broker.db"))
-        .unwrap()
-        .execute(
-            "INSERT INTO meta (key, value) VALUES ('gc.artifact_sweep.interrupted_path', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [store.to_string_lossy().as_ref()],
-        )
-        .unwrap();
+    scoped_meta_set(
+        repo.path(),
+        "gc.artifact_sweep.interrupted_path",
+        store.to_string_lossy().as_ref(),
+    );
     enable_sweep(repo.path());
 
     let report = sweep(repo.path(), container.path());
@@ -2132,14 +2259,11 @@ fn a_remembered_path_outside_the_session_worktree_is_never_touched() {
     let precious = outside.path().join(".pnpm-store");
     std::fs::create_dir_all(&precious).unwrap();
     std::fs::write(precious.join("keep"), "keep\n").unwrap();
-    rusqlite::Connection::open(repo.path().join(".aethyme/broker.db"))
-        .unwrap()
-        .execute(
-            "INSERT INTO meta (key, value) VALUES ('gc.artifact_sweep.interrupted_path', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [precious.to_string_lossy().as_ref()],
-        )
-        .unwrap();
+    scoped_meta_set(
+        repo.path(),
+        "gc.artifact_sweep.interrupted_path",
+        precious.to_string_lossy().as_ref(),
+    );
     enable_sweep(repo.path());
 
     sweep(repo.path(), container.path());
@@ -2151,14 +2275,11 @@ fn a_remembered_path_outside_the_session_worktree_is_never_touched() {
 }
 
 fn remember_interrupted_tree(repo: &Path, path: &Path) {
-    rusqlite::Connection::open(repo.join(".aethyme/broker.db"))
-        .unwrap()
-        .execute(
-            "INSERT INTO meta (key, value) VALUES ('gc.artifact_sweep.interrupted_path', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [path.to_string_lossy().as_ref()],
-        )
-        .unwrap();
+    scoped_meta_set(
+        repo,
+        "gc.artifact_sweep.interrupted_path",
+        path.to_string_lossy().as_ref(),
+    );
 }
 
 #[test]
@@ -2245,9 +2366,10 @@ fn a_remembered_non_artifact_directory_is_never_removed() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(payload["directories"], 1);
+    let expected_path: String = precious.to_string_lossy().chars().take(128).collect();
     assert_eq!(
         payload["revoked_interrupted_paths"][0]["path"],
-        precious.to_string_lossy().as_ref()
+        expected_path
     );
     assert_eq!(
         payload["revoked_interrupted_paths"][0]["reason"],

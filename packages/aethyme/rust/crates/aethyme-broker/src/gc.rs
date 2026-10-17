@@ -233,9 +233,19 @@ fn bounded_artifact_diagnostic_path(path: &str) -> String {
         .collect()
 }
 
+struct ScopedArtifactSweepWriter<'a> {
+    store: &'a mut crate::BrokerStore,
+    namespace: &'a str,
+}
+
+impl ScopedArtifactSweepWriter<'_> {
+    fn persist_interrupted_paths(&mut self, paths: &[String]) -> Result<bool, BrokerOpError> {
+        persist_interrupted_paths(self.store, self.namespace, paths)
+    }
+}
+
 fn revoke_interrupted_paths_under_root(
-    store: &mut crate::BrokerStore,
-    namespace: &str,
+    sweep_writer: &mut ScopedArtifactSweepWriter<'_>,
     interrupted_paths: &mut Vec<String>,
     interrupted_paths_valid: &mut bool,
     root: &Path,
@@ -264,7 +274,7 @@ fn revoke_interrupted_paths_under_root(
     }
     let mut updated_paths = interrupted_paths.clone();
     updated_paths.retain(|path| !revoked_paths.contains(path));
-    if persist_interrupted_paths(store, namespace, &updated_paths)? {
+    if sweep_writer.persist_interrupted_paths(&updated_paths)? {
         *interrupted_paths = updated_paths;
         revoked.extend(
             revoked_paths
@@ -3787,9 +3797,12 @@ impl Broker {
                 }
             };
             if !root_is_directory {
+                let mut sweep_writer = ScopedArtifactSweepWriter {
+                    store: self.store(),
+                    namespace: &namespace,
+                };
                 if !revoke_interrupted_paths_under_root(
-                    self.store(),
-                    &namespace,
+                    &mut sweep_writer,
                     &mut interrupted_paths,
                     &mut interrupted_paths_valid,
                     &root,
@@ -3808,9 +3821,12 @@ impl Broker {
             match ownership {
                 Ok(true) => {}
                 Ok(false) => {
+                    let mut sweep_writer = ScopedArtifactSweepWriter {
+                        store: self.store(),
+                        namespace: &namespace,
+                    };
                     if !revoke_interrupted_paths_under_root(
-                        self.store(),
-                        &namespace,
+                        &mut sweep_writer,
                         &mut interrupted_paths,
                         &mut interrupted_paths_valid,
                         &root,
@@ -5207,7 +5223,7 @@ mod tests {
             .connection_mut()
             .execute(
                 "UPDATE meta SET value = ?2 WHERE key = ?1",
-                params![
+                rusqlite::params![
                     ARTIFACT_SWEEP_CURSOR_KEY,
                     rusqlite::types::Value::Blob(blob.clone()),
                 ],
