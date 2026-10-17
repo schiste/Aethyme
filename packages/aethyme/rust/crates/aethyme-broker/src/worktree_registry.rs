@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::WorktreeRootSource;
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
 
-const MAX_RECORD_BYTES: usize = 8192;
+pub(crate) const MAX_RECORD_BYTES: usize = 8192;
 const MAX_RECORDS: usize = 8192;
 const PAGE_RECORDS: usize = 64;
 const MAX_INVENTORY_BYTES: usize = 8 * 1024 * 1024;

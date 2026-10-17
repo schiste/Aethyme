@@ -28,6 +28,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
   leave stale Git pointers after teardown. Assert paths and cleanup; avoid
   process-wide environment mutation in parallel tests.
+  Supply fixture-owned host state, cache, and coordination database when opening
+  the broker, before startup maintenance. Post-open setters cannot isolate work
+  the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
 - For storage ownership and reclamation changes, test replacement of a root and

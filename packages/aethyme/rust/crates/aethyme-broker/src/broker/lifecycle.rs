@@ -1930,6 +1930,9 @@ impl Broker {
                 ),
             });
         }
+        // Selecting a pathname is not consent to adopt its existing contents.
+        // Refuse before changing permissions on an unowned directory.
+        self.worktree_root_marker_exists_or_empty(&root)?;
         crate::host_state::protect_host_state_path(&root, true).map_err(|error| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: root.clone(),
@@ -1958,19 +1961,57 @@ impl Broker {
         Ok(root)
     }
 
+    fn worktree_root_marker_exists_or_empty(&self, root: &Path) -> Result<bool, BrokerOpError> {
+        let marker_path = root.join(WORKTREE_ROOT_MARKER);
+        match std::fs::symlink_metadata(&marker_path) {
+            Ok(_) => {
+                self.verify_worktree_root_marker(
+                    &marker_path,
+                    &WorktreeRootMarker {
+                        schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+                        repository_key: self.repository_worktree_key()?,
+                        repository_root: self.main_root.clone(),
+                    },
+                )?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let first = std::fs::read_dir(root)
+                    .and_then(|mut entries| entries.next().transpose())
+                    .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                        path: root.to_path_buf(),
+                        reason: format!("cannot inspect unmarked worktree root: {error}"),
+                    })?;
+                if first.is_some() {
+                    return Err(BrokerOpError::WorktreeRootUnavailable {
+                        path: root.to_path_buf(),
+                        reason: "nonempty unmarked directory cannot become a broker-owned root"
+                            .into(),
+                    });
+                }
+                Ok(false)
+            }
+            Err(error) => Err(BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path,
+                reason: format!("cannot inspect ownership marker: {error}"),
+            }),
+        }
+    }
+
     pub(super) fn write_or_verify_worktree_root_marker(
         &self,
         root: &Path,
     ) -> Result<(), BrokerOpError> {
+        // Recheck after permission setup. An existing witness is never replaced.
+        if self.worktree_root_marker_exists_or_empty(root)? {
+            return Ok(());
+        }
         let marker_path = root.join(WORKTREE_ROOT_MARKER);
         let expected = WorktreeRootMarker {
             schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
             repository_key: self.repository_worktree_key()?,
             repository_root: self.main_root.clone(),
         };
-        if marker_path.exists() {
-            return self.verify_worktree_root_marker(&marker_path, &expected);
-        }
         let mut bytes = serde_json::to_vec_pretty(&expected).map_err(|error| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: marker_path.clone(),
@@ -1978,42 +2019,46 @@ impl Broker {
             }
         })?;
         bytes.push(b'\n');
-        let temporary = root.join(format!(
-            ".aethyme-worktree-root.{}.{}.tmp",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
-                path: temporary.clone(),
-                reason: error.to_string(),
-            })?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
-                path: temporary.clone(),
-                reason: error.to_string(),
-            })?;
-        crate::host_state::protect_host_state_path(&temporary, false).map_err(|error| {
+        if bytes.len() > crate::worktree_registry::MAX_RECORD_BYTES {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path,
+                reason: "ownership marker exceeds its byte limit".into(),
+            });
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&marker_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return self.verify_worktree_root_marker(&marker_path, &expected);
+            }
+            Err(error) => {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: marker_path,
+                    reason: error.to_string(),
+                });
+            }
+        };
+        crate::host_state::protect_host_state_path(&marker_path, false).map_err(|error| {
             BrokerOpError::WorktreeRootUnavailable {
-                path: temporary.clone(),
+                path: marker_path.clone(),
                 reason: format!("cannot apply private marker permissions: {error}"),
             }
         })?;
-        match std::fs::rename(&temporary, &marker_path) {
-            Ok(()) => Ok(()),
-            Err(_error) if marker_path.exists() => {
-                let _ = std::fs::remove_file(&temporary);
-                self.verify_worktree_root_marker(&marker_path, &expected)
-            }
-            Err(error) => Err(BrokerOpError::WorktreeRootUnavailable {
-                path: marker_path,
+        // A crash can leave an invalid, bounded marker. Future admission refuses
+        // it; it must not be repaired by silently adopting directory contents.
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: marker_path.clone(),
                 reason: error.to_string(),
-            }),
-        }
+            })?;
+        self.verify_worktree_root_marker(&marker_path, &expected)
     }
 
     pub(super) fn verify_worktree_root_marker(
@@ -2021,12 +2066,13 @@ impl Broker {
         marker_path: &Path,
         expected: &WorktreeRootMarker,
     ) -> Result<(), BrokerOpError> {
-        let bytes =
-            std::fs::read(marker_path).map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+        let root = marker_path
+            .parent()
+            .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
                 path: marker_path.to_path_buf(),
-                reason: error.to_string(),
+                reason: "ownership marker has no root directory".into(),
             })?;
-        let actual: WorktreeRootMarker = serde_json::from_slice(&bytes).map_err(|error| {
+        let actual = crate::worktree_registry::read_marker(root).map_err(|error| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: marker_path.to_path_buf(),
                 reason: format!("invalid ownership marker: {error}"),

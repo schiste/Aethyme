@@ -39,6 +39,15 @@ can leave an empty directory or ownership marker outside the index; this is
 control debris, and is not a promise of atomic filesystem admission. No checkout
 or cache payload is allocated in that window.
 
+A new ownership marker can be created only in an empty directory. Selecting an
+existing nonempty unmarked path refuses before changing its permissions or
+contents; there is no implicit adoption. Existing markers are type-checked and
+read with an 8 KiB limit. Unix opens also prohibit following a replaced symlink;
+other platforms do not claim that handle-level race protection. Marker creation
+is exclusive and never
+overwrites an existing witness. Interrupted creation can leave a bounded invalid
+marker that refuses admission and requires independent recovery.
+
 Reusing a canonical pathname cannot replace an older filesystem proof. An
 existing row must still match the root, origin and ownership marker before
 admission, and is rechecked before recording. Changed or unknown evidence is
