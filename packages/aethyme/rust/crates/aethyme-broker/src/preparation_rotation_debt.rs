@@ -196,16 +196,14 @@ pub(crate) fn probe(cache_root: &Path, max_entries: usize, deadline: Instant) ->
     }
     match std::fs::symlink_metadata(cache_root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let Some(parent) = cache_root.parent() else {
-                return DebtProbe::Unknown;
-            };
             // An absent cache directory under an observed, real parent cannot
             // contain a published witness. Missing or ambiguous ancestors can
             // mean an unavailable mount, so they remain Unknown and keep the
             // recovery request visible. This is a local path observation; it
             // does not prove that the original filesystem is still mounted.
-            return match open_real_directory_chain(parent, deadline) {
-                Ok(_) => DebtProbe::NoDebt,
+            return match cache_root_absent_under_observed_parent(cache_root, deadline) {
+                Ok(true) => DebtProbe::NoDebt,
+                Ok(false) => DebtProbe::Unknown,
                 Err(_) => DebtProbe::Unknown,
             };
         }

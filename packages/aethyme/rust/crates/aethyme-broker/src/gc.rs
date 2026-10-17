@@ -5023,6 +5023,7 @@ mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn broker_open_keeps_published_rotation_debt_pending_when_sweep_is_disabled() {
         let tmp = tempfile::tempdir().unwrap();
