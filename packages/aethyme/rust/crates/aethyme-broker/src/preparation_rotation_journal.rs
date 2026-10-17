@@ -1154,8 +1154,9 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
-            let resource_db = directory.path().join("host-resources.db");
-            let cache_root = directory.path().join("preparation-cache");
+            let fixture_root = directory.path().canonicalize().unwrap();
+            let resource_db = fixture_root.join("host-resources.db");
+            let cache_root = fixture_root.join("preparation-cache");
             std::fs::create_dir(&cache_root).unwrap();
             Self {
                 _directory: directory,
