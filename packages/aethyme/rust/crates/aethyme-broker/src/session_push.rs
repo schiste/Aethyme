@@ -714,7 +714,8 @@ impl Broker {
             session.task.as_deref(),
             &body_commits,
             base.template.as_deref(),
-        );
+        )
+        .map_err(|error| refused(error.to_string()))?;
         let create = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id,
