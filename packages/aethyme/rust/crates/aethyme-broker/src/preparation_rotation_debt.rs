@@ -3196,7 +3196,7 @@ mod tests {
         let retained = publish(&cache_root, debt.clone()).unwrap();
         let payload = super::encode(&debt).unwrap();
         let root_identity = debt.cache_root.encode().unwrap();
-        super::rotation_journal::publish(
+        crate::preparation::rotation_journal::publish(
             &resource_db,
             &cache_root,
             &root_identity,
@@ -3207,7 +3207,7 @@ mod tests {
 
         let proof = super::ensure_fresh_stage(&cache_root, &debt, false).unwrap();
         let fresh_store_identity = proof.fresh_store.encode().unwrap();
-        super::rotation_journal::record_fresh_store_identity(
+        crate::preparation::rotation_journal::record_fresh_store_identity(
             &resource_db,
             &cache_root,
             &root_identity,
@@ -3294,7 +3294,7 @@ mod tests {
             completed_journal_rotation_fixture();
         let root_identity = debt.cache_root.encode().unwrap();
 
-        let row = super::rotation_journal::load_record(
+        let row = crate::preparation::rotation_journal::load_record(
             &resource_db,
             &cache_root,
             &root_identity,
@@ -3319,7 +3319,7 @@ mod tests {
         assert!(progress.found_debt);
         assert!(progress.complete);
         assert!(
-            super::rotation_journal::load_record(
+            crate::preparation::rotation_journal::load_record(
                 &resource_db,
                 &cache_root,
                 &root_identity,
@@ -3346,7 +3346,7 @@ mod tests {
 
         // Model a crash after the external row was removed but before the
         // root-level fresh-store proof could be removed.
-        super::rotation_journal::complete_verified(
+        crate::preparation::rotation_journal::complete_verified(
             &resource_db,
             &cache_root,
             &root_identity,
@@ -3356,7 +3356,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            super::rotation_journal::load_record(
+            crate::preparation::rotation_journal::load_record(
                 &resource_db,
                 &cache_root,
                 &root_identity,
@@ -3385,7 +3385,7 @@ mod tests {
         assert!(progress.found_debt);
         assert!(progress.complete);
         assert!(
-            super::rotation_journal::load_record(
+            crate::preparation::rotation_journal::load_record(
                 &resource_db,
                 &cache_root,
                 &root_identity,
