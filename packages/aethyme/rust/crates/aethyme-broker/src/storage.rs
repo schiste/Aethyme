@@ -31,6 +31,7 @@ const DAY_MS: i64 = 86_400_000;
 const PREPARATION_SWEEP_MAX_DISCOVERY_PATHS: usize = 4096;
 const PREPARATION_SWEEP_MAX_MARKER_BYTES: u64 = 64 * 1024;
 const PREPARATION_RETIRED_STORE_MAX_KEYS: usize = 4096;
+const PREPARATION_ROTATION_DEBT_MAX_ENTRIES: usize = 100_000;
 const PREPARATION_LEASE_TTL_MARGIN_SECONDS: u64 = 30;
 const PREPARATION_COORDINATOR_OPEN_MAX_WAIT: Duration = Duration::from_millis(25);
 const PREPARATION_APPLY_DEADLINE: Duration = Duration::from_secs(60 * 60);
@@ -1278,6 +1279,20 @@ impl PreparationCacheSweepReport {
     }
 }
 
+fn preparation_cache_sweep_report(
+    entries_removed: usize,
+    bytes_reclaimed: u64,
+    filesystem_entries_reclaimed: usize,
+    complete: bool,
+) -> PreparationCacheSweepReport {
+    PreparationCacheSweepReport {
+        entries_removed,
+        bytes_reclaimed,
+        filesystem_entries_reclaimed,
+        complete,
+    }
+}
+
 /// Checks `deadline` between filesystem operations and streamed hash chunks.
 /// Filesystem calls themselves cannot be cancelled, so a stalled OS call can
 /// outlive the deadline. Entries are independent, making a partial sweep safe.
@@ -1387,45 +1402,156 @@ fn sweep_preparation_cache_with_discovery(
     deadline: std::time::Instant,
     mut discover_live_roots: impl FnMut(std::time::Instant) -> Result<Vec<PathBuf>, StorageError>,
 ) -> PreparationCacheSweepReport {
-    let live_roots = match discover_live_roots(deadline) {
-        Ok(roots) => roots,
-        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
-    };
-    if live_roots.is_empty() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    let live_keys = match current_preparation_keys(&live_roots, deadline) {
-        Ok(keys) => keys,
-        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
-    };
-    if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    let cache_metadata = match std::fs::symlink_metadata(cache_root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return PreparationCacheSweepReport::complete_empty();
-        }
-        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
-    };
-    if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    let repositories = match std::fs::read_dir(cache_root) {
-        Ok(entries) => entries,
-        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
-    };
-    if check_preparation_sweep_deadline(deadline).is_err() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
     let mut removed = 0_usize;
     let mut bytes = 0_u64;
     let mut filesystem_entries_reclaimed = 0_usize;
     let mut complete = true;
     let mut coordinator = None;
+    let inventory = match crate::preparation::rotation_debt::inventory(
+        cache_root,
+        PREPARATION_ROTATION_DEBT_MAX_ENTRIES,
+        deadline,
+    ) {
+        Ok(inventory) => inventory,
+        Err(_) => return PreparationCacheSweepReport::incomplete_empty(),
+    };
+    complete &= inventory.complete;
+    let mut blocked_repositories = inventory.blocked_repositories.clone();
+
+    // A debt witness is explicit authority for the original cache rotation.
+    // Recover it under the same exclusive key as writers before the generic
+    // liveness sweep sees either the repository directory or any old retired
+    // tree. Each repository is independent, so a busy or malformed record
+    // blocks only that repository while other cache keys can still progress.
+    for repository in &inventory.repositories {
+        if check_preparation_sweep_deadline(deadline).is_err() {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                false,
+            );
+        }
+        let grant = match acquire_preparation_cache_lease(
+            &mut coordinator,
+            resource_db_path,
+            cache_root,
+            repository,
+            deadline,
+        ) {
+            Ok(grant) => grant,
+            Err(PreparationCacheLeaseError::Busy) => {
+                complete = false;
+                continue;
+            }
+            Err(PreparationCacheLeaseError::Deadline) => {
+                return preparation_cache_sweep_report(
+                    removed,
+                    bytes,
+                    filesystem_entries_reclaimed,
+                    false,
+                );
+            }
+            Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
+                complete = false;
+                continue;
+            }
+        };
+        let recovery = crate::preparation::rotation_debt::recover(cache_root, repository, deadline);
+        let released = release_preparation_cache_lease(&mut coordinator, &grant);
+        if !released {
+            complete = false;
+        }
+        match recovery {
+            Ok(progress) => {
+                filesystem_entries_reclaimed =
+                    filesystem_entries_reclaimed.saturating_add(progress.entries_reclaimed);
+                bytes = bytes.saturating_add(progress.bytes_reclaimed);
+                if progress.complete && (progress.found_debt || inventory.complete) {
+                    blocked_repositories.remove(repository);
+                    if progress.found_debt && progress.entries_reclaimed > 0 {
+                        removed = removed.saturating_add(1);
+                    }
+                } else {
+                    complete = false;
+                }
+            }
+            Err(error) => {
+                filesystem_entries_reclaimed =
+                    filesystem_entries_reclaimed.saturating_add(error.progress.entries_reclaimed);
+                bytes = bytes.saturating_add(error.progress.bytes_reclaimed);
+                complete = false;
+            }
+        }
+    }
+
+    let live_roots = match discover_live_roots(deadline) {
+        Ok(roots) => roots,
+        Err(_) => {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                false,
+            );
+        }
+    };
+    if live_roots.is_empty() {
+        return preparation_cache_sweep_report(removed, bytes, filesystem_entries_reclaimed, false);
+    }
+    let live_keys = match current_preparation_keys(&live_roots, deadline) {
+        Ok(keys) => keys,
+        Err(_) => {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                false,
+            );
+        }
+    };
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return preparation_cache_sweep_report(removed, bytes, filesystem_entries_reclaimed, false);
+    }
+    let cache_metadata = match std::fs::symlink_metadata(cache_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                complete,
+            );
+        }
+        Err(_) => {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                false,
+            );
+        }
+    };
+    if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
+        return preparation_cache_sweep_report(removed, bytes, filesystem_entries_reclaimed, false);
+    }
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return preparation_cache_sweep_report(removed, bytes, filesystem_entries_reclaimed, false);
+    }
+    let repositories = match std::fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return preparation_cache_sweep_report(
+                removed,
+                bytes,
+                filesystem_entries_reclaimed,
+                false,
+            );
+        }
+    };
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return preparation_cache_sweep_report(removed, bytes, filesystem_entries_reclaimed, false);
+    }
     for repository in repositories {
         if check_preparation_sweep_deadline(deadline).is_err() {
             complete = false;
@@ -1460,6 +1586,10 @@ fn sweep_preparation_cache_with_discovery(
             continue;
         };
         if retired {
+            if inventory.block_legacy_retired || blocked_repositories.contains(lease_repository) {
+                complete = false;
+                continue;
+            }
             let grant = match acquire_preparation_cache_lease(
                 &mut coordinator,
                 resource_db_path,
@@ -1489,6 +1619,22 @@ fn sweep_preparation_cache_with_discovery(
                     };
                 }
             };
+            // Inventory ran before this lease was acquired. A writer may
+            // have published durable rotation debt in that gap, then crashed
+            // and released the lease. Reclassify under the lease before the
+            // generic retired-tree path can gain deletion authority.
+            if !account_rotation_recovery(
+                crate::preparation::rotation_debt::recover(cache_root, lease_repository, deadline),
+                &mut removed,
+                &mut bytes,
+                &mut filesystem_entries_reclaimed,
+                &mut complete,
+            ) {
+                if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                    complete = false;
+                }
+                continue;
+            }
             // The budget rotator renames a complete repository store while
             // holding the original repository lease. The retired path is no
             // longer used by writers, but the same lease prevents cleanup
@@ -1566,6 +1712,10 @@ fn sweep_preparation_cache_with_discovery(
             }
             continue;
         }
+        if blocked_repositories.contains(lease_repository) {
+            complete = false;
+            continue;
+        }
         let entries = match std::fs::read_dir(&repository_path) {
             Ok(entries) => entries,
             Err(_) => {
@@ -1641,6 +1791,22 @@ fn sweep_preparation_cache_with_discovery(
                     };
                 }
             };
+
+            // Revalidate durable rotation intent after acquiring the writer's
+            // exact lease. A sidecar published after the initial bounded
+            // inventory must still take precedence over deleting a child key.
+            if !account_rotation_recovery(
+                crate::preparation::rotation_debt::recover(cache_root, lease_repository, deadline),
+                &mut removed,
+                &mut bytes,
+                &mut filesystem_entries_reclaimed,
+                &mut complete,
+            ) {
+                if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                    complete = false;
+                }
+                continue;
+            }
 
             // The writer and sweeper share this exclusive key. Re-discover
             // liveness only after acquiring it, then hold it through removal
@@ -1738,6 +1904,46 @@ fn sweep_preparation_cache_with_discovery(
         bytes_reclaimed: bytes,
         filesystem_entries_reclaimed,
         complete,
+    }
+}
+
+/// Apply exact progress from a rotation-debt recovery performed under the
+/// repository's preparation-cache lease. Return true only when no debt was
+/// found and the generic cache candidate may proceed through its own checks.
+fn account_rotation_recovery(
+    recovery: Result<
+        crate::preparation::rotation_debt::RecoveryProgress,
+        crate::preparation::rotation_debt::RecoveryError,
+    >,
+    entries_removed: &mut usize,
+    bytes_reclaimed: &mut u64,
+    filesystem_entries_reclaimed: &mut usize,
+    complete: &mut bool,
+) -> bool {
+    match recovery {
+        Ok(progress) => {
+            *filesystem_entries_reclaimed =
+                filesystem_entries_reclaimed.saturating_add(progress.entries_reclaimed);
+            *bytes_reclaimed = bytes_reclaimed.saturating_add(progress.bytes_reclaimed);
+            if progress.complete && progress.found_debt {
+                if progress.entries_reclaimed > 0 {
+                    *entries_removed = entries_removed.saturating_add(1);
+                }
+                false
+            } else if progress.complete {
+                true
+            } else {
+                *complete = false;
+                false
+            }
+        }
+        Err(error) => {
+            *filesystem_entries_reclaimed =
+                filesystem_entries_reclaimed.saturating_add(error.progress.entries_reclaimed);
+            *bytes_reclaimed = bytes_reclaimed.saturating_add(error.progress.bytes_reclaimed);
+            *complete = false;
+            false
+        }
     }
 }
 
@@ -4570,6 +4776,91 @@ mod tests {
         assert_eq!(resumed_report.bytes_reclaimed, 16);
         assert!(resumed_report.filesystem_entries_reclaimed >= 2);
         assert!(!entry.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn preparation_cache_sweep_recovers_rotation_debt_without_a_later_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let cache_root = tmp.path().join("preparation-cache");
+        let store = cache_root.join(TEST_PREPARATION_REPOSITORY);
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("old-cache"), b"interrupted old cache").unwrap();
+
+        let cache_root_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+        let store_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap();
+        let debt = crate::preparation::rotation_debt::RotationDebt::new(
+            TEST_PREPARATION_REPOSITORY,
+            &crate::preparation::rotation_debt::new_transaction_id(),
+            cache_root_identity,
+            store_identity,
+        )
+        .unwrap();
+        crate::preparation::rotation_debt::publish(&cache_root, debt).unwrap();
+        let retained =
+            crate::preparation::rotation_debt::read(&cache_root, TEST_PREPARATION_REPOSITORY)
+                .unwrap()
+                .expect("rotation intent is durable before the rename");
+        crate::preparation::rotation_debt::retire_original_store(&cache_root, &retained).unwrap();
+
+        let resource_db_path = test_host_resource_db(tmp.path());
+        let report = sweep_preparation_cache_with_discovery(
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            |_| Ok(vec![main_root.clone()]),
+        );
+
+        assert!(report.complete, "the detached sweep finishes durable debt");
+        assert_eq!(report.entries_removed, 1);
+        assert!(report.filesystem_entries_reclaimed > 0);
+        assert!(
+            store.is_dir(),
+            "recovery leaves a fresh store for the next writer"
+        );
+        assert_eq!(std::fs::read_dir(&store).unwrap().count(), 0);
+        assert!(!store.join("old-cache").exists());
+        assert!(
+            crate::preparation::rotation_debt::read(&cache_root, TEST_PREPARATION_REPOSITORY,)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn preparation_cache_sweep_never_uses_legacy_cleanup_for_unwitnessed_retired_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let cache_root = tmp.path().join("preparation-cache");
+        let retired = cache_root.join(format!("{}.retired", TEST_PREPARATION_REPOSITORY));
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&retired).unwrap();
+        std::fs::write(retired.join("old-cache"), b"preserve unknown ownership").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+
+        let report = sweep_preparation_cache_with_discovery(
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            |_| Ok(vec![main_root.clone()]),
+        );
+
+        assert!(
+            !report.complete,
+            "unwitnessed ownership keeps the pass pending"
+        );
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
+        assert_eq!(
+            std::fs::read(retired.join("old-cache")).unwrap(),
+            b"preserve unknown ownership"
+        );
     }
 
     #[test]

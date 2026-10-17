@@ -8,16 +8,17 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::ffi::{CStr, CString};
+use std::collections::BTreeSet;
+use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{self, MaybeUninit};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,13 +29,6 @@ const RECORD_PREFIX: &str = ".aethyme-preparation-rotation-";
 const SCRATCH_SUFFIX: &str = ".scratch";
 const DIRECTORY_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
-
-/// Confirm that the descriptor-relative, no-follow recovery implementation is
-/// available on this platform. The sibling unsupported-platform module returns
-/// an explicit `Unsupported` error instead of compiling a partial fallback.
-pub(crate) fn ensure_supported() -> io::Result<()> {
-    Ok(())
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -100,20 +94,8 @@ impl RotationDebt {
         Ok(debt)
     }
 
-    pub(crate) fn repository(&self) -> &str {
-        &self.repository
-    }
-
     pub(crate) fn retired_component(&self) -> &str {
         &self.retired_component
-    }
-
-    pub(crate) fn cache_root(&self) -> &DirectoryIdentity {
-        &self.cache_root
-    }
-
-    pub(crate) fn original_store(&self) -> &DirectoryIdentity {
-        &self.original_store
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -172,6 +154,56 @@ pub(crate) enum RecoveryStep {
     ClearCompletedDebt,
     Conflict,
 }
+
+/// Names that may contain an unfinished rotation. This is only bounded
+/// discovery; each candidate must be re-opened and validated under its
+/// repository lease before it can authorize recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DebtInventory {
+    pub(crate) repositories: Vec<String>,
+    pub(crate) blocked_repositories: BTreeSet<String>,
+    pub(crate) complete: bool,
+    /// An unclassifiable control name might belong to any old legacy-retired
+    /// tree, so the caller must withhold all legacy retired cleanup this pass.
+    pub(crate) block_legacy_retired: bool,
+}
+
+impl DebtInventory {
+    fn empty() -> Self {
+        Self {
+            repositories: Vec::new(),
+            blocked_repositories: BTreeSet::new(),
+            complete: true,
+            block_legacy_retired: false,
+        }
+    }
+}
+
+/// Exact progress from one repository's debt recovery. Rotation recovery does
+/// not guess bytes from paths; `bytes_reclaimed` remains zero unless a caller
+/// has an independent measured count. Entry counts come from successful
+/// unlink operations and are retained on interruption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RecoveryProgress {
+    pub(crate) found_debt: bool,
+    pub(crate) complete: bool,
+    pub(crate) bytes_reclaimed: u64,
+    pub(crate) entries_reclaimed: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct RecoveryError {
+    pub(crate) source: io::Error,
+    pub(crate) progress: RecoveryProgress,
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for RecoveryError {}
 
 /// A durable debt record together with the inode of the exact sidecar file
 /// that was opened without following links.
@@ -274,6 +306,219 @@ pub(crate) fn recovery_step(cache_root: &Path, debt: &RotationDebt) -> io::Resul
     debt.validate()?;
     let root = open_cache_root(cache_root)?;
     recovery_step_at(&root, debt)
+}
+
+/// Enumerate rotation witnesses and fixed retired-store names without
+/// following entries. The listing is only a hint: `recover` opens and checks
+/// every sidecar and tree again while holding the matching repository lease.
+/// An incomplete inventory blocks legacy retired-tree cleanup for this pass,
+/// because an unseen witness could own one of those trees.
+pub(crate) fn inventory(
+    cache_root: &Path,
+    max_entries: usize,
+    deadline: Instant,
+) -> io::Result<DebtInventory> {
+    if Instant::now() >= deadline {
+        let mut inventory = DebtInventory::empty();
+        inventory.complete = false;
+        inventory.block_legacy_retired = true;
+        return Ok(inventory);
+    }
+    let root = match open_cache_root(cache_root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DebtInventory::empty());
+        }
+        Err(error) => return Err(error),
+    };
+    let (names, complete) = directory_names(&root, max_entries, deadline)?;
+    let mut repositories = BTreeSet::new();
+    let mut inventory = DebtInventory {
+        repositories: Vec::new(),
+        blocked_repositories: BTreeSet::new(),
+        complete,
+        block_legacy_retired: !complete,
+    };
+
+    for name in names {
+        if Instant::now() >= deadline {
+            inventory.complete = false;
+            inventory.block_legacy_retired = true;
+            break;
+        }
+        let bytes = name.as_os_str().as_bytes();
+        if let Some(rest) = bytes.strip_prefix(RECORD_PREFIX.as_bytes()) {
+            let Some(repository_bytes) = rest.get(..64) else {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+                continue;
+            };
+            let Ok(repository) = std::str::from_utf8(repository_bytes) else {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+                continue;
+            };
+            if !is_hex(repository, 64, 64) {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+                continue;
+            }
+            let repository = repository.to_owned();
+            repositories.insert(repository.clone());
+            inventory.blocked_repositories.insert(repository);
+            let suffix = &rest[64..];
+            if suffix != b".json" && suffix != SCRATCH_SUFFIX.as_bytes() {
+                inventory.complete = false;
+                inventory.block_legacy_retired = true;
+            }
+            continue;
+        }
+
+        if let Some(repository_bytes) = bytes.strip_suffix(b".retired") {
+            let Ok(repository) = std::str::from_utf8(repository_bytes) else {
+                continue;
+            };
+            if is_hex(repository, 64, 64) {
+                repositories.insert(repository.to_owned());
+                // A fixed retired tree without a validated sidecar is an
+                // unresolved ownership state, never a legacy cleanup target.
+                inventory.blocked_repositories.insert(repository.to_owned());
+            }
+        }
+    }
+
+    inventory.repositories = repositories.into_iter().collect();
+    Ok(inventory)
+}
+
+/// Finish a committed rotation under the repository's existing exclusive
+/// preparation-cache lease. This operation is deliberately cache-only and
+/// does not consult current worktree liveness: the writer published the debt
+/// before it could start any command that used the store.
+pub(crate) fn recover(
+    cache_root: &Path,
+    repository: &str,
+    deadline: Instant,
+) -> Result<RecoveryProgress, RecoveryError> {
+    let mut progress = RecoveryProgress::default();
+    if !is_hex(repository, 64, 64) {
+        return Err(recovery_error(
+            progress,
+            invalid_record("repository identity is malformed"),
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(recovery_error(progress, deadline_error()));
+    }
+
+    let retained = match read_or_promote_scratch(cache_root, repository) {
+        Ok(Some(retained)) => retained,
+        Ok(None) => {
+            if has_fixed_retired_store(cache_root, repository)
+                .map_err(|source| recovery_error(progress, source))?
+            {
+                return Err(recovery_error(
+                    progress,
+                    invalid_record("fixed retired cache has no valid rotation witness"),
+                ));
+            }
+            progress.complete = true;
+            return Ok(progress);
+        }
+        Err(source) => return Err(recovery_error(progress, source)),
+    };
+    progress.found_debt = true;
+
+    // A valid transition takes at most four steps. The larger hard bound also
+    // makes unexpected state oscillation fail closed without an unbounded
+    // loop while the caller holds a host resource lease.
+    for _ in 0..8 {
+        if Instant::now() >= deadline {
+            return Err(recovery_error(progress, deadline_error()));
+        }
+        let step = recovery_step(cache_root, &retained.debt)
+            .map_err(|source| recovery_error(progress, source))?;
+        match step {
+            RecoveryStep::RenameOriginalStore => retire_original_store(cache_root, &retained)
+                .map_err(|source| recovery_error(progress, source))?,
+            RecoveryStep::RemoveRetiredStore => {
+                let witness = prepare_retired_store_removal(cache_root, &retained)
+                    .map_err(|source| recovery_error(progress, source))?;
+                let retired_path = cache_root.join(retained.debt.retired_component());
+                let pinned = crate::gc::PinnedTreeRemoval::open(&retired_path)
+                    .map_err(|source| recovery_error(progress, source))?;
+                let identity = pinned
+                    .object_identity()
+                    .map_err(|source| recovery_error(progress, source))?;
+                let filesystem_identity = pinned
+                    .filesystem_identity()
+                    .map_err(|source| recovery_error(progress, source))?;
+                let matches = witness
+                    .matches_pinned_identity(identity.device, identity.inode, &filesystem_identity)
+                    .map_err(|source| recovery_error(progress, source))?;
+                if !matches {
+                    return Err(recovery_error(
+                        progress,
+                        invalid_record("pinned retired cache does not match its debt witness"),
+                    ));
+                }
+                let witness_name = witness
+                    .component()
+                    .map_err(|source| recovery_error(progress, source))?
+                    .to_owned();
+                match pinned.remove_verified_witness_with_progress(
+                    &witness_name,
+                    Some(deadline),
+                    |bytes| witness.validate_bytes(bytes),
+                ) {
+                    Ok((crate::gc::TreeRemoval::Complete, entries)) => {
+                        progress.entries_reclaimed =
+                            progress.entries_reclaimed.saturating_add(entries);
+                    }
+                    Ok((crate::gc::TreeRemoval::Interrupted, entries)) => {
+                        progress.entries_reclaimed =
+                            progress.entries_reclaimed.saturating_add(entries);
+                        return Err(recovery_error(progress, deadline_error()));
+                    }
+                    Err(error) => {
+                        progress.entries_reclaimed = progress
+                            .entries_reclaimed
+                            .saturating_add(error.entries_reclaimed);
+                        return Err(recovery_error(progress, error.source));
+                    }
+                }
+            }
+            RecoveryStep::CreateFreshStore => create_fresh_store(cache_root, &retained)
+                .map_err(|source| recovery_error(progress, source))?,
+            RecoveryStep::ClearCompletedDebt => {
+                clear_completed(cache_root, &retained)
+                    .map_err(|source| recovery_error(progress, source))?;
+                progress.complete = true;
+                return Ok(progress);
+            }
+            RecoveryStep::Conflict => {
+                return Err(recovery_error(
+                    progress,
+                    invalid_record("rotation debt conflicts with current cache state"),
+                ));
+            }
+        }
+    }
+    Err(recovery_error(
+        progress,
+        invalid_record("rotation recovery exceeded its transition limit"),
+    ))
+}
+
+fn recovery_error(progress: RecoveryProgress, source: io::Error) -> RecoveryError {
+    RecoveryError { source, progress }
+}
+
+fn deadline_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "preparation-cache rotation recovery deadline elapsed",
+    )
 }
 
 /// Publish the in-tree removal witness and atomically move the exact original
@@ -729,6 +974,131 @@ pub(crate) fn read(
         ));
     }
     decode_retained(file, repository, &root_identity).map(Some)
+}
+
+/// Read a committed debt, or promote a fully validated pre-publication
+/// scratch record. A malformed scratch may only be discarded by `publish`
+/// after it proves the original store is still at its exact source inode and
+/// no retired or committed state exists.
+fn read_or_promote_scratch(
+    cache_root: &Path,
+    repository: &str,
+) -> io::Result<Option<RetainedRotationDebt>> {
+    match std::fs::symlink_metadata(cache_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(invalid_record(
+                "preparation cache root is not a real directory",
+            ));
+        }
+        Ok(_) => {}
+    }
+    if let Some(retained) = read(cache_root, repository)? {
+        return Ok(Some(retained));
+    }
+
+    let root = open_cache_root(cache_root)?;
+    let root_identity = identity_for_directory(&root)?;
+    let scratch_name = RotationDebt::scratch_component(repository)?;
+    let Some(scratch) = read_component(root.as_raw_fd(), &scratch_name)? else {
+        return Ok(None);
+    };
+    match serde_json::from_slice::<RotationDebt>(&scratch.bytes) {
+        Ok(debt) => {
+            debt.validate()?;
+            if debt.repository != repository
+                || !debt.cache_root.same_directory(&root_identity)
+                || scratch.bytes != encode(&debt)?
+            {
+                return Err(invalid_record(
+                    "scratch rotation witness does not match its cache root and repository",
+                ));
+            }
+            publish(cache_root, debt).map(Some)
+        }
+        Err(_) => {
+            let store_name = component(repository)?;
+            let original_store = directory_identity_at(root.as_raw_fd(), &store_name)?
+                .ok_or_else(|| invalid_record("malformed scratch has no original cache store"))?;
+            let proposed = RotationDebt::new(
+                repository,
+                &new_transaction_id(),
+                root_identity,
+                original_store,
+            )?;
+            publish(cache_root, proposed).map(Some)
+        }
+    }
+}
+
+fn has_fixed_retired_store(cache_root: &Path, repository: &str) -> io::Result<bool> {
+    match std::fs::symlink_metadata(cache_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(invalid_record(
+                "preparation cache root is not a real directory",
+            ));
+        }
+        Ok(_) => {}
+    }
+    let root = open_cache_root(cache_root)?;
+    entry_exists(
+        root.as_raw_fd(),
+        &component(&format!("{repository}.retired"))?,
+    )
+}
+
+fn directory_names(
+    directory: &File,
+    max_entries: usize,
+    deadline: Instant,
+) -> io::Result<(Vec<OsString>, bool)> {
+    let dot = CString::new(".").expect("constant is a valid C string");
+    // SAFETY: directory is live; openat returns an independent descriptor for
+    // the same pinned directory without traversing any child component.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), dot.as_ptr(), DIRECTORY_FLAGS) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is readable and uniquely transferred to fdopendir on success.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed and did not take ownership of fd.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+
+    let mut names = Vec::new();
+    loop {
+        if Instant::now() >= deadline || names.len() >= max_entries {
+            // SAFETY: stream is the unique live DIR* returned above.
+            unsafe { libc::closedir(stream) };
+            return Ok((names, false));
+        }
+        // SAFETY: errno is thread-local and writable before the readdir call.
+        unsafe { *directory_errno_location() = 0 };
+        // SAFETY: stream remains live and is closed only after copying the name.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            // SAFETY: errno is thread-local and readable on this thread.
+            let errno = unsafe { *directory_errno_location() };
+            // SAFETY: stream is uniquely owned and closed exactly once.
+            unsafe { libc::closedir(stream) };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            return Ok((names, true));
+        }
+        // SAFETY: d_name is NUL-terminated and valid until the next readdir;
+        // copy it before advancing the stream.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name.to_vec()));
+        }
+    }
 }
 
 /// Publish a debt record by writing an exclusive scratch file, syncing it,
@@ -1420,9 +1790,10 @@ fn invalid_record(message: &str) -> io::Error {
 mod tests {
     use super::{
         DirectoryIdentity, RECORD_PREFIX, RecoveryStep, RotationDebt, SCRATCH_SUFFIX,
-        classify_recovery, new_transaction_id, publish, read, recovery_step,
+        classify_recovery, inventory, new_transaction_id, publish, read, recover, recovery_step,
     };
     use std::fs;
+    use std::time::Instant;
 
     const REPOSITORY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TRANSACTION: &str = "0123456789abcdef0123456789abcdef";
@@ -1438,6 +1809,65 @@ mod tests {
         let original = DirectoryIdentity::capture(&store).unwrap();
         let debt = RotationDebt::new(REPOSITORY, TRANSACTION, root, original).unwrap();
         (temp, cache_root, debt)
+    }
+
+    #[test]
+    fn inventory_and_recovery_finish_a_committed_rotation() {
+        let (_temp, cache_root, debt) = fixture();
+        publish(&cache_root, debt.clone()).unwrap();
+        let inventory = inventory(
+            &cache_root,
+            100,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(inventory.complete);
+        assert_eq!(inventory.repositories, vec![REPOSITORY.to_owned()]);
+        assert!(inventory.blocked_repositories.contains(REPOSITORY));
+
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(progress.found_debt);
+        assert!(progress.complete);
+        assert!(progress.entries_reclaimed >= 2);
+        assert!(cache_root.join(REPOSITORY).is_dir());
+        assert_eq!(
+            fs::read_dir(cache_root.join(REPOSITORY)).unwrap().count(),
+            0
+        );
+        assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn inventory_keeps_fixed_retired_store_without_a_witness_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = temp.path().join("preparation-cache");
+        fs::create_dir(&cache_root).unwrap();
+        let retired = cache_root.join(format!("{REPOSITORY}.retired"));
+        fs::create_dir(&retired).unwrap();
+        fs::write(retired.join("payload"), b"preserve").unwrap();
+
+        let inventory = inventory(
+            &cache_root,
+            100,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(inventory.complete);
+        assert_eq!(inventory.repositories, vec![REPOSITORY.to_owned()]);
+        assert!(inventory.blocked_repositories.contains(REPOSITORY));
+        let error = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect_err("unwitnessed retired bytes are not deletion authority");
+        assert!(!error.progress.complete);
+        assert_eq!(fs::read(retired.join("payload")).unwrap(), b"preserve");
     }
 
     #[test]
@@ -1911,6 +2341,6 @@ mod tests {
             &vec![b'x'; 8193],
         );
         assert!(read(&cache_root, REPOSITORY).is_err());
-        assert_eq!(debt.repository(), REPOSITORY);
+        assert_eq!(debt.repository, REPOSITORY);
     }
 }

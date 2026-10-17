@@ -21,6 +21,13 @@ use crate::{
     HostResourceRequirement,
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "preparation_rotation_debt.rs"]
+pub(crate) mod rotation_debt;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[path = "preparation_rotation_debt_unsupported.rs"]
+pub(crate) mod rotation_debt;
+
 pub const PREPARATION_CONFIG_RELPATH: &str = ".aethyme/prepare.toml";
 pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
 const PREPARATION_LEASE_TTL_SECONDS: u64 = 30;
@@ -31,6 +38,7 @@ const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 100_000;
 const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
 const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(5);
+const SHARED_CACHE_RECOVERY_MAX_ELAPSED: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreparationError {
@@ -579,7 +587,11 @@ impl Broker {
         // it has to be inside the same critical section that granted access.
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
-        let rotation_result = shared_cache_budget(config.shared_cache.as_ref(), &digest, self);
+        let rotation_result = if shared {
+            shared_cache_budget(config.shared_cache.as_ref(), &digest, self)
+        } else {
+            Ok(None)
+        };
         let rotation =
             self.release_grant_after_error(rotation_result, &mut coordinator, &mut grant, || {
                 require_preparation_storage(&storage_root, &storage_paths)
@@ -1475,67 +1487,100 @@ pub(crate) fn current_cache_key_before(
 /// silent, because a customer watching a cache reset mid-day deserves to know
 /// which command did it.
 ///
-/// Returns `None` when no budget is declared or the store is within it, so the
-/// common path does no measurement at all.
+/// Recovers any prior rotation before applying the optional budget. A missing
+/// budget still avoids a size measurement, but cannot leave a published
+/// rotation half-finished while allowing a new preparation command to start.
 fn shared_cache_budget(
     budget: Option<&SharedCacheBudget>,
     digest: &str,
     broker: &Broker,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
-    let Some(budget) = budget.filter(|budget| budget.max_bytes > 0) else {
-        return Ok(None);
-    };
-    let store = preparation_store_dir(broker)?;
-    shared_cache_budget_at(budget, &store, digest)
+    let cache_root = broker
+        .storage_context()
+        .preparation_cache_root()
+        .ok_or_else(|| {
+            invalid_config("the broker's captured host resource database path is unavailable")
+        })?;
+    shared_cache_budget_at(
+        budget.filter(|budget| budget.max_bytes > 0),
+        &cache_root,
+        &repository_identity(broker),
+        digest,
+    )
 }
 
-/// The no-budget path, exposed for the test that proves an absent budget does
-/// no measurement at all. Separate from the real entry point so that test
-/// cannot accidentally exercise host state.
-#[cfg(test)]
-fn shared_cache_budget_at_probe(
-    budget: Option<&SharedCacheBudget>,
-    store: &Path,
-) -> Result<Option<SharedCacheRotation>, PreparationError> {
-    match budget {
-        None => Ok(None),
-        Some(budget) => shared_cache_budget_at(budget, store, "abcdef123456"),
-    }
-}
-
-/// Rotation against an explicit store path.
+/// Rotation against an explicit cache root and repository identity.
 ///
 /// Split from [`shared_cache_budget`] so the decision is testable without a
 /// broker, a host state directory, or a real package-manager store on disk.
-/// The caller holds the exclusive lease either way; this function only decides
-/// whether the bytes justify a reset.
+/// The caller holds the exclusive lease while this function recovers existing
+/// debt and applies any newly declared budget.
 fn shared_cache_budget_at(
-    budget: &SharedCacheBudget,
-    store: &Path,
+    budget: Option<&SharedCacheBudget>,
+    cache_root: &Path,
+    repository: &str,
     digest: &str,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
-    if budget.max_bytes == 0 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    recover_rotation_debt(cache_root, repository)?;
+
+    let Some(budget) = budget.filter(|budget| budget.max_bytes > 0) else {
         return Ok(None);
-    }
-    let Some(bytes) = directory_bytes(store)? else {
+    };
+    let store = cache_root.join(repository);
+    let Some(bytes) = directory_bytes(&store)? else {
         return Ok(None);
     };
     if bytes <= budget.max_bytes {
         return Ok(None);
     }
-    // Same retired-then-remove shape the managed gate cache uses, so an
-    // interrupted rotation leaves a directory that is still reclaimable by the
-    // liveness sweep rather than an unreadable half-state.
-    let retired = store.with_extension(format!("retired-{}-{}", epoch_ms(), std::process::id()));
-    std::fs::rename(store, &retired).map_err(|source| PreparationError::Io {
-        path: store.to_path_buf(),
-        source,
-    })?;
-    let remove = std::fs::remove_dir_all(&retired);
-    fs::create_dir_all(store).map_err(|source| PreparationError::Io {
-        path: store.to_path_buf(),
-        source,
-    })?;
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(PreparationError::StorageUnavailable {
+        path: store,
+        reason: "durable shared-cache rotation recovery is unavailable on this platform".into(),
+    });
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let cache_root_identity =
+            rotation_debt::DirectoryIdentity::capture(cache_root).map_err(|source| {
+                PreparationError::StorageUnavailable {
+                    path: cache_root.to_path_buf(),
+                    reason: format!("cannot identify the preparation-cache root: {source}"),
+                }
+            })?;
+        let store_identity =
+            rotation_debt::DirectoryIdentity::capture(&store).map_err(|source| {
+                PreparationError::StorageUnavailable {
+                    path: store.clone(),
+                    reason: format!("cannot identify the shared preparation cache: {source}"),
+                }
+            })?;
+        let debt = rotation_debt::RotationDebt::new(
+            repository,
+            &rotation_debt::new_transaction_id(),
+            cache_root_identity,
+            store_identity,
+        )
+        .map_err(|source| PreparationError::StorageUnavailable {
+            path: store.clone(),
+            reason: format!("cannot record shared-cache rotation intent: {source}"),
+        })?;
+        rotation_debt::publish(cache_root, debt).map_err(|source| {
+            PreparationError::StorageUnavailable {
+                path: store.clone(),
+                reason: format!("cannot publish shared-cache rotation intent: {source}"),
+            }
+        })?;
+        let progress = recover_rotation_debt(cache_root, repository)?;
+        if !progress.found_debt || !progress.complete {
+            return Err(PreparationError::StorageUnavailable {
+                path: store.clone(),
+                reason: "shared-cache rotation did not complete; retry after recovery".into(),
+            });
+        }
+    }
     Ok(Some(SharedCacheRotation {
         // The key is a digest, never a path: a report must not disclose where
         // the store lives on this machine.
@@ -1543,8 +1588,33 @@ fn shared_cache_budget_at(
         budget_bytes: budget.max_bytes,
         bytes_before: bytes,
         bytes_after: 0,
-        removed: remove.is_ok(),
+        removed: true,
     }))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recover_rotation_debt(
+    cache_root: &Path,
+    repository: &str,
+) -> Result<rotation_debt::RecoveryProgress, PreparationError> {
+    let deadline = Instant::now() + SHARED_CACHE_RECOVERY_MAX_ELAPSED;
+    match rotation_debt::recover(cache_root, repository, deadline) {
+        Ok(progress) if progress.complete => Ok(progress),
+        Ok(progress) => Err(PreparationError::StorageUnavailable {
+            path: cache_root.join(repository),
+            reason: format!(
+                "shared-cache rotation recovery stopped after unlinking {} filesystem entries",
+                progress.entries_reclaimed
+            ),
+        }),
+        Err(error) => Err(PreparationError::StorageUnavailable {
+            path: cache_root.join(repository),
+            reason: format!(
+                "shared-cache rotation recovery is incomplete after unlinking {} filesystem entries: {}",
+                error.progress.entries_reclaimed, error.source
+            ),
+        }),
+    }
 }
 
 /// What a rotation did, for the report and the event.
@@ -1554,9 +1624,8 @@ pub struct SharedCacheRotation {
     pub budget_bytes: u64,
     pub bytes_before: u64,
     pub bytes_after: u64,
-    /// False when the retired tree could not be removed. The fresh store is
-    /// still correct, so this is reported rather than fatal: the leftover is
-    /// reclaimable by the liveness sweep.
+    /// True after the old store is fully removed. Incomplete recovery returns
+    /// a storage refusal and leaves the durable debt for the next sweep.
     pub removed: bool,
 }
 
@@ -1964,13 +2033,6 @@ fn shared_cache_scan_io_refusal(path: &Path, source: &std::io::Error) -> Prepara
     }
 }
 
-fn epoch_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or_default()
-}
-
 fn preparation_cache_dir(broker: &Broker, digest: &str) -> Result<PathBuf, PreparationError> {
     Ok(preparation_store_dir(broker)?.join(&digest[..12]))
 }
@@ -2119,6 +2181,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHARED_CACHE_TEST_REPOSITORY: &str =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     #[test]
     fn a_storage_refusal_persists_a_cache_recovery_request() {
@@ -2397,25 +2462,84 @@ mod tests {
     fn an_absent_budget_means_no_rotation() {
         assert!(config().shared_cache.is_none());
         let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
+        let cache_root = tmp.path().join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("big"), vec![0_u8; 4096]).unwrap();
-        let report = shared_cache_budget_at_probe(None, &store).unwrap();
+        let report = shared_cache_budget_at(
+            None,
+            &cache_root,
+            SHARED_CACHE_TEST_REPOSITORY,
+            "abcdef123456",
+        )
+        .unwrap();
         assert!(report.is_none(), "no budget must mean no measurement");
         assert!(store.join("big").exists(), "the store must be untouched");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn an_absent_budget_still_finishes_a_previously_published_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("payload"), b"old cache").unwrap();
+        let cache_root_identity = rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+        let store_identity = rotation_debt::DirectoryIdentity::capture(&store).unwrap();
+        let debt = rotation_debt::RotationDebt::new(
+            SHARED_CACHE_TEST_REPOSITORY,
+            &rotation_debt::new_transaction_id(),
+            cache_root_identity,
+            store_identity,
+        )
+        .unwrap();
+        rotation_debt::publish(&cache_root, debt.clone()).unwrap();
+        rotation_debt::retire_original_store(
+            &cache_root,
+            &rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            shared_cache_budget_at(
+                None,
+                &cache_root,
+                SHARED_CACHE_TEST_REPOSITORY,
+                "abcdef123456",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(store.is_dir());
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+        assert!(
+            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn a_missing_shared_store_is_not_created_by_budget_measurement() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("missing-store");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
 
         assert_eq!(directory_bytes(&store).unwrap(), None);
         assert!(
-            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456")
-                .unwrap()
-                .is_none()
+            shared_cache_budget_at(
+                Some(&SharedCacheBudget { max_bytes: 1 }),
+                &cache_root,
+                SHARED_CACHE_TEST_REPOSITORY,
+                "abcdef123456",
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(!store.exists());
     }
@@ -2426,7 +2550,8 @@ mod tests {
     #[test]
     fn an_over_budget_shared_store_is_rotated_while_under_budget_is_not() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
+        let cache_root = tmp.path().join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         std::fs::create_dir_all(store.join("nested")).unwrap();
         std::fs::write(store.join("nested/payload"), vec![0_u8; 8192]).unwrap();
         let bytes = directory_bytes(&store).unwrap().unwrap();
@@ -2435,9 +2560,14 @@ mod tests {
         let budget = SharedCacheBudget {
             max_bytes: bytes - 1,
         };
-        let rotation = shared_cache_budget_at(&budget, &store, "abcdef123456")
-            .expect("rotation is reported")
-            .expect("over budget");
+        let rotation = shared_cache_budget_at(
+            Some(&budget),
+            &cache_root,
+            SHARED_CACHE_TEST_REPOSITORY,
+            "abcdef123456",
+        )
+        .expect("rotation is reported")
+        .expect("over budget");
         assert_eq!(rotation.bytes_before, bytes);
         assert_eq!(rotation.budget_bytes, budget.max_bytes);
         assert_eq!(rotation.key, "abcdef123456");
@@ -2450,9 +2580,14 @@ mod tests {
         // Under budget: measured, reported as no rotation, store preserved.
         std::fs::write(store.join("payload"), vec![0_u8; 64]).unwrap();
         assert!(
-            shared_cache_budget_at(&budget, &store, "abcdef123456")
-                .unwrap()
-                .is_none()
+            shared_cache_budget_at(
+                Some(&budget),
+                &cache_root,
+                SHARED_CACHE_TEST_REPOSITORY,
+                "abcdef123456",
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(store.join("payload").exists());
     }
@@ -2463,13 +2598,18 @@ mod tests {
     #[test]
     fn a_rotation_report_carries_no_host_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("host-state/preparation-cache/repo");
+        let cache_root = tmp.path().join("host-state/preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("payload"), vec![0_u8; 4096]).unwrap();
-        let rotation =
-            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "0123456789ab")
-                .unwrap()
-                .unwrap();
+        let rotation = shared_cache_budget_at(
+            Some(&SharedCacheBudget { max_bytes: 1 }),
+            &cache_root,
+            SHARED_CACHE_TEST_REPOSITORY,
+            "0123456789ab",
+        )
+        .unwrap()
+        .unwrap();
         let json = serde_json::to_string(&rotation).unwrap();
         assert!(
             !json.contains(tmp.path().to_string_lossy().as_ref()),
@@ -2668,7 +2808,8 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
+        let cache_root = tmp.path().join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         fs::create_dir_all(&store).unwrap();
         fs::write(store.join("keep"), b"preserve me").unwrap();
         let fifo = store.join("blocked-pipe");
@@ -2677,7 +2818,12 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
 
         assert!(matches!(
-            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456"),
+            shared_cache_budget_at(
+                Some(&SharedCacheBudget { max_bytes: 1 }),
+                &cache_root,
+                SHARED_CACHE_TEST_REPOSITORY,
+                "abcdef123456",
+            ),
             Err(PreparationError::StorageUnavailable { .. })
         ));
         assert_eq!(fs::read(store.join("keep")).unwrap(), b"preserve me");
@@ -2688,12 +2834,18 @@ mod tests {
     #[test]
     fn shared_cache_budget_fails_closed_on_unsupported_platforms() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
+        let cache_root = tmp.path().join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         fs::create_dir_all(&store).unwrap();
         fs::write(store.join("keep"), b"keep").unwrap();
 
         assert!(matches!(
-            shared_cache_budget_at(&SharedCacheBudget { max_bytes: 1 }, &store, "abcdef123456"),
+            shared_cache_budget_at(
+                Some(&SharedCacheBudget { max_bytes: 1 }),
+                &cache_root,
+                SHARED_CACHE_TEST_REPOSITORY,
+                "abcdef123456",
+            ),
             Err(PreparationError::StorageUnavailable { .. })
         ));
         assert_eq!(fs::read(store.join("keep")).unwrap(), b"keep");
