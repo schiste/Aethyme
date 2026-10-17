@@ -414,20 +414,6 @@ fn require_trusted_at_path(
     Ok(decision)
 }
 
-/// The decision made without recording anything. Grandfathered means it would
-/// record trust and proceed. This is used by read-only policy inspection.
-pub(crate) fn assess_trusted(
-    main_root: &Path,
-    policy: &GatePolicy,
-    store: Option<&BrokerStore>,
-) -> Result<TrustDecision, BrokerOpError> {
-    if !policy.runs_commands() {
-        return Ok(TrustDecision::NoCommands);
-    }
-    let path = record_path(main_root)?;
-    assess_trusted_at_path(main_root, policy, store, &path)
-}
-
 /// Assess trust using the host-state root captured by a Broker.
 pub(crate) fn assess_trusted_for_host_state(
     main_root: &Path,
