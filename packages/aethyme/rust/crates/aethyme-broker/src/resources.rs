@@ -12,10 +12,20 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod managed_storage_inventory;
+pub(crate) use managed_storage_inventory::ManagedStorageOwner;
+
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
+/// Additive ledger version; the shared host-resource schema remains version 1.
+pub(crate) const MANAGED_STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const HOST_RESOURCE_REQUEST_SCHEMA_VERSION: u32 = 1;
 const MIN_TTL_SECONDS: u64 = 15;
 const MAX_TTL_SECONDS: u64 = 86_400;
+/// Bound each repository's durable managed-storage ledger, including policy
+/// rows and released claim tombstones retained for idempotency. This is a
+/// per-repository bound; it does not constrain unrelated repositories sharing
+/// the host resource database.
+const MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY: i64 = 16_384;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -55,6 +65,73 @@ CREATE TABLE IF NOT EXISTS resource_reap_observations (
  generation INTEGER NOT NULL,
  reaped_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS managed_storage_meta (
+ key TEXT PRIMARY KEY,
+ value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO managed_storage_meta VALUES ('schema_version', 1);
+CREATE TABLE IF NOT EXISTS managed_storage_policies (
+ repository TEXT NOT NULL,
+ filesystem_id TEXT NOT NULL,
+ managed_cap_bytes INTEGER NOT NULL CHECK (managed_cap_bytes >= 0),
+ free_reserve_bytes INTEGER NOT NULL CHECK (free_reserve_bytes >= 0),
+ policy_digest TEXT NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, filesystem_id)
+);
+CREATE TABLE IF NOT EXISTS managed_storage_claims (
+ repository TEXT NOT NULL,
+ filesystem_id TEXT NOT NULL,
+ claim_id TEXT NOT NULL,
+ request_digest TEXT NOT NULL,
+ policy_digest TEXT NOT NULL,
+ policy_cap_bytes INTEGER NOT NULL CHECK (policy_cap_bytes >= 0),
+ policy_free_reserve_bytes INTEGER NOT NULL CHECK (policy_free_reserve_bytes >= 0),
+ materialization TEXT NOT NULL,
+ root_identity TEXT NOT NULL,
+ state TEXT NOT NULL CHECK (state IN ('reserved','charged','uncertain','cleanup_pending','released')),
+ requested_bytes INTEGER NOT NULL CHECK (requested_bytes > 0),
+ reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+ measured_bytes INTEGER CHECK (measured_bytes IS NULL OR measured_bytes >= 0),
+ release_receipt_digest TEXT,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, filesystem_id, claim_id),
+ CHECK (state != 'reserved' OR measured_bytes IS NULL),
+ CHECK (state != 'charged' OR (reserved_bytes = 0 AND measured_bytes IS NOT NULL)),
+ CHECK (state != 'cleanup_pending' OR (reserved_bytes = 0 AND measured_bytes IS NOT NULL)),
+ CHECK (state != 'released' OR release_receipt_digest IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS managed_storage_claims_by_filesystem_state
+ ON managed_storage_claims(filesystem_id, state);
+
+-- Additive lineage metadata keeps the shared host-resource schema at v1.
+-- It records charged-root mutation epochs without changing old claim rows.
+CREATE TABLE IF NOT EXISTS managed_storage_claim_lineage (
+ repository TEXT NOT NULL,
+ filesystem_id TEXT NOT NULL,
+ claim_id TEXT NOT NULL,
+ predecessor_claim_id TEXT,
+ baseline_bytes INTEGER NOT NULL CHECK (baseline_bytes >= 0),
+ root_instance_id TEXT,
+ superseded_by_claim_id TEXT,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, filesystem_id, claim_id),
+ UNIQUE (repository, filesystem_id, predecessor_claim_id),
+ UNIQUE (repository, filesystem_id, superseded_by_claim_id),
+ CHECK (predecessor_claim_id IS NULL OR predecessor_claim_id != claim_id),
+ CHECK (superseded_by_claim_id IS NULL OR superseded_by_claim_id != claim_id),
+ FOREIGN KEY (repository,filesystem_id,claim_id)
+   REFERENCES managed_storage_claims(repository,filesystem_id,claim_id),
+ FOREIGN KEY (repository,filesystem_id,predecessor_claim_id)
+   REFERENCES managed_storage_claims(repository,filesystem_id,claim_id),
+ FOREIGN KEY (repository,filesystem_id,superseded_by_claim_id)
+   REFERENCES managed_storage_claims(repository,filesystem_id,claim_id)
+);
+CREATE INDEX IF NOT EXISTS managed_storage_lineage_by_predecessor
+ ON managed_storage_claim_lineage(repository,filesystem_id,predecessor_claim_id);
+
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +172,147 @@ pub enum HostResourceError {
     NotQuarantined { lease_id: String, state: String },
     #[error("cannot find per-user state directory; set AETHYME_HOST_STATE_DIR")]
     StateDirectoryUnavailable,
+}
+
+/// Explicit per-repository, per-filesystem policy for the dormant managed
+/// storage ledger. It does not constrain arbitrary child-process writes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ManagedStoragePolicy {
+    /// Stable repository identity, never a worktree path.
+    pub repository: String,
+    /// Stable filesystem identity supplied by the caller.
+    pub filesystem_id: String,
+    /// Maximum measured bytes plus outstanding reservations.
+    pub managed_cap_bytes: u64,
+    /// Minimum free bytes to retain after outstanding reservations.
+    pub free_reserve_bytes: u64,
+}
+
+/// A durable reservation request. root_identity is an opaque stable identity,
+/// not a path. Claims have no PID lease or expiry.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ManagedStorageClaimRequest {
+    pub repository: String,
+    pub filesystem_id: String,
+    pub claim_id: String,
+    pub materialization: String,
+    pub root_identity: String,
+    pub reserved_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ManagedStorageClaimState {
+    Reserved,
+    Charged,
+    Uncertain,
+    CleanupPending,
+    Released,
+}
+
+impl ManagedStorageClaimState {
+    fn parse(value: &str) -> Result<Self, HostResourceError> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "charged" => Ok(Self::Charged),
+            "uncertain" => Ok(Self::Uncertain),
+            "cleanup_pending" => Ok(Self::CleanupPending),
+            "released" => Ok(Self::Released),
+            other => Err(HostResourceError::InvalidRequest(format!(
+                "unknown managed storage claim state {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct ManagedStorageClaim {
+    pub request: ManagedStorageClaimRequest,
+    /// Exact explicit policy snapshot that admitted this reservation.
+    pub policy: ManagedStoragePolicy,
+    pub state: ManagedStorageClaimState,
+    pub policy_digest: String,
+    pub request_digest: String,
+    pub measured_bytes: Option<u64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedStorageLineage {
+    predecessor_claim_id: Option<String>,
+    baseline_bytes: u64,
+    root_instance_id: Option<String>,
+    superseded_by_claim_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedStorageMutationBaseline {
+    predecessor_claim_id: String,
+    measured_bytes: u64,
+    root_instance_id: String,
+}
+
+/// Creating a durable reservation is distinct from finding an existing
+/// idempotency key. `Created` means this call inserted the reservation;
+/// `Existing` is recovery status and must not be treated as permission to
+/// repeat materialization.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) enum ManagedStorageReservationResult {
+    Created(ManagedStorageClaim),
+    Existing(ManagedStorageClaim),
+}
+
+/// Created only after the no-follow reclaimer verifies complete removal of
+/// the exact pinned root instance recorded by the claim lineage.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedManagedStorageRemoval {
+    repository: String,
+    filesystem_id: String,
+    claim_id: String,
+    root_identity: String,
+    root_instance_id: String,
+    receipt_digest: String,
+}
+
+impl VerifiedManagedStorageRemoval {
+    fn after_complete_no_follow_removal(
+        repository: String,
+        filesystem_id: String,
+        claim_id: String,
+        root_identity: String,
+        root_instance_id: Option<String>,
+        receipt_digest: String,
+        remaining_bytes: u64,
+        complete: bool,
+    ) -> Result<Self, HostResourceError> {
+        validate_managed_storage_identifier("repository", &repository)?;
+        validate_managed_storage_identifier("filesystem_id", &filesystem_id)?;
+        validate_managed_storage_identifier("claim_id", &claim_id)?;
+        validate_managed_storage_identifier("root_identity", &root_identity)?;
+        let root_instance_id = root_instance_id.ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_removal_instance_missing",
+                "release requires a pinned root instance; absent roots need a separate typed proof",
+            )
+        })?;
+        validate_managed_storage_identifier("root_instance_id", &root_instance_id)?;
+        validate_managed_storage_identifier("receipt_digest", &receipt_digest)?;
+        if !complete || remaining_bytes != 0 {
+            return Err(managed_storage_refusal(
+                "managed_storage_removal_unverified",
+                "release requires complete no-follow removal of the exact claim root",
+            ));
+        }
+        Ok(Self {
+            repository,
+            filesystem_id,
+            claim_id,
+            root_identity,
+            root_instance_id,
+            receipt_digest,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -395,6 +613,7 @@ impl HostResourceCoordinator {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         validate_schema(&conn)?;
+        validate_managed_storage_schema(&conn)?;
         Ok(Self {
             conn,
             path: path.into(),
@@ -427,6 +646,1001 @@ impl HostResourceCoordinator {
 
     pub fn db_path(&self) -> &Path {
         &self.path
+    }
+
+    /// Hold the exact preparation-cache exclusive lease while managing one
+    /// finite materialization directory. The caller supplies the resolved
+    /// preparation-cache root from this broker's storage context; this API does
+    /// not constrain arbitrary child-process writes or prove child quiescence.
+    pub(crate) fn begin_managed_storage_owner<'a>(
+        &'a mut self,
+        grant: HostResourceGrant,
+        repository: &str,
+        preparation_cache_root: &Path,
+        materialization: &str,
+        ttl_seconds: u64,
+    ) -> Result<ManagedStorageOwner<'a>, HostResourceError> {
+        ManagedStorageOwner::new(
+            self,
+            grant,
+            repository,
+            preparation_cache_root,
+            materialization,
+            ttl_seconds,
+        )
+    }
+
+    /// Read one exact durable claim so a restarted owner can distinguish an
+    /// outstanding reservation from measured, uncertain, or released storage.
+    pub(crate) fn managed_storage_claim(
+        &self,
+        repository: &str,
+        filesystem_id: &str,
+        claim_id: &str,
+    ) -> Result<Option<ManagedStorageClaim>, HostResourceError> {
+        validate_managed_storage_identifier("repository", repository)?;
+        validate_managed_storage_identifier("filesystem_id", filesystem_id)?;
+        validate_managed_storage_identifier("claim_id", claim_id)?;
+        load_managed_storage_claim(&self.conn, repository, filesystem_id, claim_id)
+    }
+
+    fn backfill_managed_storage_lineage(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        measured_bytes: u64,
+        root_instance_id: &str,
+    ) -> Result<ManagedStorageClaim, HostResourceError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal("managed_storage_claim_missing", "claim does not exist")
+        })?;
+        if claim.request != *request
+            || claim.state != ManagedStorageClaimState::Charged
+            || claim.measured_bytes != Some(measured_bytes)
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_backfill_mismatch",
+                "backfill requires the exact current charged claim and byte measurement",
+            ));
+        }
+        if let Some(lineage) = load_managed_storage_lineage(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )? {
+            if lineage.superseded_by_claim_id.is_some()
+                || lineage
+                    .root_instance_id
+                    .as_deref()
+                    .is_some_and(|known| known != root_instance_id)
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_backfill_stale",
+                    "the claim is superseded or the root instance differs from its recorded lineage",
+                ));
+            }
+            if lineage.root_instance_id.as_deref() != Some(root_instance_id) {
+                tx.execute(
+                    "UPDATE managed_storage_claim_lineage
+                     SET root_instance_id=?4,baseline_bytes=?5,updated_at=?6
+                     WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                    params![
+                        request.repository,
+                        request.filesystem_id,
+                        request.claim_id,
+                        root_instance_id,
+                        managed_storage_i64("baseline_bytes", measured_bytes)?,
+                        now
+                    ],
+                )?;
+            }
+        } else {
+            let other: Option<String> = tx
+                .query_row(
+                    "SELECT claim_id FROM managed_storage_claims
+                     WHERE repository=?1 AND filesystem_id=?2 AND materialization=?3
+                       AND root_identity=?4 AND claim_id!=?5
+                       AND state IN ('charged','cleanup_pending') LIMIT 1",
+                    params![
+                        request.repository,
+                        request.filesystem_id,
+                        request.materialization,
+                        request.root_identity,
+                        request.claim_id
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(other) = other {
+                return Err(managed_storage_refusal(
+                    "managed_storage_backfill_ambiguous",
+                    &format!("another measured claim {other:?} names this root"),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO managed_storage_claim_lineage
+                 (repository,filesystem_id,claim_id,predecessor_claim_id,baseline_bytes,
+                  root_instance_id,superseded_by_claim_id,updated_at)
+                 VALUES (?1,?2,?3,NULL,?4,?5,NULL,?6)",
+                params![
+                    request.repository,
+                    request.filesystem_id,
+                    request.claim_id,
+                    managed_storage_i64("baseline_bytes", measured_bytes)?,
+                    root_instance_id,
+                    now
+                ],
+            )?;
+        }
+        let claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            HostResourceError::InvalidRequest(
+                "managed storage claim disappeared during lineage backfill".into(),
+            )
+        })?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    /// Install or update an explicit policy. Lowering a cap preserves existing
+    /// charges; future reservations refuse until usage fits the new cap.
+    pub(crate) fn set_managed_storage_policy(
+        &mut self,
+        policy: &ManagedStoragePolicy,
+    ) -> Result<(), HostResourceError> {
+        self.set_managed_storage_policy_with_row_limit(
+            policy,
+            MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY,
+        )
+    }
+
+    fn set_managed_storage_policy_with_row_limit(
+        &mut self,
+        policy: &ManagedStoragePolicy,
+        row_limit: i64,
+    ) -> Result<(), HostResourceError> {
+        validate_managed_storage_policy(policy)?;
+        let digest = managed_storage_policy_digest(policy)?;
+        let cap = managed_storage_i64("managed_cap_bytes", policy.managed_cap_bytes)?;
+        let reserve = managed_storage_i64("free_reserve_bytes", policy.free_reserve_bytes)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_storage_policies
+             WHERE repository=?1 AND filesystem_id=?2)",
+            params![policy.repository, policy.filesystem_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            ensure_managed_storage_row_capacity(&tx, &policy.repository, row_limit)?;
+        }
+        tx.execute(
+            "INSERT INTO managed_storage_policies
+             (repository,filesystem_id,managed_cap_bytes,free_reserve_bytes,policy_digest,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(repository,filesystem_id) DO UPDATE SET
+             managed_cap_bytes=excluded.managed_cap_bytes,
+             free_reserve_bytes=excluded.free_reserve_bytes,
+             policy_digest=excluded.policy_digest,updated_at=excluded.updated_at",
+            params![policy.repository, policy.filesystem_id, cap, reserve, digest, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reserve against the configured managed cap and a current free-space
+    /// probe. The probe runs only after this method has acquired the immediate
+    /// transaction, so another broker reservation cannot settle between the
+    /// observation and admission. The filesystem can still be changed by
+    /// unrelated writers after the observation; this is not a physical quota.
+    fn reserve_managed_storage_with_probe<F>(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        free_space: F,
+    ) -> Result<ManagedStorageReservationResult, HostResourceError>
+    where
+        F: FnOnce() -> Result<u64, HostResourceError>,
+    {
+        self.reserve_managed_storage_with_row_limit_and_probe(
+            request,
+            free_space,
+            MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY,
+        )
+    }
+
+    fn reserve_managed_storage_with_row_limit_and_probe<F>(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        free_space: F,
+        row_limit: i64,
+    ) -> Result<ManagedStorageReservationResult, HostResourceError>
+    where
+        F: FnOnce() -> Result<u64, HostResourceError>,
+    {
+        self.reserve_managed_storage_with_baseline(request, free_space, row_limit, None)
+    }
+
+    fn reserve_managed_storage_mutation_with_probe<F>(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        free_space: F,
+        baseline: ManagedStorageMutationBaseline,
+    ) -> Result<ManagedStorageReservationResult, HostResourceError>
+    where
+        F: FnOnce() -> Result<u64, HostResourceError>,
+    {
+        self.reserve_managed_storage_with_baseline(
+            request,
+            free_space,
+            MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY,
+            Some(baseline),
+        )
+    }
+
+    // Test fixtures inject free-space readings through the same callback path
+    // used by production. These byte helpers are unavailable in non-test builds.
+    #[cfg(test)]
+    fn reserve_managed_storage(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        free_bytes: u64,
+    ) -> Result<ManagedStorageReservationResult, HostResourceError> {
+        self.reserve_managed_storage_with_probe(request, || Ok(free_bytes))
+    }
+
+    #[cfg(test)]
+    fn reserve_managed_storage_with_row_limit(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        free_bytes: u64,
+        row_limit: i64,
+    ) -> Result<ManagedStorageReservationResult, HostResourceError> {
+        self.reserve_managed_storage_with_row_limit_and_probe(request, || Ok(free_bytes), row_limit)
+    }
+
+    fn reserve_managed_storage_with_baseline<F>(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        free_space: F,
+        row_limit: i64,
+        baseline: Option<ManagedStorageMutationBaseline>,
+    ) -> Result<ManagedStorageReservationResult, HostResourceError>
+    where
+        F: FnOnce() -> Result<u64, HostResourceError>,
+    {
+        validate_managed_storage_claim_request(request)?;
+        let request_digest = managed_storage_claim_digest(request)?;
+        let requested_i64 = managed_storage_i64("reserved_bytes", request.reserved_bytes)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?;
+        if let Some(claim) = &existing {
+            if claim.request_digest != request_digest || claim.request != *request {
+                return Err(HostResourceError::IdempotencyMismatch(
+                    request.claim_id.clone(),
+                ));
+            }
+            let lineage = load_managed_storage_lineage(
+                &tx,
+                &request.repository,
+                &request.filesystem_id,
+                &request.claim_id,
+            )?;
+            if lineage
+                .as_ref()
+                .and_then(|row| row.predecessor_claim_id.as_deref())
+                != baseline
+                    .as_ref()
+                    .map(|value| value.predecessor_claim_id.as_str())
+            {
+                return Err(HostResourceError::IdempotencyMismatch(
+                    request.claim_id.clone(),
+                ));
+            }
+            tx.commit()?;
+            return Ok(ManagedStorageReservationResult::Existing(claim.clone()));
+        }
+
+        if let Some(baseline) = &baseline {
+            let previous = load_managed_storage_claim(
+                &tx,
+                &request.repository,
+                &request.filesystem_id,
+                &baseline.predecessor_claim_id,
+            )?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_predecessor_missing",
+                    "the charged predecessor claim does not exist",
+                )
+            })?;
+            let previous_lineage = load_managed_storage_lineage(
+                &tx,
+                &request.repository,
+                &request.filesystem_id,
+                &baseline.predecessor_claim_id,
+            )?;
+            if previous.state != ManagedStorageClaimState::Charged
+                || previous.measured_bytes != Some(baseline.measured_bytes)
+                || previous.request.materialization != request.materialization
+                || previous.request.root_identity != request.root_identity
+                || previous_lineage.as_ref().is_none_or(|row| {
+                    row.superseded_by_claim_id.is_some()
+                        || row.root_instance_id.as_deref()
+                            != Some(baseline.root_instance_id.as_str())
+                })
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_predecessor_stale",
+                    "predecessor is not the current charge for this exact root instance",
+                ));
+            }
+        }
+
+        ensure_managed_storage_row_capacity(&tx, &request.repository, row_limit)?;
+
+        let policy = load_managed_storage_policy(&tx, &request.repository, &request.filesystem_id)?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_policy_missing",
+                    "an explicit repository and filesystem storage cap is required",
+                )
+            })?;
+
+        let unresolved: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT repository,claim_id,state FROM managed_storage_claims
+             WHERE filesystem_id=?1 AND state IN ('reserved','uncertain') LIMIT 1",
+                [&request.filesystem_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((repository, claim_id, state)) = unresolved {
+            let (code, detail) = if state == "uncertain" {
+                (
+                    "managed_storage_inventory_uncertain",
+                    "has an uncertain size",
+                )
+            } else {
+                (
+                    "managed_storage_materialization_pending",
+                    "has an unresolved materialization reservation",
+                )
+            };
+            return Err(managed_storage_refusal(
+                code,
+                &format!(
+                    "claim {claim_id:?} for repository {repository:?} on this filesystem {detail}; reconcile it before admitting another allocation"
+                ),
+            ));
+        }
+
+        let managed_used = managed_storage_sum(
+            &tx,
+            "SELECT COALESCE(SUM(CASE
+                 WHEN state='released' OR EXISTS (
+                     SELECT 1 FROM managed_storage_claim_lineage l
+                     WHERE l.repository=managed_storage_claims.repository
+                       AND l.filesystem_id=managed_storage_claims.filesystem_id
+                       AND l.claim_id=managed_storage_claims.claim_id
+                       AND l.superseded_by_claim_id IS NOT NULL
+                 ) THEN 0
+                 WHEN state='reserved' THEN reserved_bytes
+                 ELSE COALESCE(measured_bytes,reserved_bytes)
+             END),0)
+             FROM managed_storage_claims WHERE repository=?1 AND filesystem_id=?2",
+            params![request.repository, request.filesystem_id],
+        )?;
+        let added_managed_bytes = request.reserved_bytes;
+        let projected = managed_used
+            .checked_add(added_managed_bytes)
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_budget_overflow",
+                    "managed storage arithmetic overflowed",
+                )
+            })?;
+        if projected > policy.policy.managed_cap_bytes {
+            return Err(managed_storage_refusal(
+                "managed_storage_budget_exceeded",
+                &format!(
+                    "request would use {projected} bytes against an explicit {} byte cap",
+                    policy.policy.managed_cap_bytes
+                ),
+            ));
+        }
+
+        let outstanding = managed_storage_sum(
+            &tx,
+            "SELECT COALESCE(SUM(reserved_bytes),0)
+             FROM managed_storage_claims WHERE filesystem_id=?1 AND state='reserved'",
+            [&request.filesystem_id],
+        )?;
+        let added_free_reservation = request.reserved_bytes;
+        let required_free = policy
+            .policy
+            .free_reserve_bytes
+            .checked_add(outstanding)
+            .and_then(|value| value.checked_add(added_free_reservation))
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_reserve_overflow",
+                    "filesystem reserve arithmetic overflowed",
+                )
+            })?;
+        // Keep the fallible filesystem sample inside this transaction. Exact
+        // retries returned above without probing; new admissions observe disk
+        // only after serializing against other broker claim settlement.
+        let free_bytes = free_space()?;
+        if free_bytes < required_free {
+            return Err(managed_storage_refusal(
+                "managed_storage_free_reserve",
+                &format!(
+                    "request needs {required_free} free bytes including outstanding reservations; observed {free_bytes}"
+                ),
+            ));
+        }
+
+        let policy_digest = policy.policy_digest.clone();
+        tx.execute(
+            "INSERT INTO managed_storage_claims
+             (repository,filesystem_id,claim_id,request_digest,policy_digest,
+              policy_cap_bytes,policy_free_reserve_bytes,materialization,root_identity,
+              state,requested_bytes,reserved_bytes,measured_bytes,release_receipt_digest,
+              created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'reserved',?10,?10,NULL,NULL,?11,?11)",
+            params![
+                request.repository,
+                request.filesystem_id,
+                request.claim_id,
+                request_digest,
+                policy_digest,
+                managed_storage_i64("managed_cap_bytes", policy.policy.managed_cap_bytes)?,
+                managed_storage_i64("free_reserve_bytes", policy.policy.free_reserve_bytes)?,
+                request.materialization,
+                request.root_identity,
+                requested_i64,
+                now
+            ],
+        )?;
+        let (predecessor_claim_id, baseline_bytes, root_instance_id) = baseline
+            .map(|baseline| {
+                (
+                    Some(baseline.predecessor_claim_id),
+                    baseline.measured_bytes,
+                    Some(baseline.root_instance_id),
+                )
+            })
+            .unwrap_or((None, 0, None));
+        tx.execute(
+            "INSERT INTO managed_storage_claim_lineage
+             (repository,filesystem_id,claim_id,predecessor_claim_id,baseline_bytes,
+              root_instance_id,superseded_by_claim_id,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,?7)",
+            params![
+                request.repository,
+                request.filesystem_id,
+                request.claim_id,
+                predecessor_claim_id,
+                managed_storage_i64("baseline_bytes", baseline_bytes)?,
+                root_instance_id,
+                now
+            ],
+        )?;
+        let claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            HostResourceError::InvalidRequest(
+                "managed storage reservation disappeared inside its transaction".into(),
+            )
+        })?;
+        tx.commit()?;
+        Ok(ManagedStorageReservationResult::Created(claim))
+    }
+
+    /// Record a complete inventory of a present root. Actual use is retained
+    /// even above policy, so over-budget bytes cannot be hidden.
+    fn reconcile_managed_storage_claim(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        measured_bytes: u64,
+        root_instance_id: Option<&str>,
+        root_present: bool,
+    ) -> Result<ManagedStorageClaim, HostResourceError> {
+        validate_managed_storage_claim_request(request)?;
+        let measured = managed_storage_i64("measured_bytes", measured_bytes)?;
+        let digest = managed_storage_claim_digest(request)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal("managed_storage_claim_missing", "claim does not exist")
+        })?;
+        if claim.request_digest != digest || claim.request != *request {
+            return Err(HostResourceError::IdempotencyMismatch(
+                request.claim_id.clone(),
+            ));
+        }
+        let lineage = load_managed_storage_lineage(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_lineage_missing",
+                "reservation has no mutation lineage row",
+            )
+        })?;
+        match claim.state {
+            ManagedStorageClaimState::Charged
+                if claim.measured_bytes == Some(measured_bytes)
+                    && lineage.root_instance_id.as_deref() == root_instance_id =>
+            {
+                tx.commit()?;
+                return Ok(claim);
+            }
+            ManagedStorageClaimState::Reserved | ManagedStorageClaimState::Uncertain => {}
+            _ => {
+                return Err(managed_storage_refusal(
+                    "managed_storage_claim_state",
+                    "only reserved or uncertain claims can be reconciled as present storage",
+                ));
+            }
+        }
+        if let Some(predecessor_id) = &lineage.predecessor_claim_id {
+            if !root_present
+                || root_instance_id.is_none()
+                || root_instance_id != lineage.root_instance_id.as_deref()
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_mutation_root_changed",
+                    "the charged root disappeared or was replaced during its mutation epoch",
+                ));
+            }
+            let predecessor = load_managed_storage_claim(
+                &tx,
+                &request.repository,
+                &request.filesystem_id,
+                predecessor_id,
+            )?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_predecessor_missing",
+                    "the charged predecessor claim disappeared before settlement",
+                )
+            })?;
+            let predecessor_lineage = load_managed_storage_lineage(
+                &tx,
+                &request.repository,
+                &request.filesystem_id,
+                predecessor_id,
+            )?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_predecessor_lineage_missing",
+                    "the charged predecessor has no lineage record",
+                )
+            })?;
+            if predecessor.state != ManagedStorageClaimState::Charged
+                || predecessor.measured_bytes != Some(lineage.baseline_bytes)
+                || predecessor.request.materialization != request.materialization
+                || predecessor.request.root_identity != request.root_identity
+                || predecessor_lineage.superseded_by_claim_id.is_some()
+                || predecessor_lineage.root_instance_id.as_deref() != root_instance_id
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_predecessor_stale",
+                    "the predecessor charge no longer matches the mutation baseline",
+                ));
+            }
+            let linked = tx.execute(
+                "UPDATE managed_storage_claim_lineage
+                 SET superseded_by_claim_id=?4,updated_at=?5
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3
+                   AND superseded_by_claim_id IS NULL",
+                params![
+                    request.repository,
+                    request.filesystem_id,
+                    predecessor_id,
+                    request.claim_id,
+                    now
+                ],
+            )?;
+            if linked != 1 {
+                return Err(managed_storage_refusal(
+                    "managed_storage_predecessor_stale",
+                    "predecessor was superseded before mutation settlement",
+                ));
+            }
+        }
+        tx.execute(
+            "UPDATE managed_storage_claims SET state='charged',reserved_bytes=0,
+             measured_bytes=?4,updated_at=?5
+             WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+            params![
+                request.repository,
+                request.filesystem_id,
+                request.claim_id,
+                measured,
+                now
+            ],
+        )?;
+        let lineage_updated = tx.execute(
+            "UPDATE managed_storage_claim_lineage SET root_instance_id=?4,updated_at=?5
+             WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+            params![
+                request.repository,
+                request.filesystem_id,
+                request.claim_id,
+                root_instance_id,
+                now
+            ],
+        )?;
+        if lineage_updated != 1 {
+            return Err(managed_storage_refusal(
+                "managed_storage_lineage_missing",
+                "the reservation lineage disappeared before settlement",
+            ));
+        }
+        claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            HostResourceError::InvalidRequest(
+                "managed storage claim disappeared during reconciliation".into(),
+            )
+        })?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    /// Preserve an allocation when its complete size or cleanup cannot be
+    /// proved. Uncertain claims block new allocations for their repo/filesystem.
+    pub(crate) fn mark_managed_storage_claim_uncertain(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+    ) -> Result<ManagedStorageClaim, HostResourceError> {
+        validate_managed_storage_claim_request(request)?;
+        let digest = managed_storage_claim_digest(request)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal("managed_storage_claim_missing", "claim does not exist")
+        })?;
+        if claim.request_digest != digest || claim.request != *request {
+            return Err(HostResourceError::IdempotencyMismatch(
+                request.claim_id.clone(),
+            ));
+        }
+        if claim.state == ManagedStorageClaimState::Released {
+            return Err(managed_storage_refusal(
+                "managed_storage_claim_released",
+                "a released claim cannot become uncertain",
+            ));
+        }
+        if claim.state != ManagedStorageClaimState::Uncertain {
+            tx.execute(
+                "UPDATE managed_storage_claims SET state='uncertain',updated_at=?4
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                params![
+                    request.repository,
+                    request.filesystem_id,
+                    request.claim_id,
+                    now
+                ],
+            )?;
+            claim = load_managed_storage_claim(
+                &tx,
+                &request.repository,
+                &request.filesystem_id,
+                &request.claim_id,
+            )?
+            .ok_or_else(|| {
+                HostResourceError::InvalidRequest(
+                    "managed storage claim disappeared while marking it uncertain".into(),
+                )
+            })?;
+        }
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    /// Keep a measured charge while its exact root awaits verified cleanup.
+    pub(crate) fn mark_managed_storage_cleanup_pending(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+    ) -> Result<ManagedStorageClaim, HostResourceError> {
+        validate_managed_storage_claim_request(request)?;
+        let digest = managed_storage_claim_digest(request)?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal("managed_storage_claim_missing", "claim does not exist")
+        })?;
+        if claim.request_digest != digest || claim.request != *request {
+            return Err(HostResourceError::IdempotencyMismatch(
+                request.claim_id.clone(),
+            ));
+        }
+        if load_managed_storage_lineage(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .is_some_and(|lineage| lineage.superseded_by_claim_id.is_some())
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_release_not_current",
+                "only the current charged-root lineage tip can enter cleanup-pending state",
+            ));
+        }
+        match claim.state {
+            ManagedStorageClaimState::CleanupPending => {
+                tx.commit()?;
+                return Ok(claim);
+            }
+            ManagedStorageClaimState::Charged => {}
+            _ => {
+                return Err(managed_storage_refusal(
+                    "managed_storage_claim_state",
+                    "only a measured charge can enter cleanup-pending state",
+                ));
+            }
+        }
+        tx.execute(
+            "UPDATE managed_storage_claims SET state='cleanup_pending',updated_at=?4
+             WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+            params![
+                request.repository,
+                request.filesystem_id,
+                request.claim_id,
+                now
+            ],
+        )?;
+        claim = load_managed_storage_claim(
+            &tx,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )?
+        .ok_or_else(|| {
+            HostResourceError::InvalidRequest(
+                "managed storage claim disappeared while queuing cleanup".into(),
+            )
+        })?;
+        tx.commit()?;
+        Ok(claim)
+    }
+
+    /// Drop a charge only after complete no-follow removal of its exact root.
+    pub(crate) fn release_managed_storage_claim(
+        &mut self,
+        receipt: &VerifiedManagedStorageRemoval,
+    ) -> Result<ManagedStorageClaim, HostResourceError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut claim = load_managed_storage_claim(
+            &tx,
+            &receipt.repository,
+            &receipt.filesystem_id,
+            &receipt.claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal("managed_storage_claim_missing", "claim does not exist")
+        })?;
+        if claim.request.root_identity != receipt.root_identity {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_mismatch",
+                "removal receipt does not match the claim root",
+            ));
+        }
+        let mut child_lineage = load_managed_storage_lineage(
+            &tx,
+            &receipt.repository,
+            &receipt.filesystem_id,
+            &receipt.claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_lineage_missing",
+                "release requires pinned lineage for the exact root instance",
+            )
+        })?;
+        if child_lineage.root_instance_id.as_deref() != Some(receipt.root_instance_id.as_str()) {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_instance_mismatch",
+                "removal receipt does not match the root instance recorded for this claim",
+            ));
+        }
+        if claim.state == ManagedStorageClaimState::Released {
+            let previous: Option<String> = tx.query_row(
+                "SELECT release_receipt_digest FROM managed_storage_claims
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                params![receipt.repository, receipt.filesystem_id, receipt.claim_id],
+                |row| row.get(0),
+            )?;
+            if previous.as_deref() == Some(receipt.receipt_digest.as_str()) {
+                tx.commit()?;
+                return Ok(claim);
+            }
+            return Err(managed_storage_refusal(
+                "managed_storage_release_replay_mismatch",
+                "claim was released with another receipt",
+            ));
+        }
+        if claim.state != ManagedStorageClaimState::CleanupPending {
+            return Err(managed_storage_refusal(
+                "managed_storage_claim_state",
+                "only cleanup-pending claims can be released",
+            ));
+        }
+        let mut chain = vec![(
+            receipt.claim_id.clone(),
+            ManagedStorageClaimState::CleanupPending,
+        )];
+        let mut child_id = receipt.claim_id.clone();
+        loop {
+            if chain.len() > MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY as usize {
+                return Err(managed_storage_refusal(
+                    "managed_storage_lineage_too_deep",
+                    "root mutation lineage exceeds the bounded repository row limit",
+                ));
+            }
+            if child_lineage.root_instance_id.as_deref() != Some(receipt.root_instance_id.as_str())
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_root_instance_mismatch",
+                    "removal receipt does not match the root instance recorded throughout its lineage",
+                ));
+            }
+            if child_id == receipt.claim_id && child_lineage.superseded_by_claim_id.is_some() {
+                return Err(managed_storage_refusal(
+                    "managed_storage_release_not_current",
+                    "verified removal must refer to the current tip of the charged-root lineage",
+                ));
+            }
+            let Some(predecessor_id) = child_lineage.predecessor_claim_id.clone() else {
+                break;
+            };
+            let predecessor = load_managed_storage_claim(
+                &tx,
+                &receipt.repository,
+                &receipt.filesystem_id,
+                &predecessor_id,
+            )?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_lineage_predecessor_missing",
+                    "verified root lineage has a missing predecessor claim",
+                )
+            })?;
+            let predecessor_lineage = load_managed_storage_lineage(
+                &tx,
+                &receipt.repository,
+                &receipt.filesystem_id,
+                &predecessor_id,
+            )?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_lineage_predecessor_missing",
+                    "verified root lineage has a missing predecessor metadata row",
+                )
+            })?;
+            if predecessor.request.root_identity != receipt.root_identity
+                || predecessor.request.materialization != claim.request.materialization
+                || predecessor.state != ManagedStorageClaimState::Charged
+                || predecessor.measured_bytes != Some(child_lineage.baseline_bytes)
+                || predecessor_lineage.root_instance_id.as_deref()
+                    != Some(receipt.root_instance_id.as_str())
+                || predecessor_lineage.superseded_by_claim_id.as_deref() != Some(child_id.as_str())
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_lineage_invalid",
+                    "verified root lineage has a mismatched root instance, byte baseline, or predecessor edge",
+                ));
+            }
+            child_id = predecessor_id.clone();
+            child_lineage = predecessor_lineage;
+            chain.push((predecessor_id, ManagedStorageClaimState::Charged));
+        }
+        for (claim_id, expected_state) in &chain {
+            let changed = tx.execute(
+                "UPDATE managed_storage_claims
+                 SET state='released',reserved_bytes=0,release_receipt_digest=?4,updated_at=?5
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3 AND state=?6",
+                params![
+                    receipt.repository,
+                    receipt.filesystem_id,
+                    claim_id,
+                    receipt.receipt_digest,
+                    now,
+                    match expected_state {
+                        ManagedStorageClaimState::CleanupPending => "cleanup_pending",
+                        ManagedStorageClaimState::Charged => "charged",
+                        _ => unreachable!("lineage release only includes charged rows"),
+                    }
+                ],
+            )?;
+            if changed != 1 {
+                return Err(managed_storage_refusal(
+                    "managed_storage_lineage_changed",
+                    "a charged-root claim changed before atomic lineage release",
+                ));
+            }
+        }
+        claim = load_managed_storage_claim(
+            &tx,
+            &receipt.repository,
+            &receipt.filesystem_id,
+            &receipt.claim_id,
+        )?
+        .ok_or_else(|| {
+            HostResourceError::InvalidRequest(
+                "managed storage claim disappeared during verified release".into(),
+            )
+        })?;
+        tx.commit()?;
+        Ok(claim)
     }
 
     /// Read-only estimate. A later acquire may race and is authoritative.
@@ -1188,6 +2402,238 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 #[cfg(not(unix))]
 fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
+}
+
+fn validate_managed_storage_identifier(field: &str, value: &str) -> Result<(), HostResourceError> {
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(HostResourceError::InvalidRequest(format!(
+            "managed storage {field} must be 1-512 non-control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_managed_storage_policy(policy: &ManagedStoragePolicy) -> Result<(), HostResourceError> {
+    validate_managed_storage_identifier("repository", &policy.repository)?;
+    validate_managed_storage_identifier("filesystem_id", &policy.filesystem_id)?;
+    managed_storage_i64("managed_cap_bytes", policy.managed_cap_bytes)?;
+    managed_storage_i64("free_reserve_bytes", policy.free_reserve_bytes)?;
+    Ok(())
+}
+
+fn validate_managed_storage_claim_request(
+    request: &ManagedStorageClaimRequest,
+) -> Result<(), HostResourceError> {
+    validate_managed_storage_identifier("repository", &request.repository)?;
+    validate_managed_storage_identifier("filesystem_id", &request.filesystem_id)?;
+    validate_managed_storage_identifier("claim_id", &request.claim_id)?;
+    validate_managed_storage_identifier("materialization", &request.materialization)?;
+    validate_managed_storage_identifier("root_identity", &request.root_identity)?;
+    if request.reserved_bytes == 0 {
+        return Err(HostResourceError::InvalidRequest(
+            "managed storage reservation must be greater than zero".into(),
+        ));
+    }
+    managed_storage_i64("reserved_bytes", request.reserved_bytes)?;
+    Ok(())
+}
+
+fn managed_storage_i64(field: &str, value: u64) -> Result<i64, HostResourceError> {
+    i64::try_from(value).map_err(|_| {
+        HostResourceError::InvalidRequest(format!(
+            "managed storage {field} exceeds SQLite signed integer range"
+        ))
+    })
+}
+
+fn managed_storage_policy_digest(
+    policy: &ManagedStoragePolicy,
+) -> Result<String, HostResourceError> {
+    let bytes = serde_json::to_vec(policy)
+        .map_err(|error| HostResourceError::InvalidRequest(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn managed_storage_claim_digest(
+    request: &ManagedStorageClaimRequest,
+) -> Result<String, HostResourceError> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|error| HostResourceError::InvalidRequest(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn managed_storage_refusal(code: &str, message: &str) -> HostResourceError {
+    HostResourceError::Conflict {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        conflicts: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ManagedStoragePolicyRow {
+    policy: ManagedStoragePolicy,
+    policy_digest: String,
+}
+
+fn load_managed_storage_policy(
+    conn: &Connection,
+    repository: &str,
+    filesystem_id: &str,
+) -> Result<Option<ManagedStoragePolicyRow>, HostResourceError> {
+    conn.query_row(
+        "SELECT repository,filesystem_id,managed_cap_bytes,free_reserve_bytes,policy_digest
+         FROM managed_storage_policies WHERE repository=?1 AND filesystem_id=?2",
+        params![repository, filesystem_id],
+        |row| {
+            let cap: i64 = row.get(2)?;
+            let reserve: i64 = row.get(3)?;
+            Ok(ManagedStoragePolicyRow {
+                policy: ManagedStoragePolicy {
+                    repository: row.get(0)?,
+                    filesystem_id: row.get(1)?,
+                    managed_cap_bytes: sql_u64(cap)?,
+                    free_reserve_bytes: sql_u64(reserve)?,
+                },
+                policy_digest: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(HostResourceError::from)
+}
+
+fn load_managed_storage_claim(
+    conn: &Connection,
+    repository: &str,
+    filesystem_id: &str,
+    claim_id: &str,
+) -> Result<Option<ManagedStorageClaim>, HostResourceError> {
+    conn.query_row(
+        "SELECT repository,filesystem_id,claim_id,materialization,root_identity,
+                state,requested_bytes,measured_bytes,request_digest,policy_digest,
+                policy_cap_bytes,policy_free_reserve_bytes,created_at,updated_at
+         FROM managed_storage_claims
+         WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+        params![repository, filesystem_id, claim_id],
+        |row| {
+            let state_text: String = row.get(5)?;
+            let measured: Option<i64> = row.get(7)?;
+            Ok(ManagedStorageClaim {
+                request: ManagedStorageClaimRequest {
+                    repository: row.get(0)?,
+                    filesystem_id: row.get(1)?,
+                    claim_id: row.get(2)?,
+                    materialization: row.get(3)?,
+                    root_identity: row.get(4)?,
+                    reserved_bytes: sql_u64(row.get(6)?)?,
+                },
+                policy: ManagedStoragePolicy {
+                    repository: row.get(0)?,
+                    filesystem_id: row.get(1)?,
+                    managed_cap_bytes: sql_u64(row.get(10)?)?,
+                    free_reserve_bytes: sql_u64(row.get(11)?)?,
+                },
+                state: ManagedStorageClaimState::parse(&state_text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                policy_digest: row.get(9)?,
+                request_digest: row.get(8)?,
+                measured_bytes: measured.map(sql_u64).transpose()?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(HostResourceError::from)
+}
+
+fn load_managed_storage_lineage(
+    conn: &Connection,
+    repository: &str,
+    filesystem_id: &str,
+    claim_id: &str,
+) -> Result<Option<ManagedStorageLineage>, HostResourceError> {
+    conn.query_row(
+        "SELECT predecessor_claim_id,baseline_bytes,root_instance_id,superseded_by_claim_id
+         FROM managed_storage_claim_lineage
+         WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+        params![repository, filesystem_id, claim_id],
+        |row| {
+            let baseline: i64 = row.get(1)?;
+            Ok(ManagedStorageLineage {
+                predecessor_claim_id: row.get(0)?,
+                baseline_bytes: sql_u64(baseline)?,
+                root_instance_id: row.get(2)?,
+                superseded_by_claim_id: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(HostResourceError::from)
+}
+
+fn sql_u64(value: i64) -> Result<u64, rusqlite::Error> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+}
+
+fn managed_storage_sum<P>(conn: &Connection, sql: &str, params: P) -> Result<u64, HostResourceError>
+where
+    P: rusqlite::Params,
+{
+    let value: i64 = conn.query_row(sql, params, |row| row.get(0))?;
+    u64::try_from(value).map_err(|_| {
+        HostResourceError::InvalidRequest(
+            "managed storage ledger contains a negative byte count".into(),
+        )
+    })
+}
+
+fn ensure_managed_storage_row_capacity(
+    conn: &Connection,
+    repository: &str,
+    row_limit: i64,
+) -> Result<(), HostResourceError> {
+    if row_limit < 0 {
+        return Err(HostResourceError::InvalidRequest(
+            "managed storage row limit cannot be negative".into(),
+        ));
+    }
+    let rows: i64 = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM managed_storage_policies WHERE repository=?1)
+             + (SELECT COUNT(*) FROM managed_storage_claims WHERE repository=?1)",
+        [repository],
+        |row| row.get(0),
+    )?;
+    if rows >= row_limit {
+        return Err(managed_storage_refusal(
+            "managed_storage_ledger_capacity",
+            &format!(
+                "repository {repository:?} already has {rows} managed-storage ledger rows; the per-repository limit is {row_limit}, and claim tombstones are retained for idempotency"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_managed_storage_schema(conn: &Connection) -> Result<(), HostResourceError> {
+    let version: i64 = conn.query_row(
+        "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    if version != i64::from(MANAGED_STORAGE_SCHEMA_VERSION) {
+        return Err(HostResourceError::InvalidRequest(format!(
+            "unsupported managed storage schema {version}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_schema(conn: &Connection) -> Result<(), HostResourceError> {
@@ -1977,6 +3423,633 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_policy(
+        repository: &str,
+        filesystem_id: &str,
+        cap: u64,
+        reserve: u64,
+    ) -> ManagedStoragePolicy {
+        ManagedStoragePolicy {
+            repository: repository.into(),
+            filesystem_id: filesystem_id.into(),
+            managed_cap_bytes: cap,
+            free_reserve_bytes: reserve,
+        }
+    }
+
+    fn managed_claim(claim_id: &str, bytes: u64) -> ManagedStorageClaimRequest {
+        ManagedStorageClaimRequest {
+            repository: "aethyme-main".into(),
+            filesystem_id: "device-42".into(),
+            claim_id: claim_id.into(),
+            materialization: "session-worktree".into(),
+            root_identity: format!("root:{claim_id}"),
+            reserved_bytes: bytes,
+        }
+    }
+
+    fn conflict_code(error: HostResourceError) -> String {
+        match error {
+            HostResourceError::Conflict { code, .. } => code,
+            other => panic!("expected managed-storage refusal, got {other:?}"),
+        }
+    }
+
+    fn newly_reserved(result: ManagedStorageReservationResult) -> ManagedStorageClaim {
+        match result {
+            ManagedStorageReservationResult::Created(claim) => claim,
+            ManagedStorageReservationResult::Existing(claim) => {
+                panic!("existing claim did not grant a new materialization: {claim:?}")
+            }
+        }
+    }
+
+    fn existing_claim(result: ManagedStorageReservationResult) -> ManagedStorageClaim {
+        match result {
+            ManagedStorageReservationResult::Existing(claim) => claim,
+            ManagedStorageReservationResult::Created(claim) => {
+                panic!("claim unexpectedly granted a new materialization: {claim:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn managed_storage_tables_are_additive_to_host_schema_v1() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let legacy = Connection::open(&db).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', 1);",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let coordinator = HostResourceCoordinator::open(&db).unwrap();
+        let host_version: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ledger_version: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(host_version, i64::from(HOST_RESOURCE_SCHEMA_VERSION));
+        assert_eq!(ledger_version, i64::from(MANAGED_STORAGE_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn managed_storage_row_limit_counts_policies_and_released_claim_tombstones() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let policy = managed_policy("aethyme-main", "device-42", 100, 0);
+        let first = managed_claim("first", 1);
+        let second_policy = managed_policy("aethyme-main", "device-43", 100, 0);
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        coordinator
+            .set_managed_storage_policy_with_row_limit(&policy, 2)
+            .unwrap();
+        let first_claim = newly_reserved(
+            coordinator
+                .reserve_managed_storage_with_row_limit(&first, 100, 2)
+                .unwrap(),
+        );
+        assert_eq!(first_claim.state, ManagedStorageClaimState::Reserved);
+        coordinator
+            .mark_managed_storage_claim_uncertain(&first)
+            .unwrap();
+        coordinator
+            .reconcile_managed_storage_claim(&first, 1, Some("test-instance:first"), true)
+            .unwrap();
+        coordinator
+            .mark_managed_storage_cleanup_pending(&first)
+            .unwrap();
+        let removal = VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+            first.repository.clone(),
+            first.filesystem_id.clone(),
+            first.claim_id.clone(),
+            first.root_identity.clone(),
+            Some("test-instance:first".into()),
+            "receipt-first".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        coordinator.release_managed_storage_claim(&removal).unwrap();
+
+        assert_eq!(
+            existing_claim(
+                coordinator
+                    .reserve_managed_storage_with_row_limit(&first, 100, 2)
+                    .unwrap()
+            )
+            .state,
+            ManagedStorageClaimState::Released
+        );
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .set_managed_storage_policy_with_row_limit(&second_policy, 2)
+                    .unwrap_err()
+            ),
+            "managed_storage_ledger_capacity"
+        );
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .reserve_managed_storage_with_row_limit(&managed_claim("second", 1), 100, 2,)
+                    .unwrap_err()
+            ),
+            "managed_storage_ledger_capacity"
+        );
+        coordinator
+            .set_managed_storage_policy_with_row_limit(
+                &managed_policy("aethyme-main", "device-42", 90, 0),
+                2,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn managed_storage_free_space_probe_is_serialized_and_failure_rolls_back() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        coordinator
+            .set_managed_storage_policy(&managed_policy("aethyme-main", "device-42", 1_000, 50))
+            .unwrap();
+
+        // Writer A completes before B enters its transaction. Its measured use
+        // has reduced the injected current free-space reading from 100 to 60.
+        let first = managed_claim("space-writer-a", 40);
+        newly_reserved(
+            coordinator
+                .reserve_managed_storage_with_probe(&first, || Ok(100))
+                .unwrap(),
+        );
+        coordinator
+            .reconcile_managed_storage_claim(&first, 40, Some("test-instance:space-writer-a"), true)
+            .unwrap();
+
+        let second = managed_claim("space-writer-b", 20);
+        let competing_connection = Connection::open(&db).unwrap();
+        competing_connection.busy_timeout(Duration::ZERO).unwrap();
+        let second_error = coordinator
+            .reserve_managed_storage_with_probe(&second, || {
+                // The sample callback runs while this connection owns
+                // BEGIN IMMEDIATE. A competing broker transaction cannot
+                // settle between this observation and B's admission decision.
+                let error = competing_connection
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .expect_err("free-space probe ran outside the immediate transaction");
+                assert!(matches!(error, rusqlite::Error::SqliteFailure(..)));
+                Ok(60)
+            })
+            .unwrap_err();
+        assert_eq!(conflict_code(second_error), "managed_storage_free_reserve");
+        assert!(
+            coordinator
+                .managed_storage_claim("aethyme-main", "device-42", &second.claim_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let third = managed_claim("space-writer-c", 1);
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .reserve_managed_storage_with_probe(&third, || {
+                        Err(managed_storage_refusal(
+                            "managed_storage_free_bytes_unknown",
+                            "injected free-space probe failure",
+                        ))
+                    })
+                    .unwrap_err()
+            ),
+            "managed_storage_free_bytes_unknown"
+        );
+        assert!(
+            coordinator
+                .managed_storage_claim("aethyme-main", "device-42", &third.claim_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // An exact-key retry remains status-only and never requires a fresh
+        // filesystem observation.
+        assert!(matches!(
+            coordinator
+                .reserve_managed_storage_with_probe(&first, || {
+                    panic!("exact retry unexpectedly sampled free space")
+                })
+                .unwrap(),
+            ManagedStorageReservationResult::Existing(_)
+        ));
+    }
+
+    #[test]
+    fn managed_storage_reservations_are_atomic_idempotent_and_durable() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let policy = managed_policy("aethyme-main", "device-42", 80, 20);
+        let first = managed_claim("session-1", 50);
+        {
+            let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+            coordinator.set_managed_storage_policy(&policy).unwrap();
+            let reserved =
+                newly_reserved(coordinator.reserve_managed_storage(&first, 200).unwrap());
+            assert_eq!(reserved.state, ManagedStorageClaimState::Reserved);
+            assert_eq!(reserved.request, first);
+            assert_eq!(reserved.policy, policy);
+            assert_eq!(
+                existing_claim(coordinator.reserve_managed_storage(&first, 1).unwrap()),
+                reserved,
+            );
+
+            let too_large = managed_claim("session-too-large", 36);
+            assert_eq!(
+                conflict_code(
+                    coordinator
+                        .reserve_managed_storage(&too_large, 200)
+                        .unwrap_err()
+                ),
+                "managed_storage_materialization_pending"
+            );
+
+            let other_repository = ManagedStorageClaimRequest {
+                repository: "another-repository".into(),
+                ..managed_claim("other-repository-session", 1)
+            };
+            coordinator
+                .set_managed_storage_policy(&managed_policy(
+                    "another-repository",
+                    "device-42",
+                    100,
+                    0,
+                ))
+                .unwrap();
+            assert_eq!(
+                conflict_code(
+                    coordinator
+                        .reserve_managed_storage(&other_repository, 200)
+                        .unwrap_err()
+                ),
+                "managed_storage_materialization_pending"
+            );
+        }
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        let reopened = existing_claim(coordinator.reserve_managed_storage(&first, 1).unwrap());
+        assert_eq!(reopened.state, ManagedStorageClaimState::Reserved);
+        assert_eq!(reopened.request, first);
+        assert_eq!(reopened.policy, policy);
+
+        coordinator
+            .reconcile_managed_storage_claim(&first, 45, Some("test-instance:session-1"), true)
+            .unwrap();
+
+        let too_large = managed_claim("session-too-large", 36);
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .reserve_managed_storage(&too_large, 200)
+                    .unwrap_err()
+            ),
+            "managed_storage_budget_exceeded"
+        );
+
+        let second = managed_claim("session-2", 30);
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .reserve_managed_storage(&second, 49)
+                    .unwrap_err()
+            ),
+            "managed_storage_free_reserve"
+        );
+        let second = newly_reserved(coordinator.reserve_managed_storage(&second, 50).unwrap());
+        assert_eq!(second.state, ManagedStorageClaimState::Reserved);
+
+        coordinator
+            .reconcile_managed_storage_claim(
+                &second.request,
+                30,
+                Some("test-instance:session-2"),
+                true,
+            )
+            .unwrap();
+        let third = managed_claim("session-3", 6);
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .reserve_managed_storage(&third, 100)
+                    .unwrap_err()
+            ),
+            "managed_storage_budget_exceeded"
+        );
+    }
+
+    #[test]
+    fn uncertain_managed_storage_survives_reopen_and_blocks_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let policy = managed_policy("aethyme-main", "device-42", 100, 0);
+        let first = managed_claim("uncertain-session", 40);
+        {
+            let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+            coordinator.set_managed_storage_policy(&policy).unwrap();
+            newly_reserved(coordinator.reserve_managed_storage(&first, 1000).unwrap());
+            let unknown = coordinator
+                .mark_managed_storage_claim_uncertain(&first)
+                .unwrap();
+            assert_eq!(unknown.state, ManagedStorageClaimState::Uncertain);
+        }
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        let next = managed_claim("next-session", 1);
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .reserve_managed_storage(&next, 1000)
+                    .unwrap_err()
+            ),
+            "managed_storage_inventory_uncertain"
+        );
+        let measured = coordinator
+            .reconcile_managed_storage_claim(&first, 41, Some("test-instance:uncertain"), true)
+            .unwrap();
+        assert_eq!(measured.state, ManagedStorageClaimState::Charged);
+        assert_eq!(measured.measured_bytes, Some(41));
+        let next = newly_reserved(coordinator.reserve_managed_storage(&next, 1000).unwrap());
+        assert_eq!(next.state, ManagedStorageClaimState::Reserved);
+    }
+
+    #[test]
+    fn managed_storage_charge_releases_only_after_exact_verified_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        coordinator
+            .set_managed_storage_policy(&managed_policy("aethyme-main", "device-42", 100, 0))
+            .unwrap();
+        let request = managed_claim("cleanup-session", 40);
+        newly_reserved(coordinator.reserve_managed_storage(&request, 1000).unwrap());
+        coordinator
+            .reconcile_managed_storage_claim(&request, 45, Some("test-instance:cleanup"), true)
+            .unwrap();
+        let pending = coordinator
+            .mark_managed_storage_cleanup_pending(&request)
+            .unwrap();
+        assert_eq!(pending.state, ManagedStorageClaimState::CleanupPending);
+        assert_eq!(pending.measured_bytes, Some(45));
+
+        assert_eq!(
+            conflict_code(
+                VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+                    request.repository.clone(),
+                    request.filesystem_id.clone(),
+                    request.claim_id.clone(),
+                    request.root_identity.clone(),
+                    None,
+                    "receipt-absent-root".into(),
+                    0,
+                    true,
+                )
+                .unwrap_err()
+            ),
+            "managed_storage_removal_instance_missing"
+        );
+        assert_eq!(
+            conflict_code(
+                VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+                    request.repository.clone(),
+                    request.filesystem_id.clone(),
+                    request.claim_id.clone(),
+                    request.root_identity.clone(),
+                    Some("test-instance:cleanup".into()),
+                    "receipt-incomplete".into(),
+                    1,
+                    true,
+                )
+                .unwrap_err()
+            ),
+            "managed_storage_removal_unverified"
+        );
+        let wrong_root = VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+            request.repository.clone(),
+            request.filesystem_id.clone(),
+            request.claim_id.clone(),
+            "different-root".into(),
+            Some("test-instance:original".into()),
+            "receipt-wrong-root".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .release_managed_storage_claim(&wrong_root)
+                    .unwrap_err()
+            ),
+            "managed_storage_root_mismatch"
+        );
+
+        let receipt = VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+            request.repository.clone(),
+            request.filesystem_id.clone(),
+            request.claim_id.clone(),
+            request.root_identity.clone(),
+            Some("test-instance:cleanup".into()),
+            "receipt-complete".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        let saved_lineage = load_managed_storage_lineage(
+            &coordinator.conn,
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )
+        .unwrap()
+        .unwrap();
+        coordinator
+            .conn
+            .execute(
+                "DELETE FROM managed_storage_claim_lineage
+                 WHERE repository=?1 AND filesystem_id=?2 AND claim_id=?3",
+                params![request.repository, request.filesystem_id, request.claim_id],
+            )
+            .unwrap();
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .release_managed_storage_claim(&receipt)
+                    .unwrap_err()
+            ),
+            "managed_storage_lineage_missing"
+        );
+        assert_eq!(
+            coordinator
+                .managed_storage_claim(
+                    &request.repository,
+                    &request.filesystem_id,
+                    &request.claim_id
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedStorageClaimState::CleanupPending
+        );
+        coordinator
+            .conn
+            .execute(
+                "INSERT INTO managed_storage_claim_lineage
+                 (repository,filesystem_id,claim_id,predecessor_claim_id,baseline_bytes,
+                  root_instance_id,superseded_by_claim_id,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    request.repository,
+                    request.filesystem_id,
+                    request.claim_id,
+                    saved_lineage.predecessor_claim_id,
+                    managed_storage_i64("baseline_bytes", saved_lineage.baseline_bytes).unwrap(),
+                    saved_lineage.root_instance_id,
+                    saved_lineage.superseded_by_claim_id,
+                    now_ms(),
+                ],
+            )
+            .unwrap();
+        let released = coordinator.release_managed_storage_claim(&receipt).unwrap();
+        assert_eq!(released.state, ManagedStorageClaimState::Released);
+        assert_eq!(released.measured_bytes, Some(45));
+        assert_eq!(
+            coordinator.release_managed_storage_claim(&receipt).unwrap(),
+            released
+        );
+        assert_eq!(
+            existing_claim(coordinator.reserve_managed_storage(&request, 0).unwrap()).state,
+            ManagedStorageClaimState::Released
+        );
+
+        let next = managed_claim("after-cleanup", 100);
+        assert_eq!(
+            newly_reserved(coordinator.reserve_managed_storage(&next, 100).unwrap()).state,
+            ManagedStorageClaimState::Reserved
+        );
+    }
+
+    #[test]
+    fn charged_claim_retry_is_not_a_new_materialization_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let request = managed_claim("charged-retry", 20);
+        {
+            let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+            coordinator
+                .set_managed_storage_policy(&managed_policy("aethyme-main", "device-42", 100, 0))
+                .unwrap();
+            newly_reserved(coordinator.reserve_managed_storage(&request, 1000).unwrap());
+            coordinator
+                .reconcile_managed_storage_claim(
+                    &request,
+                    18,
+                    Some("test-instance:charged-retry"),
+                    true,
+                )
+                .unwrap();
+        }
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        assert!(matches!(
+            coordinator.reserve_managed_storage(&request, 1000).unwrap(),
+            ManagedStorageReservationResult::Existing(ManagedStorageClaim {
+                state: ManagedStorageClaimState::Charged,
+                ..
+            })
+        ));
+        let recovered = coordinator
+            .managed_storage_claim(
+                &request.repository,
+                &request.filesystem_id,
+                &request.claim_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, ManagedStorageClaimState::Charged);
+        assert_eq!(recovered.measured_bytes, Some(18));
+    }
+
+    #[test]
+    fn concurrent_managed_storage_reservations_serialize_the_cap_check() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        {
+            let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+            coordinator
+                .set_managed_storage_policy(&managed_policy("aethyme-main", "device-42", 100, 0))
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = ["parallel-1", "parallel-2"].map(|claim_id| {
+            let db = db.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+                let request = managed_claim(claim_id, 60);
+                barrier.wait();
+                matches!(
+                    coordinator.reserve_managed_storage(&request, 1000),
+                    Ok(ManagedStorageReservationResult::Created(_))
+                )
+            })
+        });
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+    }
+
+    #[test]
+    fn managed_storage_claim_ids_bind_exact_request_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&temp.path().join("host.db")).unwrap();
+        coordinator
+            .set_managed_storage_policy(&managed_policy("aethyme-main", "device-42", 100, 0))
+            .unwrap();
+        let original = managed_claim("same-id", 25);
+        newly_reserved(
+            coordinator
+                .reserve_managed_storage(&original, 1000)
+                .unwrap(),
+        );
+        let changed = managed_claim("same-id", 26);
+        assert!(matches!(
+            coordinator.reserve_managed_storage(&changed, 1000),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+    }
+
     fn req(id: &str, resources: Vec<HostResourceRequirement>) -> HostResourceRequest {
         HostResourceRequest {
             schema_version: 1,
