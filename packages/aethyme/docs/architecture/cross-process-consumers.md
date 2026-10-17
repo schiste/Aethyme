@@ -44,6 +44,30 @@ The broker starts the private `broker gc __continue-artifacts <canonical-main-ro
 
 Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
 
+### Private spawned-agent supervision (#831)
+
+The router and broker shim dispatch the reserved
+`--aethyme-agent-supervisor-v1` and
+`--aethyme-agent-supervisor-cleanup-v1` modes before ordinary CLI parsing.
+They are paired internal process protocols, not operator commands. Launcher
+and child must agree on their version, storage context, exact executable and
+registration handshake; malformed or unsupported invocations refuse.
+
+Library embedders whose own executable does not implement these modes must
+select a compatible local runtime with
+`Broker::with_agent_supervisor_executable`. Selection resolves an exact file
+without PATH search; the caller chooses its trust and version policy. A
+missing or unusable selected executable refuses agent start before allocating
+a checkout, session or log. Unix supervision is required; unsupported
+platforms return an explicit error.
+
+Spawned-agent logs retain at most 16 MiB across stdout and stderr, with a
+bounded prefix and tail. They are diagnostic excerpts. Interrupted capture
+remains explicitly incomplete. Cleanup covers ordinary descendants in the
+owned process group; it is not containment of programs that deliberately
+escape that group. Consumers must preserve the private dispatch and exact
+runtime selection when changing entrypoints.
+
 ### Primary-checkout fast-forward (#232)
 
 Before `status`, `start`, `sync`, `push`, `submit` or `finish` runs from the primary checkout (hooks and advanced commands never move it), the broker checks the current branch against its configured, already-fetched tracking ref. With no tracked or non-ignored untracked changes, no unique commits, no Git operation in progress (merge, cherry-pick, revert, bisect, rebase, a held index lock) and no live broker session working in that checkout, a strictly-behind checkout advances by fast-forward (a compare-and-swap of the branch ref, then the index and worktree) and records `broker.checkout.fast_forwarded` with `trigger` (`broker.<command>`), `branch`, `upstream_ref`, `from` and `to`. This check does not fetch. Success prints `Updated main checkout: <branch> fast-forwarded from <from> to <to> (<upstream_ref>).` to stderr. Dirty, ahead, diverged, detached or unprovable states remain unchanged and print `warning: left the main checkout unchanged: <reason>. Run: <shell-quoted-command>` to stderr. Compatibility read-only snapshots and linked session worktrees are never moved; session worktrees use `broker sync --session <id>`. Standard output is unchanged, so JSON reports stay parseable.
