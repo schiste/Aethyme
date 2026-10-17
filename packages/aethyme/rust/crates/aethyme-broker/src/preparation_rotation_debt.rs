@@ -3261,6 +3261,28 @@ mod tests {
         )
     }
 
+    fn publish_stage_intent(cache_root: &std::path::Path, debt: &RotationDebt) {
+        let root = super::open_cache_root(cache_root).unwrap();
+        let intent = super::select_fresh_stage_intent(&root, debt, false).unwrap();
+        let intent_name = RotationDebt::fresh_stage_intent_component(&debt.repository).unwrap();
+        let scratch_name =
+            RotationDebt::fresh_stage_intent_scratch_component(&debt.repository).unwrap();
+        let bytes = super::encode_fresh_stage_intent(&intent).unwrap();
+        super::publish_control_file(&root, &intent_name, &scratch_name, &bytes).unwrap();
+    }
+
+    fn assert_rotation_inventory_blocked(cache_root: &std::path::Path) {
+        let inventory = inventory(
+            cache_root,
+            100,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(inventory.complete);
+        assert!(inventory.repositories.iter().any(|repo| repo == REPOSITORY));
+        assert!(inventory.blocked_repositories.contains(REPOSITORY));
+    }
+
     #[test]
     fn inventory_and_recovery_finish_a_committed_rotation() {
         let (_temp, cache_root, debt) = fixture();
@@ -3406,6 +3428,279 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn fresh_stage_proof_is_published_while_the_original_store_is_still_intact() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+
+        let proof = super::ensure_fresh_stage(&cache_root, &debt, false).unwrap();
+
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        let stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+        assert!(stage_identity.same_directory(&proof.fresh_store));
+        assert!(!proof.fresh_store.same_directory(&debt.original_store));
+        assert_eq!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            debt.original_store
+        );
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        super::validate_fresh_stage_state(&super::open_cache_root(&cache_root).unwrap(), &proof)
+            .unwrap();
+        assert_rotation_inventory_blocked(&cache_root);
+    }
+
+    #[test]
+    fn replacement_stage_is_refused_without_deleting_either_directory() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        let proof = super::ensure_fresh_stage(&cache_root, &debt, false).unwrap();
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        let held_stage = fs::File::open(&stage_path).unwrap();
+        let old_stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+        let moved_stage = cache_root.join("held-original-stage");
+
+        fs::rename(&stage_path, &moved_stage).unwrap();
+        fs::create_dir(&stage_path).unwrap();
+        let replacement_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+        assert_ne!(replacement_identity, old_stage_identity);
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, false).is_err());
+        assert!(
+            super::validate_fresh_stage_state(
+                &super::open_cache_root(&cache_root).unwrap(),
+                &proof,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            DirectoryIdentity::capture(&stage_path).unwrap(),
+            replacement_identity
+        );
+        assert_eq!(
+            DirectoryIdentity::capture(&moved_stage).unwrap(),
+            old_stage_identity
+        );
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_rotation_inventory_blocked(&cache_root);
+        drop(held_stage);
+    }
+
+    #[test]
+    fn foreign_transaction_intent_is_refused_without_touching_original_store() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        let foreign_debt = RotationDebt::new(
+            REPOSITORY,
+            "1123456789abcdef0123456789abcdef",
+            debt.cache_root.clone(),
+            debt.original_store.clone(),
+        )
+        .unwrap();
+        publish_stage_intent(&cache_root, &foreign_debt);
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, false).is_err());
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        assert!(!cache_root.join(stage_name.to_str().unwrap()).exists());
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        let intent = super::read_fresh_stage_intent(
+            &super::open_cache_root(&cache_root).unwrap(),
+            REPOSITORY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(intent.debt, foreign_debt);
+        assert_rotation_inventory_blocked(&cache_root);
+    }
+
+    #[test]
+    fn foreign_transaction_proof_is_refused_without_touching_original_store() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        let foreign_debt = RotationDebt::new(
+            REPOSITORY,
+            "2123456789abcdef0123456789abcdef",
+            debt.cache_root.clone(),
+            debt.original_store.clone(),
+        )
+        .unwrap();
+        let proof = super::ensure_fresh_stage(&cache_root, &foreign_debt, false).unwrap();
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        let stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, false).is_err());
+        assert_eq!(
+            DirectoryIdentity::capture(&stage_path).unwrap(),
+            stage_identity
+        );
+        assert_eq!(
+            fs::read(original_path.join("package-index")).unwrap(),
+            original_payload
+        );
+        let retained_proof = super::read_fresh_stage_proof(
+            &super::open_cache_root(&cache_root).unwrap(),
+            REPOSITORY,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained_proof, proof);
+        assert_rotation_inventory_blocked(&cache_root);
+    }
+
+    #[test]
+    fn intent_only_crash_is_inventory_visible_and_recoverable() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        publish_stage_intent(&cache_root, &debt);
+
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        assert!(!stage_path.exists());
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_rotation_inventory_blocked(&cache_root);
+
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert_eq!(fs::read_dir(&original_path).unwrap().count(), 0);
+        assert_ne!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            debt.original_store
+        );
+        assert_ne!(
+            fs::read(original_path.join("package-index")).ok(),
+            Some(original_payload)
+        );
+        assert!(!stage_path.exists());
+        assert!(super::read(&cache_root, REPOSITORY).unwrap().is_none());
+        assert!(
+            super::read_fresh_stage_intent(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn staged_directory_before_proof_is_inventory_visible_and_recoverable() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        let original_payload = fs::read(original_path.join("package-index")).unwrap();
+        publish_stage_intent(&cache_root, &debt);
+        let stage_name = RotationDebt::fresh_stage_component(REPOSITORY).unwrap();
+        let stage_path = cache_root.join(stage_name.to_str().unwrap());
+        fs::create_dir(&stage_path).unwrap();
+        let stage_identity = DirectoryIdentity::capture(&stage_path).unwrap();
+
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_rotation_inventory_blocked(&cache_root);
+
+        let progress = recover(
+            &cache_root,
+            REPOSITORY,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(progress.complete);
+        assert!(progress.found_debt);
+        assert_eq!(fs::read_dir(&original_path).unwrap().count(), 0);
+        assert_eq!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            stage_identity
+        );
+        assert_ne!(
+            fs::read(original_path.join("package-index")).ok(),
+            Some(original_payload)
+        );
+        assert!(!stage_path.exists());
+        assert!(super::read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_same_identity_empty_cache_without_tree_witness_is_refused() {
+        let (_temp, cache_root, debt) = fixture();
+        let original_path = cache_root.join(REPOSITORY);
+        fs::remove_file(original_path.join("package-index")).unwrap();
+        assert_eq!(
+            DirectoryIdentity::capture(&original_path).unwrap(),
+            debt.original_store
+        );
+
+        assert!(super::ensure_fresh_stage(&cache_root, &debt, true).is_err());
+        assert!(
+            super::read_fresh_stage_intent(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_fresh_stage_proof(
+                &super::open_cache_root(&cache_root).unwrap(),
+                REPOSITORY,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(fs::read_dir(original_path).unwrap().next().is_none());
     }
 
     #[test]
