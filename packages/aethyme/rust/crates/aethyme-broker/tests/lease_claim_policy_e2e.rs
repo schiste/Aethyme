@@ -265,7 +265,10 @@ fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
 fn guarded_exec_is_not_failed_by_a_stale_sessions_explicit_lease() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path(), None);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_agent_supervisor_executable(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .unwrap();
     let quiet = broker
         .adopt(&add_worktree(tmp.path(), "quiet"), None)
         .unwrap();

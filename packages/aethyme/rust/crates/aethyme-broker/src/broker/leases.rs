@@ -1496,50 +1496,120 @@ impl Broker {
     where
         F: FnMut() -> Result<(), BrokerOpError>,
     {
-        let mut heartbeat = heartbeat;
+        self.guarded_exec_with_env_heartbeat_and_mode(
+            session_id,
+            command,
+            environment,
+            heartbeat,
+            crate::inline_exec_supervisor::generic_exec_mode,
+        )
+    }
+
+    fn guarded_exec_with_env_heartbeat_and_mode<F, M>(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+        environment: &[(String, String)],
+        mut heartbeat: F,
+        select_mode: M,
+    ) -> Result<GuardedExecReport, BrokerOpError>
+    where
+        F: FnMut() -> Result<(), BrokerOpError>,
+        M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
+    {
+        let supervisor_executable = self.agent_supervisor_executable.clone();
         self.guarded_exec_with_runner(session_id, command, move |session| {
-            let mut child = Command::new(&command[0]);
-            child
-                .args(&command[1..])
-                .current_dir(&session.worktree_path)
-                .env("AETHYME_BROKER_SESSION_ID", session_id.to_string())
-                .env("AETHYME_GATE_WORKER_ID", format!("s{session_id}-exec"))
-                .env("AETHYME_TEST_DB_SUFFIX", format!("s{session_id}-exec"));
-            for (name, value) in environment {
-                child.env(name, value);
-            }
-            let mut child = child.spawn().map_err(|source| BrokerOpError::Spawn {
-                command: command.join(" "),
-                source,
-            })?;
-            let status = loop {
-                if let Some(status) = child.try_wait().map_err(|source| BrokerOpError::Spawn {
-                    command: command.join(" "),
-                    source,
-                })? {
-                    break status;
-                }
-                if let Err(error) = heartbeat() {
-                    if let Err(cleanup_error) = child.kill() {
-                        crate::warn_unrecorded(
-                            "stop guarded command after heartbeat failure",
-                            Err::<(), _>(cleanup_error),
-                        );
+            let mut execution_environment = vec![
+                (
+                    "AETHYME_BROKER_SESSION_ID".to_owned(),
+                    session_id.to_string(),
+                ),
+                (
+                    "AETHYME_GATE_WORKER_ID".to_owned(),
+                    format!("s{session_id}-exec"),
+                ),
+                (
+                    "AETHYME_TEST_DB_SUFFIX".to_owned(),
+                    format!("s{session_id}-exec"),
+                ),
+            ];
+            execution_environment.extend_from_slice(environment);
+
+            let result = match select_mode() {
+                crate::inline_exec_supervisor::GenericExecMode::Supervised => {
+                    let executable = crate::agent_supervisor::resolve_executable(
+                        supervisor_executable.as_deref(),
+                    )
+                    .map_err(|source| BrokerOpError::Spawn {
+                        command: command.join(" "),
+                        source,
+                    })?;
+                    let supervisor =
+                        crate::inline_exec_supervisor::InlineExecSupervisor::start_inheriting_stdin(
+                            &executable,
+                        )
+                        .map_err(|error| map_guarded_exec_supervisor_error(session_id, command, error))?;
+                    let result = supervisor
+                        .run(
+                            Path::new(&session.worktree_path),
+                            command,
+                            &execution_environment,
+                            &mut heartbeat,
+                        )
+                        .map_err(|error| map_guarded_exec_supervisor_error(session_id, command, error))?;
+                    GuardedCommandResult {
+                        exit_code: result.exit_code,
+                        succeeded: result.succeeded,
                     }
-                    if let Err(cleanup_error) = child.wait() {
-                        crate::warn_unrecorded(
-                            "reap guarded command after heartbeat failure",
-                            Err::<(), _>(cleanup_error),
-                        );
-                    }
-                    return Err(error);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                crate::inline_exec_supervisor::GenericExecMode::Legacy(reason) => {
+                    eprintln!(
+                        "warning: guarded exec for session {session_id} is using the legacy unsupervised runner ({reason}); descendant cleanup is not verified"
+                    );
+                    let mut child = Command::new(&command[0]);
+                    child
+                        .args(&command[1..])
+                        .current_dir(&session.worktree_path);
+                    for (name, value) in &execution_environment {
+                        child.env(name, value);
+                    }
+                    let mut child = child.spawn().map_err(|source| BrokerOpError::Spawn {
+                        command: command.join(" "),
+                        source,
+                    })?;
+                    let status = loop {
+                        if let Some(status) = child.try_wait().map_err(|source| {
+                            BrokerOpError::Spawn {
+                                command: command.join(" "),
+                                source,
+                            }
+                        })? {
+                            break status;
+                        }
+                        if let Err(error) = heartbeat() {
+                            if let Err(cleanup_error) = child.kill() {
+                                crate::warn_unrecorded(
+                                    "stop guarded command after heartbeat failure",
+                                    Err::<(), _>(cleanup_error),
+                                );
+                            }
+                            if let Err(cleanup_error) = child.wait() {
+                                crate::warn_unrecorded(
+                                    "reap guarded command after heartbeat failure",
+                                    Err::<(), _>(cleanup_error),
+                                );
+                            }
+                            return Err(error);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    };
+                    GuardedCommandResult {
+                        exit_code: status.code(),
+                        succeeded: status.success(),
+                    }
+                }
             };
-            Ok(GuardedCommandResult {
-                exit_code: status.code(),
-                succeeded: status.success(),
-            })
+            Ok(result)
         })
     }
 
@@ -1573,8 +1643,11 @@ impl Broker {
                     }
                     .into()
                 }
-                crate::inline_exec_supervisor::InlineExecError::CommandStart(reason) => {
-                    crate::PreparationError::SupervisorUnavailable { reason }.into()
+                crate::inline_exec_supervisor::InlineExecError::CommandStart(error) => {
+                    crate::PreparationError::SupervisorUnavailable {
+                        reason: error.to_string(),
+                    }
+                    .into()
                 }
             }
         })
@@ -1633,10 +1706,10 @@ impl Broker {
                         }
                         .into()
                     }
-                    crate::inline_exec_supervisor::InlineExecError::CommandStart(reason) => {
+                    crate::inline_exec_supervisor::InlineExecError::CommandStart(source) => {
                         BrokerOpError::Spawn {
                             command: command.join(" "),
-                            source: std::io::Error::other(reason),
+                            source,
                         }
                     }
                 })?;
@@ -1748,6 +1821,32 @@ impl Broker {
             )?;
         }
         Ok(report)
+    }
+}
+
+fn map_guarded_exec_supervisor_error(
+    session_id: i64,
+    command: &[String],
+    error: crate::inline_exec_supervisor::InlineExecError,
+) -> BrokerOpError {
+    match error {
+        crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(reason) => {
+            BrokerOpError::GuardedExecCleanupUnknown { session_id, reason }
+        }
+        crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(reason) => {
+            BrokerOpError::GuardedExecOutcomeUnknown { session_id, reason }
+        }
+        crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
+        crate::inline_exec_supervisor::InlineExecError::Setup(source) => BrokerOpError::Spawn {
+            command: command.join(" "),
+            source,
+        },
+        crate::inline_exec_supervisor::InlineExecError::CommandStart(source) => {
+            BrokerOpError::Spawn {
+                command: command.join(" "),
+                source,
+            }
+        }
     }
 }
 
@@ -1882,5 +1981,403 @@ impl PathAudit {
             foreign_paths: self.foreign,
             ok,
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod generic_guarded_exec_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn fixture() -> (tempfile::TempDir, crate::test_storage::TestStorage, Broker) {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.path().join("tracked.txt"), "before\n").unwrap();
+        git(repository.path(), &["add", "tracked.txt"]);
+        git(repository.path(), &["commit", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(repository.path()).unwrap();
+        (repository, storage, broker)
+    }
+
+    #[test]
+    fn forced_supervised_generic_exec_preserves_environment_exit_and_ownership_audit() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("generic guarded exec", None).unwrap();
+        broker.claim_lease(session.id, "tracked.txt", None).unwrap();
+        let mut heartbeats = 0;
+        let report = broker
+            .guarded_exec_with_env_heartbeat_and_mode(
+                session.id,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s:%s' \"$AETHYME_BROKER_SESSION_ID\" \"$CUSTOM_VALUE\" > tracked.txt; exit 7".into(),
+                ],
+                &[
+                    ("AETHYME_BROKER_SESSION_ID".into(), "user-override".into()),
+                    ("CUSTOM_VALUE".into(), "preserved".into()),
+                ],
+                || {
+                    heartbeats += 1;
+                    Ok(())
+                },
+                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+            )
+            .unwrap();
+
+        assert!(heartbeats > 0);
+        assert_eq!(report.exit_code, Some(7));
+        assert!(!report.command_success);
+        assert!(!report.ok);
+        assert!(report.outside_lease_paths.is_empty());
+        assert_eq!(report.touched_paths, vec!["tracked.txt".to_owned()]);
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&session.worktree_path).join("tracked.txt")).unwrap(),
+            "user-override:preserved"
+        );
+    }
+
+    #[test]
+    fn generic_heartbeat_abort_stops_a_descendant_and_preserves_liveness_error() {
+        use std::time::Duration;
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("heartbeat guarded exec", None)
+            .unwrap();
+        let output = Path::new(&session.worktree_path).join("descendant.txt");
+        let mut heartbeats = 0;
+        let error = broker
+            .guarded_exec_with_env_heartbeat_and_mode(
+                session.id,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    r#"(i=0; while [ "$i" -lt 500 ]; do printf x >> "$OUTPUT_PATH"; sleep 0.02; i=$((i + 1)); done) & wait"#.into(),
+                ],
+                &[("OUTPUT_PATH".into(), output.to_string_lossy().into_owned())],
+                || {
+                    heartbeats += 1;
+                    if heartbeats >= 3 {
+                        Err(crate::PreparationError::LivenessDeadlineElapsed.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BrokerOpError::Preparation(crate::PreparationError::LivenessDeadlineElapsed)
+        ));
+        let bytes_after_abort = std::fs::metadata(&output).unwrap().len();
+        assert!(bytes_after_abort > 0, "descendant never started writing");
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            std::fs::metadata(output).unwrap().len(),
+            bytes_after_abort,
+            "a descendant continued writing after guarded exec returned"
+        );
+    }
+
+    #[test]
+    fn empty_generic_exec_refuses_before_selecting_a_helper() {
+        let (_repository, _storage, mut broker) = fixture();
+        let error = broker
+            .guarded_exec_with_env_heartbeat_and_mode(
+                0,
+                &[],
+                &[],
+                || Ok(()),
+                || panic!("helper mode was selected for empty argv"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, BrokerOpError::MissingExecCommand));
+    }
+
+    #[test]
+    fn wrong_helper_refuses_before_the_guarded_command_can_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("wrong guarded helper", None).unwrap();
+        let wrong_helper = tempfile::tempdir().unwrap();
+        let executable = wrong_helper.path().join("not-aethyme-helper");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        broker = broker
+            .with_agent_supervisor_executable(&executable)
+            .unwrap();
+        let marker = Path::new(&session.worktree_path).join("must-not-exist");
+
+        let error = broker
+            .guarded_exec_with_env_heartbeat_and_mode(
+                session.id,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf launched > must-not-exist".into(),
+                ],
+                &[],
+                || Ok(()),
+                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, BrokerOpError::Spawn { .. }), "{error}");
+        assert!(
+            !marker.exists(),
+            "guarded command ran without a ready helper"
+        );
+    }
+
+    #[test]
+    fn supervised_spawn_errors_preserve_direct_command_io_error_kind_and_os_code() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("spawn error fidelity", None).unwrap();
+        let candidates = tempfile::tempdir().unwrap();
+        let missing = candidates.path().join("missing-command");
+        let non_executable = candidates.path().join("not-executable");
+        std::fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&non_executable).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&non_executable, permissions).unwrap();
+
+        let cases = [
+            (
+                "missing executable",
+                vec![missing.to_string_lossy().into_owned()],
+            ),
+            (
+                "non-executable file",
+                vec![non_executable.to_string_lossy().into_owned()],
+            ),
+            (
+                "NUL argument",
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exit 0".into(),
+                    "bad\0argument".into(),
+                ],
+            ),
+        ];
+
+        for (description, command) in cases {
+            let direct = Command::new(&command[0])
+                .args(&command[1..])
+                .spawn()
+                .expect_err("direct command unexpectedly started");
+            let guarded = broker
+                .guarded_exec_with_env_heartbeat_and_mode(
+                    session.id,
+                    &command,
+                    &[],
+                    || Ok(()),
+                    || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+                )
+                .expect_err("supervised command unexpectedly started");
+            let BrokerOpError::Spawn { source, .. } = guarded else {
+                panic!("{description} returned an unexpected error: {guarded}");
+            };
+            assert_eq!(source.kind(), direct.kind(), "{description}");
+            assert_eq!(
+                source.raw_os_error(),
+                direct.raw_os_error(),
+                "{description}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_helper_refuses_v2_before_the_guarded_command_can_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("old helper readiness refusal", None)
+            .unwrap();
+        let old_helper = tempfile::tempdir().unwrap();
+        let executable = old_helper.path().join("v1-helper");
+        // A v1 helper's reserved-prefix dispatcher exits 125 for the v2 flag
+        // before sending Ready or receiving a Run frame.
+        let helper_arg = old_helper.path().join("received-flag");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\ncase \"$1\" in\n  --aethyme-inline-exec-supervisor-v1) exit 0 ;;\n  --aethyme-inline-exec-supervisor*) exit 125 ;;\n  *) exit 125 ;;\nesac\n",
+                helper_arg.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let mut broker = broker
+            .with_agent_supervisor_executable(&executable)
+            .unwrap();
+        let marker = Path::new(&session.worktree_path).join("v1-helper-must-not-run-command");
+
+        let error = broker
+            .guarded_exec_with_env_heartbeat_and_mode(
+                session.id,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf launched > v1-helper-must-not-run-command".into(),
+                ],
+                &[],
+                || Ok(()),
+                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, BrokerOpError::Spawn { .. }), "{error}");
+        assert!(
+            error.to_string().contains("helper did not become ready"),
+            "old helper was not rejected during readiness: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(helper_arg).unwrap(),
+            "--aethyme-inline-exec-supervisor-v2"
+        );
+        assert!(!marker.exists(), "the command ran with an old v1 helper");
+    }
+
+    #[test]
+    fn public_guarded_exec_uses_supervisor_without_a_controlling_terminal() {
+        const CHILD_MODE: &str = "AETHYME_TEST_GUARDED_EXEC_NO_CONTROLLING_TERMINAL_CHILD";
+        if std::env::var_os(CHILD_MODE).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "broker::leases::generic_guarded_exec_tests::public_guarded_exec_uses_supervisor_without_a_controlling_terminal",
+                    "--nocapture",
+                    "--quiet",
+                ])
+                .env(CHILD_MODE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "detached child failed with {}:\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("test result: ok. 1 passed; 0 failed"),
+                "detached child did not execute exactly one test:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        // The isolated child is not a process-group leader, so setsid creates
+        // a new session with no controlling terminal before the public call.
+        // SAFETY: This detached child is not a process-group leader; `setsid`
+        // takes no pointers and changes only this child process's session.
+        let session_id = unsafe { libc::setsid() };
+        // SAFETY: `getpid` has no pointer or memory-safety preconditions.
+        assert_eq!(session_id, unsafe { libc::getpid() });
+        let terminal_error = std::fs::File::open("/dev/tty").unwrap_err();
+        assert_eq!(terminal_error.raw_os_error(), Some(libc::ENXIO));
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("public guarded exec selector", None)
+            .unwrap();
+        let wrong_helper = tempfile::tempdir().unwrap();
+        let executable = wrong_helper.path().join("not-aethyme-helper");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let mut broker = broker
+            .with_agent_supervisor_executable(&executable)
+            .unwrap();
+        let marker = Path::new(&session.worktree_path).join("production-selector-sentinel");
+
+        let result = broker.guarded_exec(
+            session.id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf launched > production-selector-sentinel".into(),
+            ],
+        );
+
+        assert!(
+            !marker.exists(),
+            "public guarded exec bypassed helper supervision"
+        );
+        let error = result.expect_err("public guarded exec accepted the incompatible helper");
+        assert!(matches!(error, BrokerOpError::Spawn { .. }), "{error}");
+        assert!(
+            error.to_string().contains("helper did not become ready"),
+            "public call did not reject the incompatible helper: {error}"
+        );
+    }
+
+    #[test]
+    fn generic_supervisor_unknown_states_map_to_typed_errors() {
+        let command = vec!["command".to_owned()];
+        let outcome = map_guarded_exec_supervisor_error(
+            42,
+            &command,
+            crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(
+                "lost result".into(),
+            ),
+        );
+        assert!(matches!(
+            outcome,
+            BrokerOpError::GuardedExecOutcomeUnknown { session_id: 42, .. }
+        ));
+        let operation = map_guarded_exec_supervisor_error(
+            42,
+            &command,
+            crate::inline_exec_supervisor::InlineExecError::Operation(
+                BrokerOpError::MissingExecCommand,
+            ),
+        );
+        assert!(matches!(operation, BrokerOpError::MissingExecCommand));
+        let cleanup = map_guarded_exec_supervisor_error(
+            42,
+            &command,
+            crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(
+                "writer may remain".into(),
+            ),
+        );
+        assert!(matches!(
+            cleanup,
+            BrokerOpError::GuardedExecCleanupUnknown { session_id: 42, .. }
+        ));
     }
 }

@@ -466,7 +466,10 @@ fn lease_plan_and_claim_share_strict_repo_relative_path_validation() {
 fn guarded_exec_requires_explicit_lease_for_new_dirty_paths() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_agent_supervisor_executable(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .unwrap();
 
     let wt = add_worktree(tmp.path(), "guarded");
     let session = broker.adopt(&wt, None).unwrap();

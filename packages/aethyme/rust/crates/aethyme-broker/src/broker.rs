@@ -488,6 +488,19 @@ pub enum BrokerOpError {
     },
     #[error("guarded exec requires a command after --")]
     MissingExecCommand,
+    /// The command was dispatched to the supervised helper, but its final
+    /// result could not be recovered. Cleanup was verified, but ownership audit
+    /// was skipped because the command result is uncertain.
+    #[error(
+        "guarded exec outcome is unknown for session {session_id}: {reason}; ownership audit was skipped, inspect the worktree before retrying"
+    )]
+    GuardedExecOutcomeUnknown { session_id: i64, reason: String },
+    /// The helper could not prove that all ordinary in-group writers stopped.
+    /// The guarded ownership audit was skipped because a writer may remain.
+    #[error(
+        "guarded exec cleanup is unknown for session {session_id}: {reason}; ownership audit was skipped, inspect the worktree before retrying"
+    )]
+    GuardedExecCleanupUnknown { session_id: i64, reason: String },
     #[error("invalid coordinated operation: {reason}")]
     InvalidCoordinatedOperation { reason: String },
     /// Session ids are numbered per repository and resolved against the

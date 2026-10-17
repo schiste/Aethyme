@@ -22,6 +22,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
+- Smoke-test each binary against its own CLI contract. Run read-only probes
+  outside a Git checkout with isolated home/state; preserve an unsupported
+  command as a failed probe instead of treating it as a successful smoke check.
+- For read-only GitHub status/check inspection, use `gh --repo` directly without
+  opening a broker session. Isolate source research in its task worktree and
+  independent reviews in their own read-only snapshot; sessions are for edits.
+- For large broker `status --json` output, retain complete stdout and stderr in
+  unique files before parsing exact session IDs and structured advice fields
+  such as severity and commands. Never infer absence from truncated output or
+  suppressed stderr.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
@@ -60,6 +70,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   replacement, directory sync, and readback; publish the verification proof only
   after that commit, bound to its digest. If proof publication then fails,
   reconcile the committed record instead of repeating the deletion.
+- For cleanup plan/apply workflows, capture the environment from the actual
+  planning and apply subprocesses; do not reconstruct it later. Resolve
+  `AETHYME_WORKTREE_ROOT` as the parent container plus the broker's repository
+  ID, and require the resolved broker root to match the plan root before apply.
+  If they differ, stop and create a fresh plan from the captured environment.
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove
