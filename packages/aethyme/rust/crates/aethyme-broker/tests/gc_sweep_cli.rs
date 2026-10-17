@@ -868,9 +868,14 @@ enum OpenSweepState {
     Partial,
 }
 
-/// Inline work is time bounded, so a loaded machine may complete a fixture
+/// Inline work is time bounded, so a faster machine may complete a fixture
 /// that pauses on another machine. Check both valid terminal states directly.
-fn assert_open_sweep_state(repo: &Path, target: &Path, target_key: &str) -> OpenSweepState {
+fn assert_open_sweep_state(
+    repo: &Path,
+    target: &Path,
+    target_key: &str,
+    entries_before: usize,
+) -> OpenSweepState {
     let partial_stamp = meta(repo, SWEEP_PARTIAL).expect("an eligible open records sweep state");
     let queued = interrupted_paths(repo);
     if partial_stamp == "0" {
@@ -887,16 +892,26 @@ fn assert_open_sweep_state(repo: &Path, target: &Path, target_key: &str) -> Open
             partial_stamp.parse::<i64>().is_ok_and(|stamp| stamp > 0),
             "a partial lap records a positive timestamp: {partial_stamp}"
         );
+        let entries_after = count_entries(target);
         if target.exists() {
             assert!(
-                queued.iter().any(|path| path == target_key)
-                    || target.join("CACHEDIR.TAG").is_file(),
-                "a partial cache is queued for resume or remains classifiable"
+                target.join("CACHEDIR.TAG").is_file(),
+                "a cache with entries remaining retains its witness"
+            );
+            if entries_after < entries_before {
+                assert!(
+                    queued.iter().any(|path| path == target_key),
+                    "a cache with removed entries is durably queued for resume"
+                );
+            }
+        } else {
+            assert!(
+                !queued.iter().any(|path| path == target_key),
+                "an absent cache has no stale interrupted-path entry"
             );
         }
         // A pass can finish this cache and hit its budget while classifying
-        // unrelated work. Its partial stamp is truthful even if this path is
-        // already absent and has no interrupted-path entry.
+        // unrelated work, so its partial stamp can coexist with an absent path.
         OpenSweepState::Partial
     }
 }
@@ -1717,6 +1732,7 @@ fn a_bounded_open_leaves_a_truthful_state_and_explicit_sweep_finishes() {
         .to_string_lossy()
         .into_owned();
 
+    let before = count_entries(&target);
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
@@ -1728,7 +1744,7 @@ fn a_bounded_open_leaves_a_truthful_state_and_explicit_sweep_finishes() {
         "status: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let first_state = assert_open_sweep_state(repo.path(), &target, &target_key);
+    let first_state = assert_open_sweep_state(repo.path(), &target, &target_key, before);
     let first_entries = count_entries(&target);
     let first_partial = meta(repo.path(), SWEEP_PARTIAL);
     let first_cadence = meta(repo.path(), SWEEP_STAMP);
@@ -1744,7 +1760,7 @@ fn a_bounded_open_leaves_a_truthful_state_and_explicit_sweep_finishes() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            assert_open_sweep_state(repo.path(), &target, &target_key),
+            assert_open_sweep_state(repo.path(), &target, &target_key, before),
             first_state
         );
         assert_eq!(count_entries(&target), first_entries);
@@ -1870,6 +1886,7 @@ fn broker_opens_preserve_the_completed_or_partial_sweep_state() {
         .unwrap()
         .to_string_lossy()
         .into_owned();
+    let before = count_entries(&target);
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 250\n",
@@ -1882,7 +1899,7 @@ fn broker_opens_preserve_the_completed_or_partial_sweep_state() {
         "status: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let first_state = assert_open_sweep_state(repo.path(), &target, &target_key);
+    let first_state = assert_open_sweep_state(repo.path(), &target, &target_key, before);
     let after_first = count_entries(&target);
     let partial_stamp = meta(repo.path(), SWEEP_PARTIAL);
     let cadence_stamp = meta(repo.path(), SWEEP_STAMP);
@@ -1896,7 +1913,7 @@ fn broker_opens_preserve_the_completed_or_partial_sweep_state() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            assert_open_sweep_state(repo.path(), &target, &target_key),
+            assert_open_sweep_state(repo.path(), &target, &target_key, before),
             first_state
         );
         assert_eq!(
