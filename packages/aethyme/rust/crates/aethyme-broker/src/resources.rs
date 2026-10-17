@@ -18,6 +18,11 @@ pub(crate) const MANAGED_STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const HOST_RESOURCE_REQUEST_SCHEMA_VERSION: u32 = 1;
 const MIN_TTL_SECONDS: u64 = 15;
 const MAX_TTL_SECONDS: u64 = 86_400;
+/// Bound each repository's durable managed-storage ledger, including policy
+/// rows and released claim tombstones retained for idempotency. This is a
+/// per-repository bound; it does not constrain unrelated repositories sharing
+/// the host resource database.
+const MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY: i64 = 16_384;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -609,6 +614,17 @@ impl HostResourceCoordinator {
         &mut self,
         policy: &ManagedStoragePolicy,
     ) -> Result<(), HostResourceError> {
+        self.set_managed_storage_policy_with_row_limit(
+            policy,
+            MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY,
+        )
+    }
+
+    fn set_managed_storage_policy_with_row_limit(
+        &mut self,
+        policy: &ManagedStoragePolicy,
+        row_limit: i64,
+    ) -> Result<(), HostResourceError> {
         validate_managed_storage_policy(policy)?;
         let digest = managed_storage_policy_digest(policy)?;
         let cap = managed_storage_i64("managed_cap_bytes", policy.managed_cap_bytes)?;
@@ -617,6 +633,15 @@ impl HostResourceCoordinator {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_storage_policies
+             WHERE repository=?1 AND filesystem_id=?2)",
+            params![policy.repository, policy.filesystem_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            ensure_managed_storage_row_capacity(&tx, &policy.repository, row_limit)?;
+        }
         tx.execute(
             "INSERT INTO managed_storage_policies
              (repository,filesystem_id,managed_cap_bytes,free_reserve_bytes,policy_digest,updated_at)
@@ -642,6 +667,19 @@ impl HostResourceCoordinator {
         request: &ManagedStorageClaimRequest,
         free_bytes: u64,
     ) -> Result<ManagedStorageReservationResult, HostResourceError> {
+        self.reserve_managed_storage_with_row_limit(
+            request,
+            free_bytes,
+            MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY,
+        )
+    }
+
+    fn reserve_managed_storage_with_row_limit(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        free_bytes: u64,
+        row_limit: i64,
+    ) -> Result<ManagedStorageReservationResult, HostResourceError> {
         validate_managed_storage_claim_request(request)?;
         let request_digest = managed_storage_claim_digest(request)?;
         let requested_i64 = managed_storage_i64("reserved_bytes", request.reserved_bytes)?;
@@ -665,6 +703,8 @@ impl HostResourceCoordinator {
             tx.commit()?;
             return Ok(ManagedStorageReservationResult::Existing(claim.clone()));
         }
+
+        ensure_managed_storage_row_capacity(&tx, &request.repository, row_limit)?;
 
         let policy = load_managed_storage_policy(&tx, &request.repository, &request.filesystem_id)?
             .ok_or_else(|| {
@@ -1985,6 +2025,34 @@ where
     })
 }
 
+fn ensure_managed_storage_row_capacity(
+    conn: &Connection,
+    repository: &str,
+    row_limit: i64,
+) -> Result<(), HostResourceError> {
+    if row_limit < 0 {
+        return Err(HostResourceError::InvalidRequest(
+            "managed storage row limit cannot be negative".into(),
+        ));
+    }
+    let rows: i64 = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM managed_storage_policies WHERE repository=?1)
+             + (SELECT COUNT(*) FROM managed_storage_claims WHERE repository=?1)",
+        [repository],
+        |row| row.get(0),
+    )?;
+    if rows >= row_limit {
+        return Err(managed_storage_refusal(
+            "managed_storage_ledger_capacity",
+            &format!(
+                "repository {repository:?} already has {rows} managed-storage ledger rows; the per-repository limit is {row_limit}, and claim tombstones are retained for idempotency"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_managed_storage_schema(conn: &Connection) -> Result<(), HostResourceError> {
     let version: i64 = conn.query_row(
         "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
@@ -2869,6 +2937,78 @@ mod tests {
             .unwrap();
         assert_eq!(host_version, i64::from(HOST_RESOURCE_SCHEMA_VERSION));
         assert_eq!(ledger_version, i64::from(MANAGED_STORAGE_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn managed_storage_row_limit_counts_policies_and_released_claim_tombstones() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let policy = managed_policy("aethyme-main", "device-42", 100, 0);
+        let first = managed_claim("first", 1);
+        let second_policy = managed_policy("aethyme-main", "device-43", 100, 0);
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        coordinator
+            .set_managed_storage_policy_with_row_limit(&policy, 2)
+            .unwrap();
+        let first_claim = newly_reserved(
+            coordinator
+                .reserve_managed_storage_with_row_limit(&first, 100, 2)
+                .unwrap(),
+        );
+        assert_eq!(first_claim.state, ManagedStorageClaimState::Reserved);
+        coordinator
+            .mark_managed_storage_claim_uncertain(&first)
+            .unwrap();
+        coordinator
+            .reconcile_managed_storage_claim(&first, 1)
+            .unwrap();
+        coordinator
+            .mark_managed_storage_cleanup_pending(&first)
+            .unwrap();
+        let removal = VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+            first.repository.clone(),
+            first.filesystem_id.clone(),
+            first.claim_id.clone(),
+            first.root_identity.clone(),
+            "receipt-first".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        coordinator.release_managed_storage_claim(&removal).unwrap();
+
+        assert_eq!(
+            existing_claim(
+                coordinator
+                    .reserve_managed_storage_with_row_limit(&first, 100, 2)
+                    .unwrap()
+            )
+            .state,
+            ManagedStorageClaimState::Released
+        );
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .set_managed_storage_policy_with_row_limit(&second_policy, 2)
+                    .unwrap_err()
+            ),
+            "managed_storage_ledger_capacity"
+        );
+        assert_eq!(
+            conflict_code(
+                coordinator
+                    .reserve_managed_storage_with_row_limit(&managed_claim("second", 1), 100, 2,)
+                    .unwrap_err()
+            ),
+            "managed_storage_ledger_capacity"
+        );
+        coordinator
+            .set_managed_storage_policy_with_row_limit(
+                &managed_policy("aethyme-main", "device-42", 90, 0),
+                2,
+            )
+            .unwrap();
     }
 
     #[test]
