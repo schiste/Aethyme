@@ -297,12 +297,9 @@ fn run_relative_context_worker() {
 /// worktree, temporary, or repository fallback candidate.
 #[test]
 fn slot_planner_rejects_a_captured_context_bound_to_another_repository() {
-    match std::env::var(SLOT_IDENTITY_MODE).as_deref() {
-        Ok("worker") => {
-            run_slot_identity_worker();
-            return;
-        }
-        _ => {}
+    if let Ok("worker") = std::env::var(SLOT_IDENTITY_MODE).as_deref() {
+        run_slot_identity_worker();
+        return;
     }
 
     let (repo_a, _) = super::landing_fixture();

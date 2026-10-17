@@ -1297,6 +1297,7 @@ fn sweep_preparation_cache_at(
     (report.entries_removed, report.bytes_reclaimed)
 }
 
+#[cfg(test)]
 fn sweep_preparation_cache_at_with_status(
     main_root: &Path,
     storage_root: &Path,
@@ -1832,6 +1833,7 @@ fn check_preparation_sweep_deadline(deadline: std::time::Instant) -> Result<(), 
     Ok(())
 }
 
+#[cfg(test)]
 fn discover_preparation_live_roots(
     main_root: &Path,
     storage_root: &Path,

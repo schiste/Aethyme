@@ -1413,7 +1413,8 @@ pub(crate) fn run_affected_for_submit_in(
     )
 }
 
-/// Same executor as native submit, with one finite admission/command allowance.
+/// Test adapter using default storage locations and a finite allowance.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_affected_bounded(
     store: &mut BrokerStore,

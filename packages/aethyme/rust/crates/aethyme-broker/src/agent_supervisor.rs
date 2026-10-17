@@ -201,17 +201,23 @@ fn run(payload: &str) -> io::Result<u8> {
     if descriptor < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fcntl returned a fresh valid descriptor; this File assumes its
+    // sole ownership and closes only that duplicate.
     let log = unsafe { File::from_raw_fd(descriptor) };
     // Diagnostics and panics must never append to the bounded log outside its
     // collector. The retained duplicate is CLOEXEC and is not passed to agents.
     use std::os::fd::AsRawFd as _;
     let null = File::open("/dev/null")?;
+    // SAFETY: null owns a live descriptor and STDERR_FILENO is a valid dup2
+    // target; no Rust handle owns the inherited stderr descriptor.
     if unsafe { libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // The launcher creates this group before exec. Without that binding a
     // private invocation must never signal an interactive or unrelated group.
-    if unsafe { libc::getpgrp() } != unsafe { libc::getpid() } {
+    // SAFETY: these kernel identity queries take no arguments or pointers.
+    let (group, pid) = unsafe { (libc::getpgrp(), libc::getpid()) };
+    if group != pid {
         return Err(io::Error::other(
             "agent supervisor is not its owned group leader",
         ));
@@ -380,6 +386,8 @@ fn run(payload: &str) -> io::Result<u8> {
             crate::warn_unrecorded("persist cleanup watcher failure", log.sync_data());
             // This process remains the original group leader. A failed watcher
             // must not turn into permission to leave its command running.
+            // SAFETY: this live, verified group leader pins its own group id;
+            // SIGKILL targets only that owned group, including this process.
             unsafe {
                 libc::killpg(libc::getpid(), libc::SIGKILL);
             }
@@ -431,6 +439,8 @@ fn run(payload: &str) -> io::Result<u8> {
     });
     collector.sync_data()?;
     if !cleanup_ready {
+        // SAFETY: this live, verified group leader still pins its own group id.
+        // Killing that group includes this process and its owned descendants.
         unsafe {
             libc::killpg(libc::getpid(), libc::SIGKILL);
         }
@@ -484,17 +494,16 @@ fn stop_direct_child(child: &mut std::process::Child) {
 fn cleanup_watcher(expected: &str) -> io::Result<u8> {
     use std::io::Write as _;
     let parent: i32 = expected.parse().map_err(io::Error::other)?;
-    if parent <= 1
-        || unsafe { libc::getppid() } != parent
-        || unsafe { libc::getpgrp() } != parent
-        || unsafe { libc::getpid() } == parent
-    {
+    // SAFETY: these kernel identity queries take no arguments or pointers.
+    let (actual_parent, group, pid) = unsafe { (libc::getppid(), libc::getpgrp(), libc::getpid()) };
+    if parent <= 1 || actual_parent != parent || group != parent || pid == parent {
         return Err(io::Error::other("cleanup watcher ownership mismatch"));
     }
     let mut ready = io::stdout().lock();
     writeln!(ready, "AETHYME_AGENT_READY cleanup-{parent}")?;
     ready.flush()?;
     drop(ready);
+    // SAFETY: getppid is a read-only kernel identity query without arguments.
     while unsafe { libc::getppid() } == parent {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -509,9 +518,12 @@ fn cleanup_watcher(expected: &str) -> io::Result<u8> {
     // This still-live member pins the original PGID after the supervisor dies.
     // It kills itself with any remaining ordinary descendants, so no later
     // signal can accidentally target a recycled process-group id.
+    // SAFETY: getpgrp is a read-only kernel identity query without arguments.
     if unsafe { libc::getpgrp() } != parent {
         return Err(io::Error::other("cleanup watcher group changed"));
     }
+    // SAFETY: this still-live watcher belongs to and pins the verified group;
+    // SIGKILL includes itself, so no signal can follow group-id reuse.
     if unsafe { libc::killpg(parent, libc::SIGKILL) } != 0 {
         return Err(io::Error::last_os_error());
     }

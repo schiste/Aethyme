@@ -3269,6 +3269,8 @@ impl Drop for GatedAgent {
                     .spawn(move || {
                         loop {
                             let mut status = 0;
+                            // SAFETY: this thread is the sole waiter for this unreaped
+                            // owned child; status points to initialized writable storage.
                             let result = unsafe { libc::waitpid(pid, &mut status, 0) };
                             if result == pid {
                                 break;

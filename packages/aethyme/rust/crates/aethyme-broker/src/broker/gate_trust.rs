@@ -465,7 +465,6 @@ fn assess_trusted_at_path(
 
 /// Standalone trust check for callers without an open Broker, such as hooks
 /// and the gate doctor. It opens the database only if it already exists.
-
 pub(crate) fn require_trusted_standalone(
     main_root: &Path,
     policy: &GatePolicy,
