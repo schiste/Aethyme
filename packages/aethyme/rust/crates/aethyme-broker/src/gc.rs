@@ -108,6 +108,10 @@ const ARTIFACT_SWEEP_WORKER_MAX_PASSES: usize = 8;
 /// a later normal open when this deadline expires.
 const ARTIFACT_SWEEP_WORKER_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
+/// Broker open checks only for rotation-debt control entries. A small bound
+/// keeps this crash-gap probe cheap even when the shared cache root is wide.
+const PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES: usize = 512;
+const PREPARATION_ROTATION_DEBT_PROBE_BUDGET: Duration = Duration::from_millis(20);
 
 /// Most a broker open may spend on the artifact sweep, whatever the policy
 /// budget or disk pressure. Broker open runs before every command, including
@@ -2687,6 +2691,16 @@ impl Broker {
             // Broker::open before the worker's own scoped pass.
             return Ok(None);
         }
+        // Rotation publishes a durable witness before it changes the shared
+        // cache store, then requests the detached worker. A crash between
+        // those operations must not leave the retired store undiscoverable
+        // until another preparation writer runs. This bounded, read-only
+        // probe uses the Broker-captured cache root and only requests the
+        // existing cache-only continuation; it is never deletion authority.
+        crate::warn_unrecorded(
+            "record preparation-cache rotation recovery request",
+            self.request_recovery_for_rotation_debt(),
+        );
         let policy = load_retention_policy(self.main_root())?;
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let resumed = match load_journal(&journal_path)? {
@@ -2709,6 +2723,34 @@ impl Broker {
             self.maybe_start_artifact_sweep_worker(false),
         );
         Ok(resumed)
+    }
+
+    fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
+        let storage = self.storage_context();
+        let probe = match (
+            storage.preparation_cache_root(),
+            storage.host_resource_db_path.as_deref(),
+        ) {
+            (Some(cache_root), Some(resource_db_path)) => {
+                crate::preparation::probe_rotation_recovery(
+                    &cache_root,
+                    resource_db_path,
+                    PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES,
+                    Instant::now() + PREPARATION_ROTATION_DEBT_PROBE_BUDGET,
+                )
+            }
+            _ => crate::preparation::rotation_debt::DebtProbe::Unknown,
+        };
+        if probe == crate::preparation::rotation_debt::DebtProbe::NoDebt
+            || self.artifact_sweep_recovery_requested()?
+        {
+            return Ok(());
+        }
+        // Keep one durable request pending while the root is Pending or
+        // Unknown. Do not bump its generation on every ordinary open: a
+        // previous worker may have intentionally set retry backoff after
+        // making no progress.
+        self.persist_artifact_sweep_recovery_request()
     }
 
     /// Run the autonomous artifact sweep now with the full policy budget,
@@ -4983,6 +5025,162 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn broker_open_keeps_published_rotation_debt_pending_when_sweep_is_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root).unwrap();
+        let cache_root = broker
+            .storage_context()
+            .preparation_cache_root()
+            .expect("test storage has a captured preparation-cache root");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let repository = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let store = cache_root.join(repository);
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("payload"), b"preserve until verified recovery").unwrap();
+        let root_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+        let debt = crate::preparation::rotation_debt::RotationDebt::new(
+            repository,
+            &crate::preparation::rotation_debt::new_transaction_id(),
+            root_identity.clone(),
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        let resource_db_path = broker
+            .storage_context()
+            .host_resource_db_path
+            .clone()
+            .expect("the fixture captures its host-resource database");
+        let payload = crate::preparation::rotation_debt::encode(&debt).unwrap();
+        crate::preparation::rotation_journal::publish(
+            &resource_db_path,
+            &cache_root,
+            &root_identity.encode().unwrap(),
+            repository,
+            &payload,
+        )
+        .unwrap();
+        crate::preparation::rotation_debt::publish(&cache_root, debt).unwrap();
+        let retained = crate::preparation::rotation_debt::read(&cache_root, repository)
+            .unwrap()
+            .expect("the witness is published before the cache is retired");
+        crate::preparation::rotation_debt::retire_original_store(&cache_root, &retained).unwrap();
+        let retired = cache_root.join(format!("{repository}.retired"));
+        drop(broker);
+
+        // This is a normal startup path. No explicit maintenance call repairs
+        // the state: Broker::open must notice the published witness itself.
+        let mut reopened = storage.open(&root).unwrap();
+        let requested = reopened
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = reopened
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(
+            requested > completed,
+            "the recovered request remains pending"
+        );
+        assert!(
+            crate::preparation::rotation_debt::read(&cache_root, repository)
+                .unwrap()
+                .is_some(),
+            "zero-budget startup must retain the durable debt witness"
+        );
+        assert_eq!(
+            std::fs::read(retired.join("payload")).unwrap(),
+            b"preserve until verified recovery",
+            "zero-budget startup must not delete the old cache store"
+        );
+    }
+
+    #[test]
+    fn broker_open_keeps_missing_cache_parent_pending_with_positive_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 5000\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut first = storage.open(&root).unwrap();
+        let cache_root = first
+            .storage_context()
+            .preparation_cache_root()
+            .expect("test storage has a captured preparation-cache root");
+        let cache_parent = cache_root.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&cache_root).unwrap();
+        for key in [
+            ARTIFACT_SWEEP_STAMP_KEY,
+            ARTIFACT_SWEEP_PROGRESS_KEY,
+            ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+            ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY,
+            ARTIFACT_SWEEP_RETRY_AFTER_KEY,
+        ] {
+            first.store().meta_set(key, "").unwrap();
+        }
+        first
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "0")
+            .unwrap();
+        first
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "0")
+            .unwrap();
+        drop(first);
+        std::fs::remove_dir_all(&cache_parent).unwrap();
+
+        let mut reopened = storage.open(&root).unwrap();
+        let requested = reopened
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = reopened
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        assert!(
+            requested > completed,
+            "unknown cache location must remain pending"
+        );
+        assert!(
+            !cache_parent.exists(),
+            "a missing captured cache parent must not be recreated by maintenance"
+        );
     }
 
     /// On a repository with hundreds of retained worktrees the build-output
