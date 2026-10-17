@@ -177,6 +177,14 @@ fn run_relative_context_parent() {
     let worker_cwd = PathBuf::from(
         std::env::var_os("AETHYME_TEST_STORAGE_CONTEXT_WORKER_CWD").expect("worker cwd path"),
     );
+    let repository_git = crate::GitRepo::discover(&repository).expect("discover relative fixture");
+    let repository_fingerprint = crate::gates::git_origin_fingerprint(&repository_git);
+    let relative_resource_db = capture_cwd.join("relative-state/host-resources.db");
+    let _relative_lease = seed_quarantined_resource_lease(
+        &relative_resource_db,
+        &repository_fingerprint,
+        "relative-context",
+    );
     let broker = Broker::open_with_options(
         &repository,
         BrokerOpenOptions::default()
@@ -200,6 +208,11 @@ fn run_relative_context_parent() {
         broker.storage_context().host_operation_db_path.as_deref(),
         Some(expected_state.join("host-operations.db").as_path())
     );
+    assert_eq!(
+        broker.storage_context().host_resource_db_path.as_deref(),
+        Some(relative_resource_db.as_path())
+    );
+    assert!(relative_resource_db.is_file());
 
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     command
