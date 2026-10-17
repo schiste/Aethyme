@@ -11,7 +11,7 @@ use aethyme_contracts::experimental_v0::{
     FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceSnapshot, SourceSnapshotId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
@@ -20,6 +20,13 @@ pub const MATERIALIZATION_PROFILE: &str = "aethyme.raw-linux-inputs/provisional-
 pub(crate) const MAX_FILES: usize = 8192;
 pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+// These bound broker-controlled logical output, not a physical disk quota.
+// Adding them does not change descriptor identity or rewrite older profiles;
+// portable-tree consumers refuse inputs over these limits before using them.
+const MAX_MATERIALIZED_FILES: usize = 8192;
+const MAX_MATERIALIZED_NODES: usize = 16_384;
+const MAX_MATERIALIZED_PATH_DEPTH: usize = 64;
+const MAX_MATERIALIZED_COMPONENT_BYTES: usize = 255;
 static SCHEMA: RecordSchema = RecordSchema {
     name: SCHEMA_NAME,
     fields: &[
@@ -129,6 +136,8 @@ pub enum SnapshotError {
     Invalid(String),
     #[error("execution inputs exceed the selected profile limit")]
     Limit,
+    #[error("execution materialization limit exceeded: {0}")]
+    MaterializationLimit(&'static str),
     #[error("execution descriptor or materialized bytes differ from their identity")]
     Tampered,
     #[error("execution snapshot belongs to another target or inactive revision")]
@@ -394,8 +403,14 @@ fn inspect(
     Ok(snapshot)
 }
 pub(crate) fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
-    let mut prefixes = BTreeMap::new();
-    let mut files = BTreeSet::new();
+    // This is the common boundary for execution inputs, local generations,
+    // and parsed artifacts. Bound logical nodes and path sizes before building
+    // prefix keys; `inspect_roles` separately enforces the all-role total.
+    validate_materialization_bounds(&[("source", snapshot)])?;
+    // Keep one owned folded key per distinct materialized node. Repeated long
+    // directory prefixes are looked up by borrowing `folded`; cloning every
+    // prefix for every file would multiply memory by file count × depth.
+    let mut prefixes: BTreeMap<String, (&str, bool)> = BTreeMap::new();
     for entry in snapshot.entries() {
         let path = std::str::from_utf8(entry.path())
             .map_err(|_| SnapshotError::Unsupported("non-UTF-8 path".into()))?;
@@ -407,23 +422,24 @@ pub(crate) fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
         // Refuse both exact filesystem collisions and folded directory aliases.
         let components: Vec<_> = path.split('/').collect();
         let mut folded = String::new();
-        let mut original = String::new();
+        let mut original_end = 0;
         for (index, component) in components.iter().enumerate() {
-            if !folded.is_empty() {
+            if index > 0 {
                 folded.push('/');
-                original.push('/');
+                original_end += 1;
             }
             folded.extend(component.nfc().flat_map(char::to_lowercase));
-            original.push_str(component);
-            if files.contains(&folded)
-                || prefixes.get(&folded).is_some_and(|old| old != &original)
-                || (index + 1 == components.len() && prefixes.contains_key(&folded))
-            {
-                return Err(SnapshotError::Unsupported("folded path collision".into()));
+            original_end += component.len();
+            let original = &path[..original_end];
+            let is_file = index + 1 == components.len();
+            if let Some((old_original, old_is_file)) = prefixes.get(folded.as_str()) {
+                if *old_original != original || *old_is_file || is_file {
+                    return Err(SnapshotError::Unsupported("folded path collision".into()));
+                }
+            } else {
+                prefixes.insert(folded.clone(), (original, is_file));
             }
-            prefixes.insert(folded.clone(), original.clone());
         }
-        files.insert(folded);
     }
     Ok(())
 }
@@ -509,32 +525,49 @@ fn materialize_in_inner(
     }
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let spec = snapshot.spec();
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("aethyme-execution-");
-    let workspace = if let Some(root) = temporary_root {
-        builder.tempdir_in(root)?
-    } else {
-        builder.tempdir()?
-    };
-    for (role, id, manifest) in inspect_roles(store, spec, MAX_INPUT_BYTES)? {
-        let path = workspace.path().join(role);
-        before_reconstruct(role, &path);
-        if let Err(error) = archive::reconstruct(store, &id, &path) {
-            on_reconstruct_error(&error);
-            return Err(error.into());
-        }
-        verify_materialized(&path, &manifest)?;
-    }
-    Ok(MaterializedInputs {
-        workspace,
-        snapshot: snapshot.clone(),
-    })
+    // Validate all roles and their combined output before creating even the
+    // temporary workspace. No partial role tree is written for an oversized
+    // descriptor.
+    with_materialization_plan(
+        || inspect_roles(store, spec, MAX_INPUT_BYTES),
+        |plan| {
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("aethyme-execution-");
+            let workspace = if let Some(root) = temporary_root {
+                builder.tempdir_in(root)?
+            } else {
+                builder.tempdir()?
+            };
+            for role in plan.roles {
+                let path = workspace.path().join(role.name);
+                before_reconstruct(role.name, &path);
+                if let Err(error) = archive::reconstruct(store, &role.id, &path) {
+                    on_reconstruct_error(&error);
+                    return Err(error.into());
+                }
+                verify_materialized(&path, &role.manifest)?;
+            }
+            Ok(MaterializedInputs {
+                workspace,
+                snapshot: snapshot.clone(),
+            })
+        },
+    )
+}
+
+/// Keep workspace creation behind complete validation of all materialized
+/// roles. This small seam makes the no-write-on-refusal ordering testable.
+fn with_materialization_plan<T>(
+    inspect: impl FnOnce() -> Result<MaterializationPlan, SnapshotError>,
+    materialize: impl FnOnce(MaterializationPlan) -> Result<T, SnapshotError>,
+) -> Result<T, SnapshotError> {
+    materialize(inspect()?)
 }
 fn inspect_roles(
     store: &CollaborationStore,
     spec: &ExecutionSpec,
     limit: u64,
-) -> Result<Vec<(&'static str, SourceSnapshotId, SourceSnapshot)>, SnapshotError> {
+) -> Result<MaterializationPlan, SnapshotError> {
     let raw = spec
         .preparation
         .as_ref()
@@ -555,10 +588,106 @@ fn inspect_roles(
             if total > limit {
                 return Err(SnapshotError::Limit);
             }
-            roles.push((role, id, manifest));
+            roles.push(MaterializationRole {
+                name: role,
+                id,
+                manifest,
+            });
         }
     }
-    Ok(roles)
+    let manifests: Vec<_> = roles
+        .iter()
+        .map(|role| (role.name, &role.manifest))
+        .collect();
+    validate_materialization_bounds(&manifests)?;
+    Ok(MaterializationPlan { roles })
+}
+
+struct MaterializationRole {
+    name: &'static str,
+    id: SourceSnapshotId,
+    manifest: SourceSnapshot,
+}
+
+/// Every role is validated before the destination workspace is created. This
+/// plan is the complete set of files and directories that the broker writer
+/// may materialize for this execution.
+struct MaterializationPlan {
+    roles: Vec<MaterializationRole>,
+}
+
+fn validate_materialization_paths(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
+    for entry in snapshot.entries() {
+        let path = std::str::from_utf8(entry.path())
+            .map_err(|_| SnapshotError::Unsupported("non-UTF-8 path".into()))?;
+        let components: Vec<_> = path.split('/').collect();
+        if components.len() > MAX_MATERIALIZED_PATH_DEPTH {
+            return Err(SnapshotError::MaterializationLimit(
+                "path depth exceeds 64 components",
+            ));
+        }
+        if components
+            .iter()
+            .any(|component| component.len() > MAX_MATERIALIZED_COMPONENT_BYTES)
+        {
+            return Err(SnapshotError::MaterializationLimit(
+                "path component exceeds 255 bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_materialization_bounds(roles: &[(&str, &SourceSnapshot)]) -> Result<(), SnapshotError> {
+    let mut file_count = 0usize;
+    // Count each role root. Materialized file paths add their implicit parent
+    // directories; the temporary workspace container itself is not a role node.
+    let mut node_count = roles.len();
+
+    for (_, manifest) in roles {
+        validate_materialization_paths(manifest)?;
+        // SourceSnapshot entries are in raw-path order. Shared parent
+        // directories are therefore the common component prefix with the
+        // preceding file in this role; counting only the suffix avoids an
+        // unbounded temporary set of every path prefix.
+        let mut previous_components: Vec<&str> = Vec::new();
+        for entry in manifest.entries() {
+            file_count = file_count.checked_add(1).ok_or(SnapshotError::Limit)?;
+            if file_count > MAX_MATERIALIZED_FILES {
+                return Err(SnapshotError::MaterializationLimit(
+                    "aggregate file count exceeds 8192",
+                ));
+            }
+
+            let path = std::str::from_utf8(entry.path())
+                .map_err(|_| SnapshotError::Unsupported("non-UTF-8 path".into()))?;
+            let components: Vec<_> = path.split('/').collect();
+
+            let current_directories = &components[..components.len().saturating_sub(1)];
+            let shared_directories = previous_components
+                .iter()
+                .zip(current_directories)
+                .take_while(|(previous, current)| previous == current)
+                .count();
+            node_count = node_count
+                .checked_add(current_directories.len().saturating_sub(shared_directories))
+                .ok_or(SnapshotError::Limit)?;
+            if node_count > MAX_MATERIALIZED_NODES {
+                return Err(SnapshotError::MaterializationLimit(
+                    "aggregate file and directory node count exceeds 16384",
+                ));
+            }
+
+            node_count = node_count.checked_add(1).ok_or(SnapshotError::Limit)?;
+            if node_count > MAX_MATERIALIZED_NODES {
+                return Err(SnapshotError::MaterializationLimit(
+                    "aggregate file and directory node count exceeds 16384",
+                ));
+            }
+            previous_components = components;
+        }
+    }
+    Ok(())
 }
 fn unresolved_lfs(bytes: &[u8]) -> bool {
     // Git LFS trims surrounding Unicode whitespace and accepts legacy version
