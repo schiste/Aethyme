@@ -6042,9 +6042,9 @@ mod tests {
             assert!(supervisor.wait().unwrap().success());
             let group_deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                // Probe only: never signal a numeric group ID after its leader
-                // has been reaped. ESRCH proves the owned group is gone;
-                // permission and unexpected probe errors fail closed.
+                // SAFETY: signal zero only probes the captured positive child
+                // process-group ID and never delivers a signal after its leader
+                // is reaped. ESRCH proves teardown; unexpected errors refuse.
                 let result = unsafe { libc::kill(-supervisor_group, 0) };
                 if result == -1 {
                     let error = std::io::Error::last_os_error();
