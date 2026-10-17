@@ -2884,7 +2884,8 @@ mod tests {
     #[test]
     fn an_absent_budget_still_finishes_a_previously_published_rotation() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache_root = tmp.path().join("preparation-cache");
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let cache_root = fixture_root.join("preparation-cache");
         let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         fs::create_dir_all(&store).unwrap();
         fs::write(store.join("payload"), b"old cache").unwrap();
@@ -2953,7 +2954,8 @@ mod tests {
     #[test]
     fn an_over_budget_shared_store_is_rotated_while_under_budget_is_not() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache_root = tmp.path().join("preparation-cache");
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let cache_root = fixture_root.join("preparation-cache");
         let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         std::fs::create_dir_all(store.join("nested")).unwrap();
         std::fs::write(store.join("nested/payload"), vec![0_u8; 8192]).unwrap();
@@ -3001,7 +3003,8 @@ mod tests {
     #[test]
     fn a_rotation_report_carries_no_host_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache_root = tmp.path().join("host-state/preparation-cache");
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let cache_root = fixture_root.join("host-state/preparation-cache");
         let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("payload"), vec![0_u8; 4096]).unwrap();
@@ -3015,7 +3018,7 @@ mod tests {
         .unwrap();
         let json = serde_json::to_string(&rotation).unwrap();
         assert!(
-            !json.contains(tmp.path().to_string_lossy().as_ref()),
+            !json.contains(fixture_root.to_string_lossy().as_ref()),
             "rotation report leaked a host path: {json}"
         );
         assert!(!json.contains("preparation-cache"), "{json}");
