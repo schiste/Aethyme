@@ -49,6 +49,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Freeze source for each invocation and record the exact head and dirty-state
   hashes before and after it. If relevant source changes during a run, retain
   that run as diagnostic evidence and rerun the committed source.
+- For disk-growth investigations, separate file-size totals, path allocation,
+  and filesystem free space. Shared extents and hardlinks can make summed
+  per-worktree sizes overstate physical use. Preserve scan completion status;
+  never present a partial walk as full-volume accounting. Measure free space
+  before and after authorized cleanup, and record concurrent writers rather
+  than claiming removed file sizes are physical bytes freed.
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove
