@@ -1666,6 +1666,82 @@ mod tests {
     }
 
     #[test]
+    fn partial_original_tree_witness_scratch_is_rebuilt_on_restart() {
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        let store = cache_root.join(REPOSITORY);
+        let scratch = store.join(
+            debt.tree_witness_scratch_component()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref(),
+        );
+        write_private(&scratch, b"{");
+
+        super::retire_original_store(&cache_root, &retained).unwrap();
+
+        let retired = cache_root.join(debt.retired_component());
+        let witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        assert_eq!(witness.bytes, super::encode(&debt).unwrap());
+        assert_eq!(fs::read(retired.join("package-index")).unwrap(), b"cached");
+        assert!(!retired.join(scratch.file_name().unwrap()).exists());
+    }
+
+    #[test]
+    fn partial_empty_retired_tree_witness_scratch_is_rebuilt_on_restart() {
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        super::retire_original_store(&cache_root, &retained).unwrap();
+        let retired = cache_root.join(debt.retired_component());
+        let first_witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        fs::remove_file(retired.join("package-index")).unwrap();
+        fs::remove_file(retired.join(first_witness.component().unwrap())).unwrap();
+
+        let scratch_name = debt.tree_witness_scratch_component().unwrap();
+        let scratch_path = retired.join(scratch_name.to_string_lossy().as_ref());
+        write_private(&scratch_path, b"{");
+
+        let rebuilt = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        assert_eq!(rebuilt.bytes, super::encode(&debt).unwrap());
+        assert!(fs::read_dir(&retired).unwrap().all(|entry| {
+            entry.unwrap().file_name().to_string_lossy() == rebuilt.component().unwrap()
+        }));
+    }
+
+    #[test]
+    fn retired_root_replacement_after_witness_preparation_fails_identity_check() {
+        use crate::gc::PinnedTreeRemoval;
+
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        super::retire_original_store(&cache_root, &retained).unwrap();
+        let retired = cache_root.join(debt.retired_component());
+        let witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+
+        let displaced = cache_root.join("displaced-retired-cache");
+        fs::rename(&retired, &displaced).unwrap();
+        fs::create_dir(&retired).unwrap();
+        fs::write(retired.join("replacement-content"), b"must remain").unwrap();
+
+        let pinned = PinnedTreeRemoval::open(&retired).unwrap();
+        let object = pinned.object_identity().unwrap();
+        let filesystem = pinned.filesystem_identity().unwrap();
+        assert!(
+            !witness
+                .matches_pinned_identity(object.device, object.inode, &filesystem)
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read(retired.join("replacement-content")).unwrap(),
+            b"must remain"
+        );
+        assert_eq!(
+            fs::read(displaced.join("package-index")).unwrap(),
+            b"cached"
+        );
+    }
+
+    #[test]
     fn restart_after_unlink_before_directory_sync_cannot_hide_old_payload() {
         let (_temp, cache_root, debt) = fixture();
         let retained = publish(&cache_root, debt.clone()).unwrap();
