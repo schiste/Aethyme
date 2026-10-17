@@ -63,6 +63,21 @@ fn configured_env(command: &Command) -> HashMap<OsString, Option<OsString>> {
         .collect()
 }
 
+fn fixture_worktree_registry_paths(host_state: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(host_state)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("worktree-roots-")
+        })
+        .map(|entry| entry.path().join("registry.sqlite3"))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 #[test]
 fn fixture_cli_replaces_poisoned_inherited_host_paths() {
     if std::env::var_os(CHILD_FLAG).is_some() {
@@ -119,9 +134,11 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            fixture_state.join("host-operations.db").is_file(),
-            "fixture host operations were not written under {}",
+        let registries = fixture_worktree_registry_paths(&fixture_state);
+        assert_eq!(
+            registries.len(),
+            1,
+            "expected one worktree registry beneath fixture host state {}",
             fixture_state.display()
         );
         assert!(

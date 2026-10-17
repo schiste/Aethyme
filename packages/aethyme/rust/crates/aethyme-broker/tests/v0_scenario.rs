@@ -54,8 +54,11 @@ fn v0_three_agents_end_to_end() {
     let mut broker = Broker::open(root).unwrap();
 
     // ── register three sessions: two adopted, one spawned ────────────
+    // Adopted checkouts may live outside the broker-managed worktree root;
+    // Carol's later broker start creates that root through the normal protocol.
+    let adopted_worktrees = tempfile::tempdir().unwrap();
     for name in ["alice", "bob"] {
-        let wt = root.join(".aethyme/worktrees").join(name);
+        let wt = adopted_worktrees.path().join(name);
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         sh(
             root,
@@ -70,8 +73,8 @@ fn v0_three_agents_end_to_end() {
             ],
         );
     }
-    let alice_wt = root.join(".aethyme/worktrees/alice");
-    let bob_wt = root.join(".aethyme/worktrees/bob");
+    let alice_wt = adopted_worktrees.path().join("alice");
+    let bob_wt = adopted_worktrees.path().join("bob");
     let alice = broker
         .adopt_with_options_and_context(
             &alice_wt,

@@ -6481,17 +6481,8 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn changed_orphan_evidence_revokes_only_the_old_authorization_and_allows_fresh_review() {
         let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
-        let database = broker.host_operation_database_path().unwrap();
         let marker = crate::worktree_registry::read_marker(&root).unwrap();
         std::fs::create_dir(&marker.repository_root).unwrap();
-        crate::worktree_registry::register(
-            &database,
-            &root,
-            &marker,
-            crate::WorktreeRootSource::HostState,
-        )
-        .unwrap();
-        std::fs::remove_dir(&marker.repository_root).unwrap();
         let revoked = broker.gc_apply(&digest).unwrap();
         assert!(revoked.complete);
         assert!(revoked.orphans_removed.is_empty());
@@ -6502,7 +6493,13 @@ mod tests {
                 .any(|reason| reason.contains("authorization revoked"))
         );
         assert!(root.join("retained.txt").is_file());
+        std::fs::remove_dir(&marker.repository_root).unwrap();
         let fresh = broker.gc_plan().unwrap();
+        assert_eq!(fresh.orphans.len(), 1);
+        assert_eq!(
+            fresh.orphans[0].worktree_root,
+            root.to_string_lossy().as_ref()
+        );
         assert_ne!(fresh.digest, digest);
         let applied = broker.gc_apply(&fresh.digest).unwrap();
         assert!(applied.complete);

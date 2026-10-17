@@ -34,6 +34,10 @@ fn init_repo(root: &Path) {
 
 fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
+    add_worktree_at(root, name, &path)
+}
+
+fn add_worktree_at(root: &Path, name: &str, path: &Path) -> std::path::PathBuf {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     sh(
         root,
@@ -47,7 +51,7 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
             "main",
         ],
     );
-    path
+    path.to_path_buf()
 }
 
 fn managed_worktree_names(root: &Path) -> Vec<String> {
@@ -651,7 +655,15 @@ fn equivalent_tree_publication_starts_from_integration_without_phantom_leases() 
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
 
-    let integration_builder = add_worktree(tmp.path(), "equivalent-integration");
+    let integration_builder_owner = tempfile::tempdir().unwrap();
+    let integration_builder_path = integration_builder_owner
+        .path()
+        .join("equivalent-integration");
+    let integration_builder = add_worktree_at(
+        tmp.path(),
+        "equivalent-integration",
+        &integration_builder_path,
+    );
     std::fs::create_dir_all(integration_builder.join("gadget")).unwrap();
     std::fs::write(integration_builder.join("gadget/wait.js"), "ready\n").unwrap();
     sh(&integration_builder, &["add", "gadget/wait.js"]);
@@ -666,6 +678,15 @@ fn equivalent_tree_publication_starts_from_integration_without_phantom_leases() 
             "-f",
             "aethyme/integration",
             "agent/equivalent-integration",
+        ],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            integration_builder.to_str().unwrap(),
         ],
     );
 

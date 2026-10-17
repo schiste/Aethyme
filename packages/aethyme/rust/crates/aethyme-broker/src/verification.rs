@@ -680,11 +680,32 @@ mod tests {
         temp: PathBuf,
     }
 
+    fn git(repository: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn fixture() -> Fixture {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let main = root_path.join("repo");
         std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        std::fs::write(main.join("README.md"), "verification fixture\n").unwrap();
+        git(&main, &["add", "README.md"]);
+        git(&main, &["commit", "-qm", "verification fixture"]);
         Fixture {
             main,
             host: root_path.join("host"),
