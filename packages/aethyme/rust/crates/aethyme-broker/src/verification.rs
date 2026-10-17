@@ -59,6 +59,13 @@ pub(crate) fn plan_slot_placement_with_worktree_root_plan(
     namespace: &str,
     root_plan: &crate::WorktreeRootPlan,
 ) -> SlotPlacement {
+    if let Some(reason) = root_plan
+        .storage_context_refusal
+        .clone()
+        .or_else(|| root_plan_repository_refusal(main_root, root_plan))
+    {
+        return refused_slot_placement(main_root, namespace, reason);
+    }
     let key = root_plan.repository_key.clone();
     let candidates = crate::broker::lifecycle::worktree_root_candidates_for(root_plan);
     let strict = matches!(
@@ -76,6 +83,78 @@ pub(crate) fn plan_slot_placement_with_worktree_root_plan(
         &key,
         strict,
     )
+}
+
+fn root_plan_repository_refusal(
+    main_root: &Path,
+    root_plan: &crate::WorktreeRootPlan,
+) -> Option<String> {
+    let actual_repo = match GitRepo::discover(main_root) {
+        Ok(repo) => repo,
+        Err(error) => {
+            return Some(format!(
+                "cannot verify verification-slot repository identity for {}: {error}",
+                main_root.display()
+            ));
+        }
+    };
+    let actual_main_root = match actual_repo.main_root() {
+        Ok(root) => root,
+        Err(error) => {
+            return Some(format!(
+                "cannot resolve verification-slot main repository root: {error}"
+            ));
+        }
+    };
+    let actual_main_root = match std::fs::canonicalize(actual_main_root) {
+        Ok(root) => root,
+        Err(error) => {
+            return Some(format!(
+                "cannot canonicalize verification-slot main repository root: {error}"
+            ));
+        }
+    };
+    let planned_main_root = match std::fs::canonicalize(&root_plan.repository_root) {
+        Ok(root) => root,
+        Err(error) => {
+            return Some(format!(
+                "cannot canonicalize planned verification-slot repository root {}: {error}",
+                root_plan.repository_root.display()
+            ));
+        }
+    };
+    if planned_main_root != actual_main_root {
+        return Some(format!(
+            "verification-slot root plan belongs to a different repository: {}",
+            root_plan.repository_root.display()
+        ));
+    }
+    let actual_common_dir = match actual_repo.git_common_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            return Some(format!(
+                "cannot verify verification-slot Git common directory: {error}"
+            ));
+        }
+    };
+    let expected_key =
+        crate::host_state::repository_key(&root_plan.repository_root, Some(&actual_common_dir));
+    if expected_key != root_plan.repository_key {
+        return Some(
+            "verification-slot root plan belongs to a different Git common directory".into(),
+        );
+    }
+    None
+}
+
+fn refused_slot_placement(main_root: &Path, namespace: &str, reason: String) -> SlotPlacement {
+    SlotPlacement {
+        directory: main_root.join(".aethyme/run").join(namespace),
+        inside_repository: true,
+        preferred: None,
+        refusals: vec![reason.clone()],
+        blocking_refusal: Some(reason),
+    }
 }
 
 /// [`plan_slot_placement`] with host and temporary roots supplied for tests.

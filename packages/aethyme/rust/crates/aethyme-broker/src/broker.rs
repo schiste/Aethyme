@@ -984,6 +984,11 @@ pub struct WorktreeRootPlan {
     /// the `[worktrees]` configuration was ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_unavailable_reason: Option<String>,
+    /// A captured storage context cannot be used for this repository. Unlike
+    /// ordinary unavailable-root reasons, this is a fail-closed planning
+    /// refusal: callers must not try another root or allocate a slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_context_refusal: Option<String>,
 }
 
 /// Storage locations selected before broker startup maintenance runs.
@@ -1042,6 +1047,8 @@ impl BrokerOpenOptions {
 /// them to a different host database or cache.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BrokerStorageContext {
+    pub(crate) repository_root: Option<PathBuf>,
+    pub(crate) git_common_dir: Option<PathBuf>,
     pub(crate) host_state_dir: Option<PathBuf>,
     pub(crate) host_resource_db_path: Option<PathBuf>,
     pub(crate) host_cache_dir: Option<PathBuf>,

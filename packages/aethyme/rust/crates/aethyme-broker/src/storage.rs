@@ -485,14 +485,25 @@ impl OwnerSources {
 /// or ownership-changing filesystem writes. It may persist one bounded size
 /// measurement when the routine policy permits it.
 pub fn storage_plan(path_inside_repo: &Path) -> Result<StoragePlan, StorageError> {
+    let context = capture_storage_context_for_path(path_inside_repo)?;
+    storage_plan_with_context(path_inside_repo, &context)
+}
+
+pub(crate) fn storage_plan_with_context(
+    path_inside_repo: &Path,
+    context: &crate::broker::BrokerStorageContext,
+) -> Result<StoragePlan, StorageError> {
     let checkout = GitRepo::discover(path_inside_repo)?;
     let main_root = checkout.main_root()?;
-    let storage_root = storage_container(&main_root)?;
+    validate_storage_context(&main_root, context)?;
+    let storage_root = storage_container_with_context(&main_root, context)?;
     let (policy, warnings) = host_policy(&main_root);
     let mut records = crate::measurement::load_size_records(&main_root);
+    let preparation_cache_root = context.preparation_cache_root();
     let plan = build_plan(
         &main_root,
         &storage_root,
+        preparation_cache_root.as_deref(),
         policy.orphan_worktree_roots_days,
         warnings.clone(),
         crate::SizeScan::Recorded,
@@ -504,23 +515,65 @@ pub fn storage_plan(path_inside_repo: &Path) -> Result<StoragePlan, StorageError
     Ok(plan)
 }
 
+fn capture_storage_context_for_path(
+    path_inside_repo: &Path,
+) -> Result<crate::broker::BrokerStorageContext, StorageError> {
+    let checkout = GitRepo::discover(path_inside_repo)?;
+    let main_root = checkout.main_root()?;
+    let repository = GitRepo::discover(&main_root)?;
+    crate::broker::BrokerStorageContext::capture_for_repository(&repository).map_err(|error| {
+        StorageError::Unavailable {
+            reason: format!("captured broker storage context is invalid: {error}"),
+        }
+    })
+}
+
+fn validate_storage_context(
+    main_root: &Path,
+    context: &crate::broker::BrokerStorageContext,
+) -> Result<(), StorageError> {
+    if context.repository_root.is_none() || context.git_common_dir.is_none() {
+        return Err(StorageError::Unavailable {
+            reason: "storage operation requires a repository-bound broker context".into(),
+        });
+    }
+    let repository = GitRepo::discover(main_root)?;
+    let common_dir = repository.git_common_dir()?;
+    if let Some(reason) = context.repository_binding_refusal(main_root, Some(&common_dir)) {
+        return Err(StorageError::Unavailable { reason });
+    }
+    Ok(())
+}
+
 /// Apply exactly one reviewed host storage plan. The digest is checked against
 /// a fresh, read-only inventory before any candidate is touched.
 pub fn storage_apply(
     path_inside_repo: &Path,
     confirm: &str,
 ) -> Result<StorageApplyReport, StorageError> {
+    let context = capture_storage_context_for_path(path_inside_repo)?;
+    storage_apply_with_context(path_inside_repo, confirm, &context)
+}
+
+pub(crate) fn storage_apply_with_context(
+    path_inside_repo: &Path,
+    confirm: &str,
+    context: &crate::broker::BrokerStorageContext,
+) -> Result<StorageApplyReport, StorageError> {
     if !is_sha256(confirm) {
         return Err(StorageError::ConfirmationNotSha256);
     }
     let checkout = GitRepo::discover(path_inside_repo)?;
     let main_root = checkout.main_root()?;
-    let storage_root = storage_container(&main_root)?;
+    validate_storage_context(&main_root, context)?;
+    let storage_root = storage_container_with_context(&main_root, context)?;
     let (policy, warnings) = host_policy(&main_root);
     let mut records = crate::measurement::load_size_records(&main_root);
+    let preparation_cache_root = context.preparation_cache_root();
     let plan = build_plan(
         &main_root,
         &storage_root,
+        preparation_cache_root.as_deref(),
         policy.orphan_worktree_roots_days,
         warnings,
         crate::SizeScan::Measure,
@@ -552,7 +605,22 @@ pub fn storage_apply(
     }
     for candidate in &plan.preparation_candidates {
         let live_roots = preparation_live_roots(&main_root, &plan.primary_checkouts, &plan.roots);
-        match apply_preparation_candidate(candidate, &live_roots) {
+        let result = match (
+            preparation_cache_root.as_deref(),
+            context.host_resource_db_path.as_deref(),
+        ) {
+            (Some(cache_root), Some(resource_db_path)) => apply_preparation_candidate(
+                candidate,
+                &live_roots,
+                resource_db_path,
+                cache_root,
+            ),
+            _ => Err(
+                "the captured host resource database path is unavailable; the cache entry was retained"
+                    .into(),
+            ),
+        };
+        match result {
             Ok(reclaimed_bytes) => applied.push(StorageAppliedItem {
                 kind: StorageCandidateKind::PreparationEntry,
                 path: candidate.path.clone(),
@@ -597,6 +665,7 @@ pub fn storage_apply(
 fn build_plan(
     main_root: &Path,
     storage_root: &Path,
+    preparation_cache_root: Option<&Path>,
     orphan_worktree_roots_days: u32,
     mut warnings: Vec<String>,
     scan: crate::SizeScan,
@@ -676,16 +745,16 @@ fn build_plan(
     // resolved beside the host resource database by preparation.rs. These
     // locations can differ when the repository overrides worktree placement.
     let live_roots = preparation_live_roots(main_root, &primary_checkouts, &roots);
-    let (preparation_entries, preparation_candidates) =
-        match crate::preparation::preparation_cache_root() {
-            Ok(cache_root) => inspect_preparation_cache(&cache_root, &live_roots, scan, records),
-            Err(error) => {
-                warnings.push(format!(
-                    "preparation cache could not be located, so its entries were retained: {error}"
-                ));
-                (Vec::new(), Vec::new())
-            }
-        };
+    let (preparation_entries, preparation_candidates) = match preparation_cache_root {
+        Some(cache_root) => inspect_preparation_cache(cache_root, &live_roots, scan, records),
+        None => {
+            warnings.push(
+                "the captured host resource database path is unavailable, so preparation cache entries were retained"
+                    .into(),
+            );
+            (Vec::new(), Vec::new())
+        }
+    };
     let digest = decision_digest(
         &storage_root,
         orphan_worktree_roots_days,
@@ -1191,23 +1260,26 @@ pub(crate) fn sweep_preparation_cache(
     if check_preparation_sweep_deadline(deadline).is_err() {
         return (0, 0);
     }
-    let Ok(storage_root) = storage_container(main_root) else {
+    let Ok(context) = capture_storage_context_for_path(main_root) else {
+        return (0, 0);
+    };
+    let Some(cache_root) = context.preparation_cache_root() else {
+        return (0, 0);
+    };
+    let Some(resource_db_path) = context.host_resource_db_path.as_deref() else {
+        return (0, 0);
+    };
+    let Ok(storage_root) = storage_container_with_context(main_root, &context) else {
         return (0, 0);
     };
     if check_preparation_sweep_deadline(deadline).is_err() {
         return (0, 0);
     }
-    let Ok(cache_root) = crate::preparation::preparation_cache_root() else {
-        return (0, 0);
-    };
-    let Ok(resource_db_path) = crate::default_host_resource_db_path() else {
-        return (0, 0);
-    };
     sweep_preparation_cache_at(
         main_root,
         &storage_root,
         &cache_root,
-        &resource_db_path,
+        resource_db_path,
         deadline,
     )
 }
@@ -2137,12 +2209,10 @@ fn retired_preparation_store_layout(path: &Path, deadline: Option<std::time::Ins
 fn apply_preparation_candidate(
     candidate: &StoragePreparationCandidate,
     live_roots: &[PathBuf],
+    resource_db_path: &Path,
+    cache_root: &Path,
 ) -> Result<u64, String> {
-    let resource_db_path = crate::default_host_resource_db_path()
-        .map_err(|error| format!("cannot locate host resource database: {error}"))?;
-    let cache_root = crate::preparation::preparation_cache_root()
-        .map_err(|error| format!("cannot locate preparation cache: {error}"))?;
-    apply_preparation_candidate_with_lease_at(candidate, live_roots, &resource_db_path, &cache_root)
+    apply_preparation_candidate_with_lease_at(candidate, live_roots, resource_db_path, cache_root)
 }
 
 fn apply_preparation_candidate_with_lease_at(
@@ -3143,6 +3213,40 @@ fn remove_empty_root(root: &Path) -> Result<u64, String> {
     }
     std::fs::remove_dir(root).map_err(|error| format!("{}: {error}", root.display()))?;
     Ok(freed)
+}
+
+fn storage_container_with_context(
+    main_root: &Path,
+    context: &crate::broker::BrokerStorageContext,
+) -> Result<PathBuf, StorageError> {
+    let container = if let Some(root) = context.worktree_root_override.as_deref() {
+        absolute_path(main_root, root)
+    } else if let Some(container) = context.worktree_root_environment_override.as_deref() {
+        absolute_path(main_root, container)
+    } else {
+        let Some(base) = context.host_state_dir.as_deref() else {
+            return Err(StorageError::Unavailable {
+                reason: "no captured host-state directory is available; set AETHYME_WORKTREE_ROOT"
+                    .into(),
+            });
+        };
+        if !context.host_state_dir_is_explicit && crate::host_state::path_is_ephemeral(main_root) {
+            return Err(StorageError::Unavailable {
+                reason: "the repository is under the system temporary directory and the implicit host-state directory is withheld; set AETHYME_WORKTREE_ROOT or AETHYME_HOST_STATE_DIR explicitly".into(),
+            });
+        }
+        absolute_path(main_root, base).join("worktrees")
+    };
+    if path_is_inside(main_root, &container) {
+        return Err(StorageError::Unavailable {
+            reason: format!(
+                "{} resolves inside repository {}; choose an external host storage root",
+                container.display(),
+                main_root.display()
+            ),
+        });
+    }
+    Ok(container)
 }
 
 fn storage_container(main_root: &Path) -> Result<PathBuf, StorageError> {

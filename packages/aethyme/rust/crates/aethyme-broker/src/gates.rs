@@ -3736,12 +3736,16 @@ fn run_gate_command(
     let (status, timed_out) = std::thread::scope(|scope| {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let progress_interval = heartbeat_interval();
-        let renewal = context
-            .resources
-            .map(|runtime| (runtime.grant.clone(), runtime.ttl_seconds));
+        let renewal = context.resources.map(|runtime| {
+            (
+                runtime.resource_db_path.clone(),
+                runtime.grant.clone(),
+                runtime.ttl_seconds,
+            )
+        });
         let interval = renewal
             .as_ref()
-            .map(|(_, ttl)| Duration::from_secs((ttl / 3).max(1)))
+            .map(|(_, _, ttl)| Duration::from_secs((ttl / 3).max(1)))
             .map(|renewal| renewal.min(progress_interval))
             .unwrap_or(progress_interval);
         let process_group = child.id() as i32;
@@ -3773,8 +3777,8 @@ fn run_gate_command(
                 match done_rx.recv_timeout(interval) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some((grant, ttl_seconds)) = renewal.as_mut() {
-                            match crate::HostResourceCoordinator::open_default().and_then(
+                        if let Some((resource_db_path, grant, ttl_seconds)) = renewal.as_mut() {
+                            match crate::HostResourceCoordinator::open(resource_db_path).and_then(
                                 |mut coordinator| {
                                     coordinator.renew(
                                         &grant.lease.lease_id,
