@@ -666,6 +666,10 @@ pub struct GcOrphanCandidate {
     pub estimated_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_inodes: Option<u64>,
+    /// Binds the reviewed plan to a registered root object, owner marker and
+    /// saved filesystem identity. Older plans must be regenerated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_fingerprint: Option<String>,
     pub reason: String,
 }
 

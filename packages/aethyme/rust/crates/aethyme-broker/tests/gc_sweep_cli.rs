@@ -54,9 +54,21 @@ fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
 }
 
 fn run_as_is(repo: &Path, container: &Path, args: &[&str]) -> Output {
+    run_from_fixture(repo, repo, container, args)
+}
+
+fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Output {
     common::broker_cli(CLI, args)
-        .current_dir(repo)
+        .current_dir(cwd)
         .env("AETHYME_WORKTREE_ROOT", container)
+        .env(
+            "AETHYME_HOST_STATE_DIR",
+            owner.join(".git/aethyme-test-state"),
+        )
+        .env(
+            "AETHYME_HOST_CACHE_DIR",
+            owner.join(".git/aethyme-test-cache"),
+        )
         .output()
         .unwrap()
 }
@@ -153,12 +165,55 @@ fn stamp_root(container: &Path, key: &str, repository_root: &Path) -> PathBuf {
     root
 }
 
+/// Obtain saved filesystem evidence through real broker admission while the
+/// origin exists; removing the owned origin then creates a genuine orphan.
+fn registered_orphan(repo: &Path, container: &Path, origin: &Path) -> PathBuf {
+    assert!(
+        origin.starts_with(container),
+        "origin must be fixture-owned"
+    );
+    assert!(!origin.exists());
+    std::fs::create_dir_all(origin).unwrap();
+    git(origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("README.md"), "registered fixture\n").unwrap();
+    std::fs::write(origin.join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(origin, &["add", "-A"]);
+    git(origin, &["commit", "-qm", "init"]);
+    std::fs::create_dir(origin.join(".aethyme")).unwrap();
+    std::fs::write(
+        origin.join(".aethyme/broker.toml"),
+        "[retention]\nartifact_sweep_budget_ms = 0\n",
+    )
+    .unwrap();
+    let started = run_from_fixture(
+        repo,
+        origin,
+        container,
+        &["start", "--task", "registered orphan", "--json"],
+    );
+    assert!(
+        started.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let root = worktree.parent().unwrap().to_path_buf();
+    assert!(root.starts_with(container.canonicalize().unwrap()));
+    assert!(root.join(".aethyme-worktree-root.json").is_file());
+    std::fs::create_dir(root.join("some-session")).unwrap();
+    std::fs::write(root.join("some-session/leftover.txt"), "registered bytes\n").unwrap();
+    std::fs::remove_dir_all(origin).unwrap();
+    root
+}
+
 #[test]
 fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
     let (repo, container) =
         fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
     let missing = container.path().join("deleted-repository");
-    let orphan = stamp_root(container.path(), "repo-orphaned", &missing);
+    let orphan = registered_orphan(repo.path(), container.path(), &missing);
     let owned = stamp_root(container.path(), "repo-owned", repo.path());
     let unmarked = container.path().join("repo-unmarked");
     std::fs::create_dir_all(&unmarked).unwrap();
@@ -171,7 +226,7 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
         .iter()
         .map(|orphan| orphan["repository_key"].as_str().unwrap())
         .collect();
-    assert_eq!(keys, vec!["repo-orphaned"]);
+    assert_eq!(keys, vec![orphan.file_name().unwrap().to_str().unwrap()]);
     assert!(plan["orphans"][0]["estimated_bytes"].as_u64().unwrap() > 0);
     assert!(
         plan["blockers"]
@@ -691,7 +746,7 @@ fn a_reappearing_repository_revokes_an_authorized_orphan_removal() {
     let (repo, container) =
         fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
     let missing = container.path().join("deleted-repository");
-    let orphan = stamp_root(container.path(), "repo-orphaned", &missing);
+    let orphan = registered_orphan(repo.path(), container.path(), &missing);
 
     let plan = plan_json(repo.path(), container.path());
     let digest = plan["digest"].as_str().unwrap().to_owned();
@@ -1675,11 +1730,21 @@ fn a_budget_too_small_to_finish_still_makes_ground_and_keeps_the_cache_resumable
 fn the_largest_orphaned_root_is_planned_before_smaller_ones() {
     let (repo, container) =
         fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
-    let missing = container.path().join("deleted-repository");
-    // Named so that alphabetical order and size order disagree: if the plan
-    // still sorted by path, `repo-a-small` would come first.
-    let small = stamp_root(container.path(), "repo-a-small", &missing);
-    let large = stamp_root(container.path(), "repo-z-large", &missing);
+    let first = registered_orphan(
+        repo.path(),
+        container.path(),
+        &container.path().join("deleted-first"),
+    );
+    let second = registered_orphan(
+        repo.path(),
+        container.path(),
+        &container.path().join("deleted-second"),
+    );
+    // Whichever key sorts later receives the larger payload: alphabetical
+    // order and measured size order must disagree independently of hashes.
+    let mut roots = [first, second];
+    roots.sort();
+    let [small, large] = roots;
     std::fs::write(large.join("some-session/bulk.bin"), vec![b'x'; 512 * 1_024]).unwrap();
 
     let plan = plan_json(repo.path(), container.path());
@@ -1689,7 +1754,13 @@ fn the_largest_orphaned_root_is_planned_before_smaller_ones() {
         .iter()
         .map(|orphan| orphan["repository_key"].as_str().unwrap())
         .collect();
-    assert_eq!(keys, vec!["repo-z-large", "repo-a-small"]);
+    assert_eq!(
+        keys,
+        vec![
+            large.file_name().unwrap().to_str().unwrap(),
+            small.file_name().unwrap().to_str().unwrap()
+        ]
+    );
     assert!(small.exists() && large.exists(), "planning removes nothing");
 }
 
@@ -1703,14 +1774,18 @@ fn doctor_counts_an_unsized_orphaned_root_against_its_own_totals() {
         "[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\nroutine_size_budget_ms = 0\nretained_bytes_budget = 1073741824\n",
     );
     let missing = container.path().join("gone-repository");
-    stamp_root(container.path(), "repo-orphaned", &missing);
+    registered_orphan(repo.path(), container.path(), &missing);
 
     // The expensive audit sizes it, so the orphan is a real, non-zero cost.
     let plan = plan_json(repo.path(), container.path());
     assert_eq!(plan["orphans"].as_array().unwrap().len(), 1);
     assert!(plan["orphans"][0]["estimated_bytes"].as_u64().unwrap() > 0);
     assert_eq!(plan["unmeasured_directory_count"].as_u64().unwrap(), 0);
-    assert_eq!(plan["budget_verdict"].as_str().unwrap(), "within");
+    assert_eq!(
+        plan["budget_verdict"].as_str().unwrap(),
+        "within",
+        "{plan:#}"
+    );
 
     let output = run(
         repo.path(),

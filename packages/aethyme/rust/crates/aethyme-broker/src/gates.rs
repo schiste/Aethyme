@@ -36,6 +36,8 @@ use crate::git::GitRepo;
 use crate::store::BrokerStore;
 use crate::types::{GateEnvironment, GateFailureClass, GateStatus, NewGateResult};
 
+mod bounded_log;
+
 pub const GATES_CONFIG_RELPATH: &str = ".aethyme/gates.toml";
 pub const GATE_SCOPE_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
@@ -678,7 +680,7 @@ pub struct GateRunOutcome {
     pub wait_duration_ms: Option<i64>,
     /// Time from command spawn until the first stdout/stderr byte appeared.
     pub first_output_ms: Option<i64>,
-    /// Combined stdout/stderr bytes captured without exposing their content.
+    /// Total stdout/stderr bytes observed, including bytes omitted from the bounded log.
     pub output_bytes: Option<i64>,
     pub log_path: Option<String>,
     /// Machine load and free disk around this execution; all `null` for a
@@ -704,9 +706,10 @@ impl GateRunOutcome {
     /// flag is set only where the broker observed the fault itself: host
     /// resources were refused, the command never started (disk headroom, spawn
     /// failure, an invalidated broker database), the broker detected a host
-    /// resource error, the command ran out of disk, or the broker's own
-    /// deadline killed it for the first time on this tree. A second timeout on
-    /// the same tree is a verdict, so a change that hangs is still rejected.
+    /// resource error or incomplete output capture, the command ran out of
+    /// disk, or the broker's own deadline killed it for the first time on this
+    /// tree. A second timeout on the same tree is a verdict, so a change that
+    /// hangs is still rejected.
     pub fn is_host_fault(&self) -> bool {
         self.host_fault && self.status != GateStatus::Pass
     }
@@ -715,14 +718,22 @@ impl GateRunOutcome {
 /// Whether the broker, rather than the command's output, shows that a gate run
 /// could not judge the change. The command's log is consulted only for storage
 /// exhaustion, which no test output plausibly fakes and which the broker
-/// already treats as never a verdict (#222).
+/// already treats as never a verdict (#222). Incomplete output capture is also
+/// a broker-observed condition: a successful exit cannot be trusted when
+/// descendants kept the output pipes open past the drain deadline.
 fn observed_host_fault(
     status: &Result<GateCommandOutcome, std::io::Error>,
     log_path: &Path,
 ) -> bool {
     match status {
         Err(_) => true,
-        Ok(outcome) if outcome.resource_error.is_some() || outcome.timed_out => true,
+        Ok(outcome)
+            if outcome.resource_error.is_some()
+                || outcome.capture_error.is_some()
+                || outcome.timed_out =>
+        {
+            true
+        }
         Ok(outcome) if outcome.exit_code.is_some_and(|code| code != 0) => {
             log_contains_any(log_path, &["no space left on device"])
         }
@@ -2645,6 +2656,7 @@ where
                 exit_code: None,
                 timed_out: false,
                 resource_error: Some(release_error),
+                capture_error: None,
                 first_output_ms: None,
                 output_bytes: 0,
             }),
@@ -2657,14 +2669,18 @@ where
         let output_bytes = status
             .as_ref()
             .ok()
-            .map(|outcome| outcome.output_bytes as i64);
+            .map(|outcome| i64::try_from(outcome.output_bytes).unwrap_or(i64::MAX));
         let timed_out = status.as_ref().is_ok_and(|outcome| outcome.timed_out);
         let mut host_fault = observed_host_fault(&status, &log_path);
+        let has_capture_or_resource_error = status.as_ref().is_ok_and(|outcome| {
+            outcome.capture_error.is_some() || outcome.resource_error.is_some()
+        });
         // A deadline kill is the host's fault only the first time. A change
         // that hangs times out on every run of its tree, and deferring each one
         // would ask the agent to resubmit unchanged code forever.
         if host_fault
             && timed_out
+            && !has_capture_or_resource_error
             && store.gate_timeouts_for_tree(&gate.name, &tree, &gate.definition_hash)? > 0
         {
             host_fault = false;
@@ -2936,6 +2952,16 @@ fn classify_gate_result(
             exit_code.map(i64::from),
         ),
         Ok(GateCommandOutcome {
+            capture_error: Some(_),
+            resource_error: None,
+            exit_code,
+            ..
+        }) => (
+            GateStatus::Error,
+            Some(GateFailureClass::Environment),
+            exit_code.map(i64::from),
+        ),
+        Ok(GateCommandOutcome {
             exit_code,
             resource_error: Some(error),
             ..
@@ -3047,10 +3073,10 @@ fn is_timeout_error(exit_code: i32, log_path: &Path) -> bool {
     if exit_code == 124 {
         return true;
     }
-    let Ok(log) = std::fs::read_to_string(log_path) else {
+    let Ok(log) = std::fs::read(log_path) else {
         return false;
     };
-    let lower = log.to_ascii_lowercase();
+    let lower = String::from_utf8_lossy(&log).to_ascii_lowercase();
     lower.contains("timed out")
         || lower.contains("timeout exceeded")
         || lower.contains("command timed out")
@@ -3081,10 +3107,10 @@ fn is_resource_contention_error(command: &str, log_path: &Path) -> bool {
             ],
         );
     }
-    let Ok(log) = std::fs::read_to_string(log_path) else {
+    let Ok(log) = std::fs::read(log_path) else {
         return false;
     };
-    let lower = log.to_ascii_lowercase();
+    let lower = String::from_utf8_lossy(&log).to_ascii_lowercase();
     let target_context = lower.contains(".fingerprint")
         || lower.contains("target/debug")
         || lower.contains("target/release")
@@ -3127,10 +3153,10 @@ fn is_environment_error(exit_code: i32, log_path: &Path) -> bool {
 }
 
 fn log_contains_any(log_path: &Path, patterns: &[&str]) -> bool {
-    let Ok(log) = std::fs::read_to_string(log_path) else {
+    let Ok(log) = std::fs::read(log_path) else {
         return false;
     };
-    let lower = log.to_ascii_lowercase();
+    let lower = String::from_utf8_lossy(&log).to_ascii_lowercase();
     patterns.iter().any(|pattern| lower.contains(pattern))
 }
 
@@ -3196,6 +3222,7 @@ struct GateCommandOutcome {
     exit_code: Option<i32>,
     timed_out: bool,
     resource_error: Option<String>,
+    capture_error: Option<String>,
     first_output_ms: Option<i64>,
     output_bytes: u64,
 }
@@ -3263,6 +3290,29 @@ fn wait_gate_child(
     child: &mut std::process::Child,
     context: &GateCommandContext<'_>,
     process_group: i32,
+    collector: &std::sync::Arc<std::sync::Mutex<bounded_log::BoundedGateLog>>,
+    drain_failed: &std::sync::atomic::AtomicBool,
+    resource_stop_requested: &std::sync::atomic::AtomicBool,
+) -> (Result<std::process::ExitStatus, std::io::Error>, bool) {
+    wait_gate_child_with_signaler(
+        child,
+        context,
+        process_group,
+        collector,
+        drain_failed,
+        resource_stop_requested,
+        signal_owned_process_group,
+    )
+}
+
+fn wait_gate_child_with_signaler(
+    child: &mut std::process::Child,
+    context: &GateCommandContext<'_>,
+    process_group: i32,
+    collector: &std::sync::Arc<std::sync::Mutex<bounded_log::BoundedGateLog>>,
+    drain_failed: &std::sync::atomic::AtomicBool,
+    resource_stop_requested: &std::sync::atomic::AtomicBool,
+    mut signal_group: impl FnMut(i32, i32) -> std::io::Result<()>,
 ) -> (Result<std::process::ExitStatus, std::io::Error>, bool) {
     let deadline = context.timeout_seconds.map(Duration::from_secs);
     let mut timed_out = false;
@@ -3271,6 +3321,44 @@ fn wait_gate_child(
             Ok(Some(status)) => {
                 timed_out = command_completion_is_late(context.absolute_deadline);
                 break Ok(status);
+            }
+            Ok(None)
+                if drain_failed.load(std::sync::atomic::Ordering::Acquire)
+                    || resource_stop_requested.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                let renewal_failed =
+                    resource_stop_requested.load(std::sync::atomic::Ordering::Acquire);
+                if renewal_failed {
+                    collector
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .write_note(
+                            b"aethyme: host resource lease renewal failed; stopping the gate while its leader is still owned\n",
+                        );
+                }
+                // Both failure sources are handled only by this waiter. The
+                // branch is reached after `try_wait()` returned `None`, so
+                // the leader is still unreaped and the process-group id has
+                // not been released for reuse.
+                signal_group_and_note(&mut signal_group, process_group, libc::SIGTERM, collector);
+                let grace_deadline = Instant::now() + Duration::from_secs(1);
+                let final_status = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) if Instant::now() >= grace_deadline => {
+                            signal_group_and_note(
+                                &mut signal_group,
+                                process_group,
+                                libc::SIGKILL,
+                                collector,
+                            );
+                            break child.wait();
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                        Err(error) => break Err(error),
+                    }
+                };
+                break 'wait final_status;
             }
             Ok(None)
                 if deadline.is_some_and(|deadline| context.started.elapsed() >= deadline)
@@ -3284,29 +3372,28 @@ fn wait_gate_child(
                     .zip(logical_cpu_count())
                     .filter(|(load_1m, cpus)| load_1m.is_finite() && *load_1m >= 0.0 && *cpus > 0)
                     .map(|(load_1m, cpus)| crate::gate_admission::LoadSample { load_1m, cpus });
-                let _ = append_gate_log(
-                    context.log_path,
-                    &format_gate_timeout_diagnostic(
-                        context.configured_timeout_seconds,
-                        seconds,
-                        context.environment,
-                        load_at_timeout,
-                    ),
+                let diagnostic = format_gate_timeout_diagnostic(
+                    context.configured_timeout_seconds,
+                    seconds,
+                    context.environment,
+                    load_at_timeout,
                 );
-                // SAFETY: killpg has no memory-safety preconditions; the
-                // leader is unreaped, so the group cannot have been reused.
-                unsafe {
-                    libc::killpg(process_group, libc::SIGTERM);
-                }
+                collector
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .write_note(diagnostic.as_bytes());
+                signal_group_and_note(&mut signal_group, process_group, libc::SIGTERM, collector);
                 let grace_deadline = Instant::now() + Duration::from_secs(1);
                 let final_status = loop {
                     match child.try_wait() {
                         Ok(Some(status)) => break Ok(status),
                         Ok(None) if Instant::now() >= grace_deadline => {
-                            // SAFETY: as for the SIGTERM above.
-                            unsafe {
-                                libc::killpg(process_group, libc::SIGKILL);
-                            }
+                            signal_group_and_note(
+                                &mut signal_group,
+                                process_group,
+                                libc::SIGKILL,
+                                collector,
+                            );
                             break child.wait();
                         }
                         Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -3322,12 +3409,75 @@ fn wait_gate_child(
     (status, timed_out)
 }
 
+fn signal_owned_process_group(process_group: i32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: callers invoke this only from the child waiter after observing
+    // `try_wait() == None`, so the unreaped child still owns this group id.
+    let result = unsafe { libc::killpg(process_group, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn signal_group_and_note(
+    signal_group: &mut impl FnMut(i32, i32) -> std::io::Result<()>,
+    process_group: i32,
+    signal: i32,
+    collector: &std::sync::Arc<std::sync::Mutex<bounded_log::BoundedGateLog>>,
+) {
+    if let Err(error) = signal_group(process_group, signal) {
+        let message = format!("aethyme: could not signal owned gate process group: {error}\n");
+        collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_note(message.as_bytes());
+    }
+}
+
+fn request_resource_stop(
+    stop_requested: &std::sync::atomic::AtomicBool,
+    error_slot: &std::sync::Mutex<Option<String>>,
+    message: String,
+) {
+    {
+        let mut slot = error_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(bounded_gate_diagnostic(message));
+        }
+    }
+    stop_requested.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn bounded_gate_diagnostic(mut message: String) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+    if message.len() > MAX_DIAGNOSTIC_BYTES {
+        let mut boundary = MAX_DIAGNOSTIC_BYTES;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+        message.push_str("…[truncated]");
+    }
+    message
+}
+
 fn spawn_gate_command(
     command: &mut std::process::Command,
     deadline: Option<Instant>,
 ) -> Result<std::process::Child, std::io::Error> {
     require_command_allowance(deadline)?;
     command.spawn()
+}
+
+fn remove_gate_pidfile_after_setup_failure(pidfile: &Path, reason: &str) {
+    match std::fs::remove_file(pidfile) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => crate::warn_unrecorded(reason, Err::<(), _>(error)),
+    }
 }
 
 fn run_gate_command(
@@ -3389,23 +3539,25 @@ fn run_gate_command(
         ));
     }
 
-    let mut log = std::fs::File::create(context.log_path)?;
+    let collector = std::sync::Arc::new(std::sync::Mutex::new(
+        bounded_log::BoundedGateLog::create(context.log_path)?,
+    ));
     // Before the command's own output, so the head of every gate log says
     // which toolchain produced the verdict below it. A gate that ran against
     // a wrapper is otherwise indistinguishable after the fact from one that
     // ran against the real thing (#177).
     //
-    // Through this handle, not a second one opened on the path: the child
-    // inherits this descriptor and its offset, and a separate append-mode
-    // write would leave that offset at zero for the child to overwrite.
-    // `try_clone` below dups it, so stdout and stderr both continue after the
-    // note rather than on top of it.
+    // Keep the log file in the broker. The child writes only to pipes, and
+    // bounded drainers append the output without giving it an unbounded file
+    // descriptor.
     {
-        use std::io::Write as _;
-        let _ = log.write_all(crate::git::subprocess_path_note().as_bytes());
+        let mut log = collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.write_header(crate::git::subprocess_path_note().as_bytes())?;
         crate::warn_unrecorded(
             "write the gate environment line to the gate log",
-            log.write_all(gate_environment_note(context.environment).as_bytes()),
+            log.write_header(gate_environment_note(context.environment).as_bytes()),
         );
     }
     // Gates execute binaries built from the tree under test.  Those binaries
@@ -3425,21 +3577,36 @@ fn run_gate_command(
     // verdict names the only database its children could have written (#361).
     let target = crate::GateBrokerDatabase::from_scope(&isolated_broker_scope)?;
     {
-        use std::io::Write as _;
-        log.write_all(
-            format!(
-                "{}broker database {}\n",
-                crate::git::SUBPROCESS_PATH_NOTE_PREFIX,
-                serde_json::to_string(&target).map_err(std::io::Error::other)?
-            )
-            .as_bytes(),
-        )?;
+        let (database, truncated) = bounded_log::bounded_json(&target)?;
+        let prefix = crate::git::SUBPROCESS_PATH_NOTE_PREFIX.as_bytes();
+        let remaining = collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .header_remaining();
+        let fits = prefix
+            .len()
+            .saturating_add(b"broker database ".len())
+            .saturating_add(database.len())
+            .saturating_add(1)
+            <= remaining;
+        let mut note = Vec::with_capacity(64 + database.len());
+        note.extend_from_slice(prefix);
+        if truncated || !fits {
+            note.extend_from_slice(b"broker database metadata omitted (over 64 KiB)\n");
+        } else {
+            note.extend_from_slice(b"broker database ");
+            note.extend_from_slice(&database);
+            note.push(b'\n');
+        }
+        collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_header(&note)?;
     }
     let host_schemas = protected_schema_versions(&target);
     context.broker_database.set(target).map_err(|_| {
         std::io::Error::other("gate broker database was prepared twice for one command")
     })?;
-    let log_err = log.try_clone()?;
     let mut process = std::process::Command::new("sh");
     process
         .arg("-c")
@@ -3456,8 +3623,8 @@ fn run_gate_command(
             context.run_labels.env_value(),
         )
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log))
-        .stderr(std::process::Stdio::from(log_err))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .process_group(0);
     if let Some(resources) = context.resources {
         for (key, value) in resources.grant.environment() {
@@ -3503,108 +3670,283 @@ fn run_gate_command(
             return Err(error);
         }
     }
-    let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let first_output = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
-    let output_monitor_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (status, timed_out) = std::thread::scope(|scope| {
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let progress_interval = heartbeat_interval();
-        let renewal = context
-            .resources
-            .map(|runtime| (runtime.grant.clone(), runtime.ttl_seconds));
-        let interval = renewal
-            .as_ref()
-            .map(|(_, ttl)| Duration::from_secs((ttl / 3).max(1)))
-            .map(|renewal| renewal.min(progress_interval))
-            .unwrap_or(progress_interval);
-        let process_group = child.id() as i32;
-        let thread_error = fatal_resource_error.clone();
-        let monitor_result = first_output.clone();
-        let monitor_done = output_monitor_done.clone();
-        scope.spawn(move || {
-            while !monitor_done.load(std::sync::atomic::Ordering::Acquire) {
-                if std::fs::metadata(context.log_path)
-                    .map(|metadata| metadata.len() > 0)
-                    .unwrap_or(false)
-                {
-                    let elapsed = context.started.elapsed().as_millis() as i64;
-                    let _ = monitor_result.compare_exchange(
-                        -1,
-                        elapsed,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    );
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(25));
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            // SAFETY: the child is unreaped, so its process group cannot have
+            // been reused.
+            unsafe {
+                libc::killpg(child.id() as i32, libc::SIGKILL);
             }
-        });
-        scope.spawn(move || {
-            let mut renewal = renewal;
-            let mut last_progress = Instant::now();
-            loop {
-                match done_rx.recv_timeout(interval) {
-                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some((grant, ttl_seconds)) = renewal.as_mut() {
-                            match crate::HostResourceCoordinator::open_default().and_then(
-                                |mut coordinator| {
-                                    coordinator.renew(
-                                        &grant.lease.lease_id,
-                                        grant.lease.generation,
-                                        &grant.ownership_token,
-                                        *ttl_seconds,
-                                    )
-                                },
-                            ) {
-                                Ok(lease) => grant.lease = lease,
-                                Err(error) => {
-                                    // Keep retrying while the last confirmed TTL still grants
-                                    // authority. Stop the process before that authority expires.
-                                    if epoch_ms().saturating_add(1_000) >= grant.lease.expires_at {
-                                        if let Ok(mut slot) = thread_error.lock() {
-                                            *slot = Some(error.to_string());
+            crate::warn_unrecorded(
+                "reap gate child after stdout pipe setup failure",
+                child.wait(),
+            );
+            if let Some(pidfile) = &pidfile {
+                remove_gate_pidfile_after_setup_failure(
+                    pidfile,
+                    "remove the gate pidfile after stdout pipe setup failure",
+                );
+            }
+            return Err(std::io::Error::other("gate stdout pipe was not created"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            // SAFETY: the child is unreaped, so its process group cannot have
+            // been reused.
+            unsafe {
+                libc::killpg(child.id() as i32, libc::SIGKILL);
+            }
+            crate::warn_unrecorded(
+                "reap gate child after stderr pipe setup failure",
+                child.wait(),
+            );
+            if let Some(pidfile) = &pidfile {
+                remove_gate_pidfile_after_setup_failure(
+                    pidfile,
+                    "remove the gate pidfile after stderr pipe setup failure",
+                );
+            }
+            return Err(std::io::Error::other("gate stderr pipe was not created"));
+        }
+    };
+    if let Err(error) =
+        bounded_log::set_nonblocking(&stdout).and_then(|()| bounded_log::set_nonblocking(&stderr))
+    {
+        // The child is unreaped and its process group cannot be reused.
+        // SAFETY: killpg takes plain integers and has no memory-safety
+        // preconditions.
+        unsafe {
+            libc::killpg(child.id() as i32, libc::SIGKILL);
+        }
+        crate::warn_unrecorded(
+            "reap gate child after nonblocking pipe setup failure",
+            child.wait(),
+        );
+        if let Some(pidfile) = &pidfile {
+            remove_gate_pidfile_after_setup_failure(
+                pidfile,
+                "remove the gate pidfile after nonblocking pipe setup failure",
+            );
+        }
+        return Err(error);
+    }
+    let stop_drainers = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let first_output = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let resource_stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (status, timed_out, pipes_incomplete, stdout_result, stderr_result) =
+        std::thread::scope(|scope| {
+            let stdout_reader = scope.spawn({
+                let collector = collector.clone();
+                let stop = stop_drainers.clone();
+                let first_output = first_output.clone();
+                let drain_failed = drain_failed.clone();
+                let drain_error = drain_error.clone();
+                move || {
+                    bounded_log::drain_pipe(
+                        stdout,
+                        collector,
+                        stop,
+                        first_output,
+                        drain_failed,
+                        drain_error,
+                        context.started,
+                    )
+                }
+            });
+            let stderr_reader = scope.spawn({
+                let collector = collector.clone();
+                let stop = stop_drainers.clone();
+                let first_output = first_output.clone();
+                let drain_failed = drain_failed.clone();
+                let drain_error = drain_error.clone();
+                move || {
+                    bounded_log::drain_pipe(
+                        stderr,
+                        collector,
+                        stop,
+                        first_output,
+                        drain_failed,
+                        drain_error,
+                        context.started,
+                    )
+                }
+            });
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let progress_interval = heartbeat_interval();
+            let renewal = context
+                .resources
+                .map(|runtime| (runtime.grant.clone(), runtime.ttl_seconds));
+            let interval = renewal
+                .as_ref()
+                .map(|(_, ttl)| Duration::from_secs((ttl / 3).max(1)))
+                .map(|renewal| renewal.min(progress_interval))
+                .unwrap_or(progress_interval);
+            let thread_error = fatal_resource_error.clone();
+            let thread_stop_requested = resource_stop_requested.clone();
+            let renewal_thread = scope.spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut renewal = renewal;
+                    let mut last_progress = Instant::now();
+                    loop {
+                        match done_rx.recv_timeout(interval) {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                request_resource_stop(
+                                    &thread_stop_requested,
+                                    &thread_error,
+                                    "gate resource-renewal shutdown control disconnected".into(),
+                                );
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if let Some((grant, ttl_seconds)) = renewal.as_mut() {
+                                    match crate::HostResourceCoordinator::open_default().and_then(
+                                        |mut coordinator| {
+                                            coordinator.renew(
+                                                &grant.lease.lease_id,
+                                                grant.lease.generation,
+                                                &grant.ownership_token,
+                                                *ttl_seconds,
+                                            )
+                                        },
+                                    ) {
+                                        Ok(lease) => grant.lease = lease,
+                                        Err(error) => {
+                                            // Keep retrying while the last confirmed TTL still
+                                            // grants authority. Ask the sole child waiter to stop
+                                            // the process before that authority expires.
+                                            if epoch_ms().saturating_add(1_000)
+                                                >= grant.lease.expires_at
+                                            {
+                                                request_resource_stop(
+                                                    &thread_stop_requested,
+                                                    &thread_error,
+                                                    error.to_string(),
+                                                );
+                                                break;
+                                            }
                                         }
-                                        // SAFETY: killpg has no memory-safety
-                                        // preconditions; the leader is unreaped,
-                                        // so the group cannot have been reused.
-                                        unsafe {
-                                            libc::killpg(process_group, libc::SIGTERM);
-                                        }
-                                        break;
                                     }
+                                }
+                                if last_progress.elapsed() >= progress_interval {
+                                    context.progress.report(&format!(
+                                        "gate {} running... {}s",
+                                        context.gate_name,
+                                        context.started.elapsed().as_secs()
+                                    ));
+                                    last_progress = Instant::now();
                                 }
                             }
                         }
-                        if last_progress.elapsed() >= progress_interval {
-                            context.progress.report(&format!(
-                                "gate {} running... {}s",
-                                context.gate_name,
-                                context.started.elapsed().as_secs()
-                            ));
-                            last_progress = Instant::now();
-                        }
                     }
+                }));
+                if result.is_err() {
+                    request_resource_stop(
+                        &thread_stop_requested,
+                        &thread_error,
+                        "gate resource-renewal thread panicked".into(),
+                    );
                 }
+            });
+            let process_group = child.id() as i32;
+            let (status, timed_out) = wait_gate_child(
+                &mut child,
+                &context,
+                process_group,
+                &collector,
+                &drain_failed,
+                &resource_stop_requested,
+            );
+            if done_tx.send(()).is_err() {
+                request_resource_stop(
+                    &resource_stop_requested,
+                    &fatal_resource_error,
+                    "gate resource-renewal thread stopped before its shutdown signal".into(),
+                );
             }
+            if renewal_thread.join().is_err() {
+                request_resource_stop(
+                    &resource_stop_requested,
+                    &fatal_resource_error,
+                    "gate resource-renewal thread could not be joined".into(),
+                );
+            }
+            let drain_deadline = Instant::now() + bounded_log::PIPE_DRAIN_GRACE;
+            while !(stdout_reader.is_finished() && stderr_reader.is_finished())
+                && Instant::now() < drain_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let pipes_incomplete = !(stdout_reader.is_finished() && stderr_reader.is_finished());
+            if pipes_incomplete {
+                stop_drainers.store(true, std::sync::atomic::Ordering::Release);
+            }
+            let stdout_result = stdout_reader
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")));
+            let stderr_result = stderr_reader
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")));
+            (
+                status,
+                timed_out,
+                pipes_incomplete,
+                stdout_result,
+                stderr_result,
+            )
         });
-        let (status, timed_out) = wait_gate_child(&mut child, &context, process_group);
-        output_monitor_done.store(true, std::sync::atomic::Ordering::Release);
-        let _ = done_tx.send(());
-        (status, timed_out)
-    });
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
+    }
+    let capture_error = if pipes_incomplete {
+        Some(format!(
+            "gate output capture incomplete: stdout/stderr pipes stayed open after {}s; remaining output was discarded",
+            bounded_log::PIPE_DRAIN_GRACE.as_secs()
+        ))
+    } else if let Err(error) = stdout_result {
+        Some(format!("gate stdout capture failed: {error}"))
+    } else if let Err(error) = stderr_result {
+        Some(format!("gate stderr capture failed: {error}"))
+    } else {
+        drain_error
+            .lock()
+            .ok()
+            .and_then(|message| message.clone())
+            .map(|error| format!("gate output capture failed: {error}"))
+    };
+    let summary = collector
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish();
+    let mut capture_error = capture_error;
+    if capture_error.is_none() && summary.incomplete {
+        capture_error = Some("gate output log could not be stored completely".to_string());
+    }
+    if let Some(error) = capture_error.as_deref() {
+        collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append_note_after_finish(format!("aethyme: {error}\n").as_bytes());
     }
     let resource_error = fatal_resource_error
         .lock()
         .ok()
-        .and_then(|mut error| error.take());
+        .and_then(|mut error| error.take())
+        .or_else(|| {
+            collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_error()
+                .map(|error| format!("gate log capture failed: {error}"))
+        });
     // Killed-by-signal surfaces as no exit code; absent a resource error,
     // `None` remains a non-conclusive cancellation.
-    let output_bytes = std::fs::metadata(context.log_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
     let observed_first_output = first_output.load(std::sync::atomic::Ordering::Acquire);
     // Isolation is environment-based, and a child can clear its environment.
     // Whatever it did, a verdict produced while a protected database changed
@@ -3622,12 +3964,13 @@ fn run_gate_command(
         exit_code: status?.code(),
         timed_out,
         resource_error,
+        capture_error,
         first_output_ms: match observed_first_output {
-            -1 if output_bytes > 0 => Some(context.started.elapsed().as_millis() as i64),
+            -1 if summary.output_bytes > 0 => Some(context.started.elapsed().as_millis() as i64),
             -1 => None,
             elapsed => Some(elapsed),
         },
-        output_bytes,
+        output_bytes: summary.output_bytes,
     })
 }
 
@@ -3676,9 +4019,7 @@ fn gate_environment_note(environment: &GateEnvironment) -> String {
 }
 
 fn append_gate_log(path: &Path, message: &str) -> Result<(), std::io::Error> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
-    file.write_all(message.as_bytes())
+    append_gate_diagnostic(path, message, false)
 }
 
 /// Record why a gate could not start, creating the log if it does not exist.
@@ -3744,12 +4085,19 @@ impl std::fmt::Display for HostBrokerDatabaseChanged {
 impl std::error::Error for HostBrokerDatabaseChanged {}
 
 fn write_gate_diagnostic(path: &Path, message: &str) -> Result<(), std::io::Error> {
+    append_gate_diagnostic(path, message, true)
+}
+
+fn append_gate_diagnostic(path: &Path, message: &str, create: bool) -> Result<(), std::io::Error> {
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    file.write_all(message.as_bytes())
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).write(true).create(create);
+    let mut file = options.open(path)?;
+    let remaining = bounded_log::MAX_LOG_BYTES.saturating_sub(file.metadata()?.len());
+    let keep = usize::try_from(remaining)
+        .unwrap_or(usize::MAX)
+        .min(message.len());
+    file.write_all(&message.as_bytes()[..keep])
 }
 
 /// Give a failing gate log a name no later run can reuse.
@@ -4157,8 +4505,35 @@ mod tests {
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         assert!(child.wait().unwrap().success());
         let group = i32::try_from(child.id()).unwrap();
-        let (result, late) = wait_gate_child(&mut child, &context(), group);
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(
+            bounded_log::BoundedGateLog::create(&log).unwrap(),
+        ));
+        let drain_failed = std::sync::atomic::AtomicBool::new(false);
+        let resource_stop_requested = std::sync::atomic::AtomicBool::new(false);
+        let renewal_error = std::sync::Mutex::new(None);
+        request_resource_stop(
+            &resource_stop_requested,
+            &renewal_error,
+            "injected late renewal failure".to_string(),
+        );
+        let mut signals = Vec::new();
+        let (result, late) = wait_gate_child_with_signaler(
+            &mut child,
+            &context(),
+            group,
+            &collector,
+            &drain_failed,
+            &resource_stop_requested,
+            |process_group, signal| {
+                signals.push((process_group, signal));
+                Ok(())
+            },
+        );
         assert!(result.unwrap().success());
+        assert!(
+            signals.is_empty(),
+            "a reaped child group must never be signalled"
+        );
         assert!(
             late,
             "production completion observer must reject late success"
@@ -4167,6 +4542,200 @@ mod tests {
             !command_completion_is_late(None),
             "ordinary legacy completion keeps its existing semantics"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renewal_failure_is_signalled_by_the_waiter_while_child_is_unreaped() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("log");
+        let environment = GateEnvironment::default();
+        let progress = Lines::default();
+        let database = std::cell::OnceCell::new();
+        let labels = crate::gate_debris::GateRunLabels::new("renewal-stop", None, "synthetic");
+        let context = GateCommandContext {
+            cwd: root.path(),
+            available_bytes: None,
+            available_inodes: None,
+            environment: &environment,
+            log_path: &log,
+            run_dir: root.path(),
+            session_id: None,
+            gate_name: "renewal-stop",
+            tree: "synthetic",
+            worker_id: "renewal-stop",
+            owner_paths: &[],
+            configured_timeout_seconds: Some(2),
+            timeout_seconds: Some(2),
+            absolute_deadline: None,
+            started: Instant::now(),
+            progress: &progress,
+            resources: None,
+            managed_cache: None,
+            broker_database: &database,
+            run_labels: &labels,
+        };
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(
+            bounded_log::BoundedGateLog::create(&log).unwrap(),
+        ));
+        let drain_failed = std::sync::atomic::AtomicBool::new(false);
+        let resource_stop_requested =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let renewal_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+
+        let renewer_stop = resource_stop_requested.clone();
+        let renewer_error = renewal_error.clone();
+        let renewer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            request_resource_stop(
+                &renewer_stop,
+                &renewer_error,
+                "injected resource renewal failure".to_string(),
+            );
+        });
+        let mut signals = Vec::new();
+        let (result, timed_out) = wait_gate_child_with_signaler(
+            &mut child,
+            &context,
+            process_group,
+            &collector,
+            &drain_failed,
+            &resource_stop_requested,
+            |owned_group, signal| {
+                assert_eq!(owned_group, process_group);
+                signals.push(signal);
+                signal_owned_process_group(owned_group, signal)
+            },
+        );
+        renewer.join().unwrap();
+
+        let status = result.unwrap();
+        assert!(!status.success(), "renewal failure must stop the live gate");
+        assert!(!timed_out);
+        assert_eq!(signals, [libc::SIGTERM]);
+        assert_eq!(
+            renewal_error.lock().unwrap().as_deref(),
+            Some("injected resource renewal failure")
+        );
+    }
+
+    #[test]
+    fn gate_command_drains_stdout_and_stderr_into_the_bounded_log() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let log_dir = root.path().join(".aethyme/logs/gates");
+        let run_dir = root.path().join(".aethyme/run");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let log_path = log_dir.join("gate.log");
+        let environment = GateEnvironment::default();
+        let progress = Lines::default();
+        let database = std::cell::OnceCell::new();
+        let labels = crate::gate_debris::GateRunLabels::new("bounded-output", None, "synthetic");
+        let status = run_gate_command(
+            "printf stdout; printf stderr >&2",
+            command_context(
+                root.path(),
+                &run_dir,
+                &log_path,
+                &environment,
+                &progress,
+                &database,
+                &labels,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.output_bytes, 12);
+        assert!(status.first_output_ms.is_some());
+        assert!(status.capture_error.is_none());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("stdout"));
+        assert!(log.contains("stderr"));
+        assert!(
+            std::fs::metadata(log_dir.join("gate.log")).unwrap().len()
+                <= bounded_log::MAX_LOG_BYTES
+        );
+    }
+
+    #[test]
+    fn gate_command_drains_both_streams_past_the_log_cap() {
+        const STREAM_BYTES: u64 = 3_000_000;
+
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let log_dir = root.path().join(".aethyme/logs/gates");
+        let run_dir = root.path().join(".aethyme/run");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let log_path = log_dir.join("gate.log");
+        let environment = GateEnvironment::default();
+        let progress = Lines::default();
+        let database = std::cell::OnceCell::new();
+        let labels = crate::gate_debris::GateRunLabels::new("bounded-output", None, "synthetic");
+        let outcome = run_gate_command(
+            "head -c 3000000 /dev/zero; head -c 3000000 /dev/zero >&2",
+            command_context(
+                root.path(),
+                &run_dir,
+                &log_path,
+                &environment,
+                &progress,
+                &database,
+                &labels,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.output_bytes, STREAM_BYTES * 2);
+        assert!(outcome.capture_error.is_none());
+        assert!(
+            std::fs::metadata(&log_path).unwrap().len() <= bounded_log::MAX_LOG_BYTES,
+            "the complete output count must not imply an unbounded log"
+        );
+    }
+
+    #[test]
+    fn descendant_held_output_pipe_is_bounded_and_never_a_pass() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let log_dir = root.path().join(".aethyme/logs/gates");
+        let run_dir = root.path().join(".aethyme/run");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let log_path = log_dir.join("gate.log");
+        let environment = GateEnvironment::default();
+        let progress = Lines::default();
+        let database = std::cell::OnceCell::new();
+        let labels = crate::gate_debris::GateRunLabels::new("bounded-output", None, "synthetic");
+        let outcome = run_gate_command(
+            "(/bin/sleep 3) & printf finished; exit 0",
+            command_context(
+                root.path(),
+                &run_dir,
+                &log_path,
+                &environment,
+                &progress,
+                &database,
+                &labels,
+            ),
+        )
+        .unwrap();
+        let (status, class, exit) = classify_gate_result("sh -c gate", &log_path, Ok(outcome));
+        assert_eq!(status, GateStatus::Error);
+        assert_eq!(class, Some(GateFailureClass::Environment));
+        assert_eq!(exit, Some(0));
+        assert_eq!(cached_failure_class(status), None);
+        assert!(std::fs::metadata(&log_path).unwrap().len() <= bounded_log::MAX_LOG_BYTES);
+        std::thread::sleep(Duration::from_secs(2));
     }
 
     #[test]
@@ -4735,6 +5304,39 @@ mod tests {
         std::fs::write(dir.join(GATES_CONFIG_RELPATH), body).unwrap();
     }
 
+    fn command_context<'a>(
+        root: &'a Path,
+        run_dir: &'a Path,
+        log_path: &'a Path,
+        environment: &'a GateEnvironment,
+        progress: &'a Lines,
+        broker_database: &'a std::cell::OnceCell<crate::GateBrokerDatabase>,
+        run_labels: &'a crate::gate_debris::GateRunLabels,
+    ) -> GateCommandContext<'a> {
+        GateCommandContext {
+            cwd: root,
+            available_bytes: Some(u64::MAX),
+            available_inodes: Some(u64::MAX),
+            environment,
+            log_path,
+            run_dir,
+            session_id: None,
+            gate_name: "bounded-output",
+            tree: "synthetic",
+            worker_id: "bounded-output-test",
+            owner_paths: &[],
+            configured_timeout_seconds: Some(10),
+            timeout_seconds: Some(10),
+            absolute_deadline: None,
+            started: Instant::now(),
+            progress,
+            resources: None,
+            managed_cache: None,
+            broker_database,
+            run_labels,
+        }
+    }
+
     fn git_in(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -4935,6 +5537,7 @@ mod tests {
                 timed_out: false,
                 exit_code: Some(101),
                 resource_error: None,
+                capture_error: None,
                 first_output_ms: None,
                 output_bytes: 0,
             }),
@@ -4956,6 +5559,7 @@ mod tests {
                 timed_out: false,
                 exit_code: Some(101),
                 resource_error: None,
+                capture_error: None,
                 first_output_ms: None,
                 output_bytes: 0,
             }),
@@ -4998,6 +5602,7 @@ mod tests {
                 timed_out: false,
                 exit_code: Some(101),
                 resource_error: None,
+                capture_error: None,
                 first_output_ms: None,
                 output_bytes: 0,
             }),
@@ -5018,6 +5623,7 @@ mod tests {
                 timed_out: false,
                 exit_code: Some(101),
                 resource_error: None,
+                capture_error: None,
                 first_output_ms: None,
                 output_bytes: 0,
             }),
@@ -5092,6 +5698,7 @@ mod tests {
             exit_code,
             timed_out,
             resource_error: None,
+            capture_error: None,
             first_output_ms: None,
             output_bytes: 0,
         }
@@ -5206,6 +5813,7 @@ mod tests {
                 exit_code: Some(101),
                 timed_out: false,
                 resource_error: None,
+                capture_error: None,
                 first_output_ms: Some(12),
                 output_bytes: 30,
             }),
@@ -5214,6 +5822,27 @@ mod tests {
         assert_eq!(status, GateStatus::Fail);
         assert_eq!(class, Some(GateFailureClass::TestFailure));
         assert_eq!(exit, Some(101));
+    }
+
+    #[test]
+    fn incomplete_pipe_capture_is_nonconclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("gate.log");
+        std::fs::write(&log_path, "gate command finished\n").unwrap();
+        let command = Ok(GateCommandOutcome {
+            exit_code: Some(0),
+            timed_out: false,
+            resource_error: None,
+            capture_error: Some("gate output capture incomplete: pipe remained open".to_string()),
+            first_output_ms: Some(1),
+            output_bytes: 42,
+        });
+        assert!(observed_host_fault(&command, &log_path));
+        let (status, class, exit) = classify_gate_result("sh -c gate", &log_path, command);
+        assert_eq!(status, GateStatus::Error);
+        assert_eq!(class, Some(GateFailureClass::Environment));
+        assert_eq!(exit, Some(0));
+        assert_eq!(cached_failure_class(status), None);
     }
 
     #[test]

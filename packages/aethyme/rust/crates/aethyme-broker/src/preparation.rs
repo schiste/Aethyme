@@ -1584,6 +1584,16 @@ fn directory_bytes(path: &Path) -> Result<Option<u64>, PreparationError> {
     directory_bytes_with_limits(path, SharedCacheScanLimits::default())
 }
 
+#[cfg(target_os = "linux")]
+fn shared_cache_stat_device(device: libc::dev_t) -> Option<u64> {
+    Some(device)
+}
+
+#[cfg(target_os = "macos")]
+fn shared_cache_stat_device(device: libc::dev_t) -> Option<u64> {
+    u64::try_from(device).ok()
+}
+
 fn directory_bytes_with_limits(
     path: &Path,
     _limits: SharedCacheScanLimits,
@@ -1687,9 +1697,9 @@ struct SharedCacheDirectoryFrame {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-enum SharedCacheScanOpenTarget<'a> {
+enum SharedCacheScanOpenTarget {
     Root,
-    Child(&'a CStr),
+    Child,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1707,7 +1717,7 @@ fn directory_bytes_fd_relative_with_hook<F>(
     mut before_open: F,
 ) -> Result<Option<u64>, PreparationError>
 where
-    F: for<'a> FnMut(SharedCacheScanOpenTarget<'a>),
+    F: FnMut(SharedCacheScanOpenTarget),
 {
     use std::mem::MaybeUninit;
 
@@ -1764,7 +1774,7 @@ where
     // SAFETY: successful fstat initialized the structure.
     let root_stat = unsafe { root_stat.assume_init() };
     if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || root_stat.st_dev != root_metadata.dev()
+        || shared_cache_stat_device(root_stat.st_dev) != Some(root_metadata.dev())
         || root_stat.st_ino != root_metadata.ino()
     {
         // SAFETY: fd was opened above and has not transferred to fdopendir.
@@ -1849,7 +1859,7 @@ where
                     ));
                 }
                 check_shared_cache_scan_deadline(path, started, limits)?;
-                before_open(SharedCacheScanOpenTarget::Child(&name));
+                before_open(SharedCacheScanOpenTarget::Child);
                 // SAFETY: name is NUL-terminated and parent_fd remains live.
                 let child_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
                 if child_fd < 0 {
@@ -2537,10 +2547,7 @@ mod tests {
             &store,
             SharedCacheScanLimits::default(),
             |target| {
-                if let SharedCacheScanOpenTarget::Child(name) = target
-                    && name.to_bytes() == b"child"
-                    && !replaced
-                {
+                if matches!(target, SharedCacheScanOpenTarget::Child) && !replaced {
                     fs::rename(&child, &original).unwrap();
                     fs::create_dir(&child).unwrap();
                     fs::write(child.join("replacement"), [0_u8; 64]).unwrap();

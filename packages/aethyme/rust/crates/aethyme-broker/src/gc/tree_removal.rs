@@ -94,6 +94,7 @@ impl PinnedTreeRemoval {
     /// `keep_until_last` is removed only after every other entry is gone. The
     /// root name is checked against the pinned inode before mutations and
     /// before final `rmdir`, so a replaced or unmounted root is left alone.
+    #[cfg(test)]
     pub(crate) fn remove(
         self,
         _keep_until_last: Option<&str>,
@@ -163,14 +164,14 @@ pub(crate) fn remove_condemned_tree_with_progress(
 ) -> Result<(TreeRemoval, usize), TreeRemovalError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        return match unix::PinnedTreeRemoval::open_optional(_dir) {
+        match unix::PinnedTreeRemoval::open_optional(_dir) {
             Ok(Some(tree)) => tree.remove_with_progress(_keep_until_last, _deadline),
             Ok(None) => Ok((TreeRemoval::Complete, 0)),
             Err(source) => Err(TreeRemovalError {
                 source,
                 entries_reclaimed: 0,
             }),
-        };
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -282,6 +283,7 @@ mod unix {
             }))
         }
 
+        #[cfg(test)]
         pub(super) fn remove<F>(
             self,
             keep_until_last: Option<&str>,
@@ -333,6 +335,7 @@ mod unix {
             .map_err(|error| error.source)
         }
 
+        #[cfg(test)]
         fn remove_with_hooks<F, G>(
             self,
             keep_until_last: Option<&str>,
@@ -699,6 +702,8 @@ mod unix {
 
     fn read_witness(parent_fd: RawFd, name: &CString) -> io::Result<WitnessBackup> {
         let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        // SAFETY: `parent_fd` is a live pinned directory, `name` is one
+        // NUL-terminated component, and `O_NOFOLLOW` rejects a symlink leaf.
         let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -756,6 +761,9 @@ mod unix {
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         // O_EXCL is the final no-overwrite check: a writer-created replacement
         // is left intact rather than replaced with the retained witness bytes.
+        // SAFETY: `parent_fd` is a live pinned directory and `name` is one
+        // NUL-terminated component. The flags create a new regular file without
+        // following a symlink or replacing an existing entry.
         let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags, 0o600 as libc::c_uint) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -763,6 +771,8 @@ mod unix {
         // SAFETY: openat returned a fresh owned descriptor.
         let mut file = unsafe { File::from_raw_fd(fd) };
         file.write_all(&backup.bytes)?;
+        // SAFETY: `file` owns a live descriptor for the newly created witness;
+        // the mode was captured from the original validated witness.
         if unsafe { libc::fchmod(file.as_raw_fd(), backup.mode as libc::mode_t) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1005,10 +1015,16 @@ mod unix {
     fn mount_identity(fd: RawFd) -> io::Result<Vec<u8>> {
         // f_fsid identifies the volume; f_mntonname distinguishes a second
         // mount of that volume from an ordinary child directory.
+        // SAFETY: `statfs` is a plain C struct whose zeroed representation is
+        // valid; `fstatfs` fills it before any field is read.
         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is a live pinned directory descriptor and `stat` is
+        // writable for the duration of the syscall.
         if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: successful `fstatfs` fills `f_mntonname` as a NUL-terminated
+        // fixed-size C string within the struct.
         let mountpoint = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_bytes();
         if mountpoint.is_empty() {
             return Err(io::Error::new(
@@ -1027,6 +1043,9 @@ mod unix {
             // description and directory offset. `dup` would share the old
             // offset, preventing a retry from seeing entries added meanwhile.
             let dot = CString::new(".").expect("dot has no NUL");
+            // SAFETY: `fd` is a live directory descriptor and `dot` is a
+            // NUL-terminated component. These flags open that directory itself
+            // without following a symlink.
             let duplicate = unsafe {
                 libc::openat(
                     fd,

@@ -396,6 +396,35 @@ pub enum BrokerOpError {
         command: String,
         source: std::io::Error,
     },
+    #[error(
+        "start-agent setup failed: {primary}; rollback was incomplete, so inspect the retained artifacts: {recovery:?}"
+    )]
+    StartAgentRollback {
+        #[source]
+        primary: Box<BrokerOpError>,
+        recovery: Vec<String>,
+    },
+    #[error(
+        "session {session_id} was registered for agent pid {pid}, but its start handshake failed: {reason}; the command was not released, and the session/worktree/log were retained for inspection ({worktree_path}; {log_path}){cleanup}"
+    )]
+    StartAgentRelease {
+        session_id: i64,
+        pid: u32,
+        worktree_path: Box<str>,
+        log_path: Box<str>,
+        reason: String,
+        cleanup: String,
+    },
+    #[error(
+        "start-agent registration outcome is uncertain after {registration_error}; no command was released, and the gated process/artifacts were retained (pid {pid}, worktree {worktree_path}, log {log_path}){cleanup}"
+    )]
+    StartAgentRegistrationUncertain {
+        registration_error: String,
+        pid: u32,
+        worktree_path: String,
+        log_path: String,
+        cleanup: String,
+    },
     #[error("cannot select a safe base for broker start: {reason}")]
     StartBaseUnavailable { reason: String },
     #[error(
@@ -3061,5 +3090,7 @@ pub(super) use status_helpers::*;
 
 #[cfg(test)]
 mod pid_liveness_tests;
+#[cfg(test)]
+mod start_agent_tests;
 #[cfg(test)]
 mod tests;

@@ -267,23 +267,39 @@ fn preflight_worktree_root(
             }
         }
     }
-    // `worktrees.min_free_bytes` is policy for an explicitly configured
-    // repository root. Environment/library overrides, host state, and the
-    // in-repository fallback get mount, ancestor, and containment checks here;
-    // verification slots apply their separate gate reserve when they are used.
-    if source == WorktreeRootSource::RepositoryConfig
-        && let Some(minimum) = min_free_bytes
-        && let Some(free) = available_bytes(path)
-        && free < minimum
-    {
-        return Err(format!(
-            "{} has {} free, below the {} required (worktrees.min_free_bytes)",
-            path.display(),
-            crate::disk_headroom::format_gibibytes(free),
-            crate::disk_headroom::format_gibibytes(minimum)
-        ));
+    // Placement overrides select a location; they do not opt out of the
+    // recovery reserve. Only the configured root uses its explicit policy.
+    let minimum = worktree_storage_minimum(source, min_free_bytes);
+    if minimum > 0 {
+        let free = available_bytes(path).ok_or_else(|| {
+            format!(
+                "cannot inspect free space at {}; refusing checkout allocation until its volume can be inspected",
+                path.display()
+            )
+        })?;
+        if free < minimum {
+            let policy = if source == WorktreeRootSource::RepositoryConfig {
+                "worktrees.min_free_bytes"
+            } else {
+                "broker recovery reserve"
+            };
+            return Err(format!(
+                "{} has {} free, below the {} required ({policy})",
+                path.display(),
+                crate::disk_headroom::format_gibibytes(free),
+                crate::disk_headroom::format_gibibytes(minimum)
+            ));
+        }
     }
     Ok(())
+}
+
+fn worktree_storage_minimum(source: WorktreeRootSource, configured: Option<u64>) -> u64 {
+    if source == WorktreeRootSource::RepositoryConfig {
+        configured.unwrap_or(crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES)
+    } else {
+        crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+    }
 }
 
 fn prepare_worktree_root_directory(
@@ -1508,56 +1524,188 @@ impl Broker {
         let (slug, branch, start_base, worktree, worktree_placement) =
             self.create_session_worktree(task, explicit_base)?;
         let base = start_base.commit.clone();
-        let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
+        let worktree_path = worktree.root().to_path_buf();
+        let repository_contract = match self.capture_repository_contract(&worktree_path, false) {
+            Ok(contract) => contract,
+            Err(error) => {
+                return Err(start_agent_setup_failure(
+                    &self.repo,
+                    &worktree_path,
+                    &branch,
+                    &base,
+                    None,
+                    error,
+                ));
+            }
+        };
 
         let log_dir = self.main_root.join(".aethyme/logs");
-        std::fs::create_dir_all(&log_dir).map_err(|source| BrokerError::Io {
-            path: log_dir.clone(),
-            source,
-        })?;
-        let log_path = log_dir.join(format!("{slug}.log"));
-        let log_file = std::fs::File::create(&log_path).map_err(|source| BrokerError::Io {
-            path: log_path.clone(),
-            source,
-        })?;
-        let log_clone = log_file.try_clone().map_err(|source| BrokerError::Io {
-            path: log_path.clone(),
-            source,
-        })?;
+        let (created_log, log_file) = match create_agent_log(&log_dir, &slug) {
+            Ok(log) => log,
+            Err(error) => {
+                return Err(start_agent_setup_failure(
+                    &self.repo,
+                    &worktree_path,
+                    &branch,
+                    &base,
+                    None,
+                    error,
+                ));
+            }
+        };
+        let log_path = created_log.path.clone();
+        let log_clone = match log_file.try_clone() {
+            Ok(log) => log,
+            Err(source) => {
+                let error = BrokerOpError::Store(BrokerError::Io {
+                    path: log_path.clone(),
+                    source,
+                });
+                return Err(start_agent_setup_failure(
+                    &self.repo,
+                    &worktree_path,
+                    &branch,
+                    &base,
+                    Some(&created_log),
+                    error,
+                ));
+            }
+        };
 
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(worktree.root())
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_clone))
-            .spawn()
-            .map_err(|source| BrokerOpError::Spawn {
-                command: command.to_string(),
-                source,
-            })?;
-
-        let session = self.store.register_session_with_context_and_leases(
+        let mut agent = match spawn_blocked_agent(command, &worktree_path, log_file, log_clone) {
+            Ok(agent) => agent,
+            Err(error) => {
+                return Err(start_agent_setup_failure(
+                    &self.repo,
+                    &worktree_path,
+                    &branch,
+                    &base,
+                    Some(&created_log),
+                    error,
+                ));
+            }
+        };
+        let pid = agent.pid();
+        let worktree_path_string = worktree_path.to_string_lossy().into_owned();
+        let log_path_string = log_path.to_string_lossy().into_owned();
+        let registration = self.store.register_session_with_context_and_leases(
             LeaseRefusalPolicy::verify_only_at(&self.main_root),
             &NewSession {
-                worktree_path: worktree.root().to_string_lossy().into_owned(),
-                branch,
+                worktree_path: worktree_path_string.clone(),
+                branch: branch.clone(),
                 origin: SessionOrigin::Spawned,
                 task: Some(task.to_string()),
                 adoption_base: Some(base.clone()),
                 adopted_head: Some(base.clone()),
-                diff_base: Some(base),
+                diff_base: Some(base.clone()),
                 repository_contract: Some(repository_contract),
-                pid: Some(child.id() as i64),
+                pid: Some(pid as i64),
                 command: Some(command.to_string()),
-                log_path: Some(log_path.to_string_lossy().into_owned()),
+                log_path: Some(log_path_string.clone()),
                 agent_identity: agent_identity.map(str::to_string),
             },
             &context,
             &[],
-        )?;
-        self.store.set_session_foreign_files(session.id, &[])?;
+        );
+        let session = match registration {
+            Ok(session) => session,
+            Err(registration_error) => {
+                let primary = BrokerOpError::Store(registration_error);
+                match self.store.session_for_worktree(&worktree_path_string) {
+                    Ok(Some(session))
+                        if start_agent_registration_matches(
+                            &session,
+                            &worktree_path_string,
+                            &branch,
+                            &base,
+                            pid,
+                            command,
+                            &log_path_string,
+                        ) =>
+                    {
+                        // Registration commits before its confirmation read.
+                        // This exact row is sufficient to continue if that
+                        // post-commit read was the failing step.
+                        session
+                    }
+                    Ok(None) => {
+                        if let Err(reason) = agent.abort() {
+                            return Err(BrokerOpError::StartAgentRollback {
+                                primary: Box::new(primary),
+                                recovery: vec![format!(
+                                    "gated agent pid {pid} did not stop/reap ({reason}); retained worktree {worktree_path_string} and log {log_path_string}"
+                                )],
+                            });
+                        }
+                        return Err(start_agent_setup_failure(
+                            &self.repo,
+                            &worktree_path,
+                            &branch,
+                            &base,
+                            Some(&created_log),
+                            primary,
+                        ));
+                    }
+                    Ok(Some(_)) => {
+                        let cleanup = agent
+                            .abort()
+                            .map(|()| "; gated child was stopped and reaped".to_string())
+                            .unwrap_or_else(|reason| {
+                                format!("; gated child stop/reap is incomplete: {reason}")
+                            });
+                        return Err(BrokerOpError::StartAgentRegistrationUncertain {
+                            registration_error: primary.to_string(),
+                            pid,
+                            worktree_path: worktree_path_string,
+                            log_path: log_path_string,
+                            cleanup,
+                        });
+                    }
+                    Err(probe_error) => {
+                        let cleanup = agent
+                            .abort()
+                            .map(|()| "; gated child was stopped and reaped".to_string())
+                            .unwrap_or_else(|reason| {
+                                format!("; gated child stop/reap is incomplete: {reason}")
+                            });
+                        return Err(BrokerOpError::StartAgentRegistrationUncertain {
+                            registration_error: format!(
+                                "{primary}; exact-row probe failed: {probe_error}"
+                            ),
+                            pid,
+                            worktree_path: worktree_path_string,
+                            log_path: log_path_string,
+                            cleanup,
+                        });
+                    }
+                }
+            }
+        };
+
+        if let Err(source) = agent.release() {
+            let cleanup = match agent.abort() {
+                Ok(()) => match self.store.set_session_status(
+                    session.id,
+                    SessionStatus::Exited,
+                    Some(125),
+                ) {
+                    Ok(()) => "; gated child was stopped/reaped and session marked exited".into(),
+                    Err(error) => format!(
+                        "; gated child was stopped/reaped, but marking the registered session exited failed: {error}"
+                    ),
+                },
+                Err(reason) => format!("; gated child stop/reap is incomplete: {reason}"),
+            };
+            return Err(BrokerOpError::StartAgentRelease {
+                session_id: session.id,
+                pid,
+                worktree_path: worktree_path_string.into_boxed_str(),
+                log_path: log_path_string.into_boxed_str(),
+                reason: source.to_string(),
+                cleanup,
+            });
+        }
+
         Ok(StartAgentReport {
             session,
             start_base,
@@ -1582,9 +1730,27 @@ impl Broker {
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Start);
         let mut start_base = self.select_session_start_base(explicit_base)?;
         refresh.record(&mut start_base);
-        let worktree = self
+        // Refresh may wait on another process or a remote. Sample the actual
+        // destination again immediately before allocating a Git checkout.
+        self.preflight_session_checkout_storage(&placement)?;
+        let worktree = match self
             .repo
-            .worktree_add(&worktree_path, &branch, &start_base.commit)?;
+            .worktree_add(&worktree_path, &branch, &start_base.commit)
+        {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                let primary = BrokerOpError::Git(error);
+                let recovery =
+                    inspect_partial_worktree_creation(&self.repo, &worktree_path, &branch);
+                if recovery.is_empty() {
+                    return Err(primary);
+                }
+                return Err(BrokerOpError::StartAgentRollback {
+                    primary: Box::new(primary),
+                    recovery,
+                });
+            }
+        };
         if placement.source == WorktreeRootSource::RepositoryConfig {
             // A failed lock must not fail the start, but it leaves the
             // registration unprotected while the drive is unplugged, so say so.
@@ -1667,22 +1833,51 @@ impl Broker {
         )
     }
 
+    fn configured_worktree_minimum(
+        &self,
+        source: WorktreeRootSource,
+    ) -> Result<Option<u64>, BrokerOpError> {
+        if source != WorktreeRootSource::RepositoryConfig {
+            return Ok(None);
+        }
+        crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
+            .map(|config| config.map(|settings| settings.min_free_bytes()))
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                path: self.main_root.join(".aethyme/config.toml"),
+                reason,
+            })
+    }
+
+    fn preflight_session_checkout_storage(
+        &self,
+        placement: &WorktreePlacement,
+    ) -> Result<(), BrokerOpError> {
+        let configured_minimum = self.configured_worktree_minimum(placement.source)?;
+        preflight_worktree_root(
+            &self.main_root,
+            &placement.root,
+            placement.source,
+            placement.source != WorktreeRootSource::RepositoryFallback,
+            configured_minimum,
+            crate::verification::removable_volume_unavailable_reason,
+            |candidate| {
+                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
+                    .map(|headroom| headroom.bytes)
+            },
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: placement.root.clone(),
+            reason,
+        })
+    }
+
     pub(super) fn prepare_worktree_root(
         &self,
         path: &Path,
         source: WorktreeRootSource,
         require_external: bool,
     ) -> Result<PathBuf, BrokerOpError> {
-        let min_free_bytes = if source == WorktreeRootSource::RepositoryConfig {
-            crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
-                .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
-                    path: self.main_root.join(".aethyme/config.toml"),
-                    reason,
-                })?
-                .map(|settings| settings.min_free_bytes())
-        } else {
-            None
-        };
+        let min_free_bytes = self.configured_worktree_minimum(source)?;
         let root = prepare_worktree_root_directory(
             &self.main_root,
             path,
@@ -1716,6 +1911,20 @@ impl Broker {
             }
         })?;
         self.write_or_verify_worktree_root_marker(&root)?;
+        crate::worktree_registry::register(
+            &self.host_operation_database_path()?,
+            &root,
+            &WorktreeRootMarker {
+                schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+                repository_key: self.repository_worktree_key()?,
+                repository_root: self.main_root.clone(),
+            },
+            source,
+        )
+        .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason: format!("cannot retain worktree storage discovery: {error}"),
+        })?;
         // Best effort on purpose: this is a disk-hygiene default, and failing
         // to start a session over one is a far worse outcome than building a
         // worktree the way cargo would have anyway.
@@ -2076,6 +2285,473 @@ impl Broker {
     }
 }
 
+const START_AGENT_GATE_TOKEN: &str = "AETHYME_START_AGENT_V1";
+const START_AGENT_GATE_SCRIPT: &str = "IFS= read -r token || exit 125; [ \"$token\" = \"AETHYME_START_AGENT_V1\" ] || exit 125; exec sh -c \"$1\"";
+
+#[derive(Debug)]
+pub(super) struct GatedAgent {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    released: bool,
+}
+
+impl GatedAgent {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn release(&mut self) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "start-agent gate input is already closed",
+            )
+        })?;
+        stdin.write_all(format!("{START_AGENT_GATE_TOKEN}\n").as_bytes())?;
+        self.stdin.take();
+        self.released = true;
+        Ok(())
+    }
+
+    pub(super) fn abort(&mut self) -> Result<(), String> {
+        self.stdin.take();
+        match self.wait_for_exit(std::time::Duration::from_millis(250)) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(_) => {}
+        }
+        let mut signal_errors = Vec::new();
+        if let Err(error) = self.signal(false) {
+            signal_errors.push(error);
+        }
+        match self.wait_for_exit(std::time::Duration::from_millis(500)) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => signal_errors.push(error),
+        }
+        if let Err(error) = self.signal(true) {
+            signal_errors.push(error);
+        }
+        match self.wait_for_exit(std::time::Duration::from_secs(2)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "pid {} remains unreaped after closing the gate and sending termination signals{}",
+                self.pid(),
+                if signal_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", signal_errors.join("; "))
+                }
+            )),
+            Err(error) => Err(format!(
+                "could not confirm pid {} exited after closing the gate and sending termination signals: {error}{}",
+                self.pid(),
+                if signal_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", signal_errors.join("; "))
+                }
+            )),
+        }
+    }
+
+    fn wait_for_exit(&mut self, allowance: std::time::Duration) -> Result<bool, String> {
+        let deadline = std::time::Instant::now() + allowance;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) if std::time::Instant::now() >= deadline => return Ok(false),
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => return Err(format!("waiting for pid {}: {error}", self.pid())),
+            }
+        }
+    }
+
+    fn signal(&mut self, force: bool) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+            // SAFETY: the child was spawned with process_group(0), so its
+            // still-unreaped PID is the exact process-group id owned here.
+            let result = unsafe { libc::killpg(self.pid() as i32, signal) };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            Err(format!(
+                "signalling owned process group {}: {error}",
+                self.pid()
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let action = if force { "force-stopping" } else { "stopping" };
+            self.child
+                .kill()
+                .map_err(|error| format!("{action} owned child {}: {error}", self.pid()))
+        }
+    }
+}
+
+impl Drop for GatedAgent {
+    fn drop(&mut self) {
+        if !self.released {
+            crate::warn_unrecorded(
+                "stop and reap an unreleased gated agent during drop",
+                self.abort(),
+            );
+        }
+    }
+}
+
+pub(super) fn spawn_blocked_agent(
+    command: &str,
+    worktree: &Path,
+    log: File,
+    log_err: File,
+) -> Result<GatedAgent, BrokerOpError> {
+    let mut process = Command::new("sh");
+    process
+        .arg("-c")
+        .arg(START_AGENT_GATE_SCRIPT)
+        .arg("aethyme-start-agent-gate")
+        .arg(command)
+        .current_dir(worktree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    let child = process.spawn().map_err(|source| BrokerOpError::Spawn {
+        command: command.to_string(),
+        source,
+    })?;
+    let mut agent = GatedAgent {
+        child,
+        stdin: None,
+        released: false,
+    };
+    agent.stdin = agent.child.stdin.take();
+    if agent.stdin.is_none() {
+        let error = BrokerOpError::Spawn {
+            command: command.to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the spawned shell has no gate input",
+            ),
+        };
+        return Err(match agent.abort() {
+            Ok(()) => error,
+            Err(reason) => BrokerOpError::StartAgentRollback {
+                primary: Box::new(error),
+                recovery: vec![format!(
+                    "gated shell pid {} did not stop/reap: {reason}",
+                    agent.pid()
+                )],
+            },
+        });
+    }
+    Ok(agent)
+}
+
+pub(super) struct CreatedAgentLog {
+    pub(super) path: PathBuf,
+    identity: AgentLogIdentity,
+}
+
+#[derive(Clone, Copy)]
+struct AgentLogIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl AgentLogIdentity {
+    #[cfg(unix)]
+    fn from_file(file: &File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "new agent log is not a regular file",
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_file(_file: &File) -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    fn matches_path_or_absent(self, path: &Path) -> std::io::Result<bool> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Ok(metadata.dev() == self.device && metadata.ino() == self.inode)
+        }
+        #[cfg(not(unix))]
+        {
+            match self {
+                Self {} => Ok(false),
+            }
+        }
+    }
+}
+
+pub(super) fn create_agent_log(
+    log_dir: &Path,
+    slug: &str,
+) -> Result<(CreatedAgentLog, File), BrokerOpError> {
+    std::fs::create_dir_all(log_dir).map_err(|source| {
+        BrokerOpError::Store(BrokerError::Io {
+            path: log_dir.to_path_buf(),
+            source,
+        })
+    })?;
+    for attempt in 0..1_000_u32 {
+        let name = if attempt == 0 {
+            format!("{slug}.log")
+        } else {
+            format!("{slug}-{}.log", attempt + 1)
+        };
+        let path = log_dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                let identity = AgentLogIdentity::from_file(&file).map_err(|source| {
+                    let source = std::io::Error::new(
+                        source.kind(),
+                        format!(
+                            "could not capture the newly created agent log identity; retained {}: {source}",
+                            path.display()
+                        ),
+                    );
+                    BrokerOpError::Store(BrokerError::Io {
+                        path: path.clone(),
+                        source,
+                    })
+                })?;
+                return Ok((CreatedAgentLog { path, identity }, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(BrokerOpError::Store(BrokerError::Io { path, source })),
+        }
+    }
+    let path = log_dir.join(format!("{slug}-1001.log"));
+    Err(BrokerOpError::Store(BrokerError::Io {
+        path,
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique agent log name",
+        ),
+    }))
+}
+
+fn start_agent_registration_matches(
+    session: &Session,
+    worktree_path: &str,
+    branch: &str,
+    base: &str,
+    pid: u32,
+    command: &str,
+    log_path: &str,
+) -> bool {
+    session.worktree_path == worktree_path
+        && session.branch == branch
+        && session.status == SessionStatus::Active
+        && session.origin == SessionOrigin::Spawned
+        && session.pid == Some(pid as i64)
+        && session.command.as_deref() == Some(command)
+        && session.log_path.as_deref() == Some(log_path)
+        && session.adoption_base.as_deref() == Some(base)
+        && session.adopted_head.as_deref() == Some(base)
+        && session.diff_base.as_deref() == Some(base)
+}
+
+fn start_agent_setup_failure(
+    repo: &GitRepo,
+    worktree_path: &Path,
+    branch: &str,
+    base: &str,
+    created_log: Option<&CreatedAgentLog>,
+    primary: BrokerOpError,
+) -> BrokerOpError {
+    let recovery = rollback_unregistered_start(repo, worktree_path, branch, base, created_log);
+    if recovery.is_empty() {
+        primary
+    } else {
+        BrokerOpError::StartAgentRollback {
+            primary: Box::new(primary),
+            recovery,
+        }
+    }
+}
+
+fn inspect_partial_worktree_creation(
+    repo: &GitRepo,
+    worktree_path: &Path,
+    branch: &str,
+) -> Vec<String> {
+    let inventory = match repo.worktree_inventory() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return vec![format!(
+                "worktree creation failed and its partial state could not be inspected: {error}; inspect path {} and branch {branch}",
+                worktree_path.display()
+            )];
+        }
+    };
+    let registered = inventory
+        .iter()
+        .any(|entry| same_path(&entry.path, worktree_path));
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_exists = repo.resolve_ref(&branch_ref).is_some();
+    if registered || worktree_path.exists() || branch_exists {
+        vec![format!(
+            "worktree creation left or may have left unregistered artifacts; retained path {} (registered={registered}, branch_ref_present={branch_exists}) and branch {branch}",
+            worktree_path.display()
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(super) fn rollback_unregistered_start(
+    repo: &GitRepo,
+    worktree_path: &Path,
+    branch: &str,
+    base: &str,
+    created_log: Option<&CreatedAgentLog>,
+) -> Vec<String> {
+    let inventory = match repo.worktree_inventory() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return vec![format!(
+                "could not verify the created worktree before rollback: {error}; retained worktree {} and branch {branch}",
+                worktree_path.display()
+            )];
+        }
+    };
+    let Some(entry) = inventory
+        .iter()
+        .find(|entry| same_path(&entry.path, worktree_path))
+    else {
+        return vec![format!(
+            "created worktree {} is no longer in Git's inventory; retained its path/branch and log for inspection",
+            worktree_path.display()
+        )];
+    };
+    let expected_branch = format!("refs/heads/{branch}");
+    if entry.branch.as_deref() != Some(expected_branch.as_str())
+        || entry.head.as_deref() != Some(base)
+    {
+        return vec![format!(
+            "created worktree identity changed before rollback (path {}, branch {:?}, head {:?}); retained it and log for inspection",
+            worktree_path.display(),
+            entry.branch,
+            entry.head
+        )];
+    }
+    let worktree = match GitRepo::discover(worktree_path) {
+        Ok(worktree) => worktree,
+        Err(error) => {
+            return vec![format!(
+                "could not reopen the exact created worktree for rollback: {error}; retained {} and branch {branch}",
+                worktree_path.display()
+            )];
+        }
+    };
+    match worktree.dirty_paths() {
+        Ok(paths) if paths.is_empty() => {}
+        Ok(paths) => {
+            return vec![format!(
+                "created worktree {} acquired changes before rollback ({paths:?}); retained it and log for inspection",
+                worktree_path.display()
+            )];
+        }
+        Err(error) => {
+            return vec![format!(
+                "could not prove created worktree {} is clean: {error}; retained it and log for inspection",
+                worktree_path.display()
+            )];
+        }
+    }
+    if let Err(error) = repo.worktree_remove_without_orphan_fallback(worktree_path) {
+        return vec![format!(
+            "could not remove the exact clean worktree {}: {error}; retained branch {branch} and log for inspection",
+            worktree_path.display()
+        )];
+    }
+    if worktree_path.exists() {
+        return vec![format!(
+            "Git reported removal but path {} remains; retained branch {branch} and log for inspection",
+            worktree_path.display()
+        )];
+    }
+    if let Err(error) = repo.delete_branch_ref_checked(branch, base) {
+        return vec![format!(
+            "removed the exact clean worktree {}, but could not delete branch {branch} at expected base {base}: {error}",
+            worktree_path.display()
+        )];
+    }
+    if let Some(created_log) = created_log
+        && let Err(reason) = remove_created_agent_log(created_log)
+    {
+        return vec![format!(
+            "removed the unregistered worktree and branch but retained agent log {}: {reason}",
+            created_log.path.display()
+        )];
+    }
+    Vec::new()
+}
+
+pub(super) fn remove_created_agent_log(created_log: &CreatedAgentLog) -> Result<(), String> {
+    match created_log
+        .identity
+        .matches_path_or_absent(&created_log.path)
+    {
+        Ok(true) => match std::fs::remove_file(&created_log.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("removal failed: {error}")),
+        },
+        Ok(false) => Err("the path no longer identifies the file created by this start attempt; it was preserved".into()),
+        Err(error) => Err(format!("could not verify the created file identity: {error}; it was preserved")),
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
 #[cfg(test)]
 mod worktree_root_candidate_tests {
     use super::*;
@@ -2249,13 +2925,16 @@ mod worktree_root_candidate_tests {
     }
 
     #[test]
-    fn only_configured_roots_use_the_configured_space_floor() {
+    fn every_placement_keeps_a_recovery_reserve_before_creating_storage() {
         let temp = tempfile::tempdir().unwrap();
         let repository = temp.path().join("repo");
         std::fs::create_dir_all(&repository).unwrap();
-        let mut headroom_reads = 0;
-
         for (source, path, require_external) in [
+            (
+                WorktreeRootSource::RepositoryConfig,
+                temp.path().join("configured-root"),
+                true,
+            ),
             (
                 WorktreeRootSource::EnvironmentOverride,
                 temp.path().join("env-root"),
@@ -2277,22 +2956,72 @@ mod worktree_root_candidate_tests {
                 false,
             ),
         ] {
-            preflight_worktree_root(
+            let minimum = if source == WorktreeRootSource::RepositoryConfig {
+                1024
+            } else {
+                crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+            };
+            let result = prepare_worktree_root_directory(
                 &repository,
                 &path,
                 source,
                 require_external,
                 Some(1024),
                 |_| None,
-                |_| {
-                    headroom_reads += 1;
-                    Some(0)
-                },
+                |_| Some(minimum - 1),
+            );
+            assert!(result.is_err(), "{source:?} ignored its reserve");
+            assert!(!path.exists(), "{source:?} wrote before admission");
+            let admitted = prepare_worktree_root_directory(
+                &repository,
+                &path,
+                source,
+                require_external,
+                Some(1024),
+                |_| None,
+                |_| Some(minimum),
             )
             .unwrap();
+            assert_eq!(admitted, path.canonicalize().unwrap());
         }
+    }
 
-        assert_eq!(headroom_reads, 0);
+    #[test]
+    fn unknown_volume_headroom_cannot_authorize_new_checkout_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        let root = temp.path().join("unknown-root");
+        let result = prepare_worktree_root_directory(
+            &repository,
+            &root,
+            WorktreeRootSource::LibraryOverride,
+            true,
+            None,
+            |_| None,
+            |_| None,
+        );
+        assert!(result.unwrap_err().contains("cannot inspect free space"));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_configured_floor_cannot_disable_an_overrides_default_reserve() {
+        assert_eq!(
+            worktree_storage_minimum(WorktreeRootSource::RepositoryConfig, Some(0)),
+            0
+        );
+        for source in [
+            WorktreeRootSource::EnvironmentOverride,
+            WorktreeRootSource::LibraryOverride,
+            WorktreeRootSource::HostState,
+            WorktreeRootSource::RepositoryFallback,
+        ] {
+            assert_eq!(
+                worktree_storage_minimum(source, Some(0)),
+                crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+            );
+        }
     }
 
     #[test]

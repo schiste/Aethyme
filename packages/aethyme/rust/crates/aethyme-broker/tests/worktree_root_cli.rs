@@ -221,3 +221,226 @@ fn cleanup_accepts_a_worktree_owned_by_the_external_root_marker() {
     assert!(!worktree.exists());
     assert!(root.join(".aethyme-worktree-root.json").is_file());
 }
+
+/// A placement override must not bypass the disk reserve or launch an agent
+/// before the checkout has been admitted. All state remains fixture-owned.
+#[test]
+fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_launch() {
+    for override_root in [false, true] {
+        for agent in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("project");
+            let state = tmp.path().join("state");
+            let cache = tmp.path().join("cache");
+            let root = tmp.path().join("override-worktrees");
+            let sentinel = tmp.path().join("agent-ran");
+            fixture_at(&repo);
+            let args = if agent {
+                vec![
+                    "start",
+                    "--task",
+                    "low space",
+                    "--cmd",
+                    "printf ran > \"$AETHYME_TEST_AGENT_SENTINEL\"",
+                    "--json",
+                ]
+            } else {
+                vec!["start", "--task", "low space", "--json"]
+            };
+            let mut command = common::broker_cli(CLI, &args);
+            command
+                .current_dir(&repo)
+                .env("AETHYME_HOST_STATE_DIR", &state)
+                .env("AETHYME_HOST_CACHE_DIR", &cache)
+                .env_remove("AETHYME_BROKER_DB")
+                .env_remove("AETHYME_GATE_BROKER_DATABASES")
+                .env("AETHYME_TEST_AGENT_SENTINEL", &sentinel)
+                .env(aethyme_broker::TEST_AVAILABLE_BYTES_ENV, "1024");
+            if override_root {
+                command.env("AETHYME_WORKTREE_ROOT", &root);
+            }
+            let output = command.output().unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !output.status.success(),
+                "low-space start was admitted: {text}"
+            );
+            assert!(text.contains("broker recovery reserve"), "{text}");
+            assert!(!root.exists(), "override root allocated before admission");
+            assert!(
+                !state.join("worktrees").exists(),
+                "host root allocated before admission"
+            );
+            assert!(
+                !repo.join(".aethyme/worktrees").exists(),
+                "fallback bypassed the reserve"
+            );
+            assert!(!sentinel.exists(), "an unadmitted agent executed");
+            // Command metrics are emitted for refused commands too. Every
+            // other entry, including any session agent log, is forbidden.
+            assert!(
+                std::fs::read_dir(repo.join(".aethyme/logs"))
+                    .map(|mut entries| {
+                        entries.all(|entry| entry.unwrap().file_name() == "command-metrics.jsonl")
+                    })
+                    .unwrap_or_else(|error| {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        true
+                    }),
+                "unadmitted agent allocated a log"
+            );
+            let branches = Command::new("git")
+                .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(branches.status.success());
+            assert!(
+                branches.stdout.is_empty(),
+                "an unadmitted session branch was created"
+            );
+        }
+    }
+}
+
+/// A remote refresh can consume the remaining space after initial placement.
+/// Recheck the volume after the actual fetch and before worktree allocation.
+#[cfg(unix)]
+#[test]
+fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("project");
+    let origin = tmp.path().join("origin.git");
+    let state = tmp.path().join("state");
+    let cache = tmp.path().join("cache");
+    let root = tmp.path().join("worktrees");
+    let bytes = tmp.path().join("available-bytes");
+    let upload_pack = tmp.path().join("upload-pack");
+    let sentinel = tmp.path().join("agent-ran");
+    fixture_at(&repo);
+    git(&repo, &["clone", "--bare", ".", origin.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["fetch", "-q", "origin"]);
+    git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+    std::fs::write(&bytes, "68719476736\n").unwrap();
+    std::fs::write(
+        &upload_pack,
+        "#!/bin/sh\nprintf '0\\n' > \"$AETHYME_TEST_RESERVE_BYTES_PATH\" || exit 1\nexec git-upload-pack \"$@\"\n",
+    ).unwrap();
+    std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().unwrap(),
+        ],
+    );
+    let plan = json(
+        common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
+            .current_dir(&repo)
+            .env("AETHYME_HOST_STATE_DIR", &state)
+            .env("AETHYME_HOST_CACHE_DIR", &cache)
+            .env("AETHYME_WORKTREE_ROOT", &root)
+            .env_remove("AETHYME_BROKER_DB")
+            .env_remove("AETHYME_GATE_BROKER_DATABASES")
+            .output()
+            .unwrap(),
+    );
+    let actual_root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
+    assert!(!root.exists(), "read-only planning allocated the placement");
+    let output = common::broker_cli(
+        CLI,
+        &[
+            "start",
+            "--task",
+            "refresh consumes reserve",
+            "--cmd",
+            "printf ran > \"$AETHYME_TEST_AGENT_SENTINEL\"",
+            "--json",
+        ],
+    )
+    .current_dir(&repo)
+    .env("AETHYME_HOST_STATE_DIR", &state)
+    .env("AETHYME_HOST_CACHE_DIR", &cache)
+    .env("AETHYME_WORKTREE_ROOT", &root)
+    .env_remove("AETHYME_BROKER_DB")
+    .env_remove("AETHYME_GATE_BROKER_DATABASES")
+    .env("AETHYME_TEST_AGENT_SENTINEL", &sentinel)
+    .env("AETHYME_TEST_RESERVE_BYTES_PATH", &bytes)
+    .env(
+        aethyme_broker::TEST_AVAILABLE_BYTES_ENV,
+        format!("@{}", bytes.display()),
+    )
+    .output()
+    .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bytes).unwrap(),
+        "0\n",
+        "the actual refresh did not exercise the late headroom change: {text}"
+    );
+    assert!(
+        !output.status.success(),
+        "checkout allocated after reserve was spent: {text}"
+    );
+    assert!(text.contains("broker recovery reserve"), "{text}");
+    assert!(!sentinel.exists(), "agent ran before late admission");
+    // Refusal still records command metrics; it must not create an agent log.
+    assert!(
+        std::fs::read_dir(repo.join(".aethyme/logs"))
+            .map(|mut entries| {
+                entries.all(|entry| entry.unwrap().file_name() == "command-metrics.jsonl")
+            })
+            .unwrap_or_else(|error| {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                true
+            }),
+        "agent log allocated before late admission"
+    );
+    let mut entries: Vec<_> = std::fs::read_dir(&actual_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            std::ffi::OsString::from(".aethyme-worktree-root.json"),
+            std::ffi::OsString::from(".cargo")
+        ],
+        "a checkout was created despite late refusal"
+    );
+    assert!(actual_root.join(".cargo/config.toml").is_file());
+    let branches = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(branches.status.success());
+    assert!(
+        branches.stdout.is_empty(),
+        "an unadmitted agent branch was created"
+    );
+}
