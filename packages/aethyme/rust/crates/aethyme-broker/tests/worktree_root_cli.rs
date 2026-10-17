@@ -172,16 +172,19 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
 }
 
 #[test]
-fn unavailable_host_state_uses_reported_legacy_fallback() {
+fn unavailable_host_placement_uses_reported_registered_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("project");
-    let blocked_state = tmp.path().join("not-a-directory");
+    let state = tmp.path().join("state");
     fixture_at(&repo);
-    std::fs::write(&blocked_state, "blocked\n").unwrap();
+    std::fs::create_dir(&state).unwrap();
+    // Placement can fail while its independent coordination domain remains
+    // healthy. Losing the entire host-state domain is a different failure.
+    std::fs::write(state.join("worktrees"), "blocked\n").unwrap();
 
     let started = json(run(
         &repo,
-        &blocked_state,
+        &state,
         &["start", "--task", "fallback", "--json"],
     ));
     let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
@@ -198,6 +201,91 @@ fn unavailable_host_state_uses_reported_legacy_fallback() {
             .unwrap()
             .contains("cannot prepare broker worktree root")
     );
+    let registry = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("worktree-roots-")
+        })
+        .unwrap()
+        .join("registry.sqlite3");
+    let history =
+        rusqlite::Connection::open_with_flags(registry, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let payload: String = history
+        .query_row("SELECT payload FROM roots", [], |row| row.get(0))
+        .unwrap();
+    let retained: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        retained["root"],
+        worktree.parent().unwrap().to_str().unwrap()
+    );
+    assert_eq!(retained["source"], "repository_fallback");
+}
+
+#[test]
+fn unavailable_history_refuses_before_fallback_root_checkout_or_agent_creation() {
+    for agent in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("project");
+        let blocked_state = tmp.path().join("not-a-directory");
+        let sentinel = tmp.path().join("agent-ran");
+        fixture_at(&repo);
+        std::fs::write(&blocked_state, "preserve blocker\n").unwrap();
+        let args = if agent {
+            vec![
+                "start",
+                "--task",
+                "unavailable history",
+                "--cmd",
+                "printf ran > \"$AETHYME_TEST_AGENT_SENTINEL\"",
+                "--json",
+            ]
+        } else {
+            vec!["start", "--task", "unavailable history", "--json"]
+        };
+        let output = common::broker_cli(CLI, &args)
+            .current_dir(&repo)
+            .env("AETHYME_HOST_STATE_DIR", &blocked_state)
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            .env("AETHYME_TEST_AGENT_SENTINEL", &sentinel)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("cannot retain worktree storage discovery"),
+            "{error}"
+        );
+        assert!(
+            !repo.join(".aethyme/worktrees").exists(),
+            "history refusal must precede root creation"
+        );
+        assert!(!sentinel.exists(), "unadmitted agent executed");
+        assert_eq!(
+            std::fs::read_to_string(&blocked_state).unwrap(),
+            "preserve blocker\n"
+        );
+        let branches = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(branches.status.success());
+        assert!(branches.stdout.is_empty(), "unadmitted branch was created");
+        let database = rusqlite::Connection::open_with_flags(
+            repo.join(".aethyme/broker.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let sessions: u64 = database
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 0, "unadmitted session was registered");
+    }
 }
 
 #[test]
@@ -444,4 +532,177 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
         branches.stdout.is_empty(),
         "an unadmitted agent branch was created"
     );
+}
+
+/// Selecting a root is not authority to adopt unrelated files, and an invalid
+/// ownership witness must not be followed, overwritten, or read without a bound.
+#[test]
+fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes() {
+    for case in ["unmarked", "oversized", "broken-link", "valid-link"] {
+        if cfg!(not(unix)) && case.ends_with("link") {
+            continue;
+        }
+        for agent in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("project");
+            let state = tmp.path().join("state");
+            let cache = tmp.path().join("cache");
+            let container = tmp.path().join("worktrees");
+            let sentinel = tmp.path().join("agent-ran");
+            fixture_at(&repo);
+            let plan = json(
+                common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
+                    .current_dir(&repo)
+                    .env("AETHYME_HOST_STATE_DIR", &state)
+                    .env("AETHYME_HOST_CACHE_DIR", &cache)
+                    .env("AETHYME_WORKTREE_ROOT", &container)
+                    .output()
+                    .unwrap(),
+            );
+            let root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
+            std::fs::create_dir_all(&root).unwrap();
+            let payload = root.join("preserve.txt");
+            std::fs::write(&payload, b"unrelated contents").unwrap();
+            let marker = root.join(".aethyme-worktree-root.json");
+            let external = tmp.path().join("external-marker.json");
+            if case == "oversized" {
+                let owner = serde_json::json!({
+                    "schema_version": 1,
+                    "repository_key": plan["repository_key"],
+                    "repository_root": repo.canonicalize().unwrap(),
+                });
+                let mut bytes = serde_json::to_vec(&owner).unwrap();
+                assert!(bytes.len() < 8193);
+                bytes.resize(8193, b' ');
+                // Valid JSON beyond the limit isolates the byte bound from
+                // parsing and owner equality checks.
+                assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
+                std::fs::write(&marker, bytes).unwrap();
+            }
+            #[cfg(unix)]
+            if case.ends_with("link") {
+                if case == "valid-link" {
+                    let owner = serde_json::json!({
+                        "schema_version": 1,
+                        "repository_key": plan["repository_key"],
+                        "repository_root": repo.canonicalize().unwrap(),
+                    });
+                    std::fs::write(&external, serde_json::to_vec(&owner).unwrap()).unwrap();
+                }
+                std::os::unix::fs::symlink(&external, &marker).unwrap();
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o750)).unwrap();
+            }
+            let before_entries: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            let before_marker = std::fs::read(&marker).ok();
+            let before_external = std::fs::read(&external).ok();
+            let args = if agent {
+                vec![
+                    "start",
+                    "--task",
+                    "unowned root",
+                    "--cmd",
+                    "printf ran > \"$AETHYME_TEST_AGENT_SENTINEL\"",
+                    "--json",
+                ]
+            } else {
+                vec!["start", "--task", "unowned root", "--json"]
+            };
+            let output = common::broker_cli(CLI, &args)
+                .current_dir(&repo)
+                .env("AETHYME_HOST_STATE_DIR", &state)
+                .env("AETHYME_HOST_CACHE_DIR", &cache)
+                .env("AETHYME_WORKTREE_ROOT", &container)
+                .env("AETHYME_TEST_AGENT_SENTINEL", &sentinel)
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.status.success(), "{case}/{agent}: {text}");
+            let expected = if case == "unmarked" {
+                "nonempty unmarked directory"
+            } else {
+                "invalid ownership marker"
+            };
+            assert!(text.contains(expected), "{case}/{agent}: {text}");
+            assert_eq!(std::fs::read(&payload).unwrap(), b"unrelated contents");
+            assert_eq!(std::fs::read(&marker).ok(), before_marker);
+            assert_eq!(std::fs::read(&external).ok(), before_external);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                    0o750,
+                    "{case}: refusing ownership must precede chmod"
+                );
+                if case.ends_with("link") {
+                    assert!(
+                        std::fs::symlink_metadata(&marker)
+                            .unwrap()
+                            .file_type()
+                            .is_symlink()
+                    );
+                    assert_eq!(std::fs::read_link(&marker).unwrap(), external);
+                }
+            }
+            let after_entries: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            let mut before_entries = before_entries;
+            let mut after_entries = after_entries;
+            before_entries.sort();
+            after_entries.sort();
+            assert_eq!(
+                after_entries, before_entries,
+                "root contents changed after refusal"
+            );
+            assert!(!sentinel.exists(), "unadmitted agent ran");
+            let database = rusqlite::Connection::open_with_flags(
+                repo.join(".aethyme/broker.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let sessions: u64 = database
+                .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sessions, 0);
+            let history_dir = std::fs::read_dir(&state)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("worktree-roots-")
+                })
+                .unwrap();
+            let history = rusqlite::Connection::open_with_flags(
+                history_dir.join("registry.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let roots: u64 = history
+                .query_row("SELECT count(*) FROM roots", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(roots, 0, "refused root acquired ownership history");
+            let branches = Command::new("git")
+                .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(branches.status.success());
+            assert!(branches.stdout.is_empty(), "unadmitted branch was created");
+        }
+    }
 }
