@@ -919,27 +919,48 @@ fn close_unrelated_descriptors(control_fd: RawFd) -> io::Result<()> {
 
 #[cfg(unix)]
 fn wait_process_group_absent(process_group: i32) -> Result<(), String> {
+    wait_process_group_absent_with_probe(GROUP_EXIT_TIMEOUT, || {
+        // SAFETY: signal zero only probes existence and permission. The parent
+        // never sends a signal to the group after waiting for its helper.
+        if unsafe { libc::killpg(process_group, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })
+}
+
+#[cfg(unix)]
+fn wait_process_group_absent_with_probe(
+    timeout: std::time::Duration,
+    mut probe: impl FnMut() -> io::Result<()>,
+) -> Result<(), String> {
     use std::time::{Duration, Instant};
-    let deadline = Instant::now() + GROUP_EXIT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
-        // SAFETY: killpg with signal zero only probes existence and permission;
-        // it sends no signal and dereferences no caller-owned pointer.
-        // The parent never signals a process group after waiting for its helper.
-        // EPERM and every error other than ESRCH remain unknown.
-        let result = unsafe { libc::killpg(process_group, 0) };
-        if result != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(());
+        let pending_error = match probe() {
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+            // Darwin can report EPERM while an existing group contains only
+            // exiting/zombie members. Retry within the same cleanup deadline;
+            // permission denial is never itself evidence that the group is gone.
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => Some(error),
+            Err(error) => {
+                return Err(format!(
+                    "cannot verify helper process-group cleanup: {error}"
+                ));
             }
-            return Err(format!(
-                "cannot verify helper process-group cleanup: {error}"
-            ));
+            Ok(()) => None,
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(match pending_error {
+                Some(error) => {
+                    format!("cannot verify helper process-group cleanup before deadline: {error}")
+                }
+                None => "helper process group remained present after cleanup deadline".into(),
+            });
         }
-        if Instant::now() >= deadline {
-            return Err("helper process group remained present after cleanup deadline".into());
-        }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20).min(deadline - now));
     }
 }
 
@@ -1303,6 +1324,47 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn group_cleanup_retries_permission_denial_until_absence_is_observed() {
+        let mut probes = 0;
+        wait_process_group_absent_with_probe(std::time::Duration::from_secs(1), || {
+            probes += 1;
+            Err(io::Error::from_raw_os_error(if probes == 1 {
+                libc::EPERM
+            } else {
+                libc::ESRCH
+            }))
+        })
+        .unwrap();
+        assert_eq!(probes, 2, "only ESRCH can establish group absence");
+    }
+
+    #[test]
+    fn group_cleanup_permission_denial_at_deadline_remains_unknown() {
+        let mut probes = 0;
+        let error = wait_process_group_absent_with_probe(std::time::Duration::ZERO, || {
+            probes += 1;
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        })
+        .unwrap_err();
+        assert_eq!(probes, 1);
+        assert!(error.contains("cannot verify helper process-group cleanup before deadline"));
+        assert!(error.contains(&io::Error::from_raw_os_error(libc::EPERM).to_string()));
+    }
+
+    #[test]
+    fn group_cleanup_other_probe_errors_remain_immediately_unknown() {
+        let mut probes = 0;
+        let error = wait_process_group_absent_with_probe(std::time::Duration::from_secs(1), || {
+            probes += 1;
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        })
+        .unwrap_err();
+        assert_eq!(probes, 1);
+        assert!(error.contains("cannot verify helper process-group cleanup:"));
+        assert!(error.contains(&io::Error::from_raw_os_error(libc::EIO).to_string()));
     }
 
     #[test]
