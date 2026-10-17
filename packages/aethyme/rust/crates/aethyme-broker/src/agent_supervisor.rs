@@ -471,7 +471,7 @@ mod tests {
         initialized_repo(&repo);
         let log = temp.path().join("agent.log");
         let mut child = spawn(
-            "dd if=/dev/zero bs=1048576 count=20 2>/dev/null; dd if=/dev/zero bs=1048576 count=20 2>/dev/null 1>&2; printf FINAL-AGENT-TAIL; exit 7",
+            "dd if=/dev/zero bs=1048576 count=20 2>/dev/null; dd if=/dev/zero bs=1048576 count=20 1>&2 2>/dev/null; printf FINAL-AGENT-TAIL; exit 7",
             &repo,
             &log,
         );
@@ -494,6 +494,12 @@ mod tests {
             bytes
                 .windows(b"FINAL-AGENT-TAIL".len())
                 .any(|w| w == b"FINAL-AGENT-TAIL")
+        );
+        assert!(
+            bytes
+                .windows(b"observed 41943056 bytes".len())
+                .any(|w| w == b"observed 41943056 bytes"),
+            "both complete 20 MiB streams must be drained"
         );
         assert!(bytes.ends_with(b"aethyme: agent capture COMPLETE\n"));
     }
