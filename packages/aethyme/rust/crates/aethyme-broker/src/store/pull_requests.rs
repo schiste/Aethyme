@@ -1,6 +1,112 @@
 use super::*;
 
+const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY: &str = "gc.artifact_sweep.v2.context_registry";
+const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX: usize = 64;
+const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX_BYTES: usize = 8 * 1024;
+
 impl BrokerStore {
+    /// Atomically register a bounded artifact-sweep namespace. IDs remain in
+    /// the registry once created so another context's durable cursor or
+    /// interrupted-path queue is never evicted to make room for a new one.
+    pub(crate) fn register_artifact_sweep_namespace(
+        &mut self,
+        namespace: &str,
+    ) -> Result<crate::broker::ArtifactSweepNamespaceRegistration, BrokerError> {
+        let valid_id = namespace.len() == 64
+            && namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !valid_id {
+            return Ok(crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry);
+        }
+
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = transaction
+            .query_row(
+                "SELECT typeof(value), length(CAST(value AS BLOB)),
+                        CASE WHEN typeof(value) = 'text'
+                                  AND length(CAST(value AS BLOB)) <= ?2
+                             THEN CAST(value AS BLOB)
+                             ELSE NULL
+                        END
+                 FROM meta WHERE key = ?1",
+                params![
+                    ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY,
+                    ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX_BYTES as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let mut namespaces = match stored {
+            None => Vec::new(),
+            Some((kind, Some(length), Some(bytes)))
+                if kind == "text"
+                    && length >= 0
+                    && length as usize <= ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX_BYTES =>
+            {
+                let Ok(value) = std::str::from_utf8(&bytes) else {
+                    return Ok(crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry);
+                };
+                match serde_json::from_str::<Vec<String>>(value) {
+                    Ok(namespaces) => namespaces,
+                    Err(_) => {
+                        return Ok(
+                            crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry,
+                        );
+                    }
+                }
+            }
+            Some(_) => {
+                return Ok(crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry);
+            }
+        };
+        if namespaces.len() > ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX
+            || namespaces.iter().any(|value| {
+                value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            || namespaces.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Ok(crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry);
+        }
+        if namespaces
+            .binary_search_by(|value| value.as_str().cmp(namespace))
+            .is_ok()
+        {
+            return Ok(crate::broker::ArtifactSweepNamespaceRegistration::Registered);
+        }
+        if namespaces.len() == ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX {
+            return Ok(crate::broker::ArtifactSweepNamespaceRegistration::AtCapacity);
+        }
+        namespaces.push(namespace.to_string());
+        namespaces.sort_unstable();
+        let encoded =
+            serde_json::to_string(&namespaces).map_err(|error| BrokerError::InvalidEnumValue {
+                field: "artifact_sweep_namespace_registry",
+                value: error.to_string(),
+            })?;
+        if encoded.len() > ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX_BYTES {
+            return Ok(crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry);
+        }
+        transaction.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY, encoded],
+        )?;
+        transaction.commit()?;
+        Ok(crate::broker::ArtifactSweepNamespaceRegistration::Registered)
+    }
+
     pub(crate) fn record_pull_request_watch_poll(
         &mut self,
         id: i64,
@@ -1292,5 +1398,181 @@ impl BrokerStore {
             )
             .optional()
             .map_err(BrokerError::from)
+    }
+}
+
+#[cfg(test)]
+mod artifact_sweep_namespace_tests {
+    use super::*;
+    use crate::broker::ArtifactSweepNamespaceRegistration;
+    use std::sync::{Arc, Barrier};
+
+    fn namespace(value: u64) -> String {
+        format!("{value:064x}")
+    }
+
+    #[test]
+    fn registry_cap_is_atomic_and_existing_namespaces_are_never_evicted() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("broker.db");
+        drop(BrokerStore::open(&database).unwrap());
+
+        let retained = namespace(0);
+        {
+            let mut store = BrokerStore::open(&database).unwrap();
+            for value in 0..ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX - 1 {
+                assert_eq!(
+                    store
+                        .register_artifact_sweep_namespace(&namespace(value as u64))
+                        .unwrap(),
+                    ArtifactSweepNamespaceRegistration::Registered
+                );
+            }
+            store
+                .meta_set(
+                    &format!("gc.artifact_sweep.v2.{retained}.cursor_session_id"),
+                    "17",
+                )
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let contenders = [namespace(1_000), namespace(1_001)];
+        let handles = contenders.map(|candidate| {
+            let database = database.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut store = BrokerStore::open(&database).unwrap();
+                store.register_artifact_sweep_namespace(&candidate).unwrap()
+            })
+        });
+        barrier.wait();
+        let outcomes = handles.map(|handle| handle.join().unwrap());
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ArtifactSweepNamespaceRegistration::Registered)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ArtifactSweepNamespaceRegistration::AtCapacity)
+                .count(),
+            1
+        );
+
+        let mut store = BrokerStore::open(&database).unwrap();
+        let registry: Vec<String> = serde_json::from_str(
+            &store
+                .meta_get(ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry.len(), ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX);
+        assert!(registry.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            store.register_artifact_sweep_namespace(&retained).unwrap(),
+            ArtifactSweepNamespaceRegistration::Registered
+        );
+        assert_eq!(
+            store
+                .meta_get(&format!(
+                    "gc.artifact_sweep.v2.{retained}.cursor_session_id"
+                ))
+                .unwrap()
+                .as_deref(),
+            Some("17")
+        );
+    }
+
+    #[test]
+    fn malformed_or_oversized_registry_is_preserved_and_refuses_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+
+        for invalid in [
+            "not-json".to_string(),
+            "x".repeat(ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX_BYTES + 1),
+            serde_json::json!([namespace(2), namespace(1)]).to_string(),
+            serde_json::json!([namespace(1), namespace(1)]).to_string(),
+            serde_json::json!(["A".repeat(64)]).to_string(),
+            serde_json::json!(["too-short"]).to_string(),
+        ] {
+            store
+                .meta_set(ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY, &invalid)
+                .unwrap();
+            assert_eq!(
+                store
+                    .register_artifact_sweep_namespace(&namespace(3))
+                    .unwrap(),
+                ArtifactSweepNamespaceRegistration::InvalidRegistry
+            );
+            assert_eq!(
+                store
+                    .meta_get(ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some(invalid.as_str())
+            );
+        }
+        let valid_registry = serde_json::json!([namespace(3)]).to_string();
+        store
+            .meta_set(ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY, &valid_registry)
+            .unwrap();
+        assert_eq!(
+            store
+                .register_artifact_sweep_namespace("invalid-namespace")
+                .unwrap(),
+            ArtifactSweepNamespaceRegistration::InvalidRegistry
+        );
+        assert_eq!(
+            store
+                .meta_get(ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(valid_registry.as_str())
+        );
+
+        let blob = vec![0xff; 16];
+        store
+            .conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![
+                    ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY,
+                    rusqlite::types::Value::Blob(blob.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .register_artifact_sweep_namespace(&namespace(3))
+                .unwrap(),
+            ArtifactSweepNamespaceRegistration::InvalidRegistry
+        );
+        let value_type: String = store
+            .conn
+            .query_row(
+                "SELECT typeof(value) FROM meta WHERE key = ?1",
+                [ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value_type, "blob");
+        let raw_value: rusqlite::types::Value = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_value, rusqlite::types::Value::Blob(blob));
     }
 }

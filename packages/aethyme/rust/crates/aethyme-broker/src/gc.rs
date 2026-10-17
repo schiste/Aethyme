@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
 use crate::artifact_catalog::ArtifactWitness;
@@ -88,6 +89,10 @@ const ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX: usize = 32;
 /// Last diagnosed unavailable marker set; replaced or cleared to avoid an
 /// append-only event for every retry of the same blocked paths.
 const ARTIFACT_SWEEP_BLOCKED_PATHS_KEY: &str = "gc.artifact_sweep.blocked_paths";
+/// Bounded JSON for the capped diagnostic list: each entry has one path capped
+/// to 128 characters plus a fixed reason and JSON framing.
+const ARTIFACT_SWEEP_BLOCKED_PATHS_VALUE_MAX_BYTES: usize =
+    ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX * (6 * ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS + 256);
 /// Durable request for the detached, cache-only continuation worker.
 const ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY: &str = "gc.artifact_sweep.recovery_requested_ms";
 /// Highest recovery request generation completed by the cache-only worker.
@@ -96,6 +101,8 @@ const ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY: &str = "gc.artifact_sweep.recovery_
 const ARTIFACT_SWEEP_RETRY_AFTER_KEY: &str = "gc.artifact_sweep.retry_after_ms";
 /// Bounded last-worker result; overwritten each run rather than appended.
 const ARTIFACT_SWEEP_WORKER_STATUS_KEY: &str = "gc.artifact_sweep.worker_status";
+const ARTIFACT_SWEEP_META_PREFIX: &str = "gc.artifact_sweep.";
+const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 /// Internal marker which keeps Broker::open from starting a second inline GC
 /// pass before the continuation worker takes its cache-only path.
 pub(crate) const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
@@ -149,12 +156,23 @@ pub struct ArtifactSweepOutcome {
 }
 
 /// Result of an explicit `gc sweep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSweepLegacyUnscopedState {
+    Clear,
+    UnknownPending,
+}
+
+/// Result of an explicit `gc sweep`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ArtifactSweepReport {
     pub directories_reclaimed: usize,
     pub complete: bool,
     pub budget_ms: u64,
     pub disk_pressured: bool,
+    /// Whether durable pre-namespace state remains outside this context's
+    /// scoped sweep. The legacy values are inspected but never changed.
+    pub legacy_unscoped_state: ArtifactSweepLegacyUnscopedState,
     /// Disposable checkouts removed or kept by this sweep (#588).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_cleanup: Option<crate::AutoCleanupReport>,
@@ -215,8 +233,19 @@ fn bounded_artifact_diagnostic_path(path: &str) -> String {
         .collect()
 }
 
+struct ScopedArtifactSweepWriter<'a> {
+    store: &'a mut crate::BrokerStore,
+    namespace: &'a str,
+}
+
+impl ScopedArtifactSweepWriter<'_> {
+    fn persist_interrupted_paths(&mut self, paths: &[String]) -> Result<bool, BrokerOpError> {
+        persist_interrupted_paths(self.store, self.namespace, paths)
+    }
+}
+
 fn revoke_interrupted_paths_under_root(
-    store: &mut crate::BrokerStore,
+    sweep_writer: &mut ScopedArtifactSweepWriter<'_>,
     interrupted_paths: &mut Vec<String>,
     interrupted_paths_valid: &mut bool,
     root: &Path,
@@ -245,7 +274,7 @@ fn revoke_interrupted_paths_under_root(
     }
     let mut updated_paths = interrupted_paths.clone();
     updated_paths.retain(|path| !revoked_paths.contains(path));
-    if persist_interrupted_paths(store, &updated_paths)? {
+    if sweep_writer.persist_interrupted_paths(&updated_paths)? {
         *interrupted_paths = updated_paths;
         revoked.extend(
             revoked_paths
@@ -389,12 +418,16 @@ fn encode_interrupted_paths(paths: &[String]) -> Option<String> {
 
 fn persist_interrupted_paths(
     store: &mut crate::BrokerStore,
+    namespace: &str,
     paths: &[String],
 ) -> Result<bool, BrokerOpError> {
     let Some(value) = encode_interrupted_paths(paths) else {
         return Ok(false);
     };
-    store.meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &value)?;
+    store.meta_set(
+        &scoped_artifact_sweep_key(namespace, ARTIFACT_SWEEP_INTERRUPTED_KEY),
+        &value,
+    )?;
     Ok(true)
 }
 
@@ -1211,9 +1244,16 @@ pub(crate) fn artifact_worker_runtime_is_aligned() -> bool {
     )
 }
 
-fn worker_retry_pending(store: &crate::BrokerStore, now: i64) -> Result<bool, BrokerOpError> {
+fn worker_retry_pending(
+    store: &crate::BrokerStore,
+    namespace: &str,
+    now: i64,
+) -> Result<bool, BrokerOpError> {
     Ok(store
-        .meta_get(ARTIFACT_SWEEP_RETRY_AFTER_KEY)?
+        .meta_get(&scoped_artifact_sweep_key(
+            namespace,
+            ARTIFACT_SWEEP_RETRY_AFTER_KEY,
+        ))?
         .and_then(|value| value.parse::<i64>().ok())
         .is_some_and(|retry_after| retry_after > now))
 }
@@ -1351,7 +1391,234 @@ fn check_deadline(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
+fn scoped_artifact_sweep_key(namespace: &str, legacy_key: &str) -> String {
+    let suffix = legacy_key
+        .strip_prefix(ARTIFACT_SWEEP_META_PREFIX)
+        .unwrap_or(legacy_key);
+    format!("gc.artifact_sweep.v2.{namespace}.{suffix}")
+}
+
+fn bounded_legacy_artifact_sweep_meta_get(
+    store: &crate::BrokerStore,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, BrokerOpError> {
+    let value = store
+        .connection()
+        .query_row(
+            "SELECT typeof(value), length(CAST(value AS BLOB)),
+                    CASE WHEN typeof(value) = 'text'
+                              AND length(CAST(value AS BLOB)) <= ?2
+                         THEN CAST(value AS BLOB)
+                         ELSE NULL
+                    END
+             FROM meta WHERE key = ?1",
+            rusqlite::params![key, max_bytes as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    match value {
+        None => Ok(None),
+        Some((kind, Some(length), Some(bytes)))
+            if kind == "text"
+                && length >= 0
+                && length as usize <= max_bytes
+                && bytes.len() == length as usize =>
+        {
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| BrokerOpError::InvalidStorageContext {
+                    reason: format!("legacy artifact-sweep field {key} is not UTF-8")
+                        .into_boxed_str(),
+                })
+        }
+        Some(_) => Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "legacy artifact-sweep field {key} is non-text or exceeds its {max_bytes}-byte inspection bound"
+            )
+            .into_boxed_str(),
+        }),
+    }
+}
+
 impl Broker {
+    fn ensure_artifact_sweep_namespace(&mut self) -> Result<String, BrokerOpError> {
+        if let Some(namespace) = self.artifact_sweep_namespace.get() {
+            return Ok(namespace.clone());
+        }
+        let namespace = self.storage_context().artifact_sweep_namespace()?;
+        let registration = self.store().register_artifact_sweep_namespace(&namespace)?;
+        match registration {
+            crate::broker::ArtifactSweepNamespaceRegistration::Registered => {
+                Ok(self
+                    .artifact_sweep_namespace
+                    .get_or_init(|| namespace.clone())
+                    .clone())
+            }
+            crate::broker::ArtifactSweepNamespaceRegistration::AtCapacity => {
+                Err(BrokerOpError::InvalidStorageContext {
+                    reason: "artifact-sweep context registry is full (64 namespaces); no sweep state was read or changed".into(),
+                })
+            }
+            crate::broker::ArtifactSweepNamespaceRegistration::InvalidRegistry => {
+                Err(BrokerOpError::InvalidStorageContext {
+                    reason: "artifact-sweep context registry is invalid or exceeds its 8 KiB bound; its raw value was preserved and maintenance refused".into(),
+                })
+            }
+        }
+    }
+
+    fn artifact_sweep_namespace(&self) -> Result<&str, BrokerOpError> {
+        self.artifact_sweep_namespace
+            .get()
+            .map(String::as_str)
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "artifact-sweep context namespace was not registered before state access"
+                    .into(),
+            })
+    }
+
+    fn artifact_sweep_key(&self, legacy_key: &str) -> Result<String, BrokerOpError> {
+        Ok(scoped_artifact_sweep_key(
+            self.artifact_sweep_namespace()?,
+            legacy_key,
+        ))
+    }
+
+    fn artifact_sweep_meta_get(
+        &mut self,
+        legacy_key: &str,
+    ) -> Result<Option<String>, BrokerOpError> {
+        self.ensure_artifact_sweep_namespace()?;
+        let key = self.artifact_sweep_key(legacy_key)?;
+        Ok(self.store().meta_get(&key)?)
+    }
+
+    fn artifact_sweep_meta_set(
+        &mut self,
+        legacy_key: &str,
+        value: &str,
+    ) -> Result<(), BrokerOpError> {
+        self.ensure_artifact_sweep_namespace()?;
+        let key = self.artifact_sweep_key(legacy_key)?;
+        self.store().meta_set(&key, value)?;
+        Ok(())
+    }
+
+    /// Inspect the nine pre-v2 sweep keys within their write bounds. Any
+    /// malformed, oversized or non-text value remains untouched and is
+    /// surfaced as unresolved legacy state.
+    fn legacy_artifact_sweep_state(&mut self) -> ArtifactSweepLegacyUnscopedState {
+        let inspect = (|| -> Result<bool, BrokerOpError> {
+            let read_scalar = |broker: &mut Self, key| {
+                bounded_legacy_artifact_sweep_meta_get(
+                    broker.store(),
+                    key,
+                    ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES,
+                )
+            };
+            let stamp = read_scalar(self, ARTIFACT_SWEEP_STAMP_KEY)?;
+            let cursor = read_scalar(self, ARTIFACT_SWEEP_CURSOR_KEY)?;
+            let progress = read_scalar(self, ARTIFACT_SWEEP_PROGRESS_KEY)?;
+            let interrupted = bounded_legacy_artifact_sweep_meta_get(
+                self.store(),
+                ARTIFACT_SWEEP_INTERRUPTED_KEY,
+                ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES,
+            )?;
+            let blocked = bounded_legacy_artifact_sweep_meta_get(
+                self.store(),
+                ARTIFACT_SWEEP_BLOCKED_PATHS_KEY,
+                ARTIFACT_SWEEP_BLOCKED_PATHS_VALUE_MAX_BYTES,
+            )?;
+            let requested = read_scalar(self, ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?;
+            let completed = read_scalar(self, ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)?;
+            let retry_after = read_scalar(self, ARTIFACT_SWEEP_RETRY_AFTER_KEY)?;
+            let _worker_status = read_scalar(self, ARTIFACT_SWEEP_WORKER_STATUS_KEY)?;
+
+            let parse_nonnegative = |value: Option<String>| -> Result<i64, ()> {
+                match value.as_deref().filter(|value| !value.is_empty()) {
+                    None => Ok(0),
+                    Some(value) => value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|value| *value >= 0)
+                        .ok_or(()),
+                }
+            };
+            let stamp =
+                parse_nonnegative(stamp).map_err(|()| BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep stamp is malformed".into(),
+                })?;
+            let cursor =
+                parse_nonnegative(cursor).map_err(|()| BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep cursor is malformed".into(),
+                })?;
+            let progress =
+                parse_nonnegative(progress).map_err(|()| BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep progress is malformed".into(),
+                })?;
+            let requested = parse_nonnegative(requested).map_err(|()| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep request is malformed".into(),
+                }
+            })?;
+            let completed = parse_nonnegative(completed).map_err(|()| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep completion is malformed".into(),
+                }
+            })?;
+            let retry_after = parse_nonnegative(retry_after).map_err(|()| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep retry time is malformed".into(),
+                }
+            })?;
+            if completed > requested {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: "legacy artifact-sweep request/completion state is inconsistent".into(),
+                });
+            }
+            let interrupted_pending = match interrupted.as_deref() {
+                None | Some("") => false,
+                Some(value) => !decode_interrupted_paths(Some(value))
+                    .map_err(|()| BrokerOpError::InvalidStorageContext {
+                        reason: "legacy artifact-sweep interrupted-path state is malformed".into(),
+                    })?
+                    .is_empty(),
+            };
+            let blocked_pending = match blocked.as_deref() {
+                None | Some("") => false,
+                Some(value) => {
+                    let paths =
+                        serde_json::from_str::<Vec<serde_json::Value>>(value).map_err(|_| {
+                            BrokerOpError::InvalidStorageContext {
+                                reason: "legacy artifact-sweep blocked-path state is malformed"
+                                    .into(),
+                            }
+                        })?;
+                    !paths.is_empty()
+                }
+            };
+            let pending = cursor > 0
+                || progress > 0
+                || interrupted_pending
+                || blocked_pending
+                || requested > completed
+                || retry_after > now_ms();
+            let _last_stamp = stamp;
+            Ok(pending)
+        })();
+        match inspect {
+            Ok(true) | Err(_) => ArtifactSweepLegacyUnscopedState::UnknownPending,
+            Ok(false) => ArtifactSweepLegacyUnscopedState::Clear,
+        }
+    }
+
     /// Build directories inside retained worktrees, for sessions idle at least
     /// `artifact_reclaim_days`.
     ///
@@ -2780,6 +3047,7 @@ impl Broker {
             complete: outcome.complete,
             budget_ms,
             disk_pressured: urgency == crate::disk_headroom::SweepUrgency::Pressured,
+            legacy_unscoped_state: self.legacy_artifact_sweep_state(),
             auto_cleanup: outcome.auto_cleanup,
         })
     }
@@ -2808,19 +3076,18 @@ impl Broker {
     /// the worker only after the lease has been released successfully.
     pub(crate) fn persist_artifact_sweep_recovery_request(&mut self) -> Result<(), BrokerOpError> {
         let prior = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         // Treat every pressure refusal as a fresh generation. The worker
         // compares this token before clearing its request, so a new refusal
         // racing the end of a complete lap cannot disappear.
         let requested_at = now_ms().max(prior.saturating_add(1)).max(1);
-        self.store().meta_set(
+        self.artifact_sweep_meta_set(
             ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
             &requested_at.to_string(),
         )?;
-        self.store().meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")?;
+        self.artifact_sweep_meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")?;
         Ok(())
     }
 
@@ -2844,8 +3111,11 @@ impl Broker {
         {
             return Ok(());
         }
-        if !pressure_request && worker_retry_pending(self.store(), now_ms())? {
-            return Ok(());
+        if !pressure_request {
+            let namespace = self.artifact_sweep_namespace()?.to_string();
+            if worker_retry_pending(self.store(), &namespace, now_ms())? {
+                return Ok(());
+            }
         }
         let Some((router, _engine)) = artifact_worker_binaries() else {
             self.defer_artifact_sweep_worker("runtime_unverified")?;
@@ -2915,7 +3185,8 @@ impl Broker {
             self.write_artifact_sweep_worker_status("no_backlog")?;
             return Ok(());
         }
-        if worker_retry_pending(self.store(), now_ms())? {
+        let namespace = self.artifact_sweep_namespace()?.to_string();
+        if worker_retry_pending(self.store(), &namespace, now_ms())? {
             self.write_artifact_sweep_worker_status("retry_deferred")?;
             return Ok(());
         }
@@ -2929,8 +3200,7 @@ impl Broker {
             return Ok(());
         }
         let request_generation = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
 
@@ -2997,11 +3267,11 @@ impl Broker {
                 // Preserve request history and advance only the generation
                 // this pass actually covered. A pressure refusal arriving
                 // between this write and the next open remains pending.
-                self.store().meta_set(
+                self.artifact_sweep_meta_set(
                     ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY,
                     &request_generation.to_string(),
                 )?;
-                self.store().meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")?;
                 self.write_artifact_sweep_worker_status(&format!(
                     "complete passes={passes} entries={entries_reclaimed}"
                 ))?;
@@ -3037,8 +3307,7 @@ impl Broker {
 
     fn defer_artifact_sweep_worker(&mut self, reason: &str) -> Result<(), BrokerOpError> {
         let retry_after = now_ms().saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS);
-        self.store()
-            .meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, &retry_after.to_string())?;
+        self.artifact_sweep_meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, &retry_after.to_string())?;
         self.write_artifact_sweep_worker_status(reason)
     }
 
@@ -3046,8 +3315,7 @@ impl Broker {
         // The value is intentionally bounded and replaced rather than logged
         // to a file that could itself grow without limit.
         let bounded = status.chars().take(160).collect::<String>();
-        self.store()
-            .meta_set(ARTIFACT_SWEEP_WORKER_STATUS_KEY, &bounded)?;
+        self.artifact_sweep_meta_set(ARTIFACT_SWEEP_WORKER_STATUS_KEY, &bounded)?;
         Ok(())
     }
 
@@ -3056,13 +3324,11 @@ impl Broker {
     /// interruptions retain this marker and the existing sweep cursor/tree.
     pub(crate) fn artifact_sweep_recovery_requested(&mut self) -> Result<bool, BrokerOpError> {
         let requested = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let completed = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         Ok(requested > completed)
@@ -3071,13 +3337,11 @@ impl Broker {
     /// An earlier pass stopped at its budget and has not finished a lap since.
     fn artifact_sweep_backlog_pending(&mut self) -> Result<bool, BrokerOpError> {
         let cursor = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let partial = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         Ok(cursor != 0 || partial != 0 || self.artifact_sweep_recovery_requested()?)
@@ -3092,8 +3356,7 @@ impl Broker {
         window_ms: i64,
     ) -> Result<bool, BrokerOpError> {
         Ok(self
-            .store()
-            .meta_get(key)?
+            .artifact_sweep_meta_get(key)?
             .and_then(|value| value.parse::<i64>().ok())
             .is_some_and(|last| last > 0 && now.saturating_sub(last) < window_ms))
     }
@@ -3104,29 +3367,7 @@ impl Broker {
         scope: ArtifactSweepScope,
     ) -> (u64, crate::disk_headroom::SweepUrgency) {
         let main_root = self.main_root().to_path_buf();
-        // The detached worker can reclaim caches from external worktree and
-        // preparation-cache volumes. Looking only at the main checkout misses
-        // pressure on those filesystems (the main checkout is often elsewhere).
-        let mut roots = BTreeSet::from([main_root.clone()]);
-        if scope == ArtifactSweepScope::AutomaticContinuation {
-            if let Ok(sessions) = self.store().live_sessions() {
-                roots.extend(
-                    sessions
-                        .into_iter()
-                        .map(|session| PathBuf::from(session.worktree_path)),
-                );
-            }
-            if let Ok(sessions) = self.store().cleaned_sessions() {
-                roots.extend(
-                    sessions
-                        .into_iter()
-                        .map(|session| PathBuf::from(session.worktree_path)),
-                );
-            }
-            if let Ok(cache_root) = crate::preparation::preparation_cache_root() {
-                roots.insert(cache_root);
-            }
-        }
+        let roots = self.artifact_sweep_budget_roots(scope);
         // One free-space sample per filesystem: many hundreds of session
         // roots may share the same mounted volume.
         let mut sampled_devices = BTreeSet::new();
@@ -3165,6 +3406,34 @@ impl Broker {
             artifact_sweep_budget_ms(policy.artifact_sweep_budget_ms, scope, urgency),
             urgency,
         )
+    }
+
+    fn artifact_sweep_budget_roots(&mut self, scope: ArtifactSweepScope) -> BTreeSet<PathBuf> {
+        let main_root = self.main_root().to_path_buf();
+        // The detached worker can reclaim caches from external worktree and
+        // preparation-cache volumes. Looking only at the main checkout misses
+        // pressure on those filesystems (the main checkout is often elsewhere).
+        let mut roots = BTreeSet::from([main_root.clone()]);
+        if scope == ArtifactSweepScope::AutomaticContinuation {
+            if let Ok(sessions) = self.store().live_sessions() {
+                roots.extend(
+                    sessions
+                        .into_iter()
+                        .map(|session| PathBuf::from(session.worktree_path)),
+                );
+            }
+            if let Ok(sessions) = self.store().cleaned_sessions() {
+                roots.extend(
+                    sessions
+                        .into_iter()
+                        .map(|session| PathBuf::from(session.worktree_path)),
+                );
+            }
+            if let Some(cache_root) = self.storage_context().preparation_cache_root() {
+                roots.insert(cache_root);
+            }
+        }
+        roots
     }
 
     /// Reclaim build caches from one just-closed session while retaining its
@@ -3274,6 +3543,7 @@ impl Broker {
                 0,
             ));
         }
+        let namespace = self.ensure_artifact_sweep_namespace()?;
         let closed_session_id = match scope {
             ArtifactSweepScope::ClosedSession(session_id) => Some(session_id),
             ArtifactSweepScope::Inline
@@ -3387,8 +3657,7 @@ impl Broker {
         let mut entries_reclaimed = preparation_entries_reclaimed;
         let mut eligible_worktree_seen = false;
         let cursor = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let mut last_visited = cursor;
@@ -3401,7 +3670,7 @@ impl Broker {
                 .collect(),
             None => sweep_order(&all, cursor, |session| session.id),
         };
-        let interrupted_value = self.store().meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?;
+        let interrupted_value = self.artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?;
         let mut interrupted_paths_valid = true;
         let mut blocked_interrupted_paths = Vec::<BlockedInterruptedPath>::new();
         let mut interrupted_paths = match decode_interrupted_paths(interrupted_value.as_deref()) {
@@ -3433,7 +3702,7 @@ impl Broker {
             if !structurally_revoked.is_empty() {
                 let mut updated_paths = interrupted_paths.clone();
                 updated_paths.retain(|path| !structurally_revoked.contains(path));
-                if persist_interrupted_paths(self.store(), &updated_paths)? {
+                if persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
                     interrupted_paths = updated_paths;
                     revoked_interrupted_paths.extend(structurally_revoked.into_iter().map(
                         |path| RevokedInterruptedPath {
@@ -3467,7 +3736,7 @@ impl Broker {
                 }));
             }
             if interrupted_paths != previous_paths
-                && !persist_interrupted_paths(self.store(), &interrupted_paths)?
+                && !persist_interrupted_paths(self.store(), &namespace, &interrupted_paths)?
             {
                 interrupted_paths_valid = false;
                 scan_completed = false;
@@ -3528,8 +3797,12 @@ impl Broker {
                 }
             };
             if !root_is_directory {
+                let mut sweep_writer = ScopedArtifactSweepWriter {
+                    store: self.store(),
+                    namespace: &namespace,
+                };
                 if !revoke_interrupted_paths_under_root(
-                    self.store(),
+                    &mut sweep_writer,
                     &mut interrupted_paths,
                     &mut interrupted_paths_valid,
                     &root,
@@ -3548,8 +3821,12 @@ impl Broker {
             match ownership {
                 Ok(true) => {}
                 Ok(false) => {
+                    let mut sweep_writer = ScopedArtifactSweepWriter {
+                        store: self.store(),
+                        namespace: &namespace,
+                    };
                     if !revoke_interrupted_paths_under_root(
-                        self.store(),
+                        &mut sweep_writer,
                         &mut interrupted_paths,
                         &mut interrupted_paths_valid,
                         &root,
@@ -3649,7 +3926,7 @@ impl Broker {
                     .collect::<BTreeSet<_>>();
                 let mut updated_paths = interrupted_paths.clone();
                 updated_paths.retain(|path| !revoked_paths.contains(path.as_str()));
-                if persist_interrupted_paths(self.store(), &updated_paths)? {
+                if persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
                     interrupted_paths = updated_paths;
                     revoked_interrupted_paths.extend(revoked_in_worktree);
                 } else {
@@ -3705,7 +3982,8 @@ impl Broker {
                         if interrupted_paths_valid {
                             let mut updated_paths = interrupted_paths.clone();
                             updated_paths.retain(|path| path != &dir_key);
-                            if persist_interrupted_paths(self.store(), &updated_paths)? {
+                            if persist_interrupted_paths(self.store(), &namespace, &updated_paths)?
+                            {
                                 interrupted_paths = updated_paths;
                                 revoked_interrupted_paths.push(RevokedInterruptedPath {
                                     canonical_path: std::fs::canonicalize(&dir).ok(),
@@ -3744,7 +4022,7 @@ impl Broker {
                         session_scan_complete = false;
                         continue;
                     }
-                    if !persist_interrupted_paths(self.store(), &updated_paths)? {
+                    if !persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
                         blocked_interrupted_paths.push(BlockedInterruptedPath {
                             path: Some(dir_key),
                             reason: "queue_update_unavailable",
@@ -3763,7 +4041,7 @@ impl Broker {
                         entries_reclaimed = entries_reclaimed.saturating_add(count);
                         let mut updated_paths = interrupted_paths.clone();
                         updated_paths.retain(|path| path != &dir_key);
-                        match persist_interrupted_paths(self.store(), &updated_paths) {
+                        match persist_interrupted_paths(self.store(), &namespace, &updated_paths) {
                             Ok(true) => interrupted_paths = updated_paths,
                             Ok(false) | Err(_) => {
                                 // The cache is gone, but retain the old queue
@@ -3831,7 +4109,7 @@ impl Broker {
             if !outside_managed_worktrees.is_empty() {
                 let mut updated_paths = interrupted_paths.clone();
                 updated_paths.retain(|path| !outside_managed_worktrees.contains(path));
-                if persist_interrupted_paths(self.store(), &updated_paths)? {
+                if persist_interrupted_paths(self.store(), &namespace, &updated_paths)? {
                     interrupted_paths = updated_paths;
                     revoked_interrupted_paths.extend(outside_managed_worktrees.into_iter().map(
                         |path| RevokedInterruptedPath {
@@ -3858,7 +4136,8 @@ impl Broker {
             // session not visited in this bounded pass.
             scan_completed = false;
         }
-        if interrupted_paths_valid && !persist_interrupted_paths(self.store(), &interrupted_paths)?
+        if interrupted_paths_valid
+            && !persist_interrupted_paths(self.store(), &namespace, &interrupted_paths)?
         {
             scan_completed = false;
         }
@@ -3868,29 +4147,26 @@ impl Broker {
         if let Some(session_id) = closed_session_id {
             if !scan_completed {
                 // Retry this session first on the next ordinary broker open.
-                self.store().meta_set(
+                self.artifact_sweep_meta_set(
                     ARTIFACT_SWEEP_CURSOR_KEY,
                     &session_id.saturating_sub(1).to_string(),
                 )?;
-                self.store().meta_set(ARTIFACT_SWEEP_STAMP_KEY, "0")?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_STAMP_KEY, "0")?;
             }
         } else {
             if eligible_worktree_seen && scan_completed {
-                self.store()
-                    .meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now.to_string())?;
             }
             // A finished lap starts the next one from the top; an interrupted pass
             // remembers where it stopped so the next one advances instead of
             // re-walking what it already cleared, and when, so broker opens
             // space their continuations instead of each paying a budget.
             if scan_completed {
-                self.store().meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
-                self.store().meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0")?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")?;
             } else {
-                self.store()
-                    .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
-                self.store()
-                    .meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, &last_visited.to_string())?;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
             }
         }
         blocked_interrupted_paths.sort_by(|left, right| {
@@ -3923,7 +4199,8 @@ impl Broker {
         } else {
             blocked_json.clone()
         };
-        let previous_blocked_state = self.store().meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)?;
+        let previous_blocked_state =
+            self.artifact_sweep_meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)?;
         let blocked_state_changed =
             previous_blocked_state.as_deref().unwrap_or("") != blocked_state;
         if !removed.is_empty() || !revoked_interrupted_paths.is_empty() || blocked_state_changed {
@@ -3961,8 +4238,7 @@ impl Broker {
             )?;
         }
         if blocked_state_changed {
-            self.store()
-                .meta_set(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY, &blocked_state)?;
+            self.artifact_sweep_meta_set(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY, &blocked_state)?;
         }
         // Whole checkouts go after their caches, under the same lock and
         // budget, and only on the general sweep: the targeted pass after a
@@ -4647,6 +4923,329 @@ mod tests {
     use super::*;
     use crate::disk_headroom::SweepUrgency;
 
+    fn test_worker_retry_pending(broker: &mut Broker, now: i64) -> Result<bool, BrokerOpError> {
+        let namespace = broker.ensure_artifact_sweep_namespace()?;
+        worker_retry_pending(broker.store(), &namespace, now)
+    }
+
+    #[test]
+    fn artifact_sweep_state_is_shared_by_linked_worktrees_but_isolated_by_storage_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let linked = temporary.path().join("linked-worktree");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let storage_a = crate::test_storage::TestStorage::new();
+        let mut root_broker = storage_a.open(&root).unwrap();
+        let root_namespace = root_broker.ensure_artifact_sweep_namespace().unwrap();
+        let interrupted_a = root.join("target").to_string_lossy().into_owned();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "41")
+            .unwrap();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "9")
+            .unwrap();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "4")
+            .unwrap();
+        root_broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &interrupted_a)
+            .unwrap();
+        let captured_cache_root = root_broker
+            .storage_context()
+            .preparation_cache_root()
+            .unwrap();
+        assert!(
+            root_broker
+                .artifact_sweep_budget_roots(ArtifactSweepScope::AutomaticContinuation)
+                .contains(&captured_cache_root)
+        );
+        drop(root_broker);
+
+        let mut linked_broker = storage_a.open(&linked).unwrap();
+        let expected_main_root = root.canonicalize().unwrap();
+        assert_eq!(linked_broker.main_root(), expected_main_root.as_path());
+        assert_eq!(
+            linked_broker.ensure_artifact_sweep_namespace().unwrap(),
+            root_namespace,
+            "a linked checkout in the same repository and storage context reuses its namespace"
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("41")
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("9")
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            linked_broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(interrupted_a.as_str())
+        );
+        let registered: Vec<String> = serde_json::from_str(
+            &linked_broker
+                .store()
+                .meta_get("gc.artifact_sweep.v2.context_registry")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registered,
+            vec![root_namespace.clone()],
+            "linked-worktree opens do not consume additional namespace slots"
+        );
+        drop(linked_broker);
+
+        let storage_b = crate::test_storage::TestStorage::new();
+        let mut broker_b = storage_b.open(&root).unwrap();
+        let namespace_b = broker_b.ensure_artifact_sweep_namespace().unwrap();
+        assert_ne!(root_namespace, namespace_b);
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "7")
+            .unwrap();
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "12")
+            .unwrap();
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "12")
+            .unwrap();
+        broker_b
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, "")
+            .unwrap();
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            broker_b
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+        drop(broker_b);
+
+        let mut reopened_a = storage_a.open(&root).unwrap();
+        assert_eq!(
+            reopened_a.ensure_artifact_sweep_namespace().unwrap(),
+            root_namespace
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("41"),
+            "a second effective storage context cannot overwrite the first context's state"
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("9"),
+            "another context cannot overwrite an outstanding recovery generation"
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            reopened_a
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(interrupted_a.as_str()),
+            "another context cannot clear interrupted-path debt"
+        );
+    }
+
+    #[test]
+    fn legacy_artifact_sweep_state_is_reported_without_rewriting_raw_values() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let clear_values = [
+            (ARTIFACT_SWEEP_STAMP_KEY, "123"),
+            (ARTIFACT_SWEEP_CURSOR_KEY, "0"),
+            (ARTIFACT_SWEEP_PROGRESS_KEY, "0"),
+            (ARTIFACT_SWEEP_INTERRUPTED_KEY, ""),
+            (ARTIFACT_SWEEP_BLOCKED_PATHS_KEY, "[]"),
+            (ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "5"),
+            (ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "5"),
+            (ARTIFACT_SWEEP_RETRY_AFTER_KEY, "0"),
+            (
+                ARTIFACT_SWEEP_WORKER_STATUS_KEY,
+                "complete passes=1 entries=0",
+            ),
+        ];
+        for (key, value) in clear_values {
+            broker.store().meta_set(key, value).unwrap();
+        }
+
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::Clear,
+            "a positive old stamp or completed worker status alone is not pending work"
+        );
+        for (key, value) in clear_values {
+            assert_eq!(
+                broker.store().meta_get(key).unwrap().as_deref(),
+                Some(value)
+            );
+        }
+
+        let oversized_status = "x".repeat(ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES + 1);
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_WORKER_STATUS_KEY, &oversized_status)
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::UnknownPending,
+            "oversized legacy text is not loaded for status inspection"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(oversized_status.as_str()),
+            "oversized legacy text remains unchanged"
+        );
+        broker
+            .store()
+            .meta_set(
+                ARTIFACT_SWEEP_WORKER_STATUS_KEY,
+                "complete passes=1 entries=0",
+            )
+            .unwrap();
+
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::UnknownPending,
+            "an outstanding legacy request remains visible as unresolved"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "5")
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::Clear,
+            "the BLOB control begins with otherwise clear legacy state"
+        );
+
+        let blob = vec![0xff; 16];
+        broker
+            .store()
+            .connection_mut()
+            .execute(
+                "UPDATE meta SET value = ?2 WHERE key = ?1",
+                rusqlite::params![
+                    ARTIFACT_SWEEP_CURSOR_KEY,
+                    rusqlite::types::Value::Blob(blob.clone()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            broker.legacy_artifact_sweep_state(),
+            ArtifactSweepLegacyUnscopedState::UnknownPending,
+            "unreadable legacy data is retained and reported as unresolved"
+        );
+        let raw_value: rusqlite::types::Value = broker
+            .store()
+            .connection()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [ARTIFACT_SWEEP_CURSOR_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_value, rusqlite::types::Value::Blob(blob));
+    }
+
     const DETACHED_FIXTURE_MODE_ENV: &str = "AETHYME_TEST_DETACHED_GC_MODE";
     const DETACHED_FIXTURE_ROOT_ENV: &str = "AETHYME_TEST_DETACHED_GC_ROOT";
 
@@ -4719,12 +5318,10 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(root).unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
             .unwrap();
         let policy = load_retention_policy(root).unwrap();
 
@@ -4748,8 +5345,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
                 .unwrap()
                 .as_deref(),
             Some("7"),
@@ -4757,22 +5353,20 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                 .unwrap()
                 .as_deref(),
             Some("3")
         );
-        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
 
         broker.persist_artifact_sweep_recovery_request().unwrap();
         let retry_generation = broker
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap()
             .unwrap();
         assert!(retry_generation.parse::<i64>().unwrap() > 7);
-        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
+        assert!(!test_worker_retry_pending(&mut broker, now_ms()).unwrap());
         broker
             .run_artifact_sweep_recovery_worker_loop(
                 &policy,
@@ -4793,14 +5387,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                 .unwrap()
                 .as_deref(),
             Some(retry_generation.as_str()),
             "a subsequent eligible pass records the requested generation"
         );
-        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
+        assert!(!test_worker_retry_pending(&mut broker, now_ms()).unwrap());
     }
 
     #[test]
@@ -4815,12 +5408,10 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(root).unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
             .unwrap();
         let policy = load_retention_policy(root).unwrap();
         let mut passes = 0;
@@ -4847,8 +5438,7 @@ mod tests {
         assert_eq!(passes, 2, "positive progress cannot bypass the pass cap");
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                 .unwrap()
                 .as_deref(),
             Some("3"),
@@ -4856,18 +5446,16 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
                 .unwrap()
                 .as_deref(),
             Some("7"),
             "the request remains durable across the bounded worker exit"
         );
-        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
                 .unwrap()
                 .as_deref(),
             Some("pass_limit passes=2 entries=2")
@@ -4875,8 +5463,7 @@ mod tests {
 
         broker.persist_artifact_sweep_recovery_request().unwrap();
         let retry_generation = broker
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap()
             .unwrap();
         broker
@@ -4899,8 +5486,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                 .unwrap()
                 .as_deref(),
             Some(retry_generation.as_str()),
@@ -4920,16 +5506,13 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(root).unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
             .unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "4")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "4")
             .unwrap();
         let policy = load_retention_policy(root).unwrap();
         let mut passes = 0;
@@ -4961,16 +5544,14 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
                 .unwrap()
                 .as_deref(),
             Some("7")
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                 .unwrap()
                 .as_deref(),
             Some("3"),
@@ -4978,8 +5559,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
                 .unwrap()
                 .as_deref(),
             Some("4"),
@@ -4987,17 +5567,27 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
                 .unwrap()
                 .as_deref(),
             Some("time_limit passes=1 entries=1")
         );
-        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
     }
 
     fn detached_fixture_store(root: &Path) -> crate::BrokerStore {
         crate::BrokerStore::open(&root.join(".aethyme/broker.db")).unwrap()
+    }
+
+    fn detached_fixture_namespace(root: &Path) -> String {
+        let store = detached_fixture_store(root);
+        let registry = store
+            .meta_get("gc.artifact_sweep.v2.context_registry")
+            .unwrap()
+            .expect("the setup child registers its captured context");
+        let namespaces: Vec<String> = serde_json::from_str(&registry).unwrap();
+        assert_eq!(namespaces.len(), 1);
+        namespaces[0].clone()
     }
 
     #[test]
@@ -5105,14 +5695,12 @@ mod tests {
         // the state: Broker::open must notice the published witness itself.
         let mut reopened = storage.open(&root).unwrap();
         let requested = reopened
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let completed = reopened
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
@@ -5166,26 +5754,22 @@ mod tests {
             first.store().meta_set(key, "").unwrap();
         }
         first
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "0")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "0")
             .unwrap();
         first
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "0")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "0")
             .unwrap();
         drop(first);
         std::fs::remove_dir_all(&cache_parent).unwrap();
 
         let mut reopened = storage.open(&root).unwrap();
         let requested = reopened
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let completed = reopened
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
@@ -5399,16 +5983,14 @@ mod tests {
         assert!(cache.join("CACHEDIR.TAG").is_file(), "the witness remains");
         let queued = decode_interrupted_paths(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
                 .unwrap()
                 .as_deref(),
         )
         .unwrap();
         assert_eq!(queued, vec![cache_key.clone()]);
         let partial_stamp = broker
-            .store()
-            .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
             .unwrap()
             .expect("the incomplete inline pass records its spacing stamp");
         assert_ne!(partial_stamp, "0");
@@ -5430,8 +6012,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
                 .unwrap()
                 .as_deref(),
             Some(cache_key.as_str()),
@@ -5441,8 +6022,7 @@ mod tests {
         // Advance only the persisted schedule marker; the test deadlines keep
         // the filesystem transition deterministic without sleeping.
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")
             .unwrap();
         let (resumed, resumed_entries) = broker
             .sweep_artifacts_autonomously_with_test_deadlines(
@@ -5461,8 +6041,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
                 .unwrap()
                 .as_deref(),
             Some(""),
@@ -5470,8 +6049,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
                 .unwrap()
                 .as_deref(),
             Some("0")
@@ -5489,16 +6067,14 @@ mod tests {
         let mut broker = storage.open(tmp.path()).unwrap();
 
         let prior_generation = broker
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         broker.persist_artifact_sweep_recovery_request().unwrap();
         assert!(broker.artifact_sweep_recovery_requested().unwrap());
         let first = broker
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap();
         let first_generation = first.as_ref().unwrap().parse::<i64>().unwrap();
         assert!(
@@ -5507,8 +6083,7 @@ mod tests {
         );
         broker.persist_artifact_sweep_recovery_request().unwrap();
         let second = broker
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap();
         let second_generation = second.unwrap().parse::<i64>().unwrap();
         assert!(
@@ -5534,6 +6109,7 @@ mod tests {
         match mode.as_str() {
             "setup" => {
                 let mut broker = open_detached_fixture_broker(&root);
+                broker.ensure_artifact_sweep_namespace().unwrap();
                 let closed = broker.start_worktree("closed cache fixture", None).unwrap();
                 let closed_worktree = PathBuf::from(&closed.worktree_path);
                 std::fs::write(closed_worktree.join("landed.txt"), "landed\n").unwrap();
@@ -5751,8 +6327,7 @@ mod tests {
                 );
                 assert_eq!(
                     broker
-                        .store()
-                        .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                        .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                         .unwrap()
                         .as_deref(),
                     Some("0"),
@@ -5803,23 +6378,22 @@ mod tests {
                 let active_cache = active_worktree.join("target");
                 let idle_cache = idle_worktree.join("target");
                 {
-                    let store = broker.store();
-                    let requested = store
-                        .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                    let requested = broker
+                        .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
                         .unwrap()
                         .unwrap();
                     assert_eq!(requested, "77");
                     assert_eq!(
-                        store
-                            .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                        broker
+                            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
                             .unwrap()
                             .as_deref(),
                         Some(closed_session_id.trim()),
                         "the restart must see the saved session cursor"
                     );
                     assert_eq!(
-                        store
-                            .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                        broker
+                            .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
                             .unwrap()
                             .as_deref(),
                         Some(cache.to_string_lossy().as_ref()),
@@ -5877,14 +6451,12 @@ mod tests {
                     "cache-only continuation must preserve the closed session branch"
                 );
                 let requested = broker
-                    .store()
-                    .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
                     .unwrap()
                     .unwrap();
                 assert_eq!(
                     broker
-                        .store()
-                        .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                        .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                         .unwrap()
                         .as_deref(),
                     Some(requested.as_str()),
@@ -5965,16 +6537,38 @@ mod tests {
         let active_cache = active_worktree.join("target");
 
         {
+            let namespace = detached_fixture_namespace(root);
             let store = detached_fixture_store(root);
             store
-                .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "77")
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY),
+                    "77",
+                )
                 .unwrap();
             store
-                .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "0")
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY),
+                    "0",
+                )
                 .unwrap();
-            store.meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "0").unwrap();
-            store.meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "1").unwrap();
-            store.meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, "").unwrap();
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_CURSOR_KEY),
+                    "0",
+                )
+                .unwrap();
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_PROGRESS_KEY),
+                    "1",
+                )
+                .unwrap();
+            store
+                .meta_set(
+                    &scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_INTERRUPTED_KEY),
+                    "",
+                )
+                .unwrap();
         }
         let cache_entries_before = std::fs::read_dir(&closed_cache).unwrap().count();
 
@@ -6111,17 +6705,24 @@ mod tests {
         assert!(partially_remaining < cache_entries_before && partially_remaining > 0);
         assert!(active_cache.join("debug/keep.txt").is_file());
         {
+            let namespace = detached_fixture_namespace(root);
             let store = detached_fixture_store(root);
             assert_eq!(
                 store
-                    .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                    .meta_get(&scoped_artifact_sweep_key(
+                        &namespace,
+                        ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+                    ))
                     .unwrap()
                     .as_deref(),
                 Some("77")
             );
             assert_eq!(
                 store
-                    .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                    .meta_get(&scoped_artifact_sweep_key(
+                        &namespace,
+                        ARTIFACT_SWEEP_CURSOR_KEY
+                    ))
                     .unwrap()
                     .as_deref(),
                 Some(
@@ -6132,7 +6733,10 @@ mod tests {
             );
             assert_eq!(
                 store
-                    .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .meta_get(&scoped_artifact_sweep_key(
+                        &namespace,
+                        ARTIFACT_SWEEP_INTERRUPTED_KEY,
+                    ))
                     .unwrap()
                     .as_deref(),
                 Some(closed_cache.to_string_lossy().as_ref())
@@ -6150,10 +6754,14 @@ mod tests {
         assert!(GitRepo::discover(&closed_worktree).is_ok());
         assert!(root.join("README.md").is_file());
         assert!(root.join(".git/HEAD").is_file());
+        let namespace = detached_fixture_namespace(root);
         let store = detached_fixture_store(root);
         assert_eq!(
             store
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+                ))
                 .unwrap()
                 .as_deref(),
             Some("77"),
@@ -6161,21 +6769,30 @@ mod tests {
         );
         assert_eq!(
             store
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY,
+                ))
                 .unwrap()
                 .as_deref(),
             Some("77")
         );
         assert_eq!(
             store
-                .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_CURSOR_KEY
+                ))
                 .unwrap()
                 .as_deref(),
             Some("0")
         );
         assert_eq!(
             store
-                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .meta_get(&scoped_artifact_sweep_key(
+                    &namespace,
+                    ARTIFACT_SWEEP_INTERRUPTED_KEY,
+                ))
                 .unwrap()
                 .as_deref(),
             Some("")
@@ -6735,16 +7352,13 @@ mod tests {
         )
         .unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
             .unwrap();
         broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, blocker.to_str().unwrap())
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, blocker.to_str().unwrap())
             .unwrap();
         let policy = load_retention_policy(root).unwrap();
         let mut pass_complete = true;
@@ -6782,8 +7396,7 @@ mod tests {
         assert!(blocker.join("keep").exists(), "a live root stays untouched");
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
                 .unwrap()
                 .as_deref(),
             Some(blocker.to_str().unwrap()),
@@ -6791,8 +7404,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
                 .unwrap()
                 .as_deref(),
             Some("3"),
@@ -6800,8 +7412,7 @@ mod tests {
         );
         let blocked: serde_json::Value = serde_json::from_str(
             broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)
                 .unwrap()
                 .as_deref()
                 .unwrap(),
@@ -6815,7 +7426,7 @@ mod tests {
                 .iter()
                 .any(|item| { item["reason"] == "live_session" && item["path"].is_string() })
         );
-        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
     }
 
     #[test]
@@ -6909,7 +7520,9 @@ mod tests {
             !outcome.complete,
             "the bounded first worktree remains an explicit incomplete pass"
         );
-        let cursor = broker.store().meta_get(ARTIFACT_SWEEP_CURSOR_KEY).unwrap();
+        let cursor = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+            .unwrap();
         let expected_cursor = later_id.to_string();
         assert_eq!(
             cursor.as_deref(),

@@ -330,8 +330,9 @@ pub use gates::{
     select_gates, verify_gate_scope_manifest,
 };
 pub use gc::{
-    ArtifactSweepOutcome, ArtifactSweepReport, GC_PLAN_SCHEMA_VERSION,
-    INLINE_ARTIFACT_SWEEP_BUDGET_MS, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
+    ArtifactSweepLegacyUnscopedState, ArtifactSweepOutcome, ArtifactSweepReport,
+    GC_PLAN_SCHEMA_VERSION, INLINE_ARTIFACT_SWEEP_BUDGET_MS,
+    UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
 };
 pub use git::{
     CherrySide, CommitShape, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,

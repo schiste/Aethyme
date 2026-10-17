@@ -3129,6 +3129,13 @@ pub struct PromotedConflict {
     pub promoted_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactSweepNamespaceRegistration {
+    Registered,
+    AtCapacity,
+    InvalidRegistry,
+}
+
 /// One broker instance per repository: git handle on the main checkout +
 /// the shared store. Open from ANY path inside the repo (including a
 /// linked worktree) — state always resolves to the main checkout.
@@ -3152,6 +3159,9 @@ pub struct Broker {
     /// checks ask for it twice per closed worktree, and each ask was a
     /// `rev-parse` subprocess (#460). Only a successful read is kept.
     main_common_dir: std::cell::OnceCell<PathBuf>,
+    /// Registered durable namespace for artifact-sweep state, derived from
+    /// the exact storage context captured by this broker.
+    pub(crate) artifact_sweep_namespace: std::cell::OnceCell<String>,
 }
 
 mod cleanup;

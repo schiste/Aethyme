@@ -1845,9 +1845,8 @@ fn preparation_store_dir(broker: &Broker) -> Result<PathBuf, PreparationError> {
     Ok(root.join(repository_identity(broker)))
 }
 
-/// Shared by preparation and garbage collection. Worktree placement is
-/// independent of the host resource database and must not redirect discovery
-/// to a different cache than the one preparation actually writes.
+/// Resolve the default cache root for tests of legacy/default configuration.
+#[cfg(test)]
 pub(crate) fn preparation_cache_root() -> Result<PathBuf, PreparationError> {
     let db = crate::default_host_resource_db_path()?;
     let parent = db

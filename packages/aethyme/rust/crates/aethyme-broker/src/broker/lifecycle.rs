@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 const BROKER_OPEN_HOST_OPERATION_DB_ENV: &str = "AETHYME_BROKER_OPEN_HOST_OPERATION_DB";
 const BROKER_OPEN_HOST_STATE_EXPLICIT_ENV: &str = "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT";
@@ -8,6 +9,7 @@ const BROKER_OPEN_COLLABORATION_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_COLLABORAT
 const BROKER_OPEN_STORAGE_CONTEXT_ENV: &str = "AETHYME_BROKER_STORAGE_CONTEXT_V1";
 const BROKER_OPEN_STORAGE_CONTEXT_VERSION: u32 = 2;
 const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
+const ARTIFACT_SWEEP_NAMESPACE_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v2\0";
 
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
@@ -124,6 +126,18 @@ impl CapturedBrokerStorageContextV2 {
 }
 
 impl BrokerStorageContext {
+    /// Stable identifier for maintenance state owned by this exact captured
+    /// storage context. The encoded payload is the same bounded V2 contract
+    /// sent to detached children, including all effective path overrides.
+    pub(crate) fn artifact_sweep_namespace(&self) -> Result<String, BrokerOpError> {
+        self.ensure_valid()?;
+        let encoded = CapturedBrokerStorageContextV2::encode(self)?;
+        let mut digest = Sha256::new();
+        digest.update(ARTIFACT_SWEEP_NAMESPACE_DOMAIN);
+        digest.update(encoded.as_bytes());
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
     fn capture(options: BrokerOpenOptions) -> Self {
         if let Some(encoded) = std::env::var_os(BROKER_OPEN_STORAGE_CONTEXT_ENV) {
             if options.host_state_dir.is_some()
@@ -956,6 +970,7 @@ impl Broker {
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
+            artifact_sweep_namespace: std::cell::OnceCell::new(),
         })
     }
 
@@ -984,6 +999,7 @@ impl Broker {
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
+            artifact_sweep_namespace: std::cell::OnceCell::new(),
         };
         broker.backfill_live_repository_contracts()?;
         Ok(broker)
@@ -1028,6 +1044,7 @@ impl Broker {
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
+            artifact_sweep_namespace: std::cell::OnceCell::new(),
         };
         // Fence pre-#660 binaries out of a repository whose committed config
         // requires collaboration capture. Best effort: the open never fails
@@ -3975,5 +3992,52 @@ mod worktree_root_candidate_tests {
                 vec![(PathBuf::from("/external/repo-key"), source)]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod artifact_sweep_namespace_tests {
+    use super::*;
+
+    #[test]
+    fn namespace_matches_the_bounded_child_context_and_tracks_effective_roots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repo");
+        let host_state = temporary.path().join("state");
+        let context = BrokerStorageContext {
+            repository_root: Some(repository.clone()),
+            git_common_dir: Some(repository.join(".git")),
+            host_state_dir: Some(host_state.clone()),
+            host_resource_db_path: Some(host_state.join("host-resources.db")),
+            host_cache_dir: Some(temporary.path().join("cache")),
+            host_operation_db_path: Some(host_state.join("operations.db")),
+            worktree_root_override: Some(temporary.path().join("worktrees")),
+            worktree_root_environment_override: None,
+            collaboration_state_dir: Some(temporary.path().join("collaboration")),
+            host_state_dir_is_explicit: true,
+            capture_error: None,
+        };
+
+        let encoded = CapturedBrokerStorageContextV2::encode(&context).unwrap();
+        let decoded = serde_json::from_str::<CapturedBrokerStorageContextV2>(&encoded)
+            .unwrap()
+            .into_context()
+            .unwrap();
+        assert_eq!(
+            context.artifact_sweep_namespace().unwrap(),
+            decoded.artifact_sweep_namespace().unwrap()
+        );
+
+        let mut different_cache = context.clone();
+        different_cache.host_cache_dir = Some(temporary.path().join("other-cache"));
+        assert_ne!(
+            context.artifact_sweep_namespace().unwrap(),
+            different_cache.artifact_sweep_namespace().unwrap()
+        );
+        assert!(
+            BrokerStorageContext::default()
+                .artifact_sweep_namespace()
+                .is_err()
+        );
     }
 }
