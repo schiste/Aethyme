@@ -239,7 +239,8 @@ pub fn open_fixture_broker(
         .with_host_operation_database(host_state_dir.join("host-operations.db"))
         .with_worktree_root(worktree_root_path.clone())
         .with_collaboration_state(host_state_dir.join("collaboration"));
-    let broker = Broker::open_with_options(repository, options)?;
+    let broker = Broker::open_with_options(repository, options)?
+        .with_agent_supervisor_executable(env!("CARGO_BIN_EXE_broker-cli-shim"))?;
     Ok(FixtureBroker {
         broker,
         worktree_root: worktree_root_path,

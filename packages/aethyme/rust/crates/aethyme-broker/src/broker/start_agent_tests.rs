@@ -219,3 +219,46 @@ fn aborting_a_blocked_agent_signals_only_its_owned_process_group() {
     );
     assert!(!sentinel.exists(), "the gated user command was released");
 }
+
+#[cfg(unix)]
+#[test]
+fn removed_explicit_supervisor_refuses_before_worktree_or_session_allocation() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let owner = tempfile::tempdir().unwrap();
+    let root = owner.path().join("repo");
+    initialized_repo(&root);
+    let worktrees = owner.path().join("worktrees");
+    let state = owner.path().join("host-state");
+    let options = crate::BrokerOpenOptions::default()
+        .with_host_state_dir(&state)
+        .with_host_cache_dir(owner.path().join("host-cache"))
+        .with_worktree_root(&worktrees)
+        .with_collaboration_state(state.join("collaboration"))
+        .with_host_operation_database(state.join("host-operations.db"));
+    let executable = owner.path().join("supervisor");
+    std::fs::write(&executable, b"not executed").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut broker = Broker::open_with_options(&root, options)
+        .unwrap()
+        .with_agent_supervisor_executable(&executable)
+        .unwrap();
+    std::fs::remove_file(&executable).unwrap();
+    assert!(matches!(
+        broker.start_agent("missing supervisor", "true", None),
+        Err(super::BrokerOpError::Spawn { .. })
+    ));
+    assert!(
+        broker
+            .repo
+            .resolve_ref("refs/heads/agent/missing-supervisor")
+            .is_none()
+    );
+    assert!(!worktrees.exists());
+    assert!(!root.join(".aethyme/logs").exists());
+    let count: i64 = broker
+        .store()
+        .connection_mut()
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}

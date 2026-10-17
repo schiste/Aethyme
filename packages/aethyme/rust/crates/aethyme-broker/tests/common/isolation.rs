@@ -54,7 +54,10 @@ pub fn open(repo: &Path) -> Broker {
         .with_host_operation_database(host_state_dir.join("host-operations.db"))
         .with_worktree_root(worktree_root(repo))
         .with_collaboration_state(host_state_dir.join("collaboration"));
-    Broker::open_with_options(repo, options).unwrap()
+    Broker::open_with_options(repo, options)
+        .unwrap()
+        .with_agent_supervisor_executable(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .unwrap()
 }
 
 pub fn command(binary: &str, repo: &Path, args: &[&str]) -> Command {

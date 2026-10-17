@@ -59,11 +59,41 @@ pub(crate) fn ensure_supported() -> io::Result<()> {
     }
 }
 
+/// Resolve an exact local executable. The caller chooses its trust/version
+/// policy; this private protocol never searches PATH or guesses an installation.
+pub(crate) fn resolve_executable(explicit: Option<&Path>) -> io::Result<std::path::PathBuf> {
+    ensure_supported()?;
+    let executable = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe()?,
+    }
+    .canonicalize()?;
+    let metadata = executable.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent supervisor executable is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "agent supervisor file is not executable",
+            ));
+        }
+    }
+    Ok(executable)
+}
+
 #[cfg(unix)]
 pub(crate) fn process(
     command: &str,
     worktree: &Path,
     log: &std::fs::File,
+    executable: Option<&Path>,
 ) -> io::Result<(std::process::Command, String)> {
     use std::os::unix::fs::MetadataExt as _;
     ensure_supported()?;
@@ -76,7 +106,7 @@ pub(crate) fn process(
     let repo = crate::git::GitRepo::discover(worktree).map_err(io::Error::other)?;
     let metadata = log.metadata()?;
     let launch = Launch {
-        executable: std::env::current_exe()?.canonicalize()?,
+        executable: resolve_executable(executable)?,
         repository: repo.main_root().map_err(io::Error::other)?.canonicalize()?,
         common_dir: repo
             .git_common_dir()
@@ -106,14 +136,18 @@ pub(crate) fn process(
     #[cfg(not(test))]
     process.arg(FLAG).arg(payload);
     #[cfg(test)]
-    process
-        .args([
-            "--exact",
-            "agent_supervisor::tests::supervisor_child_fixture",
-            "--nocapture",
-            "--quiet",
-        ])
-        .env("AETHYME_TEST_AGENT_SUPERVISOR_PAYLOAD", payload);
+    if executable.is_none() {
+        process
+            .args([
+                "--exact",
+                "agent_supervisor::tests::supervisor_child_fixture",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env("AETHYME_TEST_AGENT_SUPERVISOR_PAYLOAD", payload);
+    } else {
+        process.arg(FLAG).arg(payload);
+    }
     Ok((process, launch.nonce))
 }
 
@@ -122,6 +156,7 @@ pub(crate) fn process(
     _: &str,
     _: &Path,
     _: &std::fs::File,
+    _: Option<&Path>,
 ) -> io::Result<(std::process::Command, String)> {
     ensure_supported()?;
     unreachable!()
@@ -575,6 +610,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_executable_is_exact_and_rejects_missing_directory_or_nonexecutable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let owner = tempfile::tempdir().unwrap();
+        let absent = owner.path().join("missing");
+        assert!(super::resolve_executable(Some(&absent)).is_err());
+        assert!(super::resolve_executable(Some(owner.path())).is_err());
+        let file = owner.path().join("supervisor");
+        std::fs::write(&file, b"unused executable fixture").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::resolve_executable(Some(&file)).is_err());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = owner.path().join("selected");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(
+            super::resolve_executable(Some(&link)).unwrap(),
+            file.canonicalize().unwrap()
+        );
+        assert_eq!(
+            super::resolve_executable(None).unwrap(),
+            std::env::current_exe().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn reserved_protocol_never_routes_malformed_invocations() {
         assert_eq!(
             super::dispatch(&["--aethyme-agent-supervisor-v9".into()]),
@@ -635,7 +694,7 @@ mod tests {
     ) -> std::process::Child {
         use std::os::unix::process::CommandExt as _;
         let log = std::fs::File::create(log).unwrap();
-        let (mut process, nonce) = super::process(command, repo, &log).unwrap();
+        let (mut process, nonce) = super::process(command, repo, &log, None).unwrap();
         process
             .current_dir(repo)
             .stdin(std::process::Stdio::piped())
