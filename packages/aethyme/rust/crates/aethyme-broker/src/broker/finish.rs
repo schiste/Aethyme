@@ -869,25 +869,89 @@ impl Broker {
             .find(|entry| entry.session_id == session_id);
         let visible_entry = latest_for_head.or(latest_for_session);
 
-        // Promotion commonly represents the accepted session tree under a
-        // different integration commit SHA. Resetting the checkout to that
-        // recorded counterpart is delivered even without a queue row at HEAD.
-        let submitted_head_is_delivered = latest_for_head.is_some_and(|entry| {
+        // Finish, cleanup, and integration reconciliation share the same
+        // landing proof. Finish keeps #152's explicit confirmation gate for
+        // non-ancestry deliveries: a content or patch match is a candidate,
+        // not permission to delete the only worktree, until it is recorded.
+        // An adopted session can use the primary checkout itself. Its own
+        // HEAD must not count as proof that its commits were delivered; only
+        // independent integration and upstream refs can establish that.
+        let delivery_targets =
+            if std::path::Path::new(&session.worktree_path) == self.main_root.as_path() {
+                let mut targets = Vec::new();
+                if let Some(integration) = self.integration_tip() {
+                    targets.push(integration);
+                }
+                if let Some((_, upstream)) = self.repo.tracking_upstream() {
+                    targets.push(upstream);
+                }
+                targets.sort();
+                targets.dedup();
+                targets
+            } else {
+                self.cleanup_delivery_targets()?
+            };
+        let landing = self.landing_on_delivery_targets(head, &delivery_targets)?;
+
+        // Unlike a historical queue status, a representation record only
+        // counts when its carrying commit is still reachable from a current
+        // delivery target.
+        let representation_evidence =
+            self.recorded_representation_evidence(session, head, &delivery_targets)?;
+        let representation = if representation_evidence.is_some() {
+            self.store.session_representation(session_id, head)?
+        } else {
+            None
+        };
+
+        // A promoted queue row is a trusted acceptance only while both its
+        // recorded promotion commit and this exact session head still have
+        // shared landing evidence on current targets. A later squash that
+        // overwrote the contribution cannot keep a historical `Promoted` row
+        // alive as delivery evidence.
+        let queued_merge_commit = latest_for_head
+            .and_then(|entry| entry.details_json.as_deref())
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .and_then(|details| {
+                details
+                    .get("merge_commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let accepted_integration_commit = session
+            .accepted_integration_commit
+            .as_deref()
+            .or(queued_merge_commit.as_deref());
+        let accepted_commit_is_current = accepted_integration_commit.is_some_and(|accepted| {
+            delivery_targets
+                .iter()
+                .any(|target| self.repo.is_ancestor(accepted, target))
+        });
+        let queue_accepts_head = latest_for_head.is_some_and(|entry| {
             matches!(
                 entry.status,
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded
             )
-        }) || session.accepted_integration_commit.as_deref()
-            == Some(head);
-        // Work merged through a reviewed pull request is on the default branch
-        // but leaves no promotion row, and ancestry cannot see it because a
-        // squash rewrites the SHA. A recorded representation is the evidence
-        // that it landed (#152); without it the session can never close.
-        let representation = self.store.session_representation(session_id, head)?;
+        }) || session.accepted_session_head.as_deref() == Some(head);
+        // Exact ancestry on a current delivery target proves that this
+        // worktree HEAD is already present there. Content/patch matches remain
+        // gated on accepted queue evidence or a recorded representation.
+        let ancestry_proves_delivery = landing
+            .as_ref()
+            .is_some_and(|(_, evidence, _)| evidence == &crate::LandingEvidence::Ancestry);
+        let submitted_head_is_delivered = ancestry_proves_delivery
+            || (queue_accepts_head && accepted_commit_is_current && landing.is_some());
+
         let remote_default_tip = self.remote_tracking_default_tip();
-        let on_remote_default = remote_default_tip
-            .as_deref()
-            .is_some_and(|tip| self.repo.is_ancestor(head, tip));
+        let on_remote_default = if let Some(tip) = remote_default_tip.as_ref() {
+            // An ancestry proof is self-verifying. A squash/rebase match on
+            // this branch still needs the explicit representation record
+            // checked above before finish can close the session.
+            self.landing_on_delivery_targets(head, std::slice::from_ref(tip))?
+                .is_some_and(|(_, evidence, _)| evidence == crate::LandingEvidence::Ancestry)
+        } else {
+            false
+        };
         let head_is_delivered =
             submitted_head_is_delivered || representation.is_some() || on_remote_default;
         let unsubmitted_commits = if head_is_delivered {
@@ -909,7 +973,7 @@ impl Broker {
                             .count() as u64
                     })
             });
-            if let Some(pending) = pending_from_plan {
+            if let Some(pending) = pending_from_plan.filter(|pending| *pending > 0) {
                 pending
             } else {
                 let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
