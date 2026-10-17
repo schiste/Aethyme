@@ -2121,10 +2121,13 @@ fn rename_noreplace(
         )
     };
     #[cfg(target_os = "linux")]
-    // SAFETY: both directory descriptors are live; from/to are NUL-terminated
-    // single components and RENAME_NOREPLACE prevents replacement of target.
+    // SAFETY: `SYS_renameat2` receives the Linux renameat2 ABI arguments;
+    // both directory descriptors are live, `from` and `to` are valid
+    // NUL-terminated single components, and RENAME_NOREPLACE forbids replacing
+    // an existing target. A syscall failure is returned below without fallback.
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             parent_fd,
             from.as_ptr(),
             to_parent_fd,
@@ -2389,6 +2392,31 @@ mod tests {
         let repeated = publish(&cache_root, different).unwrap();
         assert_eq!(repeated.debt, debt);
         assert_eq!(read(&cache_root, REPOSITORY).unwrap().unwrap().debt, debt);
+    }
+
+    #[test]
+    fn no_replace_rename_preserves_source_and_existing_destination() {
+        use std::os::fd::AsRawFd;
+
+        let (_temp, cache_root, _) = fixture();
+        let source_path = cache_root.join("rename-source");
+        let destination_path = cache_root.join("rename-destination");
+        fs::write(&source_path, b"source must remain").unwrap();
+        fs::write(&destination_path, b"destination must remain").unwrap();
+
+        let root = super::open_cache_root(&cache_root).unwrap();
+        let source = super::component("rename-source").unwrap();
+        let destination = super::component("rename-destination").unwrap();
+        assert!(
+            super::rename_noreplace(root.as_raw_fd(), &source, root.as_raw_fd(), &destination,)
+                .is_err()
+        );
+
+        assert_eq!(fs::read(source_path).unwrap(), b"source must remain");
+        assert_eq!(
+            fs::read(destination_path).unwrap(),
+            b"destination must remain"
+        );
     }
 
     fn write_private(path: &std::path::Path, bytes: &[u8]) {

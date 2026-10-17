@@ -2232,10 +2232,10 @@ fn sweep_preparation_cache_with_discovery(
         }
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let Some(lap) = rotation_journal_lap.as_mut() {
-        if !lap.finish(complete) {
-            complete = false;
-        }
+    if let Some(lap) = rotation_journal_lap.as_mut()
+        && !lap.finish(complete)
+    {
+        complete = false;
     }
     PreparationCacheSweepReport {
         entries_removed: removed,

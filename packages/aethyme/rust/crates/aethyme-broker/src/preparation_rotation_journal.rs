@@ -57,6 +57,16 @@ pub(crate) enum JournalProbe {
     Unknown,
 }
 
+struct RotationRootRow {
+    root_identity: Vec<u8>,
+    generation: i64,
+    completed_generation: i64,
+    lap_generation: i64,
+    cursor: Option<Vec<u8>>,
+    lap_incomplete: i64,
+    lap_state: i64,
+}
+
 /// Derive a private, stable journal path from the exact captured resource DB
 /// path. The hash avoids disclosing host paths in filenames while keeping
 /// distinct captured databases in separate recovery domains.
@@ -164,6 +174,11 @@ pub(crate) fn load(
         .optional()
         .map_err(sqlite_error)?;
     let Some(expected) = expected else {
+        if root_has_debt_rows(&connection, root)? {
+            return Err(invalid_data(
+                "rotation debt rows exist without a root journal record",
+            ));
+        }
         return Ok(None);
     };
     if expected != root_identity {
@@ -545,37 +560,41 @@ pub(crate) fn probe(
         return Err(invalid_data("rotation debt journal schema is absent"));
     }
     let root = root_path_bytes(cache_root)?;
-    let state: Option<(Vec<u8>, i64, i64, i64, Option<Vec<u8>>, i64, i64)> = connection
+    let state: Option<RotationRootRow> = connection
         .query_row(
             "SELECT root_identity, generation, completed_generation, lap_generation, cursor, \
                 lap_incomplete, lap_state \
              FROM rotation_root WHERE root_path=?1",
             params![root],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
+                Ok(RotationRootRow {
+                    root_identity: row.get(0)?,
+                    generation: row.get(1)?,
+                    completed_generation: row.get(2)?,
+                    lap_generation: row.get(3)?,
+                    cursor: row.get(4)?,
+                    lap_incomplete: row.get(5)?,
+                    lap_state: row.get(6)?,
+                })
             },
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((
-        expected_identity,
+    let Some(RotationRootRow {
+        root_identity: expected_identity,
         generation,
         completed_generation,
         lap_generation,
         cursor,
-        incomplete,
+        lap_incomplete: incomplete,
         lap_state,
-    )) = state
+    }) = state
     else {
-        return Ok(Some(JournalProbe::NoDebt));
+        return Ok(Some(if root_has_debt_rows(&connection, &root)? {
+            JournalProbe::Unknown
+        } else {
+            JournalProbe::NoDebt
+        }));
     };
     let count: i64 = connection
         .query_row(
@@ -616,6 +635,19 @@ pub(crate) fn probe(
     } else {
         JournalProbe::NoDebt
     }))
+}
+
+/// Detect orphan debt rows using the root-path prefix of the composite
+/// primary key. Missing root metadata is no debt only when this indexed
+/// lookup also proves that no child rows remain.
+fn root_has_debt_rows(connection: &Connection, root: &[u8]) -> io::Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM rotation_debt WHERE root_path=?1)",
+            params![root],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)
 }
 
 fn validate_inputs(
@@ -974,47 +1006,46 @@ fn ensure_root(
     root: &[u8],
     root_identity: &[u8],
 ) -> io::Result<u64> {
-    let existing: Option<(Vec<u8>, i64, i64, i64, Option<Vec<u8>>, i64, i64)> = transaction
+    let existing: Option<RotationRootRow> = transaction
         .query_row(
             "SELECT root_identity, generation, completed_generation, lap_generation, cursor, lap_incomplete, lap_state \
              FROM rotation_root WHERE root_path=?1",
             params![root],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
+                Ok(RotationRootRow {
+                    root_identity: row.get(0)?,
+                    generation: row.get(1)?,
+                    completed_generation: row.get(2)?,
+                    lap_generation: row.get(3)?,
+                    cursor: row.get(4)?,
+                    lap_incomplete: row.get(5)?,
+                    lap_state: row.get(6)?,
+                })
             },
         )
         .optional()
         .map_err(sqlite_error)?;
     match existing {
-        Some((identity, generation, completed, lap_generation, cursor, incomplete, lap_state))
-            if identity == root_identity =>
-        {
+        Some(existing) if existing.root_identity == root_identity => {
             validate_rotation_state(
-                generation,
-                completed,
-                lap_generation,
-                cursor.as_deref(),
-                incomplete,
-                lap_state,
+                existing.generation,
+                existing.completed_generation,
+                existing.lap_generation,
+                existing.cursor.as_deref(),
+                existing.lap_incomplete,
+                existing.lap_state,
             )?;
-            u64::try_from(generation).map_err(|_| invalid_data("negative rotation generation"))
+            u64::try_from(existing.generation)
+                .map_err(|_| invalid_data("negative rotation generation"))
         }
-        Some((_identity, generation, completed, lap_generation, cursor, incomplete, lap_state)) => {
+        Some(existing) => {
             validate_rotation_state(
-                generation,
-                completed,
-                lap_generation,
-                cursor.as_deref(),
-                incomplete,
-                lap_state,
+                existing.generation,
+                existing.completed_generation,
+                existing.lap_generation,
+                existing.cursor.as_deref(),
+                existing.lap_incomplete,
+                existing.lap_state,
             )?;
             let count: i64 = transaction
                 .query_row(
@@ -1024,11 +1055,11 @@ fn ensure_root(
                 )
                 .map_err(sqlite_error)?;
             if count != 0
-                || generation != completed
-                || lap_generation != generation
-                || cursor.is_some()
-                || incomplete != 0
-                || lap_state != LAP_IDLE
+                || existing.generation != existing.completed_generation
+                || existing.lap_generation != existing.generation
+                || existing.cursor.is_some()
+                || existing.lap_incomplete != 0
+                || existing.lap_state != LAP_IDLE
             {
                 return Err(invalid_data(
                     "preparation cache root changed with rotation debt pending",
@@ -1178,6 +1209,59 @@ mod tests {
     }
 
     #[test]
+    fn orphan_debt_without_root_record_is_unknown_and_load_refuses_without_mutation() {
+        let fixture = Fixture::new();
+        fixture.publish(REPOSITORY_A, b"debt-a");
+        let path = path_for_resource_db(&fixture.resource_db).unwrap();
+        let root = fixture.cache_root.as_os_str().as_bytes();
+
+        // Simulate a malformed database created with foreign-key enforcement
+        // disabled. The child row remains, while its root row is absent.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM rotation_root WHERE root_path=?1",
+                params![root],
+            )
+            .unwrap();
+        let orphan_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM rotation_debt WHERE root_path=?1",
+                params![root],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_count, 1);
+        drop(connection);
+
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(
+            probe(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                Some(ROOT_IDENTITY)
+            )
+            .unwrap(),
+            Some(JournalProbe::Unknown)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        assert!(
+            load(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                ROOT_IDENTITY,
+                REPOSITORY_A
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
     fn first_recovery_with_an_absent_cache_root_is_a_noop_without_creating_state() {
         let fixture = Fixture::new();
         std::fs::remove_dir(&fixture.cache_root).unwrap();
@@ -1222,8 +1306,9 @@ mod tests {
         )
         .unwrap();
         let moved_root = fixture
-            ._directory
-            .path()
+            .cache_root
+            .parent()
+            .unwrap()
             .join("cache-root-with-pending-debt");
         std::fs::rename(&fixture.cache_root, &moved_root).unwrap();
 
