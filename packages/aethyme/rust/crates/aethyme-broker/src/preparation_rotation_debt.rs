@@ -3192,7 +3192,11 @@ mod tests {
         use crate::gc::{PinnedTreeRemoval, TreeRemoval};
 
         let (temp, cache_root, debt) = fixture();
-        let resource_db = temp.path().join("host-resources.db");
+        let resource_db = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("host-resources.db");
         let retained = publish(&cache_root, debt.clone()).unwrap();
         let payload = super::encode(&debt).unwrap();
         let root_identity = debt.cache_root.encode().unwrap();
