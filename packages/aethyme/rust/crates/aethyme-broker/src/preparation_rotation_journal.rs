@@ -170,7 +170,7 @@ pub(crate) fn load(
             "preparation cache root identity differs from its durable journal",
         ));
     }
-    let payload: Option<Vec<u8>> = connection
+    let payload: Option<i64> = connection
         .query_row(
             "SELECT length(payload) FROM rotation_debt WHERE root_path=?1 AND repository=?2",
             params![root, repository],
