@@ -246,6 +246,7 @@ pub(crate) fn record_trust(
 }
 
 /// Record digests under an explicitly selected host-state root.
+#[cfg(test)]
 pub(crate) fn record_trust_for_host_state(
     main_root: &Path,
     host_state_dir: &Path,
@@ -384,13 +385,13 @@ pub(crate) fn require_trusted_for_host_state(
 fn require_trusted_at_path(
     main_root: &Path,
     policy: &GatePolicy,
-    mut store: Option<&mut BrokerStore>,
+    store: Option<&mut BrokerStore>,
     session_id: Option<i64>,
     path: &Path,
 ) -> Result<TrustDecision, BrokerOpError> {
     let decision = assess_trusted_at_path(main_root, policy, store.as_deref(), path)?;
     if decision == TrustDecision::Grandfathered
-        && let Some(store) = store.as_deref_mut()
+        && let Some(store) = store
     {
         // The accepted history predates this check. Record all current policy
         // digests at the same selected trust-record path.
