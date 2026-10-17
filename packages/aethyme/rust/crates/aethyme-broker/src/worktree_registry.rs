@@ -21,6 +21,8 @@ pub(crate) const MAX_RECORD_BYTES: usize = 8192;
 const MAX_RECORDS: usize = 8192;
 const PAGE_RECORDS: usize = 64;
 const MAX_INVENTORY_BYTES: usize = 8 * 1024 * 1024;
+const REGISTRATION_LOCK_WAIT: Duration = Duration::from_secs(5);
+const REGISTRATION_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -201,6 +203,35 @@ fn registry_lock(
         }
     }
     Ok(claim)
+}
+
+/// Foreground creation waits briefly for another registrar or remover. Each
+/// attempt repeats the lock object's type, identity and pathname checks. GC
+/// keeps its nonblocking acquisition so it yields to an admitted foreground
+/// operation rather than waiting while holding other cleanup resources.
+fn registration_lock(
+    host_database: &Path,
+    wait: Duration,
+) -> io::Result<crate::file_lock::ExclusiveFileLock> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match registry_lock(host_database, true) {
+            Ok(claim) => return Ok(claim),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+                tests::observe_registration_contention();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "worktree history coordination remained busy through the bounded registration wait; retry the command",
+                    ));
+                }
+                std::thread::sleep(REGISTRATION_LOCK_RETRY.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn open_registry(host_database: &Path, create: bool) -> io::Result<Connection> {
@@ -440,9 +471,18 @@ fn admit_with_limit(
     planned_root: &Path,
     limit: usize,
 ) -> io::Result<RegistrationAdmission> {
+    admit_with_limit_and_wait(host_database, planned_root, limit, REGISTRATION_LOCK_WAIT)
+}
+
+fn admit_with_limit_and_wait(
+    host_database: &Path,
+    planned_root: &Path,
+    limit: usize,
+    wait: Duration,
+) -> io::Result<RegistrationAdmission> {
     let root = crate::broker::lifecycle::canonical_prefix(planned_root).map_err(invalid)?;
     registry_outside_root(host_database, &root)?;
-    let exclusion = registry_lock(host_database, true)?;
+    let exclusion = registration_lock(host_database, wait)?;
     let mut connection = open_registry(host_database, true)?;
     maintain_capacity(&mut connection, &record_key(&root), limit)?;
     let existing_payload = retained_registration(&connection, &root)?;
@@ -901,6 +941,21 @@ pub(crate) fn claim_for_removal(
 mod tests {
     use super::*;
 
+    thread_local! {
+        static REGISTRATION_CONTENTION: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_registration_contention() {
+        REGISTRATION_CONTENTION.with(|observer| {
+            if let Some(sender) = observer.borrow_mut().take() {
+                sender
+                    .send(())
+                    .expect("contention observer must remain alive");
+            }
+        });
+    }
+
     struct Fixture {
         _owned: tempfile::TempDir,
         database: PathBuf,
@@ -1050,7 +1105,7 @@ mod tests {
             "admission must not create its checkout root"
         );
         let contender = fixture._owned.path().join("contender");
-        let error = admit_with_limit(&fixture.database, &contender, 1)
+        let error = admit_with_limit_and_wait(&fixture.database, &contender, 1, Duration::ZERO)
             .err()
             .expect("exclusion must stay held");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
@@ -1063,6 +1118,95 @@ mod tests {
             .expect("the recorded root consumes capacity");
         assert!(error.to_string().contains("registry is full"));
         assert!(!contender.exists());
+    }
+
+    #[test]
+    fn foreground_admission_waits_for_transient_history_contention() {
+        use std::sync::mpsc;
+
+        let fixture = Fixture::new();
+        let planned = fixture._owned.path().join("waiting-admission");
+        let held = registry_lock(&fixture.database, true).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let database = &fixture.database;
+            let planned = &planned;
+            scope.spawn(move || {
+                REGISTRATION_CONTENTION.with(|observer| {
+                    assert!(observer.borrow_mut().replace(started_tx).is_none());
+                });
+                let result = admit(database, planned)
+                    .map(drop)
+                    .map_err(|error| error.to_string());
+                result_tx.send(result).unwrap();
+            });
+            // This signal comes only after the public admission path actually
+            // observed WouldBlock, so scheduler delay cannot mimic waiting.
+            let blocked = started_rx.recv_timeout(Duration::from_secs(2));
+            // Release before asserting so a failed assertion cannot keep a
+            // foreground waiter blocked while the scoped thread is joined.
+            drop(held);
+            assert!(
+                blocked.is_ok(),
+                "foreground admission did not observe contention and wait: {blocked:?}"
+            );
+            result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .expect("foreground admission must retry transient contention");
+        });
+        assert!(
+            !planned.exists(),
+            "admission alone must not create the root"
+        );
+    }
+
+    #[test]
+    fn foreground_contention_timeout_preserves_lock_and_storage() {
+        let fixture = Fixture::new();
+        let planned = fixture._owned.path().join("still-blocked");
+        let held = registry_lock(&fixture.database, true).unwrap();
+        let started = Instant::now();
+        let wait = Duration::from_millis(20);
+        let error = admit_with_limit_and_wait(&fixture.database, &planned, MAX_RECORDS, wait)
+            .err()
+            .expect("held history lock must time out");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= wait,
+            "registration refused before its wait expired"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "registration wait was not bounded"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("bounded registration wait"));
+        assert!(registry_lock(&fixture.database, true).is_err());
+        assert!(!planned.exists());
+        drop(held);
+        assert!(admit(&fixture.database, &planned).is_ok());
+    }
+
+    #[test]
+    fn orphan_removal_yields_while_foreground_admission_owns_history() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("orphan");
+        fixture.register(&root, &owner);
+        fs::remove_dir(&fixture.origin).unwrap();
+        let record = inventory(&fixture.database, None).roots.remove(0);
+        let fingerprint = ownership_fingerprint(&record).unwrap();
+        let planned = fixture._owned.path().join("foreground");
+        let held = admit(&fixture.database, &planned).unwrap();
+        assert!(matches!(
+            claim_for_removal(&fixture.database, &root, &fingerprint),
+            Err(ClaimError::Unavailable(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert!(!planned.exists());
+        drop(held);
+        assert!(claim_for_removal(&fixture.database, &root, &fingerprint).is_ok());
     }
 
     #[test]
@@ -1497,13 +1641,20 @@ mod tests {
         };
         let root = PathBuf::from(std::env::var_os("AETHYME_REGISTRY_TEST_ROOT").unwrap());
         let marker = read_marker(&root).unwrap();
-        let result = register(
-            Path::new(&database),
-            &root,
-            &marker,
-            WorktreeRootSource::HostState,
-        );
         let expected_blocked = std::env::var_os("AETHYME_REGISTRY_TEST_BLOCKED").is_some();
+        let result = if expected_blocked {
+            admit_with_limit_and_wait(Path::new(&database), &root, MAX_RECORDS, Duration::ZERO)
+                .and_then(|admission| {
+                    admission.record(&root, &marker, WorktreeRootSource::HostState)
+                })
+        } else {
+            register(
+                Path::new(&database),
+                &root,
+                &marker,
+                WorktreeRootSource::HostState,
+            )
+        };
         if expected_blocked {
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
         } else {
