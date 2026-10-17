@@ -17,7 +17,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_RECORD_BYTES: usize = 8 * 1024;
 const MAX_ROOT_BYTES: usize = 4 * 1024;
 const MAX_ROOT_IDENTITY_BYTES: usize = 512;
@@ -39,6 +39,16 @@ pub(crate) struct JournalDebt {
     pub(crate) repository: Option<String>,
     pub(crate) sort_key: Vec<u8>,
     pub(crate) payload_valid: bool,
+    /// Serialized directory identity for the staged replacement. `None` is
+    /// retained for migrated v2 rows that predate inode-reuse-safe staging.
+    pub(crate) fresh_store_identity: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadedDebt {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) protocol_version: u8,
+    pub(crate) fresh_store_identity: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +104,49 @@ pub(crate) fn publish(
     repository: &str,
     payload: &[u8],
 ) -> io::Result<()> {
+    publish_with_protocol(
+        resource_db,
+        cache_root,
+        root_identity,
+        repository,
+        payload,
+        3,
+    )
+}
+
+/// Recreate a missing external row from an already-published legacy in-cache
+/// witness. The row remains protocol 2 until a verified fresh-store proof is
+/// adopted; this prevents a migrated/legacy transition from being treated as
+/// a transaction that is known to have staged its replacement.
+pub(crate) fn publish_legacy(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    repository: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    publish_with_protocol(
+        resource_db,
+        cache_root,
+        root_identity,
+        repository,
+        payload,
+        2,
+    )
+}
+
+fn publish_with_protocol(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    repository: &str,
+    payload: &[u8],
+    protocol_version: i64,
+) -> io::Result<()> {
     validate_inputs(cache_root, root_identity, repository, payload)?;
+    if !matches!(protocol_version, 2 | 3) {
+        return Err(invalid_input("rotation protocol version is invalid"));
+    }
     let path = path_for_resource_db(resource_db)?;
     let mut connection = open_writer(&path)?;
     ensure_writer_schema(&connection)?;
@@ -132,8 +184,10 @@ pub(crate) fn publish(
         .ok_or_else(|| invalid_data("rotation debt generation is exhausted"))?;
     transaction
         .execute(
-            "INSERT INTO rotation_debt(root_path, repository, payload) VALUES (?1, ?2, ?3)",
-            params![root, repository, payload],
+            "INSERT INTO rotation_debt(\
+                root_path, repository, payload, protocol_version, fresh_store_identity\
+             ) VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![root, repository, payload, protocol_version],
         )
         .map_err(sqlite_error)?;
     transaction
@@ -155,6 +209,21 @@ pub(crate) fn load(
     root_identity: &[u8],
     repository: &str,
 ) -> io::Result<Option<Vec<u8>>> {
+    Ok(
+        load_record(resource_db, cache_root, root_identity, repository)?
+            .map(|record| record.payload),
+    )
+}
+
+/// Read one exact row and its durable replacement identity. Schema-v2 rows
+/// remain readable as protocol 2 with no replacement identity; callers must
+/// apply the narrower legacy recovery rules before adopting them.
+pub(crate) fn load_record(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    repository: &str,
+) -> io::Result<Option<LoadedDebt>> {
     validate_root(cache_root, root_identity)?;
     validate_repository(repository)?;
     let path = path_for_resource_db(resource_db)?;
@@ -186,28 +255,54 @@ pub(crate) fn load(
             "preparation cache root identity differs from its durable journal",
         ));
     }
-    let payload: Option<i64> = connection
-        .query_row(
-            "SELECT length(payload) FROM rotation_debt WHERE root_path=?1 AND repository=?2",
-            params![root, repository],
-            |row| row.get(0),
-        )
-        .optional()
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(sqlite_error)?;
-    let Some(length) = payload else {
+    let row = match version {
+        2 => connection
+            .query_row(
+                "SELECT payload, length(payload) FROM rotation_debt \
+                 WHERE root_path=?1 AND repository=?2",
+                params![root, repository],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map(|row| row.map(|(payload, length)| (payload, length, 2_i64, None)))
+            .map_err(sqlite_error)?,
+        SCHEMA_VERSION => connection
+            .query_row(
+                "SELECT payload, length(payload), protocol_version, fresh_store_identity \
+                 FROM rotation_debt WHERE root_path=?1 AND repository=?2",
+                params![root, repository],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sqlite_error)?,
+        _ => return Err(invalid_data("rotation debt journal schema is unsupported")),
+    };
+    let Some((payload, length, protocol_version, fresh_store_identity)) = row else {
         return Ok(None);
     };
-    if !(1..=MAX_RECORD_BYTES as i64).contains(&length) {
+    if !(1..=MAX_RECORD_BYTES as i64).contains(&length)
+        || !matches!(protocol_version, 2 | 3)
+        || fresh_store_identity
+            .as_ref()
+            .is_some_and(|identity| identity.is_empty() || identity.len() > MAX_ROOT_IDENTITY_BYTES)
+    {
         return Err(invalid_data("rotation debt row exceeds its size limit"));
     }
-    connection
-        .query_row(
-            "SELECT payload FROM rotation_debt WHERE root_path=?1 AND repository=?2",
-            params![root, repository],
-            |row| row.get(0),
-        )
-        .map(Some)
-        .map_err(sqlite_error)
+    Ok(Some(LoadedDebt {
+        payload,
+        protocol_version: protocol_version as u8,
+        fresh_store_identity,
+    }))
 }
 
 /// Advance the durable keyset cursor before the caller acquires any
@@ -501,17 +596,24 @@ pub(crate) fn mark_lap_incomplete(
     check_database_size(&path)
 }
 
-/// Remove a row only after the caller has completed the pinned filesystem
-/// transition and removed the in-cache witness. If a crash occurs first, the
-/// external row remains discoverable and the next pass revalidates it.
-pub(crate) fn complete(
+/// Bind the exact staged replacement identity to a published debt row.
+/// `None` may transition to one identity once; an exact retry is harmless,
+/// while a different identity is always refused. The caller must already
+/// hold the repository lease and have verified the root-level stage proof.
+pub(crate) fn record_fresh_store_identity(
     resource_db: &Path,
     cache_root: &Path,
     root_identity: &[u8],
     repository: &str,
     expected_payload: &[u8],
+    fresh_store_identity: &[u8],
 ) -> io::Result<()> {
     validate_inputs(cache_root, root_identity, repository, expected_payload)?;
+    if fresh_store_identity.is_empty() || fresh_store_identity.len() > MAX_ROOT_IDENTITY_BYTES {
+        return Err(invalid_input(
+            "fresh preparation-cache identity is malformed",
+        ));
+    }
     let path = path_for_resource_db(resource_db)?;
     let mut connection = open_writer(&path)?;
     ensure_writer_schema(&connection)?;
@@ -520,16 +622,107 @@ pub(crate) fn complete(
         .map_err(sqlite_error)?;
     let root = cache_root.as_os_str().as_bytes();
     ensure_root(&transaction, root, root_identity)?;
-    let current: Option<Vec<u8>> = transaction
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> = transaction
         .query_row(
-            "SELECT payload FROM rotation_debt WHERE root_path=?1 AND repository=?2",
+            "SELECT payload, fresh_store_identity FROM rotation_debt \
+             WHERE root_path=?1 AND repository=?2",
             params![root, repository],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    match row {
+        Some((payload, Some(current)))
+            if payload == expected_payload && current == fresh_store_identity => {}
+        Some((payload, None)) if payload == expected_payload => {
+            transaction
+                .execute(
+                    "UPDATE rotation_debt SET fresh_store_identity=?3 \
+                     WHERE root_path=?1 AND repository=?2 \
+                     AND payload=?4 AND fresh_store_identity IS NULL",
+                    params![root, repository, fresh_store_identity, expected_payload],
+                )
+                .map_err(sqlite_error)?;
+        }
+        Some(_) => {
+            return Err(invalid_data(
+                "rotation debt or staged replacement identity changed",
+            ));
+        }
+        None => {
+            return Err(invalid_data(
+                "rotation debt disappeared before stage binding",
+            ));
+        }
+    }
+    transaction.commit().map_err(sqlite_error)?;
+    check_database_size(&path)
+}
+
+/// Remove a row only after the caller has completed the pinned filesystem
+/// transition and removed the in-cache witness. If a crash occurs first, the
+/// external row remains discoverable and the next pass revalidates it.
+#[cfg(test)]
+fn complete(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    repository: &str,
+    expected_payload: &[u8],
+) -> io::Result<()> {
+    let record = load_record(resource_db, cache_root, root_identity, repository)?
+        .ok_or_else(|| invalid_data("rotation debt row is absent before completion"))?;
+    let fresh_identity = record
+        .fresh_store_identity
+        .ok_or_else(|| invalid_data("rotation debt has no fresh-store identity"))?;
+    complete_verified(
+        resource_db,
+        cache_root,
+        root_identity,
+        repository,
+        expected_payload,
+        &fresh_identity,
+    )
+}
+
+pub(crate) fn complete_verified(
+    resource_db: &Path,
+    cache_root: &Path,
+    root_identity: &[u8],
+    repository: &str,
+    expected_payload: &[u8],
+    expected_fresh_store_identity: &[u8],
+) -> io::Result<()> {
+    validate_inputs(cache_root, root_identity, repository, expected_payload)?;
+    if expected_fresh_store_identity.is_empty()
+        || expected_fresh_store_identity.len() > MAX_ROOT_IDENTITY_BYTES
+    {
+        return Err(invalid_input(
+            "fresh preparation-cache identity is malformed",
+        ));
+    }
+    let path = path_for_resource_db(resource_db)?;
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let root = cache_root.as_os_str().as_bytes();
+    ensure_root(&transaction, root, root_identity)?;
+    let current: Option<(Vec<u8>, Option<Vec<u8>>)> = transaction
+        .query_row(
+            "SELECT payload, fresh_store_identity FROM rotation_debt \
+             WHERE root_path=?1 AND repository=?2",
+            params![root, repository],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
     match current {
-        Some(current) if current == expected_payload => {
+        Some((current_payload, Some(current_identity)))
+            if current_payload == expected_payload
+                && current_identity == expected_fresh_store_identity =>
+        {
             transaction
                 .execute(
                     "DELETE FROM rotation_debt WHERE root_path=?1 AND repository=?2",
@@ -846,7 +1039,7 @@ fn validate_schema_before_writer(connection: &Connection) -> io::Result<()> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(sqlite_error)?;
-    if version == SCHEMA_VERSION {
+    if version == SCHEMA_VERSION || version == 2 {
         if ensure_schema(connection, false)? {
             return Ok(());
         }
@@ -925,7 +1118,7 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(sqlite_error)?;
-    if version == SCHEMA_VERSION {
+    if version == SCHEMA_VERSION || version == 2 {
         let roots: bool = connection
             .query_row(
                 "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_root'",
@@ -950,6 +1143,18 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
         connection
             .prepare("SELECT lap_state FROM rotation_root LIMIT 0")
             .map_err(sqlite_error)?;
+        if version == SCHEMA_VERSION {
+            connection
+                .prepare(
+                    "SELECT root_path, repository, payload, protocol_version, \
+                     fresh_store_identity FROM rotation_debt LIMIT 0",
+                )
+                .map_err(sqlite_error)?;
+        } else {
+            connection
+                .prepare("SELECT root_path, repository, payload FROM rotation_debt LIMIT 0")
+                .map_err(sqlite_error)?;
+        }
         return Ok(true);
     }
     if version != 0 || !create {
@@ -982,9 +1187,14 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
                 root_path BLOB NOT NULL REFERENCES rotation_root(root_path) ON DELETE CASCADE,
                 repository TEXT NOT NULL CHECK(length(repository)=64),
                 payload BLOB NOT NULL CHECK(length(payload) BETWEEN 1 AND 8192),
+                protocol_version INTEGER NOT NULL CHECK(protocol_version IN (2,3)),
+                fresh_store_identity BLOB CHECK(\
+                    fresh_store_identity IS NULL OR \
+                    length(fresh_store_identity) BETWEEN 1 AND 512\
+                ),
                 PRIMARY KEY(root_path, repository)
              ) WITHOUT ROWID;
-             PRAGMA user_version=2;",
+             PRAGMA user_version=3;",
         )
         .map_err(sqlite_error)?;
     transaction.commit().map_err(sqlite_error)?;
@@ -992,6 +1202,12 @@ fn ensure_schema(connection: &Connection, create: bool) -> io::Result<bool> {
 }
 
 fn ensure_writer_schema(connection: &Connection) -> io::Result<()> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(sqlite_error)?;
+    if version == 2 {
+        migrate_v2_schema(connection)?;
+    }
     if ensure_schema(connection, true)? {
         Ok(())
     } else {
@@ -999,6 +1215,28 @@ fn ensure_writer_schema(connection: &Connection) -> io::Result<()> {
             "rotation journal schema version is unsupported",
         ))
     }
+}
+
+fn migrate_v2_schema(connection: &Connection) -> io::Result<()> {
+    if !ensure_schema(connection, false)? {
+        return Err(invalid_data("rotation journal schema is unsupported"));
+    }
+    let transaction = connection.unchecked_transaction().map_err(sqlite_error)?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE rotation_debt ADD COLUMN protocol_version INTEGER NOT NULL \
+                 DEFAULT 2 CHECK(protocol_version IN (2,3)); \
+             ALTER TABLE rotation_debt ADD COLUMN fresh_store_identity BLOB \
+                 CHECK(fresh_store_identity IS NULL OR \
+                       length(fresh_store_identity) BETWEEN 1 AND 512); \
+             PRAGMA user_version=3;",
+        )
+        .map_err(sqlite_error)?;
+    transaction.commit().map_err(sqlite_error)?;
+    if !ensure_schema(connection, false)? {
+        return Err(invalid_data("rotation journal migration did not complete"));
+    }
+    Ok(())
 }
 
 fn ensure_root(
@@ -1175,6 +1413,7 @@ mod tests {
     const REPOSITORY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const REPOSITORY_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const REPOSITORY_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const TEST_FRESH_IDENTITY: &[u8] = b"fixture-fresh-store-identity";
 
     struct Fixture {
         _directory: TempDir,
@@ -1203,6 +1442,15 @@ mod tests {
                 ROOT_IDENTITY,
                 repository,
                 payload,
+            )
+            .unwrap();
+            record_fresh_store_identity(
+                &self.resource_db,
+                &self.cache_root,
+                ROOT_IDENTITY,
+                repository,
+                payload,
+                TEST_FRESH_IDENTITY,
             )
             .unwrap();
         }
