@@ -12,7 +12,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{self, MaybeUninit};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -144,6 +144,20 @@ impl RotationDebt {
         }
         component(&format!("{RECORD_PREFIX}{repository}{SCRATCH_SUFFIX}"))
     }
+
+    fn tree_witness_component(&self) -> io::Result<CString> {
+        component(&format!(
+            "{RECORD_PREFIX}{}-{}.witness",
+            self.repository, self.transaction
+        ))
+    }
+
+    fn tree_witness_scratch_component(&self) -> io::Result<CString> {
+        component(&format!(
+            "{RECORD_PREFIX}{}-{}.witness{SCRATCH_SUFFIX}",
+            self.repository, self.transaction
+        ))
+    }
 }
 
 /// A read-only classification. It is not authority to mutate any path.
@@ -165,6 +179,42 @@ pub(crate) enum RecoveryStep {
 pub(crate) struct RetainedRotationDebt {
     pub(crate) debt: RotationDebt,
     marker: FileIdentity,
+}
+
+/// Exact in-tree witness that lets the pinned common deleter remove the
+/// retired store while retaining the witness until the final unlink.
+#[derive(Debug, Clone)]
+pub(crate) struct RetiredTreeWitness {
+    component: String,
+    bytes: Vec<u8>,
+    directory: DirectoryIdentity,
+}
+
+impl RetiredTreeWitness {
+    pub(crate) fn component(&self) -> io::Result<&str> {
+        Ok(&self.component)
+    }
+
+    pub(crate) fn validate_bytes(&self, actual: &[u8]) -> io::Result<()> {
+        if actual == self.bytes {
+            Ok(())
+        } else {
+            Err(invalid_record(
+                "retired cache witness does not match its debt",
+            ))
+        }
+    }
+
+    pub(crate) fn matches_pinned_identity(
+        &self,
+        device: u64,
+        inode: u64,
+        filesystem_identity: &[u8],
+    ) -> io::Result<bool> {
+        Ok(self.directory.device == device
+            && self.directory.inode == inode
+            && self.directory.filesystem_id == encode_hex(filesystem_identity))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +276,147 @@ pub(crate) fn recovery_step(cache_root: &Path, debt: &RotationDebt) -> io::Resul
     recovery_step_at(&root, debt)
 }
 
+/// Publish the in-tree removal witness and atomically move the exact original
+/// cache to its retired name. The durable sidecar must already have been
+/// published, and the caller must hold the repository-scoped cache lease.
+///
+/// A crash before the rename leaves the original store and sidecar intact. A
+/// crash after the rename leaves the same witness inside the retired tree, so
+/// retry can verify the original inode before handing it to the common pinned
+/// deleter.
+pub(crate) fn retire_original_store(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+) -> io::Result<()> {
+    if recovery_step(cache_root, &retained.debt)? != RecoveryStep::RenameOriginalStore {
+        return Err(invalid_record("original cache is not ready to be retired"));
+    }
+    let witness = prepare_tree_witness(cache_root, retained)?;
+    let root = open_cache_root(cache_root)?;
+    verify_retained_sidecar(&root, retained)?;
+    if recovery_step_at(&root, &retained.debt)? != RecoveryStep::RenameOriginalStore {
+        return Err(invalid_record("original cache is not ready to be retired"));
+    }
+
+    let current_name = component(&retained.debt.repository)?;
+    let retired_name = component(&retained.debt.retired_component)?;
+    let current_directory = open_directory_at(root.as_raw_fd(), &current_name)?;
+    let current_identity = identity_for_directory(&current_directory)?;
+    if !current_identity.same_directory(&retained.debt.original_store)
+        || !current_identity.same_filesystem(&retained.debt.cache_root)
+    {
+        return Err(invalid_record(
+            "original cache identity changed before retirement",
+        ));
+    }
+    verify_tree_witness(&current_directory, retained, &witness)?;
+    let named_identity = directory_identity_at(root.as_raw_fd(), &current_name)?
+        .ok_or_else(|| invalid_record("original cache disappeared before retirement"))?;
+    if !named_identity.same_directory(&current_identity) {
+        return Err(invalid_record(
+            "original cache name changed before retirement",
+        ));
+    }
+    if entry_exists(root.as_raw_fd(), &retired_name)? {
+        return Err(invalid_record("retired cache path already exists"));
+    }
+    verify_retained_sidecar(&root, retained)?;
+    if recovery_step_at(&root, &retained.debt)? != RecoveryStep::RenameOriginalStore {
+        return Err(invalid_record(
+            "rotation state changed before cache retirement",
+        ));
+    }
+    let final_source = directory_identity_at(root.as_raw_fd(), &current_name)?
+        .ok_or_else(|| invalid_record("original cache disappeared before retirement"))?;
+    if !final_source.same_directory(&current_identity) {
+        return Err(invalid_record(
+            "original cache name changed before retirement",
+        ));
+    }
+    verify_tree_witness(&current_directory, retained, &witness)?;
+    rename_noreplace(
+        root.as_raw_fd(),
+        &current_name,
+        root.as_raw_fd(),
+        &retired_name,
+    )?;
+    root.sync_all()?;
+
+    let moved = open_directory_at(root.as_raw_fd(), &retired_name)?;
+    let moved_identity = identity_for_directory(&moved)?;
+    if !moved_identity.same_directory(&retained.debt.original_store)
+        || !moved_identity.same_filesystem(&retained.debt.cache_root)
+    {
+        return Err(invalid_record(
+            "retired cache identity changed after rename",
+        ));
+    }
+    verify_tree_witness(&moved, retained, &witness)
+}
+
+/// Ensure the exact in-tree witness is ready for `PinnedTreeRemoval` and
+/// return the identity and bytes that the common deleter must verify.
+///
+/// If a previous deletion removed the witness but crashed before removing the
+/// now-empty retired directory, this restores the witness only after a
+/// descriptor-relative emptiness check and exact root/filesystem validation.
+/// A missing witness in a nonempty retired tree is ambiguous and is refused.
+pub(crate) fn prepare_retired_store_removal(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+) -> io::Result<RetiredTreeWitness> {
+    if recovery_step(cache_root, &retained.debt)? != RecoveryStep::RemoveRetiredStore {
+        return Err(invalid_record(
+            "no retired cache store is ready for removal",
+        ));
+    }
+    prepare_tree_witness(cache_root, retained)
+}
+
+/// Create the replacement cache directory only after the original retired
+/// store is absent. The caller must keep the repository-scoped lease through
+/// the creation and subsequent debt clearing.
+pub(crate) fn create_fresh_store(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+) -> io::Result<DirectoryIdentity> {
+    retained.debt.validate()?;
+    let root = open_cache_root(cache_root)?;
+    verify_retained_sidecar(&root, retained)?;
+    if recovery_step_at(&root, &retained.debt)? != RecoveryStep::CreateFreshStore {
+        return Err(invalid_record(
+            "rotation is not ready for a fresh cache store",
+        ));
+    }
+
+    let current_name = component(&retained.debt.repository)?;
+    let mode = 0o700 as libc::mode_t;
+    // SAFETY: root is a live cache-root directory descriptor and current_name
+    // is one validated NUL-terminated component. mkdirat creates only this
+    // missing child and cannot replace an existing entry.
+    if unsafe { libc::mkdirat(root.as_raw_fd(), current_name.as_ptr(), mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    root.sync_all()?;
+
+    let fresh = open_directory_at(root.as_raw_fd(), &current_name)?;
+    let identity = identity_for_directory(&fresh)?;
+    if identity.same_directory(&retained.debt.original_store)
+        || !identity.same_filesystem(&retained.debt.cache_root)
+        || !directory_is_empty(&fresh)?
+    {
+        return Err(invalid_record(
+            "new cache store is not a fresh empty directory on the recorded filesystem",
+        ));
+    }
+    if recovery_step_at(&root, &retained.debt)? != RecoveryStep::ClearCompletedDebt {
+        return Err(invalid_record(
+            "fresh cache store changed before debt clearing",
+        ));
+    }
+    Ok(identity)
+}
+
 fn recovery_step_at(root: &File, debt: &RotationDebt) -> io::Result<RecoveryStep> {
     debt.validate()?;
     let root_identity = identity_for_directory(root)?;
@@ -253,6 +444,268 @@ fn recovery_step_at(root: &File, debt: &RotationDebt) -> io::Result<RecoveryStep
         retired.as_ref(),
         fresh_empty,
     ))
+}
+
+fn prepare_tree_witness(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+) -> io::Result<RetiredTreeWitness> {
+    retained.debt.validate()?;
+    let root = open_cache_root(cache_root)?;
+    verify_retained_sidecar(&root, retained)?;
+    let step = recovery_step_at(&root, &retained.debt)?;
+    let (store_name, is_original_at_current) = match step {
+        RecoveryStep::RenameOriginalStore => (component(&retained.debt.repository)?, true),
+        RecoveryStep::RemoveRetiredStore => (component(&retained.debt.retired_component)?, false),
+        _ => return Err(invalid_record("rotation has no removable original tree")),
+    };
+    let directory = open_directory_at(root.as_raw_fd(), &store_name)?;
+    let directory_identity = identity_for_directory(&directory)?;
+    if !directory_identity.same_directory(&retained.debt.original_store)
+        || !directory_identity.same_filesystem(&retained.debt.cache_root)
+    {
+        return Err(invalid_record(
+            "rotation tree identity changed before witness setup",
+        ));
+    }
+
+    let witness_name = retained.debt.tree_witness_component()?;
+    let scratch_name = retained.debt.tree_witness_scratch_component()?;
+    let bytes = encode(&retained.debt)?;
+    let witness = read_component(directory.as_raw_fd(), &witness_name)?;
+    let scratch = read_component(directory.as_raw_fd(), &scratch_name)?;
+
+    if let Some(witness) = witness {
+        if scratch.is_some() || witness.bytes != bytes {
+            return Err(invalid_record(
+                "retired cache has an ambiguous or mismatched debt witness",
+            ));
+        }
+    } else {
+        let scratch = match scratch {
+            Some(scratch) => {
+                if !is_original_at_current
+                    && !directory_contains_only(&directory, Some(&scratch_name))?
+                {
+                    return Err(invalid_record(
+                        "missing retired-tree witness is not the only remaining entry",
+                    ));
+                }
+                if scratch.bytes != bytes {
+                    verify_named_rotation_tree(
+                        &root,
+                        retained,
+                        step,
+                        &store_name,
+                        &directory_identity,
+                    )?;
+                    remove_scratch(directory.as_raw_fd(), &scratch_name, &scratch)?;
+                    directory.sync_all()?;
+                    None
+                } else {
+                    Some(scratch)
+                }
+            }
+            None => None,
+        };
+
+        if let Some(scratch) = scratch {
+            promote_tree_witness(
+                &root,
+                retained,
+                step,
+                &store_name,
+                &directory,
+                &directory_identity,
+                &scratch_name,
+                &witness_name,
+                &bytes,
+                &scratch,
+            )?;
+        } else {
+            if !is_original_at_current && !directory_is_empty(&directory)? {
+                return Err(invalid_record(
+                    "missing witness in a nonempty retired cache tree",
+                ));
+            }
+            publish_tree_witness(
+                &root,
+                retained,
+                step,
+                &store_name,
+                &directory,
+                &directory_identity,
+                &scratch_name,
+                &witness_name,
+                &bytes,
+            )?;
+        }
+    }
+
+    verify_named_rotation_tree(&root, retained, step, &store_name, &directory_identity)?;
+    let final_witness = read_component(directory.as_raw_fd(), &witness_name)?
+        .ok_or_else(|| invalid_record("retired cache debt witness disappeared"))?;
+    if final_witness.bytes != bytes
+        || read_component(directory.as_raw_fd(), &scratch_name)?.is_some()
+    {
+        return Err(invalid_record("retired cache debt witness changed"));
+    }
+    Ok(RetiredTreeWitness {
+        component: witness_name
+            .to_str()
+            .map_err(|_| invalid_record("witness component is not UTF-8"))?
+            .to_owned(),
+        bytes,
+        directory: directory_identity,
+    })
+}
+
+fn publish_tree_witness(
+    root: &File,
+    retained: &RetainedRotationDebt,
+    step: RecoveryStep,
+    store_name: &CStr,
+    directory: &File,
+    directory_identity: &DirectoryIdentity,
+    scratch_name: &CStr,
+    witness_name: &CStr,
+    bytes: &[u8],
+) -> io::Result<()> {
+    verify_named_rotation_tree(root, retained, step, store_name, directory_identity)?;
+    let mut scratch = create_regular_exclusive(directory.as_raw_fd(), scratch_name)?;
+    scratch.write_all(bytes)?;
+    scratch.sync_all()?;
+    let metadata = scratch.metadata()?;
+    if !is_private_owned_file(&metadata) || metadata.len() != bytes.len() as u64 {
+        return Err(invalid_record(
+            "new retired-tree witness scratch is invalid",
+        ));
+    }
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    drop(scratch);
+
+    verify_named_rotation_tree(root, retained, step, store_name, directory_identity)?;
+    let checked = read_component(directory.as_raw_fd(), scratch_name)?
+        .ok_or_else(|| invalid_record("retired-tree witness scratch disappeared"))?;
+    if checked.identity != identity || checked.bytes != bytes {
+        return Err(invalid_record("retired-tree witness scratch changed"));
+    }
+    ensure_component_identity(directory.as_raw_fd(), scratch_name, identity)?;
+    directory.sync_all()?;
+    rename_noreplace(
+        directory.as_raw_fd(),
+        scratch_name,
+        directory.as_raw_fd(),
+        witness_name,
+    )?;
+    directory.sync_all()?;
+    verify_tree_witness_bytes(directory, witness_name, bytes)
+}
+
+fn promote_tree_witness(
+    root: &File,
+    retained: &RetainedRotationDebt,
+    step: RecoveryStep,
+    store_name: &CStr,
+    directory: &File,
+    directory_identity: &DirectoryIdentity,
+    scratch_name: &CStr,
+    witness_name: &CStr,
+    bytes: &[u8],
+    expected: &ReadComponent,
+) -> io::Result<()> {
+    verify_named_rotation_tree(root, retained, step, store_name, directory_identity)?;
+    let scratch = read_component(directory.as_raw_fd(), scratch_name)?
+        .ok_or_else(|| invalid_record("retired-tree witness scratch disappeared"))?;
+    if scratch.identity != expected.identity || scratch.bytes != bytes {
+        return Err(invalid_record("retired-tree witness scratch is ambiguous"));
+    }
+    ensure_component_identity(directory.as_raw_fd(), scratch_name, scratch.identity)?;
+    directory.sync_all()?;
+    rename_noreplace(
+        directory.as_raw_fd(),
+        scratch_name,
+        directory.as_raw_fd(),
+        witness_name,
+    )?;
+    directory.sync_all()?;
+    verify_tree_witness_bytes(directory, witness_name, bytes)
+}
+
+fn verify_tree_witness(
+    directory: &File,
+    retained: &RetainedRotationDebt,
+    expected: &RetiredTreeWitness,
+) -> io::Result<()> {
+    let name = retained.debt.tree_witness_component()?;
+    if expected.component.as_bytes() != name.to_bytes()
+        || !expected
+            .directory
+            .same_directory(&retained.debt.original_store)
+    {
+        return Err(invalid_record(
+            "retired-tree witness binding is inconsistent",
+        ));
+    }
+    verify_tree_witness_bytes(directory, &name, &expected.bytes)
+}
+
+fn verify_tree_witness_bytes(directory: &File, name: &CStr, expected: &[u8]) -> io::Result<()> {
+    let file = read_component(directory.as_raw_fd(), name)?
+        .ok_or_else(|| invalid_record("retired-tree witness disappeared"))?;
+    if file.bytes != expected {
+        return Err(invalid_record("retired-tree witness payload changed"));
+    }
+    Ok(())
+}
+
+fn verify_retained_sidecar(root: &File, retained: &RetainedRotationDebt) -> io::Result<()> {
+    retained.debt.validate()?;
+    let root_identity = identity_for_directory(root)?;
+    if !root_identity.same_directory(&retained.debt.cache_root) {
+        return Err(invalid_record(
+            "cache root changed during rotation recovery",
+        ));
+    }
+    let committed_name = RotationDebt::record_component(&retained.debt.repository)?;
+    let scratch_name = RotationDebt::scratch_component(&retained.debt.repository)?;
+    let committed = read_component(root.as_raw_fd(), &committed_name)?
+        .ok_or_else(|| invalid_record("committed rotation debt disappeared"))?;
+    if committed.identity != retained.marker || committed.bytes != encode(&retained.debt)? {
+        return Err(invalid_record("committed rotation debt changed"));
+    }
+    if read_component(root.as_raw_fd(), &scratch_name)?.is_some() {
+        return Err(invalid_record(
+            "unpublished sidecar scratch conflicts with committed rotation debt",
+        ));
+    }
+    ensure_component_identity(root.as_raw_fd(), &committed_name, retained.marker)
+}
+
+fn verify_named_rotation_tree(
+    root: &File,
+    retained: &RetainedRotationDebt,
+    expected_step: RecoveryStep,
+    store_name: &CStr,
+    expected_identity: &DirectoryIdentity,
+) -> io::Result<()> {
+    verify_retained_sidecar(root, retained)?;
+    if recovery_step_at(root, &retained.debt)? != expected_step {
+        return Err(invalid_record(
+            "rotation state changed during witness setup",
+        ));
+    }
+    let named = directory_identity_at(root.as_raw_fd(), store_name)?
+        .ok_or_else(|| invalid_record("rotation tree disappeared during witness setup"))?;
+    if !named.same_directory(expected_identity) {
+        return Err(invalid_record(
+            "rotation tree name changed during witness setup",
+        ));
+    }
+    Ok(())
 }
 
 /// Read the committed witness. A scratch file is not authority: publication
@@ -654,7 +1107,24 @@ fn open_directory_at(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
 
 fn directory_is_empty_at(parent_fd: RawFd, name: &CStr) -> io::Result<bool> {
     let directory = open_directory_at(parent_fd, name)?;
-    let fd = directory.into_raw_fd();
+    directory_is_empty(&directory)
+}
+
+fn directory_is_empty(directory: &File) -> io::Result<bool> {
+    directory_contains_only(directory, None)
+}
+
+/// Return true when the pinned directory has no entries except an optional
+/// single known component. The directory stream is opened relative to the
+/// retained descriptor so path replacement cannot redirect this check.
+fn directory_contains_only(directory: &File, allowed: Option<&CStr>) -> io::Result<bool> {
+    let dot = CString::new(".").expect("constant is a valid C string");
+    // SAFETY: directory is a live directory descriptor and dot is a single
+    // NUL-terminated component. openat returns an independent descriptor.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), dot.as_ptr(), DIRECTORY_FLAGS) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
     // SAFETY: fd is a readable directory descriptor transferred from File;
     // fdopendir owns it on success.
     let stream = unsafe { libc::fdopendir(fd) };
@@ -685,10 +1155,13 @@ fn directory_is_empty_at(parent_fd: RawFd, name: &CStr) -> io::Result<bool> {
         // NUL-terminated; the bytes are copied/inspected before the next call.
         let entry_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if entry_name != b"." && entry_name != b".." {
-            // SAFETY: stream is the live DIR* returned by fdopendir and is
-            // closed exactly once here.
-            unsafe { libc::closedir(stream) };
-            return Ok(false);
+            let expected = allowed.map(CStr::to_bytes);
+            if expected != Some(entry_name) {
+                // SAFETY: stream is the live DIR* returned by fdopendir and is
+                // closed exactly once here.
+                unsafe { libc::closedir(stream) };
+                return Ok(false);
+            }
         }
     }
 }
@@ -930,6 +1403,15 @@ fn is_hex(value: &str, min_len: usize, max_len: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
 fn invalid_record(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
@@ -1089,6 +1571,98 @@ mod tests {
         fs::remove_file(store.join("unexpected")).unwrap();
         super::clear_completed(&cache_root, &retained).unwrap();
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn retired_store_witness_is_verified_by_the_common_pinned_deleter() {
+        use crate::gc::{PinnedTreeRemoval, TreeRemoval};
+
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        super::retire_original_store(&cache_root, &retained).unwrap();
+        let witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        let retired = cache_root.join(debt.retired_component());
+        let pinned = PinnedTreeRemoval::open(&retired).unwrap();
+        let object = pinned.object_identity().unwrap();
+        let filesystem = pinned.filesystem_identity().unwrap();
+        assert!(
+            witness
+                .matches_pinned_identity(object.device, object.inode, &filesystem)
+                .unwrap()
+        );
+
+        assert_eq!(
+            pinned
+                .remove_verified_witness(witness.component().unwrap(), None, |bytes| {
+                    witness.validate_bytes(bytes)
+                })
+                .unwrap(),
+            TreeRemoval::Complete
+        );
+        assert!(!retired.exists());
+        assert_eq!(
+            super::recovery_step(&cache_root, &debt).unwrap(),
+            RecoveryStep::CreateFreshStore
+        );
+        super::create_fresh_store(&cache_root, &retained).unwrap();
+        super::clear_completed(&cache_root, &retained).unwrap();
+        assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_retired_witness_is_restored_only_after_descriptor_relative_empty_check() {
+        use crate::gc::{PinnedTreeRemoval, TreeRemoval};
+
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        super::retire_original_store(&cache_root, &retained).unwrap();
+        let retired = cache_root.join(debt.retired_component());
+        let first_witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+
+        // Model the common deleter's crash after its final witness unlink but
+        // before rmdir: all payload and the marker are gone, while the exact
+        // retired directory inode remains.
+        fs::remove_file(retired.join("package-index")).unwrap();
+        fs::remove_file(retired.join(first_witness.component().unwrap())).unwrap();
+        assert!(fs::read_dir(&retired).unwrap().next().is_none());
+
+        let restored = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        assert_eq!(restored.bytes, super::encode(&debt).unwrap());
+        assert!(fs::read_dir(&retired).unwrap().all(|entry| {
+            entry.unwrap().file_name().to_string_lossy() == restored.component().unwrap()
+        }));
+        let pinned = PinnedTreeRemoval::open(&retired).unwrap();
+        let object = pinned.object_identity().unwrap();
+        let filesystem = pinned.filesystem_identity().unwrap();
+        assert!(
+            restored
+                .matches_pinned_identity(object.device, object.inode, &filesystem)
+                .unwrap()
+        );
+        assert_eq!(
+            pinned
+                .remove_verified_witness(restored.component().unwrap(), None, |bytes| {
+                    restored.validate_bytes(bytes)
+                })
+                .unwrap(),
+            TreeRemoval::Complete
+        );
+        assert!(!retired.exists());
+    }
+
+    #[test]
+    fn missing_witness_on_nonempty_retired_store_is_preserved_and_refused() {
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        super::retire_original_store(&cache_root, &retained).unwrap();
+        let retired = cache_root.join(debt.retired_component());
+        let witness = super::prepare_retired_store_removal(&cache_root, &retained).unwrap();
+        fs::remove_file(retired.join(witness.component().unwrap())).unwrap();
+
+        assert!(super::prepare_retired_store_removal(&cache_root, &retained).is_err());
+        assert!(!retired.join(witness.component().unwrap()).exists());
+        assert_eq!(fs::read(retired.join("package-index")).unwrap(), b"cached");
+        assert_eq!(read(&cache_root, REPOSITORY).unwrap().unwrap().debt, debt);
     }
 
     #[test]

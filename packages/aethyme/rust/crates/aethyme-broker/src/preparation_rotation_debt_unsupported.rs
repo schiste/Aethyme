@@ -73,11 +73,54 @@ pub(crate) struct RetainedRotationDebt {
     pub(crate) debt: RotationDebt,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RetiredTreeWitness;
+
+impl RetiredTreeWitness {
+    pub(crate) fn component(&self) -> io::Result<&str> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn validate_bytes(&self, _actual: &[u8]) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn matches_pinned_identity(
+        &self,
+        _device: u64,
+        _inode: u64,
+        _filesystem_identity: &[u8],
+    ) -> io::Result<bool> {
+        Err(unsupported())
+    }
+}
+
 pub(crate) fn ensure_supported() -> io::Result<()> {
     Err(unsupported())
 }
 
 pub(crate) fn recovery_step(_cache_root: &Path, _debt: &RotationDebt) -> io::Result<RecoveryStep> {
+    Err(unsupported())
+}
+
+pub(crate) fn retire_original_store(
+    _cache_root: &Path,
+    _retained: &RetainedRotationDebt,
+) -> io::Result<()> {
+    Err(unsupported())
+}
+
+pub(crate) fn prepare_retired_store_removal(
+    _cache_root: &Path,
+    _retained: &RetainedRotationDebt,
+) -> io::Result<RetiredTreeWitness> {
+    Err(unsupported())
+}
+
+pub(crate) fn create_fresh_store(
+    _cache_root: &Path,
+    _retained: &RetainedRotationDebt,
+) -> io::Result<DirectoryIdentity> {
     Err(unsupported())
 }
 
