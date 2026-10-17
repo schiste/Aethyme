@@ -1769,6 +1769,29 @@ pub(super) fn worktree_activity_ms(main_root: &Path, session: &Session) -> Optio
     newest
 }
 
+/// Spawned agents own a process group whose id is their stored supervisor PID.
+/// Keep the session protected through detached descendant cleanup, including
+/// the interval after the supervisor is reaped. Legacy plain PIDs still use
+/// the ordinary process check first. An ambiguous group probe protects data.
+pub(crate) fn session_pid_alive(pid: i64) -> bool {
+    if pid <= 0 || i32::try_from(pid).is_err() {
+        return true; // Corrupt session ownership is unknown, never cleanup authority.
+    }
+    if pid_alive(pid) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // Signal zero probes existence/permission; it delivers no signal.
+        if unsafe { libc::killpg(pid as i32, 0) } == 0 {
+            return true;
+        }
+        return std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    }
+    #[cfg(not(unix))]
+    false
+}
+
 /// True when the PID exists and is not a zombie (macOS/Linux — the v0
 /// platforms). `kill -0` alone is wrong here: it succeeds on zombies,
 /// and an exited-but-unreaped agent must read as dead.

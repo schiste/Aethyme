@@ -15,7 +15,7 @@ impl Broker {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
             let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
 
-            let pid_alive = session.pid.map(pid_alive);
+            let pid_alive = session.pid.map(session_pid_alive);
             let mut derived_status = session.status;
             if matches!(
                 session.status,
@@ -242,7 +242,7 @@ impl Broker {
         for session in sessions {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
             let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
-            let pid_alive = session.pid.map(pid_alive);
+            let pid_alive = session.pid.map(session_pid_alive);
             let mut derived_status = session.status;
             if matches!(
                 session.status,

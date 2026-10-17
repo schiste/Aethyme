@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 const FLAG: &str = "--aethyme-agent-supervisor-v1";
 #[cfg(unix)]
+const CLEANUP_FLAG: &str = "--aethyme-agent-supervisor-cleanup-v1";
+#[cfg(unix)]
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) const GO: &str = "AETHYME_START_AGENT_V1";
 
@@ -30,7 +32,14 @@ pub fn dispatch(args: &[String]) -> Option<u8> {
     if !args.first()?.starts_with("--aethyme-agent-supervisor") {
         return None;
     }
-    if args.len() != 2 || args[0] != FLAG {
+    if args.len() != 2 {
+        return Some(125);
+    }
+    #[cfg(unix)]
+    if args[0] == CLEANUP_FLAG {
+        return Some(cleanup_watcher(&args[1]).unwrap_or(125));
+    }
+    if args[0] != FLAG {
         return Some(125);
     }
     #[cfg(unix)]
@@ -200,6 +209,13 @@ fn run(payload: &str) -> io::Result<u8> {
     if unsafe { libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
         return Err(io::Error::last_os_error());
     }
+    // The launcher creates this group before exec. Without that binding a
+    // private invocation must never signal an interactive or unrelated group.
+    if unsafe { libc::getpgrp() } != unsafe { libc::getpid() } {
+        return Err(io::Error::other(
+            "agent supervisor is not its owned group leader",
+        ));
+    }
     if payload.len() > MAX_PAYLOAD_BYTES {
         return Err(io::Error::other("oversized agent launch payload"));
     }
@@ -258,6 +274,7 @@ fn run(payload: &str) -> io::Result<u8> {
     let mut collector = BoundedGateLog::from_file(log, AGENT_LOG_MAX_BYTES, "agent")?;
     collector.write_header(b"aethyme: agent capture initially INCOMPLETE; only a final COMPLETE footer confirms capture\n")?;
     collector.sync_data()?;
+    let mut cleanup = start_cleanup_watcher()?;
     let mut ready = io::stdout().lock();
     writeln!(ready, "AETHYME_AGENT_READY {}", launch.nonce)?;
     ready.flush()?;
@@ -287,8 +304,7 @@ fn run(payload: &str) -> io::Result<u8> {
         .take()
         .ok_or_else(|| io::Error::other("missing stderr"))?;
     if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
-        crate::warn_unrecorded("stop agent after pipe setup failure", child.kill());
-        crate::warn_unrecorded("reap agent after pipe setup failure", child.wait());
+        stop_direct_child(&mut child);
         return Err(error);
     }
     let collector = Arc::new(Mutex::new(collector));
@@ -297,8 +313,10 @@ fn run(payload: &str) -> io::Result<u8> {
     let first = Arc::new(AtomicI64::new(-1));
     let error = Arc::new(Mutex::new(None));
     let started = Instant::now();
+    #[cfg(test)]
+    let inject_stdout_failure = std::env::var_os("AETHYME_TEST_AGENT_DRAIN_FAILURE").is_some();
     macro_rules! drainer {
-        ($pipe:expr) => {{
+        ($pipe:expr, $inject:expr) => {{
             let (c, s, f, t, e) = (
                 collector.clone(),
                 stop.clone(),
@@ -308,23 +326,38 @@ fn run(payload: &str) -> io::Result<u8> {
             );
             std::thread::Builder::new()
                 .name("aethyme-agent-log".into())
-                .spawn(move || drain_pipe($pipe, c, s, t, f, e, started))
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if inject_stdout_failure && $inject {
+                            return Err(io::Error::other("injected agent pipe read failure"));
+                        }
+                        drain_pipe($pipe, c, s, t, f.clone(), e.clone(), started)
+                    }))
+                    .unwrap_or_else(|_| Err(io::Error::other("agent drainer panicked")));
+                    if let Err(error) = &result {
+                        f.store(true, Ordering::Release);
+                        let mut slot = e.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot.is_none() {
+                            *slot = Some(error.to_string().chars().take(512).collect());
+                        }
+                    }
+                    result
+                })
         }};
     }
-    let out = match drainer!(stdout) {
+    let out = match drainer!(stdout, true) {
         Ok(handle) => handle,
         Err(error) => {
-            crate::warn_unrecorded("stop agent after collector spawn failure", child.kill());
-            crate::warn_unrecorded("reap agent after collector spawn failure", child.wait());
+            stop_direct_child(&mut child);
             return Err(error);
         }
     };
-    let err = match drainer!(stderr) {
+    let err = match drainer!(stderr, false) {
         Ok(handle) => handle,
         Err(error) => {
             stop.store(true, Ordering::Release);
-            crate::warn_unrecorded("stop agent after collector spawn failure", child.kill());
-            crate::warn_unrecorded("reap agent after collector spawn failure", child.wait());
+            stop_direct_child(&mut child);
             crate::warn_unrecorded(
                 "join first agent collector",
                 out.join()
@@ -336,7 +369,33 @@ fn run(payload: &str) -> io::Result<u8> {
     };
     // This subprocess is the sole waiter for the shell. It survives launcher
     // exit and never signals a reaped PID or a process-group id after reaping.
-    let status = child.wait();
+    let status = loop {
+        if !matches!(cleanup.try_wait(), Ok(None)) {
+            let mut log = collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            log.write_note(
+                b"\naethyme: cleanup watcher exited before agent completion; capture INCOMPLETE\n",
+            );
+            crate::warn_unrecorded("persist cleanup watcher failure", log.sync_data());
+            // This process remains the original group leader. A failed watcher
+            // must not turn into permission to leave its command running.
+            unsafe {
+                libc::killpg(libc::getpid(), libc::SIGKILL);
+            }
+            std::process::exit(125);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(error) => break Err(error),
+            Ok(None) if failed.load(Ordering::Acquire) => {
+                break Err(io::Error::other(
+                    "agent pipe capture failed while command was running",
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
     let deadline = Instant::now() + PIPE_DRAIN_GRACE;
     while !(out.is_finished() && err.is_finished()) && Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -348,8 +407,18 @@ fn run(payload: &str) -> io::Result<u8> {
     let mut collector = collector
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(detail) = error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+    {
+        let detail = detail.chars().take(512).collect::<String>();
+        collector.write_note(format!("\naethyme: agent pipe capture error: {detail}\n").as_bytes());
+    }
+    let cleanup_ready = matches!(cleanup.try_wait(), Ok(None));
     let summary = collector.finish();
-    let complete = status.is_ok()
+    let complete = cleanup_ready
+        && status.is_ok()
         && !held_pipes
         && out_ok
         && err_ok
@@ -361,11 +430,126 @@ fn run(payload: &str) -> io::Result<u8> {
         b"\naethyme: agent capture INCOMPLETE (pipe, process or storage failure)\n"
     });
     collector.sync_data()?;
+    if !cleanup_ready {
+        unsafe {
+            libc::killpg(libc::getpid(), libc::SIGKILL);
+        }
+        std::process::exit(125);
+    }
     let status = status?;
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
         .clamp(0, 255) as u8)
+}
+
+/// Stop only an unreaped child owned by this process, with a bounded reap poll.
+/// Whole-group cleanup belongs to the still-live watcher after supervisor exit.
+#[cfg(unix)]
+fn stop_direct_child(child: &mut std::process::Child) {
+    use std::time::{Duration, Instant};
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Err(error) => {
+            crate::warn_unrecorded("inspect owned child before stop", Err::<(), _>(error));
+            return;
+        }
+        Ok(None) => {}
+    }
+    crate::warn_unrecorded("stop unreaped agent child", child.kill());
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Err(error) => {
+                crate::warn_unrecorded("poll owned child reap", Err::<(), _>(error));
+                return;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                crate::warn_unrecorded(
+                    "owned child reap remains incomplete",
+                    Err::<(), _>(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "child did not reap before cleanup deadline",
+                    )),
+                );
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_watcher(expected: &str) -> io::Result<u8> {
+    use std::io::Write as _;
+    let parent: i32 = expected.parse().map_err(io::Error::other)?;
+    if parent <= 1
+        || unsafe { libc::getppid() } != parent
+        || unsafe { libc::getpgrp() } != parent
+        || unsafe { libc::getpid() } == parent
+    {
+        return Err(io::Error::other("cleanup watcher ownership mismatch"));
+    }
+    let mut ready = io::stdout().lock();
+    writeln!(ready, "AETHYME_AGENT_READY cleanup-{parent}")?;
+    ready.flush()?;
+    drop(ready);
+    while unsafe { libc::getppid() } == parent {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("AETHYME_TEST_AGENT_CLEANUP_HOLD") {
+        let path = std::path::PathBuf::from(path);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    // This still-live member pins the original PGID after the supervisor dies.
+    // It kills itself with any remaining ordinary descendants, so no later
+    // signal can accidentally target a recycled process-group id.
+    if unsafe { libc::getpgrp() } != parent {
+        return Err(io::Error::other("cleanup watcher group changed"));
+    }
+    if unsafe { libc::killpg(parent, libc::SIGKILL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(125) // SIGKILL includes this watcher; reaching here is nonconclusive.
+}
+
+#[cfg(unix)]
+fn start_cleanup_watcher() -> io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let parent = std::process::id();
+    let mut process = Command::new(std::env::current_exe()?);
+    #[cfg(not(test))]
+    process.arg(CLEANUP_FLAG).arg(parent.to_string());
+    #[cfg(test)]
+    process
+        .args([
+            "--exact",
+            "agent_supervisor::tests::cleanup_child_fixture",
+            "--nocapture",
+            "--quiet",
+        ])
+        .env("AETHYME_TEST_AGENT_CLEANUP_PARENT", parent.to_string());
+    // Deliberately inherit the supervisor group, not process_group(0).
+    let mut child = process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let readiness = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing cleanup readiness pipe"))
+        .and_then(|mut stdout| await_ready(&mut stdout, &format!("cleanup-{parent}")));
+    if let Err(error) = readiness {
+        stop_direct_child(&mut child);
+        return Err(error);
+    }
+    Ok(child)
 }
 
 #[cfg(all(test, unix))]
@@ -390,6 +574,14 @@ mod tests {
             Some(125)
         );
         assert_eq!(super::dispatch(&["status".into()]), None);
+    }
+
+    #[test]
+    fn cleanup_child_fixture() {
+        let Ok(parent) = std::env::var("AETHYME_TEST_AGENT_CLEANUP_PARENT") else {
+            return;
+        };
+        std::process::exit(super::cleanup_watcher(&parent).unwrap_or(125).into());
     }
 
     fn initialized_repo(path: &std::path::Path) {
@@ -419,6 +611,16 @@ mod tests {
     }
 
     fn spawn(command: &str, repo: &std::path::Path, log: &std::path::Path) -> std::process::Child {
+        spawn_configured(command, repo, log, false, None)
+    }
+
+    fn spawn_configured(
+        command: &str,
+        repo: &std::path::Path,
+        log: &std::path::Path,
+        inject_failure: bool,
+        cleanup_hold: Option<&std::path::Path>,
+    ) -> std::process::Child {
         use std::os::unix::process::CommandExt as _;
         let log = std::fs::File::create(log).unwrap();
         let (mut process, nonce) = super::process(command, repo, &log).unwrap();
@@ -429,6 +631,14 @@ mod tests {
             .stderr(log)
             .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
             .process_group(0);
+        process.env_remove("AETHYME_TEST_AGENT_CLEANUP_HOLD");
+        if let Some(path) = cleanup_hold {
+            process.env("AETHYME_TEST_AGENT_CLEANUP_HOLD", path);
+        }
+        process.env_remove("AETHYME_TEST_AGENT_DRAIN_FAILURE");
+        if inject_failure {
+            process.env("AETHYME_TEST_AGENT_DRAIN_FAILURE", "1");
+        }
         let mut child = process.spawn().unwrap();
         let result = super::await_ready(child.stdout.as_mut().unwrap(), &nonce);
         if let Err(error) = result {
@@ -607,6 +817,170 @@ mod tests {
                 "detached capture did not finish"
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn assert_writer_stops(repo: &std::path::Path) {
+        // The cleanup watcher runs after the tracked supervisor's actual death.
+        // Allow its cooperative scheduling interval, then prove no more writes.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let path = repo.join("background-writes");
+        let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            before, after,
+            "same-group descendant kept writing after cleanup"
+        );
+    }
+
+    #[test]
+    fn closed_pipe_background_writer_stops_after_supervisor_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        initialized_repo(&repo);
+        let log = temp.path().join("agent.log");
+        let mut child = spawn(
+            "sh -c 'while :; do printf x >> background-writes; sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15; printf foreground-done",
+            &repo,
+            &log,
+        );
+        release(&mut child);
+        assert!(wait(&mut child).success());
+        assert!(
+            std::fs::metadata(repo.join("background-writes"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert_writer_stops(&repo);
+    }
+
+    #[test]
+    fn drainer_failure_stops_running_command_and_its_background_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        initialized_repo(&repo);
+        let log = temp.path().join("agent.log");
+        let mut child = spawn_configured(
+            "while :; do printf x >> background-writes; sleep 0.02; done",
+            &repo,
+            &log,
+            true,
+            None,
+        );
+        let started = std::time::Instant::now();
+        release(&mut child);
+        assert_eq!(wait(&mut child).code(), Some(125));
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        let bytes = std::fs::read(&log).unwrap();
+        assert!(
+            bytes.ends_with(
+                b"aethyme: agent capture INCOMPLETE (pipe, process or storage failure)\n"
+            )
+        );
+        assert_writer_stops(&repo);
+    }
+
+    #[test]
+    fn session_remains_live_until_the_cleanup_group_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        initialized_repo(&repo);
+        let log = temp.path().join("agent.log");
+        let hold = temp.path().join("hold-cleanup");
+        std::fs::write(&hold, b"test-owned barrier").unwrap();
+        let mut child = spawn_configured(
+            "sh -c 'while :; do printf x >> background-writes; sleep 0.02; done' >/dev/null 2>&1 & sleep 0.15",
+            &repo,
+            &log,
+            false,
+            Some(&hold),
+        );
+        let group = child.id() as i64;
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repo).unwrap();
+        let session = broker
+            .store()
+            .register_session(&crate::types::NewSession {
+                worktree_path: repo.to_string_lossy().into_owned(),
+                branch: "main".into(),
+                origin: crate::types::SessionOrigin::Spawned,
+                task: Some("supervisor cleanup liveness".into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: Some(group),
+                command: Some("test-owned background writer".into()),
+                log_path: Some(log.to_string_lossy().into_owned()),
+                agent_identity: None,
+            })
+            .unwrap();
+        release(&mut child);
+        assert!(wait(&mut child).success());
+        assert!(
+            !crate::broker::pid_alive(group),
+            "tracked supervisor was reaped"
+        );
+        assert!(
+            crate::broker::session_pid_alive(group),
+            "cleanup watcher and descendants must protect the session"
+        );
+        // Exercise both production session consumers while only the cleanup
+        // watcher and writer remain. Neither may grant cleanup candidacy.
+        for views in [
+            broker.agents_snapshot(i64::MAX).unwrap(),
+            broker.agents(i64::MAX).unwrap(),
+        ] {
+            let view = views
+                .iter()
+                .find(|view| view.session.id == session.id)
+                .unwrap();
+            assert_eq!(view.pid_alive, Some(true));
+            assert!(!view.derived_status.is_closed());
+        }
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
+        let before = std::fs::metadata(repo.join("background-writes"))
+            .unwrap()
+            .len();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            std::fs::metadata(repo.join("background-writes"))
+                .unwrap()
+                .len()
+                > before,
+            "test must exercise a writer after supervisor exit"
+        );
+        std::fs::remove_file(&hold).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::broker::session_pid_alive(group) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !crate::broker::session_pid_alive(group),
+            "group should become reclaimable only after all members exit"
+        );
+        let views = broker.agents(i64::MAX).unwrap();
+        let view = views
+            .iter()
+            .find(|view| view.session.id == session.id)
+            .unwrap();
+        assert_eq!(view.pid_alive, Some(false));
+        assert!(view.derived_status.is_closed());
+        assert_writer_stops(&repo);
+    }
+    #[test]
+    fn invalid_session_ownership_stays_protected_without_group_zero_probe() {
+        for pid in [0, -1, i64::from(i32::MAX) + 1] {
+            assert!(crate::broker::session_pid_alive(pid));
         }
     }
 }
