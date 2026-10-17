@@ -57,9 +57,11 @@ Library embedders whose own executable does not implement these modes must
 select a compatible local runtime with
 `Broker::with_agent_supervisor_executable`. Selection resolves an exact file
 without PATH search; the caller chooses its trust and version policy. A
-missing or unusable selected executable refuses agent start before allocating
-a checkout, session or log. Unix supervision is required; unsupported
-platforms return an explicit error.
+missing, nonregular or nonexecutable selected file refuses agent start before
+allocating a checkout, session or log. A file passing those checks must still
+implement the paired private protocol; protocol failure follows transactional
+startup rollback. Unix supervision is required; unsupported platforms return
+an explicit error.
 
 Spawned-agent logs retain at most 16 MiB across stdout and stderr, with a
 bounded prefix and tail. They are diagnostic excerpts. Interrupted capture
