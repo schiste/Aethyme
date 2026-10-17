@@ -4618,12 +4618,35 @@ mod tests {
             .env_remove(crate::BROKER_DB_ENV)
             .env_remove("AETHYME_TEST_DB_SUFFIX")
             .env_remove("AETHYME_WORKTREE_ROOT")
+            .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+            .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+            .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+            .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+            .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
             .env_remove(crate::disk_headroom::TEST_AVAILABLE_BYTES_ENV)
             .env_remove(crate::disk_headroom::TEST_AVAILABLE_INODES_ENV)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    fn open_detached_fixture_broker(root: &Path) -> Broker {
+        let marker_path = |name| {
+            PathBuf::from(
+                std::fs::read_to_string(detached_fixture_marker(root, name))
+                    .unwrap()
+                    .trim(),
+            )
+        };
+        let state = marker_path("host-state");
+        let options = crate::BrokerOpenOptions::default()
+            .with_host_state_dir(&state)
+            .with_host_cache_dir(marker_path("host-cache"))
+            .with_host_operation_database(state.join("host-operations.db"))
+            .with_worktree_root(marker_path("worktree-root"))
+            .with_collaboration_state(state.join("collaboration"));
+        Broker::open_with_options(root, options).unwrap()
     }
 
     #[test]
@@ -4635,7 +4658,8 @@ mod tests {
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
-        let mut broker = Broker::open(root).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
         broker
             .store()
             .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
@@ -4730,7 +4754,8 @@ mod tests {
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
-        let mut broker = Broker::open(root).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
         broker
             .store()
             .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
@@ -4834,7 +4859,8 @@ mod tests {
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
-        let mut broker = Broker::open(root).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
         broker
             .store()
             .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
@@ -4978,7 +5004,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(tmp.path().join(".git/info/exclude"), "target/\n").unwrap();
-        let mut broker = Broker::open(tmp.path()).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(tmp.path()).unwrap();
         let session = broker.start_worktree("retained build", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
@@ -5106,7 +5133,8 @@ mod tests {
             "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
-        let mut broker = Broker::open(root).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
 
         let session = broker
             .start_worktree("partial cache fixture", None)
@@ -5243,7 +5271,8 @@ mod tests {
         std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
         git(tmp.path(), &["add", "README.md"]);
         git(tmp.path(), &["commit", "-qm", "init"]);
-        let mut broker = Broker::open(tmp.path()).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(tmp.path()).unwrap();
 
         assert!(!broker.artifact_sweep_recovery_requested().unwrap());
         broker.persist_artifact_sweep_recovery_request().unwrap();
@@ -5280,12 +5309,7 @@ mod tests {
         let root = PathBuf::from(std::env::var_os(DETACHED_FIXTURE_ROOT_ENV).unwrap());
         match mode.as_str() {
             "setup" => {
-                let worktree_root =
-                    std::fs::read_to_string(detached_fixture_marker(&root, "worktree-root"))
-                        .unwrap();
-                let mut broker = Broker::open(&root)
-                    .unwrap()
-                    .with_worktree_root(worktree_root.trim());
+                let mut broker = open_detached_fixture_broker(&root);
                 let closed = broker.start_worktree("closed cache fixture", None).unwrap();
                 let closed_worktree = PathBuf::from(&closed.worktree_path);
                 std::fs::write(closed_worktree.join("landed.txt"), "landed\n").unwrap();
@@ -5425,7 +5449,7 @@ mod tests {
             }
             "crash-child" => {
                 let lock = acquire_artifact_sweep_worker_lock(&root).unwrap();
-                let mut broker = Broker::open(&root).unwrap();
+                let mut broker = open_detached_fixture_broker(&root);
                 std::fs::write(detached_fixture_marker(&root, "child-ready"), b"ready").unwrap();
                 assert!(wait_for_fixture_marker(
                     &detached_fixture_marker(&root, "parent-exited"),
@@ -5530,7 +5554,7 @@ mod tests {
             }
             "resume-child" => {
                 let lock = acquire_artifact_sweep_worker_lock(&root).unwrap();
-                let mut broker = Broker::open(&root).unwrap();
+                let mut broker = open_detached_fixture_broker(&root);
                 let closed_worktree = PathBuf::from(
                     std::fs::read_to_string(detached_fixture_marker(&root, "closed-worktree"))
                         .unwrap(),
@@ -6369,7 +6393,8 @@ mod tests {
             "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
-        let mut broker = Broker::open(root).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
 
         let mut make_closed = |label: &str| {
             let session = broker.start_worktree(label, None).unwrap();
@@ -6509,7 +6534,8 @@ mod tests {
             "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
-        let mut broker = Broker::open(root).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
 
         let mut make_closed = |label: &str| {
             let session = broker.start_worktree(label, None).unwrap();

@@ -1,0 +1,106 @@
+//! Owned storage for library test fixtures, selected before broker startup.
+
+use std::path::{Path, PathBuf};
+
+use crate::{Broker, BrokerOpError, BrokerOpenOptions};
+
+/// Keep this owner alive across every broker drop/reopen in one fixture.
+/// Storage is a sibling of the temporary repository, never an ambient host
+/// directory. Dropping a broker handle does not remove retained checkouts.
+pub(crate) struct TestStorage {
+    owner: tempfile::TempDir,
+}
+
+impl TestStorage {
+    pub(crate) fn new() -> Self {
+        Self {
+            owner: tempfile::tempdir().expect("create fixture storage owner"),
+        }
+    }
+
+    pub(crate) fn worktree_root(&self) -> PathBuf {
+        self.owner.path().join("worktrees")
+    }
+
+    pub(crate) fn options(&self) -> BrokerOpenOptions {
+        let state = self.owner.path().join("host-state");
+        BrokerOpenOptions::default()
+            .with_host_state_dir(&state)
+            .with_host_cache_dir(self.owner.path().join("host-cache"))
+            .with_host_operation_database(state.join("host-operations.db"))
+            .with_worktree_root(self.worktree_root())
+            .with_collaboration_state(self.owner.path().join("collaboration"))
+    }
+
+    pub(crate) fn open(&self, repository: &Path) -> Result<Broker, BrokerOpError> {
+        Broker::open_with_options(repository, self.options())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_options_bind_every_storage_domain_before_open() {
+        let storage = TestStorage::new();
+        let options = storage.options();
+        let root = storage.owner.path();
+        assert_eq!(options.host_state_dir, Some(root.join("host-state")));
+        assert_eq!(options.host_cache_dir, Some(root.join("host-cache")));
+        assert_eq!(
+            options.host_operation_db_path,
+            Some(root.join("host-state/host-operations.db"))
+        );
+        assert_eq!(options.worktree_root, Some(root.join("worktrees")));
+        assert_eq!(
+            options.collaboration_state_dir,
+            Some(root.join("collaboration"))
+        );
+    }
+
+    #[test]
+    fn storage_owner_preserves_checkouts_across_broker_reopen_then_removes_them() {
+        let repository = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(repository.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let storage = TestStorage::new();
+        let storage_root = storage.owner.path().to_path_buf();
+        let mut broker = storage.open(repository.path()).unwrap();
+        let session = broker.start_worktree("retained fixture", None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(worktree.starts_with(storage.worktree_root().canonicalize().unwrap()));
+        std::fs::write(worktree.join("uncommitted"), b"preserve across reopen").unwrap();
+        drop(broker);
+
+        assert!(worktree.is_dir());
+        let mut reopened = storage.open(repository.path()).unwrap();
+        assert_eq!(
+            reopened.store().session(session.id).unwrap().worktree_path,
+            session.worktree_path
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("uncommitted")).unwrap(),
+            b"preserve across reopen"
+        );
+        drop(reopened);
+        drop(storage);
+
+        assert!(!storage_root.exists());
+        assert!(!worktree.exists());
+        assert!(repository.path().join(".git").is_dir());
+    }
+}
