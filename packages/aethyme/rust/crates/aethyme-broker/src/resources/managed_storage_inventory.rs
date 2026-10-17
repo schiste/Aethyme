@@ -175,6 +175,191 @@ impl<'a> ManagedStorageOwner<'a> {
         }
     }
 
+    /// Capture root-instance identity for an existing charged ledger row that
+    /// has no lineage metadata yet. This only backfills a charge when a complete
+    /// scan exactly matches persisted measured bytes; it never starts a write or
+    /// adopts an untracked legacy cache root. Full pre-ledger root adoption needs
+    /// a separate complete inventory and claim-creation path before activation.
+    pub(crate) fn backfill_current_charge(
+        &mut self,
+        claim_id: &str,
+    ) -> Result<ManagedStorageClaim, HostResourceError> {
+        self.renew()?;
+        let claim = self
+            .coordinator
+            .managed_storage_claim(&self.repository, &self.root.filesystem_id, claim_id)?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_claim_missing",
+                    "there is no persisted claim to backfill",
+                )
+            })?;
+        self.validate_request(&claim.request)?;
+        if claim.state != super::ManagedStorageClaimState::Charged {
+            return Err(managed_storage_refusal(
+                "managed_storage_backfill_state",
+                "only a measured charged claim can be backfilled",
+            ));
+        }
+        let inventory = scan_complete(&self.root, &self.grant, &claim.request)?;
+        self.renew()?;
+        inventory.validate_for(&claim.request, &self.grant)?;
+        if !inventory.root_present
+            || inventory.root_instance_id.is_none()
+            || claim.measured_bytes != Some(inventory.allocated_bytes)
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_backfill_mismatch",
+                "complete current inventory must match the exact persisted charge before backfill",
+            ));
+        }
+        self.coordinator.backfill_managed_storage_lineage(
+            &claim.request,
+            inventory.allocated_bytes,
+            inventory.root_instance_id.as_deref().ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_root_instance_missing",
+                    "present root has no stable instance identity",
+                )
+            })?,
+        )
+    }
+
+    /// Admit a new finite write to a previously charged cache root. The
+    /// predecessor charge stays counted while the new claim reserves only its
+    /// incremental growth. The same root and baseline are rescanned while the
+    /// exact preparation-cache owner is held.
+    pub(crate) fn reserve_mutation(
+        &mut self,
+        request: &ManagedStorageClaimRequest,
+        predecessor_claim_id: &str,
+    ) -> Result<ManagedStorageAdmission, HostResourceError> {
+        self.validate_request(request)?;
+        if predecessor_claim_id == request.claim_id {
+            return Err(managed_storage_refusal(
+                "managed_storage_self_predecessor",
+                "a mutation claim cannot name itself as its charged predecessor",
+            ));
+        }
+        self.renew()?;
+        if let Some(existing) = self.coordinator.managed_storage_claim(
+            &request.repository,
+            &request.filesystem_id,
+            &request.claim_id,
+        )? {
+            let lineage = super::load_managed_storage_lineage(
+                &self.coordinator.conn,
+                &request.repository,
+                &request.filesystem_id,
+                &request.claim_id,
+            )?;
+            if existing.request != *request
+                || lineage
+                    .as_ref()
+                    .and_then(|row| row.predecessor_claim_id.as_deref())
+                    != Some(predecessor_claim_id)
+            {
+                return Err(HostResourceError::IdempotencyMismatch(
+                    request.claim_id.clone(),
+                ));
+            }
+            return Ok(ManagedStorageAdmission::Existing(existing));
+        }
+
+        let predecessor = self
+            .coordinator
+            .managed_storage_claim(
+                &request.repository,
+                &request.filesystem_id,
+                predecessor_claim_id,
+            )?
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_predecessor_missing",
+                    "the charged predecessor claim does not exist",
+                )
+            })?;
+        self.validate_request(&predecessor.request)?;
+        if predecessor.state != super::ManagedStorageClaimState::Charged
+            || predecessor.request.materialization != request.materialization
+            || predecessor.request.root_identity != request.root_identity
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_predecessor_stale",
+                "mutation requires the current charged claim for this exact root",
+            ));
+        }
+        let baseline_bytes = predecessor.measured_bytes.ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_predecessor_unmeasured",
+                "predecessor has no measured size",
+            )
+        })?;
+        let lineage = super::load_managed_storage_lineage(
+            &self.coordinator.conn,
+            &request.repository,
+            &request.filesystem_id,
+            predecessor_claim_id,
+        )?
+        .ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_backfill_required",
+                "the predecessor root identity must be backfilled before mutation",
+            )
+        })?;
+        if lineage.superseded_by_claim_id.is_some() || lineage.root_instance_id.is_none() {
+            return Err(managed_storage_refusal(
+                "managed_storage_predecessor_stale",
+                "the predecessor is superseded or has no pinned root instance",
+            ));
+        }
+        let inventory = scan_complete(&self.root, &self.grant, &predecessor.request)?;
+        self.renew()?;
+        inventory.validate_for(&predecessor.request, &self.grant)?;
+        if !inventory.root_present
+            || inventory.allocated_bytes != baseline_bytes
+            || inventory.root_instance_id != lineage.root_instance_id
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_mutation_baseline_changed",
+                "the exact charged root no longer matches its measured baseline and instance",
+            ));
+        }
+        let free_bytes =
+            crate::disk_headroom::available_bytes(&self.root.parent).ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_free_bytes_unknown",
+                    "filesystem free space could not be measured; mutation reservation is refused",
+                )
+            })?;
+        let root_instance_id = lineage.root_instance_id.ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_predecessor_unmeasured",
+                "predecessor has no root-instance identity",
+            )
+        })?;
+        let baseline = super::ManagedStorageMutationBaseline {
+            predecessor_claim_id: predecessor_claim_id.to_owned(),
+            measured_bytes: baseline_bytes,
+            root_instance_id,
+        };
+        match self
+            .coordinator
+            .reserve_managed_storage_mutation(request, free_bytes, baseline)?
+        {
+            ManagedStorageReservationResult::Created(_) => Ok(
+                ManagedStorageAdmission::Materialize(ManagedStorageGrowthPermit {
+                    request: request.clone(),
+                    lease_id: self.grant.lease.lease_id.clone(),
+                    generation: self.grant.lease.generation,
+                }),
+            ),
+            ManagedStorageReservationResult::Existing(claim) => {
+                Ok(ManagedStorageAdmission::Existing(claim))
+            }
+        }
+    }
+
     /// Reconcile one new materialization. The complete receipt never escapes
     /// the owner and is consumed immediately after a post-scan lease renewal.
     pub(crate) fn reconcile_new(
@@ -299,8 +484,12 @@ impl<'a> ManagedStorageOwner<'a> {
     ) -> Result<ManagedStorageClaim, HostResourceError> {
         self.validate_request(request)?;
         inventory.validate_for(request, &self.grant)?;
-        self.coordinator
-            .reconcile_managed_storage_claim(request, inventory.allocated_bytes)
+        self.coordinator.reconcile_managed_storage_claim(
+            request,
+            inventory.allocated_bytes,
+            inventory.root_instance_id.as_deref(),
+            inventory.root_present,
+        )
     }
 }
 
@@ -325,6 +514,7 @@ struct CompleteManagedStorageInventory {
     lease_id: String,
     generation: u64,
     allocated_bytes: u64,
+    root_instance_id: Option<String>,
     entry_count: usize,
     inventory_digest: String,
     root_present: bool,
@@ -346,6 +536,7 @@ impl CompleteManagedStorageInventory {
             || self.generation != grant.lease.generation
             || self.inventory_digest.is_empty()
             || self.entry_count == 0
+            || self.root_present != self.root_instance_id.is_some()
         {
             return Err(managed_storage_refusal(
                 "managed_storage_inventory_mismatch",
@@ -542,6 +733,7 @@ fn scan_complete(
     }
 
     let mut scanner = Scanner::new(expected_device, Instant::now() + SCAN_MAX_DURATION);
+    let mut root_instance_id = None;
     let root_present = if let Some(root_stat) = root_stat {
         if file_type(&root_stat) != libc::S_IFDIR || root_stat.st_dev as u64 != expected_device {
             return Err(managed_storage_refusal(
@@ -556,6 +748,10 @@ fn scan_complete(
             &opened_stat,
             "managed root changed while it was being opened",
         )?;
+        root_instance_id = Some(format!(
+            "unix-inode-v1:{}:{}",
+            opened_stat.st_dev, opened_stat.st_ino
+        ));
         scanner.visit_directory(root_fd.as_raw_fd(), &leaf_path, 0, Some(&opened_stat))?;
         let named_after = stat_at(parent_fd.as_raw_fd(), &leaf_c, libc::AT_SYMLINK_NOFOLLOW)
             .map_err(|source| HostResourceError::Io {
@@ -596,6 +792,9 @@ fn scan_complete(
     receipt_hash.update(root.leaf.as_bytes());
     receipt_hash.update(scanner.allocated_bytes.to_le_bytes());
     receipt_hash.update((scanner.entry_count as u64).to_le_bytes());
+    if let Some(root_instance_id) = &root_instance_id {
+        receipt_hash.update(root_instance_id.as_bytes());
+    }
     Ok(CompleteManagedStorageInventory {
         repository: request.repository.clone(),
         filesystem_id: root.filesystem_id.clone(),
@@ -605,6 +804,7 @@ fn scan_complete(
         lease_id: grant.lease.lease_id.clone(),
         generation: grant.lease.generation,
         allocated_bytes: scanner.allocated_bytes,
+        root_instance_id,
         entry_count: scanner.entry_count.max(1),
         inventory_digest: format!("{:x}", receipt_hash.finalize()),
         root_present,
@@ -1069,6 +1269,7 @@ mod tests {
     use super::*;
     use crate::resources::{
         HostResourceKind, HostResourceRequest, HostResourceRequirement, ManagedStoragePolicy,
+        VerifiedManagedStorageRemoval,
     };
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
@@ -1304,6 +1505,270 @@ mod tests {
             ManagedStorageAdmission::Existing(existing)
                 if existing.state == crate::resources::ManagedStorageClaimState::Reserved
         ));
+    }
+
+    #[test]
+    fn existing_untracked_root_is_not_adopted_by_lineage_backfill() {
+        let mut fixture = Fixture::new();
+        let request = fixture.claim("untracked-existing", 16 * 1024);
+        std::fs::create_dir(&fixture.materialization_root).unwrap();
+        std::fs::write(fixture.materialization_root.join("legacy"), b"legacy bytes").unwrap();
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let mut owner = fixture.owner().unwrap();
+
+        let reserve_error = owner.reserve(&request).unwrap_err();
+        assert_eq!(
+            conflict_code(&reserve_error),
+            Some("managed_storage_root_not_fresh")
+        );
+        let backfill_error = owner
+            .backfill_current_charge(&request.claim_id)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&backfill_error),
+            Some("managed_storage_claim_missing")
+        );
+        assert!(
+            owner
+                .coordinator
+                .managed_storage_claim(&repository, &filesystem_id, &request.claim_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn charged_root_mutation_backfills_then_swaps_charge_and_gc_releases_the_chain() {
+        let mut fixture = Fixture::new();
+        let first = fixture.claim("first-charge", 1_000_000);
+        let second = fixture.claim("second-epoch", 64 * 1024);
+        let root = fixture.materialization_root.clone();
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let root_identity = fixture.root_identity.clone();
+        let mut owner = fixture.owner().unwrap();
+        let first_permit = expect_permit(owner.reserve(&first).unwrap());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("base"), vec![1_u8; 4_096]).unwrap();
+        let first_charged = owner.reconcile_new(first_permit).unwrap();
+        let first_bytes = first_charged.measured_bytes.unwrap();
+        assert!(first_bytes > 0);
+
+        // A migrated v1 charge has no root-generation record. Backfill only
+        // after a complete scan matches the exact persisted byte count.
+        owner
+            .coordinator
+            .conn
+            .execute(
+                "DELETE FROM managed_storage_claim_lineage WHERE repository=?1
+                 AND filesystem_id=?2 AND claim_id=?3",
+                params![repository, filesystem_id, first.claim_id],
+            )
+            .unwrap();
+        owner.backfill_current_charge(&first.claim_id).unwrap();
+
+        let second_permit = match owner.reserve_mutation(&second, &first.claim_id).unwrap() {
+            ManagedStorageAdmission::Materialize(permit) => permit,
+            ManagedStorageAdmission::Existing(claim) => {
+                panic!("new mutation unexpectedly returned status: {claim:?}")
+            }
+        };
+        std::fs::write(root.join("growth"), vec![2_u8; 8_192]).unwrap();
+        let second_charged = owner.reconcile_new(second_permit).unwrap();
+        let second_bytes = second_charged.measured_bytes.unwrap();
+        assert!(second_bytes > first_bytes);
+        let first_lineage = load_managed_storage_lineage(
+            &owner.coordinator.conn,
+            &repository,
+            &filesystem_id,
+            &first.claim_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first_lineage.superseded_by_claim_id.as_deref(),
+            Some(second.claim_id.as_str())
+        );
+
+        let cleanup = owner
+            .coordinator
+            .mark_managed_storage_cleanup_pending(&second)
+            .unwrap();
+        assert_eq!(
+            cleanup.state,
+            crate::resources::ManagedStorageClaimState::CleanupPending
+        );
+        let receipt = VerifiedManagedStorageRemoval::after_complete_no_follow_removal(
+            repository.clone(),
+            filesystem_id.clone(),
+            second.claim_id.clone(),
+            root_identity,
+            "complete-chain-removal".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        owner
+            .coordinator
+            .release_managed_storage_claim(&receipt)
+            .unwrap();
+        for claim_id in [&first.claim_id, &second.claim_id] {
+            let claim = owner
+                .coordinator
+                .managed_storage_claim(&repository, &filesystem_id, claim_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                claim.state,
+                crate::resources::ManagedStorageClaimState::Released
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_requires_exact_baseline_and_does_not_double_count_superseded_charge() {
+        let mut fixture = Fixture::new();
+        let first = fixture.claim("mutation-first", 1_000_000);
+        let second = fixture.claim("mutation-second", 64 * 1024);
+        let third = fixture.claim("mutation-third", 1);
+        let root = fixture.materialization_root.clone();
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let mut owner = fixture.owner().unwrap();
+        let first_permit = expect_permit(owner.reserve(&first).unwrap());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("base"), vec![3_u8; 4_096]).unwrap();
+        let first_charged = owner.reconcile_new(first_permit).unwrap();
+
+        std::fs::write(root.join("external-growth"), vec![4_u8; 4_096]).unwrap();
+        let error = owner
+            .reserve_mutation(&second, &first.claim_id)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_mutation_baseline_changed")
+        );
+        assert!(
+            owner
+                .coordinator
+                .managed_storage_claim(&repository, &filesystem_id, &second.claim_id)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_file(root.join("external-growth")).unwrap();
+
+        let second_permit = match owner.reserve_mutation(&second, &first.claim_id).unwrap() {
+            ManagedStorageAdmission::Materialize(permit) => permit,
+            ManagedStorageAdmission::Existing(claim) => {
+                panic!("new mutation unexpectedly returned status: {claim:?}")
+            }
+        };
+        std::fs::write(root.join("growth"), vec![5_u8; 8_192]).unwrap();
+        let second_charged = owner.reconcile_new(second_permit).unwrap();
+        let second_bytes = second_charged.measured_bytes.unwrap();
+        assert!(second_bytes > first_charged.measured_bytes.unwrap());
+
+        // If the superseded first charge were counted again, this exact cap
+        // would reject a one-byte next epoch. The current root alone fits.
+        owner
+            .coordinator
+            .set_managed_storage_policy(&ManagedStoragePolicy {
+                repository: repository.clone(),
+                filesystem_id: filesystem_id.clone(),
+                managed_cap_bytes: second_bytes + 1,
+                free_reserve_bytes: 0,
+            })
+            .unwrap();
+        let self_predecessor = owner.reserve_mutation(&third, &third.claim_id).unwrap_err();
+        assert_eq!(
+            conflict_code(&self_predecessor),
+            Some("managed_storage_self_predecessor")
+        );
+        assert!(matches!(
+            owner.reserve_mutation(&third, &second.claim_id).unwrap(),
+            ManagedStorageAdmission::Materialize(_)
+        ));
+    }
+
+    #[test]
+    fn restarted_mutation_reconciles_pending_claim_without_replaying_write() {
+        let mut fixture = Fixture::new();
+        let first = fixture.claim("crash-first", 1_000_000);
+        let second = fixture.claim("crash-pending", 64 * 1024);
+        let root = fixture.materialization_root.clone();
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        {
+            let mut owner = fixture.owner().unwrap();
+            let first_permit = expect_permit(owner.reserve(&first).unwrap());
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("base"), vec![6_u8; 4_096]).unwrap();
+            owner.reconcile_new(first_permit).unwrap();
+            let pending = owner.reserve_mutation(&second, &first.claim_id).unwrap();
+            assert!(matches!(pending, ManagedStorageAdmission::Materialize(_)));
+            std::fs::write(root.join("partial-growth"), vec![7_u8; 2_048]).unwrap();
+        }
+
+        drop(fixture.coordinator);
+        fixture.coordinator = HostResourceCoordinator::open(&fixture.database).unwrap();
+        let mut owner = fixture.owner().unwrap();
+        assert!(matches!(
+            owner.reserve_mutation(&second, &first.claim_id).unwrap(),
+            ManagedStorageAdmission::Existing(claim)
+                if claim.state == crate::resources::ManagedStorageClaimState::Reserved
+        ));
+        let recovered = owner.reconcile_existing(&second).unwrap();
+        assert_eq!(
+            recovered.state,
+            crate::resources::ManagedStorageClaimState::Charged
+        );
+        let predecessor_lineage = load_managed_storage_lineage(
+            &owner.coordinator.conn,
+            &repository,
+            &filesystem_id,
+            &first.claim_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            predecessor_lineage.superseded_by_claim_id.as_deref(),
+            Some(second.claim_id.as_str())
+        );
+    }
+
+    #[test]
+    fn replacement_root_instance_refuses_mutation_even_when_bytes_match() {
+        let mut fixture = Fixture::new();
+        let first = fixture.claim("replace-first", 1_000_000);
+        let second = fixture.claim("replace-second", 64 * 1024);
+        let root = fixture.materialization_root.clone();
+        let held_old = fixture._temp.path().join("held-old-root");
+        let repository = fixture.repository.clone();
+        let filesystem_id = fixture.filesystem_id.clone();
+        let mut owner = fixture.owner().unwrap();
+        let first_permit = expect_permit(owner.reserve(&first).unwrap());
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("same"), vec![8_u8; 4_096]).unwrap();
+        owner.reconcile_new(first_permit).unwrap();
+
+        std::fs::rename(&root, &held_old).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("same"), vec![8_u8; 4_096]).unwrap();
+        let error = owner
+            .reserve_mutation(&second, &first.claim_id)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_mutation_baseline_changed")
+        );
+        assert!(
+            owner
+                .coordinator
+                .managed_storage_claim(&repository, &filesystem_id, &second.claim_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
