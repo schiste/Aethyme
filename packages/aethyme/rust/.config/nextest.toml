@@ -1,13 +1,21 @@
 # cargo-nextest configuration for the packages/aethyme/rust workspace.
 #
-# nextest runs every test in its own process, so tests cannot share
-# in-process state; it also schedules tests across all test binaries at
-# once, which is where most of its speed over `cargo test` comes from.
-# It does not run doctests or example targets: CI runs those with
-# `cargo test --doc` and `cargo test --examples` separately.
+# nextest runs each test in its own process and schedules tests across all
+# test binaries. It does not run doctests or example targets; CI runs those
+# with cargo test --doc and cargo test --examples separately.
 
 [profile.default]
-# Local runs keep nextest's defaults.
+# Preserve nextest's standard behavior for direct invocations.
+
+[profile.local]
+# Ordinary local runs keep compile and test concurrency bounded.
+test-threads = 2
+retries = 0
+fail-fast = true
+# Keep passing output quiet while retaining each failure in the final report.
+failure-output = "final"
+success-output = "never"
+status-level = "fail"
 
 [profile.ci]
 # Report every failure in one run instead of stopping at the first.
@@ -24,6 +32,4 @@ failure-output = "immediate-final"
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.ci.junit]
-# packages/aethyme/scripts/test-like-ci.sh reads per-test durations from this
-# report to print the slowest tests after every run, local or CI (#598).
 path = "junit.xml"
