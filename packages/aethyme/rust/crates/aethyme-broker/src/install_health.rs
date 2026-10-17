@@ -1,6 +1,6 @@
 //! Whether this machine's Aethyme installation is coherent and current.
 //!
-//! Two failures motivated this module, and neither announced itself.
+//! Three failures motivated this module, and none announced itself.
 //!
 //! **The pair split.** `aethyme` and `aethyme-engine-cli` are one product in
 //! two binaries and must be installed together. On a machine that develops
@@ -12,16 +12,23 @@
 //! **The stale release.** `aethyme update check` has always computed the right
 //! answer, and nothing ever ran it.
 //!
+//! **The stale Claude plugin.** Claude Code caches the plugin's hook files by
+//! `plugin.json` version. When the bundled hooks change without a version bump,
+//! an installed copy can keep running the old behavior after the CLI updates.
+//! The CLI now compares the installed files with the copies embedded at build
+//! time and names the update or reinstall command when they differ.
+//!
 //! So the answers are reported where they are already free: `aethyme plugin
 //! status`, which exists to say whether the installation works, and the
 //! `SessionStart` hook, which fires at a turn boundary that costs no tokens.
 //!
 //! ## Reporting is the whole contract
 //!
-//! Nothing here installs, upgrades, or repairs anything, and nothing here
-//! reaches the network. `aethyme update` keeps its stance that changing the
-//! binaries is explicit and confirmed; this only ever prints a sentence and
-//! names the command a person may choose to run.
+//! Nothing here installs, upgrades, or repairs anything. Plugin freshness is
+//! checked from local files only, and the session hook never waits on a network.
+//! `aethyme update` keeps its stance that changing binaries is explicit and
+//! confirmed; this only ever prints a sentence and names the command a person
+//! may choose to run.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -31,6 +38,31 @@ use crate::update_cache;
 
 /// Set to `off` to silence every notice and suppress the cache refresh.
 pub const DISABLE_ENVIRONMENT_VARIABLE: &str = "AETHYME_UPDATE_CHECK";
+const CLAUDE_PLUGIN_ROOT_ENVIRONMENT_VARIABLE: &str = "CLAUDE_PLUGIN_ROOT";
+const CLAUDE_PLUGIN_REPAIR_COMMAND: &str = "claude plugin marketplace update aethyme && \
+    claude plugin update aethyme@aethyme";
+const CLAUDE_PLUGIN_REINSTALL_COMMAND: &str = "claude plugin uninstall aethyme@aethyme && \
+    claude plugin install aethyme@aethyme";
+
+// The command-side hook logic is distributed as a Claude plugin, separately
+// from this binary. Embed the files the hook runs so a newly installed CLI can
+// recognize a cached plugin that still carries older hook behavior.
+const CLAUDE_PLUGIN_HOOK_FILES: &[(&str, &[u8])] = &[
+    (
+        "hooks/hooks.json",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../plugins/aethyme/hooks/hooks.json"
+        )),
+    ),
+    (
+        "hooks/aethyme-hook.sh",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../plugins/aethyme/hooks/aethyme-hook.sh"
+        )),
+    ),
+];
 
 pub const ROUTER_BINARY: &str = "aethyme";
 pub const ENGINE_BINARY: &str = "aethyme-engine-cli";
@@ -174,11 +206,43 @@ pub fn session_start_warnings(now_unix_ms: i64) -> Vec<String> {
     if let Some(warning) = pair_warning(&resolve_pair()) {
         warnings.push(format!("Aethyme: {warning}"));
     }
+    if let Some(warning) =
+        claude_plugin_warning_from_root(std::env::var_os(CLAUDE_PLUGIN_ROOT_ENVIRONMENT_VARIABLE))
+    {
+        warnings.push(format!("Aethyme: {warning}"));
+    }
     match cached_release_warning(now_unix_ms) {
         Some(warning) => warnings.push(warning),
         None => prime_release_cache(now_unix_ms),
     }
     warnings
+}
+
+/// What to say when Claude Code's cached plugin cannot run the hooks this
+/// binary was built to expect. No plugin root means another agent surface (or
+/// a direct CLI invocation), so it is intentionally silent.
+fn claude_plugin_warning(plugin_root: Option<&std::path::Path>) -> Option<String> {
+    let plugin_root = plugin_root?;
+    let current = CLAUDE_PLUGIN_HOOK_FILES
+        .iter()
+        .all(|(relative_path, bundled)| {
+            std::fs::read(plugin_root.join(relative_path))
+                .is_ok_and(|installed| installed.as_slice() == *bundled)
+        });
+    if current {
+        None
+    } else {
+        Some(format!(
+            "Claude Code's installed Aethyme plugin is missing or has stale hook files. \
+             Update it with `{CLAUDE_PLUGIN_REPAIR_COMMAND}`. If Claude reports it is \
+             already current, reinstall it with `{CLAUDE_PLUGIN_REINSTALL_COMMAND}`."
+        ))
+    }
+}
+
+fn claude_plugin_warning_from_root(plugin_root: Option<std::ffi::OsString>) -> Option<String> {
+    let plugin_root = plugin_root.map(PathBuf::from);
+    claude_plugin_warning(plugin_root.as_deref())
 }
 
 fn disabled() -> bool {
@@ -252,6 +316,48 @@ pub(crate) fn first_line_of(command: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_bundled_plugin_hooks(root: &std::path::Path) {
+        for (relative_path, bundled) in CLAUDE_PLUGIN_HOOK_FILES {
+            let path = root.join(relative_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bundled).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_current_claude_plugin_is_silent() {
+        let root = tempfile::tempdir().unwrap();
+        write_bundled_plugin_hooks(root.path());
+
+        assert_eq!(
+            claude_plugin_warning_from_root(Some(root.path().as_os_str().to_os_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_claude_plugin_root_is_silent() {
+        assert_eq!(claude_plugin_warning_from_root(None), None);
+    }
+
+    #[test]
+    fn stale_or_incomplete_claude_hooks_name_update_and_reinstall_commands() {
+        let root = tempfile::tempdir().unwrap();
+        write_bundled_plugin_hooks(root.path());
+        std::fs::write(root.path().join("hooks/hooks.json"), b"stale hooks").unwrap();
+
+        let plugin_root = Some(root.path().as_os_str().to_os_string());
+        let warning =
+            claude_plugin_warning_from_root(plugin_root.clone()).expect("stale plugin warning");
+        assert!(warning.contains(CLAUDE_PLUGIN_REPAIR_COMMAND));
+        assert!(warning.contains(CLAUDE_PLUGIN_REINSTALL_COMMAND));
+
+        std::fs::remove_file(root.path().join("hooks/aethyme-hook.sh")).unwrap();
+        let warning =
+            claude_plugin_warning_from_root(plugin_root).expect("incomplete plugin warning");
+        assert!(warning.contains("missing or has stale hook files"));
+    }
 
     #[test]
     fn the_program_name_is_dropped_and_the_build_kept() {
