@@ -10,6 +10,8 @@ use std::process::Command;
 
 use aethyme_broker::{Broker, IntegrationRefreshTrigger};
 
+mod common;
+
 const INTEGRATION: &str = "refs/heads/aethyme/integration";
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -121,8 +123,8 @@ impl Fixture {
         git(&self.root, &["rev-parse", INTEGRATION])
     }
 
-    fn broker(&self) -> Broker {
-        Broker::open(&self.root).unwrap()
+    fn broker(&self) -> common::FixtureBroker {
+        common::open_fixture_broker(&self.root, self._tmp.path()).unwrap()
     }
 }
 

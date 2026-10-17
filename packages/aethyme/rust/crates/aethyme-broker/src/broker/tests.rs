@@ -7,6 +7,8 @@ use crate::types::{MergeQueueEntry, Session, SessionOrigin, SessionStatus};
 use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
 use std::path::{Path, PathBuf};
 
+mod storage_context_startup;
+
 #[test]
 fn routine_inventory_zero_budget_is_incomplete_and_cannot_authorize_cleanup() {
     let repo = tempfile::tempdir().unwrap();
