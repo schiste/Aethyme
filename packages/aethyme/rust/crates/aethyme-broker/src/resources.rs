@@ -844,7 +844,6 @@ impl HostResourceCoordinator {
                 request.materialization,
                 request.root_identity,
                 requested_i64,
-                requested_i64,
                 now
             ],
         )?;
