@@ -533,7 +533,7 @@ fn scan_complete(
     let expected_device = parse_filesystem_identity(&root.filesystem_id)?;
     if parent_before.st_dev as u64 != expected_device
         || parent_before.st_dev as u64 != root.parent_device
-        || parent_before.st_ino as u64 != root.parent_inode
+        || parent_before.st_ino != root.parent_inode
     {
         return Err(managed_storage_refusal(
             "managed_storage_filesystem_changed",
@@ -664,21 +664,25 @@ impl Scanner {
         if dir_stat.st_dev as u64 != self.device || file_type(&dir_stat) != libc::S_IFDIR {
             return Err(scan_refusal("directory crossed filesystem or changed type"));
         }
-        if let Some(expected) = expected {
-            if !same_identity(expected, &dir_stat) {
-                return Err(scan_refusal(
-                    "directory identity changed before enumeration",
-                ));
-            }
+        if expected.is_some_and(|expected| !same_identity(expected, &dir_stat)) {
+            return Err(scan_refusal(
+                "directory identity changed before enumeration",
+            ));
         }
         self.count_stat(&dir_stat, b".")?;
 
+        // SAFETY: `fd` is the live directory descriptor checked above; `fcntl`
+        // duplicates it and returns either a new owned descriptor or -1.
         let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if duplicate < 0 {
             return Err(io_failure(path));
         }
+        // SAFETY: `duplicate` is a fresh descriptor owned by this function;
+        // on success `fdopendir` takes ownership, and on failure we close it.
         let stream = unsafe { libc::fdopendir(duplicate) };
         if stream.is_null() {
+            // SAFETY: `fdopendir` failed and therefore did not take ownership
+            // of this freshly duplicated descriptor.
             unsafe { libc::close(duplicate) };
             return Err(io_failure(path));
         }
@@ -686,6 +690,8 @@ impl Scanner {
         let mut names = Vec::<Vec<u8>>::new();
         loop {
             set_errno(0);
+            // SAFETY: `stream` uniquely owns this DIR pointer and is used only
+            // by this scan; `readdir` returns a borrowed entry for that stream.
             let entry = unsafe { libc::readdir(stream.0) };
             if entry.is_null() {
                 if get_errno() != 0 {
@@ -693,11 +699,13 @@ impl Scanner {
                 }
                 break;
             }
+            // SAFETY: `readdir` returned a live entry whose `d_name` is
+            // NUL-terminated and remains valid until the next `readdir` call.
             let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
             if name == b"." || name == b".." {
                 continue;
             }
-            if names.len() % 256 == 0 {
+            if names.len().is_multiple_of(256) {
                 self.check_deadline(path)?;
             }
             if self.entry_count.saturating_add(names.len()) >= SCAN_MAX_ENTRIES {
@@ -754,10 +762,7 @@ impl Scanner {
     }
 
     fn count_stat(&mut self, stat: &libc::stat, name: &[u8]) -> Result<(), HostResourceError> {
-        if self
-            .seen_inodes
-            .insert((stat.st_dev as u64, stat.st_ino as u64))
-        {
+        if self.seen_inodes.insert((stat.st_dev as u64, stat.st_ino)) {
             let blocks = u64::try_from(stat.st_blocks)
                 .map_err(|_| scan_refusal("negative allocated block count"))?;
             let bytes = blocks
@@ -775,10 +780,10 @@ impl Scanner {
         self.digest.update((name.len() as u64).to_le_bytes());
         self.digest.update(name);
         self.digest.update((stat.st_dev as u64).to_le_bytes());
-        self.digest.update((stat.st_ino as u64).to_le_bytes());
+        self.digest.update(stat.st_ino.to_le_bytes());
         self.digest.update((stat.st_mode as u64).to_le_bytes());
-        self.digest.update((stat.st_size as i64).to_le_bytes());
-        self.digest.update((stat.st_blocks as i64).to_le_bytes());
+        self.digest.update(stat.st_size.to_le_bytes());
+        self.digest.update(stat.st_blocks.to_le_bytes());
         if self.entry_count > SCAN_MAX_ENTRIES {
             return Err(scan_refusal("entry limit exceeded"));
         }
@@ -802,6 +807,8 @@ struct DirectoryStream(*mut libc::DIR);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for DirectoryStream {
     fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the non-null DIR pointer returned
+        // by `fdopendir`; `closedir` closes its descriptor and frees the stream.
         unsafe {
             libc::closedir(self.0);
         }
@@ -816,6 +823,8 @@ fn open_absolute_directory_nofollow(
     use std::os::unix::ffi::OsStrExt as _;
 
     let root = std::ffi::CString::new("/").expect("static path has no NUL");
+    // SAFETY: `root` is a valid NUL-terminated path for this call; `open`
+    // returns a new descriptor on success, which is adopted below.
     let raw = unsafe {
         libc::open(
             root.as_ptr(),
@@ -825,6 +834,8 @@ fn open_absolute_directory_nofollow(
     if raw < 0 {
         return Err(io_failure(Path::new("/")));
     }
+    // SAFETY: `open` succeeded, so `raw` is a newly owned descriptor and is
+    // transferred exactly once into `OwnedFd`.
     let mut current = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
     for component in path.components() {
         let std::path::Component::Normal(name) = component else {
@@ -840,6 +851,8 @@ fn open_absolute_directory_nofollow(
         };
         let name = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| scan_refusal("directory component contained an invalid NUL"))?;
+        // SAFETY: `current` is a live directory descriptor and `name` is a
+        // valid NUL-terminated component; `openat` returns a new descriptor.
         let next = unsafe {
             libc::openat(
                 current.as_raw_fd(),
@@ -850,6 +863,8 @@ fn open_absolute_directory_nofollow(
         if next < 0 {
             return Err(io_failure(path));
         }
+        // SAFETY: `openat` succeeded, so `next` is a newly owned descriptor;
+        // transferring it drops the previous parent descriptor exactly once.
         current = unsafe { std::os::fd::OwnedFd::from_raw_fd(next) };
     }
     Ok(current)
@@ -862,6 +877,8 @@ fn openat_directory(
     path: &Path,
 ) -> Result<std::os::fd::OwnedFd, HostResourceError> {
     use std::os::fd::FromRawFd as _;
+    // SAFETY: `parent` is a live directory descriptor and `name` is a valid
+    // NUL-terminated entry name; `openat` returns a new descriptor.
     let raw = unsafe {
         libc::openat(
             parent,
@@ -872,6 +889,7 @@ fn openat_directory(
     if raw < 0 {
         return Err(io_failure(path));
     }
+    // SAFETY: `openat` succeeded and returned a newly owned descriptor.
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
 }
 
@@ -882,6 +900,8 @@ fn openat_regular(
     path: &Path,
 ) -> Result<std::fs::File, HostResourceError> {
     use std::os::fd::FromRawFd as _;
+    // SAFETY: `parent` is a live directory descriptor and `name` is a valid
+    // NUL-terminated entry name; `openat` returns a new descriptor.
     let raw = unsafe {
         libc::openat(
             parent,
@@ -892,6 +912,7 @@ fn openat_regular(
     if raw < 0 {
         return Err(io_failure(path));
     }
+    // SAFETY: `openat` succeeded and returned a newly owned descriptor.
     Ok(unsafe { std::fs::File::from_raw_fd(raw) })
 }
 
@@ -902,18 +923,24 @@ fn stat_at(
     flags: libc::c_int,
 ) -> std::io::Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `parent` is an open directory descriptor, `name` is NUL
+    // terminated, and `stat` points to writable uninitialized output storage.
     if unsafe { libc::fstatat(parent, name.as_ptr(), stat.as_mut_ptr(), flags) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: successful `fstatat` initialized the complete `libc::stat` value.
     Ok(unsafe { stat.assume_init() })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn fstat(fd: libc::c_int, path: &Path) -> Result<libc::stat, HostResourceError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is an open descriptor and `stat` points to writable
+    // uninitialized output storage for the system call.
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
         return Err(io_failure(path));
     }
+    // SAFETY: successful `fstat` initialized the complete `libc::stat` value.
     Ok(unsafe { stat.assume_init() })
 }
 
@@ -1011,6 +1038,8 @@ fn io_failure(path: &Path) -> HostResourceError {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn set_errno(value: libc::c_int) {
+    // SAFETY: the platform errno accessor returns a writable pointer to this
+    // thread's errno slot, valid for the current thread.
     unsafe {
         *errno_location() = value;
     }
@@ -1018,16 +1047,20 @@ fn set_errno(value: libc::c_int) {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn get_errno() -> libc::c_int {
+    // SAFETY: the platform errno accessor returns a readable pointer to this
+    // thread's errno slot, valid for the current thread.
     unsafe { *errno_location() }
 }
 
 #[cfg(target_os = "macos")]
 unsafe fn errno_location() -> *mut libc::c_int {
+    // SAFETY: `__error` is the macOS libc accessor for this thread's errno slot.
     unsafe { libc::__error() }
 }
 
 #[cfg(target_os = "linux")]
 unsafe fn errno_location() -> *mut libc::c_int {
+    // SAFETY: `__errno_location` is the Linux libc accessor for this thread's errno slot.
     unsafe { libc::__errno_location() }
 }
 

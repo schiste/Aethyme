@@ -13,9 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod managed_storage_inventory;
-pub(crate) use managed_storage_inventory::{
-    ManagedStorageAdmission, ManagedStorageGrowthPermit, ManagedStorageOwner,
-};
+pub(crate) use managed_storage_inventory::ManagedStorageOwner;
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
 /// Additive ledger version; the shared host-resource schema remains version 1.
