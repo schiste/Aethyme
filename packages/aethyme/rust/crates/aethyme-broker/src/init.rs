@@ -1318,10 +1318,12 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
                     r#"["pnpm", "install", "--frozen-lockfile"]"#,
                     r#"["pnpm", "install", "--offline", "--frozen-lockfile"]"#,
                     r#"["package.json", "pnpm-lock.yaml"]"#,
-                    "pnpm hard-links node_modules out of one content-addressable store, so \
-                     worktrees on the store's volume already share one copy; to give this \
-                     repository its own store, set repository_shared and pass \
-                     --store-dir \"$AETHYME_PREPARE_CACHE_DIR\" through sh -c. \
+                    "pnpm can share package content through hard links when the store and \
+                     worktrees use the same filesystem and the installation mode permits it. \
+                     A store on another filesystem causes copies; repository_shared does not \
+                     guarantee deduplication. To select this repository's store, set \
+                     repository_shared and pass --store-dir \"$AETHYME_PREPARE_CACHE_DIR\" \
+                     through sh -c. \
                      pnpm's dev server accepts an ephemeral port with --port 0 and prints \
                      the bound one; prefer that over a fixed PORT in a gate.",
                 ));
@@ -1339,9 +1341,10 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
                     r#"["npm", "ci"]"#,
                     r#"["npm", "ci", "--offline"]"#,
                     r#"["package.json", "package-lock.json"]"#,
-                    "npm copies every package into each worktree. Under many concurrent \
-                     worktrees, migrating to pnpm and setting repository_shared is the \
-                     difference between one copy on disk and one per session.",
+                    "npm installs packages into each worktree. A shared download cache does \
+                     not remove those copies. pnpm can share package content when its store \
+                     and worktrees use the same filesystem and its installation mode permits \
+                     hard links; repository_shared alone does not guarantee deduplication.",
                 ));
             }
             NodeRunner::Npm => guidance.push(
@@ -1443,13 +1446,15 @@ pub fn draft_prepare_config(main_root: &Path) -> Option<String> {
          #\n\
          # cache = \"worktree_local\"    each worktree installs its own copy.\n\
          # cache = \"repository_shared\" exports AETHYME_PREPARE_CACHE_DIR and serializes\n\
-         #                            writers in host state, so concurrent worktrees share\n\
-         #                            one package-manager store. Costs a lock and a shared\n\
-         #                            directory; use it when installs are the bottleneck.\n\
+         #                            writers in host state. The command must explicitly\n\
+         #                            use that path as its package-manager store. Worktree\n\
+         #                            outputs can still allocate a separate copy per session.\n\
+         #                            Sharing a cache is not a storage quota.\n\
          #\n\
          # The store is keyed by preparation digest, so a repository whose lockfile\n\
          # changes between branches grows one directory per distinct input set. Uncomment\n\
-         # to cap it; the store is rotated when it exceeds the budget.\n\
+         # to request rotation above this threshold before preparation. This is not a\n\
+         # write quota: a running install can exceed it, and worktree outputs are separate.\n\
          # [shared_cache]\n\
          # max_bytes = 21474836480\n\
          #\n\

@@ -33,6 +33,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+- When exercising no-follow storage paths, canonicalize the fixture-owned
+  temporary root before deriving its database and cache paths. Platform aliases
+  such as macOS `/var` must not turn a valid fixture into a symlink traversal;
+  keep the production no-follow check intact.
 - Give background-writer tests an independent, fixture-owned stop condition
   and a finite write limit. Deliberately breaking production cleanup must not
   leave the test itself writing indefinitely after an assertion fails.
