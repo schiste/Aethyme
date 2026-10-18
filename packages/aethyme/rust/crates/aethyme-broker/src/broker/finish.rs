@@ -462,6 +462,21 @@ impl Broker {
         options: FinishOptions,
         abandon_reason: Option<&str>,
     ) -> Result<FinishReport, BrokerOpError> {
+        self.finish_with_options_inner_with_retention_audit(
+            session_id,
+            options,
+            abandon_reason,
+            |broker, at_ms| broker.cleanup_retention(at_ms),
+        )
+    }
+
+    pub(super) fn finish_with_options_inner_with_retention_audit(
+        &mut self,
+        session_id: i64,
+        options: FinishOptions,
+        abandon_reason: Option<&str>,
+        retention_audit: impl FnOnce(&Self, i64) -> Result<CleanupRetention, BrokerOpError>,
+    ) -> Result<FinishReport, BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
         let at_ms = now_ms();
@@ -470,8 +485,10 @@ impl Broker {
             .iter()
             .rev()
             .find(|entry| entry.session_id == session_id);
-        let retention = self.cleanup_retention(at_ms)?;
-        let retention_warning = cleanup_retention_warning(&retention);
+        let retention_warning =
+            finish_retention_warning(crate::git::active_git_deadline().is_some(), || {
+                retention_audit(self, at_ms)
+            })?;
         // Cleanup is safe only when the repository policy can be read and
         // explicitly permits automation. A malformed policy therefore keeps
         // a worktree available for manual review rather than deleting it.
@@ -1058,6 +1075,21 @@ impl Broker {
         let expected = self.main_git_common_dir()?;
         Ok(actual == expected)
     }
+}
+
+fn finish_retention_warning(
+    deadline_active: bool,
+    retention_audit: impl FnOnce() -> Result<CleanupRetention, BrokerOpError>,
+) -> Result<Option<String>, BrokerOpError> {
+    if deadline_active {
+        return Ok(Some(
+            "retention audit deferred because finish has a command-scoped Git deadline; inspect with `aethyme broker gc plan`"
+                .into(),
+        ));
+    }
+
+    let retention = retention_audit()?;
+    Ok(cleanup_retention_warning(&retention))
 }
 
 fn canonical_path_or_missing(path: &Path) -> Result<PathBuf, GitError> {
