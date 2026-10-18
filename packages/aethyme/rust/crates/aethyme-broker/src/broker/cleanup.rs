@@ -54,6 +54,37 @@ fn ownership_inspection_error(path: &Path, action: &str, error: std::io::Error) 
     }
 }
 
+fn worktree_size_estimate(
+    path: &Path,
+    record_key: &str,
+    worktree_present: bool,
+    broker_owned: bool,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+    measure: impl FnOnce(&Path) -> Option<crate::disk_headroom::DirectoryUsage>,
+) -> (Option<u64>, Option<u64>) {
+    if !worktree_present {
+        return (Some(0), Some(0));
+    }
+    if !broker_owned {
+        return (None, None);
+    }
+    if scan.measures() {
+        let measured = measure(path);
+        if let Some(usage) = measured {
+            records.record_usage(record_key, usage.bytes, Some(usage.inodes), now_ms());
+        }
+        measured
+            .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
+            .unwrap_or((None, None))
+    } else {
+        records
+            .get(record_key)
+            .map(|record| (Some(record.bytes), record.inodes))
+            .unwrap_or((None, None))
+    }
+}
+
 impl Broker {
     /// Whether a directory is the remains of a worktree of *this* repository
     /// whose registration is already gone.
@@ -642,29 +673,6 @@ impl Broker {
         if !worktree_present && branch_tip.is_none() {
             return Ok(None);
         }
-        let (estimated_bytes, estimated_inodes) = if !worktree_present {
-            // Nothing on disk is a measured zero, not an unknown.
-            (Some(0), Some(0))
-        } else if scan.measures() {
-            let measured =
-                crate::disk_headroom::directory_usage_without_following_links(&worktree_path).ok();
-            if let Some(usage) = measured {
-                records.record_usage(
-                    &session.worktree_path,
-                    usage.bytes,
-                    Some(usage.inodes),
-                    now_ms(),
-                );
-            }
-            measured
-                .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
-                .unwrap_or((None, None))
-        } else {
-            records
-                .get(&session.worktree_path)
-                .map(|record| (Some(record.bytes), record.inodes))
-                .unwrap_or((None, None))
-        };
         let unreachable = (!worktree_present)
             .then(|| {
                 crate::worktree_location::unavailable_configured_location(
@@ -673,12 +681,23 @@ impl Broker {
                 )
             })
             .flatten();
+        let broker_owned =
+            unreachable.is_none() && self.is_broker_owned_worktree(session, &worktree_path);
+        let (estimated_bytes, estimated_inodes) = worktree_size_estimate(
+            &worktree_path,
+            &session.worktree_path,
+            worktree_present,
+            broker_owned,
+            scan,
+            records,
+            |path| crate::disk_headroom::directory_usage_without_following_links(path).ok(),
+        );
         let (mut disposition, mut reason, provenance) = if let Some(reason) = unreachable {
             // An unplugged drive is not a deleted worktree. Proposing cleanup
             // here would act on a checkout nobody can see, so it stays blocked
             // until the volume is back.
             (CleanupDisposition::InspectionFailed, reason, None)
-        } else if !self.is_broker_owned_worktree(session, &worktree_path) {
+        } else if !broker_owned {
             (
                 CleanupDisposition::UnsafePath,
                 "spawned session path is outside the broker-owned worktree directory".into(),
@@ -1112,7 +1131,9 @@ impl Broker {
         let paths = plan
             .worktrees
             .iter()
-            .filter(|item| item.worktree_present)
+            .filter(|item| {
+                item.worktree_present && item.disposition != CleanupDisposition::UnsafePath
+            })
             .map(|item| item.worktree_path.clone())
             .collect::<Vec<_>>();
         let ttl_ms = i64::from(policy.size_record_ttl_hours).saturating_mul(3_600_000);
@@ -1570,6 +1591,118 @@ impl Broker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cleanup_size_ownership_tests {
+    use super::worktree_size_estimate;
+    use crate::measurement::{SizeRecords, SizeScan};
+
+    #[test]
+    fn unowned_replacement_is_not_measured_or_reported_from_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let broker_root = temp.path().join("broker-worktrees");
+        let replacement = temp.path().join("replaced-session-path");
+        std::fs::create_dir_all(&broker_root).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        assert!(!replacement.starts_with(&broker_root));
+
+        let key = replacement.to_string_lossy().into_owned();
+        let mut records = SizeRecords::default();
+        records.record_usage(&key, 4096, Some(3), 1);
+        let mut measurement_calls = 0;
+        let measured = worktree_size_estimate(
+            &replacement,
+            &key,
+            true,
+            false,
+            SizeScan::Measure,
+            &mut records,
+            |_| {
+                measurement_calls += 1;
+                panic!("an unowned path must not be traversed for size")
+            },
+        );
+        assert_eq!(measured, (None, None));
+        assert_eq!(measurement_calls, 0);
+
+        let recorded = worktree_size_estimate(
+            &replacement,
+            &key,
+            true,
+            false,
+            SizeScan::Recorded,
+            &mut records,
+            |_| {
+                measurement_calls += 1;
+                None
+            },
+        );
+        assert_eq!(recorded, (None, None));
+        assert_eq!(measurement_calls, 0);
+    }
+
+    #[test]
+    fn owned_existing_path_is_measured_once_and_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("owned-worktree");
+        std::fs::create_dir(&path).unwrap();
+        let key = path.to_string_lossy().into_owned();
+        let mut records = SizeRecords::default();
+        let mut measurement_calls = 0;
+
+        let estimate = worktree_size_estimate(
+            &path,
+            &key,
+            true,
+            true,
+            SizeScan::Measure,
+            &mut records,
+            |measured_path| {
+                measurement_calls += 1;
+                assert_eq!(measured_path, path.as_path());
+                Some(crate::disk_headroom::DirectoryUsage {
+                    bytes: 8192,
+                    inodes: 5,
+                })
+            },
+        );
+
+        assert_eq!(estimate, (Some(8192), Some(5)));
+        assert_eq!(measurement_calls, 1);
+        assert_eq!(
+            records
+                .get(&key)
+                .map(|record| (record.bytes, record.inodes)),
+            Some((8192, Some(5)))
+        );
+    }
+
+    #[test]
+    fn absent_path_is_zero_without_measuring() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("absent-worktree");
+        let key = path.to_string_lossy().into_owned();
+        let mut records = SizeRecords::default();
+        let mut measurement_calls = 0;
+
+        let estimate = worktree_size_estimate(
+            &path,
+            &key,
+            false,
+            false,
+            SizeScan::Measure,
+            &mut records,
+            |_| {
+                measurement_calls += 1;
+                panic!("an absent path must not be measured")
+            },
+        );
+
+        assert_eq!(estimate, (Some(0), Some(0)));
+        assert_eq!(measurement_calls, 0);
+        assert_eq!(records.get(&key), None);
     }
 }
 
