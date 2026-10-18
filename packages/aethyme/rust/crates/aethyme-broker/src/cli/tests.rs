@@ -1349,3 +1349,19 @@ fn a_read_only_refusal_names_the_cause_the_fix_and_the_snapshot_alternative() {
          For the recorded snapshot now: run it without --refresh"
     );
 }
+
+#[test]
+fn identity_recovery_usage_names_the_dispatched_command() {
+    let parsed = match super::parse(&args(&["identity", "plan"])) {
+        Ok(parsed) => parsed,
+        Err(_) => panic!("identity plan arguments should parse"),
+    };
+    let Err(UsageError::Message(message)) = super::gc_storage::run_storage(parsed) else {
+        panic!("missing identity recovery paths should report usage before opening state");
+    };
+    assert!(
+        message.starts_with("usage: aethyme broker storage identity <plan|apply> "),
+        "{message}"
+    );
+    assert!(message.contains("--confirm <old-sha256:new-sha256:owner-marker-sha256>"));
+}
