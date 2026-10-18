@@ -782,7 +782,7 @@ pub(crate) fn apply_root_identity_recovery(
         repository_key,
         confirm,
         &directory_identity,
-        |_, _, _| Ok(()),
+        || Ok(()),
     )
 }
 
@@ -793,7 +793,7 @@ fn apply_root_identity_recovery_with(
     repository_key: &str,
     confirm: &str,
     identity_reader: &impl Fn(&Path, &Metadata) -> io::Result<Option<DirectoryIdentity>>,
-    before_compare_and_swap: impl FnOnce(&Connection, &str, &str) -> io::Result<()>,
+    before_compare_and_swap: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<RootIdentityRecoveryPlan> {
     apply_root_identity_recovery_with_hooks(
         host_database,
@@ -804,7 +804,7 @@ fn apply_root_identity_recovery_with(
         identity_reader,
         RootIdentityRecoveryHooks {
             before_compare_and_swap,
-            after_update_before_reobservation: |_, _, _| Ok(()),
+            after_update_before_reobservation: || Ok(()),
         },
     )
 }
@@ -824,8 +824,8 @@ fn apply_root_identity_recovery_with_hooks<BeforeUpdate, AfterUpdate>(
     hooks: RootIdentityRecoveryHooks<BeforeUpdate, AfterUpdate>,
 ) -> io::Result<RootIdentityRecoveryPlan>
 where
-    BeforeUpdate: FnOnce(&Connection, &str, &str) -> io::Result<()>,
-    AfterUpdate: FnOnce(&Connection, &str, &str) -> io::Result<()>,
+    BeforeUpdate: FnOnce() -> io::Result<()>,
+    AfterUpdate: FnOnce() -> io::Result<()>,
 {
     let RootIdentityRecoveryHooks {
         before_compare_and_swap,
@@ -852,7 +852,7 @@ where
 
     // This hook is a no-op in production. It makes a writer that ignores the
     // registry lock deterministic in the CAS regression test.
-    before_compare_and_swap(&connection, &prepared.key, &prepared.previous_payload)?;
+    before_compare_and_swap()?;
 
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -875,7 +875,7 @@ where
 
     // This test-only hook models an external marker writer after the row has
     // been updated but before the transaction's final live reobservation.
-    after_update_before_reobservation(&transaction, &prepared.key, &prepared.replacement_payload)?;
+    after_update_before_reobservation()?;
 
     let observed = observe_recovery_record(
         &prepared.replacement_record,
@@ -2030,7 +2030,7 @@ mod tests {
             &owner.repository_key,
             &plan.confirmation,
             &current_recovery_identity,
-            |_, _, _| Ok(()),
+            || Ok(()),
         )
         .unwrap();
         assert!(applied.applied);
@@ -2055,7 +2055,7 @@ mod tests {
                 &owner.repository_key,
                 &plan.confirmation,
                 &current_recovery_identity,
-                |_, _, _| Ok(()),
+                || Ok(()),
             )
             .is_err()
         );
@@ -2086,7 +2086,7 @@ mod tests {
             &owner.repository_key,
             &plan.confirmation,
             &current_recovery_identity,
-            |_, _, _| Ok(()),
+            || Ok(()),
         )
         .expect_err("confirmation must pin exact owner marker bytes across plan/apply");
 
@@ -2119,8 +2119,8 @@ mod tests {
             &plan.confirmation,
             &current_recovery_identity,
             RootIdentityRecoveryHooks {
-                before_compare_and_swap: |_, _, _| Ok(()),
-                after_update_before_reobservation: |_, _, _| {
+                before_compare_and_swap: || Ok(()),
+                after_update_before_reobservation: || {
                     let mut production_marker =
                         serde_json::to_vec_pretty(&owner).map_err(invalid)?;
                     production_marker.push(b'\n');
@@ -2192,7 +2192,7 @@ mod tests {
             &owner.repository_key,
             &plan.confirmation,
             &current_recovery_identity,
-            |_, _, _| Ok(()),
+            || Ok(()),
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
@@ -2222,7 +2222,7 @@ mod tests {
             &owner.repository_key,
             &plan.confirmation,
             &current_recovery_identity,
-            |_, _, _| {
+            || {
                 fs::rename(&root, &retained)?;
                 fs::create_dir(&root)?;
                 fs::write(
@@ -2278,7 +2278,7 @@ mod tests {
                 &owner.repository_key,
                 &plan.confirmation,
                 &current_recovery_identity,
-                |_, _, _| Ok(()),
+                || Ok(()),
             )
             .is_err()
         );
@@ -2311,7 +2311,7 @@ mod tests {
                 &owner.repository_key,
                 &plan.confirmation,
                 &current_recovery_identity,
-                |_, _, _| Ok(()),
+                || Ok(()),
             )
             .is_err()
         );
@@ -2343,7 +2343,7 @@ mod tests {
                 &owner.repository_key,
                 &plan.confirmation,
                 &current_recovery_identity,
-                |_, _, _| Ok(()),
+                || Ok(()),
             )
             .is_err()
         );
@@ -2371,11 +2371,12 @@ mod tests {
                 &owner.repository_key,
                 &plan.confirmation,
                 &current_recovery_identity,
-                |connection, key, _| {
+                || {
+                    let connection = open_existing_registry_for_write(&fixture.database)?;
                     let changed = connection
                         .execute(
                             "UPDATE roots SET payload=?1 WHERE key=?2",
-                            params![competing_payload, key],
+                            params![competing_payload, record_key(&root)],
                         )
                         .map_err(invalid)?;
                     assert_eq!(changed, 1);
