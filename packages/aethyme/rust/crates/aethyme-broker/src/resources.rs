@@ -1124,47 +1124,45 @@ where
     F: FnMut(&str),
 {
     #[cfg(unix)]
-    let mut signal_error = {
+    {
         event("sending SIGTERM to the still-owned supervised process group");
-        let result = signal_unreaped_process_group(process, libc::SIGTERM);
-        if let Err(error) = &result {
+        if let Err(error) = signal_unreaped_process_group(process, libc::SIGTERM) {
             event(&format!("SIGTERM request failed: {error}"));
         }
-        result.err()
-    };
+    }
     #[cfg(not(unix))]
-    let mut signal_error = {
+    {
         event("force-killing the still-owned supervised child on this platform");
-        let result = kill_unreaped_child(process);
-        if let Err(error) = &result {
+        if let Err(error) = kill_unreaped_child(process) {
             event(&format!("direct-child kill request failed: {error}"));
         }
-        result.err()
-    };
+    }
 
     if let Some(status) = wait_for_child_exit(process, AUTHORITY_LOSS_TERM_GRACE)? {
         return Ok(Some(status));
     }
 
     #[cfg(unix)]
-    {
+    let signal_error = {
         // `wait_for_child_exit` ended with `try_wait() == None`, so the leader
         // remains unreaped. Only now escalate, and never signal this group once
         // a status has been collected.
         event("SIGTERM grace expired; sending SIGKILL to the unreaped process group");
-        signal_error = signal_unreaped_process_group(process, libc::SIGKILL).err();
-        if let Some(error) = &signal_error {
+        let result = signal_unreaped_process_group(process, libc::SIGKILL);
+        if let Err(error) = &result {
             event(&format!("SIGKILL request failed: {error}"));
         }
-    }
+        result.err()
+    };
     #[cfg(not(unix))]
-    {
+    let signal_error = {
         event("direct-child kill grace expired; retrying kill while it remains unreaped");
-        signal_error = kill_unreaped_child(process).err();
-        if let Some(error) = &signal_error {
+        let result = kill_unreaped_child(process);
+        if let Err(error) = &result {
             event(&format!("direct-child kill retry failed: {error}"));
         }
-    }
+        result.err()
+    };
 
     let status = wait_for_child_exit(process, AUTHORITY_LOSS_KILL_GRACE)?;
     if status.is_none() {
