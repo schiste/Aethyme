@@ -1128,14 +1128,7 @@ impl Broker {
             return Ok(());
         };
         let mut records = crate::measurement::load_size_records(&self.main_root);
-        let paths = plan
-            .worktrees
-            .iter()
-            .filter(|item| {
-                item.worktree_present && item.disposition != CleanupDisposition::UnsafePath
-            })
-            .map(|item| item.worktree_path.clone())
-            .collect::<Vec<_>>();
+        let paths = size_warm_candidates(plan);
         let ttl_ms = i64::from(policy.size_record_ttl_hours).saturating_mul(3_600_000);
         let Some(path) = records.next_to_measure(&paths, now_ms(), ttl_ms) else {
             return Ok(());
@@ -1594,10 +1587,64 @@ impl Broker {
     }
 }
 
+fn size_warm_candidates(plan: &CleanupPlan) -> Vec<String> {
+    plan.worktrees
+        .iter()
+        .filter(|item| item.worktree_present && item.disposition != CleanupDisposition::UnsafePath)
+        .map(|item| item.worktree_path.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod cleanup_size_ownership_tests {
-    use super::worktree_size_estimate;
+    use super::{size_warm_candidates, worktree_size_estimate};
     use crate::measurement::{SizeRecords, SizeScan};
+    use crate::{CleanupDisposition, CleanupPlan, CleanupWorktreePlan, SessionOrigin};
+
+    fn worktree_plan(
+        path: &str,
+        present: bool,
+        disposition: CleanupDisposition,
+    ) -> CleanupWorktreePlan {
+        CleanupWorktreePlan {
+            session_id: 1,
+            worktree_path: path.to_owned(),
+            worktree_present: present,
+            branch_ref: "refs/heads/test".to_owned(),
+            branch_tip: None,
+            delete_branch: false,
+            origin: SessionOrigin::Spawned,
+            disposition,
+            provenance: None,
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: String::new(),
+            inspection_commands: Vec::new(),
+            force_cleanup_command: String::new(),
+        }
+    }
+
+    #[test]
+    fn warm_candidates_skip_unsafe_and_absent_worktrees_but_keep_owned_dirty_entries() {
+        let plan = CleanupPlan {
+            worktrees: vec![
+                worktree_plan("/unsafe", true, CleanupDisposition::UnsafePath),
+                worktree_plan("/owned-dirty", true, CleanupDisposition::Dirty),
+                worktree_plan(
+                    "/owned-unproven",
+                    true,
+                    CleanupDisposition::UnprovenProvenance,
+                ),
+                worktree_plan("/absent", false, CleanupDisposition::Eligible),
+            ],
+            ..CleanupPlan::default()
+        };
+
+        assert_eq!(
+            size_warm_candidates(&plan),
+            vec!["/owned-dirty", "/owned-unproven"]
+        );
+    }
 
     #[test]
     fn unowned_replacement_is_not_measured_or_reported_from_cache() {
