@@ -72,9 +72,9 @@ identity, and the retained row remains unchanged. A raw mismatch leaves absence
 unknown.
 
 Recover one mismatched legacy row with
-`aethyme broker storage identity plan <host-operation-db> <exact-root>`, then
+`aethyme broker gc storage identity plan <host-operation-db> <exact-root>`, then
 review its exact old and replacement payload hashes and apply them with
-`aethyme broker storage identity apply <host-operation-db> <exact-root>
+`aethyme broker gc storage identity apply <host-operation-db> <exact-root>
 --confirm <old-sha256:new-sha256:owner-marker-sha256>`. The marker digest binds
 the exact bytes observed during planning; apply rechecks those same bytes after
 the payload update and rolls back if they changed. Marker validation accepts
