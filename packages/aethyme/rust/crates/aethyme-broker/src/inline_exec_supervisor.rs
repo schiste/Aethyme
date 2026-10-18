@@ -16,6 +16,9 @@ const FLAG: &str = "--aethyme-inline-exec-supervisor-v2";
 const FRAME_MAGIC: &[u8; 4] = b"AIX2";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Polling for an idle control channel is short, but once a frame starts the
+// complete frame still has a fixed assembly budget.
+const FRAME_IO_TIMEOUT: std::time::Duration = READY_TIMEOUT;
 const HELPER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const GROUP_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -25,7 +28,7 @@ pub(crate) enum InlineExecError {
     CommandStart(io::Error),
     CommandOutcomeUnknown(String),
     CleanupUnknown(String),
-    Operation(crate::BrokerOpError),
+    OperationAfterDispatch(crate::BrokerOpError),
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -577,7 +580,7 @@ impl InlineExecSupervisor {
             if let Err(error) = heartbeat() {
                 let cleanup = self.abort_and_verify();
                 return match cleanup {
-                    Ok(()) => Err(InlineExecError::Operation(error)),
+                    Ok(()) => Err(InlineExecError::OperationAfterDispatch(error)),
                     Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
                 };
             }
@@ -1353,58 +1356,66 @@ fn read_frame_until<T: serde::de::DeserializeOwned>(
     stream: &mut std::os::unix::net::UnixStream,
     deadline: std::time::Instant,
 ) -> io::Result<T> {
-    read_frame_deadline(stream, deadline, false)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "inline helper frame timed out before its first byte",
-        )
+    with_nonblocking(stream, |stream| {
+        let mut received_any = false;
+        let mut magic = [0u8; 4];
+        read_exact_until(stream, &mut magic, deadline, &mut received_any)?;
+        read_frame_after_magic(stream, magic, deadline, &mut received_any)
     })
 }
 
 #[cfg(unix)]
 fn read_frame_timeout<T: serde::de::DeserializeOwned>(
     stream: &mut std::os::unix::net::UnixStream,
-    timeout: std::time::Duration,
-) -> io::Result<Option<T>> {
-    read_frame_deadline(stream, std::time::Instant::now() + timeout, true)
-}
-
-#[cfg(unix)]
-fn read_frame_deadline<T: serde::de::DeserializeOwned>(
-    stream: &mut std::os::unix::net::UnixStream,
-    deadline: std::time::Instant,
-    allow_empty_timeout: bool,
+    idle_timeout: std::time::Duration,
 ) -> io::Result<Option<T>> {
     with_nonblocking(stream, |stream| {
         let mut received_any = false;
         let mut magic = [0u8; 4];
-        if let Err(error) = read_exact_until(stream, &mut magic, deadline, &mut received_any) {
-            if allow_empty_timeout && !received_any && error.kind() == io::ErrorKind::TimedOut {
+        let idle_deadline = std::time::Instant::now() + idle_timeout;
+        if let Err(error) =
+            read_exact_until(stream, &mut magic[..1], idle_deadline, &mut received_any)
+        {
+            if !received_any && error.kind() == io::ErrorKind::TimedOut {
                 return Ok(None);
             }
             return Err(error);
         }
-        if &magic != FRAME_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "inline helper frame has invalid version marker",
-            ));
-        }
-        let mut length = [0u8; 4];
-        read_exact_until(stream, &mut length, deadline, &mut received_any)?;
-        let length = u32::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_FRAME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "inline helper frame exceeds its size limit",
-            ));
-        }
-        let mut payload = vec![0; length];
-        read_exact_until(stream, &mut payload, deadline, &mut received_any)?;
-        serde_json::from_slice(&payload)
-            .map(Some)
-            .map_err(io::Error::other)
+
+        // The short timeout above only answers whether a new frame has begun.
+        // Once its first byte arrives, keep one absolute deadline for the rest
+        // of the frame so a stalled or dripping peer cannot extend it forever.
+        let frame_deadline = std::time::Instant::now() + FRAME_IO_TIMEOUT;
+        read_exact_until(stream, &mut magic[1..], frame_deadline, &mut received_any)?;
+        read_frame_after_magic(stream, magic, frame_deadline, &mut received_any).map(Some)
     })
+}
+
+#[cfg(unix)]
+fn read_frame_after_magic<T: serde::de::DeserializeOwned>(
+    stream: &mut std::os::unix::net::UnixStream,
+    magic: [u8; 4],
+    deadline: std::time::Instant,
+    received_any: &mut bool,
+) -> io::Result<T> {
+    if &magic != FRAME_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inline helper frame has invalid version marker",
+        ));
+    }
+    let mut length = [0u8; 4];
+    read_exact_until(stream, &mut length, deadline, received_any)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inline helper frame exceeds its size limit",
+        ));
+    }
+    let mut payload = vec![0; length];
+    read_exact_until(stream, &mut payload, deadline, received_any)?;
+    serde_json::from_slice(&payload).map_err(io::Error::other)
 }
 
 #[cfg(unix)]
@@ -1985,6 +1996,88 @@ mod tests {
     }
 
     #[test]
+    fn idle_poll_timeout_does_not_limit_partial_frame_assembly() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+        use std::time::{Duration, Instant};
+
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let payload = serialize_frame_payload(&HelperFrame::Ready).unwrap();
+        let length = frame_length(&payload).unwrap();
+        let mut encoded = Vec::with_capacity(8 + payload.len());
+        encoded.extend_from_slice(FRAME_MAGIC);
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(&payload);
+
+        // Queue the first byte before starting the reader, then wait until the
+        // reader consumed it. The remaining bytes arrive after its 100 ms idle
+        // poll interval but well within the fixed full-frame budget.
+        writer.write_all(&encoded[..1]).unwrap();
+        let remainder = encoded[1..].to_vec();
+        let reader_fd = reader.as_raw_fd();
+        let reader_thread = std::thread::spawn(move || {
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100))
+        });
+
+        let consume_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match poll_control(reader_fd, 0).unwrap() {
+                ControlPoll::Pending => break,
+                ControlPoll::Readable if Instant::now() < consume_deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                ControlPoll::Readable => panic!("reader did not consume the first frame byte"),
+                ControlPoll::Writable | ControlPoll::Closed => {
+                    panic!("unexpected reader socket state while consuming frame")
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        let delivery = writer.write_all(&remainder);
+        let frame = reader_thread.join().unwrap();
+        assert!(
+            matches!(frame.as_ref(), Ok(Some(HelperFrame::Ready))),
+            "reader rejected a delayed but valid frame: {frame:?}"
+        );
+        assert!(
+            delivery.is_ok(),
+            "writer could not deliver the delayed frame remainder: {delivery:?}"
+        );
+    }
+
+    #[test]
+    fn incomplete_partial_frame_hits_fixed_assembly_deadline() {
+        use std::io::Write as _;
+        use std::time::{Duration, Instant};
+
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let payload = serialize_frame_payload(&HelperFrame::Ready).unwrap();
+        let length = frame_length(&payload).unwrap();
+        let mut encoded = Vec::with_capacity(8 + payload.len());
+        encoded.extend_from_slice(FRAME_MAGIC);
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(&payload);
+        writer.write_all(&encoded[..1]).unwrap();
+
+        let started = Instant::now();
+        let error =
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= FRAME_IO_TIMEOUT,
+            "partial-frame deadline ended too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < FRAME_IO_TIMEOUT + Duration::from_secs(5),
+            "partial-frame deadline was not enforced promptly: {elapsed:?}"
+        );
+        // Keep the writer alive through the timeout so this exercises an
+        // incomplete frame, not a peer disconnect.
+        drop(writer);
+    }
+
+    #[test]
     fn frame_deadlines_cover_partial_reads_and_blocked_writes() {
         use std::io::Write as _;
         use std::os::fd::AsRawFd as _;
@@ -2134,7 +2227,10 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(InlineExecError::Operation(_))));
+        assert!(matches!(
+            result,
+            Err(InlineExecError::OperationAfterDispatch(_))
+        ));
         let bytes_after_cleanup = std::fs::metadata(&output).unwrap().len();
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(
