@@ -648,9 +648,14 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             report.version.status.as_str(),
             report.version.message
         );
-        if let Some(describe) = &report.version.binary.describe {
+        if let Some(revision) = report.version.binary.revision.as_ref().or(report
+            .version
+            .binary
+            .describe
+            .as_ref())
+        {
             out!(
-                "  binary: aethyme {} ({describe})",
+                "  binary: aethyme {} ({revision})",
                 report.version.binary.version
             );
         } else {

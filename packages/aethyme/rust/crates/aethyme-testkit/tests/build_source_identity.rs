@@ -27,9 +27,17 @@ fn clear_git_environment(command: &mut Command) {
     for name in inherited_git_variables {
         command.env_remove(name);
     }
-    // Match build-script Git calls while suppressing optional index refreshes.
-    // `describe --dirty` still refreshes, so its oracle uses a copied index below.
-    command.env("GIT_OPTIONAL_LOCKS", "0");
+    // Match the build-script's isolated Git identity profile.
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1");
 }
 
 fn git_with_environment(root: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
@@ -46,9 +54,8 @@ fn git_with_environment(root: &Path, args: &[&str], environment: &[(&str, &str)]
 }
 
 fn git_with_copied_index(root: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
-    // `git describe --dirty` refreshes index stat data even with
-    // GIT_OPTIONAL_LOCKS=0. Run it against a copy so the oracle cannot change
-    // the fixture's watched `.git` directory before the Cargo probe.
+    // Git diff can refresh index stat data even with GIT_OPTIONAL_LOCKS=0. Run
+    // the oracle against a copy so it cannot mutate watched inputs.
     let index = PathBuf::from(git(
         root,
         &["rev-parse", "--path-format=absolute", "--git-path", "index"],
@@ -74,17 +81,40 @@ fn git_with_copied_index(root: &Path, args: &[&str], environment: &[(&str, &str)
     git_with_environment(root, args, &isolated_environment)
 }
 
-fn git_describe_dirty(root: &Path) -> String {
-    let output = git_with_copied_index(root, &["describe", "--tags", "--always", "--dirty"], &[]);
-    assert!(
-        output.status.success(),
-        "Git describe failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+fn git_revision(root: &Path) -> String {
+    let commit = git(root, &["rev-parse", "--verify", "HEAD^{commit}"]);
+    let attributes_file = format!(
+        "core.attributesFile={}",
+        if cfg!(windows) { "NUL" } else { "/dev/null" }
     );
-    String::from_utf8(output.stdout)
-        .expect("fixture Git describe UTF-8")
-        .trim()
-        .to_owned()
+    let output = git_with_copied_index(
+        root,
+        &[
+            "--attr-source=HEAD",
+            "-c",
+            attributes_file.as_str(),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "--quiet",
+            "HEAD",
+            "--",
+        ],
+        &[],
+    );
+    match output.status.code() {
+        Some(0) => commit,
+        Some(1) => format!("{commit}-dirty"),
+        code => panic!(
+            "Git tracked-dirty check failed with {code:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
@@ -168,10 +198,10 @@ fn run_probe_with_environment(
     }
 }
 
-fn assert_identity(run: &ProbeRun, commit: &str, describe: &str, context: &str) {
+fn assert_identity(run: &ProbeRun, commit: &str, revision: &str, context: &str) {
     assert_eq!(
         run.identity,
-        format!("{commit}|{describe}"),
+        format!("{commit}|{revision}|{revision}"),
         "{context}; Cargo diagnostics:\n{}",
         run.diagnostics
     );
@@ -305,7 +335,7 @@ fn assert_no_private_index_copies(target: &Path, context: &str) {
 }
 
 #[test]
-fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tree() {
+fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds() {
     let scripts = [
         (
             "cli",
@@ -328,7 +358,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
     ];
     // Serial nested Cargo invocations have an independent tiny target and no
     // dependencies. A common cwd also prevents PWD from hiding the regression.
-    for (name, script, commit_variable, describe_variable) in scripts {
+    for (name, script, commit_variable, legacy_alias_variable) in scripts {
         let temp = aethyme_testkit::tmp_dir();
         let repo = temp.path().join("newer");
         let older = temp.path().join("older");
@@ -349,9 +379,12 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         fs::write(package_root.join("build.rs"), script).unwrap();
         fs::write(
             package_root.join("src/main.rs"),
-            format!(
-                "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
-            ),
+            {
+                let revision_variable = commit_variable.replace("_COMMIT", "_REVISION");
+                format!(
+                    "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{revision_variable}\"), env!(\"{legacy_alias_variable}\")); }}\n"
+                )
+            },
         )
         .unwrap();
         git(&repo, &["init", "--initial-branch=probe"]);
@@ -384,20 +417,70 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         git(&repo, &["commit", "-m", "advance newer source"]);
         let second = git(&repo, &["rev-parse", "HEAD"]);
         assert_ne!(first, second);
-        // Start with packed refs already present so an absent packed-refs path
-        // cannot conceal an invalidation bug.
-        git(&repo, &["pack-refs", "--all", "--no-prune"]);
-
         for (tree, expected) in [(&repo, &second), (&older, &first), (&repo, &second)] {
             let run = run_probe(&tree.join(package).join("Cargo.toml"), &target, temp.path());
-            let describe = git_describe_dirty(tree);
-            assert_identity(&run, expected, &describe, name);
+            let revision = git_revision(tree);
+            assert_identity(&run, expected, &revision, name);
             assert_script_ran(&run, "switching source worktree");
+            if tree == &older {
+                let linked_git_dir = git(tree, &["rev-parse", "--absolute-git-dir"]);
+                let commondir_watch = format!(
+                    "cargo:rerun-if-changed={}",
+                    Path::new(&linked_git_dir).join("commondir").display()
+                );
+                let cargo_prefixed_commondir_watch =
+                    format!("[source-identity-probe 0.1.0] {commondir_watch}");
+                assert!(
+                    run.diagnostics.lines().any(|line| {
+                        line == commondir_watch || line == cargo_prefixed_commondir_watch
+                    }),
+                    "linked worktree source identity omitted its commondir input: {}",
+                    run.diagnostics
+                );
+            }
         }
         let warm = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let stable_describe = git_describe_dirty(&repo);
-        assert_identity(&warm, &second, &stable_describe, name);
+        let stable_revision = git_revision(&repo);
+        assert_identity(&warm, &second, &stable_revision, name);
         assert_script_fresh(&warm, "same linked worktree and source state");
+
+        let sibling = temp.path().join("sibling-only");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                sibling.to_str().unwrap(),
+                &second,
+            ],
+        );
+        let sibling_added = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(&sibling_added, &second, &second, "sibling worktree added");
+        assert_script_fresh(&sibling_added, "sibling worktree added");
+        fs::write(sibling.join("sibling-only.txt"), "sibling-only\n").unwrap();
+        git(
+            &repo,
+            &["-C", sibling.to_str().unwrap(), "add", "sibling-only.txt"],
+        );
+        git(
+            &repo,
+            &[
+                "-C",
+                sibling.to_str().unwrap(),
+                "commit",
+                "-m",
+                "sibling-only commit",
+            ],
+        );
+        let sibling_committed =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(&sibling_committed, &second, &second, "sibling-only commit");
+        assert_script_fresh(&sibling_committed, "sibling-only commit");
+        git(
+            &repo,
+            &["worktree", "remove", "--force", sibling.to_str().unwrap()],
+        );
 
         // `--dirty` changes for tracked worktree edits even without an index or
         // HEAD update. Both entering and leaving dirty state must be observed.
@@ -405,119 +488,215 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         let original = fs::read(&marker).unwrap();
         fs::write(&marker, "tracked edit\n").unwrap();
         let dirty = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let dirty_describe = git_describe_dirty(&repo);
-        assert!(dirty_describe.ends_with("-dirty"));
-        assert_identity(&dirty, &second, &dirty_describe, "tracked edit");
+        let dirty_revision = git_revision(&repo);
+        assert!(dirty_revision.ends_with("-dirty"));
+        assert_identity(&dirty, &second, &dirty_revision, "tracked edit");
         assert_script_ran(&dirty, "tracked worktree edit");
         fs::write(&marker, original).unwrap();
         let clean = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let clean_describe = git_describe_dirty(&repo);
-        assert_identity(&clean, &second, &clean_describe, "tracked edit restored");
+        let clean_revision = git_revision(&repo);
+        assert_identity(&clean, &second, &clean_revision, "tracked edit restored");
         assert_script_ran(&clean, "tracked edit restoration");
 
-        // Untracked files do not affect `git describe --dirty`; they should not
-        // invalidate the build script or make a warm package rebuild.
+        // Untracked files do not affect exact commit + tracked-dirty identity.
         let untracked = repo.join("untracked-marker");
         fs::write(&untracked, "untracked\n").unwrap();
         let untracked_run = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let untracked_describe = git_describe_dirty(&repo);
-        assert_eq!(untracked_describe, clean_describe);
-        assert_identity(&untracked_run, &second, &clean_describe, "untracked file");
+        assert_identity(&untracked_run, &second, &second, "untracked file");
         assert_script_fresh(&untracked_run, "untracked file");
         fs::remove_file(untracked).unwrap();
 
-        // Tag creation and packing both change `git describe` inputs. The refs
-        // directory and packed file are watched without naming missing files.
+        // An untracked text attribute cannot normalize a tracked CRLF-only edit
+        // out of the dirty bit because Git reads attributes from HEAD.
+        let attributes = repo.join(".gitattributes");
+        fs::write(&attributes, "tracked-marker text\n").unwrap();
+        let marker_bytes = fs::read(&marker).unwrap();
+        let attributes_only =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &attributes_only,
+            &second,
+            &second,
+            "untracked attributes file",
+        );
+        assert_script_fresh(&attributes_only, "untracked attributes file");
+        let mut crlf_marker = Vec::with_capacity(marker_bytes.len() + 1);
+        for byte in &marker_bytes {
+            if *byte == b'\n' {
+                crlf_marker.push(b'\r');
+            }
+            crlf_marker.push(*byte);
+        }
+        fs::write(&marker, crlf_marker).unwrap();
+        let attribute_probe =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &attribute_probe,
+            &second,
+            &format!("{second}-dirty"),
+            "untracked text attribute",
+        );
+        assert_script_ran(&attribute_probe, "tracked edit under untracked attributes");
+        fs::write(&marker, marker_bytes).unwrap();
+        let restored_after_attributes =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &restored_after_attributes,
+            &second,
+            &second,
+            "attributes test restored",
+        );
+        assert_script_ran(
+            &restored_after_attributes,
+            "tracked edit restoration under untracked attributes",
+        );
+        fs::remove_file(attributes).unwrap();
+
+        // Tag creation and tag packing leave the exact source revision intact.
+        // The loose current branch ref stays present until the final prune case.
         let tag = format!("{name}-release");
         git(&repo, &["tag", "-a", &tag, "-m", "fixture release"]);
         let tagged = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        assert_identity(&tagged, &second, &tag, "annotated tag added");
-        assert_script_ran(&tagged, "tag added");
+        assert_identity(&tagged, &second, &second, "annotated tag added");
+        assert_script_fresh(&tagged, "tag added");
+        git(&repo, &["pack-refs", "--all", "--no-prune"]);
+        let packed_tags = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &packed_tags,
+            &second,
+            &second,
+            "tags packed with loose branch ref",
+        );
+        assert_script_fresh(&packed_tags, "packed tags with loose branch ref");
+
+        // Git does not prune a checked-out branch. Detach first, pack its ref,
+        // then attach HEAD to the packed-only branch and verify absent-to-present
+        // transition handling when a commit recreates the loose ref.
+        git(&repo, &["checkout", "--detach", &second]);
+        let detached_for_pack =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &detached_for_pack,
+            &second,
+            &second,
+            "detach before branch packing",
+        );
+        assert_script_ran(&detached_for_pack, "detach before branch packing");
         git(&repo, &["pack-refs", "--all", "--prune"]);
-        let packed = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        assert_identity(&packed, &second, &tag, "tag packed");
-        assert_script_ran(&packed, "refs packed");
-        let packed_warm = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        assert_identity(&packed_warm, &second, &tag, "packed tag stable");
-        assert_script_fresh(&packed_warm, "packed refs stable");
+        let packed_detached =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &packed_detached,
+            &second,
+            &second,
+            "unrelated packed branch while detached",
+        );
+        assert_script_fresh(&packed_detached, "unrelated packed branch while detached");
+
+        let git_dir = PathBuf::from(git(&repo, &["rev-parse", "--absolute-git-dir"]));
+        let loose_branch = git_dir.join("refs/heads/probe");
+        assert!(!loose_branch.exists(), "fixture branch must be packed only");
+        git(&repo, &["symbolic-ref", "HEAD", "refs/heads/probe"]);
+        let packed_only = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &packed_only,
+            &second,
+            &second,
+            "HEAD attached to packed-only branch",
+        );
+        assert_script_ran(&packed_only, "HEAD attached to packed-only branch");
+        assert!(
+            !loose_branch.exists(),
+            "symbolic-ref unexpectedly recreated the loose branch"
+        );
+        let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let advanced = git(
+            &repo,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &second,
+                "-m",
+                "advance packed branch",
+            ],
+        );
+        git(&repo, &["update-ref", "refs/heads/probe", &advanced]);
+        let packed_to_loose =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &packed_to_loose,
+            &advanced,
+            &advanced,
+            "packed ref became loose",
+        );
+        assert_script_ran(&packed_to_loose, "packed ref became loose");
+        assert!(
+            loose_branch.is_file(),
+            "updated packed branch should have a loose ref"
+        );
 
         // Detached HEAD identity changes live in the per-worktree HEAD file.
         git(&repo, &["checkout", "--detach", &first]);
         let detached = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let detached_describe = git_describe_dirty(&repo);
-        assert_identity(&detached, &first, &detached_describe, "detached HEAD");
+        let detached_revision = git_revision(&repo);
+        assert_identity(&detached, &first, &detached_revision, "detached HEAD");
         assert_script_ran(&detached, "detached HEAD changed");
         let detached_warm = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
         assert_identity(
             &detached_warm,
             &first,
-            &detached_describe,
+            &detached_revision,
             "detached HEAD stable",
         );
         assert_script_fresh(&detached_warm, "detached HEAD stable");
 
-        // Git replacement and config variables can alter `git describe`, which
-        // is part of the exported build identity. Verify each poison changes
-        // raw Git output, then verify Cargo's build script still sees the real
-        // checkout after clearing all inherited GIT_* variables.
+        // Replacement refs and inherited Git environment cannot rewrite this
+        // profile's exact commit + tracked-dirty identity.
         git(&repo, &["checkout", "--detach", &second]);
-        // An exact tag on HEAD makes parent traversal irrelevant to describe.
-        // Put the tagged commit behind a clean child so the replacement must
-        // change Git's independently derived description.
         git(
             &repo,
             &["commit", "--allow-empty", "-m", "replacement fixture child"],
         );
         let replacement_head = git(&repo, &["rev-parse", "HEAD"]);
+        let expected_revision = git_revision(&repo);
+        let replacement_base =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &replacement_base,
+            &replacement_head,
+            &expected_revision,
+            "replacement fixture commit",
+        );
+        assert_script_ran(&replacement_base, "replacement fixture commit");
         git(&repo, &["replace", "--graft", &replacement_head]);
-        let expected_describe = git_describe_dirty(&repo);
-        let no_replace = git_with_copied_index(
-            &repo,
-            &["describe", "--tags", "--always", "--dirty"],
-            &[("GIT_NO_REPLACE_OBJECTS", "1")],
+        let replacement_probe =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &replacement_probe,
+            &replacement_head,
+            &expected_revision,
+            "replacement ref added",
         );
-        assert!(no_replace.status.success());
-        assert_ne!(
-            String::from_utf8(no_replace.stdout).unwrap().trim(),
-            expected_describe,
-            "GIT_NO_REPLACE_OBJECTS must alter describe in the replacement fixture"
-        );
-        let short_abbrev = git_with_copied_index(
-            &repo,
-            &["describe", "--tags", "--always", "--dirty"],
-            &[
-                ("GIT_CONFIG_COUNT", "1"),
-                ("GIT_CONFIG_KEY_0", "core.abbrev"),
-                ("GIT_CONFIG_VALUE_0", "4"),
-            ],
-        );
-        assert!(short_abbrev.status.success());
-        assert_ne!(
-            String::from_utf8(short_abbrev.stdout).unwrap().trim(),
-            expected_describe,
-            "GIT_CONFIG_COUNT must alter describe abbreviation in the fixture"
-        );
+        assert_script_fresh(&replacement_probe, "replacement ref added");
         let poisoned_identity = run_probe_with_environment(
             &repo.join(package).join("Cargo.toml"),
             &temp.path().join("poisoned-git-env-target"),
             temp.path(),
             &[
-                ("GIT_NO_REPLACE_OBJECTS", "1"),
+                ("GIT_NO_REPLACE_OBJECTS", "0"),
                 ("GIT_REPLACE_REF_BASE", "refs/poison/replace/"),
                 ("GIT_CONFIG_COUNT", "1"),
                 ("GIT_CONFIG_KEY_0", "core.abbrev"),
                 ("GIT_CONFIG_VALUE_0", "4"),
             ],
         );
-        assert_script_ran(
-            &poisoned_identity,
-            "poisoned Git config and replacement environment",
-        );
+        assert_script_ran(&poisoned_identity, "poisoned Git configuration environment");
         assert_identity(
             &poisoned_identity,
             &replacement_head,
-            &expected_describe,
-            "poisoned Git config and replacement environment",
+            &expected_revision,
+            "poisoned Git configuration environment",
         );
         git(&repo, &["checkout", "--detach", &first]);
 
@@ -532,11 +711,11 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
             &["update-index", "--add", "--cacheinfo", &gitlink_cache_info],
         );
         let gitlink_run = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let gitlink_describe = git_describe_dirty(&repo);
+        let gitlink_revision = git_revision(&repo);
         assert_identity(
             &gitlink_run,
             &first,
-            &gitlink_describe,
+            &gitlink_revision,
             "tracked gitlink directory",
         );
         assert_script_ran(&gitlink_run, "tracked gitlink directory");
@@ -557,11 +736,11 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
             git(&repo, &["add", "tracked-directory-symlink"]);
             let symlink_run =
                 run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-            let symlink_describe = git_describe_dirty(&repo);
+            let symlink_revision = git_revision(&repo);
             assert_identity(
                 &symlink_run,
                 &first,
-                &symlink_describe,
+                &symlink_revision,
                 "tracked directory symlink",
             );
             assert_script_ran(&symlink_run, "tracked directory symlink");
@@ -580,12 +759,43 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         if symlink_target.exists() {
             fs::remove_dir_all(&symlink_target).unwrap();
         }
+        let filter_attributes = repo.join(".gitattributes");
+        fs::write(
+            &filter_attributes,
+            "packages/probe/src/main.rs filter=probe\n",
+        )
+        .unwrap();
+        git(&repo, &["add", ".gitattributes"]);
+        git(&repo, &["commit", "-m", "tracked clean filter attribute"]);
+        let filter_commit = git(&repo, &["rev-parse", "--verify", "HEAD^{commit}"]);
+        let filter_marker = temp.path().join("clean-filter-executed");
+        let filter_command = format!("touch '{}'", filter_marker.display());
+        git(&repo, &["config", "filter.probe.clean", &filter_command]);
+        let source_path = repo.join(package).join("src/main.rs");
+        let mut changed_source = fs::read(&source_path).unwrap();
+        changed_source.extend_from_slice(b"\n// force clean-filter evaluation\n");
+        fs::write(&source_path, changed_source).unwrap();
+        let filter_run = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &filter_run,
+            &filter_commit,
+            &format!("{filter_commit}-dirty"),
+            "configured clean filter fallback",
+        );
+        assert_conservative_index_fallback(&filter_run, "configured clean filter");
+        assert!(
+            !filter_marker.exists(),
+            "source identity diff executed a configured external clean filter"
+        );
+        git(&repo, &["config", "--unset-all", "filter.probe.clean"]);
+        git(&repo, &["reset", "--hard", &first]);
+
         let index = PathBuf::from(git(
             &repo,
             &["rev-parse", "--path-format=absolute", "--git-path", "index"],
         ));
         let git_dir = PathBuf::from(git(&repo, &["rev-parse", "--absolute-git-dir"]));
-        let fallback_describe = git(&repo, &["describe", "--tags", "--always"]);
+        let fallback_revision = git(&repo, &["rev-parse", "--verify", "HEAD^{commit}"]);
 
         // A split index is detected through its sharedindex entry before the
         // primary index is opened for a private copy.
@@ -600,7 +810,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         assert_identity(
             &split_run,
             &first,
-            &format!("{fallback_describe}-dirty"),
+            &format!("{fallback_revision}-dirty"),
             "split-index conservative identity",
         );
         assert_conservative_index_fallback(&split_run, "split index");
@@ -636,7 +846,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
         assert_identity(
             &oversized_run,
             &first,
-            &format!("{fallback_describe}-dirty"),
+            &format!("{fallback_revision}-dirty"),
             "oversized-index conservative identity",
         );
         assert_conservative_index_fallback(&oversized_run, "oversized index");
@@ -646,7 +856,7 @@ fn shared_cache_tracks_each_worktrees_source_identity_without_rebuilding_warm_tr
 }
 
 #[test]
-fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
+fn shallow_metadata_does_not_change_the_stable_source_identity() {
     let scripts = [
         (
             "cli-shallow",
@@ -668,7 +878,7 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
         ),
     ];
 
-    for (name, script, commit_variable, describe_variable) in scripts {
+    for (name, script, commit_variable, legacy_alias_variable) in scripts {
         let temp = aethyme_testkit::tmp_dir();
         let repo = temp.path().join("repo");
         let package_root = repo.join("packages/probe");
@@ -687,9 +897,12 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
         fs::write(package_root.join("build.rs"), script).unwrap();
         fs::write(
             package_root.join("src/main.rs"),
-            format!(
-                "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
-            ),
+            {
+                let revision_variable = commit_variable.replace("_COMMIT", "_REVISION");
+                format!(
+                    "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{revision_variable}\"), env!(\"{legacy_alias_variable}\")); }}\n"
+                )
+            },
         )
         .unwrap();
         git(&repo, &["init", "--initial-branch=probe"]);
@@ -715,7 +928,7 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
         );
 
         let initial = run_probe(&package_root.join("Cargo.toml"), &target, temp.path());
-        let expected_before = git_describe_dirty(&repo);
+        let expected_before = git_revision(&repo);
         assert_identity(&initial, &head, &expected_before, name);
         assert_script_ran(&initial, "initial shallow fixture build");
 
@@ -740,10 +953,10 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
             refs
         );
         let shallow_run = run_probe(&package_root.join("Cargo.toml"), &target, temp.path());
-        let expected_after = git_describe_dirty(&repo);
-        assert_ne!(
+        let expected_after = git_revision(&repo);
+        assert_eq!(
             expected_before, expected_after,
-            "shallow boundary must change describe"
+            "shallow metadata does not alter commit or tracked dirtiness"
         );
 
         assert_identity(
@@ -752,7 +965,7 @@ fn absent_shallow_metadata_appearing_invalidates_the_source_identity() {
             &expected_after,
             "shallow metadata appeared",
         );
-        assert_script_ran(
+        assert_script_fresh(
             &shallow_run,
             "shallow metadata appeared without HEAD/index/ref changes",
         );
@@ -783,7 +996,7 @@ fn symlinked_tracked_ancestor_uses_fallback_without_watching_its_target() {
         ),
     ];
 
-    for (name, script, commit_variable, describe_variable) in scripts {
+    for (name, script, commit_variable, legacy_alias_variable) in scripts {
         let temp = aethyme_testkit::tmp_dir();
         let repo = temp.path().join("repo");
         let package_root = repo.join("packages/probe");
@@ -803,9 +1016,12 @@ fn symlinked_tracked_ancestor_uses_fallback_without_watching_its_target() {
         fs::write(package_root.join("build.rs"), script).unwrap();
         fs::write(
             package_root.join("src/main.rs"),
-            format!(
-                "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{describe_variable}\")); }}\n"
-            ),
+            {
+                let revision_variable = commit_variable.replace("_COMMIT", "_REVISION");
+                format!(
+                    "fn main() {{ println!(\"AETHYME_PROBE_IDENTITY:{{}}|{{}}|{{}}\", env!(\"{commit_variable}\"), env!(\"{revision_variable}\"), env!(\"{legacy_alias_variable}\")); }}\n"
+                )
+            },
         )
         .unwrap();
         let tracked = repo.join("tracked-parent/source.txt");
@@ -825,8 +1041,8 @@ fn symlinked_tracked_ancestor_uses_fallback_without_watching_its_target() {
         std::os::unix::fs::symlink(&external, repo.join("tracked-parent")).unwrap();
 
         let run = run_probe(&package_root.join("Cargo.toml"), &target, temp.path());
-        let describe = git_describe_dirty(&repo);
-        assert_identity(&run, &commit, &describe, name);
+        let revision = git_revision(&repo);
+        assert_identity(&run, &commit, &revision, name);
         assert_script_ran(&run, "tracked path gained a symlinked ancestor");
         assert_nonregular_entry_falls_back(
             &run,
@@ -870,7 +1086,7 @@ fn build_scripts_keep_empty_identity_exports_when_git_is_unavailable() {
     let temp = aethyme_testkit::tmp_dir();
     let empty_path = temp.path().join("empty-path");
     fs::create_dir(&empty_path).unwrap();
-    for (name, script, commit_variable, describe_variable) in scripts {
+    for (name, script, commit_variable, legacy_alias_variable) in scripts {
         let source = temp.path().join(format!("{name}.rs"));
         fs::write(&source, script).unwrap();
         let mut executable = temp.path().join(name);
@@ -919,11 +1135,18 @@ fn build_scripts_keep_empty_identity_exports_when_git_is_unavailable() {
                 .any(|line| line == format!("cargo:rustc-env={commit_variable}=")),
             "missing best-effort empty commit export for {name}: {stdout}"
         );
+        let revision_variable = commit_variable.replace("_COMMIT", "_REVISION");
         assert!(
             stdout
                 .lines()
-                .any(|line| line == format!("cargo:rustc-env={describe_variable}=")),
-            "missing best-effort empty describe export for {name}: {stdout}"
+                .any(|line| line == format!("cargo:rustc-env={revision_variable}=")),
+            "missing best-effort empty revision export for {name}: {stdout}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == format!("cargo:rustc-env={legacy_alias_variable}=")),
+            "missing best-effort empty compatibility alias for {name}: {stdout}"
         );
         assert!(
             stdout.lines().any(|line| {
