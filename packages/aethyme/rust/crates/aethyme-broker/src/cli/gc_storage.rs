@@ -1176,7 +1176,7 @@ fn render_root_identity_recovery(plan: &crate::worktree_registry::RootIdentityRe
 fn run_storage_identity(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.positional.len() != 4 {
         return Err(UsageError::Message(
-            "usage: aethyme broker storage identity <plan|apply> <host-operation-db> <exact-root> [--confirm <old-sha256:new-sha256:owner-marker-sha256>] [--json]".into(),
+            "usage: aethyme broker gc storage identity <plan|apply> <host-operation-db> <exact-root> [--confirm <old-sha256:new-sha256:owner-marker-sha256>] [--json]".into(),
         ));
     }
     let action = parsed.positional[1].as_str();

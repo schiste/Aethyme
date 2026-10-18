@@ -41,8 +41,8 @@ consumer. This file exists so that doesn't happen again.
 ### Reviewed worktree identity recovery (#847)
 
 The operator-facing commands are
-`aethyme broker storage identity plan <host-operation-db> <exact-root> [--json]`
-and `aethyme broker storage identity apply <host-operation-db> <exact-root>
+`aethyme broker gc storage identity plan <host-operation-db> <exact-root> [--json]`
+and `aethyme broker gc storage identity apply <host-operation-db> <exact-root>
 --confirm <old-sha256:new-sha256:owner-marker-sha256> [--json]`.
 The CLI exposes these commands, and operator recovery instructions consume
 this contract. Renaming the commands or changing the confirmation tuple

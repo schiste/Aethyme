@@ -1352,15 +1352,18 @@ fn a_read_only_refusal_names_the_cause_the_fix_and_the_snapshot_alternative() {
 
 #[test]
 fn identity_recovery_usage_names_the_dispatched_command() {
-    let parsed = match super::parse(&args(&["identity", "plan"])) {
-        Ok(parsed) => parsed,
-        Err(_) => panic!("identity plan arguments should parse"),
-    };
-    let Err(UsageError::Message(message)) = super::gc_storage::run_storage(parsed) else {
+    let resolved = super::resolve(&args(&["gc", "storage", "identity", "plan"]));
+    assert!(resolved.refusal.is_none(), "{:?}", resolved.refusal);
+    assert_eq!(resolved.args, args(&["storage", "identity", "plan"]));
+    // Include public-surface normalization and the actual dispatcher without
+    // the outer command metrics, which would open repository state.
+    let Err(UsageError::Message(message)) =
+        super::run_inner(&resolved.args, &super::CompatibilityMode::Normal)
+    else {
         panic!("missing identity recovery paths should report usage before opening state");
     };
     assert!(
-        message.starts_with("usage: aethyme broker storage identity <plan|apply> "),
+        message.starts_with("usage: aethyme broker gc storage identity <plan|apply> "),
         "{message}"
     );
     assert!(message.contains("--confirm <old-sha256:new-sha256:owner-marker-sha256>"));
