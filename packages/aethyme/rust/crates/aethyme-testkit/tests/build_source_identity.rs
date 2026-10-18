@@ -428,8 +428,12 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
                     "cargo:rerun-if-changed={}",
                     Path::new(&linked_git_dir).join("commondir").display()
                 );
+                let cargo_prefixed_commondir_watch =
+                    format!("[source-identity-probe 0.1.0] {commondir_watch}");
                 assert!(
-                    run.diagnostics.lines().any(|line| line == commondir_watch),
+                    run.diagnostics.lines().any(|line| {
+                        line == commondir_watch || line == cargo_prefixed_commondir_watch
+                    }),
                     "linked worktree source identity omitted its commondir input: {}",
                     run.diagnostics
                 );
