@@ -846,12 +846,12 @@ Usage:
       Git registrations, and repository session ledgers. Apply removes only
       exact reviewed orphan roots or stray directories.
   aethyme broker storage identity plan <host-operation-db> <exact-root> [--json]
-  aethyme broker storage identity apply <host-operation-db> <exact-root> --confirm <old-sha256:new-sha256> [--json]
+  aethyme broker storage identity apply <host-operation-db> <exact-root> --confirm <old-sha256:new-sha256:owner-marker-sha256> [--json]
       Review then recover one legacy worktree-root identity after a mount
       identity change. The live root and repository origin must retain their
       inodes, owner marker, repository binding, and nonzero volume UUIDs; the
-      confirmation binds the exact old and replacement payloads. This does
-      not prove their historical volume UUIDs.
+      confirmation binds the exact old and replacement payloads and owner
+      marker bytes. This does not prove historical volume UUIDs.
   aethyme broker storage attribute [--apply] [--json]
       List host worktree roots with no ownership marker and whether this
       repository can prove it owns each one: every Git worktree under it is

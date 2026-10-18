@@ -60,6 +60,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   exceptions, and finite deadlines for every synthetic process. Original group
   absence proves only that group's absence; it says nothing about escaped or
   detached descendants.
+- Before adding strict validation or recovery for persisted data, inspect every
+  production writer and test its exact serialized bytes. Accept only known
+  producer encodings, and bind the exact observed bytes across plan/apply when
+  an operator confirmation spans invocations; test re-encoding drift and
+  rollback after the write-side recheck.
 - For storage ownership and reclamation changes, test replacement of a root and
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem

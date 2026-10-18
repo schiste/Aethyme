@@ -62,18 +62,30 @@ retained and refuses replacement. On platforms without filesystem identity,
 only byte-identical idempotent reuse is allowed; that opaque history remains
 protected from automatic reclamation.
 
-Legacy macOS rows have no saved volume UUID and remain exact-match only during
-ordinary admission and reclamation. Recover one row with
+When a legacy macOS row still matches the live root and origin by inode, device,
+and raw `f_fsid`, ordinary admission may record the live UUIDs forward. The
+shared registry lock remains held through owner, root, origin, and replacement
+record validation. If any saved raw identity differs, the row stays fenced for
+reviewed recovery. A missing origin cannot acquire a UUID: its absence is
+accepted only when the nearest existing ancestor matches the saved raw volume
+identity, and the retained row remains unchanged. A raw mismatch leaves absence
+unknown.
+
+Recover one mismatched legacy row with
 `aethyme broker storage identity plan <host-operation-db> <exact-root>`, then
 review its exact old and replacement payload hashes and apply them with
 `aethyme broker storage identity apply <host-operation-db> <exact-root>
---confirm <old-sha256:new-sha256>`. The recovery takes the same host-domain
-registry lock as admission and removal. It requires the recorded root and
-origin inodes, owner marker and repository binding to match, and nonzero current
-volume UUIDs for both directories. It explicitly does not prove the historical
-volume UUIDs; the operator reviews that gap before applying. An older binary
-with the strict pre-UUID record decoder may refuse a row after recovery, so
-retain the host state until using a compatible version.
+--confirm <old-sha256:new-sha256:owner-marker-sha256>`. The marker digest binds
+the exact bytes observed during planning; apply rechecks those same bytes after
+the payload update and rolls back if they changed. Marker validation accepts
+the compact encoding and the broker's production pretty-JSON-plus-newline
+encoding, without accepting arbitrary whitespace. Recovery takes the same
+host-domain registry lock as admission and removal. It requires the recorded
+root and origin inodes, owner marker and repository binding to match, and
+nonzero current volume UUIDs for both directories. It explicitly does not
+prove the historical volume UUIDs; the operator reviews that gap before
+applying. An older binary with the strict pre-UUID record decoder may refuse a
+row after recovery, so retain the host state until using a compatible version.
 
 ## Reclamation authority
 

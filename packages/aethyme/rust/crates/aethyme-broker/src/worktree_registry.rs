@@ -48,15 +48,16 @@ struct DirectoryIdentity {
 
 impl DirectoryIdentity {
     /// Stable registry identity uses the volume UUID and inode when both
-    /// observations carry a UUID. Legacy records remain exact-match only; a
-    /// path whose fields happen to match cannot silently acquire a UUID.
+    /// observations carry a UUID. A legacy record can upgrade in the normal
+    /// locked admission path only when its saved mount-scoped fields and inode
+    /// still match the live observation exactly.
     fn same_registered_object(&self, current: &Self) -> bool {
         if self.inode != current.inode {
             return false;
         }
         match (self.volume_uuid, current.volume_uuid) {
             (Some(saved), Some(actual)) => saved == actual,
-            (None, None) => self.device == current.device && self.filesystem == current.filesystem,
+            (None, _) => self.device == current.device && self.filesystem == current.filesystem,
             _ => false,
         }
     }
@@ -66,7 +67,7 @@ impl DirectoryIdentity {
     fn same_registered_filesystem(&self, current: &Self) -> bool {
         match (self.volume_uuid, current.volume_uuid) {
             (Some(saved), Some(actual)) => saved == actual,
-            (None, None) => self.device == current.device && self.filesystem == current.filesystem,
+            (None, _) => self.device == current.device && self.filesystem == current.filesystem,
             _ => false,
         }
     }
@@ -88,7 +89,9 @@ fn legacy_uuid_recovery_needed(
     current: Option<&DirectoryIdentity>,
 ) -> bool {
     matches!((saved, current), (Some(saved), Some(current))
-        if saved.volume_uuid.is_none() && current.volume_uuid.is_some())
+        if saved.volume_uuid.is_none()
+            && current.volume_uuid.is_some()
+            && (saved.device != current.device || saved.filesystem != current.filesystem))
 }
 
 fn changed_identity_reason(
@@ -96,7 +99,9 @@ fn changed_identity_reason(
     saved: Option<&DirectoryIdentity>,
     current: Option<&DirectoryIdentity>,
 ) -> String {
-    if legacy_uuid_recovery_needed(saved, current) {
+    if legacy_uuid_recovery_needed(saved, current)
+        && matches!((saved, current), (Some(saved), Some(current)) if saved.inode == current.inode)
+    {
         format!(
             "registered {object} has a legacy identity without a saved volume UUID; reviewed identity recovery is required"
         )
@@ -476,7 +481,8 @@ fn open_registry_with_mode(
 
 /// Exact, one-root proposal for upgrading a legacy filesystem identity.
 /// Historical UUID identity is deliberately never claimed: the user reviews
-/// the live inode, owner marker, repository binding, and both payload hashes.
+/// the live inodes, owner marker, repository binding, both payload hashes, and
+/// the exact marker-byte digest.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct RootIdentityRecoveryPlan {
     pub(crate) host_operation_database: PathBuf,
@@ -485,6 +491,7 @@ pub(crate) struct RootIdentityRecoveryPlan {
     pub(crate) repository_key: String,
     pub(crate) old_payload_sha256: String,
     pub(crate) new_payload_sha256: String,
+    pub(crate) owner_marker_sha256: String,
     pub(crate) root_inode: u64,
     pub(crate) root_volume_uuid_hex: String,
     pub(crate) origin_inode: u64,
@@ -500,6 +507,12 @@ struct PreparedRootIdentityRecovery {
     previous_payload: String,
     replacement_payload: String,
     replacement_record: RootRecord,
+    owner_marker_payload: Vec<u8>,
+}
+
+struct ObservedRecoveryRecord {
+    record: RootRecord,
+    owner_marker_payload: Vec<u8>,
 }
 
 fn recovery_volume_uuid(identity: &DirectoryIdentity, object: &str) -> io::Result<[u8; 16]> {
@@ -541,7 +554,7 @@ fn observe_recovery_record(
     repository_root: &Path,
     repository_key: &str,
     identity_reader: &impl Fn(&Path, &Metadata) -> io::Result<Option<DirectoryIdentity>>,
-) -> io::Result<RootRecord> {
+) -> io::Result<ObservedRecoveryRecord> {
     if !root.is_absolute() || record.root != root {
         return Err(invalid(
             "the supplied exact root differs from the retained root record",
@@ -578,10 +591,13 @@ fn observe_recovery_record(
     recovery_volume_uuid(&origin_identity, "origin")?;
     recovery_identity_matches(saved_origin, &origin_identity, "origin")?;
 
-    Ok(RootRecord {
-        identity: Some(root_identity),
-        origin_identity: Some(origin_identity),
-        ..record.clone()
+    Ok(ObservedRecoveryRecord {
+        record: RootRecord {
+            identity: Some(root_identity),
+            origin_identity: Some(origin_identity),
+            ..record.clone()
+        },
+        owner_marker_payload: marker_payload,
     })
 }
 
@@ -610,13 +626,15 @@ fn prepare_root_identity_recovery(
         ));
     }
 
-    let replacement_record = observe_recovery_record(
+    let observed = observe_recovery_record(
         &retained,
         root,
         repository_root,
         repository_key,
         identity_reader,
     )?;
+    let replacement_record = observed.record;
+    let owner_marker_payload = observed.owner_marker_payload;
     let replacement_payload = serde_json::to_string(&replacement_record).map_err(invalid)?;
     if replacement_payload.len() > MAX_RECORD_BYTES {
         return Err(invalid(
@@ -625,6 +643,7 @@ fn prepare_root_identity_recovery(
     }
     let old_payload_sha256 = format!("{:x}", Sha256::digest(previous_payload.as_bytes()));
     let new_payload_sha256 = format!("{:x}", Sha256::digest(replacement_payload.as_bytes()));
+    let owner_marker_sha256 = format!("{:x}", Sha256::digest(&owner_marker_payload));
     let root_identity = replacement_record
         .identity
         .as_ref()
@@ -633,7 +652,7 @@ fn prepare_root_identity_recovery(
         .origin_identity
         .as_ref()
         .ok_or_else(|| invalid("recovery target has no origin identity"))?;
-    let confirmation = format!("{old_payload_sha256}:{new_payload_sha256}");
+    let confirmation = format!("{old_payload_sha256}:{new_payload_sha256}:{owner_marker_sha256}");
     Ok(PreparedRootIdentityRecovery {
         plan: RootIdentityRecoveryPlan {
             host_operation_database: host_database.to_path_buf(),
@@ -642,6 +661,7 @@ fn prepare_root_identity_recovery(
             repository_key: repository_key.to_string(),
             old_payload_sha256,
             new_payload_sha256,
+            owner_marker_sha256,
             root_inode: root_identity.inode,
             root_volume_uuid_hex: format_uuid_hex(&recovery_volume_uuid(root_identity, "root")?),
             origin_inode: origin_identity.inode,
@@ -657,6 +677,7 @@ fn prepare_root_identity_recovery(
         previous_payload: previous_payload.to_string(),
         replacement_payload,
         replacement_record,
+        owner_marker_payload,
     })
 }
 
@@ -671,11 +692,15 @@ fn format_uuid_hex(uuid: &[u8; 16]) -> String {
 }
 
 fn ensure_canonical_marker_payload(marker: &WorktreeRootMarker, payload: &[u8]) -> io::Result<()> {
-    let expected = serde_json::to_vec(marker).map_err(invalid)?;
-    let canonical = payload == expected.as_slice()
-        || (payload.len() == expected.len() + 1
-            && &payload[..expected.len()] == expected.as_slice()
-            && payload[expected.len()] == b'\n');
+    let compact = serde_json::to_vec(marker).map_err(invalid)?;
+    let pretty = serde_json::to_vec_pretty(marker).map_err(invalid)?;
+    let mut compact_with_newline = compact.clone();
+    compact_with_newline.push(b'\n');
+    let mut pretty_with_newline = pretty;
+    pretty_with_newline.push(b'\n');
+    let canonical = payload == compact.as_slice()
+        || payload == compact_with_newline.as_slice()
+        || payload == pretty_with_newline.as_slice();
     if canonical {
         Ok(())
     } else {
@@ -769,6 +794,28 @@ fn apply_root_identity_recovery_with(
     identity_reader: &impl Fn(&Path, &Metadata) -> io::Result<Option<DirectoryIdentity>>,
     before_compare_and_swap: impl FnOnce(&Connection, &str, &str) -> io::Result<()>,
 ) -> io::Result<RootIdentityRecoveryPlan> {
+    apply_root_identity_recovery_with_hooks(
+        host_database,
+        root,
+        repository_root,
+        repository_key,
+        confirm,
+        identity_reader,
+        before_compare_and_swap,
+        |_, _, _| Ok(()),
+    )
+}
+
+fn apply_root_identity_recovery_with_hooks(
+    host_database: &Path,
+    root: &Path,
+    repository_root: &Path,
+    repository_key: &str,
+    confirm: &str,
+    identity_reader: &impl Fn(&Path, &Metadata) -> io::Result<Option<DirectoryIdentity>>,
+    before_compare_and_swap: impl FnOnce(&Connection, &str, &str) -> io::Result<()>,
+    after_update_before_reobservation: impl FnOnce(&Connection, &str, &str) -> io::Result<()>,
+) -> io::Result<RootIdentityRecoveryPlan> {
     require_absolute_recovery_paths(host_database, root, repository_root)?;
     let _exclusion = registry_lock(host_database, false)?;
     let mut connection = open_existing_registry_for_write(host_database)?;
@@ -784,7 +831,7 @@ fn apply_root_identity_recovery_with(
     )?;
     if prepared.plan.confirmation != confirm {
         return Err(invalid(
-            "old:new payload confirmation does not match the current exact-root recovery plan",
+            "old:new:owner-marker confirmation does not match the current exact-root recovery plan",
         ));
     }
 
@@ -811,14 +858,23 @@ fn apply_root_identity_recovery_with(
         ));
     }
 
-    let current_record = observe_recovery_record(
+    // This test-only hook models an external marker writer after the row has
+    // been updated but before the transaction's final live reobservation.
+    after_update_before_reobservation(&transaction, &prepared.key, &prepared.replacement_payload)?;
+
+    let observed = observe_recovery_record(
         &prepared.replacement_record,
         root,
         repository_root,
         repository_key,
         identity_reader,
     )?;
-    let current_payload = serde_json::to_string(&current_record).map_err(invalid)?;
+    if observed.owner_marker_payload != prepared.owner_marker_payload {
+        return Err(invalid(
+            "owner marker bytes changed during recovery; transaction rolled back",
+        ));
+    }
+    let current_payload = serde_json::to_string(&observed.record).map_err(invalid)?;
     if current_payload != prepared.replacement_payload {
         return Err(invalid(
             "root, origin, or owner marker changed during recovery; transaction rolled back",
@@ -1829,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_identity_needs_explicit_volume_uuid_recovery() {
+    fn legacy_identity_upgrades_only_when_saved_mount_identity_matches_live() {
         let legacy = DirectoryIdentity {
             device: 11,
             inode: 23,
@@ -1840,8 +1896,25 @@ mod tests {
             volume_uuid: Some([7; 16]),
             ..legacy.clone()
         };
-        assert!(!legacy.same_registered_object(&current_with_uuid));
+        assert!(legacy.same_registered_object(&current_with_uuid));
+        assert!(legacy.same_registered_filesystem(&current_with_uuid));
+        assert!(!legacy_uuid_recovery_needed(
+            Some(&legacy),
+            Some(&current_with_uuid)
+        ));
         assert!(!current_with_uuid.same_registered_object(&legacy));
+
+        let remounted_with_uuid = DirectoryIdentity {
+            device: 12,
+            filesystem: vec![4, 5, 6],
+            ..current_with_uuid.clone()
+        };
+        assert!(!legacy.same_registered_object(&remounted_with_uuid));
+        assert!(!legacy.same_registered_filesystem(&remounted_with_uuid));
+        assert!(legacy_uuid_recovery_needed(
+            Some(&legacy),
+            Some(&remounted_with_uuid)
+        ));
 
         let unchanged_legacy = DirectoryIdentity {
             volume_uuid: None,
@@ -1909,6 +1982,12 @@ mod tests {
         fixture.register(&root, &owner);
         let legacy_payload = retain_legacy_registration(&fixture, &root);
 
+        // Production lifecycle and storage attribution writers use pretty
+        // JSON followed by exactly one newline.
+        let mut production_marker = serde_json::to_vec_pretty(&owner).unwrap();
+        production_marker.push(b'\n');
+        fs::write(root.join(WORKTREE_ROOT_MARKER), &production_marker).unwrap();
+
         let plan = plan_recovery(&fixture, &root, &owner);
         assert!(!plan.historical_uuid_proven);
         assert!(!plan.applied);
@@ -1916,9 +1995,17 @@ mod tests {
         assert_eq!(plan.origin_volume_uuid_hex, "5a".repeat(16));
         assert_eq!(plan.old_payload_sha256.len(), 64);
         assert_eq!(plan.new_payload_sha256.len(), 64);
+        assert_eq!(plan.owner_marker_sha256.len(), 64);
+        assert_eq!(
+            plan.owner_marker_sha256,
+            format!("{:x}", Sha256::digest(&production_marker))
+        );
         assert_eq!(
             plan.confirmation,
-            format!("{}:{}", plan.old_payload_sha256, plan.new_payload_sha256)
+            format!(
+                "{}:{}:{}",
+                plan.old_payload_sha256, plan.new_payload_sha256, plan.owner_marker_sha256
+            )
         );
 
         let applied = apply_root_identity_recovery_with(
@@ -1962,6 +2049,81 @@ mod tests {
                 .unwrap(),
             Some(upgraded_payload),
             "replayed confirmation must leave the already-upgraded row intact"
+        );
+    }
+
+    #[test]
+    fn recovery_confirmation_refuses_owner_marker_reencoding_between_plan_and_apply() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let legacy_payload = retain_legacy_registration(&fixture, &root);
+
+        let plan = plan_recovery(&fixture, &root, &owner);
+        let mut production_marker = serde_json::to_vec_pretty(&owner).unwrap();
+        production_marker.push(b'\n');
+        fs::write(root.join(WORKTREE_ROOT_MARKER), production_marker).unwrap();
+
+        let error = apply_root_identity_recovery_with(
+            &fixture.database,
+            &root,
+            &owner.repository_root,
+            &owner.repository_key,
+            &plan.confirmation,
+            &current_recovery_identity,
+            |_, _, _| Ok(()),
+        )
+        .expect_err("confirmation must pin exact owner marker bytes across plan/apply");
+
+        assert!(
+            error
+                .to_string()
+                .contains("old:new:owner-marker confirmation")
+        );
+        assert_eq!(
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap(),
+            Some(legacy_payload),
+            "a marker re-encoding must leave retained history unchanged"
+        );
+    }
+
+    #[test]
+    fn recovery_rolls_back_when_owner_marker_bytes_change_after_cas() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let legacy_payload = retain_legacy_registration(&fixture, &root);
+        let plan = plan_recovery(&fixture, &root, &owner);
+
+        let error = apply_root_identity_recovery_with_hooks(
+            &fixture.database,
+            &root,
+            &owner.repository_root,
+            &owner.repository_key,
+            &plan.confirmation,
+            &current_recovery_identity,
+            |_, _, _| Ok(()),
+            |_, _, _| {
+                let mut production_marker = serde_json::to_vec_pretty(&owner).map_err(invalid)?;
+                production_marker.push(b'\n');
+                fs::write(root.join(WORKTREE_ROOT_MARKER), production_marker)?;
+                Ok(())
+            },
+        )
+        .expect_err("post-CAS reobservation must reject changed owner marker bytes");
+
+        assert!(
+            error
+                .to_string()
+                .contains("owner marker bytes changed during recovery"),
+            "{error}"
+        );
+        assert_eq!(
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap(),
+            Some(legacy_payload),
+            "a failed post-CAS marker check must roll back the upgraded row"
         );
     }
 
@@ -2373,7 +2535,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn legacy_registration_remains_refused_until_reviewed_identity_recovery() {
+    fn legacy_registration_with_exact_raw_identity_upgrades_during_admission() {
         let fixture = Fixture::new();
         let (root, owner) = fixture.root("root");
         fixture.register(&root, &owner);
@@ -2389,9 +2551,41 @@ mod tests {
             )
             .unwrap();
 
+        admit(&fixture.database, &root)
+            .unwrap()
+            .record(&root, &owner, WorktreeRootSource::LibraryOverride)
+            .expect("exact prior raw identity and owner proof should allow UUID capture");
+
+        let refreshed = inventory(&fixture.database, None).roots.remove(0);
+        assert!(refreshed.identity.unwrap().volume_uuid.is_some());
+        assert!(refreshed.origin_identity.unwrap().volume_uuid.is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remounted_legacy_registration_stays_fenced_for_reviewed_recovery() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let mut retained = inventory(&fixture.database, None).roots.remove(0);
+        retained.identity.as_mut().unwrap().volume_uuid = None;
+        retained.origin_identity.as_mut().unwrap().volume_uuid = None;
+        retained.identity.as_mut().unwrap().device ^= 1;
+        retained.identity.as_mut().unwrap().filesystem[0] ^= 1;
+        retained.origin_identity.as_mut().unwrap().device ^= 1;
+        retained.origin_identity.as_mut().unwrap().filesystem[0] ^= 1;
+        let previous = serde_json::to_string(&retained).unwrap();
+        open_registry(&fixture.database, true)
+            .unwrap()
+            .execute(
+                "UPDATE roots SET payload=?1 WHERE key=?2",
+                params![previous, record_key(&root)],
+            )
+            .unwrap();
+
         let error = admit(&fixture.database, &root)
             .err()
-            .expect("legacy root identity must remain untrusted");
+            .expect("changed legacy mount identity must require reviewed recovery");
         assert!(
             error
                 .to_string()
@@ -2401,6 +2595,61 @@ mod tests {
             retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
                 .unwrap(),
             Some(previous)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn absent_legacy_origin_uses_only_exact_raw_filesystem_proof() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let mut retained = inventory(&fixture.database, None).roots.remove(0);
+        retained.origin_identity.as_mut().unwrap().volume_uuid = None;
+        let previous = serde_json::to_string(&retained).unwrap();
+        open_registry(&fixture.database, true)
+            .unwrap()
+            .execute(
+                "UPDATE roots SET payload=?1 WHERE key=?2",
+                params![previous, record_key(&root)],
+            )
+            .unwrap();
+
+        fs::remove_dir(&fixture.origin).unwrap();
+        assert!(origin_is_missing(&retained).expect("matching raw filesystem proves absence"));
+        assert_eq!(
+            retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
+                .unwrap(),
+            Some(previous),
+            "absence inspection must not capture a UUID into retained history"
+        );
+
+        let mismatch_fixture = Fixture::new();
+        let (mismatch_root, mismatch_owner) = mismatch_fixture.root("root");
+        mismatch_fixture.register(&mismatch_root, &mismatch_owner);
+        let mut mismatched = inventory(&mismatch_fixture.database, None).roots.remove(0);
+        let saved_origin = mismatched.origin_identity.as_mut().unwrap();
+        saved_origin.volume_uuid = None;
+        saved_origin.device ^= 1;
+        saved_origin.filesystem[0] ^= 1;
+        let mismatch_payload = serde_json::to_string(&mismatched).unwrap();
+        open_registry(&mismatch_fixture.database, true)
+            .unwrap()
+            .execute(
+                "UPDATE roots SET payload=?1 WHERE key=?2",
+                params![mismatch_payload, record_key(&mismatch_root)],
+            )
+            .unwrap();
+        fs::remove_dir(&mismatch_fixture.origin).unwrap();
+        assert!(origin_is_missing(&mismatched).is_err());
+        assert_eq!(
+            retained_registration(
+                &open_registry(&mismatch_fixture.database, false).unwrap(),
+                &mismatch_root
+            )
+            .unwrap(),
+            Some(mismatch_payload),
+            "mismatched absence must stay unknown without rewriting history"
         );
     }
 

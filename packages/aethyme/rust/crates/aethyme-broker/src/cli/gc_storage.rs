@@ -1169,13 +1169,14 @@ fn render_root_identity_recovery(plan: &crate::worktree_registry::RootIdentityRe
     );
     out!("  old payload SHA-256: {}", plan.old_payload_sha256);
     out!("  new payload SHA-256: {}", plan.new_payload_sha256);
+    out!("  owner marker bytes SHA-256: {}", plan.owner_marker_sha256);
     out!("  confirmation: {}", plan.confirmation);
 }
 
 fn run_storage_identity(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.positional.len() != 4 {
         return Err(UsageError::Message(
-            "usage: aethyme broker storage identity <plan|apply> <host-operation-db> <exact-root> [--confirm <old-sha256:new-sha256>] [--json]".into(),
+            "usage: aethyme broker storage identity <plan|apply> <host-operation-db> <exact-root> [--confirm <old-sha256:new-sha256:owner-marker-sha256>] [--json]".into(),
         ));
     }
     let action = parsed.positional[1].as_str();
@@ -1210,7 +1211,7 @@ fn run_storage_identity(parsed: Parsed) -> Result<(), UsageError> {
         "apply" => {
             let confirm = parsed.confirm.as_deref().ok_or_else(|| {
                 UsageError::Message(
-                    "storage identity apply requires --confirm <old-sha256:new-sha256>".into(),
+                    "storage identity apply requires --confirm <old-sha256:new-sha256:owner-marker-sha256>".into(),
                 )
             })?;
             let report = crate::worktree_registry::apply_root_identity_recovery(
