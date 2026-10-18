@@ -855,11 +855,13 @@ impl HostResourceCoordinator {
             if child_group_absent {
                 event("running exact cleanup command");
                 let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
-                let cleanup_child = spawn_resource_process(&cleanup_argv, cwd, &grant, &environment)
-                    .map_err(|source| HostResourceRunError::Spawn {
-                        program: "sh".into(),
-                        source,
-                    });
+                let cleanup_child =
+                    spawn_resource_process(&cleanup_argv, cwd, &grant, &environment).map_err(
+                        |source| HostResourceRunError::Spawn {
+                            program: "sh".into(),
+                            source,
+                        },
+                    );
                 let mut cleanup_child = match cleanup_child {
                     Ok(child) => child,
                     Err(error) => {
@@ -1091,22 +1093,27 @@ fn wait_for_child_exit(
 }
 
 #[cfg(unix)]
-fn signal_unreaped_process_group(process: &ResourceChild, signal: libc::c_int) {
+fn signal_unreaped_process_group(
+    process: &ResourceChild,
+    signal: libc::c_int,
+) -> std::io::Result<()> {
     // This helper is called only after a bounded `try_wait` loop observed the
     // leader unreaped. Its pid still names the original group and cannot have
     // been reused; no delivered signal is sent after `try_wait` reports exit.
     // SAFETY: the group was created by `process_group(0)` before spawn, and
     // `killpg` takes both values without dereferencing crate-owned memory.
-    unsafe {
-        libc::killpg(process.child.id() as libc::pid_t, signal);
+    if unsafe { libc::killpg(process.child.id() as libc::pid_t, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
 #[cfg(not(unix))]
-fn kill_unreaped_child(process: &mut ResourceChild) {
+fn kill_unreaped_child(process: &mut ResourceChild) -> std::io::Result<()> {
     // This library can be compiled on platforms where this broker CLI is not
     // supported. `Child::kill` is bounded and targets only the owned child.
-    let _ = process.child.kill();
+    process.child.kill()
 }
 
 fn terminate_after_authority_loss<F>(
@@ -1117,15 +1124,23 @@ where
     F: FnMut(&str),
 {
     #[cfg(unix)]
-    {
+    let mut signal_error = {
         event("sending SIGTERM to the still-owned supervised process group");
-        signal_unreaped_process_group(process, libc::SIGTERM);
-    }
+        let result = signal_unreaped_process_group(process, libc::SIGTERM);
+        if let Err(error) = &result {
+            event(&format!("SIGTERM request failed: {error}"));
+        }
+        result.err()
+    };
     #[cfg(not(unix))]
-    {
+    let mut signal_error = {
         event("force-killing the still-owned supervised child on this platform");
-        kill_unreaped_child(process);
-    }
+        let result = kill_unreaped_child(process);
+        if let Err(error) = &result {
+            event(&format!("direct-child kill request failed: {error}"));
+        }
+        result.err()
+    };
 
     if let Some(status) = wait_for_child_exit(process, AUTHORITY_LOSS_TERM_GRACE)? {
         return Ok(Some(status));
@@ -1137,15 +1152,27 @@ where
         // remains unreaped. Only now escalate, and never signal this group once
         // a status has been collected.
         event("SIGTERM grace expired; sending SIGKILL to the unreaped process group");
-        signal_unreaped_process_group(process, libc::SIGKILL);
+        signal_error = signal_unreaped_process_group(process, libc::SIGKILL).err();
+        if let Some(error) = &signal_error {
+            event(&format!("SIGKILL request failed: {error}"));
+        }
     }
     #[cfg(not(unix))]
     {
         event("direct-child kill grace expired; retrying kill while it remains unreaped");
-        kill_unreaped_child(process);
+        signal_error = kill_unreaped_child(process).err();
+        if let Some(error) = &signal_error {
+            event(&format!("direct-child kill retry failed: {error}"));
+        }
     }
 
-    wait_for_child_exit(process, AUTHORITY_LOSS_KILL_GRACE)
+    let status = wait_for_child_exit(process, AUTHORITY_LOSS_KILL_GRACE)?;
+    if status.is_none() {
+        if let Some(error) = signal_error {
+            return Err(error);
+        }
+    }
+    Ok(status)
 }
 
 fn quarantine_unconfirmed_termination<F>(
@@ -2319,13 +2346,38 @@ mod tests {
             )
             .unwrap();
 
+        let ready_path = t.path().join("term-handler-ready");
         let command = vec![
             "sh".to_string(),
             "-c".to_string(),
-            "trap '' TERM; exec sleep 3".to_string(),
+            "trap '' TERM; : > \"$1\"; exec sleep 3".to_string(),
+            "authority-loss-child".to_string(),
+            ready_path.display().to_string(),
         ];
         let environment = BTreeMap::new();
         let mut child = spawn_resource_process(&command, t.path(), &grant, &environment).unwrap();
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready_path.exists() && std::time::Instant::now() < ready_deadline {
+            if child.child.try_wait().unwrap().is_some() {
+                panic!("owned test child exited before installing its TERM handler");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready_path.exists() {
+            if child.child.try_wait().unwrap().is_none() {
+                let kill_result = signal_unreaped_process_group(&child, libc::SIGKILL);
+                let reap_result = wait_for_child_exit(&mut child, AUTHORITY_LOSS_KILL_GRACE);
+                assert!(
+                    kill_result.is_ok(),
+                    "failed to kill the owned test process group"
+                );
+                assert!(
+                    matches!(&reap_result, Ok(Some(_))),
+                    "failed to reap the owned test child after readiness timeout: {reap_result:?}"
+                );
+            }
+            panic!("owned test child did not install its TERM handler before the deadline");
+        }
         let started = std::time::Instant::now();
         let mut events = Vec::new();
         let status = terminate_after_authority_loss(&mut child, &mut |message| {
@@ -2349,6 +2401,44 @@ mod tests {
         assert_eq!(
             coordinator.list(false).unwrap()[0].state,
             HostLeaseState::Quarantined
+        );
+    }
+
+    #[test]
+    fn unconfirmed_authority_loss_termination_quarantines_without_a_status() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = req(
+            "unconfirmed-authority-loss",
+            vec![exclusive("unknown-status")],
+        );
+        let mut grant = coordinator.acquire(&request).unwrap();
+        let mut events = Vec::new();
+
+        let error = quarantine_unconfirmed_termination(
+            &mut coordinator,
+            &mut grant,
+            "the child status remained unavailable after bounded TERM/KILL waits".into(),
+            &mut |message| events.push(message.to_string()),
+        );
+
+        assert!(matches!(
+            error,
+            HostResourceRunError::TerminationUnconfirmed {
+                ref lease_id,
+                ref lease_state,
+                ..
+            } if lease_id == &grant.lease.lease_id && lease_state == "quarantined"
+        ));
+        assert_eq!(grant.lease.state, HostLeaseState::Quarantined);
+        assert_eq!(
+            coordinator.list(false).unwrap()[0].state,
+            HostLeaseState::Quarantined
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("status unavailable"))
         );
     }
 
