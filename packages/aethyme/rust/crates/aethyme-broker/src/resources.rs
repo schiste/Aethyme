@@ -746,6 +746,12 @@ impl HostResourceCoordinator {
     /// supplemental environment values after acquisition has selected the
     /// actual allocations. This is the narrow hook consumers need when a
     /// child-facing value depends on the granted port or namespace.
+    ///
+    /// On Unix, requested cleanup runs only after the command's original
+    /// process group is observed absent. This bounded check cannot see a
+    /// descendant that deliberately leaves that group, for example with
+    /// `setsid` or `setpgid`. On other platforms, group quiescence cannot be
+    /// proven and the lease is retained in quarantine.
     #[allow(clippy::too_many_arguments)]
     pub fn run_supervised_with_environment<F, P>(
         &mut self,
@@ -818,49 +824,70 @@ impl HostResourceCoordinator {
                 return Err(error);
             }
         };
-        let child_status = supervise_process(
+        let child_completion = supervise_process(
             self,
             &mut grant,
             request.ttl_seconds,
             &mut child,
             &mut event,
         )?;
-        let child_signal = exit_signal(&child_status);
-        let child_exit_code = portable_exit_code(&child_status);
+        let child_signal = exit_signal(&child_completion.status);
+        let child_exit_code = portable_exit_code(&child_completion.status);
 
         let mut cleanup_exit_code = None;
-        let mut lifecycle_safe = true;
+        let child_group_absent = child_completion.process_group == ProcessGroupObservation::Absent;
+        let mut lifecycle_safe = child_group_absent;
+        if !child_group_absent {
+            event(&format!(
+                "original supervised process group {} after leader exit; resource lease will be quarantined",
+                child_completion.process_group.description()
+            ));
+        }
         if let Some(cleanup) = cleanup_command {
-            event("running exact cleanup command");
-            let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
-            let cleanup_child = spawn_resource_process(&cleanup_argv, cwd, &grant, &environment)
-                .map_err(|source| HostResourceRunError::Spawn {
-                    program: "sh".into(),
-                    source,
-                });
-            let mut cleanup_child = match cleanup_child {
-                Ok(child) => child,
-                Err(error) => {
-                    crate::warn_unrecorded(
-                        "quarantine the host resource lease",
-                        self.quarantine(
-                            &grant.lease.lease_id,
-                            grant.lease.generation,
-                            &grant.ownership_token,
-                        ),
-                    );
-                    return Err(error);
+            if child_group_absent {
+                event("running exact cleanup command");
+                let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
+                let cleanup_child = spawn_resource_process(&cleanup_argv, cwd, &grant, &environment)
+                    .map_err(|source| HostResourceRunError::Spawn {
+                        program: "sh".into(),
+                        source,
+                    });
+                let mut cleanup_child = match cleanup_child {
+                    Ok(child) => child,
+                    Err(error) => {
+                        crate::warn_unrecorded(
+                            "quarantine the host resource lease",
+                            self.quarantine(
+                                &grant.lease.lease_id,
+                                grant.lease.generation,
+                                &grant.ownership_token,
+                            ),
+                        );
+                        return Err(error);
+                    }
+                };
+                let cleanup_completion = supervise_process(
+                    self,
+                    &mut grant,
+                    request.ttl_seconds,
+                    &mut cleanup_child,
+                    &mut event,
+                )?;
+                cleanup_exit_code = Some(portable_exit_code(&cleanup_completion.status));
+                let cleanup_group_absent =
+                    cleanup_completion.process_group == ProcessGroupObservation::Absent;
+                lifecycle_safe = cleanup_completion.status.success() && cleanup_group_absent;
+                if !cleanup_group_absent {
+                    event(&format!(
+                        "cleanup process group {} after leader exit; resource lease will be quarantined",
+                        cleanup_completion.process_group.description()
+                    ));
                 }
-            };
-            let cleanup_status = supervise_process(
-                self,
-                &mut grant,
-                request.ttl_seconds,
-                &mut cleanup_child,
-                &mut event,
-            )?;
-            cleanup_exit_code = Some(portable_exit_code(&cleanup_status));
-            lifecycle_safe = cleanup_status.success();
+            } else {
+                event(
+                    "skipping exact cleanup command because the original process group may still contain writers",
+                );
+            }
         }
 
         let authority_lost = grant.lease.state != HostLeaseState::Active;
@@ -966,6 +993,72 @@ struct ResourceChild {
     child: std::process::Child,
     #[cfg(unix)]
     signals: BlockedSignals,
+}
+
+/// The command leader's exit status and the best available observation of its
+/// original process group after the leader has been reaped.
+///
+/// On Unix this observes only the group created for the direct child. A
+/// descendant that deliberately leaves the group, for example with `setsid`
+/// or `setpgid`, is outside this bounded quiescence check. Other platforms
+/// cannot observe that group and therefore report `Unknown` rather than claim
+/// it is gone.
+struct SupervisedProcessCompletion {
+    status: std::process::ExitStatus,
+    process_group: ProcessGroupObservation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessGroupObservation {
+    Absent,
+    Present,
+    Unknown,
+}
+
+impl ProcessGroupObservation {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Absent => "was observed absent",
+            Self::Present => "is still present",
+            Self::Unknown => "could not be confirmed absent",
+        }
+    }
+}
+
+fn process_completion(
+    process: &ResourceChild,
+    status: std::process::ExitStatus,
+) -> SupervisedProcessCompletion {
+    SupervisedProcessCompletion {
+        status,
+        process_group: observe_owned_process_group(process.child.id()),
+    }
+}
+
+#[cfg(unix)]
+fn observe_owned_process_group(process_group_id: u32) -> ProcessGroupObservation {
+    // The group leader has already been reaped. Signal 0 only probes whether
+    // this numeric process group exists; never send a delivered signal after
+    // reaping, when the identifier could eventually be reused.
+    // SAFETY: `killpg` takes the group id and signal by value and dereferences
+    // no memory owned by this crate. Signal 0 queries existence without
+    // delivering a signal.
+    let result = unsafe { libc::killpg(process_group_id as libc::pid_t, 0) };
+    if result == 0 {
+        ProcessGroupObservation::Present
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        ProcessGroupObservation::Absent
+    } else {
+        ProcessGroupObservation::Unknown
+    }
+}
+
+#[cfg(not(unix))]
+fn observe_owned_process_group(_process_group_id: u32) -> ProcessGroupObservation {
+    // The broker CLI is not supported on Windows, and this platform has no
+    // process-group observation here. Do not convert lack of proof into
+    // quiescence if the library is compiled or used independently.
+    ProcessGroupObservation::Unknown
 }
 
 #[cfg(unix)]
@@ -1098,7 +1191,7 @@ fn supervise_process<F>(
     ttl_seconds: u64,
     process: &mut ResourceChild,
     event: &mut F,
-) -> Result<std::process::ExitStatus, HostResourceRunError>
+) -> Result<SupervisedProcessCompletion, HostResourceRunError>
 where
     F: FnMut(&str),
 {
@@ -1114,7 +1207,7 @@ where
                     source,
                 })?
         {
-            return Ok(status);
+            return Ok(process_completion(process, status));
         }
         #[cfg(unix)]
         if let Some(signal) = process.signals.pending() {
@@ -1158,13 +1251,14 @@ where
                     }
                     #[cfg(not(unix))]
                     let _ = process.child.kill();
-                    return process
+                    let status = process
                         .child
                         .wait()
                         .map_err(|source| HostResourceRunError::Spawn {
                             program: "supervised child".into(),
                             source,
-                        });
+                        })?;
+                    return Ok(process_completion(process, status));
                 }
             }
         }

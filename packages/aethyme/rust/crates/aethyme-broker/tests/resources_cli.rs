@@ -355,6 +355,158 @@ fn supervised_run_preserves_child_status_and_quarantines_failed_cleanup() {
 
 #[cfg(unix)]
 #[test]
+fn supervised_run_quarantines_when_group_outlives_leader_and_skips_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let request_path = temp.path().join("run.json");
+    let cleanup_marker = temp.path().join("cleanup-marker");
+    std::fs::write(
+        &request_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "surviving-group-run",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "opaque",
+            "run_id": "surviving-group",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "runner",
+                "kind": "exclusive_key",
+                "name": "surviving-group-runner"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "run",
+            request_path.to_str().unwrap(),
+            "--cleanup-command",
+            ": > cleanup-marker",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "sleep 3 </dev/null >/dev/null 2>&1 & exit 23",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(23));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"child_exit_code\":23"), "{stderr}");
+    assert!(
+        stderr.contains("\"final_lease_state\":\"quarantined\""),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("skipping exact cleanup command"),
+        "{stderr}"
+    );
+    assert!(!cleanup_marker.exists());
+
+    let inventory = run(
+        temp.path(),
+        &state,
+        &["advanced", "resources", "list", "--json"],
+    );
+    let inventory: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    assert_eq!(inventory[0]["state"], "quarantined");
+
+    let contender_path = temp.path().join("contender.json");
+    std::fs::write(
+        &contender_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "surviving-group-contender",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "opaque-contender",
+            "run_id": "surviving-group-contender",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "runner",
+                "kind": "exclusive_key",
+                "name": "surviving-group-runner"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let blocked = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "acquire",
+            contender_path.to_str().unwrap(),
+            "--wait",
+            "1ms",
+            "--json",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(75));
+}
+
+#[cfg(unix)]
+#[test]
+fn supervised_run_releases_after_direct_exit_and_clean_groups() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let request_path = temp.path().join("run.json");
+    let cleanup_marker = temp.path().join("cleanup-marker");
+    std::fs::write(
+        &request_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "clean-group-run",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "opaque",
+            "run_id": "clean-group",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "runner",
+                "kind": "exclusive_key",
+                "name": "clean-group-runner"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "run",
+            request_path.to_str().unwrap(),
+            "--cleanup-command",
+            ": > cleanup-marker",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"cleanup_exit_code\":0"), "{stderr}");
+    assert!(
+        stderr.contains("\"final_lease_state\":\"released\""),
+        "{stderr}"
+    );
+    assert!(cleanup_marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn supervised_run_forwards_termination_to_the_child_group_and_releases() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
@@ -387,7 +539,7 @@ fn supervised_run_forwards_termination_to_the_child_group_and_releases() {
             "--",
             "sh",
             "-c",
-            "trap 'exit 42' TERM; printf 'child-ready\\n'; while :; do sleep 1; done",
+            "trap 'wait \"$sleeper\" 2>/dev/null; exit 42' TERM; sleep 10 & sleeper=$!; printf 'child-ready\\n'; wait \"$sleeper\"",
         ])
         .current_dir(temp.path())
         .env("AETHYME_HOST_STATE_DIR", &state)
