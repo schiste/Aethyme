@@ -764,9 +764,10 @@ fn plan_root_identity_recovery_with(
     .plan)
 }
 
-/// Apply one explicitly reviewed exact-root upgrade. The old and replacement
-/// payload hashes are both required, and the retained row is changed only by an
-/// exact SQL compare-and-swap while the shared registry lock remains held.
+/// Apply one explicitly reviewed exact-root upgrade. The old payload,
+/// replacement payload, and exact owner-marker bytes hashes are all required;
+/// the retained row changes only by exact SQL compare-and-swap under the shared
+/// registry lock.
 pub(crate) fn apply_root_identity_recovery(
     host_database: &Path,
     root: &Path,
@@ -801,21 +802,35 @@ fn apply_root_identity_recovery_with(
         repository_key,
         confirm,
         identity_reader,
-        before_compare_and_swap,
-        |_, _, _| Ok(()),
+        RootIdentityRecoveryHooks {
+            before_compare_and_swap,
+            after_update_before_reobservation: |_, _, _| Ok(()),
+        },
     )
 }
 
-fn apply_root_identity_recovery_with_hooks(
+struct RootIdentityRecoveryHooks<BeforeUpdate, AfterUpdate> {
+    before_compare_and_swap: BeforeUpdate,
+    after_update_before_reobservation: AfterUpdate,
+}
+
+fn apply_root_identity_recovery_with_hooks<BeforeUpdate, AfterUpdate>(
     host_database: &Path,
     root: &Path,
     repository_root: &Path,
     repository_key: &str,
     confirm: &str,
     identity_reader: &impl Fn(&Path, &Metadata) -> io::Result<Option<DirectoryIdentity>>,
-    before_compare_and_swap: impl FnOnce(&Connection, &str, &str) -> io::Result<()>,
-    after_update_before_reobservation: impl FnOnce(&Connection, &str, &str) -> io::Result<()>,
-) -> io::Result<RootIdentityRecoveryPlan> {
+    hooks: RootIdentityRecoveryHooks<BeforeUpdate, AfterUpdate>,
+) -> io::Result<RootIdentityRecoveryPlan>
+where
+    BeforeUpdate: FnOnce(&Connection, &str, &str) -> io::Result<()>,
+    AfterUpdate: FnOnce(&Connection, &str, &str) -> io::Result<()>,
+{
+    let RootIdentityRecoveryHooks {
+        before_compare_and_swap,
+        after_update_before_reobservation,
+    } = hooks;
     require_absolute_recovery_paths(host_database, root, repository_root)?;
     let _exclusion = registry_lock(host_database, false)?;
     let mut connection = open_existing_registry_for_write(host_database)?;
@@ -2103,12 +2118,15 @@ mod tests {
             &owner.repository_key,
             &plan.confirmation,
             &current_recovery_identity,
-            |_, _, _| Ok(()),
-            |_, _, _| {
-                let mut production_marker = serde_json::to_vec_pretty(&owner).map_err(invalid)?;
-                production_marker.push(b'\n');
-                fs::write(root.join(WORKTREE_ROOT_MARKER), production_marker)?;
-                Ok(())
+            RootIdentityRecoveryHooks {
+                before_compare_and_swap: |_, _, _| Ok(()),
+                after_update_before_reobservation: |_, _, _| {
+                    let mut production_marker =
+                        serde_json::to_vec_pretty(&owner).map_err(invalid)?;
+                    production_marker.push(b'\n');
+                    fs::write(root.join(WORKTREE_ROOT_MARKER), production_marker)?;
+                    Ok(())
+                },
             },
         )
         .expect_err("post-CAS reobservation must reject changed owner marker bytes");
