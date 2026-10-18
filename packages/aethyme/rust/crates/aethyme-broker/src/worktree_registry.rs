@@ -538,12 +538,12 @@ fn recovery_identity_matches(
             "registered {object} inode changed; retained history was preserved"
         )));
     }
-    if let Some(saved_uuid) = saved.volume_uuid {
-        if recovery_volume_uuid(current, object)? != saved_uuid {
-            return Err(invalid(format!(
-                "registered {object} volume UUID changed; retained history was preserved"
-            )));
-        }
+    if let Some(saved_uuid) = saved.volume_uuid
+        && recovery_volume_uuid(current, object)? != saved_uuid
+    {
+        return Err(invalid(format!(
+            "registered {object} volume UUID changed; retained history was preserved"
+        )));
     }
     Ok(())
 }
