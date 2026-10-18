@@ -206,9 +206,10 @@ blocked.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
-   with `aethyme broker start --reuse --task "..." --short-name "<short name>"`. `finish` closes broker
-   state but deliberately leaves the worktree available for review or reuse.
-   When it reports cleanup is safe, reclaim that exact worktree with
+   with `aethyme broker start --reuse --task "..." --short-name "<short name>"`.
+   A successful `finish` may clean a safe session worktree and branch by
+   default. Use `--keep-worktree` when pinned provenance or recovery needs the
+   exact checkout; later reclaim a retained checkout with
    `aethyme broker finish cleanup <id>`. Operators can periodically review all
    retained broker-owned worktrees with
    `aethyme broker finish cleanup --all-cleaned` and apply the unchanged plan

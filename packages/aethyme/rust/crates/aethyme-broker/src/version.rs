@@ -292,12 +292,11 @@ fn resolve_binary_commit(repo: &GitRepo, binary: &BinaryBuild) -> Option<String>
     {
         return Some(commit);
     }
-    if let Some(revision) = binary.revision.as_deref() {
-        if let Some(commitish) = commitish_from_label(revision)
-            && let Some(commit) = repo.resolve_ref(&commitish)
-        {
-            return Some(commit);
-        }
+    if let Some(revision) = binary.revision.as_deref()
+        && let Some(commitish) = commitish_from_label(revision)
+        && let Some(commit) = repo.resolve_ref(&commitish)
+    {
+        return Some(commit);
     }
     let legacy_describe = binary.describe.as_deref()?;
     let commitish = commitish_from_label(legacy_describe)?;

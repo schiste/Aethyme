@@ -51,45 +51,53 @@ pub fn recorded(store: &crate::BrokerStore, session_id: i64) -> Option<RecordedI
     })
 }
 
-/// A build's identity for comparison: the commit when both sides know it,
-/// otherwise version plus its stable revision label, falling back to a legacy
-/// `describe` value for historical events.
+/// A build's identity for comparison. Full revisions include tracked dirty
+/// state; historical events may only carry a legacy `describe` value.
 fn identity(version: &str, revision: Option<&str>, commit: Option<&str>) -> String {
+    if let Some(revision) = revision.filter(|revision| is_exact_revision(revision)) {
+        return format!("{version} ({revision})");
+    }
     match commit {
         Some(commit) => commit.to_string(),
         None => format!("{version} ({})", revision.unwrap_or("unknown revision")),
     }
 }
 
+fn is_exact_revision(revision: &str) -> bool {
+    let oid = revision.strip_suffix("-dirty").unwrap_or(revision);
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// `Some((recorded, current))` when the installed build differs from the
-/// session's record. Builds are compared by commit when both sides carry
-/// one, and by version and revision otherwise, so a build without commit
-/// metadata never reads as a change on its own.
+/// session's record. Compare full revisions when both sides carry them so a
+/// tracked dirty build differs from a clean build of the same commit. When
+/// either side has only legacy metadata, compare commits when both are known
+/// to keep historical `describe` labels compatible.
 pub fn replacement(recorded: &RecordedInstall, current: &BinaryBuild) -> Option<(String, String)> {
+    let recorded_revision = recorded
+        .revision
+        .as_deref()
+        .or(recorded.describe.as_deref());
+    let current_revision = current.revision.as_deref().or(current.describe.as_deref());
+    let both_have_exact_revisions = recorded_revision.is_some_and(is_exact_revision)
+        && current_revision.is_some_and(is_exact_revision);
     let both_have_commits = recorded.commit.is_some() && current.commit.is_some();
-    let (before, after) = if both_have_commits {
-        (
-            identity(&recorded.version, None, recorded.commit.as_deref()),
-            identity(&current.version, None, current.commit.as_deref()),
-        )
+    let before = identity(
+        &recorded.version,
+        recorded_revision,
+        recorded.commit.as_deref(),
+    );
+    let after = identity(
+        &current.version,
+        current_revision,
+        current.commit.as_deref(),
+    );
+    let changed = if both_have_commits && !both_have_exact_revisions {
+        recorded.commit.as_deref() != current.commit.as_deref()
     } else {
-        (
-            identity(
-                &recorded.version,
-                recorded
-                    .revision
-                    .as_deref()
-                    .or(recorded.describe.as_deref()),
-                None,
-            ),
-            identity(
-                &current.version,
-                current.revision.as_deref().or(current.describe.as_deref()),
-                None,
-            ),
-        )
+        before != after
     };
-    (before != after).then_some((before, after))
+    changed.then_some((before, after))
 }
 
 /// `install.replaced` advice for each live session whose recorded build is
@@ -178,6 +186,39 @@ mod tests {
         )
         .expect("a different commit is a replacement");
         assert_eq!((before.as_str(), after.as_str()), ("aaa", "bbb"));
+    }
+
+    #[test]
+    fn tracked_dirty_revision_is_a_replacement_in_both_directions() {
+        const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let clean = recorded("0.8.22", Some(COMMIT), Some(COMMIT));
+        let clean_build = build("0.8.22", Some(COMMIT), Some(COMMIT));
+        let dirty_revision = format!("{COMMIT}-dirty");
+        let mut dirty = recorded("0.8.22", Some(&dirty_revision), Some(COMMIT));
+        dirty.revision = Some(dirty_revision.clone());
+        let mut dirty_build = build("0.8.22", Some(&dirty_revision), Some(COMMIT));
+        dirty_build.revision = Some(dirty_revision.clone());
+
+        assert_eq!(
+            replacement(&clean, &dirty_build).map(|(_, after)| after),
+            Some(format!("0.8.22 ({dirty_revision})"))
+        );
+        assert_eq!(
+            replacement(&dirty, &clean_build).map(|(before, _)| before),
+            Some(format!("0.8.22 ({dirty_revision})"))
+        );
+        assert_eq!(replacement(&clean, &clean_build), None);
+    }
+
+    #[test]
+    fn a_legacy_describe_and_new_revision_for_the_same_commit_are_compatible() {
+        const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let legacy_describe = "v0.8.22-3-gaaaaaaaaaaaa";
+        let mut old_build = recorded("0.8.22", Some(legacy_describe), Some(COMMIT));
+        old_build.revision = Some(legacy_describe.into());
+        let new_build = build("0.8.22", Some(COMMIT), Some(COMMIT));
+
+        assert_eq!(replacement(&old_build, &new_build), None);
     }
 
     #[test]
