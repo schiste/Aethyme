@@ -28,10 +28,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For read-only GitHub status/check inspection, use `gh --repo` directly without
   opening a broker session. Isolate source research in its task worktree and
   independent reviews in their own read-only snapshot; sessions are for edits.
-- For large broker `status --json` output, retain complete stdout and stderr in
-  unique files before parsing exact session IDs and structured advice fields
-  such as severity and commands. Never infer absence from truncated output or
-  suppressed stderr.
+- For routine broker status checks, prefer `aethyme broker status --summary
+  --json`; capture full `status --json` only when its additional detail is needed.
+  Retain complete stdout and stderr before parsing exact session IDs and
+  structured advice fields such as severity and commands. Never infer absence
+  from truncated output or suppressed stderr.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
@@ -93,15 +94,23 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
-- For build-cache identity changes, check an unchanged repeat build as well as
-  switching between linked worktrees and advancing a branch. Verify freshness
-  from Cargo output; correct embedded identity alone does not rule out forced
-  recompilation on every invocation. Use a dependency-free fixture first.
+- For build-cache identity changes, start with a dependency-free Cargo fixture.
+  Verify the embedded identity and Cargo freshness across an unchanged repeat,
+  linked-worktree switches, and source advances. Also hold the current source
+  identity fixed while adding a sibling worktree and making a sibling-only
+  commit; compare Cargo's build-script rerun output. A fixed build-date shim can
+  distinguish Git-admin watch invalidation from time-derived build output.
   Keep production probes and oracles from changing watched inputs: Git dirty
   checks can refresh Cargo-watched index and split-index shared-index mtimes,
   even with optional locks disabled. Trace those paths before and after rather
   than inferring read-only behavior from flags; an isolated index must also
   protect its split-index backing files.
+- For routine Rust validation, reuse a matching warm target and run one Cargo
+  process at a time with `--locked -j1`. Prefer a selected package/binary or
+  focused test filter. On a resource-constrained target, use `debug=0` and
+  `incremental=0` from the outset; avoid changing profile settings on a warm
+  target. Expand to verbose or workspace-wide runs only when explicitly needed
+  or after a focused failure.
 - Run the fastest relevant test command first.
   Check the selected test names and a nonzero executed count before treating a
   focused run as evidence. Rust module aliases can differ from filenames; a
@@ -116,7 +125,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 - `fast_test`: `packages/aethyme/scripts/test-like-ci.sh`
 - `full_test`: `packages/aethyme/scripts/test-like-ci.sh --full`
-- `build`: `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+- `focused_build`: `cargo build --locked -j1 --manifest-path packages/aethyme/rust/Cargo.toml --package <package> --bin <binary>`
+- `full_workspace_build` (explicit): `cargo build --locked -j1 --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
 
 ## Primary Entrypoints
 

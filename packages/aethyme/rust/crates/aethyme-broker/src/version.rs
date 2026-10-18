@@ -3,7 +3,7 @@
 //! The broker can run against any repository, but source-drift comparison
 //! is only meaningful when the target repository is the Aethyme source
 //! checkout itself. In that case, compare the running binary's build
-//! commit/describe to the repository's `aethyme/integration` branch.
+//! revision/commit to the repository's `aethyme/integration` branch.
 
 use std::path::Path;
 
@@ -25,6 +25,9 @@ const BROKER_CORRECTNESS_PATHS: &[&str] = &[
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BinaryBuild {
     pub version: String,
+    /// Stable source identity: exact commit OID plus `-dirty` when tracked files differ.
+    pub revision: Option<String>,
+    /// Compatibility alias retained for older event readers.
     pub describe: Option<String>,
     pub commit: Option<String>,
     pub path: Option<String>,
@@ -76,7 +79,10 @@ impl VersionDriftStatus {
 pub fn current_binary_build() -> BinaryBuild {
     BinaryBuild {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        describe: non_empty(option_env!("AETHYME_BROKER_GIT_DESCRIBE")),
+        revision: non_empty(option_env!("AETHYME_BROKER_GIT_REVISION"))
+            .or_else(|| non_empty(option_env!("AETHYME_BROKER_GIT_DESCRIBE"))),
+        describe: non_empty(option_env!("AETHYME_BROKER_GIT_REVISION"))
+            .or_else(|| non_empty(option_env!("AETHYME_BROKER_GIT_DESCRIBE"))),
         commit: non_empty(option_env!("AETHYME_BROKER_GIT_COMMIT")),
         path: std::env::current_exe()
             .ok()
@@ -124,7 +130,7 @@ fn broker_start_warning_with_binary(main_root: &Path, binary: BinaryBuild) -> Op
     changed.sort();
     changed.dedup();
 
-    let binary_label = binary.describe.as_deref().unwrap_or(binary_commit.as_str());
+    let binary_label = binary_label(&binary);
     Some(format!(
         concat!(
             "installed broker build {} ({}) predates main {}; newer ",
@@ -207,6 +213,9 @@ pub(crate) fn inspect_version_with_binary(
     };
 
     let binary_label = binary_label(&binary);
+    let release_commit = release_tag
+        .as_deref()
+        .and_then(|tag| repo.resolve_ref(&format!("refs/tags/{tag}")));
     let integration_label = integration_describe
         .as_deref()
         .unwrap_or_else(|| short_commit(integration));
@@ -216,10 +225,7 @@ pub(crate) fn inspect_version_with_binary(
             format!("running CLI {binary_label} matches {integration_branch} {integration_label}"),
         )
     } else if repo.is_ancestor(&binary_commit, integration) {
-        if release_tag
-            .as_deref()
-            .is_some_and(|tag| binary.describe.as_deref() == Some(tag))
-        {
+        if release_commit.as_deref() == Some(binary_commit.as_str()) {
             (
                 VersionDriftStatus::ReleaseBehindIntegration,
                 format!(
@@ -286,13 +292,20 @@ fn resolve_binary_commit(repo: &GitRepo, binary: &BinaryBuild) -> Option<String>
     {
         return Some(commit);
     }
-    let describe = binary.describe.as_deref()?;
-    let commitish = commitish_from_describe(describe)?;
+    if let Some(revision) = binary.revision.as_deref() {
+        if let Some(commitish) = commitish_from_label(revision)
+            && let Some(commit) = repo.resolve_ref(&commitish)
+        {
+            return Some(commit);
+        }
+    }
+    let legacy_describe = binary.describe.as_deref()?;
+    let commitish = commitish_from_label(legacy_describe)?;
     repo.resolve_ref(&commitish)
 }
 
-fn commitish_from_describe(describe: &str) -> Option<String> {
-    let clean = describe.strip_suffix("-dirty").unwrap_or(describe);
+fn commitish_from_label(label: &str) -> Option<String> {
+    let clean = label.strip_suffix("-dirty").unwrap_or(label);
     if let Some((_, suffix)) = clean.rsplit_once("-g")
         && !suffix.is_empty()
         && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -304,8 +317,9 @@ fn commitish_from_describe(describe: &str) -> Option<String> {
 
 fn binary_label(binary: &BinaryBuild) -> String {
     binary
-        .describe
+        .revision
         .clone()
+        .or_else(|| binary.describe.clone())
         .unwrap_or_else(|| binary.version.clone())
 }
 
@@ -352,6 +366,7 @@ mod tests {
     fn binary(commit: &str, describe: &str) -> BinaryBuild {
         BinaryBuild {
             version: "0.1.1".into(),
+            revision: Some(commit.into()),
             describe: Some(describe.into()),
             commit: Some(commit.into()),
             path: Some("/tmp/aethyme".into()),
@@ -382,6 +397,39 @@ mod tests {
         let report = inspect_version_with_binary(tmp.path(), binary(&release, "v0.1.1"));
         assert_eq!(report.status, VersionDriftStatus::ReleaseBehindIntegration);
         assert!(report.message.contains("newer unreleased broker changes"));
+    }
+
+    #[test]
+    fn legacy_tag_label_does_not_override_resolved_binary_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        sh(tmp.path(), &["init", "-q", "-b", "main"]);
+        marker_source_checkout(tmp.path());
+        sh(tmp.path(), &["add", "-A"]);
+        sh(tmp.path(), &["commit", "-qm", "release"]);
+        sh(tmp.path(), &["tag", "v0.1.1"]);
+
+        std::fs::write(tmp.path().join("README.md"), "intermediate commit\n").unwrap();
+        sh(tmp.path(), &["add", "-A"]);
+        sh(tmp.path(), &["commit", "-qm", "intermediate"]);
+        let intermediate = GitRepo::discover(tmp.path())
+            .unwrap()
+            .head_commit()
+            .unwrap();
+
+        let operations = tmp
+            .path()
+            .join("packages/aethyme/rust/crates/aethyme-broker/src/operations.rs");
+        std::fs::create_dir_all(operations.parent().unwrap()).unwrap();
+        std::fs::write(operations, "new broker correctness code\n").unwrap();
+        sh(tmp.path(), &["add", "-A"]);
+        sh(tmp.path(), &["commit", "-qm", "integration change"]);
+        sh(
+            tmp.path(),
+            &["update-ref", "refs/heads/aethyme/integration", "HEAD"],
+        );
+
+        let report = inspect_version_with_binary(tmp.path(), binary(&intermediate, "v0.1.1"));
+        assert_eq!(report.status, VersionDriftStatus::BehindIntegration);
     }
 
     #[test]

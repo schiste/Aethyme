@@ -15,6 +15,7 @@ use crate::version::BinaryBuild;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedInstall {
     pub version: String,
+    pub revision: Option<String>,
     pub describe: Option<String>,
     pub commit: Option<String>,
     pub recorded_at_ms: i64,
@@ -43,6 +44,7 @@ pub fn recorded(store: &crate::BrokerStore, session_id: i64) -> Option<RecordedI
     let text = |key: &str| payload.get(key)?.as_str().map(str::to_string);
     Some(RecordedInstall {
         version: text("version")?,
+        revision: text("revision").or_else(|| text("describe")),
         describe: text("describe"),
         commit: text("commit"),
         recorded_at_ms: event.ts,
@@ -50,17 +52,18 @@ pub fn recorded(store: &crate::BrokerStore, session_id: i64) -> Option<RecordedI
 }
 
 /// A build's identity for comparison: the commit when both sides know it,
-/// otherwise version plus `git describe`. `None` when nothing identifies it.
-fn identity(version: &str, describe: Option<&str>, commit: Option<&str>) -> String {
+/// otherwise version plus its stable revision label, falling back to a legacy
+/// `describe` value for historical events.
+fn identity(version: &str, revision: Option<&str>, commit: Option<&str>) -> String {
     match commit {
         Some(commit) => commit.to_string(),
-        None => format!("{version} ({})", describe.unwrap_or("unknown describe")),
+        None => format!("{version} ({})", revision.unwrap_or("unknown revision")),
     }
 }
 
 /// `Some((recorded, current))` when the installed build differs from the
 /// session's record. Builds are compared by commit when both sides carry
-/// one, and by version and describe otherwise, so a build without commit
+/// one, and by version and revision otherwise, so a build without commit
 /// metadata never reads as a change on its own.
 pub fn replacement(recorded: &RecordedInstall, current: &BinaryBuild) -> Option<(String, String)> {
     let both_have_commits = recorded.commit.is_some() && current.commit.is_some();
@@ -71,8 +74,19 @@ pub fn replacement(recorded: &RecordedInstall, current: &BinaryBuild) -> Option<
         )
     } else {
         (
-            identity(&recorded.version, recorded.describe.as_deref(), None),
-            identity(&current.version, current.describe.as_deref(), None),
+            identity(
+                &recorded.version,
+                recorded
+                    .revision
+                    .as_deref()
+                    .or(recorded.describe.as_deref()),
+                None,
+            ),
+            identity(
+                &current.version,
+                current.revision.as_deref().or(current.describe.as_deref()),
+                None,
+            ),
         )
     };
     (before != after).then_some((before, after))
@@ -126,6 +140,9 @@ mod tests {
     fn recorded(version: &str, describe: Option<&str>, commit: Option<&str>) -> RecordedInstall {
         RecordedInstall {
             version: version.into(),
+            revision: commit
+                .map(str::to_string)
+                .or_else(|| describe.map(str::to_string)),
             describe: describe.map(str::to_string),
             commit: commit.map(str::to_string),
             recorded_at_ms: 1,
@@ -135,6 +152,9 @@ mod tests {
     fn build(version: &str, describe: Option<&str>, commit: Option<&str>) -> BinaryBuild {
         BinaryBuild {
             version: version.into(),
+            revision: commit
+                .map(str::to_string)
+                .or_else(|| describe.map(str::to_string)),
             describe: describe.map(str::to_string),
             commit: commit.map(str::to_string),
             path: Some("/usr/local/bin/aethyme".into()),

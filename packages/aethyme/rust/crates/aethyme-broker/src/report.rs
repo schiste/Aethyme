@@ -1373,6 +1373,7 @@ mod tests {
     fn build() -> BinaryBuild {
         BinaryBuild {
             version: "0.1.5".into(),
+            revision: Some("abcdef0123456789".into()),
             describe: Some("v0.1.5-1-gabc".into()),
             commit: Some("abcdef0123456789".into()),
             path: Some("/private/bin/aethyme-BINARY-PATH-SECRET".into()),

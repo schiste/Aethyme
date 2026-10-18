@@ -28,7 +28,7 @@ fn top_level_help_names_the_normal_broker_lifecycle() {
 }
 
 #[test]
-fn version_banner_exposes_build_commit_and_date() {
+fn version_banner_exposes_build_revision_commit_and_date() {
     let output = Command::new(env!("CARGO_BIN_EXE_aethyme"))
         .arg("--version")
         .output()
@@ -37,14 +37,27 @@ fn version_banner_exposes_build_commit_and_date() {
 
     let version = String::from_utf8(output.stdout).expect("UTF-8 version");
     let version = version.trim();
+    let revision = version
+        .split_once("build_revision=")
+        .and_then(|(_, value)| value.split(" build_commit=").next())
+        .expect("version must expose build_revision");
     let commit = version
         .split_once("build_commit=")
         .and_then(|(_, value)| value.split(')').next())
         .expect("version must expose build_commit");
+    let revision_commit = revision.strip_suffix("-dirty").unwrap_or(revision);
     assert_eq!(
+        revision_commit.len(),
         commit.len(),
-        40,
-        "build commit must be a full SHA: {version}"
+        "build revision must contain the full commit plus an optional dirty marker: {version}"
+    );
+    assert_eq!(
+        revision_commit, commit,
+        "build revision must name the exact commit: {version}"
+    );
+    assert!(
+        commit.len() == 40 || commit.len() == 64,
+        "build commit must be a full SHA-1 or SHA-256: {version}"
     );
     assert!(
         commit.bytes().all(|byte| byte.is_ascii_hexdigit()),

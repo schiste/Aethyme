@@ -943,6 +943,7 @@ fn doctor_report(
         version: VersionDriftReport {
             binary: BinaryBuild {
                 version: "0.1.1".into(),
+                revision: Some("aaaaaaaaaaaa".into()),
                 describe: Some("v0.1.1".into()),
                 commit: Some("aaaaaaaaaaaa".into()),
                 path: Some("/tmp/aethyme".into()),
