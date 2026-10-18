@@ -1330,12 +1330,10 @@ where
     };
 
     let status = wait_for_child_exit(process, AUTHORITY_LOSS_KILL_GRACE)?;
-    if status.is_none() {
-        if let Some(error) = signal_error {
-            return Err(error);
-        }
+    match (status, signal_error) {
+        (None, Some(error)) => Err(error),
+        (status, _) => Ok(status),
     }
-    Ok(status)
 }
 
 fn quarantine_unconfirmed_termination<F>(
@@ -2646,6 +2644,55 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn supervised_run_does_not_prepare_or_spawn_before_capacity_is_acquired() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        coordinator
+            .acquire(&capacity_request(
+                "capacity-owner",
+                "workers",
+                1,
+                1,
+                Some(std::process::id()),
+            ))
+            .unwrap();
+
+        let child_marker = t.path().join("child-started");
+        let mut environment_prepared = false;
+        let result = coordinator.run_supervised_with_environment(
+            &capacity_request(
+                "blocked-supervised-run",
+                "workers",
+                1,
+                1,
+                Some(std::process::id()),
+            ),
+            std::time::Duration::ZERO,
+            &["sh".into(), "-c".into(), "touch \"$CHILD_MARKER\"".into()],
+            None,
+            t.path(),
+            |_| {
+                environment_prepared = true;
+                Ok(BTreeMap::from([(
+                    "CHILD_MARKER".into(),
+                    child_marker.to_string_lossy().into_owned(),
+                )]))
+            },
+            |_| {},
+        );
+
+        assert!(matches!(
+            result,
+            Err(HostResourceRunError::Resource(
+                HostResourceError::Conflict { .. }
+            ))
+        ));
+        assert!(!environment_prepared);
+        assert!(!child_marker.exists());
+    }
+
     #[test]
     fn supervised_request_id_cannot_be_replayed_or_cross_modes() {
         let t = tempfile::tempdir().unwrap();
@@ -2738,7 +2785,7 @@ mod tests {
         assert_eq!(after.allocations[0].kind, "exclusive_key");
         drop(coordinator);
 
-        let mut newer = Connection::open(&path).unwrap();
+        let newer = Connection::open(&path).unwrap();
         newer
             .execute("UPDATE meta SET value=3 WHERE key='schema_version'", [])
             .unwrap();
@@ -2827,6 +2874,32 @@ mod tests {
                 )
                 .is_err()
         );
+        assert!(
+            old_connection
+                .execute(
+                    "UPDATE resource_allocations SET units=0 WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+
+        // Disable SQLite's foreign-key check for this statement so the
+        // generation-bound trigger, rather than the hold table's FK, proves
+        // that an already-open v1 writer cannot delete the held lease.
+        old_connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        assert!(
+            old_connection
+                .execute(
+                    "DELETE FROM resource_leases WHERE lease_id=?1",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+        old_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
 
         let legacy_second = capacity_request(
             "legacy-second",
