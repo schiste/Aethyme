@@ -454,6 +454,103 @@ fn supervised_run_quarantines_when_group_outlives_leader_and_skips_cleanup() {
 
 #[cfg(unix)]
 #[test]
+fn supervised_run_quarantines_when_cleanup_group_outlives_leader() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let request_path = temp.path().join("run.json");
+    let cleanup_started = temp.path().join("cleanup-started");
+    std::fs::write(
+        &request_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "surviving-cleanup-group-run",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "opaque",
+            "run_id": "surviving-cleanup-group",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "runner",
+                "kind": "exclusive_key",
+                "name": "surviving-cleanup-runner"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "run",
+            request_path.to_str().unwrap(),
+            "--cleanup-command",
+            ": > cleanup-started; sleep 3 </dev/null >/dev/null 2>&1 & exit 0",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "exit 31",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(31));
+    assert!(cleanup_started.exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"child_exit_code\":31"), "{stderr}");
+    assert!(stderr.contains("\"cleanup_exit_code\":0"), "{stderr}");
+    assert!(
+        stderr.contains("\"final_lease_state\":\"quarantined\""),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cleanup process group"), "{stderr}");
+
+    let inventory = run(
+        temp.path(),
+        &state,
+        &["advanced", "resources", "list", "--json"],
+    );
+    let inventory: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    assert_eq!(inventory[0]["state"], "quarantined");
+
+    let contender_path = temp.path().join("contender.json");
+    std::fs::write(
+        &contender_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "surviving-cleanup-contender",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "opaque-contender",
+            "run_id": "surviving-cleanup-contender",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "runner",
+                "kind": "exclusive_key",
+                "name": "surviving-cleanup-runner"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let blocked = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "acquire",
+            contender_path.to_str().unwrap(),
+            "--wait",
+            "1ms",
+            "--json",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(75));
+}
+
+#[cfg(unix)]
+#[test]
 fn supervised_run_releases_after_direct_exit_and_clean_groups() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
