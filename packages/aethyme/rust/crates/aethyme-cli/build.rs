@@ -14,6 +14,7 @@ const MAX_TRACKED_PATHS: usize = 32_768;
 const MAX_WATCH_DIRECTIVE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GIT_ADMIN_ENTRIES: usize = 4_096;
 const MAX_GIT_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CONFIG_LIST_BYTES: usize = 1024 * 1024;
 
 fn manifest_dir() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
@@ -42,9 +43,24 @@ fn clear_git_environment(command: &mut Command) {
     }
 }
 
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+fn source_git_environment(command: &mut Command) {
+    clear_git_environment(command);
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1");
+}
+
 fn git_command(manifest_dir: &Path, args: &[&str]) -> Option<Output> {
     let mut command = Command::new("git");
-    clear_git_environment(&mut command);
+    source_git_environment(&mut command);
     command.current_dir(manifest_dir).args(args);
     let output = command.output().ok()?;
     output.status.success().then_some(output)
@@ -128,54 +144,77 @@ fn copied_git_index_for_diff(manifest_dir: &Path) -> Option<TemporaryGitIndex> {
 
 fn git_exit_code(manifest_dir: &Path, args: &[&str], index_file: &Path) -> Option<i32> {
     let mut command = Command::new("git");
-    clear_git_environment(&mut command);
+    source_git_environment(&mut command);
+    let attributes_file = format!("core.attributesFile={}", null_device());
     command
-        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_INDEX_FILE", index_file)
         .current_dir(manifest_dir)
+        .arg("--attr-source=HEAD")
+        .args(["-c", attributes_file.as_str(), "-c", "core.fsmonitor=false"])
+        .args(["-c", "core.untrackedCache=false"])
         .args(args);
     command.output().ok()?.status.code()
 }
 
-fn git_describe(manifest_dir: Option<&Path>) -> (String, bool) {
+fn is_full_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn source_revision(manifest_dir: Option<&Path>) -> (String, String, bool) {
     let Some(manifest_dir) = manifest_dir else {
-        return (String::new(), true);
+        return (String::new(), String::new(), true);
     };
-    let Some(describe) = git_output(manifest_dir, &["describe", "--tags", "--always"]) else {
-        return (String::new(), true);
+    let Some(commit) = git_output(
+        manifest_dir,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )
+    .filter(|value| is_full_oid(value)) else {
+        return (String::new(), String::new(), true);
     };
 
-    // Keep Git's exact diff semantics without allowing its stat-only index
-    // refresh to mutate the real checkout watched by Cargo. Fail closed for
-    // split indexes and any copy or Git error.
-    let Some(index_file) = copied_git_index_for_diff(manifest_dir) else {
-        return (format!("{describe}-dirty"), true);
+    // Screen configuration before diff: local includes can redirect Git to
+    // unbounded inputs, clean filters can execute commands, and sparse
+    // checkouts omit tracked paths. These modes use conservative identity and
+    // always recheck rather than running an incomplete dirty scan.
+    let Some((_, sparse_checkout)) = local_git_config_state(manifest_dir) else {
+        return (commit.clone(), format!("{commit}-dirty"), true);
     };
-    match git_exit_code(
+    if sparse_checkout {
+        return (commit.clone(), format!("{commit}-dirty"), true);
+    }
+
+    // Compare the worktree with the exact commit, against a private index.
+    // The fixed HEAD attribute source prevents untracked .gitattributes files
+    // from changing this build identity. Unsupported Git versions fail closed.
+    let Some(index_file) = copied_git_index_for_diff(manifest_dir) else {
+        return (commit.clone(), format!("{commit}-dirty"), true);
+    };
+    let diff_code = git_exit_code(
         manifest_dir,
         &[
-            "-c",
-            "core.splitIndex=false",
             "diff",
             "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
             "--quiet",
             "HEAD",
             "--",
         ],
         &index_file.path,
-    ) {
-        Some(0) => (describe, false),
-        Some(1) => (format!("{describe}-dirty"), false),
+    );
+    match diff_code {
+        Some(0) => (commit.clone(), commit, false),
+        Some(1) => (commit.clone(), format!("{commit}-dirty"), false),
         // Exit codes other than 0 (clean) and 1 (differences), or failure to
         // start Git, leave dirty state unknown. Report conservatively and make
         // Cargo recheck the build script on the next invocation.
-        _ => (format!("{describe}-dirty"), true),
+        _ => (commit.clone(), format!("{commit}-dirty"), true),
     }
 }
 
 fn git_stdout_bounded(manifest_dir: &Path, args: &[&str], limit: usize) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
-    clear_git_environment(&mut command);
+    source_git_environment(&mut command);
     command
         .current_dir(manifest_dir)
         .args(args)
@@ -212,6 +251,183 @@ fn canonical_git_directory(manifest_dir: &Path, args: &[&str]) -> Option<PathBuf
     let canonical = fs::canonicalize(absolute).ok()?;
     let metadata = fs::symlink_metadata(&canonical).ok()?;
     metadata.file_type().is_dir().then_some(canonical)
+}
+
+fn parse_config_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "" | "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn local_git_config_state(manifest_dir: &Path) -> Option<(bool, bool)> {
+    // Disable include expansion so include/includeIf declarations themselves
+    // remain visible. A local include can add an arbitrary config source or a
+    // missing include can appear later; in either case use the conservative
+    // always-recheck path instead of claiming a bounded config watch.
+    let bytes = git_stdout_bounded(
+        manifest_dir,
+        &[
+            "config",
+            "--null",
+            "--no-includes",
+            "--show-origin",
+            "--list",
+        ],
+        MAX_CONFIG_LIST_BYTES,
+    )?;
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        return None;
+    }
+    let fields = bytes
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut worktree_config = false;
+    let mut sparse_checkout = false;
+    for pair in fields.chunks_exact(2) {
+        let origin = std::str::from_utf8(pair[0]).ok()?;
+        if !origin.starts_with("file:") {
+            return None;
+        }
+        let setting = std::str::from_utf8(pair[1]).ok()?;
+        let (key, value) = setting.split_once('\n')?;
+        let key = key.to_ascii_lowercase();
+        if key.starts_with("filter.") {
+            // A configured clean filter can execute arbitrary external code
+            // while Git computes the dirty bit. Its full dependency surface
+            // is not a bounded build input, so use the conservative fallback.
+            return None;
+        }
+        if key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path")) {
+            return None;
+        }
+        if key == "extensions.worktreeconfig" {
+            worktree_config = parse_config_bool(value)?;
+        } else if key == "core.sparsecheckout" {
+            sparse_checkout = parse_config_bool(value)?;
+        }
+    }
+    Some((worktree_config, sparse_checkout))
+}
+
+fn add_file_watch(path: &Path, allow_missing: bool, watches: &mut BTreeSet<PathBuf>) -> Option<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            watches.insert(path.to_path_buf());
+            Some(())
+        }
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            watches.insert(path.to_path_buf());
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn add_ref_directory_watch(
+    common_dir: &Path,
+    desired_parent: &Path,
+    watches: &mut BTreeSet<PathBuf>,
+) -> Option<()> {
+    let relative = desired_parent.strip_prefix(common_dir).ok()?;
+    let mut cursor = common_dir.to_path_buf();
+    let mut nearest = common_dir.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return None;
+        };
+        cursor.push(component);
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_dir() => nearest = cursor.clone(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            _ => return None,
+        }
+    }
+    if nearest == common_dir {
+        return None;
+    }
+    watches.insert(nearest);
+    Some(())
+}
+
+fn valid_ref_name(name: &str) -> bool {
+    name.starts_with("refs/")
+        && !name.contains('\\')
+        && !name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        && name
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+        && !Path::new(name).is_absolute()
+        && Path::new(name)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn add_current_ref_watch(
+    manifest_dir: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+    commit: &str,
+    watches: &mut BTreeSet<PathBuf>,
+) -> Option<()> {
+    let ref_format = git_output(manifest_dir, &["rev-parse", "--show-ref-format"])?;
+    match ref_format.as_str() {
+        "reftable" => {
+            let reftable = common_dir.join("reftable");
+            let metadata = fs::symlink_metadata(&reftable).ok()?;
+            if !metadata.file_type().is_dir() {
+                return None;
+            }
+            watches.insert(reftable);
+            return Some(());
+        }
+        "files" => {}
+        _ => return None,
+    }
+
+    let head_ref = git_output(manifest_dir, &["symbolic-ref", "--quiet", "HEAD"]);
+    let head_path = git_dir.join("HEAD");
+    let worktree_head = fs::read_to_string(&head_path).ok()?;
+    let worktree_head = worktree_head.trim_end_matches(['\r', '\n']);
+    let Some(head_ref) = head_ref else {
+        return (worktree_head == commit).then_some(());
+    };
+    if !valid_ref_name(&head_ref) || worktree_head != format!("ref: {head_ref}") {
+        return None;
+    }
+    let resolved = git_output(
+        manifest_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{head_ref}^{{commit}}"),
+        ],
+    )?;
+    if resolved != commit {
+        return None;
+    }
+
+    let loose_ref = common_dir.join(&head_ref);
+    let parent = loose_ref.parent()?;
+    let packed_refs = common_dir.join("packed-refs");
+    match fs::symlink_metadata(&loose_ref) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            watches.insert(loose_ref);
+            Some(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            add_file_watch(&packed_refs, false, watches)?;
+            add_ref_directory_watch(common_dir, parent, watches)
+        }
+        _ => None,
+    }
 }
 
 fn add_tracked_files(repo_root: &Path, watches: &mut BTreeSet<PathBuf>) -> Option<()> {
@@ -262,8 +478,8 @@ fn add_tracked_files(repo_root: &Path, watches: &mut BTreeSet<PathBuf>) -> Optio
         let path = repo_root.join(relative);
         let metadata = fs::symlink_metadata(&path).ok()?;
         if !metadata.file_type().is_file() {
-            // Cargo recursively scans directory inputs. Gitlinks, symlinks,
-            // and special files use the conservative fallback instead.
+            // Gitlinks, symlinks, and special files use the conservative
+            // fallback instead of making Cargo recursively scan them.
             return None;
         }
         watches.insert(path);
@@ -271,13 +487,18 @@ fn add_tracked_files(repo_root: &Path, watches: &mut BTreeSet<PathBuf>) -> Optio
     Some(())
 }
 
-fn source_identity_watch_paths(manifest_dir: &Path) -> Option<Vec<PathBuf>> {
+fn source_identity_watch_paths(manifest_dir: &Path, commit: &str) -> Option<Vec<PathBuf>> {
     let repo_root = canonical_git_directory(manifest_dir, &["rev-parse", "--show-toplevel"])?;
     let git_dir = canonical_git_directory(manifest_dir, &["rev-parse", "--absolute-git-dir"])?;
     let common_dir = canonical_git_directory(
         manifest_dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
+
+    let (worktree_config_enabled, sparse_checkout) = local_git_config_state(manifest_dir)?;
+    if sparse_checkout {
+        return None;
+    }
 
     let mut watches = BTreeSet::new();
     let git_marker = repo_root.join(".git");
@@ -292,15 +513,45 @@ fn source_identity_watch_paths(manifest_dir: &Path) -> Option<Vec<PathBuf>> {
         Ok(_) | Err(_) => return None,
     }
 
-    // Watching the validated real Git administrative directories covers files
-    // that do not exist yet (including shallow, packed-refs, refs/reftable,
-    // and per-worktree metadata), without maintaining a fragile optional-file
-    // inventory. Cargo recursively scans these directories. This deliberately
-    // includes objects, logs, hooks, and other worktree metadata; that cost is
-    // broad and is not bounded by the inventory limits below.
-    watches.insert(git_dir);
-    watches.insert(common_dir);
+    if git_dir != common_dir {
+        add_file_watch(&git_dir.join("commondir"), false, &mut watches)?;
+    }
+    let head_path = git_dir.join("HEAD");
+    add_file_watch(&head_path, false, &mut watches)?;
+    add_file_watch(&git_dir.join("index"), false, &mut watches)?;
+    add_file_watch(&common_dir.join("config"), false, &mut watches)?;
+    let worktree_config = git_dir.join("config.worktree");
+    let has_worktree_config = fs::symlink_metadata(&worktree_config).is_ok();
+    if worktree_config_enabled || has_worktree_config {
+        add_file_watch(&worktree_config, true, &mut watches)?;
+    }
+
+    let attributes = common_dir.join("info/attributes");
+    match fs::symlink_metadata(&attributes) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            watches.insert(attributes);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let info = common_dir.join("info");
+            let metadata = fs::symlink_metadata(&info).ok()?;
+            if !metadata.file_type().is_dir() {
+                return None;
+            }
+            watches.insert(info);
+        }
+        _ => return None,
+    }
+
+    add_current_ref_watch(manifest_dir, &git_dir, &common_dir, commit, &mut watches)?;
     add_tracked_files(&repo_root, &mut watches)?;
+
+    let current_commit = git_output(
+        manifest_dir,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )?;
+    if current_commit != commit {
+        return None;
+    }
 
     let mut output_bytes = "cargo:rerun-if-changed=build.rs\n".len();
     for path in &watches {
@@ -321,13 +572,17 @@ fn source_identity_watch_paths(manifest_dir: &Path) -> Option<Vec<PathBuf>> {
     Some(watches.into_iter().collect())
 }
 
-fn emit_source_identity_reruns(manifest_dir: Option<&Path>, identity_uncertain: bool) {
+fn emit_source_identity_reruns(
+    manifest_dir: Option<&Path>,
+    commit: &str,
+    identity_uncertain: bool,
+) {
     println!("cargo:rerun-if-changed=build.rs");
     if identity_uncertain {
         println!("cargo:rerun-if-changed={ALWAYS_RECHECK}");
         return;
     }
-    match manifest_dir.and_then(source_identity_watch_paths) {
+    match manifest_dir.and_then(|directory| source_identity_watch_paths(directory, commit)) {
         Some(paths) => {
             for path in paths {
                 println!("cargo:rerun-if-changed={}", path.display());
@@ -353,14 +608,12 @@ fn build_date() -> String {
 
 fn main() {
     let manifest_dir = manifest_dir();
-    let (describe, identity_uncertain) = git_describe(manifest_dir.as_deref());
-    let commit = manifest_dir
-        .as_deref()
-        .and_then(|directory| git_output(directory, &["rev-parse", "HEAD"]));
-    let identity_uncertain = identity_uncertain || commit.is_none();
-    let commit = commit.unwrap_or_default();
+    let (commit, revision, identity_uncertain) = source_revision(manifest_dir.as_deref());
     println!("cargo:rustc-env=AETHYME_BUILD_DATE={}", build_date());
-    println!("cargo:rustc-env=AETHYME_GIT_DESCRIBE={describe}");
+    // Keep the old variable as a compatibility alias. It no longer claims
+    // git-describe tag/ancestry semantics; consumers should use REVISION.
+    println!("cargo:rustc-env=AETHYME_GIT_REVISION={revision}");
+    println!("cargo:rustc-env=AETHYME_GIT_DESCRIBE={revision}");
     println!("cargo:rustc-env=AETHYME_GIT_COMMIT={commit}");
-    emit_source_identity_reruns(manifest_dir.as_deref(), identity_uncertain);
+    emit_source_identity_reruns(manifest_dir.as_deref(), &commit, identity_uncertain);
 }

@@ -50,7 +50,7 @@ pub enum PairState {
 
 /// The build identity inside a `--version` banner.
 ///
-/// A banner is `<program> <version> (<describe>)`, and the program name is the
+/// A banner is `<program> <version> (build_revision=<oid>[-dirty] ...)`, and the program name is the
 /// one part guaranteed to differ between the two binaries. Everything from the
 /// first digit-leading token onward is what must match:
 /// `aethyme 0.7.17 (v0.7.17)` and `aethyme-engine-cli 0.7.17 (v0.7.17)` both
@@ -59,10 +59,9 @@ pub enum PairState {
 /// binaries built from the same source commit do not look split merely because
 /// they were built seconds apart.
 ///
-/// Comparing the whole thing, `describe` included, is deliberate. Two builds
+/// Comparing the whole thing, including the exact revision and dirty marker, is deliberate. Two builds
 /// from different commits of the same unreleased version share a `version` and
-/// differ only in the `-N-g<sha>` suffix, and that suffix is precisely the
-/// evidence of a split.
+/// differ in the full revision OID, which is precisely the evidence of a split.
 pub fn build_identity(banner: &str) -> Option<&str> {
     let banner = banner.trim();
     let offset = banner
@@ -268,15 +267,15 @@ mod tests {
     #[test]
     fn build_date_is_not_part_of_the_pair_identity() {
         let router = build_identity(
-            "aethyme 0.7.18 (v0.7.18-1-gabcdef0 build_commit=abcdef0123456789) build_date=2026-09-14T10:00:00Z",
+            "aethyme 0.7.18 (build_revision=abcdef0123456789 build_commit=abcdef0123456789) build_date=2026-09-14T10:00:00Z",
         );
         let engine = build_identity(
-            "aethyme-engine-cli 0.7.18 (v0.7.18-1-gabcdef0 build_commit=abcdef0123456789) build_date=2026-09-14T10:00:01Z",
+            "aethyme-engine-cli 0.7.18 (build_revision=abcdef0123456789 build_commit=abcdef0123456789) build_date=2026-09-14T10:00:01Z",
         );
         assert_eq!(router, engine);
         assert_eq!(
             router,
-            Some("0.7.18 (v0.7.18-1-gabcdef0 build_commit=abcdef0123456789)")
+            Some("0.7.18 (build_revision=abcdef0123456789 build_commit=abcdef0123456789)")
         );
     }
 

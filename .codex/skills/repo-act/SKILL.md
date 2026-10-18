@@ -28,10 +28,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For read-only GitHub status/check inspection, use `gh --repo` directly without
   opening a broker session. Isolate source research in its task worktree and
   independent reviews in their own read-only snapshot; sessions are for edits.
-- For large broker `status --json` output, retain complete stdout and stderr in
-  unique files before parsing exact session IDs and structured advice fields
-  such as severity and commands. Never infer absence from truncated output or
-  suppressed stderr.
+- For routine broker status checks, prefer `aethyme broker status --summary
+  --json`; capture full `status --json` only when its additional detail is needed.
+  Retain complete stdout and stderr before parsing exact session IDs and
+  structured advice fields such as severity and commands. Never infer absence
+  from truncated output or suppressed stderr.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
@@ -69,11 +70,18 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- Keep authoritative frozen plans, validation helpers, inputs and receipts on
+  durable storage before execution; use temporary directories for scratch only.
+  After a reboot, mark missing evidence interrupted or unavailable. Recorded
+  hashes do not recover missing bytes or recreate a trust record.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Preserve earlier outputs before retrying.
   Freeze source for each invocation and record the exact head and dirty-state
   hashes before and after it. If relevant source changes during a run, retain
   that run as diagnostic evidence and rerun the committed source.
+- Treat frozen source and review artifacts as immutable. When source changes
+  after an artifact is bound to a published hash, keep the earlier artifact
+  intact and create a new version bound to the new exact hashes.
 - For disk-growth investigations, separate file-size totals, path allocation,
   and filesystem free space. Shared extents and hardlinks can make summed
   per-worktree sizes overstate physical use. Preserve scan completion status;
@@ -104,19 +112,37 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove
-  that the shell is using the deployed build.
+  that the shell is using the deployed build. Pass the same absolute executable
+  and required sibling identity to delegated agents; selecting a repository
+  runtime does not rewrite their inherited PATH.
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
-- For build-cache identity changes, check an unchanged repeat build as well as
-  switching between linked worktrees and advancing a branch. Verify freshness
-  from Cargo output; correct embedded identity alone does not rule out forced
-  recompilation on every invocation. Use a dependency-free fixture first.
+- For build-cache identity changes, start with a dependency-free Cargo fixture.
+  Verify the embedded identity and Cargo freshness across an unchanged repeat,
+  linked-worktree switches, and source advances. Also hold the current source
+  identity fixed while adding a sibling worktree and making a sibling-only
+  commit; compare Cargo's build-script rerun output. A fixed build-date shim can
+  distinguish Git-admin watch invalidation from time-derived build output.
+  Inspect actual Cargo build-script output when switching worktrees on a shared
+  target: a stale compiled script can be newer than the current source file.
+  If that happens, refresh the owned build-script input timestamps and record
+  unchanged byte hashes before validation. Refresh the affected crate entrypoint
+  too when required to invalidate stale compiled source. Repeat warm probes
+  without refreshing inputs between runs.
   Keep production probes and oracles from changing watched inputs: Git dirty
   checks can refresh Cargo-watched index and split-index shared-index mtimes,
   even with optional locks disabled. Trace those paths before and after rather
   than inferring read-only behavior from flags; an isolated index must also
   protect its split-index backing files.
+  Use the same isolated-index probes for operator status checks during pinned
+  validation; an ordinary Git status command can refresh the watched index.
+- For routine Rust validation, reuse a matching warm target and run one Cargo
+  process at a time with `--locked -j1`. Prefer a selected package/binary or
+  focused test filter. On a resource-constrained target, use `debug=0` and
+  `incremental=0` from the outset; avoid changing profile settings on a warm
+  target. Expand to verbose or workspace-wide runs only when explicitly needed
+  or after a focused failure.
 - Run the fastest relevant test command first.
   Check the selected test names and a nonzero executed count before treating a
   focused run as evidence. Rust module aliases can differ from filenames; a
@@ -131,7 +157,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 - `fast_test`: `packages/aethyme/scripts/test-like-ci.sh`
 - `full_test`: `packages/aethyme/scripts/test-like-ci.sh --full`
-- `build`: `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+- `focused_build`: `cargo build --locked -j1 --manifest-path packages/aethyme/rust/Cargo.toml --package <package> --bin <binary>`
+- `full_workspace_build` (explicit): `cargo build --locked -j1 --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
 
 ## Primary Entrypoints
 

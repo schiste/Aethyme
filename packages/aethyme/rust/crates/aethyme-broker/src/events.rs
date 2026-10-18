@@ -138,6 +138,7 @@ pub fn session_install_recorded_payload(
 ) -> String {
     json!({
         "version": router.version,
+        "revision": router.revision,
         "describe": router.describe,
         "commit": router.commit,
         "path": router.path,
