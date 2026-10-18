@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
 pub const HOST_RESOURCE_REQUEST_SCHEMA_VERSION: u32 = 1;
+const HOST_RESOURCE_STORE_SCHEMA_VERSION: u32 = 2;
 const MIN_TTL_SECONDS: u64 = 15;
 const MAX_TTL_SECONDS: u64 = 86_400;
 
@@ -55,6 +56,89 @@ CREATE TABLE IF NOT EXISTS resource_reap_observations (
  generation INTEGER NOT NULL,
  reaped_at INTEGER NOT NULL
 );
+"#;
+
+const SUPERVISED_HOLD_MIGRATION: &str = r#"
+CREATE TABLE resource_supervised_capacity_holds (
+ lease_id TEXT NOT NULL REFERENCES resource_leases(lease_id),
+ generation INTEGER NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY (lease_id, generation)
+);
+
+CREATE TRIGGER resource_supervised_hold_capacity_insert
+BEFORE INSERT ON resource_allocations
+WHEN NEW.kind='capacity'
+ AND EXISTS (
+     SELECT 1
+     FROM resource_supervised_capacity_holds h
+     JOIN resource_leases hl ON hl.lease_id=h.lease_id AND hl.generation=h.generation
+     JOIN resource_allocations held ON held.lease_id=h.lease_id
+          AND held.kind='capacity' AND held.value=NEW.value
+     WHERE hl.state IN ('active','quarantined')
+ )
+ AND COALESCE((
+     SELECT SUM(COALESCE(a.units,0))
+     FROM resource_allocations a
+     JOIN resource_leases l ON l.lease_id=a.lease_id
+     WHERE a.kind='capacity' AND a.value=NEW.value
+       AND l.state IN ('active','quarantined')
+ ),0) + COALESCE(NEW.units,0) > MIN(
+     COALESCE(NEW.capacity_limit,0),
+     COALESCE((
+         SELECT MIN(a.capacity_limit)
+         FROM resource_allocations a
+         JOIN resource_leases l ON l.lease_id=a.lease_id
+         WHERE a.kind='capacity' AND a.value=NEW.value
+           AND l.state IN ('active','quarantined')
+     ),COALESCE(NEW.capacity_limit,0))
+ )
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold exceeds pool limit');
+END;
+
+CREATE TRIGGER resource_supervised_hold_capacity_delete
+BEFORE DELETE ON resource_allocations
+WHEN EXISTS (
+ SELECT 1 FROM resource_supervised_capacity_holds h
+ JOIN resource_leases l ON l.lease_id=h.lease_id AND l.generation=h.generation
+ WHERE h.lease_id=OLD.lease_id
+)
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
+
+CREATE TRIGGER resource_supervised_hold_capacity_update
+BEFORE UPDATE ON resource_allocations
+WHEN EXISTS (
+ SELECT 1 FROM resource_supervised_capacity_holds h
+ JOIN resource_leases l ON l.lease_id=h.lease_id AND l.generation=h.generation
+ WHERE h.lease_id IN (OLD.lease_id,NEW.lease_id)
+)
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
+
+CREATE TRIGGER resource_supervised_hold_lease_release
+BEFORE UPDATE OF state ON resource_leases
+WHEN NEW.state='released' AND OLD.state!='released'
+ AND EXISTS (
+     SELECT 1 FROM resource_supervised_capacity_holds h
+     WHERE h.lease_id=OLD.lease_id AND h.generation=OLD.generation
+ )
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
+
+CREATE TRIGGER resource_supervised_hold_lease_delete
+BEFORE DELETE ON resource_leases
+WHEN EXISTS (
+ SELECT 1 FROM resource_supervised_capacity_holds h
+ WHERE h.lease_id=OLD.lease_id AND h.generation=OLD.generation
+)
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -346,6 +430,14 @@ pub enum HostResourceRunError {
     },
     #[error("cannot supervise process signals: {0}")]
     Signals(std::io::Error),
+    #[error(
+        "cannot confirm supervised child exit after authority loss: {detail}; lease {lease_id:?} {lease_state}"
+    )]
+    TerminationUnconfirmed {
+        lease_id: String,
+        lease_state: String,
+        detail: String,
+    },
 }
 
 pub struct HostResourceCoordinator {
@@ -382,7 +474,7 @@ impl HostResourceCoordinator {
                 }
             })?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         crate::host_state::protect_host_state_path(path, false).map_err(|source| {
             HostResourceError::Io {
                 path: path.into(),
@@ -394,6 +486,7 @@ impl HostResourceCoordinator {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_writable_schema(&mut conn)?;
         validate_schema(&conn)?;
         Ok(Self {
             conn,
@@ -492,8 +585,20 @@ impl HostResourceCoordinator {
         &mut self,
         request: &HostResourceRequest,
     ) -> Result<HostResourceGrant, HostResourceError> {
+        self.acquire_inner(request, false)
+    }
+
+    fn acquire_inner(
+        &mut self,
+        request: &HostResourceRequest,
+        supervised: bool,
+    ) -> Result<HostResourceGrant, HostResourceError> {
         validate_request(request)?;
-        let digest = request_digest(request)?;
+        let digest = if supervised {
+            supervised_request_digest(request)?
+        } else {
+            request_digest(request)?
+        };
         let now = now_ms();
         let tx = self
             .conn
@@ -505,6 +610,12 @@ impl HostResourceCoordinator {
             |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)),
         ).optional()? {
             if existing_digest != digest { return Err(HostResourceError::IdempotencyMismatch(request.request_id.clone())); }
+            if supervised {
+                return Err(HostResourceError::RequestNotActive {
+                    request_id: request.request_id.clone(),
+                    state: "already used by a supervised run".into(),
+                });
+            }
             if state != "active" { return Err(HostResourceError::RequestNotActive { request_id: request.request_id.clone(), state }); }
             let lease = load_lease(&tx, "request_id", &request.request_id)?.ok_or_else(|| HostResourceError::LeaseNotFound(request.request_id.clone()))?;
             tx.commit()?;
@@ -537,6 +648,12 @@ impl HostResourceCoordinator {
             "INSERT INTO resource_leases (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id,generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9,?10,?11,?10)",
             params![lease_id,request.request_id,digest,request.repository,request.worktree_fingerprint,request.run_id,generation,ownership_token,request.holder_pid.map(i64::from),now,expires_at])?;
+        if supervised {
+            tx.execute(
+                "INSERT INTO resource_supervised_capacity_holds(lease_id,generation,created_at) VALUES (?1,?2,?3)",
+                params![lease_id, generation, now],
+            )?;
+        }
         for allocation in &allocations {
             tx.execute(
                 "INSERT INTO resource_allocations VALUES (?1,?2,?3,?4,?5,?6)",
@@ -599,6 +716,19 @@ impl HostResourceCoordinator {
         &mut self,
         request: &HostResourceRequest,
         wait: std::time::Duration,
+        on_conflict: F,
+    ) -> Result<HostResourceGrant, HostResourceError>
+    where
+        F: FnMut(&str),
+    {
+        self.acquire_with_wait_inner(request, wait, false, on_conflict)
+    }
+
+    fn acquire_with_wait_inner<F>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        supervised: bool,
         mut on_conflict: F,
     ) -> Result<HostResourceGrant, HostResourceError>
     where
@@ -606,7 +736,7 @@ impl HostResourceCoordinator {
     {
         let deadline = std::time::Instant::now() + wait;
         loop {
-            match self.acquire(request) {
+            match self.acquire_inner(request, supervised) {
                 Ok(grant) => return Ok(grant),
                 Err(HostResourceError::Conflict {
                     code: _,
@@ -670,7 +800,45 @@ impl HostResourceCoordinator {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, false)?;
+        if has_supervised_capacity_hold(&tx, lease_id, generation)? {
+            return Err(HostResourceError::InvalidRequest(
+                "supervised resource hold requires verified terminal release or reconciliation"
+                    .into(),
+            ));
+        }
         tx.execute("UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 WHERE lease_id=?1 AND state!='released'", params![lease_id,now])?;
+        let lease = load_lease(&tx, "lease_id", lease_id)?
+            .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
+        tx.commit()?;
+        Ok(lease)
+    }
+
+    fn release_supervised_verified(
+        &mut self,
+        lease_id: &str,
+        generation: u64,
+        token: &str,
+    ) -> Result<HostResourceLease, HostResourceError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        quarantine_reclaimable(&tx, now)?;
+        verify_ownership(&tx, lease_id, generation, token, false)?;
+        if !has_supervised_capacity_hold(&tx, lease_id, generation)? {
+            return Err(HostResourceError::InvalidRequest(
+                "supervised terminal release requires its generation-bound hold".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM resource_supervised_capacity_holds WHERE lease_id=?1 AND generation=?2",
+            params![lease_id, generation as i64],
+        )?;
+        tx.execute(
+            "UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 \
+             WHERE lease_id=?1 AND state!='released'",
+            params![lease_id, now],
+        )?;
         let lease = load_lease(&tx, "lease_id", lease_id)?
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
         tx.commit()?;
@@ -746,6 +914,12 @@ impl HostResourceCoordinator {
     /// supplemental environment values after acquisition has selected the
     /// actual allocations. This is the narrow hook consumers need when a
     /// child-facing value depends on the granted port or namespace.
+    ///
+    /// On Unix, requested cleanup runs only after the command's original
+    /// process group is observed absent. This bounded check cannot see a
+    /// descendant that deliberately leaves that group, for example with
+    /// `setsid` or `setpgid`. On other platforms, group quiescence cannot be
+    /// proven and the lease is retained in quarantine.
     #[allow(clippy::too_many_arguments)]
     pub fn run_supervised_with_environment<F, P>(
         &mut self,
@@ -768,7 +942,7 @@ impl HostResourceCoordinator {
         }
         let acquire_started = std::time::Instant::now();
         let mut last_wait_notice = None;
-        let mut grant = self.acquire_with_wait(request, wait, |message| {
+        let mut grant = self.acquire_with_wait_inner(request, wait, true, |message| {
             let emit = last_wait_notice.is_none_or(|last: std::time::Instant| {
                 last.elapsed() >= std::time::Duration::from_secs(10)
             });
@@ -818,54 +992,77 @@ impl HostResourceCoordinator {
                 return Err(error);
             }
         };
-        let child_status = supervise_process(
+        let child_completion = supervise_process(
             self,
             &mut grant,
             request.ttl_seconds,
             &mut child,
             &mut event,
         )?;
-        let child_signal = exit_signal(&child_status);
-        let child_exit_code = portable_exit_code(&child_status);
+        let child_signal = exit_signal(&child_completion.status);
+        let child_exit_code = portable_exit_code(&child_completion.status);
 
         let mut cleanup_exit_code = None;
-        let mut lifecycle_safe = true;
+        let child_group_absent = child_completion.process_group == ProcessGroupObservation::Absent;
+        let mut lifecycle_safe = child_group_absent;
+        if !child_group_absent {
+            event(&format!(
+                "original supervised process group {} after leader exit; resource lease will be quarantined",
+                child_completion.process_group.description()
+            ));
+        }
         if let Some(cleanup) = cleanup_command {
-            event("running exact cleanup command");
-            let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
-            let cleanup_child = spawn_resource_process(&cleanup_argv, cwd, &grant, &environment)
-                .map_err(|source| HostResourceRunError::Spawn {
-                    program: "sh".into(),
-                    source,
-                });
-            let mut cleanup_child = match cleanup_child {
-                Ok(child) => child,
-                Err(error) => {
-                    crate::warn_unrecorded(
-                        "quarantine the host resource lease",
-                        self.quarantine(
-                            &grant.lease.lease_id,
-                            grant.lease.generation,
-                            &grant.ownership_token,
-                        ),
+            if child_group_absent {
+                event("running exact cleanup command");
+                let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
+                let cleanup_child =
+                    spawn_resource_process(&cleanup_argv, cwd, &grant, &environment).map_err(
+                        |source| HostResourceRunError::Spawn {
+                            program: "sh".into(),
+                            source,
+                        },
                     );
-                    return Err(error);
+                let mut cleanup_child = match cleanup_child {
+                    Ok(child) => child,
+                    Err(error) => {
+                        crate::warn_unrecorded(
+                            "quarantine the host resource lease",
+                            self.quarantine(
+                                &grant.lease.lease_id,
+                                grant.lease.generation,
+                                &grant.ownership_token,
+                            ),
+                        );
+                        return Err(error);
+                    }
+                };
+                let cleanup_completion = supervise_process(
+                    self,
+                    &mut grant,
+                    request.ttl_seconds,
+                    &mut cleanup_child,
+                    &mut event,
+                )?;
+                cleanup_exit_code = Some(portable_exit_code(&cleanup_completion.status));
+                let cleanup_group_absent =
+                    cleanup_completion.process_group == ProcessGroupObservation::Absent;
+                lifecycle_safe = cleanup_completion.status.success() && cleanup_group_absent;
+                if !cleanup_group_absent {
+                    event(&format!(
+                        "cleanup process group {} after leader exit; resource lease will be quarantined",
+                        cleanup_completion.process_group.description()
+                    ));
                 }
-            };
-            let cleanup_status = supervise_process(
-                self,
-                &mut grant,
-                request.ttl_seconds,
-                &mut cleanup_child,
-                &mut event,
-            )?;
-            cleanup_exit_code = Some(portable_exit_code(&cleanup_status));
-            lifecycle_safe = cleanup_status.success();
+            } else {
+                event(
+                    "skipping exact cleanup command because the original process group may still contain writers",
+                );
+            }
         }
 
         let authority_lost = grant.lease.state != HostLeaseState::Active;
         let final_lease = if lifecycle_safe && !authority_lost {
-            self.release(
+            self.release_supervised_verified(
                 &grant.lease.lease_id,
                 grant.lease.generation,
                 &grant.ownership_token,
@@ -928,6 +1125,10 @@ impl HostResourceCoordinator {
                 state,
             });
         }
+        tx.execute(
+            "DELETE FROM resource_supervised_capacity_holds WHERE lease_id=?1 AND generation=?2",
+            params![lease_id, confirmed as i64],
+        )?;
         tx.execute("UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 WHERE lease_id=?1", params![lease_id,now])?;
         let lease = load_lease(&tx, "lease_id", lease_id)?
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
@@ -951,12 +1152,13 @@ impl HostResourceCoordinator {
             .collect::<Result<Vec<_>, _>>()?;
         let mut leases = Vec::new();
         for id in ids {
-            if let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? {
-                if lease.state == HostLeaseState::Active && lease.expires_at <= now_ms() {
-                    lease.state = HostLeaseState::Quarantined;
-                }
-                leases.push(lease);
+            let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? else {
+                continue;
+            };
+            if lease.state == HostLeaseState::Active && lease.expires_at <= now_ms() {
+                lease.state = HostLeaseState::Quarantined;
             }
+            leases.push(lease);
         }
         Ok(leases)
     }
@@ -966,6 +1168,204 @@ struct ResourceChild {
     child: std::process::Child,
     #[cfg(unix)]
     signals: BlockedSignals,
+}
+
+/// The command leader's exit status and the best available observation of its
+/// original process group after the leader has been reaped.
+///
+/// On Unix this observes only the group created for the direct child. A
+/// descendant that deliberately leaves the group, for example with `setsid`
+/// or `setpgid`, is outside this bounded quiescence check. Other platforms
+/// cannot observe that group and therefore report `Unknown` rather than claim
+/// it is gone.
+struct SupervisedProcessCompletion {
+    status: std::process::ExitStatus,
+    process_group: ProcessGroupObservation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessGroupObservation {
+    Absent,
+    Present,
+    Unknown,
+}
+
+impl ProcessGroupObservation {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Absent => "was observed absent",
+            Self::Present => "is still present",
+            Self::Unknown => "could not be confirmed absent",
+        }
+    }
+}
+
+fn process_completion(
+    process: &ResourceChild,
+    status: std::process::ExitStatus,
+) -> SupervisedProcessCompletion {
+    SupervisedProcessCompletion {
+        status,
+        process_group: observe_owned_process_group(process.child.id()),
+    }
+}
+
+#[cfg(unix)]
+fn observe_owned_process_group(process_group_id: u32) -> ProcessGroupObservation {
+    // The group leader has already been reaped. Signal 0 only probes whether
+    // this numeric process group exists; never send a delivered signal after
+    // reaping, when the identifier could eventually be reused.
+    // SAFETY: `killpg` takes the group id and signal by value and dereferences
+    // no memory owned by this crate. Signal 0 queries existence without
+    // delivering a signal.
+    let result = unsafe { libc::killpg(process_group_id as libc::pid_t, 0) };
+    if result == 0 {
+        ProcessGroupObservation::Present
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        ProcessGroupObservation::Absent
+    } else {
+        ProcessGroupObservation::Unknown
+    }
+}
+
+#[cfg(not(unix))]
+fn observe_owned_process_group(_process_group_id: u32) -> ProcessGroupObservation {
+    // The broker CLI is not supported on Windows, and this platform has no
+    // process-group observation here. Do not convert lack of proof into
+    // quiescence if the library is compiled or used independently.
+    ProcessGroupObservation::Unknown
+}
+
+const AUTHORITY_LOSS_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+const AUTHORITY_LOSS_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const CHILD_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn wait_for_child_exit(
+    process: &mut ResourceChild,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = process.child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep((deadline - now).min(CHILD_REAP_POLL_INTERVAL));
+    }
+}
+
+#[cfg(unix)]
+fn signal_unreaped_process_group(
+    process: &ResourceChild,
+    signal: libc::c_int,
+) -> std::io::Result<()> {
+    // This helper is called only after a bounded `try_wait` loop observed the
+    // leader unreaped. Its pid still names the original group and cannot have
+    // been reused; no delivered signal is sent after `try_wait` reports exit.
+    // SAFETY: the group was created by `process_group(0)` before spawn, and
+    // `killpg` takes both values without dereferencing crate-owned memory.
+    if unsafe { libc::killpg(process.child.id() as libc::pid_t, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_unreaped_child(process: &mut ResourceChild) -> std::io::Result<()> {
+    // This library can be compiled on platforms where this broker CLI is not
+    // supported. `Child::kill` is bounded and targets only the owned child.
+    process.child.kill()
+}
+
+fn terminate_after_authority_loss<F>(
+    process: &mut ResourceChild,
+    event: &mut F,
+) -> std::io::Result<Option<std::process::ExitStatus>>
+where
+    F: FnMut(&str),
+{
+    #[cfg(unix)]
+    {
+        event("sending SIGTERM to the still-owned supervised process group");
+        if let Err(error) = signal_unreaped_process_group(process, libc::SIGTERM) {
+            event(&format!("SIGTERM request failed: {error}"));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        event("force-killing the still-owned supervised child on this platform");
+        if let Err(error) = kill_unreaped_child(process) {
+            event(&format!("direct-child kill request failed: {error}"));
+        }
+    }
+
+    if let Some(status) = wait_for_child_exit(process, AUTHORITY_LOSS_TERM_GRACE)? {
+        return Ok(Some(status));
+    }
+
+    #[cfg(unix)]
+    let signal_error = {
+        // `wait_for_child_exit` ended with `try_wait() == None`, so the leader
+        // remains unreaped. Only now escalate, and never signal this group once
+        // a status has been collected.
+        event("SIGTERM grace expired; sending SIGKILL to the unreaped process group");
+        let result = signal_unreaped_process_group(process, libc::SIGKILL);
+        if let Err(error) = &result {
+            event(&format!("SIGKILL request failed: {error}"));
+        }
+        result.err()
+    };
+    #[cfg(not(unix))]
+    let signal_error = {
+        event("direct-child kill grace expired; retrying kill while it remains unreaped");
+        let result = kill_unreaped_child(process);
+        if let Err(error) = &result {
+            event(&format!("direct-child kill retry failed: {error}"));
+        }
+        result.err()
+    };
+
+    let status = wait_for_child_exit(process, AUTHORITY_LOSS_KILL_GRACE)?;
+    match (status, signal_error) {
+        (None, Some(error)) => Err(error),
+        (status, _) => Ok(status),
+    }
+}
+
+fn quarantine_unconfirmed_termination<F>(
+    coordinator: &mut HostResourceCoordinator,
+    grant: &mut HostResourceGrant,
+    detail: String,
+    event: &mut F,
+) -> HostResourceRunError
+where
+    F: FnMut(&str),
+{
+    let lease_id = grant.lease.lease_id.clone();
+    grant.lease.state = HostLeaseState::Quarantined;
+    let lease_state = match coordinator.quarantine(
+        &grant.lease.lease_id,
+        grant.lease.generation,
+        &grant.ownership_token,
+    ) {
+        Ok(lease) => {
+            grant.lease = lease;
+            grant.lease.state.as_str().to_string()
+        }
+        Err(error) => format!("quarantine could not be confirmed: {error}"),
+    };
+    event(&format!(
+        "supervised child status unavailable after authority loss; lease {lease_id} {lease_state}"
+    ));
+    HostResourceRunError::TerminationUnconfirmed {
+        lease_id,
+        lease_state,
+        detail,
+    }
 }
 
 #[cfg(unix)]
@@ -1098,7 +1498,7 @@ fn supervise_process<F>(
     ttl_seconds: u64,
     process: &mut ResourceChild,
     event: &mut F,
-) -> Result<std::process::ExitStatus, HostResourceRunError>
+) -> Result<SupervisedProcessCompletion, HostResourceRunError>
 where
     F: FnMut(&str),
 {
@@ -1114,7 +1514,7 @@ where
                     source,
                 })?
         {
-            return Ok(status);
+            return Ok(process_completion(process, status));
         }
         #[cfg(unix)]
         if let Some(signal) = process.signals.pending() {
@@ -1150,21 +1550,30 @@ where
                         "resource authority lost; terminating process group: {error}"
                     ));
                     grant.lease.state = HostLeaseState::Quarantined;
-                    #[cfg(unix)]
-                    // SAFETY: as above — the child leads the process group
-                    // created before spawn and is still live at this point.
-                    unsafe {
-                        libc::killpg(process.child.id() as i32, libc::SIGTERM);
-                    }
-                    #[cfg(not(unix))]
-                    let _ = process.child.kill();
-                    return process
-                        .child
-                        .wait()
-                        .map_err(|source| HostResourceRunError::Spawn {
-                            program: "supervised child".into(),
-                            source,
-                        });
+                    let status = match terminate_after_authority_loss(process, event) {
+                        Ok(Some(status)) => status,
+                        Ok(None) => {
+                            return Err(quarantine_unconfirmed_termination(
+                                coordinator,
+                                grant,
+                                format!(
+                                    "leader did not exit within the bounded {}ms TERM and {}ms KILL waits",
+                                    AUTHORITY_LOSS_TERM_GRACE.as_millis(),
+                                    AUTHORITY_LOSS_KILL_GRACE.as_millis()
+                                ),
+                                event,
+                            ));
+                        }
+                        Err(source) => {
+                            return Err(quarantine_unconfirmed_termination(
+                                coordinator,
+                                grant,
+                                format!("failed to observe child exit: {source}"),
+                                event,
+                            ));
+                        }
+                    };
+                    return Ok(process_completion(process, status));
                 }
             }
         }
@@ -1190,18 +1599,86 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-fn validate_schema(conn: &Connection) -> Result<(), HostResourceError> {
+fn migrate_writable_schema(conn: &mut Connection) -> Result<(), HostResourceError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version = store_schema_version(&tx)?;
+    match version {
+        1 => {
+            tx.execute_batch(SUPERVISED_HOLD_MIGRATION)?;
+            tx.execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                [i64::from(HOST_RESOURCE_STORE_SCHEMA_VERSION)],
+            )?;
+        }
+        version if version == HOST_RESOURCE_STORE_SCHEMA_VERSION => {}
+        version => {
+            return Err(HostResourceError::InvalidRequest(format!(
+                "unsupported host schema {version}"
+            )));
+        }
+    }
+    validate_schema(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn store_schema_version(conn: &Connection) -> Result<u32, HostResourceError> {
     let version: i64 = conn.query_row(
         "SELECT value FROM meta WHERE key='schema_version'",
         [],
         |row| row.get(0),
     )?;
-    if version != i64::from(HOST_RESOURCE_SCHEMA_VERSION) {
-        return Err(HostResourceError::InvalidRequest(format!(
-            "unsupported host schema {version}"
-        )));
+    u32::try_from(version).map_err(|_| {
+        HostResourceError::InvalidRequest(format!("unsupported host schema {version}"))
+    })
+}
+
+fn has_supervised_capacity_hold(
+    conn: &Connection,
+    lease_id: &str,
+    generation: u64,
+) -> Result<bool, HostResourceError> {
+    if store_schema_version(conn)? < HOST_RESOURCE_STORE_SCHEMA_VERSION {
+        return Ok(false);
     }
-    Ok(())
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM resource_supervised_capacity_holds \
+         WHERE lease_id=?1 AND generation=?2)",
+        params![lease_id, generation as i64],
+        |row| row.get(0),
+    )?)
+}
+
+fn validate_schema(conn: &Connection) -> Result<u32, HostResourceError> {
+    let version = store_schema_version(conn)?;
+    match version {
+        1 => Ok(version),
+        HOST_RESOURCE_STORE_SCHEMA_VERSION => {
+            for object in [
+                "resource_supervised_capacity_holds",
+                "resource_supervised_hold_capacity_insert",
+                "resource_supervised_hold_capacity_delete",
+                "resource_supervised_hold_capacity_update",
+                "resource_supervised_hold_lease_release",
+                "resource_supervised_hold_lease_delete",
+            ] {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [object],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(HostResourceError::InvalidRequest(format!(
+                        "host schema {version} is missing {object}"
+                    )));
+                }
+            }
+            Ok(version)
+        }
+        _ => Err(HostResourceError::InvalidRequest(format!(
+            "unsupported host schema {version}"
+        ))),
+    }
 }
 
 pub fn default_host_resource_db_path() -> Result<PathBuf, HostResourceError> {
@@ -1328,6 +1805,14 @@ fn request_digest(request: &HostResourceRequest) -> Result<String, HostResourceE
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn supervised_request_digest(request: &HostResourceRequest) -> Result<String, HostResourceError> {
+    let generic_digest = request_digest(request)?;
+    let mut digest = Sha256::new();
+    digest.update(b"aethyme-host-resource-supervised/v1\0");
+    digest.update(generic_digest.as_bytes());
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 struct Occupied {
     lease_id: String,
     generation: u64,
@@ -1339,6 +1824,9 @@ struct Occupied {
     /// A named resource stays reserved after its holder dies, so the waiter needs
     /// to be told that waiting cannot resolve it.
     holder_gone: bool,
+    /// A supervised run keeps capacity reserved until observed group absence or
+    /// generation-bound reconciliation, even after its coordinator PID dies.
+    supervised_hold: bool,
 }
 
 /// Quarantined leases keep occupying their resources, because reusing a name
@@ -1356,7 +1844,22 @@ struct Occupied {
 /// still running keeps its units, because it is still consuming the CPU and memory
 /// the pool exists to bound.
 fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> {
-    let mut stmt=conn.prepare("SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key")?;
+    let schema_version = store_schema_version(conn)?;
+    let mut stmt = if schema_version >= HOST_RESOURCE_STORE_SCHEMA_VERSION {
+        conn.prepare(
+            "SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid,\
+             EXISTS(SELECT 1 FROM resource_supervised_capacity_holds h \
+                    WHERE h.lease_id=l.lease_id AND h.generation=l.generation) \
+             FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id \
+             WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid,0 \
+             FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id \
+             WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key",
+        )?
+    };
     let rows = stmt
         .query_map([], |row| {
             let holder_pid = row.get::<_, Option<i64>>(6)?;
@@ -1369,13 +1872,16 @@ fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> 
                 limit: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
                 holder_pid,
                 holder_gone: holder_pid.is_some_and(holder_process_is_gone),
+                supervised_hold: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
         .filter(|occupied| {
-            occupied.kind != "capacity" || !occupied.holder_pid.is_some_and(holder_process_is_gone)
+            occupied.kind != "capacity"
+                || occupied.supervised_hold
+                || !occupied.holder_pid.is_some_and(holder_process_is_gone)
         })
         .collect())
 }
@@ -1778,6 +2284,11 @@ fn reclaim_dead_capacity(
                  SELECT 1 FROM resource_reap_observations r \
                  WHERE r.lease_id=resource_leases.lease_id\
              ) \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM resource_supervised_capacity_holds h \
+                 WHERE h.lease_id=resource_leases.lease_id \
+                   AND h.generation=resource_leases.generation\
+             ) \
              ORDER BY generation",
         )?;
         stmt.query_map([], |row| {
@@ -2082,6 +2593,478 @@ mod tests {
             Err(HostResourceError::Conflict { .. })
         ));
     }
+    #[test]
+    fn supervised_capacity_hold_survives_dead_supervisor_before_terminal_proof() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let dead_holder = reaped_pid();
+        let request = capacity_request("supervised", "workers", 1, 1, Some(dead_holder));
+        let grant = coordinator.acquire_inner(&request, true).unwrap();
+
+        let report = coordinator.reap_dead_holders().unwrap();
+        assert_eq!(report.reclaimed_capacity_units, 0);
+        assert!(report.leases.is_empty());
+        let lease = coordinator.list(false).unwrap().remove(0);
+        assert_eq!(lease.holder_pid, Some(dead_holder));
+        assert_eq!(lease.state, HostLeaseState::Quarantined);
+        assert!(matches!(
+            coordinator.acquire(&capacity_request(
+                "contender",
+                "workers",
+                1,
+                1,
+                Some(std::process::id())
+            )),
+            Err(HostResourceError::Conflict { .. })
+        ));
+        assert!(matches!(
+            coordinator.release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token
+            ),
+            Err(HostResourceError::InvalidRequest(_))
+        ));
+
+        let reconciled = coordinator
+            .reconcile(&grant.lease.lease_id, grant.lease.generation)
+            .unwrap();
+        assert_eq!(reconciled.state, HostLeaseState::Released);
+        assert!(
+            coordinator
+                .plan(&capacity_request(
+                    "after-reconcile",
+                    "workers",
+                    1,
+                    1,
+                    Some(std::process::id())
+                ))
+                .unwrap()
+                .available
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_run_does_not_prepare_or_spawn_before_capacity_is_acquired() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        coordinator
+            .acquire(&capacity_request(
+                "capacity-owner",
+                "workers",
+                1,
+                1,
+                Some(std::process::id()),
+            ))
+            .unwrap();
+
+        let child_marker = t.path().join("child-started");
+        let mut environment_prepared = false;
+        let result = coordinator.run_supervised_with_environment(
+            &capacity_request(
+                "blocked-supervised-run",
+                "workers",
+                1,
+                1,
+                Some(std::process::id()),
+            ),
+            std::time::Duration::ZERO,
+            &["sh".into(), "-c".into(), "touch \"$CHILD_MARKER\"".into()],
+            None,
+            t.path(),
+            |_| {
+                environment_prepared = true;
+                Ok(BTreeMap::from([(
+                    "CHILD_MARKER".into(),
+                    child_marker.to_string_lossy().into_owned(),
+                )]))
+            },
+            |_| {},
+        );
+
+        assert!(matches!(
+            result,
+            Err(HostResourceRunError::Resource(
+                HostResourceError::Conflict { .. }
+            ))
+        ));
+        assert!(!environment_prepared);
+        assert!(!child_marker.exists());
+    }
+
+    #[test]
+    fn supervised_request_id_cannot_be_replayed_or_cross_modes() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let supervised = capacity_request(
+            "supervised-request",
+            "supervised-pool",
+            1,
+            2,
+            Some(std::process::id()),
+        );
+        coordinator.acquire_inner(&supervised, true).unwrap();
+        assert!(matches!(
+            coordinator.acquire_inner(&supervised, true),
+            Err(HostResourceError::RequestNotActive { .. })
+        ));
+        assert!(matches!(
+            coordinator.acquire(&supervised),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+
+        let generic = capacity_request(
+            "generic-request",
+            "generic-pool",
+            1,
+            2,
+            Some(std::process::id()),
+        );
+        coordinator.acquire(&generic).unwrap();
+        assert!(matches!(
+            coordinator.acquire_inner(&generic, true),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_v1_capacity_reclamation_survives_v2_migration_and_readonly() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("legacy.db");
+        let dead_holder = reaped_pid();
+        let mut legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(SCHEMA).unwrap();
+        insert_legacy_v1_capacity(
+            &mut legacy,
+            "legacy-dead",
+            "legacy-pool",
+            1,
+            4,
+            Some(dead_holder),
+        )
+        .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO resource_allocations \
+                 (lease_id,resource_key,kind,value,units,capacity_limit) \
+                 VALUES ('legacy-legacy-dead','database','exclusive_key','legacy-db',NULL,NULL)",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let readonly = HostResourceCoordinator::open_read_only(&path).unwrap();
+        assert!(
+            readonly
+                .plan(&capacity_request(
+                    "readonly-v1-plan",
+                    "legacy-pool",
+                    1,
+                    4,
+                    Some(std::process::id())
+                ))
+                .unwrap()
+                .available
+        );
+        drop(readonly);
+
+        let mut coordinator = HostResourceCoordinator::open(&path).unwrap();
+        assert_eq!(store_schema_version(&coordinator.conn).unwrap(), 2);
+        let before = coordinator.list(false).unwrap().remove(0);
+        assert_eq!(before.holder_pid, Some(dead_holder));
+        assert_eq!(before.request_id, "legacy-dead");
+        assert_eq!(before.generation, 1);
+        let report = coordinator.reap_dead_holders().unwrap();
+        assert_eq!(report.reclaimed_capacity_units, 1);
+        assert_eq!(report.retained_quarantined_leases, 1);
+        let after = coordinator.list(false).unwrap().remove(0);
+        assert_eq!(after.holder_pid, Some(dead_holder));
+        assert_eq!(after.state, HostLeaseState::Quarantined);
+        assert_eq!(after.allocations.len(), 1);
+        assert_eq!(after.allocations[0].kind, "exclusive_key");
+        drop(coordinator);
+
+        let newer = Connection::open(&path).unwrap();
+        newer
+            .execute("UPDATE meta SET value=3 WHERE key='schema_version'", [])
+            .unwrap();
+        drop(newer);
+        assert!(matches!(
+            HostResourceCoordinator::open_read_only(&path),
+            Err(HostResourceError::InvalidRequest(message)) if message.contains("unsupported host schema 3")
+        ));
+    }
+
+    #[test]
+    fn old_open_v1_connection_cannot_release_or_reap_supervised_capacity() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("old-open.db");
+        let mut old_connection = Connection::open(&path).unwrap();
+        old_connection.execute_batch(SCHEMA).unwrap();
+        old_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        old_connection
+            .pragma_update(None, "journal_mode", "wal")
+            .unwrap();
+
+        let mut coordinator = HostResourceCoordinator::open(&path).unwrap();
+        let dead_holder = reaped_pid();
+        let request = capacity_request("held", "guarded-pool", 1, 2, Some(dead_holder));
+        let grant = coordinator.acquire_inner(&request, true).unwrap();
+        let (stored_pid, stored_units): (i64, i64) = old_connection
+            .query_row(
+                "SELECT l.holder_pid,a.units FROM resource_leases l \
+                 JOIN resource_allocations a ON a.lease_id=l.lease_id \
+                 WHERE l.lease_id=?1 AND a.kind='capacity'",
+                [&grant.lease.lease_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_pid as u32, dead_holder);
+        assert_eq!(stored_units, 1);
+        assert!(holder_process_is_gone(stored_pid));
+        // The already-open v1 planner would omit this dead-holder capacity.
+        assert_eq!(
+            if holder_process_is_gone(stored_pid) {
+                0
+            } else {
+                stored_units
+            },
+            0
+        );
+
+        {
+            let tx = old_connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "INSERT INTO resource_reap_observations(lease_id,generation,reaped_at) \
+                 VALUES (?1,?2,?3) ON CONFLICT(lease_id) DO NOTHING",
+                params![
+                    grant.lease.lease_id,
+                    grant.lease.generation as i64,
+                    now_ms()
+                ],
+            )
+            .unwrap();
+            assert!(
+                tx.execute(
+                    "DELETE FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+            );
+            tx.rollback().unwrap();
+        }
+        assert!(
+            old_connection
+                .execute(
+                    "DELETE FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+        assert!(
+            old_connection
+                .execute(
+                    "UPDATE resource_leases SET state='released' WHERE lease_id=?1",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+        assert!(
+            old_connection
+                .execute(
+                    "UPDATE resource_allocations SET units=0 WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+
+        // Disable SQLite's foreign-key check for this statement so the
+        // generation-bound trigger, rather than the hold table's FK, proves
+        // that an already-open v1 writer cannot delete the held lease.
+        old_connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        assert!(
+            old_connection
+                .execute(
+                    "DELETE FROM resource_leases WHERE lease_id=?1",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+        old_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+
+        let legacy_second = capacity_request(
+            "legacy-second",
+            "guarded-pool",
+            1,
+            2,
+            Some(std::process::id()),
+        );
+        insert_legacy_v1_capacity(
+            &mut old_connection,
+            &legacy_second.request_id,
+            "guarded-pool",
+            1,
+            2,
+            legacy_second.holder_pid,
+        )
+        .unwrap();
+        assert!(
+            insert_legacy_v1_capacity(
+                &mut old_connection,
+                "legacy-third",
+                "guarded-pool",
+                1,
+                2,
+                Some(std::process::id()),
+            )
+            .is_err()
+        );
+
+        let report = coordinator.reap_dead_holders().unwrap();
+        assert_eq!(report.reclaimed_capacity_units, 0);
+        assert!(matches!(
+            coordinator.acquire(&capacity_request(
+                "new-contender",
+                "guarded-pool",
+                1,
+                2,
+                Some(std::process::id())
+            )),
+            Err(HostResourceError::Conflict { .. })
+        ));
+        assert_eq!(
+            old_connection
+                .query_row(
+                    "SELECT COUNT(*) FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_loss_kills_a_leader_that_ignores_term_within_the_grace() {
+        let t = tempfile::tempdir().unwrap();
+        let database = t.path().join("h.db");
+        let mut coordinator = HostResourceCoordinator::open(&database).unwrap();
+        let request = req("authority-loss", vec![exclusive("authority-loss")]);
+        let mut grant = coordinator.acquire(&request).unwrap();
+        grant.lease = coordinator
+            .quarantine(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+
+        let ready_path = t.path().join("term-handler-ready");
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "trap '' TERM; : > \"$1\"; exec sleep 3".to_string(),
+            "authority-loss-child".to_string(),
+            ready_path.display().to_string(),
+        ];
+        let environment = BTreeMap::new();
+        let mut child = spawn_resource_process(&command, t.path(), &grant, &environment).unwrap();
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready_path.exists() && std::time::Instant::now() < ready_deadline {
+            if child.child.try_wait().unwrap().is_some() {
+                panic!("owned test child exited before installing its TERM handler");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready_path.exists() {
+            if child.child.try_wait().unwrap().is_none() {
+                let kill_result = signal_unreaped_process_group(&child, libc::SIGKILL);
+                let reap_result = wait_for_child_exit(&mut child, AUTHORITY_LOSS_KILL_GRACE);
+                assert!(
+                    kill_result.is_ok(),
+                    "failed to kill the owned test process group"
+                );
+                assert!(
+                    matches!(&reap_result, Ok(Some(_))),
+                    "failed to reap the owned test child after readiness timeout: {reap_result:?}"
+                );
+            }
+            panic!("owned test child did not install its TERM handler before the deadline");
+        }
+        let started = std::time::Instant::now();
+        let mut events = Vec::new();
+        let status = terminate_after_authority_loss(&mut child, &mut |message| {
+            events.push(message.to_string())
+        })
+        .unwrap()
+        .expect("the owned leader must be reaped within the bounded TERM/KILL waits");
+        let completion = process_completion(&child, status);
+
+        assert!(
+            started.elapsed()
+                < AUTHORITY_LOSS_TERM_GRACE
+                    + AUTHORITY_LOSS_KILL_GRACE
+                    + std::time::Duration::from_secs(2),
+            "authority-loss termination exceeded its bounded waits"
+        );
+        assert_eq!(exit_signal(&completion.status), Some(libc::SIGKILL));
+        assert_eq!(completion.process_group, ProcessGroupObservation::Absent);
+        assert_eq!(grant.lease.state, HostLeaseState::Quarantined);
+        assert!(events.iter().any(|event| event.contains("SIGKILL")));
+        assert_eq!(
+            coordinator.list(false).unwrap()[0].state,
+            HostLeaseState::Quarantined
+        );
+    }
+
+    #[test]
+    fn unconfirmed_authority_loss_termination_quarantines_without_a_status() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = req(
+            "unconfirmed-authority-loss",
+            vec![exclusive("unknown-status")],
+        );
+        let mut grant = coordinator.acquire(&request).unwrap();
+        let mut events = Vec::new();
+
+        let error = quarantine_unconfirmed_termination(
+            &mut coordinator,
+            &mut grant,
+            "the child status remained unavailable after bounded TERM/KILL waits".into(),
+            &mut |message| events.push(message.to_string()),
+        );
+
+        assert!(matches!(
+            error,
+            HostResourceRunError::TerminationUnconfirmed {
+                ref lease_id,
+                ref lease_state,
+                ..
+            } if lease_id == &grant.lease.lease_id && lease_state == "quarantined"
+        ));
+        assert_eq!(grant.lease.state, HostLeaseState::Quarantined);
+        assert_eq!(
+            coordinator.list(false).unwrap()[0].state,
+            HostLeaseState::Quarantined
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("status unavailable"))
+        );
+    }
+
     /// Reaped, so the PID is provably absent rather than merely idle.
     fn reaped_pid() -> u32 {
         let mut child = std::process::Command::new("true").spawn().unwrap();
@@ -2102,6 +3085,60 @@ mod tests {
                 },
             }],
         )
+    }
+
+    fn capacity_request(
+        id: &str,
+        pool: &str,
+        units: u32,
+        limit: u32,
+        holder_pid: Option<u32>,
+    ) -> HostResourceRequest {
+        let mut request = req(
+            id,
+            vec![HostResourceRequirement {
+                key: "workers".into(),
+                resource: HostResourceKind::Capacity {
+                    pool: pool.into(),
+                    units,
+                    limit,
+                },
+            }],
+        );
+        request.holder_pid = holder_pid;
+        request
+    }
+
+    fn insert_legacy_v1_capacity(
+        conn: &mut Connection,
+        request_id: &str,
+        pool: &str,
+        units: u32,
+        limit: u32,
+        holder_pid: Option<u32>,
+    ) -> Result<(), rusqlite::Error> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation: i64 = tx.query_row(
+            "UPDATE meta SET value=value+1 WHERE key='generation' RETURNING value",
+            [],
+            |row| row.get(0),
+        )?;
+        let lease_id = format!("legacy-{request_id}");
+        tx.execute(
+            "INSERT INTO resource_leases \
+             (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id, \
+              generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at) \
+             VALUES (?1,?2,'legacy-digest','owner/repo','legacy-fingerprint',?2,?3, \
+                     'legacy-token','active',?4,1,9223372036854775807,1)",
+            params![lease_id, request_id, generation, holder_pid.map(i64::from)],
+        )?;
+        tx.execute(
+            "INSERT INTO resource_allocations \
+             (lease_id,resource_key,kind,value,units,capacity_limit) \
+             VALUES (?1,'workers','capacity',?2,?3,?4)",
+            params![lease_id, pool, i64::from(units), i64::from(limit)],
+        )?;
+        tx.commit()
     }
 
     fn slot_and_worktree(id: &str, holder_pid: u32) -> HostResourceRequest {

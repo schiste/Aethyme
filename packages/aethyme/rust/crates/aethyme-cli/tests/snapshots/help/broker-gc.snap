@@ -47,6 +47,6 @@ exit: 0
       the marker for those it can prove, removing nothing; review a new
       storage plan afterwards. A root it cannot prove is never marked.
   aethyme broker gc reap [--json]
-      Reclaim capacity from quarantined leases whose holder process is gone;
-      named allocations remain quarantined for cleanup review.
+      Reclaim ordinary capacity from quarantined leases whose holder is gone;
+      supervised capacity holds remain until clean release or reconciliation.
 --- stderr

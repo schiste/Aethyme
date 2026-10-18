@@ -37,11 +37,30 @@ lease id and generation, renews at one third of the request TTL, forwards
 child exit code. The ownership token never enters the child environment.
 
 If supplied, `--cleanup-command` runs through `sh -c` with the same public
-allocation environment after the child exits. A successful cleanup permits
-release. A failed or unspawnable cleanup, or lost renewal authority,
-quarantines the exact generation rather than making its resources available.
-If the child succeeded but lifecycle cleanup did not, the command exits 70;
-otherwise a failing child's original exit code wins.
+allocation environment after the original child process group is observed
+absent. Release requires the cleanup command to succeed and its process group
+to be observed absent too. A failed or unspawnable cleanup, a surviving or
+unobservable process group, or lost renewal authority leaves the exact
+generation quarantined. If the child succeeded but lifecycle cleanup did not,
+the command exits 70; otherwise a failing child's original exit code wins.
+
+Before calling environment preparation or spawning the child, `resources run`
+commits a supervised capacity hold with the lease. This protects capacity if
+the supervisor exits before it can prove its owned process groups are absent.
+The hold survives dead-holder reaping and ordinary `release`; only a verified
+clean terminal path or an operator's exact-generation `reconcile` clears it.
+Treat a supervised `request_id` as one-shot: use a new ID for every run, since
+reusing it never starts another child. The bounded check sees only the original
+process groups; a descendant that deliberately leaves its group or session is
+outside this proof.
+
+The request and report JSON schema remains version 1. The host-resource SQLite
+store has its own version and writable open atomically migrates a version-1
+store to version 2. Current read-only clients can still read version-1
+stores; older binaries fail closed when opening a version-2 store. Already-open
+version-1 connections are fenced by database triggers from releasing or
+reaping a held lease and from inserting capacity that would exceed the held
+pool's limit. Existing headroom in that pool remains usable.
 
 Normal child stdout and stderr remain untouched. With `--json`, bounded wait,
 grant, signal, cleanup, and final lifecycle records are emitted as JSON lines
@@ -337,12 +356,16 @@ stdout. Inventory and gate reports never contain that token, file contents,
 diffs, or absolute worktree paths.
 
 `reap` is an independent dead-holder sweep. It quarantines active leases whose
-holder PID is provably gone, releases their capacity allocations immediately,
-and reports the reclaimed units. Named allocations such as namespaces, ports,
-and exclusive keys remain quarantined until an operator reviews cleanup and
-uses the exact generation-fenced `reconcile` command. This split prevents a dead
-process from silently shrinking shared capacity without treating a possibly
-dirty named resource as safe to reuse.
+holder PID is provably gone, releases ordinary leases' capacity allocations,
+and reports the reclaimed units. A supervised capacity hold is retained even
+when the supervisor PID is gone, because the child or cleanup process group may
+still contain writers. Named allocations such as namespaces, ports, and
+exclusive keys also remain quarantined until an operator reviews cleanup and
+uses the exact generation-fenced `reconcile` command. Before reconciling,
+review independently retained operator run records and the current process
+list for surviving writers, then clean exact owned resources. The host-resource
+registry records the lease and holder PID, not child or cleanup process-group
+IDs.
 
 A minimal low-level request is:
 
@@ -364,9 +387,12 @@ A minimal low-level request is:
 }
 ```
 
-Reuse a `request_id` only to recover the same idempotent acquisition. Reusing
-it with different content is refused. Pass the exact grant JSON to renew or
-release; do not place its ownership token in process arguments or logs.
+For a generic acquisition, reuse a `request_id` only to recover the same
+idempotent grant. A `resources run` request ID is one-shot and cannot be reused
+to start another supervised child; give each run a fresh ID. Reusing an ID with
+different request content is refused. Pass the exact grant JSON to renew or
+release; a generic release cannot clear a supervised capacity hold. Do not
+place an ownership token in process arguments or logs.
 
 For quarantined Docker or database resources, inspect the recorded allocation,
 clean only exact container IDs or the exact allocated namespace, then confirm

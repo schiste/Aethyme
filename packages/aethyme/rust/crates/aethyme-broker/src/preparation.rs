@@ -555,9 +555,7 @@ impl Broker {
                 next_action: "dependencies are already current".into(),
             });
         }
-        if status.state == PreparationState::InProgress {
-            return Err(PreparationError::PriorPreparationIncomplete { session_id }.into());
-        }
+        ensure_preparation_retry_allowed(session_id, status.state)?;
         // Everything below runs the repository's own commands. The policy is
         // this worktree's: its gates and the preparation just loaded.
         let gates = match crate::gates::load_gates(&root) {
@@ -792,32 +790,28 @@ impl Broker {
             }) {
                 Ok(report) => report,
                 Err(error) => {
-                    if matches!(
+                    let restart_storage_worker = route_preparation_command_failure(
                         &error,
-                        BrokerOpError::Preparation(PreparationError::CleanupUnknown { .. })
-                    ) {
-                        // The command may still be writing. Keep both the
-                        // in-progress preparation record and its named shared
-                        // cache allocation until an operator can verify cleanup.
-                        quarantine_grant_best_effort(&mut coordinator, &mut grant);
-                        return Err(error);
-                    }
-                    let recovery_persisted =
-                        self.recover_storage_pressure_after_command_failure(&error, || {
-                            require_preparation_storage_with_cache_root(
-                                &main_root,
-                                &storage_paths,
-                                cache_root_binding.as_ref(),
-                            )
-                        });
-                    record.state = PreparationState::Failed;
-                    record.failed_step = Some(step.name.clone());
-                    record.completed_at = Some(now_ms());
-                    let lease_released = best_effort_failed_preparation_cleanup(
-                        || write_record(&state_path, &record),
-                        || release_grant(&mut coordinator, &mut grant),
+                        PreparationCommandFailureContext {
+                            step: &step.name,
+                            state_path: &state_path,
+                            record: &mut record,
+                            coordinator: &mut coordinator,
+                            grant: &mut grant,
+                            exit_code: None,
+                            write_exit_code: false,
+                        },
+                        |error| {
+                            self.recover_storage_pressure_after_command_failure(error, || {
+                                require_preparation_storage_with_cache_root(
+                                    &main_root,
+                                    &storage_paths,
+                                    cache_root_binding.as_ref(),
+                                )
+                            })
+                        },
                     );
-                    if recovery_persisted && lease_released {
+                    if restart_storage_worker {
                         self.start_storage_recovery_worker();
                     }
                     return Err(error);
@@ -835,23 +829,28 @@ impl Broker {
                     session_id,
                 };
                 let error = BrokerOpError::from(error);
-                let recovery_persisted =
-                    self.recover_storage_pressure_after_command_failure(&error, || {
-                        require_preparation_storage_with_cache_root(
-                            &main_root,
-                            &storage_paths,
-                            cache_root_binding.as_ref(),
-                        )
-                    });
-                record.state = PreparationState::Failed;
-                record.failed_step = Some(step.name.clone());
-                record.exit_code = report.exit_code;
-                record.completed_at = Some(now_ms());
-                let lease_released = best_effort_failed_preparation_cleanup(
-                    || write_record(&state_path, &record),
-                    || release_grant(&mut coordinator, &mut grant),
+                let restart_storage_worker = route_preparation_command_failure(
+                    &error,
+                    PreparationCommandFailureContext {
+                        step: &step.name,
+                        state_path: &state_path,
+                        record: &mut record,
+                        coordinator: &mut coordinator,
+                        grant: &mut grant,
+                        exit_code: report.exit_code,
+                        write_exit_code: true,
+                    },
+                    |error| {
+                        self.recover_storage_pressure_after_command_failure(error, || {
+                            require_preparation_storage_with_cache_root(
+                                &main_root,
+                                &storage_paths,
+                                cache_root_binding.as_ref(),
+                            )
+                        })
+                    },
                 );
-                if recovery_persisted && lease_released {
+                if restart_storage_worker {
                     self.start_storage_recovery_worker();
                 }
                 return Err(error);
@@ -2571,6 +2570,68 @@ fn best_effort_failed_preparation_cleanup(
     }
 }
 
+struct PreparationCommandFailureContext<'a> {
+    step: &'a str,
+    state_path: &'a Path,
+    record: &'a mut PreparationRecord,
+    coordinator: &'a mut Option<HostResourceCoordinator>,
+    grant: &'a mut Option<crate::HostResourceGrant>,
+    exit_code: Option<i32>,
+    write_exit_code: bool,
+}
+
+fn route_preparation_command_failure(
+    error: &BrokerOpError,
+    context: PreparationCommandFailureContext<'_>,
+    recover_storage_pressure: impl FnOnce(&BrokerOpError) -> bool,
+) -> bool {
+    let PreparationCommandFailureContext {
+        step,
+        state_path,
+        record,
+        coordinator,
+        grant,
+        exit_code,
+        write_exit_code,
+    } = context;
+    if matches!(
+        error,
+        BrokerOpError::Preparation(
+            PreparationError::CommandOutcomeUnknown { .. }
+                | PreparationError::CleanupUnknown { .. }
+        )
+    ) {
+        // The command may have changed the worktree even when its process is
+        // gone. Keep the durable in-progress record and host lease until an
+        // operator inspects the effects and chooses how to reconcile them.
+        quarantine_grant_best_effort(coordinator, grant);
+        return false;
+    }
+
+    let recovery_persisted = recover_storage_pressure(error);
+    record.state = PreparationState::Failed;
+    record.failed_step = Some(step.into());
+    if write_exit_code {
+        record.exit_code = exit_code;
+    }
+    record.completed_at = Some(now_ms());
+    let lease_released = best_effort_failed_preparation_cleanup(
+        || write_record(state_path, record),
+        || release_grant(coordinator, grant),
+    );
+    recovery_persisted && lease_released
+}
+
+fn ensure_preparation_retry_allowed(
+    session_id: i64,
+    state: PreparationState,
+) -> Result<(), PreparationError> {
+    if state == PreparationState::InProgress {
+        return Err(PreparationError::PriorPreparationIncomplete { session_id });
+    }
+    Ok(())
+}
+
 fn release_grant_best_effort(
     coordinator: &mut Option<HostResourceCoordinator>,
     grant: &mut Option<crate::HostResourceGrant>,
@@ -3161,6 +3222,176 @@ mod tests {
             coordinator.as_mut().unwrap().acquire(&retry),
             Err(crate::HostResourceError::Conflict { .. })
         ));
+    }
+
+    fn preparation_failure_test_request(request_id: &str) -> HostResourceRequest {
+        HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: request_id.into(),
+            repository: "fixture-repository".into(),
+            worktree_fingerprint: "f".repeat(64),
+            run_id: format!("{request_id}-run"),
+            ttl_seconds: PREPARATION_LEASE_TTL_SECONDS,
+            holder_pid: Some(std::process::id()),
+            resources: vec![HostResourceRequirement {
+                key: "preparation_cache".into(),
+                resource: HostResourceKind::ExclusiveKey {
+                    name: preparation_cache_lease_name("fixture-repository"),
+                },
+            }],
+        }
+    }
+
+    fn in_progress_test_record(
+        session_id: i64,
+        grant: &crate::HostResourceGrant,
+    ) -> PreparationRecord {
+        PreparationRecord {
+            schema_version: PREPARATION_SCHEMA_VERSION,
+            session_id,
+            state: PreparationState::InProgress,
+            digest: "test-digest".into(),
+            source_digest: "test-source-digest".into(),
+            started_at: now_ms(),
+            completed_at: None,
+            failed_step: None,
+            exit_code: None,
+            host_lease_id: Some(grant.lease.lease_id.clone()),
+            host_lease_generation: Some(grant.lease.generation),
+        }
+    }
+
+    #[test]
+    fn unknown_command_outcomes_keep_preparation_unresolved_and_retry_blocked() {
+        let errors: Vec<BrokerOpError> = vec![
+            PreparationError::CommandOutcomeUnknown {
+                session_id: 41,
+                reason: "injected lost result".into(),
+            }
+            .into(),
+            PreparationError::CleanupUnknown {
+                session_id: 41,
+                reason: "injected unconfirmed cleanup".into(),
+            }
+            .into(),
+        ];
+
+        for (index, error) in errors.into_iter().enumerate() {
+            let owner = tempfile::tempdir().unwrap();
+            let mut coordinator = Some(
+                HostResourceCoordinator::open(&owner.path().join("host-resources.db")).unwrap(),
+            );
+            let request = preparation_failure_test_request(&format!("unknown-{index}"));
+            let acquired = coordinator.as_mut().unwrap().acquire(&request).unwrap();
+            let lease_id = acquired.lease.lease_id.clone();
+            let mut grant = Some(acquired);
+            let session_id = 41;
+            let mut record = in_progress_test_record(session_id, grant.as_ref().unwrap());
+            let state_path = record_path(owner.path(), session_id);
+            write_record(&state_path, &record).unwrap();
+            let initial_record = fs::read(&state_path).unwrap();
+
+            let restart_storage_worker = route_preparation_command_failure(
+                &error,
+                PreparationCommandFailureContext {
+                    step: "dependencies",
+                    state_path: &state_path,
+                    record: &mut record,
+                    coordinator: &mut coordinator,
+                    grant: &mut grant,
+                    exit_code: None,
+                    write_exit_code: false,
+                },
+                |_| panic!("unknown outcomes must not trigger storage recovery"),
+            );
+
+            assert!(!restart_storage_worker);
+            assert!(grant.is_none());
+            assert_eq!(fs::read(&state_path).unwrap(), initial_record);
+            let persisted = read_record(&state_path).unwrap().unwrap();
+            assert_eq!(persisted.state, PreparationState::InProgress);
+            assert_eq!(persisted.failed_step, None);
+            assert_eq!(persisted.completed_at, None);
+            assert!(matches!(
+                ensure_preparation_retry_allowed(session_id, persisted.state),
+                Err(PreparationError::PriorPreparationIncomplete { session_id: 41 })
+            ));
+
+            let retained = coordinator
+                .as_ref()
+                .unwrap()
+                .list(true)
+                .unwrap()
+                .into_iter()
+                .find(|lease| lease.lease_id == lease_id)
+                .unwrap();
+            assert_eq!(retained.state, crate::HostLeaseState::Quarantined);
+            let mut retry = request;
+            retry.request_id = format!("unknown-{index}-retry");
+            retry.run_id = format!("unknown-{index}-retry-run");
+            assert!(matches!(
+                coordinator.as_mut().unwrap().acquire(&retry),
+                Err(crate::HostResourceError::Conflict { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn known_command_failure_records_failed_state_and_releases_lease() {
+        let owner = tempfile::tempdir().unwrap();
+        let mut coordinator =
+            Some(HostResourceCoordinator::open(&owner.path().join("host-resources.db")).unwrap());
+        let request = preparation_failure_test_request("known-failure");
+        let acquired = coordinator.as_mut().unwrap().acquire(&request).unwrap();
+        let lease_id = acquired.lease.lease_id.clone();
+        let mut grant = Some(acquired);
+        let session_id = 42;
+        let mut record = in_progress_test_record(session_id, grant.as_ref().unwrap());
+        let state_path = record_path(owner.path(), session_id);
+        write_record(&state_path, &record).unwrap();
+        let error: BrokerOpError = PreparationError::StepFailed {
+            step: "dependencies".into(),
+            exit_code: Some(17),
+            session_id,
+        }
+        .into();
+
+        let restart_storage_worker = route_preparation_command_failure(
+            &error,
+            PreparationCommandFailureContext {
+                step: "dependencies",
+                state_path: &state_path,
+                record: &mut record,
+                coordinator: &mut coordinator,
+                grant: &mut grant,
+                exit_code: Some(17),
+                write_exit_code: true,
+            },
+            |_| false,
+        );
+
+        assert!(!restart_storage_worker);
+        assert!(grant.is_none());
+        let persisted = read_record(&state_path).unwrap().unwrap();
+        assert_eq!(persisted.state, PreparationState::Failed);
+        assert_eq!(persisted.failed_step.as_deref(), Some("dependencies"));
+        assert_eq!(persisted.exit_code, Some(17));
+        assert!(persisted.completed_at.is_some());
+        assert!(ensure_preparation_retry_allowed(session_id, persisted.state).is_ok());
+        let released = coordinator
+            .as_ref()
+            .unwrap()
+            .list(true)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == lease_id)
+            .unwrap();
+        assert_eq!(released.state, crate::HostLeaseState::Released);
+
+        let mut retry = request;
+        retry.request_id = "known-failure-retry".into();
+        retry.run_id = "known-failure-retry-run".into();
+        coordinator.as_mut().unwrap().acquire(&retry).unwrap();
     }
 
     #[test]
