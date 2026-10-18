@@ -149,6 +149,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   nested or suffixed module names; prefer `--exact` or explicit `--skip`
   exclusions. Require the expected names and counts, and fail on zero runs,
   missing or unexpected names, or ignored tests outside an explicit allowlist.
+  Some harnesses split test-name headers from result lines, including
+  interleaved output. Count ordinary and split forms, and use finite parser
+  controls that reject ambiguous pairings, missing/unexpected/duplicate names,
+  unapproved ignored tests, and summary mismatches.
   Rust module aliases can differ from filenames; a successful build with zero
   matching tests does not validate the change. Automated focused-test runners
   should refuse a successful zero-test result; preserve the process exit
