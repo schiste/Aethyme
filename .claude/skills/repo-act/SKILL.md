@@ -50,6 +50,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Give background-writer tests an independent, fixture-owned stop condition
   and a finite write limit. Deliberately breaking production cleanup must not
   leave the test itself writing indefinitely after an assertion fails.
+- Before mutating source or spawning children, freeze and verify the complete
+  helper closure against its pins and preflight required process-control
+  capabilities in the actual interpreter at every spawn entrypoint. For owned
+  groups, retain the leader unreaped through bounded TERM/KILL cleanup, probe
+  non-zombie members, reap once, then probe final group absence; never signal
+  the group after reaping. Refuse when ownership or capabilities are unknown.
+  Test early leader exits with open and closed pipes, setup and monitoring
+  exceptions, and finite deadlines for every synthetic process. Original group
+  absence proves only that group's absence; it says nothing about escaped or
+  detached descendants.
 - For storage ownership and reclamation changes, test replacement of a root and
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem

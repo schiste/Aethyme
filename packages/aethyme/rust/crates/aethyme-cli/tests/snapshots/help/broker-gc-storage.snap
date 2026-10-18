@@ -6,6 +6,13 @@ exit: 0
       Inventory every host worktree root by reconciling disk directories,
       Git registrations, and repository session ledgers. Apply removes only
       exact reviewed orphan roots or stray directories.
+  aethyme broker gc storage identity plan <host-operation-db> <exact-root> [--json]
+  aethyme broker gc storage identity apply <host-operation-db> <exact-root> --confirm <old-sha256:new-sha256> [--json]
+      Review then recover one legacy worktree-root identity after a mount
+      identity change. The live root and repository origin must retain their
+      inodes, owner marker, repository binding, and nonzero volume UUIDs; the
+      confirmation binds the exact old and replacement payloads. This does
+      not prove their historical volume UUIDs.
   aethyme broker gc storage attribute [--apply] [--json]
       List host worktree roots with no ownership marker and whether this
       repository can prove it owns each one: every Git worktree under it is

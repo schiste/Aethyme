@@ -1,6 +1,6 @@
 # Broker worktree storage lifecycle
 
-Last Updated: 2026-10-17
+Last Updated: 2026-10-18
 
 The broker must account for worktree storage after its repository or placement
 configuration disappears. A placement rule alone is insufficient: temporary
@@ -10,11 +10,18 @@ leave roots outside the next process's search path.
 ## Root history
 
 A successful root admission records its exact canonical path, marker owner,
-placement source, and root and origin filesystem identities. The bounded index
-lives beside the host-operation database in a separate private directory. An
-explicit private host-operation database therefore gets a separate index too.
-Tests must supply that private coordination domain before startup maintenance
-and root admission; a temporary Git repository alone provides no isolation.
+placement source, and root and origin filesystem identities. On macOS, new
+records identify each directory by its inode and the current filesystem UUID;
+the mount-scoped device and `f_fsid` values remain available for runtime
+pin-time checks. A remount can change those mount-scoped values without
+changing the volume UUID or directory inode. Linux keeps its existing
+device, `f_fsid`, and inode behavior.
+
+The bounded index lives beside the host-operation database in a separate
+private directory. An explicit private host-operation database therefore gets
+a separate index too. Tests must supply that private coordination domain before
+startup maintenance and root admission; a temporary Git repository alone
+provides no isolation.
 
 The index is discovery history, not permission to delete. Planning combines it
 with the current known placement locations. Parent path aliases resolve to one
@@ -54,6 +61,19 @@ admission, and is rechecked before recording. Changed or unknown evidence is
 retained and refuses replacement. On platforms without filesystem identity,
 only byte-identical idempotent reuse is allowed; that opaque history remains
 protected from automatic reclamation.
+
+Legacy macOS rows have no saved volume UUID and remain exact-match only during
+ordinary admission and reclamation. Recover one row with
+`aethyme broker storage identity plan <host-operation-db> <exact-root>`, then
+review its exact old and replacement payload hashes and apply them with
+`aethyme broker storage identity apply <host-operation-db> <exact-root>
+--confirm <old-sha256:new-sha256>`. The recovery takes the same host-domain
+registry lock as admission and removal. It requires the recorded root and
+origin inodes, owner marker and repository binding to match, and nonzero current
+volume UUIDs for both directories. It explicitly does not prove the historical
+volume UUIDs; the operator reviews that gap before applying. An older binary
+with the strict pre-UUID record decoder may refuse a row after recovery, so
+retain the host state until using a compatible version.
 
 ## Reclamation authority
 
