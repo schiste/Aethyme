@@ -228,6 +228,12 @@ blocked.
    appears—or after rebasing or reusing a worktree—inspect
    `aethyme broker status --json` before continuing on the named paths.
 
+   If status output is too large to inspect directly, retain the complete
+   unfiltered JSON in a temporary file and use a JSON parser to project the
+   relevant sessions and coordination fields, including warnings, blockers,
+   and next actions. Do not truncate or text-filter the output before parsing;
+   that can hide the very advisory or refusal being checked.
+
    `.aethyme/broker-advisory.md` is a gitignored persistence projection; it
    is not automatically visible to agents and the broker database remains
    authoritative. Read it when a delivery surface points to it. Directory

@@ -1076,6 +1076,9 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
 
 /// `broker storage`.
 pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.first().map(String::as_str) == Some("identity") {
+        return run_storage_identity(parsed);
+    }
     let action = parsed.positional.first().map(String::as_str);
     if parsed.positional.len() > 1 {
         return Err(UsageError::Message(
@@ -1130,6 +1133,103 @@ pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
         Some(other) => {
             return Err(UsageError::Message(format!(
                 "unknown storage action {other:?}; expected `plan`, `apply` or `attribute`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn render_root_identity_recovery(plan: &crate::worktree_registry::RootIdentityRecoveryPlan) {
+    out!(
+        "Worktree root identity recovery {}",
+        if plan.applied { "applied" } else { "plan" }
+    );
+    out!(
+        "  host operation database: {}",
+        plan.host_operation_database.display()
+    );
+    out!("  exact root: {}", plan.root.display());
+    out!(
+        "  repository owner: {} ({})",
+        plan.repository_root.display(),
+        plan.repository_key
+    );
+    out!(
+        "  root inode / current volume UUID: {} / {}",
+        plan.root_inode,
+        plan.root_volume_uuid_hex
+    );
+    out!(
+        "  origin inode / current volume UUID: {} / {}",
+        plan.origin_inode,
+        plan.origin_volume_uuid_hex
+    );
+    out!(
+        "  historical UUID proof: none; review the existing inode, owner marker, and repository binding"
+    );
+    out!("  old payload SHA-256: {}", plan.old_payload_sha256);
+    out!("  new payload SHA-256: {}", plan.new_payload_sha256);
+    out!("  owner marker bytes SHA-256: {}", plan.owner_marker_sha256);
+    out!("  confirmation: {}", plan.confirmation);
+}
+
+fn run_storage_identity(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 4 {
+        return Err(UsageError::Message(
+            "usage: aethyme broker gc storage identity <plan|apply> <host-operation-db> <exact-root> [--confirm <old-sha256:new-sha256:owner-marker-sha256>] [--json]".into(),
+        ));
+    }
+    let action = parsed.positional[1].as_str();
+    let host_database = Path::new(&parsed.positional[2]);
+    let root = Path::new(&parsed.positional[3]);
+    let cwd = std::env::current_dir()
+        .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+    let repository = crate::GitRepo::discover(&cwd)?;
+    let repository_root = repository.main_root()?;
+    let git_common_dir = repository.git_common_dir()?;
+    let repository_key = crate::host_state::repository_key(&repository_root, Some(&git_common_dir));
+
+    match action {
+        "plan" => {
+            if parsed.confirm.is_some() {
+                return Err(UsageError::Message(
+                    "storage identity plan does not accept --confirm".into(),
+                ));
+            }
+            let plan = crate::worktree_registry::plan_root_identity_recovery(
+                host_database,
+                root,
+                &repository_root,
+                &repository_key,
+            )?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                render_root_identity_recovery(&plan);
+            }
+        }
+        "apply" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "storage identity apply requires --confirm <old-sha256:new-sha256:owner-marker-sha256>".into(),
+                )
+            })?;
+            let report = crate::worktree_registry::apply_root_identity_recovery(
+                host_database,
+                root,
+                &repository_root,
+                &repository_key,
+                confirm,
+            )?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_root_identity_recovery(&report);
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown storage identity action {other:?}; expected `plan` or `apply`"
             )));
         }
     }

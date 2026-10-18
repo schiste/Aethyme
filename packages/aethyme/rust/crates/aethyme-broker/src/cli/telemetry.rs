@@ -333,6 +333,7 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("storage") => match args.get(1).map(String::as_str) {
             Some("apply") => true,
             Some("attribute") => args.iter().any(|arg| arg == "--apply"),
+            Some("identity") => args.get(2).map(String::as_str) == Some("apply"),
             _ => false,
         },
         Some("representation") => args.get(1).map(String::as_str) == Some("record"),

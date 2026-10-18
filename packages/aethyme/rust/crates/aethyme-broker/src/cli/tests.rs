@@ -189,6 +189,13 @@ fn telemetry_classification_tracks_semantic_mutability() {
         args(&["gc", "plan"]),
         args(&["storage"]),
         args(&["storage", "plan"]),
+        args(&[
+            "storage",
+            "identity",
+            "plan",
+            "/state/host.db",
+            "/worktrees/repo",
+        ]),
         args(&["operations"]),
         args(&["operations", "stats"]),
         args(&["advisories", "list"]),
@@ -224,6 +231,15 @@ fn telemetry_classification_tracks_semantic_mutability() {
         args(&["doctor", "--fix-version"]),
         args(&["gc", "apply", "--confirm", "digest"]),
         args(&["storage", "apply", "--confirm", "digest"]),
+        args(&[
+            "storage",
+            "identity",
+            "apply",
+            "/state/host.db",
+            "/worktrees/repo",
+            "--confirm",
+            "old:new",
+        ]),
         args(&["report", "file", "reviewed.issue.md"]),
         args(&[
             "checkpoint",
@@ -1332,4 +1348,23 @@ fn a_read_only_refusal_names_the_cause_the_fix_and_the_snapshot_alternative() {
          To restore it: run `aethyme upgrade plan --repo .`.\n\
          For the recorded snapshot now: run it without --refresh"
     );
+}
+
+#[test]
+fn identity_recovery_usage_names_the_dispatched_command() {
+    let resolved = super::resolve(&args(&["gc", "storage", "identity", "plan"]));
+    assert!(resolved.refusal.is_none(), "{:?}", resolved.refusal);
+    assert_eq!(resolved.args, args(&["storage", "identity", "plan"]));
+    // Include public-surface normalization and the actual dispatcher without
+    // the outer command metrics, which would open repository state.
+    let Err(UsageError::Message(message)) =
+        super::run_inner(&resolved.args, &super::CompatibilityMode::Normal)
+    else {
+        panic!("missing identity recovery paths should report usage before opening state");
+    };
+    assert!(
+        message.starts_with("usage: aethyme broker gc storage identity <plan|apply> "),
+        "{message}"
+    );
+    assert!(message.contains("--confirm <old-sha256:new-sha256:owner-marker-sha256>"));
 }

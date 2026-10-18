@@ -119,6 +119,9 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
             CommandCapability::RecoveryWrite
         }
         (Some("storage"), Some("apply")) => CommandCapability::RecoveryWrite,
+        (Some("storage"), Some("identity")) if args.get(2).map(String::as_str) == Some("apply") => {
+            CommandCapability::RecoveryWrite
+        }
         // Trust writes only host state, and it is how a refused repository
         // recovers, so compatibility policy must not stand in its way.
         (Some("trust"), Some("status")) => CommandCapability::DiagnosticRead,
@@ -1107,6 +1110,32 @@ mod compatibility_command_tests {
             ),
             (
                 &["broker", "gc", "storage", "apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &[
+                    "broker",
+                    "gc",
+                    "storage",
+                    "identity",
+                    "plan",
+                    "/state/host-operations.db",
+                    "/worktrees/repo",
+                ][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &[
+                    "broker",
+                    "gc",
+                    "storage",
+                    "identity",
+                    "apply",
+                    "/state/host-operations.db",
+                    "/worktrees/repo",
+                    "--confirm",
+                    "old:new",
+                ][..],
                 CommandCapability::RecoveryWrite,
             ),
             (

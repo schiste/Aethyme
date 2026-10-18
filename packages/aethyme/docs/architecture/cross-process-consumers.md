@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-17
+Last Updated: 2026-10-18
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -37,6 +37,27 @@ consumer. This file exists so that doesn't happen again.
    playground; it asserts a subset of the contracts below.
 
 ## Inventory
+
+### Reviewed worktree identity recovery (#847)
+
+The operator-facing commands are
+`aethyme broker gc storage identity plan <host-operation-db> <exact-root> [--json]`
+and `aethyme broker gc storage identity apply <host-operation-db> <exact-root>
+--confirm <old-sha256:new-sha256:owner-marker-sha256> [--json]`.
+The CLI exposes these commands, and operator recovery instructions consume
+this contract. Renaming the commands or changing the confirmation tuple
+requires updating both.
+
+Planning reports the exact saved and proposed records without replacing the
+saved record. Apply requires all three reviewed hashes, revalidates the exact
+root, origin, repository binding and owner marker under the registry lock,
+and refuses changed or unknown evidence. Recovery requires matching directory
+inodes and current nonzero volume UUIDs; it does not establish the historical
+volume UUIDs of a legacy record. Unresolved history remains retained. An older
+strict record decoder may refuse the recovered record, so operators must keep
+host state and use a compatible runtime. See
+[the storage lifecycle recovery contract](local-v3-storage-lifecycle.md)
+before applying a plan.
 
 ### Detached automatic artifact continuation (#818)
 
@@ -151,13 +172,13 @@ is unsupported, the broker preserves the legacy direct runner and prints a
 degraded-mode warning. Descendant cleanup is not verified on that path, so it
 is not suitable as evidence of process quiescence or managed-storage admission.
 `GuardedExecOutcomeUnknown` means the helper verified cleanup but could not
-recover the command result; ownership audit was skipped. If the command result
-is known but the heartbeat or another broker callback fails, verified cleanup
-returns that original typed error and also skips the ownership audit.
-`GuardedExecCleanupUnknown` means cleanup could not be verified and ownership
-audit was skipped. Unknown states require inspecting the worktree before
-retrying. Downstream exhaustive matches on public `BrokerOpError` must handle
-the new unknown-state variants.
+recover the command result; ownership audit was skipped. After dispatch, a
+heartbeat or other broker callback failure returns `GuardedExecOutcomeUnknown`
+once cleanup is verified, because the callback error does not make the command
+result known; ownership audit is skipped. `GuardedExecCleanupUnknown` means
+cleanup could not be verified and ownership audit was skipped. Unknown states
+require inspecting the worktree before retrying. Downstream exhaustive matches
+on public `BrokerOpError` must handle the new unknown-state variants.
 
 ### Primary-checkout fast-forward (#232)
 

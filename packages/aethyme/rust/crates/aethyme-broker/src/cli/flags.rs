@@ -487,6 +487,8 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("storage plan", &["--detail", "--confirm"]),
     ("storage apply", &["--confirm"]),
     ("storage attribute", &["--apply"]),
+    ("storage identity plan", &[]),
+    ("storage identity apply", &["--confirm"]),
 ];
 
 /// Extra guidance for a refusal whose plausible cause the generic list does not

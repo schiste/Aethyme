@@ -51,6 +51,21 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Give background-writer tests an independent, fixture-owned stop condition
   and a finite write limit. Deliberately breaking production cleanup must not
   leave the test itself writing indefinitely after an assertion fails.
+- Before mutating source or spawning children, freeze and verify the complete
+  helper closure against its pins and preflight required process-control
+  capabilities in the actual interpreter at every spawn entrypoint. For owned
+  groups, retain the leader unreaped through bounded TERM/KILL cleanup, probe
+  non-zombie members, reap once, then probe final group absence; never signal
+  the group after reaping. Refuse when ownership or capabilities are unknown.
+  Test early leader exits with open and closed pipes, setup and monitoring
+  exceptions, and finite deadlines for every synthetic process. Original group
+  absence proves only that group's absence; it says nothing about escaped or
+  detached descendants.
+- Before adding strict validation or recovery for persisted data, inspect every
+  production writer and test its exact serialized bytes. Accept only known
+  producer encodings, and bind the exact observed bytes across plan/apply when
+  an operator confirmation spans invocations; test re-encoding drift and
+  rollback after the write-side recheck.
 - For storage ownership and reclamation changes, test replacement of a root and
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
@@ -129,11 +144,19 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   target. Expand to verbose or workspace-wide runs only when explicitly needed
   or after a focused failure.
 - Run the fastest relevant test command first.
-  Check the selected test names and a nonzero executed count before treating a
-  focused run as evidence. Rust module aliases can differ from filenames; a
-  successful build with zero matching tests does not validate the change.
-  Automated focused-test runners should refuse a successful zero-test result;
-  preserve the process exit separately from that validation refusal.
+  Check the complete selected test names and a nonzero executed count before
+  treating a focused run as evidence. Rust filters match substrings, including
+  nested or suffixed module names; prefer `--exact` or explicit `--skip`
+  exclusions. Require the expected names and counts, and fail on zero runs,
+  missing or unexpected names, or ignored tests outside an explicit allowlist.
+  Some harnesses split test-name headers from result lines, including
+  interleaved output. Count ordinary and split forms, and use finite parser
+  controls that reject ambiguous pairings, missing/unexpected/duplicate names,
+  unapproved ignored tests, and summary mismatches.
+  Rust module aliases can differ from filenames; a successful build with zero
+  matching tests does not validate the change. Automated focused-test runners
+  should refuse a successful zero-test result; preserve the process exit
+  separately from that validation refusal.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
