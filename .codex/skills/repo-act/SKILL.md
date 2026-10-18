@@ -144,11 +144,15 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   target. Expand to verbose or workspace-wide runs only when explicitly needed
   or after a focused failure.
 - Run the fastest relevant test command first.
-  Check the selected test names and a nonzero executed count before treating a
-  focused run as evidence. Rust module aliases can differ from filenames; a
-  successful build with zero matching tests does not validate the change.
-  Automated focused-test runners should refuse a successful zero-test result;
-  preserve the process exit separately from that validation refusal.
+  Check the complete selected test names and a nonzero executed count before
+  treating a focused run as evidence. Rust filters match substrings, including
+  nested or suffixed module names; prefer `--exact` or explicit `--skip`
+  exclusions. Require the expected names and counts, and fail on zero runs,
+  missing or unexpected names, or ignored tests outside an explicit allowlist.
+  Rust module aliases can differ from filenames; a successful build with zero
+  matching tests does not validate the change. Automated focused-test runners
+  should refuse a successful zero-test result; preserve the process exit
+  separately from that validation refusal.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
