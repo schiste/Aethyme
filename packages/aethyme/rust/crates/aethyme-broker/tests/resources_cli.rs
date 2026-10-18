@@ -3,7 +3,11 @@ use std::io::BufRead as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::{Command, Output};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -14,6 +18,63 @@ fn run(cwd: &Path, state: &Path, args: &[&str]) -> Output {
         .env("AETHYME_HOST_STATE_DIR", state)
         .output()
         .unwrap()
+}
+
+#[cfg(unix)]
+struct ProcessGroupSurvivor {
+    started: PathBuf,
+    release: PathBuf,
+    finished: PathBuf,
+}
+
+#[cfg(unix)]
+impl ProcessGroupSurvivor {
+    fn new(directory: &Path, name: &str) -> Self {
+        Self {
+            started: directory.join(format!("{name}-started")),
+            release: directory.join(format!("{name}-release")),
+            finished: directory.join(format!("{name}-finished")),
+        }
+    }
+
+    fn shell_fragment(&self) -> String {
+        let started = self.started.file_name().unwrap().to_str().unwrap();
+        let release = self.release.file_name().unwrap().to_str().unwrap();
+        let finished = self.finished.file_name().unwrap().to_str().unwrap();
+        // The iteration cap gives a best-effort fallback; scheduler delays can
+        // stretch its nominal 60 seconds.
+        format!(
+            ": > '{started}'; ( i=0; while [ ! -e '{release}' ] && [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i + 1)); done; : > '{finished}' ) </dev/null >/dev/null 2>&1 &"
+        )
+    }
+
+    fn wait_for(&self, marker: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        marker.exists()
+    }
+
+    fn wait_started(&self) -> bool {
+        self.wait_for(&self.started)
+    }
+
+    fn stop_and_wait(&self) -> bool {
+        if std::fs::write(&self.release, b"release").is_err() {
+            return false;
+        }
+        self.wait_for(&self.finished)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupSurvivor {
+    fn drop(&mut self) {
+        if std::fs::write(&self.release, b"release").is_ok() && self.started.exists() {
+            let _ = self.wait_for(&self.finished);
+        }
+    }
 }
 
 #[test]
@@ -355,11 +416,13 @@ fn supervised_run_preserves_child_status_and_quarantines_failed_cleanup() {
 
 #[cfg(unix)]
 #[test]
-fn supervised_run_quarantines_when_group_outlives_leader_and_skips_cleanup() {
+fn supervised_capacity_hold_blocks_after_dead_holder_and_group_survivor() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let request_path = temp.path().join("run.json");
     let cleanup_marker = temp.path().join("cleanup-marker");
+    let survivor = ProcessGroupSurvivor::new(temp.path(), "survivor");
+    let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
     std::fs::write(
         &request_path,
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -369,16 +432,24 @@ fn supervised_run_quarantines_when_group_outlives_leader_and_skips_cleanup() {
             "worktree_fingerprint": "opaque",
             "run_id": "surviving-group",
             "ttl_seconds": 15,
+            "holder_pid": holder.id(),
             "resources": [{
                 "key": "runner",
                 "kind": "exclusive_key",
                 "name": "surviving-group-runner"
+            }, {
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "supervised-pool",
+                "units": 1,
+                "limit": 1
             }]
         }))
         .unwrap(),
     )
     .unwrap();
 
+    let child_command = format!("{} exit 23", survivor.shell_fragment());
     let output = run(
         temp.path(),
         &state,
@@ -393,10 +464,14 @@ fn supervised_run_quarantines_when_group_outlives_leader_and_skips_cleanup() {
             "--",
             "sh",
             "-c",
-            "sleep 3 </dev/null >/dev/null 2>&1 & exit 23",
+            child_command.as_str(),
         ],
     );
     assert_eq!(output.status.code(), Some(23));
+    assert!(
+        survivor.wait_started(),
+        "process-group survivor did not start"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("\"child_exit_code\":23"), "{stderr}");
     assert!(
@@ -408,6 +483,16 @@ fn supervised_run_quarantines_when_group_outlives_leader_and_skips_cleanup() {
         "{stderr}"
     );
     assert!(!cleanup_marker.exists());
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let reaped = run(temp.path(), &state, &["gc", "reap", "--json"]);
+    assert!(
+        reaped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reaped.stderr)
+    );
+    let reaped: serde_json::Value = serde_json::from_slice(&reaped.stdout).unwrap();
+    assert_eq!(reaped["reclaimed_capacity_units"], 0);
 
     let inventory = run(
         temp.path(),
@@ -450,15 +535,59 @@ fn supervised_run_quarantines_when_group_outlives_leader_and_skips_cleanup() {
         ],
     );
     assert_eq!(blocked.status.code(), Some(75));
+
+    let capacity_contender_path = temp.path().join("capacity-contender.json");
+    std::fs::write(
+        &capacity_contender_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "surviving-group-capacity-contender",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "capacity-contender",
+            "run_id": "capacity-contender",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "supervised-pool",
+                "units": 1,
+                "limit": 1
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let capacity_blocked = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "acquire",
+            capacity_contender_path.to_str().unwrap(),
+            "--wait",
+            "1ms",
+            "--json",
+        ],
+    );
+    assert_eq!(capacity_blocked.status.code(), Some(75));
+    let failure: serde_json::Value = serde_json::from_slice(&capacity_blocked.stdout).unwrap();
+    assert_eq!(failure["conflicts"][0]["resource_key"], "workers");
+    assert!(
+        survivor.stop_and_wait(),
+        "process-group survivor did not acknowledge release"
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn supervised_run_quarantines_when_cleanup_group_outlives_leader() {
+fn supervised_cleanup_capacity_hold_blocks_after_dead_holder() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let request_path = temp.path().join("run.json");
     let cleanup_started = temp.path().join("cleanup-started");
+    let cleanup_survivor = ProcessGroupSurvivor::new(temp.path(), "cleanup-survivor");
+    let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
     std::fs::write(
         &request_path,
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -468,16 +597,24 @@ fn supervised_run_quarantines_when_cleanup_group_outlives_leader() {
             "worktree_fingerprint": "opaque",
             "run_id": "surviving-cleanup-group",
             "ttl_seconds": 15,
+            "holder_pid": holder.id(),
             "resources": [{
                 "key": "runner",
                 "kind": "exclusive_key",
                 "name": "surviving-cleanup-runner"
+            }, {
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "cleanup-pool",
+                "units": 1,
+                "limit": 1
             }]
         }))
         .unwrap(),
     )
     .unwrap();
 
+    let cleanup_command = format!(": > cleanup-started; {}", cleanup_survivor.shell_fragment());
     let output = run(
         temp.path(),
         &state,
@@ -487,7 +624,7 @@ fn supervised_run_quarantines_when_cleanup_group_outlives_leader() {
             "run",
             request_path.to_str().unwrap(),
             "--cleanup-command",
-            ": > cleanup-started; sleep 3 </dev/null >/dev/null 2>&1 & exit 0",
+            cleanup_command.as_str(),
             "--json",
             "--",
             "sh",
@@ -496,6 +633,10 @@ fn supervised_run_quarantines_when_cleanup_group_outlives_leader() {
         ],
     );
     assert_eq!(output.status.code(), Some(31));
+    assert!(
+        cleanup_survivor.wait_started(),
+        "cleanup process-group survivor did not start"
+    );
     assert!(cleanup_started.exists());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("\"child_exit_code\":31"), "{stderr}");
@@ -505,6 +646,16 @@ fn supervised_run_quarantines_when_cleanup_group_outlives_leader() {
         "{stderr}"
     );
     assert!(stderr.contains("cleanup process group"), "{stderr}");
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    let reaped = run(temp.path(), &state, &["gc", "reap", "--json"]);
+    assert!(
+        reaped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reaped.stderr)
+    );
+    let reaped: serde_json::Value = serde_json::from_slice(&reaped.stdout).unwrap();
+    assert_eq!(reaped["reclaimed_capacity_units"], 0);
 
     let inventory = run(
         temp.path(),
@@ -547,15 +698,58 @@ fn supervised_run_quarantines_when_cleanup_group_outlives_leader() {
         ],
     );
     assert_eq!(blocked.status.code(), Some(75));
+
+    let capacity_contender_path = temp.path().join("capacity-contender.json");
+    std::fs::write(
+        &capacity_contender_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "cleanup-capacity-contender",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "cleanup-capacity-contender",
+            "run_id": "cleanup-capacity-contender",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "cleanup-pool",
+                "units": 1,
+                "limit": 1
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let capacity_blocked = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "acquire",
+            capacity_contender_path.to_str().unwrap(),
+            "--wait",
+            "1ms",
+            "--json",
+        ],
+    );
+    assert_eq!(capacity_blocked.status.code(), Some(75));
+    let failure: serde_json::Value = serde_json::from_slice(&capacity_blocked.stdout).unwrap();
+    assert_eq!(failure["conflicts"][0]["resource_key"], "workers");
+    assert!(
+        cleanup_survivor.stop_and_wait(),
+        "cleanup process-group survivor did not acknowledge release"
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn supervised_run_releases_after_direct_exit_and_clean_groups() {
+fn supervised_capacity_hold_is_cleared_after_both_groups_are_absent() {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
     let request_path = temp.path().join("run.json");
-    let cleanup_marker = temp.path().join("cleanup-marker");
+    let cleanup_marker = temp.path().join("clean-group-cleanup-marker");
+    let mut holder = Command::new("sleep").arg("30").spawn().unwrap();
     std::fs::write(
         &request_path,
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -565,10 +759,13 @@ fn supervised_run_releases_after_direct_exit_and_clean_groups() {
             "worktree_fingerprint": "opaque",
             "run_id": "clean-group",
             "ttl_seconds": 15,
+            "holder_pid": holder.id(),
             "resources": [{
-                "key": "runner",
-                "kind": "exclusive_key",
-                "name": "clean-group-runner"
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "clean-pool",
+                "units": 1,
+                "limit": 1
             }]
         }))
         .unwrap(),
@@ -584,7 +781,7 @@ fn supervised_run_releases_after_direct_exit_and_clean_groups() {
             "run",
             request_path.to_str().unwrap(),
             "--cleanup-command",
-            ": > cleanup-marker",
+            ": > clean-group-cleanup-marker; exit 0",
             "--json",
             "--",
             "sh",
@@ -600,6 +797,46 @@ fn supervised_run_releases_after_direct_exit_and_clean_groups() {
         "{stderr}"
     );
     assert!(cleanup_marker.exists());
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    let contender_path = temp.path().join("after-cleanup.json");
+    std::fs::write(
+        &contender_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "request_id": "after-clean-groups",
+            "repository": "owner/repo",
+            "worktree_fingerprint": "after-clean-groups",
+            "run_id": "after-clean-groups",
+            "ttl_seconds": 15,
+            "resources": [{
+                "key": "workers",
+                "kind": "capacity",
+                "pool": "clean-pool",
+                "units": 1,
+                "limit": 1
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let acquired = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "acquire",
+            contender_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        acquired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
 }
 
 #[cfg(unix)]

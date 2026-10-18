@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
 pub const HOST_RESOURCE_REQUEST_SCHEMA_VERSION: u32 = 1;
+const HOST_RESOURCE_STORE_SCHEMA_VERSION: u32 = 2;
 const MIN_TTL_SECONDS: u64 = 15;
 const MAX_TTL_SECONDS: u64 = 86_400;
 
@@ -55,6 +56,89 @@ CREATE TABLE IF NOT EXISTS resource_reap_observations (
  generation INTEGER NOT NULL,
  reaped_at INTEGER NOT NULL
 );
+"#;
+
+const SUPERVISED_HOLD_MIGRATION: &str = r#"
+CREATE TABLE resource_supervised_capacity_holds (
+ lease_id TEXT NOT NULL REFERENCES resource_leases(lease_id),
+ generation INTEGER NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY (lease_id, generation)
+);
+
+CREATE TRIGGER resource_supervised_hold_capacity_insert
+BEFORE INSERT ON resource_allocations
+WHEN NEW.kind='capacity'
+ AND EXISTS (
+     SELECT 1
+     FROM resource_supervised_capacity_holds h
+     JOIN resource_leases hl ON hl.lease_id=h.lease_id AND hl.generation=h.generation
+     JOIN resource_allocations held ON held.lease_id=h.lease_id
+          AND held.kind='capacity' AND held.value=NEW.value
+     WHERE hl.state IN ('active','quarantined')
+ )
+ AND COALESCE((
+     SELECT SUM(COALESCE(a.units,0))
+     FROM resource_allocations a
+     JOIN resource_leases l ON l.lease_id=a.lease_id
+     WHERE a.kind='capacity' AND a.value=NEW.value
+       AND l.state IN ('active','quarantined')
+ ),0) + COALESCE(NEW.units,0) > MIN(
+     COALESCE(NEW.capacity_limit,0),
+     COALESCE((
+         SELECT MIN(a.capacity_limit)
+         FROM resource_allocations a
+         JOIN resource_leases l ON l.lease_id=a.lease_id
+         WHERE a.kind='capacity' AND a.value=NEW.value
+           AND l.state IN ('active','quarantined')
+     ),COALESCE(NEW.capacity_limit,0))
+ )
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold exceeds pool limit');
+END;
+
+CREATE TRIGGER resource_supervised_hold_capacity_delete
+BEFORE DELETE ON resource_allocations
+WHEN EXISTS (
+ SELECT 1 FROM resource_supervised_capacity_holds h
+ JOIN resource_leases l ON l.lease_id=h.lease_id AND l.generation=h.generation
+ WHERE h.lease_id=OLD.lease_id
+)
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
+
+CREATE TRIGGER resource_supervised_hold_capacity_update
+BEFORE UPDATE ON resource_allocations
+WHEN EXISTS (
+ SELECT 1 FROM resource_supervised_capacity_holds h
+ JOIN resource_leases l ON l.lease_id=h.lease_id AND l.generation=h.generation
+ WHERE h.lease_id IN (OLD.lease_id,NEW.lease_id)
+)
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
+
+CREATE TRIGGER resource_supervised_hold_lease_release
+BEFORE UPDATE OF state ON resource_leases
+WHEN NEW.state='released' AND OLD.state!='released'
+ AND EXISTS (
+     SELECT 1 FROM resource_supervised_capacity_holds h
+     WHERE h.lease_id=OLD.lease_id AND h.generation=OLD.generation
+ )
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
+
+CREATE TRIGGER resource_supervised_hold_lease_delete
+BEFORE DELETE ON resource_leases
+WHEN EXISTS (
+ SELECT 1 FROM resource_supervised_capacity_holds h
+ WHERE h.lease_id=OLD.lease_id AND h.generation=OLD.generation
+)
+BEGIN
+ SELECT RAISE(ABORT, 'supervised capacity hold requires verified release or reconciliation');
+END;
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -390,7 +474,7 @@ impl HostResourceCoordinator {
                 }
             })?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         crate::host_state::protect_host_state_path(path, false).map_err(|source| {
             HostResourceError::Io {
                 path: path.into(),
@@ -402,6 +486,7 @@ impl HostResourceCoordinator {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_writable_schema(&mut conn)?;
         validate_schema(&conn)?;
         Ok(Self {
             conn,
@@ -500,8 +585,20 @@ impl HostResourceCoordinator {
         &mut self,
         request: &HostResourceRequest,
     ) -> Result<HostResourceGrant, HostResourceError> {
+        self.acquire_inner(request, false)
+    }
+
+    fn acquire_inner(
+        &mut self,
+        request: &HostResourceRequest,
+        supervised: bool,
+    ) -> Result<HostResourceGrant, HostResourceError> {
         validate_request(request)?;
-        let digest = request_digest(request)?;
+        let digest = if supervised {
+            supervised_request_digest(request)?
+        } else {
+            request_digest(request)?
+        };
         let now = now_ms();
         let tx = self
             .conn
@@ -513,6 +610,12 @@ impl HostResourceCoordinator {
             |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)),
         ).optional()? {
             if existing_digest != digest { return Err(HostResourceError::IdempotencyMismatch(request.request_id.clone())); }
+            if supervised {
+                return Err(HostResourceError::RequestNotActive {
+                    request_id: request.request_id.clone(),
+                    state: "already used by a supervised run".into(),
+                });
+            }
             if state != "active" { return Err(HostResourceError::RequestNotActive { request_id: request.request_id.clone(), state }); }
             let lease = load_lease(&tx, "request_id", &request.request_id)?.ok_or_else(|| HostResourceError::LeaseNotFound(request.request_id.clone()))?;
             tx.commit()?;
@@ -545,6 +648,12 @@ impl HostResourceCoordinator {
             "INSERT INTO resource_leases (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id,generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9,?10,?11,?10)",
             params![lease_id,request.request_id,digest,request.repository,request.worktree_fingerprint,request.run_id,generation,ownership_token,request.holder_pid.map(i64::from),now,expires_at])?;
+        if supervised {
+            tx.execute(
+                "INSERT INTO resource_supervised_capacity_holds(lease_id,generation,created_at) VALUES (?1,?2,?3)",
+                params![lease_id, generation, now],
+            )?;
+        }
         for allocation in &allocations {
             tx.execute(
                 "INSERT INTO resource_allocations VALUES (?1,?2,?3,?4,?5,?6)",
@@ -607,6 +716,19 @@ impl HostResourceCoordinator {
         &mut self,
         request: &HostResourceRequest,
         wait: std::time::Duration,
+        on_conflict: F,
+    ) -> Result<HostResourceGrant, HostResourceError>
+    where
+        F: FnMut(&str),
+    {
+        self.acquire_with_wait_inner(request, wait, false, on_conflict)
+    }
+
+    fn acquire_with_wait_inner<F>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        supervised: bool,
         mut on_conflict: F,
     ) -> Result<HostResourceGrant, HostResourceError>
     where
@@ -614,7 +736,7 @@ impl HostResourceCoordinator {
     {
         let deadline = std::time::Instant::now() + wait;
         loop {
-            match self.acquire(request) {
+            match self.acquire_inner(request, supervised) {
                 Ok(grant) => return Ok(grant),
                 Err(HostResourceError::Conflict {
                     code: _,
@@ -678,7 +800,45 @@ impl HostResourceCoordinator {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         quarantine_reclaimable(&tx, now)?;
         verify_ownership(&tx, lease_id, generation, token, false)?;
+        if has_supervised_capacity_hold(&tx, lease_id, generation)? {
+            return Err(HostResourceError::InvalidRequest(
+                "supervised resource hold requires verified terminal release or reconciliation"
+                    .into(),
+            ));
+        }
         tx.execute("UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 WHERE lease_id=?1 AND state!='released'", params![lease_id,now])?;
+        let lease = load_lease(&tx, "lease_id", lease_id)?
+            .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
+        tx.commit()?;
+        Ok(lease)
+    }
+
+    fn release_supervised_verified(
+        &mut self,
+        lease_id: &str,
+        generation: u64,
+        token: &str,
+    ) -> Result<HostResourceLease, HostResourceError> {
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        quarantine_reclaimable(&tx, now)?;
+        verify_ownership(&tx, lease_id, generation, token, false)?;
+        if !has_supervised_capacity_hold(&tx, lease_id, generation)? {
+            return Err(HostResourceError::InvalidRequest(
+                "supervised terminal release requires its generation-bound hold".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM resource_supervised_capacity_holds WHERE lease_id=?1 AND generation=?2",
+            params![lease_id, generation as i64],
+        )?;
+        tx.execute(
+            "UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 \
+             WHERE lease_id=?1 AND state!='released'",
+            params![lease_id, now],
+        )?;
         let lease = load_lease(&tx, "lease_id", lease_id)?
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
         tx.commit()?;
@@ -782,7 +942,7 @@ impl HostResourceCoordinator {
         }
         let acquire_started = std::time::Instant::now();
         let mut last_wait_notice = None;
-        let mut grant = self.acquire_with_wait(request, wait, |message| {
+        let mut grant = self.acquire_with_wait_inner(request, wait, true, |message| {
             let emit = last_wait_notice.is_none_or(|last: std::time::Instant| {
                 last.elapsed() >= std::time::Duration::from_secs(10)
             });
@@ -902,7 +1062,7 @@ impl HostResourceCoordinator {
 
         let authority_lost = grant.lease.state != HostLeaseState::Active;
         let final_lease = if lifecycle_safe && !authority_lost {
-            self.release(
+            self.release_supervised_verified(
                 &grant.lease.lease_id,
                 grant.lease.generation,
                 &grant.ownership_token,
@@ -965,6 +1125,10 @@ impl HostResourceCoordinator {
                 state,
             });
         }
+        tx.execute(
+            "DELETE FROM resource_supervised_capacity_holds WHERE lease_id=?1 AND generation=?2",
+            params![lease_id, confirmed as i64],
+        )?;
         tx.execute("UPDATE resource_leases SET state='released',released_at=?2,updated_at=?2 WHERE lease_id=?1", params![lease_id,now])?;
         let lease = load_lease(&tx, "lease_id", lease_id)?
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
@@ -988,12 +1152,13 @@ impl HostResourceCoordinator {
             .collect::<Result<Vec<_>, _>>()?;
         let mut leases = Vec::new();
         for id in ids {
-            if let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? {
-                if lease.state == HostLeaseState::Active && lease.expires_at <= now_ms() {
-                    lease.state = HostLeaseState::Quarantined;
-                }
-                leases.push(lease);
+            let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? else {
+                continue;
+            };
+            if lease.state == HostLeaseState::Active && lease.expires_at <= now_ms() {
+                lease.state = HostLeaseState::Quarantined;
             }
+            leases.push(lease);
         }
         Ok(leases)
     }
@@ -1436,18 +1601,86 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-fn validate_schema(conn: &Connection) -> Result<(), HostResourceError> {
+fn migrate_writable_schema(conn: &mut Connection) -> Result<(), HostResourceError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version = store_schema_version(&tx)?;
+    match version {
+        1 => {
+            tx.execute_batch(SUPERVISED_HOLD_MIGRATION)?;
+            tx.execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                [i64::from(HOST_RESOURCE_STORE_SCHEMA_VERSION)],
+            )?;
+        }
+        version if version == HOST_RESOURCE_STORE_SCHEMA_VERSION => {}
+        version => {
+            return Err(HostResourceError::InvalidRequest(format!(
+                "unsupported host schema {version}"
+            )));
+        }
+    }
+    validate_schema(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn store_schema_version(conn: &Connection) -> Result<u32, HostResourceError> {
     let version: i64 = conn.query_row(
         "SELECT value FROM meta WHERE key='schema_version'",
         [],
         |row| row.get(0),
     )?;
-    if version != i64::from(HOST_RESOURCE_SCHEMA_VERSION) {
-        return Err(HostResourceError::InvalidRequest(format!(
-            "unsupported host schema {version}"
-        )));
+    u32::try_from(version).map_err(|_| {
+        HostResourceError::InvalidRequest(format!("unsupported host schema {version}"))
+    })
+}
+
+fn has_supervised_capacity_hold(
+    conn: &Connection,
+    lease_id: &str,
+    generation: u64,
+) -> Result<bool, HostResourceError> {
+    if store_schema_version(conn)? < HOST_RESOURCE_STORE_SCHEMA_VERSION {
+        return Ok(false);
     }
-    Ok(())
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM resource_supervised_capacity_holds \
+         WHERE lease_id=?1 AND generation=?2)",
+        params![lease_id, generation as i64],
+        |row| row.get(0),
+    )?)
+}
+
+fn validate_schema(conn: &Connection) -> Result<u32, HostResourceError> {
+    let version = store_schema_version(conn)?;
+    match version {
+        1 => Ok(version),
+        HOST_RESOURCE_STORE_SCHEMA_VERSION => {
+            for object in [
+                "resource_supervised_capacity_holds",
+                "resource_supervised_hold_capacity_insert",
+                "resource_supervised_hold_capacity_delete",
+                "resource_supervised_hold_capacity_update",
+                "resource_supervised_hold_lease_release",
+                "resource_supervised_hold_lease_delete",
+            ] {
+                let exists: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                    [object],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(HostResourceError::InvalidRequest(format!(
+                        "host schema {version} is missing {object}"
+                    )));
+                }
+            }
+            Ok(version)
+        }
+        _ => Err(HostResourceError::InvalidRequest(format!(
+            "unsupported host schema {version}"
+        ))),
+    }
 }
 
 pub fn default_host_resource_db_path() -> Result<PathBuf, HostResourceError> {
@@ -1574,6 +1807,14 @@ fn request_digest(request: &HostResourceRequest) -> Result<String, HostResourceE
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn supervised_request_digest(request: &HostResourceRequest) -> Result<String, HostResourceError> {
+    let generic_digest = request_digest(request)?;
+    let mut digest = Sha256::new();
+    digest.update(b"aethyme-host-resource-supervised/v1\0");
+    digest.update(generic_digest.as_bytes());
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 struct Occupied {
     lease_id: String,
     generation: u64,
@@ -1585,6 +1826,9 @@ struct Occupied {
     /// A named resource stays reserved after its holder dies, so the waiter needs
     /// to be told that waiting cannot resolve it.
     holder_gone: bool,
+    /// A supervised run keeps capacity reserved until observed group absence or
+    /// generation-bound reconciliation, even after its coordinator PID dies.
+    supervised_hold: bool,
 }
 
 /// Quarantined leases keep occupying their resources, because reusing a name
@@ -1602,7 +1846,22 @@ struct Occupied {
 /// still running keeps its units, because it is still consuming the CPU and memory
 /// the pool exists to bound.
 fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> {
-    let mut stmt=conn.prepare("SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key")?;
+    let schema_version = store_schema_version(conn)?;
+    let mut stmt = if schema_version >= HOST_RESOURCE_STORE_SCHEMA_VERSION {
+        conn.prepare(
+            "SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid,\
+             EXISTS(SELECT 1 FROM resource_supervised_capacity_holds h \
+                    WHERE h.lease_id=l.lease_id AND h.generation=l.generation) \
+             FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id \
+             WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid,0 \
+             FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id \
+             WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key",
+        )?
+    };
     let rows = stmt
         .query_map([], |row| {
             let holder_pid = row.get::<_, Option<i64>>(6)?;
@@ -1615,13 +1874,16 @@ fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> 
                 limit: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
                 holder_pid,
                 holder_gone: holder_pid.is_some_and(holder_process_is_gone),
+                supervised_hold: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
         .filter(|occupied| {
-            occupied.kind != "capacity" || !occupied.holder_pid.is_some_and(holder_process_is_gone)
+            occupied.kind != "capacity"
+                || occupied.supervised_hold
+                || !occupied.holder_pid.is_some_and(holder_process_is_gone)
         })
         .collect())
 }
@@ -2024,6 +2286,11 @@ fn reclaim_dead_capacity(
                  SELECT 1 FROM resource_reap_observations r \
                  WHERE r.lease_id=resource_leases.lease_id\
              ) \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM resource_supervised_capacity_holds h \
+                 WHERE h.lease_id=resource_leases.lease_id \
+                   AND h.generation=resource_leases.generation\
+             ) \
              ORDER BY generation",
         )?;
         stmt.query_map([], |row| {
@@ -2328,6 +2595,291 @@ mod tests {
             Err(HostResourceError::Conflict { .. })
         ));
     }
+    #[test]
+    fn supervised_capacity_hold_survives_dead_supervisor_before_terminal_proof() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let dead_holder = reaped_pid();
+        let request = capacity_request("supervised", "workers", 1, 1, Some(dead_holder));
+        let grant = coordinator.acquire_inner(&request, true).unwrap();
+
+        let report = coordinator.reap_dead_holders().unwrap();
+        assert_eq!(report.reclaimed_capacity_units, 0);
+        assert!(report.leases.is_empty());
+        let lease = coordinator.list(false).unwrap().remove(0);
+        assert_eq!(lease.holder_pid, Some(dead_holder));
+        assert_eq!(lease.state, HostLeaseState::Quarantined);
+        assert!(matches!(
+            coordinator.acquire(&capacity_request(
+                "contender",
+                "workers",
+                1,
+                1,
+                Some(std::process::id())
+            )),
+            Err(HostResourceError::Conflict { .. })
+        ));
+        assert!(matches!(
+            coordinator.release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token
+            ),
+            Err(HostResourceError::InvalidRequest(_))
+        ));
+
+        let reconciled = coordinator
+            .reconcile(&grant.lease.lease_id, grant.lease.generation)
+            .unwrap();
+        assert_eq!(reconciled.state, HostLeaseState::Released);
+        assert!(
+            coordinator
+                .plan(&capacity_request(
+                    "after-reconcile",
+                    "workers",
+                    1,
+                    1,
+                    Some(std::process::id())
+                ))
+                .unwrap()
+                .available
+        );
+    }
+
+    #[test]
+    fn supervised_request_id_cannot_be_replayed_or_cross_modes() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let supervised = capacity_request(
+            "supervised-request",
+            "supervised-pool",
+            1,
+            2,
+            Some(std::process::id()),
+        );
+        coordinator.acquire_inner(&supervised, true).unwrap();
+        assert!(matches!(
+            coordinator.acquire_inner(&supervised, true),
+            Err(HostResourceError::RequestNotActive { .. })
+        ));
+        assert!(matches!(
+            coordinator.acquire(&supervised),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+
+        let generic = capacity_request(
+            "generic-request",
+            "generic-pool",
+            1,
+            2,
+            Some(std::process::id()),
+        );
+        coordinator.acquire(&generic).unwrap();
+        assert!(matches!(
+            coordinator.acquire_inner(&generic, true),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_v1_capacity_reclamation_survives_v2_migration_and_readonly() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("legacy.db");
+        let dead_holder = reaped_pid();
+        let mut legacy = Connection::open(&path).unwrap();
+        legacy.execute_batch(SCHEMA).unwrap();
+        insert_legacy_v1_capacity(
+            &mut legacy,
+            "legacy-dead",
+            "legacy-pool",
+            1,
+            4,
+            Some(dead_holder),
+        )
+        .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO resource_allocations \
+                 (lease_id,resource_key,kind,value,units,capacity_limit) \
+                 VALUES ('legacy-legacy-dead','database','exclusive_key','legacy-db',NULL,NULL)",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let readonly = HostResourceCoordinator::open_read_only(&path).unwrap();
+        assert!(
+            readonly
+                .plan(&capacity_request(
+                    "readonly-v1-plan",
+                    "legacy-pool",
+                    1,
+                    4,
+                    Some(std::process::id())
+                ))
+                .unwrap()
+                .available
+        );
+        drop(readonly);
+
+        let mut coordinator = HostResourceCoordinator::open(&path).unwrap();
+        assert_eq!(store_schema_version(&coordinator.conn).unwrap(), 2);
+        let before = coordinator.list(false).unwrap().remove(0);
+        assert_eq!(before.holder_pid, Some(dead_holder));
+        assert_eq!(before.request_id, "legacy-dead");
+        assert_eq!(before.generation, 1);
+        let report = coordinator.reap_dead_holders().unwrap();
+        assert_eq!(report.reclaimed_capacity_units, 1);
+        assert_eq!(report.retained_quarantined_leases, 1);
+        let after = coordinator.list(false).unwrap().remove(0);
+        assert_eq!(after.holder_pid, Some(dead_holder));
+        assert_eq!(after.state, HostLeaseState::Quarantined);
+        assert_eq!(after.allocations.len(), 1);
+        assert_eq!(after.allocations[0].kind, "exclusive_key");
+        drop(coordinator);
+
+        let mut newer = Connection::open(&path).unwrap();
+        newer
+            .execute("UPDATE meta SET value=3 WHERE key='schema_version'", [])
+            .unwrap();
+        drop(newer);
+        assert!(matches!(
+            HostResourceCoordinator::open_read_only(&path),
+            Err(HostResourceError::InvalidRequest(message)) if message.contains("unsupported host schema 3")
+        ));
+    }
+
+    #[test]
+    fn old_open_v1_connection_cannot_release_or_reap_supervised_capacity() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("old-open.db");
+        let mut old_connection = Connection::open(&path).unwrap();
+        old_connection.execute_batch(SCHEMA).unwrap();
+        old_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        old_connection
+            .pragma_update(None, "journal_mode", "wal")
+            .unwrap();
+
+        let mut coordinator = HostResourceCoordinator::open(&path).unwrap();
+        let dead_holder = reaped_pid();
+        let request = capacity_request("held", "guarded-pool", 1, 2, Some(dead_holder));
+        let grant = coordinator.acquire_inner(&request, true).unwrap();
+        let (stored_pid, stored_units): (i64, i64) = old_connection
+            .query_row(
+                "SELECT l.holder_pid,a.units FROM resource_leases l \
+                 JOIN resource_allocations a ON a.lease_id=l.lease_id \
+                 WHERE l.lease_id=?1 AND a.kind='capacity'",
+                [&grant.lease.lease_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_pid as u32, dead_holder);
+        assert_eq!(stored_units, 1);
+        assert!(holder_process_is_gone(stored_pid));
+        // The already-open v1 planner would omit this dead-holder capacity.
+        assert_eq!(
+            if holder_process_is_gone(stored_pid) {
+                0
+            } else {
+                stored_units
+            },
+            0
+        );
+
+        {
+            let tx = old_connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "INSERT INTO resource_reap_observations(lease_id,generation,reaped_at) \
+                 VALUES (?1,?2,?3) ON CONFLICT(lease_id) DO NOTHING",
+                params![
+                    grant.lease.lease_id,
+                    grant.lease.generation as i64,
+                    now_ms()
+                ],
+            )
+            .unwrap();
+            assert!(
+                tx.execute(
+                    "DELETE FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+            );
+            tx.rollback().unwrap();
+        }
+        assert!(
+            old_connection
+                .execute(
+                    "DELETE FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+        assert!(
+            old_connection
+                .execute(
+                    "UPDATE resource_leases SET state='released' WHERE lease_id=?1",
+                    [&grant.lease.lease_id],
+                )
+                .is_err()
+        );
+
+        let legacy_second = capacity_request(
+            "legacy-second",
+            "guarded-pool",
+            1,
+            2,
+            Some(std::process::id()),
+        );
+        insert_legacy_v1_capacity(
+            &mut old_connection,
+            &legacy_second.request_id,
+            "guarded-pool",
+            1,
+            2,
+            legacy_second.holder_pid,
+        )
+        .unwrap();
+        assert!(
+            insert_legacy_v1_capacity(
+                &mut old_connection,
+                "legacy-third",
+                "guarded-pool",
+                1,
+                2,
+                Some(std::process::id()),
+            )
+            .is_err()
+        );
+
+        let report = coordinator.reap_dead_holders().unwrap();
+        assert_eq!(report.reclaimed_capacity_units, 0);
+        assert!(matches!(
+            coordinator.acquire(&capacity_request(
+                "new-contender",
+                "guarded-pool",
+                1,
+                2,
+                Some(std::process::id())
+            )),
+            Err(HostResourceError::Conflict { .. })
+        ));
+        assert_eq!(
+            old_connection
+                .query_row(
+                    "SELECT COUNT(*) FROM resource_allocations WHERE lease_id=?1 AND kind='capacity'",
+                    [&grant.lease.lease_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn authority_loss_kills_a_leader_that_ignores_term_within_the_grace() {
@@ -2460,6 +3012,60 @@ mod tests {
                 },
             }],
         )
+    }
+
+    fn capacity_request(
+        id: &str,
+        pool: &str,
+        units: u32,
+        limit: u32,
+        holder_pid: Option<u32>,
+    ) -> HostResourceRequest {
+        let mut request = req(
+            id,
+            vec![HostResourceRequirement {
+                key: "workers".into(),
+                resource: HostResourceKind::Capacity {
+                    pool: pool.into(),
+                    units,
+                    limit,
+                },
+            }],
+        );
+        request.holder_pid = holder_pid;
+        request
+    }
+
+    fn insert_legacy_v1_capacity(
+        conn: &mut Connection,
+        request_id: &str,
+        pool: &str,
+        units: u32,
+        limit: u32,
+        holder_pid: Option<u32>,
+    ) -> Result<(), rusqlite::Error> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation: i64 = tx.query_row(
+            "UPDATE meta SET value=value+1 WHERE key='generation' RETURNING value",
+            [],
+            |row| row.get(0),
+        )?;
+        let lease_id = format!("legacy-{request_id}");
+        tx.execute(
+            "INSERT INTO resource_leases \
+             (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id, \
+              generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at) \
+             VALUES (?1,?2,'legacy-digest','owner/repo','legacy-fingerprint',?2,?3, \
+                     'legacy-token','active',?4,1,9223372036854775807,1)",
+            params![lease_id, request_id, generation, holder_pid.map(i64::from)],
+        )?;
+        tx.execute(
+            "INSERT INTO resource_allocations \
+             (lease_id,resource_key,kind,value,units,capacity_limit) \
+             VALUES (?1,'workers','capacity',?2,?3,?4)",
+            params![lease_id, pool, i64::from(units), i64::from(limit)],
+        )?;
+        tx.commit()
     }
 
     fn slot_and_worktree(id: &str, holder_pid: u32) -> HostResourceRequest {

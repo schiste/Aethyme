@@ -283,9 +283,12 @@ Usage:
       --grant-out atomically creates a mode-0600 private grant and keeps the
       ownership token out of command output.
   aethyme broker resources run <request.json> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...
-      Acquire, expose only public allocations, supervise the process group,
-      renew while it runs, execute optional exact cleanup, then release. Lost
-      authority or unproven cleanup quarantines the bundle.
+      Store v2 holds capacity before spawn; fresh opens by older binaries fail.
+      Supervised request IDs are one-shot. SQLite fences already-open old
+      writers from releasing/reaping held allocations or exceeding the pool
+      limit. Any cleanup must succeed, and the child and optional cleanup
+      groups must be observed absent; otherwise reconcile the exact
+      generation after reviewing cleanup.
   aethyme broker resources renew <grant.json> --ttl <seconds> [--json]
   aethyme broker resources release <grant.json> [--json]
       Renew or release with the exact grant returned by acquire. Tokens are
@@ -293,8 +296,8 @@ Usage:
   aethyme broker resources list [--all] [--json]
       Read-only inventory. Ownership tokens are never included.
   aethyme broker resources reap [--json]
-      Reclaim capacity from quarantined leases whose holder process is gone;
-      named allocations remain quarantined for cleanup review.
+      Reclaim ordinary capacity from quarantined leases whose holder is gone;
+      supervised capacity holds remain until clean release or reconciliation.
   aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]
       Release an expired, quarantined allocation after reviewing host cleanup.
       The generation confirmation fences stale cleanup commands.
