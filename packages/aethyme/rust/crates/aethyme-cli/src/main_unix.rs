@@ -446,16 +446,16 @@ fn main() -> ExitCode {
 
 /// Crate version plus the source identity and build time captured by build.rs.
 fn print_version() {
-    let describe = env!("AETHYME_GIT_DESCRIBE");
+    let revision = env!("AETHYME_GIT_REVISION");
     let commit = {
         let value = env!("AETHYME_GIT_COMMIT");
         if value.is_empty() { "unknown" } else { value }
     };
     let build_date = env!("AETHYME_BUILD_DATE");
-    let stable = if describe.is_empty() {
+    let stable = if revision.is_empty() {
         format!("build_commit={commit}")
     } else {
-        format!("{describe} build_commit={commit}")
+        format!("build_revision={revision} build_commit={commit}")
     };
     println!(
         "aethyme {} ({stable}) build_date={build_date}",
