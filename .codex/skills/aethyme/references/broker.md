@@ -204,7 +204,9 @@ blocked.
    `[promote] mode = "verify-only"`, so verified work does not pile up
    unpublished on the local integration branch.
    Report the outcome (verified / rejected / conflict) in your summary.
-   Afterwards, finish the session with
+   In PR delivery workflows, keep the session live until its PR has merged and
+   required follow-up is complete. Ending an agent turn does not close a broker
+   session. After verified publication or PR merge, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
    with `aethyme broker start --reuse --task "..." --short-name "<short name>"`.
    A successful `finish` may clean a safe session worktree and branch by
