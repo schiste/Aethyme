@@ -25,7 +25,7 @@ pub(crate) enum InlineExecError {
     CommandStart(io::Error),
     CommandOutcomeUnknown(String),
     CleanupUnknown(String),
-    Operation(crate::BrokerOpError),
+    OperationAfterDispatch(crate::BrokerOpError),
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -577,7 +577,7 @@ impl InlineExecSupervisor {
             if let Err(error) = heartbeat() {
                 let cleanup = self.abort_and_verify();
                 return match cleanup {
-                    Ok(()) => Err(InlineExecError::Operation(error)),
+                    Ok(()) => Err(InlineExecError::OperationAfterDispatch(error)),
                     Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
                 };
             }
@@ -2134,7 +2134,10 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(InlineExecError::Operation(_))));
+        assert!(matches!(
+            result,
+            Err(InlineExecError::OperationAfterDispatch(_))
+        ));
         let bytes_after_cleanup = std::fs::metadata(&output).unwrap().len();
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(

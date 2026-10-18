@@ -1636,7 +1636,14 @@ impl Broker {
                     }
                     .into()
                 }
-                crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
+                crate::inline_exec_supervisor::InlineExecError::OperationAfterDispatch(error) => {
+                    crate::PreparationError::SupervisorUnavailable {
+                        reason: format!(
+                            "unexpected post-dispatch supervisor state while starting helper: {error}"
+                        ),
+                    }
+                    .into()
+                }
                 crate::inline_exec_supervisor::InlineExecError::Setup(error) => {
                     crate::PreparationError::SupervisorUnavailable {
                         reason: error.to_string(),
@@ -1690,28 +1697,8 @@ impl Broker {
                     &execution_environment,
                     heartbeat,
                 )
-                .map_err(|error| match error {
-                    crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(reason) => {
-                        crate::PreparationError::CleanupUnknown { session_id, reason }.into()
-                    }
-                    crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(
-                        reason,
-                    ) => {
-                        crate::PreparationError::CommandOutcomeUnknown { session_id, reason }.into()
-                    }
-                    crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
-                    crate::inline_exec_supervisor::InlineExecError::Setup(error) => {
-                        crate::PreparationError::SupervisorUnavailable {
-                            reason: error.to_string(),
-                        }
-                        .into()
-                    }
-                    crate::inline_exec_supervisor::InlineExecError::CommandStart(source) => {
-                        BrokerOpError::Spawn {
-                            command: command.join(" "),
-                            source,
-                        }
-                    }
+                .map_err(|error| {
+                    map_preparation_exec_supervisor_error(session_id, command, error)
                 })?;
             Ok(GuardedCommandResult {
                 exit_code: result.exit_code,
@@ -1824,6 +1811,40 @@ impl Broker {
     }
 }
 
+fn map_preparation_exec_supervisor_error(
+    session_id: i64,
+    command: &[String],
+    error: crate::inline_exec_supervisor::InlineExecError,
+) -> BrokerOpError {
+    match error {
+        crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(reason) => {
+            crate::PreparationError::CleanupUnknown { session_id, reason }.into()
+        }
+        crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(reason) => {
+            crate::PreparationError::CommandOutcomeUnknown { session_id, reason }.into()
+        }
+        crate::inline_exec_supervisor::InlineExecError::OperationAfterDispatch(error) => {
+            crate::PreparationError::CommandOutcomeUnknown {
+                session_id,
+                reason: format!("supervisor operation failed after command dispatch: {error}"),
+            }
+            .into()
+        }
+        crate::inline_exec_supervisor::InlineExecError::Setup(error) => {
+            crate::PreparationError::SupervisorUnavailable {
+                reason: error.to_string(),
+            }
+            .into()
+        }
+        crate::inline_exec_supervisor::InlineExecError::CommandStart(source) => {
+            BrokerOpError::Spawn {
+                command: command.join(" "),
+                source,
+            }
+        }
+    }
+}
+
 fn map_guarded_exec_supervisor_error(
     session_id: i64,
     command: &[String],
@@ -1836,7 +1857,12 @@ fn map_guarded_exec_supervisor_error(
         crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(reason) => {
             BrokerOpError::GuardedExecOutcomeUnknown { session_id, reason }
         }
-        crate::inline_exec_supervisor::InlineExecError::Operation(error) => error,
+        crate::inline_exec_supervisor::InlineExecError::OperationAfterDispatch(error) => {
+            BrokerOpError::GuardedExecOutcomeUnknown {
+                session_id,
+                reason: format!("supervisor operation failed after command dispatch: {error}"),
+            }
+        }
         crate::inline_exec_supervisor::InlineExecError::Setup(source) => BrokerOpError::Spawn {
             command: command.join(" "),
             source,
@@ -2347,7 +2373,7 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
-    fn generic_supervisor_unknown_states_map_to_typed_errors() {
+    fn supervisor_outcomes_map_to_typed_errors() {
         let command = vec!["command".to_owned()];
         let outcome = map_guarded_exec_supervisor_error(
             42,
@@ -2360,14 +2386,18 @@ mod generic_guarded_exec_tests {
             outcome,
             BrokerOpError::GuardedExecOutcomeUnknown { session_id: 42, .. }
         ));
-        let operation = map_guarded_exec_supervisor_error(
+        let after_dispatch = map_guarded_exec_supervisor_error(
             42,
             &command,
-            crate::inline_exec_supervisor::InlineExecError::Operation(
+            crate::inline_exec_supervisor::InlineExecError::OperationAfterDispatch(
                 BrokerOpError::MissingExecCommand,
             ),
         );
-        assert!(matches!(operation, BrokerOpError::MissingExecCommand));
+        assert!(matches!(
+            after_dispatch,
+            BrokerOpError::GuardedExecOutcomeUnknown { session_id: 42, reason }
+                if reason.contains("after command dispatch")
+        ));
         let cleanup = map_guarded_exec_supervisor_error(
             42,
             &command,
@@ -2378,6 +2408,46 @@ mod generic_guarded_exec_tests {
         assert!(matches!(
             cleanup,
             BrokerOpError::GuardedExecCleanupUnknown { session_id: 42, .. }
+        ));
+
+        let preparation_unknown = map_preparation_exec_supervisor_error(
+            42,
+            &command,
+            crate::inline_exec_supervisor::InlineExecError::OperationAfterDispatch(
+                BrokerOpError::MissingExecCommand,
+            ),
+        );
+        assert!(matches!(
+            preparation_unknown,
+            BrokerOpError::Preparation(crate::PreparationError::CommandOutcomeUnknown {
+                session_id: 42,
+                reason
+            }) if reason.contains("after command dispatch")
+        ));
+
+        let setup = map_preparation_exec_supervisor_error(
+            42,
+            &command,
+            crate::inline_exec_supervisor::InlineExecError::Setup(std::io::Error::other(
+                "helper setup failed",
+            )),
+        );
+        assert!(matches!(
+            setup,
+            BrokerOpError::Preparation(crate::PreparationError::SupervisorUnavailable {
+                reason
+            }) if reason.contains("helper setup failed")
+        ));
+        let command_start = map_preparation_exec_supervisor_error(
+            42,
+            &command,
+            crate::inline_exec_supervisor::InlineExecError::CommandStart(std::io::Error::other(
+                "command start failed",
+            )),
+        );
+        assert!(matches!(
+            command_start,
+            BrokerOpError::Spawn { command: ref name, .. } if name == "command"
         ));
     }
 }
