@@ -1,6 +1,7 @@
 use super::*;
 use crate::collaboration_archive::CommitOid;
 use crate::local_target::tests::{Fixture, git};
+use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceEntry};
 
 fn digest(c: char) -> String {
     format!("sha256:{}", c.to_string().repeat(64))
@@ -58,6 +59,242 @@ fn capture(f: &mut Fixture, files: &[(&str, &[u8])]) -> SourceSnapshotId {
         .unwrap()
         .snapshot_id
 }
+
+fn manifest(paths: impl IntoIterator<Item = String>) -> SourceSnapshot {
+    SourceSnapshot::new(
+        paths
+            .into_iter()
+            .map(|path| SourceEntry::from_content(path, EntryKind::Regular, b"")),
+    )
+    .unwrap()
+}
+
+#[test]
+fn materialization_rejects_aggregate_file_count_across_roles() {
+    let source = manifest((0..4_097).map(|index| format!("source-{index:04}.txt")));
+    let harness = manifest((0..4_097).map(|index| format!("harness-{index:04}.txt")));
+
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source), ("harness", &harness)]),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file count exceeds 8192"
+        ))
+    ));
+}
+
+#[test]
+fn materialization_rejects_file_limit_plus_one() {
+    let source = manifest((0..8_193).map(|index| format!("file-{index:04}.txt")));
+
+    assert_eq!(source.entries().len(), 8_193);
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source)]),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file count exceeds 8192"
+        ))
+    ));
+}
+
+#[test]
+fn materialization_rejects_excessive_path_depth() {
+    let path = std::iter::repeat_n("d", 64)
+        .chain(["file.txt"])
+        .collect::<Vec<_>>()
+        .join("/");
+    assert_eq!(path.split('/').count(), 65);
+    let source = manifest([path]);
+
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source)]),
+        Err(SnapshotError::MaterializationLimit(
+            "path depth exceeds 64 components"
+        ))
+    ));
+}
+
+#[test]
+fn materialization_rejects_excessive_component_length() {
+    let path = format!("{}.txt", "x".repeat(252));
+    assert_eq!(path.len(), 256);
+    let source = manifest([path]);
+
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source)]),
+        Err(SnapshotError::MaterializationLimit(
+            "path component exceeds 255 bytes"
+        ))
+    ));
+}
+
+#[test]
+fn materialization_rejects_excessive_implicit_directory_nodes() {
+    let source = manifest((0..300).map(|file| {
+        std::iter::once(format!("root-{file:03}"))
+            .chain((0..62).map(|depth| format!("dir-{depth:02}-{file:03}")))
+            .chain([format!("file-{file:03}.txt")])
+            .collect::<Vec<_>>()
+            .join("/")
+    }));
+
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source)]),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file and directory node count exceeds 16384"
+        ))
+    ));
+}
+
+#[test]
+fn materialization_accepts_exact_aggregate_file_limit_across_roles() {
+    let source = manifest((0..4_096).map(|index| format!("source-{index:04}.txt")));
+    let harness = manifest((0..4_096).map(|index| format!("harness-{index:04}.txt")));
+
+    assert_eq!(source.entries().len() + harness.entries().len(), 8_192);
+    assert!(validate_materialization_bounds(&[("source", &source), ("harness", &harness)]).is_ok());
+    assert!(portable(&source).is_ok());
+    assert!(portable(&harness).is_ok());
+}
+
+#[test]
+fn materialization_accepts_exact_path_depth_and_component_limits() {
+    let depth_path = std::iter::repeat_n("d", 63)
+        .chain(["file.txt"])
+        .collect::<Vec<_>>()
+        .join("/");
+    let component_path = format!("{}.txt", "x".repeat(251));
+    assert_eq!(depth_path.split('/').count(), 64);
+    assert_eq!(component_path.len(), 255);
+    let depth = manifest([depth_path]);
+    let component = manifest([component_path]);
+
+    assert!(validate_materialization_bounds(&[("source", &depth)]).is_ok());
+    assert!(validate_materialization_bounds(&[("source", &component)]).is_ok());
+    assert!(portable(&depth).is_ok());
+    assert!(portable(&component).is_ok());
+}
+
+#[test]
+fn materialization_accepts_exact_aggregate_node_limit() {
+    // One role root + 8,191 unique directories + 8,192 files = 16,384 nodes.
+    let mut paths: Vec<_> = (0..8_191)
+        .map(|directory| format!("directory-{directory:04}/a.txt"))
+        .collect();
+    paths.push("directory-8190/b.txt".into());
+    let source = manifest(paths);
+
+    assert_eq!(source.entries().len(), 8_192);
+    assert!(validate_materialization_bounds(&[("source", &source)]).is_ok());
+    assert!(portable(&source).is_ok());
+}
+
+#[test]
+fn materialization_rejects_aggregate_node_limit_plus_one() {
+    // One role root + 8,192 unique directories + 8,192 files = 16,385 nodes.
+    let source = manifest((0..8_192).map(|directory| format!("directory-{directory:04}/a.txt")));
+
+    assert_eq!(source.entries().len(), 8_192);
+    assert!(matches!(
+        validate_materialization_bounds(&[("source", &source)]),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file and directory node count exceeds 16384"
+        ))
+    ));
+}
+
+#[test]
+fn portable_accepts_shared_directory_prefixes() {
+    let source = manifest(["shared/a.txt".into(), "shared/nested/b.txt".into()]);
+
+    assert!(portable(&source).is_ok());
+}
+
+#[test]
+fn portable_enforces_materialization_path_and_file_limits() {
+    let too_deep_path = std::iter::repeat_n("d", 64)
+        .chain(["file.txt"])
+        .collect::<Vec<_>>()
+        .join("/");
+    assert_eq!(too_deep_path.split('/').count(), 65);
+    let too_deep = manifest([too_deep_path]);
+    assert!(matches!(
+        portable(&too_deep),
+        Err(SnapshotError::MaterializationLimit(
+            "path depth exceeds 64 components"
+        ))
+    ));
+
+    let too_wide_path = format!("{}.txt", "x".repeat(252));
+    assert_eq!(too_wide_path.len(), 256);
+    let too_wide = manifest([too_wide_path]);
+    assert!(matches!(
+        portable(&too_wide),
+        Err(SnapshotError::MaterializationLimit(
+            "path component exceeds 255 bytes"
+        ))
+    ));
+
+    let too_many = manifest((0..8_193).map(|index| format!("file-{index:04}.txt")));
+    assert!(matches!(
+        portable(&too_many),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file count exceeds 8192"
+        ))
+    ));
+}
+
+#[test]
+fn portable_rejects_node_overflow_before_prefix_allocation() {
+    // The first raw-sorted path contains a backslash, so portable() returns
+    // immediately if it reaches path checks before the node preflight. This
+    // compact synthetic manifest avoids creating a large filesystem tree
+    // while checking the common boundary used by execution, generation, and
+    // artifact callers.
+    let paths = std::iter::once("!bad\\dir/file.txt".to_owned()).chain((0..256).map(|file| {
+        std::iter::once(format!("root-{file:03}"))
+            .chain((0..62).map(|depth| format!("dir-{depth:02}-{file:03}")))
+            .chain([format!("file-{file:03}.txt")])
+            .collect::<Vec<_>>()
+            .join("/")
+    }));
+    let source = manifest(paths);
+
+    assert!(matches!(
+        portable(&source),
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file and directory node count exceeds 16384"
+        ))
+    ));
+}
+
+#[test]
+fn materialization_plan_refusal_does_not_create_a_workspace() {
+    let source = manifest((0..4_097).map(|index| format!("source-{index:04}.txt")));
+    let harness = manifest((0..4_097).map(|index| format!("harness-{index:04}.txt")));
+    let temporary_root = tempfile::tempdir().unwrap();
+    let mut writer_ran = false;
+
+    let result = with_materialization_plan(
+        || {
+            validate_materialization_bounds(&[("source", &source), ("harness", &harness)])?;
+            Ok(MaterializationPlan { roles: Vec::new() })
+        },
+        |_| {
+            writer_ran = true;
+            std::fs::create_dir(temporary_root.path().join("workspace"))?;
+            Ok(())
+        },
+    );
+
+    assert!(matches!(
+        result,
+        Err(SnapshotError::MaterializationLimit(
+            "aggregate file count exceeds 8192"
+        ))
+    ));
+    assert!(!writer_ran);
+    assert_eq!(std::fs::read_dir(temporary_root.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn canonical_descriptor_roundtrip_and_each_input_identity_changes_execution() {
     let mut f = Fixture::new();
