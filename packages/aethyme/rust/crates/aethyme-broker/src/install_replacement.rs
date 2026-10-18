@@ -69,10 +69,11 @@ fn is_exact_revision(revision: &str) -> bool {
 }
 
 /// `Some((recorded, current))` when the installed build differs from the
-/// session's record. Compare full revisions when both sides carry them so a
-/// tracked dirty build differs from a clean build of the same commit. When
-/// either side has only legacy metadata, compare commits when both are known
-/// to keep historical `describe` labels compatible.
+/// session's record. Compare package version and exact full revisions when
+/// both sides carry them so a tracked dirty build differs from a clean build
+/// of the same commit. Otherwise compare commit OIDs when both are known; if
+/// either is missing, compare package version and legacy `describe` labels so
+/// adding commit metadata alone does not appear to replace the build.
 pub fn replacement(recorded: &RecordedInstall, current: &BinaryBuild) -> Option<(String, String)> {
     let recorded_revision = recorded
         .revision
@@ -92,10 +93,13 @@ pub fn replacement(recorded: &RecordedInstall, current: &BinaryBuild) -> Option<
         current_revision,
         current.commit.as_deref(),
     );
-    let changed = if both_have_commits && !both_have_exact_revisions {
+    let changed = if both_have_exact_revisions {
+        before != after
+    } else if both_have_commits {
         recorded.commit.as_deref() != current.commit.as_deref()
     } else {
-        before != after
+        (recorded.version.as_str(), recorded.describe.as_deref())
+            != (current.version.as_str(), current.describe.as_deref())
     };
     changed.then_some((before, after))
 }
@@ -219,6 +223,19 @@ mod tests {
         let new_build = build("0.8.22", Some(COMMIT), Some(COMMIT));
 
         assert_eq!(replacement(&old_build, &new_build), None);
+    }
+
+    #[test]
+    fn one_sided_commit_metadata_keeps_full_revision_builds_legacy_compatible() {
+        const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let legacy_describe = "v0.8.22-3-gaaaaaaaaaaaa";
+        let old_record = recorded("0.8.22", Some(legacy_describe), None);
+        let new_build = build("0.8.22", Some(legacy_describe), Some(COMMIT));
+        assert_eq!(replacement(&old_record, &new_build), None);
+
+        let new_record = recorded("0.8.22", Some(legacy_describe), Some(COMMIT));
+        let old_build = build("0.8.22", Some(legacy_describe), None);
+        assert_eq!(replacement(&new_record, &old_build), None);
     }
 
     #[test]
