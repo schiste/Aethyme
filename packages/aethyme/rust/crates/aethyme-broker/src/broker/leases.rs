@@ -2083,7 +2083,7 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
-    fn generic_heartbeat_abort_stops_a_descendant_and_preserves_liveness_error() {
+    fn generic_heartbeat_abort_marks_outcome_unknown_and_stops_descendant() {
         use std::time::Duration;
 
         let (_repository, _storage, mut broker) = fixture();
@@ -2113,10 +2113,15 @@ mod generic_guarded_exec_tests {
             )
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            BrokerOpError::Preparation(crate::PreparationError::LivenessDeadlineElapsed)
-        ));
+        assert!(
+            matches!(
+                &error,
+                BrokerOpError::GuardedExecOutcomeUnknown { session_id, reason }
+                    if *session_id == session.id
+                        && reason == "supervisor operation failed after command dispatch: preparation cache liveness deadline elapsed"
+            ),
+            "post-dispatch heartbeat failure lost its liveness cause: {error:?}"
+        );
         let bytes_after_abort = std::fs::metadata(&output).unwrap().len();
         assert!(bytes_after_abort > 0, "descendant never started writing");
         std::thread::sleep(Duration::from_millis(150));
