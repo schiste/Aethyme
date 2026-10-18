@@ -346,6 +346,14 @@ pub enum HostResourceRunError {
     },
     #[error("cannot supervise process signals: {0}")]
     Signals(std::io::Error),
+    #[error(
+        "cannot confirm supervised child exit after authority loss: {detail}; lease {lease_id:?} {lease_state}"
+    )]
+    TerminationUnconfirmed {
+        lease_id: String,
+        lease_state: String,
+        detail: String,
+    },
 }
 
 pub struct HostResourceCoordinator {
@@ -1061,6 +1069,117 @@ fn observe_owned_process_group(_process_group_id: u32) -> ProcessGroupObservatio
     ProcessGroupObservation::Unknown
 }
 
+const AUTHORITY_LOSS_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+const AUTHORITY_LOSS_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const CHILD_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn wait_for_child_exit(
+    process: &mut ResourceChild,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = process.child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep((deadline - now).min(CHILD_REAP_POLL_INTERVAL));
+    }
+}
+
+#[cfg(unix)]
+fn signal_unreaped_process_group(process: &ResourceChild, signal: libc::c_int) {
+    // This helper is called only after a bounded `try_wait` loop observed the
+    // leader unreaped. Its pid still names the original group and cannot have
+    // been reused; no delivered signal is sent after `try_wait` reports exit.
+    // SAFETY: the group was created by `process_group(0)` before spawn, and
+    // `killpg` takes both values without dereferencing crate-owned memory.
+    unsafe {
+        libc::killpg(process.child.id() as libc::pid_t, signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_unreaped_child(process: &mut ResourceChild) {
+    // This library can be compiled on platforms where this broker CLI is not
+    // supported. `Child::kill` is bounded and targets only the owned child.
+    let _ = process.child.kill();
+}
+
+fn terminate_after_authority_loss<F>(
+    process: &mut ResourceChild,
+    event: &mut F,
+) -> std::io::Result<Option<std::process::ExitStatus>>
+where
+    F: FnMut(&str),
+{
+    #[cfg(unix)]
+    {
+        event("sending SIGTERM to the still-owned supervised process group");
+        signal_unreaped_process_group(process, libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    {
+        event("force-killing the still-owned supervised child on this platform");
+        kill_unreaped_child(process);
+    }
+
+    if let Some(status) = wait_for_child_exit(process, AUTHORITY_LOSS_TERM_GRACE)? {
+        return Ok(Some(status));
+    }
+
+    #[cfg(unix)]
+    {
+        // `wait_for_child_exit` ended with `try_wait() == None`, so the leader
+        // remains unreaped. Only now escalate, and never signal this group once
+        // a status has been collected.
+        event("SIGTERM grace expired; sending SIGKILL to the unreaped process group");
+        signal_unreaped_process_group(process, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    {
+        event("direct-child kill grace expired; retrying kill while it remains unreaped");
+        kill_unreaped_child(process);
+    }
+
+    wait_for_child_exit(process, AUTHORITY_LOSS_KILL_GRACE)
+}
+
+fn quarantine_unconfirmed_termination<F>(
+    coordinator: &mut HostResourceCoordinator,
+    grant: &mut HostResourceGrant,
+    detail: String,
+    event: &mut F,
+) -> HostResourceRunError
+where
+    F: FnMut(&str),
+{
+    let lease_id = grant.lease.lease_id.clone();
+    grant.lease.state = HostLeaseState::Quarantined;
+    let lease_state = match coordinator.quarantine(
+        &grant.lease.lease_id,
+        grant.lease.generation,
+        &grant.ownership_token,
+    ) {
+        Ok(lease) => {
+            grant.lease = lease;
+            grant.lease.state.as_str().to_string()
+        }
+        Err(error) => format!("quarantine could not be confirmed: {error}"),
+    };
+    event(&format!(
+        "supervised child status unavailable after authority loss; lease {lease_id} {lease_state}"
+    ));
+    HostResourceRunError::TerminationUnconfirmed {
+        lease_id,
+        lease_state,
+        detail,
+    }
+}
+
 #[cfg(unix)]
 struct BlockedSignals {
     watched: libc::sigset_t,
@@ -1243,21 +1362,29 @@ where
                         "resource authority lost; terminating process group: {error}"
                     ));
                     grant.lease.state = HostLeaseState::Quarantined;
-                    #[cfg(unix)]
-                    // SAFETY: as above — the child leads the process group
-                    // created before spawn and is still live at this point.
-                    unsafe {
-                        libc::killpg(process.child.id() as i32, libc::SIGTERM);
-                    }
-                    #[cfg(not(unix))]
-                    let _ = process.child.kill();
-                    let status = process
-                        .child
-                        .wait()
-                        .map_err(|source| HostResourceRunError::Spawn {
-                            program: "supervised child".into(),
-                            source,
-                        })?;
+                    let status = match terminate_after_authority_loss(process, event) {
+                        Ok(Some(status)) => status,
+                        Ok(None) => {
+                            return Err(quarantine_unconfirmed_termination(
+                                coordinator,
+                                grant,
+                                format!(
+                                    "leader did not exit within the bounded {}ms TERM and {}ms KILL waits",
+                                    AUTHORITY_LOSS_TERM_GRACE.as_millis(),
+                                    AUTHORITY_LOSS_KILL_GRACE.as_millis()
+                                ),
+                                event,
+                            ));
+                        }
+                        Err(source) => {
+                            return Err(quarantine_unconfirmed_termination(
+                                coordinator,
+                                grant,
+                                format!("failed to observe child exit: {source}"),
+                                event,
+                            ));
+                        }
+                    };
                     return Ok(process_completion(process, status));
                 }
             }
@@ -2176,6 +2303,55 @@ mod tests {
             Err(HostResourceError::Conflict { .. })
         ));
     }
+    #[cfg(unix)]
+    #[test]
+    fn authority_loss_kills_a_leader_that_ignores_term_within_the_grace() {
+        let t = tempfile::tempdir().unwrap();
+        let database = t.path().join("h.db");
+        let mut coordinator = HostResourceCoordinator::open(&database).unwrap();
+        let request = req("authority-loss", vec![exclusive("authority-loss")]);
+        let mut grant = coordinator.acquire(&request).unwrap();
+        grant.lease = coordinator
+            .quarantine(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "trap '' TERM; exec sleep 3".to_string(),
+        ];
+        let environment = BTreeMap::new();
+        let mut child = spawn_resource_process(&command, t.path(), &grant, &environment).unwrap();
+        let started = std::time::Instant::now();
+        let mut events = Vec::new();
+        let status = terminate_after_authority_loss(&mut child, &mut |message| {
+            events.push(message.to_string())
+        })
+        .unwrap()
+        .expect("the owned leader must be reaped within the bounded TERM/KILL waits");
+        let completion = process_completion(&child, status);
+
+        assert!(
+            started.elapsed()
+                < AUTHORITY_LOSS_TERM_GRACE
+                    + AUTHORITY_LOSS_KILL_GRACE
+                    + std::time::Duration::from_secs(2),
+            "authority-loss termination exceeded its bounded waits"
+        );
+        assert_eq!(exit_signal(&completion.status), Some(libc::SIGKILL));
+        assert_eq!(completion.process_group, ProcessGroupObservation::Absent);
+        assert_eq!(grant.lease.state, HostLeaseState::Quarantined);
+        assert!(events.iter().any(|event| event.contains("SIGKILL")));
+        assert_eq!(
+            coordinator.list(false).unwrap()[0].state,
+            HostLeaseState::Quarantined
+        );
+    }
+
     /// Reaped, so the PID is provably absent rather than merely idle.
     fn reaped_pid() -> u32 {
         let mut child = std::process::Command::new("true").spawn().unwrap();
