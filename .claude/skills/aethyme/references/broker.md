@@ -95,6 +95,20 @@ blocked.
    aethyme broker push --session <your-session-id> --pr
    ```
 
+   The draft body is composed from the session task, commit sections, and the
+   default pull-request template on the fetched base branch. When a task has
+   an exact reviewed body, set it through the coordinated GitHub path:
+
+   ```bash
+   aethyme broker advanced gh --session <your-session-id> --repo <owner/name> \
+     --scope pull-request:<number> --effect write \
+     --reason "Apply the reviewed draft body" -- \
+     pr edit <number> --body-file <approved-body-file>
+   ```
+
+   Read the pull-request body back and compare it with the approved file before
+   handing the draft off for review.
+
    `--pr` opens a draft PR, or reports the one already open. The policy is
    the authorization for exactly these two things -- pushing your own session
    branch and opening a draft PR -- and nothing more: it does not authorize
