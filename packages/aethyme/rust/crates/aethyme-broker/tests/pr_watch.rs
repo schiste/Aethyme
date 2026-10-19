@@ -714,7 +714,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
         .poll_pull_request_watch(watch.id, &provider, 61_000)
         .unwrap();
 
-    let claimed = run(&claim);
+    let claimed = run(&broker, &claim);
     assert!(
         claimed.status.success(),
         "{}",
@@ -730,13 +730,16 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
     );
     assert_eq!(command_events(&mut broker), 1);
 
-    let failed = run(&[
-        "advanced",
-        "deliveries",
-        "claim",
-        "--adapter",
-        "test-adapter",
-    ]);
+    let failed = run(
+        &broker,
+        &[
+            "advanced",
+            "deliveries",
+            "claim",
+            "--adapter",
+            "test-adapter",
+        ],
+    );
     assert!(!failed.status.success());
     assert_eq!(metric_lines(), 2, "a failed poll is recorded");
     assert_eq!(command_events(&mut broker), 2);

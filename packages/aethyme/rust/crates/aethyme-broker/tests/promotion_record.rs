@@ -5,7 +5,7 @@ use std::process::Command;
 
 mod common;
 
-use aethyme_broker::{Broker, FinishOptions, MergeStatus};
+use aethyme_broker::{FinishOptions, MergeStatus};
 use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn git(repo: &Path, args: &[&str]) -> String {
