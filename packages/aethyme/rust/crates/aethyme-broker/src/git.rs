@@ -1584,12 +1584,18 @@ impl GitRepo {
     pub fn discover(path: &Path) -> Result<Self, GitError> {
         let root =
             run_git(path, &["rev-parse", "--show-toplevel"]).map_err(|error| match error {
-                GitError::Git { .. } => GitError::NotARepository {
-                    path: path.to_path_buf(),
-                },
-                // A deadline or an unavailable/untrusted Git executable says
-                // nothing about whether the checkout is a repository. Preserve
-                // that cause so cleanup can report its real blocker and retry.
+                GitError::Git { args, stderr }
+                    if args == "rev-parse --show-toplevel"
+                        && stderr.to_ascii_lowercase().contains("not a git repository") =>
+                {
+                    GitError::NotARepository {
+                        path: path.to_path_buf(),
+                    }
+                }
+                // A timeout, spawn failure, or unrelated Git error says nothing
+                // about whether the path belongs to a repository. Preserve the
+                // original invocation and failure instead of disguising it as an
+                // invalid checkout.
                 other => other,
             })?;
         Ok(Self {
