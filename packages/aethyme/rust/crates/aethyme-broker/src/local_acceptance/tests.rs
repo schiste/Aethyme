@@ -489,8 +489,16 @@ fn stopped_historical_observation_never_delivers_or_restarts_a_target() {
     );
 }
 
-#[test]
-fn private_current_qualification_requires_verifier_and_refuses_revocation() {
+fn accepted_wave_fixture() -> (
+    verifier::tests::Subject,
+    Broker,
+    GitCarrier,
+    RecordId,
+    Intent,
+    AcceptanceBinding,
+    AcceptanceReceipt,
+    TrustedEvidence,
+) {
     let mut v = verifier::tests::Subject::acceptance_fixture();
     // The existing verifier test fixture supplies test-only sealed capabilities.
     // No production API can manufacture those capabilities from imported bytes.
@@ -587,7 +595,29 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
     )
     .unwrap();
     assert_eq!(receipt.spec.decision, ProviderDecision::Accepted);
+
+    // The test artifact is synthetic. Retain its manifest and file objects the
+    // same way the native supervisor retains a real build output closure.
+    let mut output_objects = v
+        .artifact
+        .output
+        .files
+        .values()
+        .map(|bytes| archive::put_object(&v.f.store, bytes).unwrap())
+        .collect::<Vec<_>>();
+    output_objects.push(
+        archive::put_object(&v.f.store, &v.artifact.output.manifest.manifest_bytes()).unwrap(),
+    );
+    let revision_id = v.execution.target_revision().clone();
+    target::retain_artifacts(&mut v.f.store, &v.owner, &revision_id, &[], &output_objects).unwrap();
     let evidence = v.evidence();
+    (v, broker, carrier, w.id, intent, binding, receipt, evidence)
+}
+
+#[test]
+fn private_current_qualification_requires_verifier_and_refuses_revocation() {
+    let (mut v, mut broker, carrier, _wave, intent, binding, receipt, evidence) =
+        accepted_wave_fixture();
     let grant = qualify_receipt(
         &mut v.f.store,
         &v.owner,
@@ -601,9 +631,12 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
     .unwrap();
     assert_eq!(grant.receipt(), &receipt);
     assert_eq!(grant.expires_ms(), evidence.expires_ms());
+
     let current = current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant).unwrap();
     current.check_clock().unwrap();
     drop(current);
+    let newest_receipt = last_receipt(&v.f.store, binding.id()).unwrap().unwrap();
+    assert_ne!(newest_receipt.id, receipt.id);
     let wrong = v.f.b.result.commit.as_str();
     git(
         v.f._repo.path(),
@@ -663,6 +696,262 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
             verifier::VerificationError::Producer
         ))
     ));
+}
+
+fn age_archive_objects(store: &CollaborationStore) {
+    for prefix in std::fs::read_dir(archive::objects_dir(store)).unwrap() {
+        for object in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            std::fs::File::open(object.unwrap().path())
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn historical_completion_roots_survive_revision_release_and_gc() {
+    let (mut v, mut broker, carrier, wave_id, intent, binding, receipt, evidence) =
+        accepted_wave_fixture();
+    let grant = qualify_receipt(
+        &mut v.f.store,
+        &v.owner,
+        binding.id(),
+        &v.execution,
+        &v.artifact,
+        &v.permit,
+        &evidence,
+        receipt.clone(),
+    )
+    .unwrap();
+    let completion = crate::local_controller::complete(
+        &mut v.f.store,
+        &v.owner,
+        &mut broker,
+        &carrier,
+        &wave_id,
+        &grant,
+    )
+    .unwrap();
+    let completion_raw: String =
+        v.f.store
+            .read_connection()
+            .query_row(
+                "SELECT id FROM local_controller_completions WHERE wave=?1",
+                [wave_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    let completion_id = RecordId::parse(&completion_raw).unwrap();
+    let historical = HistoricalCompletionIdentity {
+        completion: completion_id.to_string(),
+        target: completion.target.clone(),
+        issuer: v.owner.issuer().into(),
+        revision: completion.revision.clone(),
+        epoch: completion.epoch.clone(),
+        wave: completion.wave.clone(),
+        source: completion.source.clone(),
+        candidate_commit: completion.candidate_commit.clone(),
+        candidate_tree: completion.candidate_tree.clone(),
+        qualification: completion.qualification.clone(),
+        receipt: completion.acceptance_receipt.clone(),
+        accepted_commit: completion.accepted_commit.clone(),
+        accepted_tree: completion.accepted_tree.clone(),
+    };
+    assert_eq!(historical.receipt, receipt.id.as_str());
+    assert_ne!(
+        last_receipt(&v.f.store, binding.id()).unwrap().unwrap().id,
+        receipt.id
+    );
+    let (generation_column, evidence_body): (i64, Vec<u8>) = v
+        .f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT generation,body FROM local_verification_evidence WHERE id=(SELECT evidence FROM local_acceptance_qualifications WHERE id=?1)",
+            [&historical.qualification],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
+    let body_generation = evidence_json["observation"]["generation"]
+        .as_str()
+        .expect("the evidence producer stores generation as a decimal string");
+    assert_eq!(
+        body_generation.parse::<i64>().unwrap(),
+        generation_column,
+        "the serialized producer generation agrees with the integer journal column"
+    );
+    verify_historical_completion(&v.f.store, &historical).unwrap();
+
+    let mut wrong_completion = historical.clone();
+    wrong_completion.completion = format!("sha256:{}", "f".repeat(64));
+    assert!(verify_historical_completion(&v.f.store, &wrong_completion).is_err());
+    let mut wrong_epoch = historical.clone();
+    wrong_epoch.epoch = format!("sha256:{}", "e".repeat(64));
+    assert!(verify_historical_completion(&v.f.store, &wrong_epoch).is_err());
+    let mut wrong_receipt = historical.clone();
+    wrong_receipt.receipt = format!("sha256:{}", "d".repeat(64));
+    assert!(verify_historical_completion(&v.f.store, &wrong_receipt).is_err());
+    let mut wrong_qualification = historical.clone();
+    wrong_qualification.qualification = format!("sha256:{}", "c".repeat(64));
+    assert!(verify_historical_completion(&v.f.store, &wrong_qualification).is_err());
+
+    let receipt_body: Vec<u8> =
+        v.f.store
+            .read_connection()
+            .query_row(
+                "SELECT body FROM local_acceptance_receipts WHERE id=?1",
+                [&historical.receipt],
+                |row| row.get(0),
+            )
+            .unwrap();
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_acceptance_receipts SET body=?1 WHERE id=?2",
+            rusqlite::params![b"{}".as_slice(), &historical.receipt],
+        )
+        .unwrap();
+    assert!(verify_historical_completion(&v.f.store, &historical).is_err());
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_acceptance_receipts SET body=?1 WHERE id=?2",
+            rusqlite::params![receipt_body, &historical.receipt],
+        )
+        .unwrap();
+    let qualification_body: Vec<u8> =
+        v.f.store
+            .read_connection()
+            .query_row(
+                "SELECT body FROM local_acceptance_qualifications WHERE id=?1",
+                [&historical.qualification],
+                |row| row.get(0),
+            )
+            .unwrap();
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_acceptance_qualifications SET body=?1 WHERE id=?2",
+            rusqlite::params![b"{}".as_slice(), &historical.qualification],
+        )
+        .unwrap();
+    assert!(verify_historical_completion(&v.f.store, &historical).is_err());
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_acceptance_qualifications SET body=?1 WHERE id=?2",
+            rusqlite::params![qualification_body, &historical.qualification],
+        )
+        .unwrap();
+
+    // Rebase a fresh contribution on the exact accepted source so the next
+    // immutable revision can legitimately use that source as its baseline.
+    let accepted_base =
+        crate::collaboration_archive::CommitOid::parse(&completion.accepted_commit).unwrap();
+    git(
+        v.f._repo.path(),
+        &["switch", "-qc", "post-completion", accepted_base.as_str()],
+    );
+    std::fs::write(v.f._repo.path().join("post-completion.txt"), "continued\n").unwrap();
+    git(v.f._repo.path(), &["add", "post-completion.txt"]);
+    git(
+        v.f._repo.path(),
+        &["commit", "-qm", "post completion contribution"],
+    );
+    let child = crate::collaboration_archive::CommitOid::parse(&git(
+        v.f._repo.path(),
+        &["rev-parse", "HEAD"],
+    ))
+    .unwrap();
+    let retained =
+        archive::retain_contribution(&mut v.f.store, v.f._repo.path(), &accepted_base, &child)
+            .unwrap();
+    let old_revision = RecordId::parse(&completion.revision).unwrap();
+    let mut next_spec = target::load_revision(&v.f.store, &old_revision)
+        .unwrap()
+        .spec;
+    next_spec.baseline = completion.source.clone();
+    next_spec.contributions = vec![target::RequestedContribution {
+        id: "next".into(),
+        lineage: retained.lineage_record_id.to_string(),
+        requires: Vec::new(),
+        atomic_group: None,
+        revision_of: None,
+        derived_from: Vec::new(),
+    }];
+    next_spec.selected = vec!["next".into()];
+    let next_revision = target::propose_revision(&mut v.f.store, &v.owner, next_spec).unwrap();
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_targets SET phase='idle',resume_phase=NULL WHERE target=?1",
+            [v.owner.target()],
+        )
+        .unwrap();
+    target::select_revision(&mut v.f.store, &v.owner, &next_revision.id).unwrap();
+    target::release_revision(&mut v.f.store, &v.owner, &old_revision).unwrap();
+
+    let orphan = archive::put_object(&v.f.store, b"historical completion GC sentinel").unwrap();
+    age_archive_objects(&v.f.store);
+    let options = crate::collaboration_gc::GcOptions::default();
+    let plan = crate::collaboration_gc::plan(&mut v.f.store, &options).unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    let report = crate::collaboration_gc::apply(&mut v.f.store, &plan.digest, &options).unwrap();
+    assert!(report.reclaimed_bytes > 0);
+    assert!(archive::read_object(&v.f.store, &orphan).is_err());
+    verify_historical_completion(&v.f.store, &historical).unwrap();
+
+    drop(grant);
+    let prior_epoch = v.owner.authority_epoch().clone();
+    let target_name = historical.target.clone();
+    let issuer = historical.issuer.clone();
+    let frozen =
+        crate::local_authority::freeze(&mut v.f.store, &prior_epoch, "historical proof fixture")
+            .unwrap();
+    let _resumed = crate::local_authority::resume(&mut v.f.store, &frozen.epoch).unwrap();
+    drop(v.owner);
+    let new_owner = target::acquire_controller(&mut v.f.store, &target_name, &issuer).unwrap();
+    assert_ne!(new_owner.authority_epoch(), &prior_epoch);
+    verify_historical_completion(&v.f.store, &historical).unwrap();
+
+    // The normal admission path selects the historical completion after the
+    // owner epoch changes, then composition binds the actual accepted commit
+    // separately from its retained source snapshot.
+    crate::local_wave::available(&mut v.f.store, &new_owner, "next", 0).unwrap();
+    let policy = crate::local_wave::WavePolicy {
+        batch_width: 1,
+        ..Default::default()
+    };
+    let crate::local_wave::Admission::Frozen(admitted) =
+        crate::local_wave::admit(&mut v.f.store, &new_owner, policy, 1_000).unwrap()
+    else {
+        panic!("historical baseline was not admitted after owner reacquisition")
+    };
+    assert_eq!(
+        admitted.spec.prior_completion.as_deref(),
+        Some(historical.completion.as_str())
+    );
+    assert_eq!(admitted.spec.baseline, historical.source);
+    let composed =
+        crate::local_wave::compose(&mut v.f.store, &new_owner, v.f._repo.path(), &admitted.id)
+            .unwrap();
+    assert_eq!(composed.phase, crate::local_wave::WavePhase::Verifying);
+    let (composed, source) = crate::local_wave::load_composition_source(
+        &mut v.f.store,
+        &new_owner,
+        v.f._repo.path(),
+        &admitted.id,
+    )
+    .unwrap();
+    let source = source.expect("the exact composition source remains attached");
+    assert_eq!(source.request.baseline.as_str(), historical.accepted_commit);
+    assert_ne!(source.request.baseline.as_str(), historical.source);
+    assert_eq!(composed.spec.baseline, historical.source);
 }
 
 #[test]

@@ -329,6 +329,63 @@ pub fn load(
 ) -> Result<ExecutionSnapshot, SnapshotError> {
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    let (execution, _) = read_snapshot(store, locator)?;
+    let rooted: bool = store.read_connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_target_roots WHERE revision=?1 AND kind='object' AND reference=?2)",
+        rusqlite::params![execution.target_revision().as_str(), locator.object.hex()], |row| row.get(0)
+    ).map_err(target::TargetError::from)?;
+    if !rooted {
+        return Err(SnapshotError::Invalid("snapshot is not retained".into()));
+    }
+    Ok(execution)
+}
+
+/// Load an execution descriptor through the exact durable completion that
+/// retained it. This is historical provenance only: it does not grant current
+/// target authority. The completion's immutable revision must match the
+/// descriptor, and every declared input snapshot must remain rooted by that
+/// same completion before its archive closure is read.
+pub(crate) fn load_from_completion(
+    store: &CollaborationStore,
+    locator: &SnapshotRef,
+    completion: &RecordId,
+) -> Result<ExecutionSnapshot, SnapshotError> {
+    let completion_spec = crate::local_controller::load(store, completion)
+        .map_err(|_| SnapshotError::Invalid("completion record is unavailable".into()))?;
+    let _archive = crate::collaboration_gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let completion_bytes: Vec<u8> = store
+        .read_connection()
+        .query_row(
+            "SELECT body FROM local_controller_completions WHERE id=?1",
+            [completion.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(target::TargetError::from)?;
+    let completion_object = ObjectDigest::of(&completion_bytes);
+    if archive::read_object(store, &completion_object)? != completion_bytes {
+        return Err(SnapshotError::Invalid(
+            "completion record is not canonically retained".into(),
+        ));
+    }
+    require_completion_root(store, completion, "object", completion_object.hex())?;
+    let (execution, inputs) = read_snapshot(store, locator)?;
+    if completion_spec.revision != execution.target_revision().as_str() {
+        return Err(SnapshotError::Stale);
+    }
+    require_completion_root(store, completion, "object", locator.object.hex())?;
+    let mut total = 0;
+    for input in inputs {
+        require_completion_root(store, completion, "snapshot", input.as_str())?;
+        inspect(store, &input, &mut total)?;
+    }
+    Ok(execution)
+}
+
+fn read_snapshot(
+    store: &CollaborationStore,
+    locator: &SnapshotRef,
+) -> Result<(ExecutionSnapshot, Vec<SourceSnapshotId>), SnapshotError> {
     let path = archive::object_path(store, &locator.object);
     if std::fs::metadata(path)?.len() > 1024 * 1024 {
         return Err(SnapshotError::Limit);
@@ -345,19 +402,38 @@ pub fn load(
             .ok_or(SnapshotError::Tampered)?,
     )?;
     let spec: ExecutionSpec = serde_json::from_value(json["spec"].clone())?;
-    validate(&spec)?;
-    let rooted: bool = store.read_connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_target_roots WHERE revision=?1 AND kind='object' AND reference=?2)",
-        rusqlite::params![revision.as_str(), locator.object.hex()], |row| row.get(0)
-    ).map_err(target::TargetError::from)?;
+    let inputs = validate(&spec)?;
+    Ok((
+        ExecutionSnapshot {
+            reference: locator.clone(),
+            target_revision: revision,
+            spec,
+        },
+        inputs,
+    ))
+}
+
+fn require_completion_root(
+    store: &CollaborationStore,
+    completion: &RecordId,
+    kind: &str,
+    reference: &str,
+) -> Result<(), SnapshotError> {
+    let rooted: bool = store
+        .read_connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_controller_completion_roots
+             WHERE completion=?1 AND kind=?2 AND reference=?3)",
+            rusqlite::params![completion.as_str(), kind, reference],
+            |row| row.get(0),
+        )
+        .map_err(target::TargetError::from)?;
     if !rooted {
-        return Err(SnapshotError::Invalid("snapshot is not retained".into()));
+        return Err(SnapshotError::Invalid(format!(
+            "execution {kind} is not retained by completion"
+        )));
     }
-    Ok(ExecutionSnapshot {
-        reference: locator.clone(),
-        target_revision: revision,
-        spec,
-    })
+    Ok(())
 }
 
 fn inspect(

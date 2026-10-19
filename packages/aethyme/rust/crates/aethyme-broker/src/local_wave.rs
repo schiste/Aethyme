@@ -25,6 +25,8 @@ use crate::composition::{
 use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::resolution::{self, FailedCheck, RequirementRef};
 
+pub(crate) mod prior_completion;
+
 #[cfg(test)]
 struct SynthesizedAttachGuardCallback(Box<dyn FnMut(&CollaborationStore)>);
 
@@ -501,9 +503,11 @@ pub(crate) fn read_synthesized_wave_result(
             "synthesized result requires an exact request/result pair".into(),
         ));
     };
-    if wave.phase != WavePhase::Verifying || wave.spec.prior_completion.is_some() {
+    if wave.phase != WavePhase::Verifying {
         return Err(WaveError::ResolutionUnsupported);
     }
+    let pinned = target::load_revision(store, &id(&wave.spec.revision)?)?;
+    let prior = prior_completion::load_retained(store, wave, &pinned)?;
     let synthesis =
         resolution::read_synthesized_attempt_result_for_refs(store, repo, request_ref, result_ref)?;
     if synthesis.status.request != *request_ref
@@ -517,6 +521,11 @@ pub(crate) fn read_synthesized_wave_result(
         || synthesis.candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
         || synthesis.candidate.baseline != synthesis.request.baseline().commit
         || synthesis.request.baseline().snapshot_id.as_str() != wave.spec.baseline
+        || prior.as_ref().is_some_and(|binding| {
+            binding
+                .validate_request_baseline(&synthesis.request, wave)
+                .is_err()
+        })
         || wave.candidate_snapshot.as_ref() != Some(&synthesis.candidate.subject)
         || wave.candidate_commit.as_ref() != Some(&synthesis.candidate.commit)
     {
@@ -525,7 +534,7 @@ pub(crate) fn read_synthesized_wave_result(
         ));
     }
 
-    let revision = target::load_revision(store, &id(&wave.spec.revision)?)?;
+    let revision = pinned;
     if revision.target != wave.spec.target || revision.issuer != wave.spec.issuer {
         return Err(WaveError::Stale);
     }
@@ -1553,35 +1562,20 @@ fn source_from_payload(
 
 fn expected_composition_request(
     store: &CollaborationStore,
-    owner: &ControllerOwner,
+    repo: &Path,
     wave: &Wave,
     pinned: &target::TargetRevision,
+    prior: Option<&prior_completion::Binding>,
 ) -> Result<CompositionRequest, WaveError> {
     let baseline =
         archive::retained(store, &snapshot(&wave.spec.baseline)?)?.ok_or(TargetError::Missing)?;
-    let (base_commit, accepted) = if let Some(key) = &wave.spec.prior_completion {
-        let (completion, previous) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
-        if completion.target != owner.target()
-            || completion.epoch != owner.authority_epoch().as_str()
-        {
-            return Err(WaveError::Stale);
-        }
-        let same_revision = completion.revision == wave.spec.revision;
-        let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
-            .ok_or(TargetError::Missing)?;
-        let accepted = if same_revision {
-            if previous
-                .selected
-                .iter()
-                .any(|member| !wave.spec.selected.contains(member))
-            {
-                return Err(WaveError::Stale);
-            }
-            vec![original.commit]
-        } else {
-            Vec::new()
-        };
-        (CommitOid::parse(&completion.accepted_commit)?, accepted)
+    let (base_commit, accepted) = if let Some(prior) = prior {
+        prior.validate_retained_completion(store)?;
+        prior.validate_git_binding(repo)?;
+        (
+            prior.request_baseline_commit().clone(),
+            prior.accepted_history(store, pinned)?,
+        )
     } else {
         (baseline.commit, Vec::new())
     };
@@ -1598,26 +1592,12 @@ fn expected_composition_request(
 }
 
 fn expected_source_provenance(
-    store: &CollaborationStore,
-    owner: &ControllerOwner,
-    wave: &Wave,
+    prior: Option<&prior_completion::Binding>,
 ) -> Result<(&'static str, Option<serde_json::Value>), WaveError> {
-    let Some(key) = &wave.spec.prior_completion else {
+    let Some(prior) = prior else {
         return Ok((composer::PROVISIONAL_TEXT_PROFILE, None));
     };
-    let (completion, previous) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
-    if completion.target != owner.target() || completion.epoch != owner.authority_epoch().as_str() {
-        return Err(WaveError::Stale);
-    }
-    let members = if completion.revision == wave.spec.revision {
-        previous.selected
-    } else {
-        Vec::new()
-    };
-    Ok((
-        ACCEPTED_BASELINE_TEXT_PROFILE,
-        Some(serde_json::json!({"completion": key, "members": members})),
-    ))
+    Ok((prior.producer_profile(), Some(prior.recipe_binding())))
 }
 
 fn prior_completion_recipe_matches(
@@ -1656,9 +1636,14 @@ fn validate_source_context(
     {
         return Err(WaveError::Stale);
     }
-    let expected = expected_composition_request(store, owner, wave, pinned)?;
+    let prior = prior_completion::load(store, owner, wave, pinned)?;
+    if let Some(prior) = &prior {
+        prior.validate_retained_completion(store)?;
+        prior.validate_git_binding(repo)?;
+    }
+    let expected = expected_composition_request(store, repo, wave, pinned, prior.as_ref())?;
     let (expected_producer_profile, expected_prior_completion) =
-        expected_source_provenance(store, owner, wave)?;
+        expected_source_provenance(prior.as_ref())?;
     if source.request.baseline != expected.baseline
         || source.request.accepted != expected.accepted
         || source.request.catalog != expected.catalog
@@ -2282,6 +2267,7 @@ pub(crate) fn accepted_completion(
 /// Find the newest canonical accepted completion for this target and exact
 /// epoch. The sequence and record ID ordering make repeated source snapshots
 /// resolve deterministically; the source comparison is still exact.
+#[cfg(test)]
 pub(crate) fn latest_completion_for(
     store: &CollaborationStore,
     target: &str,
@@ -2521,46 +2507,44 @@ pub(crate) fn admit_after_notices(
             }
         }
     }
-    let same_revision_completion = latest_completion_for(
-        store,
-        owner.target(),
-        owner.authority_epoch().as_str(),
-        Some(revision.as_str()),
-        None,
-    )?;
-    let prior_completion = match same_revision_completion {
-        Some(key) => Some(key),
-        None => latest_completion_for(
-            store,
-            owner.target(),
-            owner.authority_epoch().as_str(),
-            None,
-            Some(&pinned.spec.baseline),
-        )?,
-    };
+    let prior_completion = prior_completion::latest_for_admission(store, owner, &pinned)?;
     if let Some(key) = &prior_completion {
         let (completion, previous) = accepted_completion(store, key, i64::MAX)?;
         let same_revision = completion.revision == revision.as_str();
         if completion.target != owner.target()
-            || completion.epoch != owner.authority_epoch().as_str()
             || (!same_revision && completion.source != pinned.spec.baseline)
+            || previous.target != owner.target()
+            || previous.issuer != owner.issuer()
         {
             return Err(WaveError::Stale);
         }
-        let delivered: Vec<_> = dispositions
+        let delivered: BTreeSet<_> = dispositions
             .iter()
             .filter(|(_, d)| **d == target::Disposition::Delivered)
-            .map(|(c, _)| c.clone())
+            .map(|(c, _)| c.as_str())
             .collect();
         if same_revision {
-            if delivered.iter().any(|c| !previous.selected.contains(c))
-                || previous.selected.iter().any(|c| !delivered.contains(c))
+            let prior_members: BTreeSet<_> = previous.selected.iter().map(String::as_str).collect();
+            let catalog_members: BTreeSet<_> = pinned
+                .spec
+                .contributions
+                .iter()
+                .map(|contribution| contribution.id.as_str())
+                .collect();
+            if prior_members.len() != previous.selected.len()
+                || prior_members != delivered
+                || previous
+                    .selected
+                    .iter()
+                    .any(|member| !catalog_members.contains(member.as_str()))
             {
                 return Err(WaveError::Invalid(
                     "delivered members do not match prior accepted wave".into(),
                 ));
             }
-            selected.extend(delivered);
+            let current_members = std::mem::take(&mut selected);
+            selected = previous.selected;
+            selected.extend(current_members);
         } else if !delivered.is_empty() {
             return Err(WaveError::Invalid(
                 "new revision cannot inherit delivered contribution identities".into(),
@@ -3396,31 +3380,14 @@ pub(crate) fn compose_with_source(
             .transpose()?;
         let baseline = archive::retained(store, &snapshot(&wave.spec.baseline)?)?
             .ok_or(TargetError::Missing)?;
-        let (base_commit, accepted, already_delivered) = if let Some(key) =
-            &wave.spec.prior_completion
-        {
-            let (completion, prior) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
-            if completion.target != owner.target()
-                || completion.epoch != owner.authority_epoch().as_str()
-            {
-                return Err(WaveError::Stale);
-            }
-            let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
-                .ok_or(TargetError::Missing)?;
-            let members = if completion.revision == wave.spec.revision {
-                prior.selected
-            } else {
-                Vec::new()
-            };
-            let accepted = if completion.revision == wave.spec.revision {
-                vec![original.commit]
-            } else {
-                Vec::new()
-            };
+        let prior = prior_completion::load(store, owner, &wave, &pinned)?;
+        let (base_commit, accepted, already_delivered) = if let Some(prior) = prior {
+            prior.validate_retained_completion(store)?;
+            prior.validate_git_binding(repo)?;
             (
-                CommitOid::parse(&completion.accepted_commit)?,
-                accepted,
-                Some((id(key)?, members)),
+                prior.request_baseline_commit().clone(),
+                prior.accepted_history(store, &pinned)?,
+                Some((prior.key().clone(), prior.previous_members().to_vec())),
             )
         } else {
             (baseline.commit, vec![], None)
