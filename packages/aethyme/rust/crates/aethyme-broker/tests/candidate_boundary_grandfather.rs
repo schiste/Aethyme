@@ -81,11 +81,7 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     let outcome = broker.submit(first.id).unwrap();
     assert!(outcome.promoted, "{outcome:?}");
     assert!(!outcome.gate_outcomes.is_empty(), "the gate ran");
-    assert!(
-        files(&host_state)
-            .iter()
-            .all(|path| !path.to_string_lossy().contains("trust"))
-    );
+    assert!(files(&host_state.join("gate-trust")).is_empty());
 
     // SAFETY: as above.
     unsafe {
@@ -104,12 +100,7 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
         broker.store().events_after(0, i64::MAX).unwrap().len(),
         events
     );
-    let trust_files = |dir: &Path| {
-        files(dir)
-            .into_iter()
-            .filter(|path| path.to_string_lossy().contains("trust"))
-            .collect::<Vec<_>>()
-    };
+    let trust_files = |dir: &Path| files(&dir.join("gate-trust"));
     assert!(trust_files(&host_state).is_empty());
 
     // Submit grandfathers, then gates and promotes the same tree.

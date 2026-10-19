@@ -90,12 +90,8 @@ fn an_untrusted_policy_on_the_baseline_is_refused_as_submit_refuses_it() {
         events
     );
     // Assessing trust records none.
-    let mut recorded = Vec::new();
-    for entry in walk(&host_state) {
-        if entry.to_string_lossy().contains("trust") {
-            recorded.push(entry);
-        }
-    }
+    // Inspect the production record directory, independent of fixture ancestor names.
+    let recorded = walk(&host_state.join("gate-trust"));
     assert!(recorded.is_empty(), "{recorded:?}");
 
     match broker.submit(session.id) {
