@@ -34,6 +34,94 @@ fn append_gc_id_filter(
     sql.push(')');
 }
 
+fn gc_event_blocker_needs(kinds: impl IntoIterator<Item = String>) -> [bool; 4] {
+    let prefixes = ["advisory.", "exposure.", "operation.", "merge."];
+    let mut needed = [false; 4];
+    for kind in kinds {
+        for (index, prefix) in prefixes.iter().enumerate() {
+            needed[index] |= kind
+                .get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix));
+        }
+    }
+    needed
+}
+
+fn gc_event_blocker_needs_for_ids(
+    conn: &rusqlite::Connection,
+    event_ids: Option<&[i64]>,
+) -> Result<[bool; 4], BrokerError> {
+    let Some(event_ids) = event_ids else {
+        return Ok([true; 4]);
+    };
+    if event_ids.is_empty() {
+        return Ok([false; 4]);
+    }
+
+    let mut sql = String::from("SELECT kind FROM events WHERE 1 = 1");
+    let mut values = Vec::new();
+    let mut next_parameter = 1;
+    append_gc_id_filter(
+        &mut sql,
+        "id",
+        Some(event_ids),
+        &mut next_parameter,
+        &mut values,
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let kinds = statement
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(gc_event_blocker_needs(kinds))
+}
+
+#[cfg(test)]
+mod gc_event_blocker_needs_tests {
+    use super::gc_event_blocker_needs_for_ids;
+
+    #[test]
+    fn bounded_batches_probe_only_blockers_for_current_event_prefixes() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL);
+             INSERT INTO events (id, kind) VALUES
+                 (1, 'gate.pass'),
+                 (2, 'Advisory.fixture'),
+                 (3, 'exposure.fixture'),
+                 (4, 'operation.fixture'),
+                 (5, 'merge.fixture');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[1])).unwrap(),
+            [false; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[])).unwrap(),
+            [false; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[2, 5])).unwrap(),
+            [true, false, false, true]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[2, 3, 4, 5])).unwrap(),
+            [true; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[999])).unwrap(),
+            [false; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, None).unwrap(),
+            [true; 4]
+        );
+    }
+}
+
 impl BrokerStore {
     /// Atomically register a bounded artifact-sweep namespace. IDs remain in
     /// the registry once created so another context's durable cursor or
@@ -945,28 +1033,41 @@ impl BrokerStore {
         });
 
         let mut candidates = Vec::new();
-        let unresolved_advisories: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM advisories WHERE resolution_state != 'resolved'",
-            [],
-            |row| row.get(0),
-        )?;
-        let outstanding_exposures: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entry_path_exposures WHERE state = 'outstanding'",
-            [],
-            |row| row.get(0),
-        )?;
-        let unresolved_operations: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM coordinated_operations
-             WHERE status IN ('prepared', 'running', 'outcome_unknown')",
-            [],
-            |row| row.get(0),
-        )?;
-        let unresolved_queue: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM merge_queue
-             WHERE status IN ('submitted', 'simulating', 'conflict', 'verified')",
-            [],
-            |row| row.get(0),
-        )?;
+        let blocker_needs = gc_event_blocker_needs_for_ids(conn, event_ids.as_deref())?;
+        let unresolved_advisories = blocker_needs[0]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM advisories WHERE resolution_state != 'resolved'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        let outstanding_exposures = blocker_needs[1]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM entry_path_exposures WHERE state = 'outstanding'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        let unresolved_operations = blocker_needs[2]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM coordinated_operations
+                     WHERE status IN ('prepared', 'running', 'outcome_unknown')
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        let unresolved_queue = blocker_needs[3]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM merge_queue
+                     WHERE status IN ('submitted', 'simulating', 'conflict', 'verified')
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
 
         let mut event_sql = String::from(
             "SELECT e.id, e.ts,
@@ -984,10 +1085,10 @@ impl BrokerStore {
         );
         let mut event_parameters = vec![
             rusqlite::types::Value::Integer(event_cutoff),
-            rusqlite::types::Value::Integer(unresolved_advisories),
-            rusqlite::types::Value::Integer(outstanding_exposures),
-            rusqlite::types::Value::Integer(unresolved_operations),
-            rusqlite::types::Value::Integer(unresolved_queue),
+            rusqlite::types::Value::Integer(i64::from(u8::from(unresolved_advisories))),
+            rusqlite::types::Value::Integer(i64::from(u8::from(outstanding_exposures))),
+            rusqlite::types::Value::Integer(i64::from(u8::from(unresolved_operations))),
+            rusqlite::types::Value::Integer(i64::from(u8::from(unresolved_queue))),
         ];
         let mut next_parameter = 6;
         append_gc_id_filter(
