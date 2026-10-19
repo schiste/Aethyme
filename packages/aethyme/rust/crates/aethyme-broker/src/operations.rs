@@ -790,14 +790,14 @@ pub struct PostMergeCleanupReport {
     pub next_action: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ExactPushDestination {
     destination_ref: String,
     pre_push_sha: Option<String>,
     proposed_sha: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ExactPushPlan {
     remote: String,
     destinations: Vec<ExactPushDestination>,
@@ -948,6 +948,20 @@ impl fmt::Display for UnknownOutcomeRecovery {
 pub struct OperationReconcileReport {
     pub operation: CoordinatedOperation,
     pub reason: String,
+    /// How the outcome was chosen. Remote inspection only proposes an outcome;
+    /// it never clears the write barrier by itself.
+    pub source: &'static str,
+    /// `succeeded` or `failed` when an operator chose an outcome or the exact
+    /// remote refs support a proposal. Absent when remote evidence is mixed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Whether this call actually moved the operation out of
+    /// `outcome_unknown`.
+    pub reconciled: bool,
+    /// Exact refs and SHAs observed by the broker, when this was a remote
+    /// inspection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -986,6 +1000,14 @@ pub struct OperationReconciliation {
     pub automatic_retry_allowed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<serde_json::Value>,
+    /// Broker-collected exact-ref inspection proposal, separate from an
+    /// operator's final outcome assertion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_inspection: Option<serde_json::Value>,
+    /// Provenance of a recorded final outcome, absent while the operation is
+    /// still awaiting an operator decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1028,6 +1050,16 @@ impl OperationShowReport {
                     .or_else(|| details.get("create_reconciliation"))
             })
             .cloned();
+        let remote_inspection = details
+            .as_ref()
+            .and_then(|details| details.get("remote_inspection"))
+            .cloned();
+        let source = details
+            .as_ref()
+            .and_then(|details| details.get("reconciliation"))
+            .and_then(|reconciliation| reconciliation.get("source"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let operator_reason = details.as_ref().and_then(|details| {
             details
                 .get("reconciliation")
@@ -1044,6 +1076,8 @@ impl OperationShowReport {
                 write_blocked: state == OperationReconciliationState::Required,
                 automatic_retry_allowed: false,
                 evidence,
+                remote_inspection,
+                source,
                 operator_reason,
                 recovery,
             },

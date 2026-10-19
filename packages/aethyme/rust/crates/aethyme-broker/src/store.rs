@@ -1957,6 +1957,90 @@ mod operation_history_tests {
         operation.id
     }
 
+    #[test]
+    fn remote_inspection_refuses_stale_operation_and_preserves_operator_decision() {
+        let mut store = store();
+        let id = operation(
+            &mut store,
+            1,
+            OperationProvider::Git,
+            "github.com/owner/a",
+            OperationStatus::OutcomeUnknown,
+        );
+        let observed = store.coordinated_operation(id).unwrap().unwrap();
+        let decided = store
+            .transition_coordinated_operation(
+                id,
+                OperationStatus::ReconciledSucceeded,
+                Some(0),
+                Some("{\"operator\":true}"),
+            )
+            .unwrap();
+        assert!(
+            store
+                .record_unknown_operation_inspection(&observed, "{\"stale\":true}")
+                .unwrap()
+                .is_none()
+        );
+        let current = store.coordinated_operation(id).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap(),
+            serde_json::to_value(decided).unwrap()
+        );
+        let inspected: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'operation.inspected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inspected, 0);
+    }
+
+    #[test]
+    fn remote_inspection_preserves_newer_evidence_and_original_completion_time() {
+        let mut store = store();
+        let id = operation(
+            &mut store,
+            1,
+            OperationProvider::Git,
+            "github.com/owner/a",
+            OperationStatus::OutcomeUnknown,
+        );
+        let observed = store.coordinated_operation(id).unwrap().unwrap();
+        let updated = store
+            .record_unknown_operation_inspection(&observed, "{\"inspection\":1}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, OperationStatus::OutcomeUnknown);
+        assert_eq!(updated.finished_at, observed.finished_at);
+        assert_eq!(updated.exit_code, observed.exit_code);
+        assert!(
+            store
+                .record_unknown_operation_inspection(&observed, "{\"inspection\":2}")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .coordinated_operation(id)
+                .unwrap()
+                .unwrap()
+                .details_json,
+            updated.details_json
+        );
+        let inspected: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'operation.inspected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inspected, 1);
+    }
+
     fn ids(page: OperationHistoryPage) -> Vec<i64> {
         page.operations
             .into_iter()

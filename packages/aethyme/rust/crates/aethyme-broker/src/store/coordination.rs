@@ -150,6 +150,69 @@ impl BrokerStore {
             .ok_or(BrokerError::CoordinatedOperationNotFound(id))
     }
 
+    /// Attach inspection evidence only to the exact operation observed before
+    /// the remote read. Inspection must never overwrite a concurrent operator
+    /// reconciliation or a newer inspection.
+    pub(crate) fn record_unknown_operation_inspection(
+        &mut self,
+        expected: &CoordinatedOperation,
+        details_json: &str,
+    ) -> Result<Option<CoordinatedOperation>, BrokerError> {
+        if expected.status != OperationStatus::OutcomeUnknown {
+            return Ok(None);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let read = |tx: &rusqlite::Transaction<'_>| {
+            tx.query_row(
+                "SELECT id, session_id, provider, repository, scope, effect,
+                        status, authorization_reason, command_json, pid,
+                        exit_code, details_json, created_at, updated_at, finished_at,
+                        host_operation_id, identity_provenance, agent_provenance_json
+                 FROM coordinated_operations WHERE id = ?1",
+                [expected.id],
+                coordinated_operation_from_row,
+            )
+            .optional()
+        };
+        let Some(current) = read(&tx)?.transpose()? else {
+            return Ok(None);
+        };
+        // Compare every persisted field while holding the write lock, including
+        // the exact original details string and host-operation identity.
+        if serde_json::to_value(&current).expect("serializing an operation")
+            != serde_json::to_value(expected).expect("serializing an operation")
+        {
+            return Ok(None);
+        }
+        let now = now_ms();
+        tx.execute(
+            "UPDATE coordinated_operations SET details_json = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![expected.id, details_json, now],
+        )?;
+        let payload = crate::events::operation_payload(
+            expected.id,
+            expected.provider,
+            &expected.repository,
+            &expected.scope,
+            expected.effect,
+            expected.status,
+            expected.exit_code,
+        );
+        insert_event(
+            &tx,
+            now,
+            "operation.inspected",
+            Some(expected.session_id),
+            Some(&payload),
+        )?;
+        let updated = read(&tx)?.transpose()?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     // ── non-blocking advisories ─────────────────────────────────────
 
     /// Persist one immutable advisory idempotently by producer identity.
