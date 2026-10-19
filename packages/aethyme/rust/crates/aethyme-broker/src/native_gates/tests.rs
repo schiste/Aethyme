@@ -1219,7 +1219,10 @@ fn synthesized_conflict_suffix_recomposes_and_prepares_the_full_hybrid_candidate
     assert_eq!(fresh_job.spec.inputs, expected_inputs);
     assert_eq!(fresh_job.spec.synthesized_group.as_ref(), Some(&provenance));
     let candidate = validate_source(&mut s.f.store, owner, &repo, &fresh_job.spec).unwrap();
-    assert_eq!(candidate.mode, crate::composition::CompositionMode::Hybrid);
+    assert_eq!(
+        seed.candidate.mode,
+        crate::composition::CompositionMode::Hybrid
+    );
     assert_eq!(candidate.commit.as_str(), fresh_job.spec.commit);
     assert_eq!(candidate.inputs.len(), 3);
     assert_eq!(

@@ -849,11 +849,12 @@ pub fn prepare(
     validate_source(store, owner, broker.repo_handle().root(), &spec)?;
     let rec = record(&spec)?;
     let object = archive::put_object(store, &rec.canonical_bytes())?;
-    let recipe_bytes = spec
-        .recipe
-        .as_deref()
-        .map(|recipe| archive::read_object(store, &digest(recipe)?))
-        .transpose()?;
+    let recipe_bytes = if let Some(recipe) = spec.recipe.as_deref() {
+        let recipe_digest = digest(recipe)?;
+        Some(archive::read_object(store, &recipe_digest)?)
+    } else {
+        None
+    };
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;

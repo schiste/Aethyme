@@ -587,6 +587,7 @@ fn seeded_conflict_binding_for_wave(
         &synthesis.candidate,
         &synthesis.input_manifest.sha256,
     );
+    let expected: serde_json::Value = serde_json::to_value(expected)?;
     if seeded != &expected {
         return Err(WaveError::Invalid(
             "seeded recipe does not match its exact request, result, prefix and suffix".into(),
@@ -1886,7 +1887,7 @@ fn source_from_payload(
 }
 
 fn expected_composition_request(
-    store: &CollaborationStore,
+    store: &mut CollaborationStore,
     repo: &Path,
     wave: &Wave,
     pinned: &target::TargetRevision,
@@ -3720,10 +3721,11 @@ pub fn recompose_synthesized_conflict(
     let candidate = composition.outcome.candidate().ok_or_else(|| {
         WaveError::Invalid("synthesized conflict suffix did not produce a candidate".into())
     })?;
-    let recipe = composition
-        .recipe
-        .as_ref()
-        .ok_or_else(|| WaveError::Invalid("synthesized conflict candidate has no recipe".into()))?;
+    if composition.recipe.is_none() {
+        return Err(WaveError::Invalid(
+            "synthesized conflict candidate has no recipe".into(),
+        ));
+    }
     if candidate.mode != CompositionMode::Hybrid {
         return Err(WaveError::Invalid(
             "synthesized conflict continuation must preserve hybrid provenance".into(),

@@ -668,11 +668,8 @@ fn verify_historical_source_inner(
                 .ok_or_else(|| WaveError::Invalid("historical seed tree".into()))?;
             if seeded_request != *request
                 || seeded_result != *result
-                || seeded["schema"].as_str() != Some(composer::SEEDED_CONFLICT_RECIPE_SCHEMA_NAME)
                 || seeded["version"].as_u64() != Some(1)
                 || seeded["trust"].as_str() != Some("unverified")
-                || seeded_request != *request
-                || seeded_result != *result
                 || seeded["input_manifest_sha256"].as_str()
                     != Some(proof.input_manifest.sha256.as_str())
                 || seed_candidate["subject"].as_str() != Some(proof.candidate_subject.as_str())
@@ -680,7 +677,7 @@ fn verify_historical_source_inner(
                 || seed_tree.is_empty()
                 || seeded["prefix_len"].as_u64() != Some(prefix_len as u64)
                 || seeded["selected"] != serde_json::to_value(&wave_spec.selected)?
-                || suffix != expected_suffix
+                || suffix != &expected_suffix
                 || order.len() != wave_spec.selected.len()
                 || order
                     .iter()
@@ -923,7 +920,7 @@ fn verify_historical_seed_binding_git(
         request_ref,
         result_ref,
     )?;
-    if proof.request != synthesis.request
+    if proof.request.record() != synthesis.request.record()
         || proof.group_record != synthesis.group_record
         || proof.candidate_subject != synthesis.candidate.subject
         || proof.candidate_commit != synthesis.candidate.commit
@@ -986,6 +983,7 @@ fn verify_historical_seed_binding_git(
         &synthesis.candidate,
         &synthesis.input_manifest.sha256,
     );
+    let expected: Value = serde_json::to_value(expected)?;
     if seeded != &expected {
         return Err(WaveError::Invalid(
             "historical seeded recipe differs from its exact conflict, result, or suffix".into(),
