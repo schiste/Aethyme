@@ -71,6 +71,9 @@ AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
 - `references/dead-code.md`: usage-boundary, public API, facts, ambiguity.
 - `references/broker.md`: sessions, leases, gates, Git/GitHub coordination,
   publication, advisories, recovery.
+  For GitHub writes, the broker supplies `gh` and the repository; put
+  `issue create` (or other `gh` args) after `--` without a leading `gh` or
+  a second `--repo`.
 - `references/policy.md`: commit format, branch and review practice, generated
   files and overrides, verifying the enhancement.
 
