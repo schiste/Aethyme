@@ -134,7 +134,7 @@ fn attach_gc_row_content_fingerprints(
             for (index, candidate) in chunk.iter().enumerate() {
                 parameters[index] = rusqlite::types::Value::Integer(candidate.id);
             }
-            let rows = statement
+            let mut rows = statement
                 .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
                     let id = row.get::<_, i64>(id_column)?;
                     let fingerprint = gc_row_content_fingerprint(kind, &column_names, row)?;
