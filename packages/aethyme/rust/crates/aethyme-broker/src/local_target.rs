@@ -477,9 +477,20 @@ fn normalize_with_d10(
 }
 
 fn require_snapshot(store: &CollaborationStore, value: &str) -> Result<(), TargetError> {
+    require_snapshot_with_limits(
+        store,
+        value,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS,
+    )
+}
+
+fn require_snapshot_with_limits(
+    store: &CollaborationStore,
+    value: &str,
+    limits: archive::ReconstructionLimits,
+) -> Result<(), TargetError> {
     let id = SourceSnapshotId::parse(value).map_err(|_| TargetError::Invalid("snapshot".into()))?;
-    let scratch = tempfile::tempdir()?;
-    archive::reconstruct(store, &id, scratch.path())?;
+    archive::validate_snapshot_bounded(store, &id, limits, |_| {})?;
     Ok(())
 }
 

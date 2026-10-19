@@ -541,6 +541,20 @@ pub fn build_view(
     snapshot: &SourceSnapshotId,
     options: &ViewOptions,
 ) -> Result<String, ViewError> {
+    build_view_with_limits(
+        store,
+        snapshot,
+        options,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS,
+    )
+}
+
+fn build_view_with_limits(
+    store: &CollaborationStore,
+    snapshot: &SourceSnapshotId,
+    options: &ViewOptions,
+    limits: crate::collaboration_archive::ReconstructionLimits,
+) -> Result<String, ViewError> {
     let _archive = archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let started = Instant::now();
@@ -562,12 +576,12 @@ pub fn build_view(
     // The retained snapshot, materialised privately. Its own `.aethyme/`
     // is not source: the walker skips it and the indexer writes there.
     let source = building.join("source");
-    crate::collaboration_archive::reconstruct(store, snapshot, &source).map_err(|source| {
-        ViewError::Source {
+    crate::collaboration_archive::reconstruct_bounded(store, snapshot, &source, limits).map_err(
+        |source| ViewError::Source {
             snapshot: snapshot.to_string(),
             source,
-        }
-    })?;
+        },
+    )?;
     let materialize_us = started.elapsed().as_micros();
     let committed_graph = source.join(".aethyme");
     if committed_graph.exists() {
@@ -1595,6 +1609,37 @@ mod tests {
         let view = build_view(&store, &snapshot, &options()).unwrap();
         let error = build_overlay(&store, &view, &snapshot, &options()).unwrap_err();
         assert_eq!(error.code(), "overlays_unsupported", "{error}");
+    }
+
+    #[test]
+    fn bounded_snapshot_refusal_preserves_building_debris_without_materializing_source() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let mut tiny = crate::execution_snapshot::RECONSTRUCTION_LIMITS;
+        tiny.max_output_bytes = 0;
+
+        let error = build_view_with_limits(&store, &snapshot, &options(), tiny).unwrap_err();
+        assert!(matches!(
+            error,
+            ViewError::Source {
+                source: crate::collaboration_archive::ArchiveError::ReconstructionLimit {
+                    resource: "output_bytes",
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let view_dir = views_root(&store).join(view_name(&snapshot, &options().profile));
+        let building = std::fs::read_dir(&view_dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("building-"))
+            .expect("failed build debris remains available to the existing GC lifecycle");
+        assert!(building.path().is_dir());
+        assert!(!building.path().join("source").exists());
     }
 
     /// T90: a view answers only under the profile it was built with; another
