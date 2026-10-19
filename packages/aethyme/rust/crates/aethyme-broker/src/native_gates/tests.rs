@@ -1221,8 +1221,9 @@ fn synthesized_conflict_suffix_recomposes_and_prepares_the_full_hybrid_candidate
     let candidate = validate_source(&mut s.f.store, owner, &repo, &fresh_job.spec).unwrap();
     let (_, composition_source) =
         wave::load_composition_source(&mut s.f.store, owner, &repo, &s.wave).unwrap();
+    let composition_source =
+        composition_source.expect("the recomposed wave retains its exact composition source");
     let final_candidate = composition_source
-        .expect("the recomposed wave retains its exact composition source")
         .composition
         .outcome
         .candidate()
