@@ -163,7 +163,9 @@ fn physical_snapshot_file_reader_rejects_symlinks_and_special_files() {
     let pipe = root.path().join("pipe");
     let pipe_name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
     // An empty FIFO must be rejected without waiting for a writer.
-    assert_eq!(unsafe { libc::mkfifo(pipe_name.as_ptr(), 0o600) }, 0);
+    // SAFETY: pipe_name is a live, NUL-terminated CString for this temporary path.
+    let created = unsafe { libc::mkfifo(pipe_name.as_ptr(), 0o600) };
+    assert_eq!(created, 0);
     assert!(matches!(
         read_source_file(&pipe, 3),
         Err(NativeGateError::Mismatch)
