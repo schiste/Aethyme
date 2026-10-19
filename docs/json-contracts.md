@@ -650,3 +650,23 @@ Under `capture = "advisory"`, `broker submit --json`'s `collaboration_capture`
 gains `ignored_settings` (sorted) when the config carries `[collaboration]`
 keys this binary does not implement; text output adds one warning line.
 Under `required` such a key is refused as `unknown_setting`.
+
+
+## Provisional push size report
+
+Added 2026-10-20. The optional `pr_size` object in
+`aethyme broker push --pr --json` remains a provisional output. Its existing
+`files` and `changed_lines` fields count the review-policy eligible diff;
+thresholds and `over_threshold` continue to use those counts.
+
+Two additive fields explain the scope:
+
+- `excluded`, omitted when empty, lists excluded paths with their `path` and
+  `why` reason (`generated` or `excluded_path`; lockfiles use the latter).
+- `diff_totals`, omitted when the complete local diff is unavailable, contains
+  unfiltered `files` and `changed_lines` from the same Git diff. Paths are
+  counted once. A binary file counts as a file and contributes zero lines.
+
+The human warning labels the policy-filtered counts and prints the unfiltered
+totals when exclusions explain a difference. These totals do not change review
+classification or make an advisory threshold a gate.

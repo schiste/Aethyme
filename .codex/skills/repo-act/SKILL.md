@@ -59,7 +59,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   capabilities in the actual interpreter at every spawn entrypoint. For owned
   groups, retain the leader unreaped through bounded TERM/KILL cleanup, probe
   non-zombie members, reap once, then probe final group absence; never signal
-  the group after reaping. Refuse when ownership or capabilities are unknown.
+  the group after reaping. A TERM/KILL error can be discharged only after the
+  leader is reaped and a successful final probe proves group absence; EPERM
+  itself never proves absence. Refuse when ownership or capabilities are unknown.
   Test early leader exits with open and closed pipes, setup and monitoring
   exceptions, and finite deadlines for every synthetic process. Original group
   absence proves only that group's absence; it says nothing about escaped or
