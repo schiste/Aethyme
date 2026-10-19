@@ -33,6 +33,10 @@ blocked.
    If `status` shows another session holding leases on the files you plan
    to change, prefer working elsewhere first or say so in your report —
    overlapping edits will conflict at merge time.
+   Coordinate the exact shared hunk with its holder; a sibling session's PR
+   or branch is not automatically your upstream. Sync against the configured
+   upstream when required, and do not import or restack onto another session's
+   branch without separate authorization.
    When you edit a file another live session is changing, the broker tells you
    in context who, where and whether Git would conflict, never blocking the
    edit; `aethyme broker advanced note send --to-session <id>` reaches that
