@@ -813,7 +813,26 @@ fn resolve_update_plan(
         now_unix_ms(),
     )
     .map_err(|error| error.to_string())?;
+    preflight_up_to_date_host_resources(plan.action, || {
+        crate::HostResourceCoordinator::open_read_only_default().map(|_| ())
+    })?;
     Ok((plan, fetch))
+}
+
+fn preflight_up_to_date_host_resources(
+    action: UpdateAction,
+    open_read_only: impl FnOnce() -> Result<(), crate::HostResourceError>,
+) -> Result<(), String> {
+    if action != UpdateAction::UpToDate {
+        return Ok(());
+    }
+
+    match open_read_only() {
+        Ok(()) | Err(crate::HostResourceError::StateDirectoryUnavailable) => Ok(()),
+        Err(error) => Err(format!(
+            "cannot report this binary as up to date because its host resource state is not readable: {error}. Check for a compatible release with `aethyme update plan --channel preview` before using broker resource commands; this check is read-only and no migration was attempted."
+        )),
+    }
 }
 
 /// Build a plan from an already-cached manifest, or `None` when none is fresh.
@@ -1905,6 +1924,130 @@ mod tests {
         )
         .unwrap();
         assert_eq!(downgrade.action, UpdateAction::RefuseDowngrade);
+    }
+
+    #[test]
+    fn host_resource_preflight_reports_unsupported_schema() {
+        let mut inspected = false;
+        let error = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
+            inspected = true;
+            Err(crate::HostResourceError::InvalidRequest(
+                "unsupported host schema 2".into(),
+            ))
+        })
+        .unwrap_err();
+
+        assert!(inspected);
+        assert!(error.contains("cannot report this binary as up to date"));
+        assert!(error.contains("unsupported host schema 2"));
+        assert!(error.contains("aethyme update plan --channel preview"));
+        assert!(error.contains("no migration was attempted"));
+    }
+
+    #[test]
+    fn host_resource_preflight_refuses_future_schema_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("host-resources.db");
+        drop(crate::HostResourceCoordinator::open(&database).unwrap());
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute("UPDATE meta SET value=3 WHERE key='schema_version'", [])
+            .unwrap();
+
+        let read_schema = || {
+            rusqlite::Connection::open_with_flags(
+                &database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let before_hash = sha256_bytes(&fs::read(&database).unwrap());
+        let before = read_schema();
+        let error = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
+            crate::HostResourceCoordinator::open_read_only(&database).map(drop)
+        })
+        .unwrap_err();
+        let after = read_schema();
+        let after_hash = sha256_bytes(&fs::read(&database).unwrap());
+
+        assert!(error.contains("unsupported host schema 3"));
+        assert!(error.contains("no migration was attempted"));
+        assert_eq!(before, after);
+        assert_eq!(after, 3);
+        assert_eq!(before_hash, after_hash);
+    }
+
+    #[test]
+    fn host_resource_preflight_does_not_create_missing_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("missing-host-resources.db");
+
+        let result = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
+            crate::HostResourceCoordinator::open_read_only(&database).map(drop)
+        });
+
+        assert!(result.is_ok());
+        assert!(!database.exists());
+    }
+
+    #[test]
+    fn host_resource_preflight_opens_compatible_state_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("host-resources.db");
+        drop(crate::HostResourceCoordinator::open(&database).unwrap());
+
+        let read_schema = || {
+            rusqlite::Connection::open_with_flags(
+                &database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let before = read_schema();
+        let result = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
+            crate::HostResourceCoordinator::open_read_only(&database).map(drop)
+        });
+        let after = read_schema();
+
+        assert!(result.is_ok());
+        assert_eq!(before, 2);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn host_resource_preflight_accepts_missing_state_directory() {
+        let result = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
+            Err(crate::HostResourceError::StateDirectoryUnavailable)
+        });
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn host_resource_preflight_does_not_block_update_available() {
+        let mut inspected = false;
+        let result =
+            preflight_up_to_date_host_resources(UpdateAction::ExecuteInstallerUpdate, || {
+                inspected = true;
+                Err(crate::HostResourceError::InvalidRequest(
+                    "unsupported host schema 2".into(),
+                ))
+            });
+
+        assert!(result.is_ok());
+        assert!(!inspected);
     }
 
     #[test]
