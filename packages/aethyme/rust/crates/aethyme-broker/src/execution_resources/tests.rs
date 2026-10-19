@@ -1291,7 +1291,7 @@ fn admission_request(
     budget::Request {
         nonce: digest(nonce),
         recipe: execution.id().to_string(),
-        kind: WorkKind::Verification,
+        kind: budget::WorkKind::Verification,
         units,
         max_attempts: 1,
         deadline_ms,
@@ -1303,7 +1303,7 @@ fn parent_request(execution: &ExecutionSnapshot, deadline_ms: i64) -> budget::Re
     budget::Request {
         nonce: digest(b"admission-parent"),
         recipe: execution.id().to_string(),
-        kind: WorkKind::Verification,
+        kind: budget::WorkKind::Verification,
         units: Units {
             time_ms: child.time_ms * 4,
             memory_bytes: child.memory_bytes * 4,
