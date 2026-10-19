@@ -111,8 +111,9 @@ or broker command.
 
 ## What `SessionStart` says about the installation
 
-Two things about this machine's Aethyme are worth a sentence at a session
-start, and are invisible everywhere else.
+Three things about this machine's Aethyme are worth a sentence at a session
+start, and are invisible everywhere else: a split binary pair, a newer release,
+and stale Claude Code hook files.
 
 ### Split pair
 
@@ -151,9 +152,18 @@ This does not weaken `aethyme update`'s rule that nothing installs in the
 background: what runs detached downloads a manifest and prints a verdict, and
 nothing it does can change a binary.
 
+### A stale Claude Code plugin
+
+Claude Code caches installed plugin files by the version in `plugin.json`. At
+`SessionStart`, the bundled CLI compares the installed Claude hooks with the
+copies it was built to expect. If either hook file is missing or differs, the
+notice names the update command. If Claude says the plugin is already current,
+the notice gives the uninstall-and-install command to refresh its cached copy.
+The hook only reports the mismatch; it never changes the plugin installation.
+
 | Variable | Effect |
 | --- | --- |
-| `AETHYME_UPDATE_CHECK=off` | Silence both notices and the background refresh. |
+| `AETHYME_UPDATE_CHECK=off` | Silence all installation notices and the background refresh. |
 | `AETHYME_UPDATE_CACHE_TTL_SECONDS` | How long a cached manifest counts as current. Default 6 hours; `0` disables the cache, and with it the fallback to an expired copy when the network is down. |
 
 `aethyme update check --refresh` re-asks immediately, whatever the cache holds.
