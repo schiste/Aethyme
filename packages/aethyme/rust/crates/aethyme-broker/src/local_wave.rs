@@ -587,7 +587,7 @@ fn seeded_conflict_binding_for_wave(
         &synthesis.candidate,
         &synthesis.input_manifest.sha256,
     );
-    let expected: serde_json::Value = serde_json::to_value(expected)?;
+    let expected: serde_json::Value = serde_json::from_slice(&expected.to_canonical_bytes())?;
     if seeded != &expected {
         return Err(WaveError::Invalid(
             "seeded recipe does not match its exact request, result, prefix and suffix".into(),

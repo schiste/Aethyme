@@ -985,7 +985,7 @@ fn verify_historical_seed_binding_git(
         &synthesis.candidate,
         &synthesis.input_manifest.sha256,
     );
-    let expected: Value = serde_json::to_value(expected)?;
+    let expected: Value = serde_json::from_slice(&expected.to_canonical_bytes())?;
     if seeded != &expected {
         return Err(WaveError::Invalid(
             "historical seeded recipe differs from its exact conflict, result, or suffix".into(),
