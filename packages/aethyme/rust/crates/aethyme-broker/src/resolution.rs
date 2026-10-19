@@ -4942,6 +4942,19 @@ mod tests {
     }
 
     #[test]
+    fn managed_decision_fields_match_canonical_ledger_identity() {
+        let request = managed_decision_request(&["b", "a", "b"], &["src/z", "src/a"]);
+        let (key, kind, members, paths) = request.managed_decision_fields();
+        assert_eq!(key, request.decision_key());
+        assert_eq!(kind, "conflict");
+        assert_eq!(members, "a\nb");
+        assert_eq!(paths, "src/a\nsrc/z");
+        assert!(managed_attempt_decision_matches(
+            &request, &key, kind, &members, &paths,
+        ));
+    }
+
+    #[test]
     fn managed_attempt_rows_match_exact_bindings_and_hold_subset_or_superset_decisions() {
         let request = managed_decision_request(&["a", "b"], &["src/a", "src/b"]);
         let key = request.decision.key();
