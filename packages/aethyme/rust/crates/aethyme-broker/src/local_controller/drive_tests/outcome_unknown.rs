@@ -485,8 +485,13 @@ fn actual_fx13_publication_survives_restore_and_old_worker_is_fenced() {
         stderr: super::digest(b""),
     }])
     .unwrap();
-    std::fs::write(repo.join("inventory.json"), inventory.canonical_bytes()).unwrap();
-    git(&repo, &["add", "inventory.json"]);
+    std::fs::create_dir_all(repo.join("harness")).unwrap();
+    std::fs::write(
+        repo.join("harness/inventory.json"),
+        inventory.canonical_bytes(),
+    )
+    .unwrap();
+    git(&repo, &["add", "harness/inventory.json"]);
     git(
         &repo,
         &["commit", "-qm", "independent controller behavior inventory"],
