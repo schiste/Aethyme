@@ -1137,7 +1137,7 @@ mod gate_result_clear_metadata_tests {
         }
         let journal_path = repo.join(".aethyme/gc-journal.json");
         let journal: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(journal_path).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
         let remaining_rows: Vec<crate::GcRowCandidate> =
             serde_json::from_value(journal["remaining_rows"].clone()).unwrap();
         assert_eq!(

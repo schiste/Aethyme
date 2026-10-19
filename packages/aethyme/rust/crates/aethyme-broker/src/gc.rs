@@ -8157,6 +8157,8 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn gc_abandon_reuses_exact_crash_window_archive_and_forget_only_removes_journal() {
+        use std::os::unix::fs::PermissionsExt;
+
         let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
         let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
         let exact_pending_bytes = std::fs::read(&journal_path).unwrap();
