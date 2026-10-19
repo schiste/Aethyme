@@ -246,6 +246,16 @@ fn verify_historical_source(
     verify_historical_source_inner(store, &response, key, completion, wave_spec, &mut seen, 0)
 }
 
+#[cfg(test)]
+pub(crate) fn verify_historical_source_for_test(
+    store: &CollaborationStore,
+    key: &RecordId,
+    completion: &CompletionSpec,
+    wave_spec: &WaveSpec,
+) -> Result<(), WaveError> {
+    verify_historical_source(store, key, completion, wave_spec)
+}
+
 fn verify_historical_source_inner(
     store: &CollaborationStore,
     response: &crate::collaboration_sensitive::ResponseUse,
@@ -668,8 +678,7 @@ fn verify_historical_source_inner(
                 .ok_or_else(|| WaveError::Invalid("historical seed tree".into()))?;
             if seeded_request != *request
                 || seeded_result != *result
-                || seeded["schema"].as_str()
-                    != Some(composer::SEEDED_CONFLICT_RECIPE_SCHEMA_NAME)
+                || seeded["schema"].as_str() != Some(composer::SEEDED_CONFLICT_RECIPE_SCHEMA_NAME)
                 || seeded["version"].as_u64() != Some(1)
                 || seeded["trust"].as_str() != Some("unverified")
                 || seeded["input_manifest_sha256"].as_str()

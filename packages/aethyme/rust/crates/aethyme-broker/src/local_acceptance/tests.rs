@@ -1245,6 +1245,38 @@ fn assert_completion_admits_next_wave(
     completion: &crate::local_controller::CompletionSpec,
     completion_id: &RecordId,
 ) {
+    // Preserve the underlying historical-provenance failure in this fixture.
+    // Admission intentionally collapses corrupted historical authority to
+    // `WaveError::Stale`; these test-only calls identify which retained proof
+    // rejects the accepted completion before admission makes that collapse.
+    let historical = HistoricalCompletionIdentity {
+        completion: completion_id.to_string(),
+        target: completion.target.clone(),
+        issuer: v.owner.issuer().to_owned(),
+        revision: completion.revision.clone(),
+        epoch: completion.epoch.clone(),
+        wave: completion.wave.clone(),
+        source: completion.source.clone(),
+        candidate_commit: completion.candidate_commit.clone(),
+        candidate_tree: completion.candidate_tree.clone(),
+        qualification: completion.qualification.clone(),
+        receipt: completion.acceptance_receipt.clone(),
+        accepted_commit: completion.accepted_commit.clone(),
+        accepted_tree: completion.accepted_tree.clone(),
+    };
+    crate::local_acceptance::verify_historical_completion(&v.f.store, &historical).unwrap_or_else(
+        |error| panic!("historical completion verifier rejected fixture: {error:?}"),
+    );
+    let source_wave_id = RecordId::parse(&completion.wave).unwrap();
+    let source_wave = crate::local_wave::load(&v.f.store, &source_wave_id).unwrap();
+    crate::local_wave::prior_completion::verify_historical_source_for_test(
+        &v.f.store,
+        completion_id,
+        completion,
+        &source_wave.spec,
+    )
+    .unwrap_or_else(|error| panic!("historical source verifier rejected fixture: {error:?}"));
+
     let accepted = CommitOid::parse(&completion.accepted_commit).unwrap();
     git(
         v.f._repo.path(),
