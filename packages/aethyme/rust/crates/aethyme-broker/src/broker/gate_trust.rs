@@ -285,6 +285,7 @@ pub(crate) fn record_trust_at_path(
 
 /// Remove a repository's trust record. For disposable repositories that
 /// trusted their own fixture policy.
+#[cfg(test)]
 pub(crate) fn forget_record(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
