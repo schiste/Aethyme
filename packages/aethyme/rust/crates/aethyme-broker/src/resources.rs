@@ -16,7 +16,7 @@ mod managed_storage_inventory;
 pub(crate) use managed_storage_inventory::ManagedStorageOwner;
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
-/// Additive ledger version; the shared host-resource schema remains version 1.
+/// Additive ledger version, independent of the host-resource store version.
 pub(crate) const MANAGED_STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const HOST_RESOURCE_REQUEST_SCHEMA_VERSION: u32 = 1;
 const HOST_RESOURCE_STORE_SCHEMA_VERSION: u32 = 2;
@@ -700,10 +700,10 @@ impl HostResourceCoordinator {
             }
         })?;
         conn.busy_timeout(busy_timeout)?;
+        preflight_existing_store_versions(&conn)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(SCHEMA)?;
         migrate_writable_schema(&mut conn)?;
         validate_schema(&conn)?;
         validate_managed_storage_schema(&conn)?;
@@ -3045,8 +3045,31 @@ fn validate_managed_storage_schema(conn: &Connection) -> Result<(), HostResource
     Ok(())
 }
 
+/// Refuse a future store before applying this binary's table/index definitions.
+/// The writable migration repeats this under its transaction to close the
+/// race with another opener between preflight and acquiring the write lock.
+fn preflight_existing_store_versions(conn: &Connection) -> Result<(), HostResourceError> {
+    for (table, managed) in [("meta", false), ("managed_storage_meta", true)] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if exists {
+            if managed {
+                validate_managed_storage_schema(conn)?;
+            } else {
+                validate_schema(conn)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn migrate_writable_schema(conn: &mut Connection) -> Result<(), HostResourceError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    preflight_existing_store_versions(&tx)?;
+    tx.execute_batch(SCHEMA)?;
     let version = store_schema_version(&tx)?;
     match version {
         1 => {
@@ -3064,6 +3087,7 @@ fn migrate_writable_schema(conn: &mut Connection) -> Result<(), HostResourceErro
         }
     }
     validate_schema(&tx)?;
+    validate_managed_storage_schema(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -4015,8 +4039,76 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(host_version, i64::from(HOST_RESOURCE_SCHEMA_VERSION));
+        assert_eq!(host_version, i64::from(HOST_RESOURCE_STORE_SCHEMA_VERSION));
         assert_eq!(ledger_version, i64::from(MANAGED_STORAGE_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn managed_storage_addition_preserves_existing_host_schema_v2() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let legacy = Connection::open(&db).unwrap();
+        legacy
+            .execute_batch(
+                SCHEMA
+                    .split("CREATE TABLE IF NOT EXISTS managed_storage_meta")
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+        legacy.execute_batch(SUPERVISED_HOLD_MIGRATION).unwrap();
+        legacy
+            .execute("UPDATE meta SET value=2 WHERE key='schema_version'", [])
+            .unwrap();
+        drop(legacy);
+        let coordinator = HostResourceCoordinator::open(&db).unwrap();
+        assert_eq!(
+            store_schema_version(&coordinator.conn).unwrap(),
+            HOST_RESOURCE_STORE_SCHEMA_VERSION
+        );
+        validate_managed_storage_schema(&coordinator.conn).unwrap();
+        validate_schema(&coordinator.conn).unwrap();
+    }
+
+    #[test]
+    fn future_managed_storage_schema_is_refused_before_database_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("future-managed.db");
+        let future = Connection::open(&db).unwrap();
+        future
+            .execute_batch(
+                "CREATE TABLE managed_storage_meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
+             INSERT INTO managed_storage_meta VALUES('schema_version',2);
+             CREATE TABLE managed_storage_claims (future_column TEXT);",
+            )
+            .unwrap();
+        drop(future);
+        let before = std::fs::read(&db).unwrap();
+        let error = HostResourceCoordinator::open(&db).err().unwrap();
+        assert!(
+            matches!(error, HostResourceError::InvalidRequest(message) if message.contains("unsupported managed storage schema 2"))
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+        let readonly = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let created: i64 = readonly.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('meta','resource_leases','managed_storage_policies')", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(created, 0);
+    }
+
+    #[test]
+    fn future_host_schema_is_refused_before_managed_storage_is_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("future-host.db");
+        let future = Connection::open(&db).unwrap();
+        future.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL); INSERT INTO meta VALUES('schema_version',3);").unwrap();
+        drop(future);
+        let before = std::fs::read(&db).unwrap();
+        let error = HostResourceCoordinator::open(&db).err().unwrap();
+        assert!(
+            matches!(error, HostResourceError::InvalidRequest(message) if message.contains("unsupported host schema 3"))
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), before);
     }
 
     #[test]
