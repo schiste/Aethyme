@@ -72,8 +72,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   is unchanged. Refusal must preserve the previous identity record and data.
 - Keep authoritative frozen plans, validation helpers, inputs and receipts on
   durable storage before execution; use temporary directories for scratch only.
-  After a reboot, mark missing evidence interrupted or unavailable. Recorded
-  hashes do not recover missing bytes or recreate a trust record.
+  Before a long validation, choose a unique durable output directory outside
+  frozen input or proposal bundles and preflight that its parent can accept
+  output with an exclusive-create canary that is then removed. Refuse before
+  expensive work if the preflight fails; never chmod or unfreeze prior evidence
+  to make it writable. After a reboot, mark missing evidence interrupted or
+  unavailable. Recorded hashes do not recover missing bytes or recreate a trust
+  record.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Preserve earlier outputs before retrying.
   Freeze source for each invocation and record the exact head and dirty-state
