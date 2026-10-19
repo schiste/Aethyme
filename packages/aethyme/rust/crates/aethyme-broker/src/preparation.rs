@@ -606,7 +606,12 @@ impl Broker {
                 .iter()
                 .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
         {
-            Some(preparation_cache_dir(self, &digest)?)
+            Some(
+                preparation_cache_root_binding_for_broker(self)?
+                    .path
+                    .join(repository_identity(self))
+                    .join(&digest[..12]),
+            )
         } else {
             None
         };
