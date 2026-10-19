@@ -300,11 +300,11 @@ fn direct_and_delegated_paths_share_one_nonce_identity() {
         &mut direct_first.store,
         &direct_owner,
         &direct_wave,
-        request('p', 4, WorkKind::Composition),
+        request('a', 4, WorkKind::Composition),
         0,
     )
     .unwrap();
-    let shared = request('x', 1, WorkKind::Composition);
+    let shared = request('b', 1, WorkKind::Composition);
     let direct = reserve(
         &mut direct_first.store,
         &direct_owner,
@@ -357,11 +357,11 @@ fn direct_and_delegated_paths_share_one_nonce_identity() {
         &mut delegated_first.store,
         &delegated_owner,
         &delegated_wave,
-        request('p', 4, WorkKind::Composition),
+        request('a', 4, WorkKind::Composition),
         0,
     )
     .unwrap();
-    let shared = request('x', 1, WorkKind::Composition);
+    let shared = request('b', 1, WorkKind::Composition);
     let child = delegate(
         &mut delegated_first.store,
         &delegated_owner,
