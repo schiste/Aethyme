@@ -31,8 +31,9 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 #[test]
 fn an_untrusted_policy_on_the_baseline_is_refused_as_submit_refuses_it() {
-    // This test process owns its trust-policy environment; the broker's
-    // storage paths are passed through fixture options, not global host vars.
+    // SAFETY: This is the sole test in this binary; no sibling test or child
+    // reads the trust escape while it is removed. Storage paths are supplied
+    // through fixture options rather than process-wide host variables.
     unsafe {
         std::env::remove_var("AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS");
     }
