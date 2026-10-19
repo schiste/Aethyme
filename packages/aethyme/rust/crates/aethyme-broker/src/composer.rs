@@ -167,6 +167,7 @@ pub fn compose_structural(
             deliveries: &request.deliveries,
             recomposition: None,
             revision_bindings: None,
+            seeded_conflict: None,
         },
         None,
         &mut profile,
@@ -181,6 +182,8 @@ pub fn compose_structural(
 pub const COMPOSER_BASELINE_SOURCE: &str = "retained";
 
 pub const COMPOSITION_RECIPE_SCHEMA_NAME: &str = "aethyme.composition-recipe/experimental-v0";
+const SEEDED_CONFLICT_RECIPE_SCHEMA_NAME: &str =
+    "aethyme.seeded-conflict-composition/experimental-v1";
 
 /// Consecutive non-blank lines (whitespace-insensitive) that must leave one
 /// place and reappear in another for a change to count as moving a block.
@@ -219,8 +222,14 @@ pub static COMPOSITION_RECIPE_SCHEMA: RecordSchema = RecordSchema {
             required: false,
             capability: Some("accepted-baseline-v1"),
         },
+        FieldSpec {
+            name: "seeded_conflict",
+            kind: FieldKind::Opaque,
+            required: false,
+            capability: Some("seeded-conflict-v1"),
+        },
     ],
-    capabilities: &["accepted-baseline-v1"],
+    capabilities: &["accepted-baseline-v1", "seeded-conflict-v1"],
 };
 
 /// One contribution the caller knows about, by its lineage record.
@@ -371,6 +380,17 @@ struct CompositionInputs<'a> {
     deliveries: &'a [String],
     recomposition: Option<&'a Subtraction>,
     revision_bindings: Option<&'a BTreeMap<String, RecordId>>,
+    seeded_conflict: Option<&'a SeededConflict<'a>>,
+}
+
+/// A strict resolver result used only as the unverified initial state for an
+/// exact, frozen suffix recomposition. It never enters `Baseline::accepted`.
+#[derive(Debug, Clone, Copy)]
+struct SeededConflict<'a> {
+    binding: &'a crate::local_wave::CurrentConflictRequestBinding,
+    result: &'a crate::resolution::RecordRef,
+    synthesis: &'a crate::resolution::UnverifiedSynthesis,
+    prefix_len: usize,
 }
 
 fn refused(reason: Refusal, detail: impl Into<String>) -> Refused {
@@ -392,6 +412,7 @@ pub fn compose(
             deliveries: &request.deliveries,
             recomposition: None,
             revision_bindings: None,
+            seeded_conflict: None,
         },
         None,
         &mut MergeProfile {
@@ -421,6 +442,7 @@ pub(crate) fn compose_with_candidate_retainer(
             deliveries: &request.deliveries,
             recomposition: None,
             revision_bindings: None,
+            seeded_conflict: None,
         },
         Some(retainer),
         &mut MergeProfile {
@@ -450,6 +472,7 @@ pub(crate) fn compose_with_candidate_retainer_and_revisions(
             deliveries: &request.deliveries,
             recomposition: None,
             revision_bindings: Some(revisions),
+            seeded_conflict: None,
         },
         Some(retainer),
         &mut MergeProfile {
@@ -459,6 +482,423 @@ pub(crate) fn compose_with_candidate_retainer_and_revisions(
             accepted_baseline: None,
         },
     )
+}
+
+/// Rebuild a frozen conflict from one strict, unverified resolver result and
+/// the exact original-order suffix. Partial-prefix results cannot be attached
+/// through the ordinary synthesized-result path. This function instead
+/// rechecks the current blocked wave's exact request and source under archive,
+/// response, and owner-authority guards, then builds and retains the complete
+/// candidate. The caller must atomically link the settled result and complete
+/// candidate with a current-wave CAS after this returns.
+pub(crate) fn compose_after_synthesized_conflict(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &crate::local_target::ControllerOwner,
+    wave_id: &RecordId,
+    expected_version: i64,
+    binding: &crate::local_wave::CurrentConflictRequestBinding,
+    result: &crate::resolution::RecordRef,
+) -> Result<Composition, ComposeError> {
+    let retained_binding = crate::local_wave::read_retained_conflict_request_binding(
+        store,
+        repo,
+        &binding.request,
+        &binding.source,
+    )
+    .map_err(|error| ComposeError::InvalidRequest(format!("frozen conflict binding: {error}")))?;
+    if retained_binding != *binding {
+        return Err(ComposeError::InvalidRequest(
+            "frozen conflict binding changed".into(),
+        ));
+    }
+    if binding.plan_payload.prior_completion.is_some() {
+        return Err(ComposeError::InvalidRequest(
+            "synthesized conflict recomposition does not support prior completion".into(),
+        ));
+    }
+
+    let (request, revisions) = composition_request_from_conflict_plan(&binding.plan_payload)?;
+    if !request.accepted.is_empty() {
+        return Err(ComposeError::InvalidRequest(
+            "synthesized conflict recomposition does not support accepted baselines".into(),
+        ));
+    }
+    if request.deliveries != binding.plan_payload.selected {
+        return Err(ComposeError::InvalidRequest(
+            "frozen selected IDs differ from the composition request".into(),
+        ));
+    }
+    validate_conflict_profile_pins(&binding.plan_payload)?;
+
+    let archive_guard = crate::collaboration_gc::archive_use(store)
+        .map_err(|source| io(&crate::collaboration_gc::lock_path(store), source))?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)
+        .map_err(|error| ComposeError::InvalidRequest(format!("response retention: {error}")))?;
+    let _authority_guard = crate::local_target::authorize(store, owner)
+        .map_err(|error| ComposeError::InvalidRequest(format!("wave authority: {error}")))?;
+    let wave = crate::local_wave::load(store, wave_id)
+        .map_err(|error| ComposeError::InvalidRequest(format!("current wave: {error}")))?;
+    validate_current_conflict_wave_links(&wave, wave_id, owner, binding)
+        .map_err(|error| ComposeError::InvalidRequest(error.into()))?;
+
+    let synthesis = crate::resolution::read_synthesized_attempt_result_for_refs(
+        store,
+        repo,
+        &binding.request,
+        result,
+    )
+    .map_err(|error| ComposeError::InvalidRequest(format!("synthesized result: {error}")))?;
+    let status = crate::local_target::status(store, owner.target())
+        .map_err(|error| ComposeError::InvalidRequest(format!("target status: {error}")))?;
+    let latest_sequence: i64 = store
+        .read_connection()
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM local_waves WHERE target=?1 AND revision=?2",
+            rusqlite::params![owner.target(), wave.spec.revision],
+            |row| row.get(0),
+        )
+        .map_err(|error| ComposeError::InvalidRequest(format!("latest wave sequence: {error}")))?;
+    let released: bool = store
+        .read_connection()
+        .query_row(
+            "SELECT released FROM local_target_revisions WHERE revision=?1",
+            [&wave.spec.revision],
+            |row| row.get(0),
+        )
+        .map_err(|error| ComposeError::InvalidRequest(format!("target revision: {error}")))?;
+    validate_current_blocked_conflict_wave(
+        &wave,
+        expected_version,
+        &status,
+        latest_sequence,
+        released,
+        binding,
+    )
+    .map_err(|error| ComposeError::InvalidRequest(error.into()))?;
+    validate_current_conflict_result(&wave, binding, result, &synthesis, &request)
+        .map_err(|error| ComposeError::InvalidRequest(error.into()))?;
+
+    let prefix_len = synthesis
+        .request
+        .contents()
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ComposeError::InvalidRequest("synthesized prefix length overflow".into()))?;
+    if prefix_len > binding.plan_payload.order.len() {
+        return Err(ComposeError::InvalidRequest(
+            "synthesized conflict prefix exceeds the frozen full order".into(),
+        ));
+    }
+    if prefix_len == binding.plan_payload.order.len() {
+        return Err(ComposeError::InvalidRequest(
+            "synthesized conflict has an empty suffix; attach it directly for fresh verification"
+                .into(),
+        ));
+    }
+    let seed = SeededConflict {
+        binding,
+        result,
+        synthesis: &synthesis,
+        prefix_len,
+    };
+    let composition = compose_inner_under_archive_guard(
+        store,
+        repo,
+        &request,
+        CompositionInputs {
+            deliveries: &request.deliveries,
+            recomposition: None,
+            revision_bindings: revisions.as_ref(),
+            seeded_conflict: Some(&seed),
+        },
+        None,
+        &mut MergeProfile {
+            engine: None,
+            observations: Vec::new(),
+            text_merges: 0,
+            accepted_baseline: None,
+        },
+        &archive_guard,
+    )?;
+    if let CompositionOutcome::Candidate(candidate) = &composition.outcome {
+        let recipe = composition.recipe.as_ref().ok_or_else(|| {
+            ComposeError::InvalidRequest("tail candidate has no immutable recipe".into())
+        })?;
+        let revision = RecordId::parse(&wave.spec.revision)
+            .map_err(|error| ComposeError::InvalidRequest(error.to_string()))?;
+        let retention = crate::local_target::ArtifactRetentionPermit::new(
+            store,
+            owner,
+            &archive_guard,
+            &_response_guard,
+            &_authority_guard,
+        )
+        .map_err(|error| ComposeError::CandidateRetention(error.to_string()))?;
+        retain_seeded_conflict_artifacts(
+            store, &revision, binding, result, &synthesis, candidate, recipe, &retention,
+        )?;
+    }
+    Ok(composition)
+}
+
+fn retain_seeded_conflict_artifacts(
+    store: &mut CollaborationStore,
+    revision: &RecordId,
+    binding: &crate::local_wave::CurrentConflictRequestBinding,
+    result: &crate::resolution::RecordRef,
+    synthesis: &crate::resolution::UnverifiedSynthesis,
+    candidate: &Candidate,
+    recipe: &RecipeRef,
+    retention: &crate::local_target::ArtifactRetentionPermit<'_>,
+) -> Result<(), ComposeError> {
+    let mut snapshots = BTreeMap::new();
+    let mut add_snapshot = |snapshot: &SourceSnapshotId| {
+        snapshots.insert(snapshot.to_string(), snapshot.clone());
+    };
+    add_snapshot(&synthesis.request.baseline().snapshot_id);
+    add_snapshot(&synthesis.request.accumulator().snapshot_id);
+    add_snapshot(&synthesis.candidate.subject);
+    add_snapshot(&candidate.subject);
+    for entry in &synthesis.input_manifest.entries {
+        add_snapshot(&entry.snapshot);
+    }
+    for item in &binding.plan_payload.order {
+        for value in [&item.base_snapshot, &item.result_snapshot] {
+            let snapshot = SourceSnapshotId::parse(value)
+                .map_err(|error| ComposeError::InvalidRequest(error.to_string()))?;
+            add_snapshot(&snapshot);
+        }
+    }
+
+    let mut objects = BTreeMap::new();
+    for object in [
+        binding.request.object,
+        binding.source.object,
+        binding.plan.object,
+        result.object,
+        recipe.object,
+        parse_sha256_object_digest(&synthesis.input_manifest.sha256)?,
+    ] {
+        objects.insert(object.hex(), object);
+    }
+    for entry in &synthesis.input_manifest.entries {
+        if let Some(digest) = &entry.sha256 {
+            let object = parse_sha256_object_digest(digest)?;
+            objects.insert(object.hex(), object);
+        }
+    }
+
+    crate::local_target::retain_artifacts_under_guards(
+        store,
+        revision,
+        &snapshots.into_values().collect::<Vec<_>>(),
+        &objects.into_values().collect::<Vec<_>>(),
+        retention,
+    )
+    .map_err(|error| ComposeError::CandidateRetention(error.to_string()))
+}
+
+fn parse_sha256_object_digest(value: &str) -> Result<ObjectDigest, ComposeError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ComposeError::InvalidRequest(
+            "synthesized artifact digest is not canonical SHA-256".into(),
+        ));
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|_| {
+            ComposeError::InvalidRequest("synthesized artifact digest is malformed".into())
+        })?;
+    }
+    Ok(ObjectDigest::from_bytes(bytes))
+}
+
+fn validate_current_conflict_wave_links(
+    wave: &crate::local_wave::Wave,
+    wave_id: &RecordId,
+    owner: &crate::local_target::ControllerOwner,
+    binding: &crate::local_wave::CurrentConflictRequestBinding,
+) -> Result<(), &'static str> {
+    if wave.id != *wave_id
+        || wave.phase != crate::local_wave::WavePhase::Blocked
+        || wave.spec.target != owner.target()
+        || wave.spec.issuer != owner.issuer()
+        || wave.spec.prior_completion.is_some()
+        || wave.spec.selected != binding.plan_payload.selected
+        || wave.resolution_request.as_ref() != Some(&binding.request)
+        || wave.composition_source.as_ref() != Some(&binding.source)
+        || wave.resolution_result.is_some()
+        || wave.candidate_snapshot.is_some()
+        || wave.candidate_commit.is_some()
+        || wave.recipe_object.is_some()
+    {
+        return Err(
+            "synthesized request and frozen source are not linked to this current blocked wave",
+        );
+    }
+    Ok(())
+}
+
+fn validate_current_blocked_conflict_wave(
+    wave: &crate::local_wave::Wave,
+    expected_version: i64,
+    status: &crate::local_target::ControllerStatus,
+    latest_sequence: i64,
+    released: bool,
+    binding: &crate::local_wave::CurrentConflictRequestBinding,
+) -> Result<(), &'static str> {
+    let revision_matches = status
+        .revision
+        .as_ref()
+        .is_some_and(|revision| revision.as_str() == wave.spec.revision);
+    let idle_target =
+        status.phase == crate::local_target::Phase::Idle && status.resume_phase.is_none();
+    if status.version != expected_version
+        || !revision_matches
+        || !idle_target
+        || latest_sequence != wave.spec.sequence
+        || released
+    {
+        return Err("conflict request is no longer current on the blocked wave");
+    }
+    if wave.spec.selected != binding.plan_payload.selected {
+        return Err("frozen conflict plan differs from the current blocked wave");
+    }
+    Ok(())
+}
+
+fn validate_current_conflict_result(
+    wave: &crate::local_wave::Wave,
+    binding: &crate::local_wave::CurrentConflictRequestBinding,
+    result: &crate::resolution::RecordRef,
+    synthesis: &crate::resolution::UnverifiedSynthesis,
+    request: &CompositionRequest,
+) -> Result<(), &'static str> {
+    if synthesis.request.record() != &binding.request
+        || synthesis.status.request != binding.request
+        || synthesis.group_record != *result
+        || synthesis.status.result.as_ref() != Some(result)
+        || synthesis.candidate.baseline != request.baseline
+        || synthesis.request.baseline().commit != request.baseline
+        || synthesis.request.baseline().snapshot_id.as_str() != wave.spec.baseline
+        || synthesis.candidate.producer
+            != (Producer::Resolver {
+                profile: crate::resolution::SYNTHESIS_PROFILE.into(),
+            })
+        || synthesis.candidate.mode != CompositionMode::Synthesized
+        || synthesis.candidate.baseline_source != COMPOSER_BASELINE_SOURCE
+    {
+        return Err("settled resolver result differs from the exact frozen conflict request");
+    }
+    Ok(())
+}
+
+fn composition_request_from_conflict_plan(
+    payload: &crate::local_wave::ConflictPlanPayload,
+) -> Result<(CompositionRequest, Option<BTreeMap<String, RecordId>>), ComposeError> {
+    if payload.schema_name != "aethyme.local-conflict-plan/experimental-v0" || payload.version != 1
+    {
+        return Err(ComposeError::InvalidRequest(
+            "frozen conflict plan schema version".into(),
+        ));
+    }
+    let max_bytes = payload
+        .request
+        .budget
+        .max_bytes
+        .parse::<u64>()
+        .map_err(|_| ComposeError::InvalidRequest("frozen byte budget".into()))?;
+    if max_bytes.to_string() != payload.request.budget.max_bytes {
+        return Err(ComposeError::InvalidRequest(
+            "frozen byte budget is not canonical".into(),
+        ));
+    }
+    let request = CompositionRequest {
+        baseline: CommitOid::parse(&payload.request.baseline)?,
+        accepted: payload
+            .request
+            .accepted
+            .iter()
+            .map(|commit| CommitOid::parse(commit).map_err(ComposeError::from))
+            .collect::<Result<Vec<_>, _>>()?,
+        catalog: payload
+            .request
+            .catalog
+            .iter()
+            .map(|item| {
+                Ok(ContributionSpec {
+                    id: item.id.clone(),
+                    lineage: item
+                        .lineage
+                        .as_deref()
+                        .map(RecordId::parse)
+                        .transpose()
+                        .map_err(|error| ComposeError::InvalidRequest(error.to_string()))?,
+                    requires: item.requires.clone(),
+                    atomic_group: item.atomic_group.clone(),
+                    revision_of: item.revision_of.clone(),
+                    derived_from: item.derived_from.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ComposeError>>()?,
+        deliveries: payload.request.deliveries.clone(),
+        budget: CompositionBudget {
+            max_contributions: payload.request.budget.max_contributions,
+            max_paths: payload.request.budget.max_paths,
+            max_bytes,
+            max_merges: payload.request.budget.max_merges,
+        },
+    };
+
+    let pinned_revisions = payload
+        .order
+        .iter()
+        .filter(|item| item.revision.is_some())
+        .count();
+    let revisions = if pinned_revisions == 0 {
+        None
+    } else {
+        if pinned_revisions != payload.order.len() {
+            return Err(ComposeError::InvalidRequest(
+                "frozen revision pins are incomplete".into(),
+            ));
+        }
+        let mut revisions = BTreeMap::new();
+        for item in &payload.order {
+            let revision = RecordId::parse(item.revision.as_deref().unwrap_or_default())
+                .map_err(|error| ComposeError::InvalidRequest(error.to_string()))?;
+            if revisions.insert(item.id.clone(), revision).is_some() {
+                return Err(ComposeError::InvalidRequest(
+                    "frozen revision pins repeat a contribution".into(),
+                ));
+            }
+        }
+        Some(revisions)
+    };
+    Ok((request, revisions))
+}
+
+fn validate_conflict_profile_pins(
+    payload: &crate::local_wave::ConflictPlanPayload,
+) -> Result<(), ComposeError> {
+    let current = provisional_text_profile_pins()?;
+    if payload.profile != current.profile
+        || payload.engine.engine != current.engine
+        || payload.engine.version != current.version
+        || payload.engine.diff != current.diff
+        || payload.engine.move_window != current.move_window
+    {
+        return Err(ComposeError::InvalidRequest(
+            "frozen conflict profile pins do not match this composer".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Internal wave adapter only: the caller has rechecked a private completion
@@ -548,6 +988,7 @@ fn compose_after_accepted_inner(
             deliveries: &request.deliveries,
             recomposition: None,
             revision_bindings,
+            seeded_conflict: None,
         },
         retainer,
         &mut MergeProfile {
@@ -690,6 +1131,7 @@ fn recompose_inner(
             deliveries: &deliveries,
             recomposition: Some(subtraction),
             revision_bindings: None,
+            seeded_conflict: None,
         },
         None,
         profile,
@@ -749,12 +1191,31 @@ fn compose_inner(
     candidate_retainer: Option<&mut CandidateRetainer<'_>>,
     profile: &mut MergeProfile<'_>,
 ) -> Result<Composition, ComposeError> {
+    let archive_guard = crate::collaboration_gc::archive_use(store)
+        .map_err(|source| io(&crate::collaboration_gc::lock_path(store), source))?;
+    compose_inner_under_archive_guard(
+        store,
+        repo,
+        request,
+        inputs,
+        candidate_retainer,
+        profile,
+        &archive_guard,
+    )
+}
+
+fn compose_inner_under_archive_guard(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    inputs: CompositionInputs<'_>,
+    candidate_retainer: Option<&mut CandidateRetainer<'_>>,
+    profile: &mut MergeProfile<'_>,
+    archive_guard: &crate::collaboration_gc::ArchiveUse,
+) -> Result<Composition, ComposeError> {
     if let Some(revisions) = inputs.revision_bindings {
         validate_revision_bindings(request, inputs.deliveries, revisions)?;
     }
-    // Reclamation cannot remove an input while this composition reads it.
-    let _use = crate::collaboration_gc::archive_use(store)
-        .map_err(|source| io(&crate::collaboration_gc::lock_path(store), source))?;
     let mut usage = BudgetUsage::default();
     let mut order = Vec::new();
     let unavailable = |detail: String, error: ArchiveError| -> Result<Composition, ComposeError> {
@@ -842,6 +1303,7 @@ fn compose_inner(
         inputs.deliveries,
         (&mut usage, &mut order),
         profile,
+        inputs.seeded_conflict,
     )? {
         Ok(Built::Candidate(candidate, plan)) => (candidate, plan),
         Ok(Built::Other(outcome)) => {
@@ -876,7 +1338,7 @@ fn compose_inner(
     let object = collaboration_archive::put_object(store, &bytes)?;
     let recipe = RecipeRef { id, object };
     if let Some(retain) = candidate_retainer {
-        retain(store, &candidate, &recipe, &_use)?;
+        retain(store, &candidate, &recipe, archive_guard)?;
     }
     Ok(Composition {
         outcome: CompositionOutcome::Candidate(candidate),
@@ -945,6 +1407,203 @@ struct Baseline {
     accepted: Vec<SourceSnapshotId>,
 }
 
+fn validate_seeded_plan(
+    request: &CompositionRequest,
+    plan: &Plan,
+    seed: &SeededConflict<'_>,
+) -> Result<(), Refused> {
+    let refuse = |reason, detail: &str| Err(refused(reason, detail));
+    let frozen = &seed.binding.plan_payload;
+    let resolution_request = &seed.synthesis.request;
+    if frozen.prior_completion.is_some() || !request.accepted.is_empty() {
+        return refuse(
+            Refusal::InseparableSelection,
+            "synthesized suffix recomposition cannot use an accepted baseline",
+        );
+    }
+    if frozen.order.len() != plan.steps.len()
+        || frozen.selected != request.deliveries
+        || frozen.request.deliveries != request.deliveries
+        || plan.baseline.commit != request.baseline
+    {
+        return refuse(
+            Refusal::UnsafePlan,
+            "replanned selection differs from the frozen conflict source",
+        );
+    }
+    for (step, source) in plan.steps.iter().zip(&frozen.order) {
+        if source.id != step.spec.id
+            || source.lineage != step.retained.lineage_record_id.as_str()
+            || source.base_commit != step.retained.base.commit.as_str()
+            || source.result_commit != step.retained.result.commit.as_str()
+            || source.base_snapshot != step.retained.base.snapshot_id.as_str()
+            || source.result_snapshot != step.retained.result.snapshot_id.as_str()
+        {
+            return refuse(
+                Refusal::UnsafePlan,
+                "replanned lineage or source locator differs from the frozen conflict order",
+            );
+        }
+    }
+    if seed.prefix_len != resolution_request.contents().len().saturating_add(1)
+        || seed.prefix_len >= plan.steps.len()
+        || resolution_request.record() != &seed.binding.request
+        || seed.synthesis.status.request != seed.binding.request
+        || seed.synthesis.group_record != *seed.result
+        || seed.synthesis.status.result.as_ref() != Some(seed.result)
+        || seed.synthesis.status.input_manifest_sha256 != seed.synthesis.input_manifest.sha256
+        || seed.synthesis.candidate.baseline != plan.baseline.commit
+        || seed.synthesis.request.baseline().commit != plan.baseline.commit
+        || seed.synthesis.request.baseline().snapshot_id != plan.baseline.snapshot_id
+    {
+        return refuse(
+            Refusal::UnsafePlan,
+            "strict synthesized result does not bind the frozen prefix and baseline",
+        );
+    }
+
+    let conflict_step = &plan.steps[seed.prefix_len - 1];
+    for (index, member) in resolution_request.contents().iter().enumerate() {
+        if !group_member_matches_step(member, &plan.steps[index]) {
+            return refuse(
+                Refusal::UnsafePlan,
+                "resolver contents are not the exact frozen order prefix",
+            );
+        }
+    }
+    let mut includes_conflict_step = false;
+    for member in resolution_request.members() {
+        let Some(index) = plan.steps.iter().position(|step| step.spec.id == member.id) else {
+            return refuse(
+                Refusal::UnsafePlan,
+                "resolver member is outside the frozen selected order",
+            );
+        };
+        if index >= seed.prefix_len || !group_member_matches_step(member, &plan.steps[index]) {
+            return refuse(
+                Refusal::UnsafePlan,
+                "resolver member is not an exact source from the synthesized prefix",
+            );
+        }
+        includes_conflict_step |= index == seed.prefix_len - 1;
+    }
+    if !includes_conflict_step {
+        return refuse(
+            Refusal::UnsafePlan,
+            "resolver members omit the contribution that raised the conflict",
+        );
+    }
+    let crate::resolution::Trigger::Conflict(trigger_conflicts) = resolution_request.trigger()
+    else {
+        return refuse(
+            Refusal::UnsafePlan,
+            "tail recomposition requires a frozen conflict request",
+        );
+    };
+    if trigger_conflicts.is_empty()
+        || trigger_conflicts
+            .iter()
+            .any(|conflict| conflict.input != conflict_step.retained.result.commit)
+        || trigger_conflicts.len() != frozen.conflicts.len()
+        || trigger_conflicts
+            .iter()
+            .zip(&frozen.conflicts)
+            .any(|(conflict, source)| {
+                conflict.path != source.path
+                    || conflict.input.as_str() != source.input
+                    || conflict.reason != source.reason
+            })
+    {
+        return refuse(
+            Refusal::UnsafePlan,
+            "resolver trigger differs from the frozen conflict step",
+        );
+    }
+
+    let mut expected_inputs: Vec<&crate::resolution::GroupMember> =
+        resolution_request.contents().iter().collect();
+    for member in resolution_request.members() {
+        if !expected_inputs
+            .iter()
+            .any(|existing| existing.lineage == member.lineage)
+        {
+            expected_inputs.push(member);
+        }
+    }
+    let expected_inputs: Vec<CandidateInput> = expected_inputs
+        .into_iter()
+        .map(|member| CandidateInput {
+            base: member.base_commit.clone(),
+            result: member.result_commit.clone(),
+            base_snapshot: Some(member.base.clone()),
+            result_snapshot: Some(member.result.clone()),
+        })
+        .collect();
+    if seed.synthesis.candidate.inputs != expected_inputs {
+        return refuse(
+            Refusal::UnsafePlan,
+            "resolver candidate inputs do not equal the exact ordered prefix",
+        );
+    }
+    let mut decision_members = BTreeSet::new();
+    for member in resolution_request.decision_members() {
+        let Some(step) = plan.steps.iter().find(|step| step.spec.id == member.id) else {
+            return refuse(
+                Refusal::UnsafePlan,
+                "resolver decision member is outside the frozen full selection",
+            );
+        };
+        if !group_member_matches_step(member, step) || !decision_members.insert(member.id.as_str())
+        {
+            return refuse(
+                Refusal::UnsafePlan,
+                "resolver decision member differs from its frozen source",
+            );
+        }
+    }
+
+    let prefix_ids: BTreeSet<&str> = plan.steps[..seed.prefix_len]
+        .iter()
+        .map(|step| step.spec.id.as_str())
+        .collect();
+    let suffix_ids: BTreeSet<&str> = plan.steps[seed.prefix_len..]
+        .iter()
+        .map(|step| step.spec.id.as_str())
+        .collect();
+    let mut group_sides: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
+    for step in &plan.steps {
+        let Some(group) = step.spec.atomic_group.as_deref() else {
+            continue;
+        };
+        let sides = group_sides.entry(group).or_default();
+        if prefix_ids.contains(step.spec.id.as_str()) {
+            sides.0 = true;
+        }
+        if suffix_ids.contains(step.spec.id.as_str()) {
+            sides.1 = true;
+        }
+    }
+    if group_sides
+        .values()
+        .any(|(prefix, suffix)| *prefix && *suffix)
+    {
+        return refuse(
+            Refusal::InseparableSelection,
+            "an atomic contribution group crosses the synthesized prefix boundary",
+        );
+    }
+    Ok(())
+}
+
+fn group_member_matches_step(member: &crate::resolution::GroupMember, step: &Planned) -> bool {
+    member.id == step.spec.id
+        && member.lineage == step.retained.lineage_record_id
+        && member.base == step.retained.base.snapshot_id
+        && member.result == step.retained.result.snapshot_id
+        && member.base_commit == step.retained.base.commit
+        && member.result_commit == step.retained.result.commit
+}
+
 /// Validate an archived target with the same revision, atomic group, and
 /// source-lineage rules as composition. This never invokes Git or writes a
 /// recipe, candidate, or ref. Accepted history is absent unless explicitly
@@ -993,6 +1652,7 @@ fn build(
     deliveries: &[String],
     progress: (&mut BudgetUsage, &mut Vec<String>),
     profile: &mut MergeProfile<'_>,
+    seeded_conflict: Option<&SeededConflict<'_>>,
 ) -> Result<Result<Built, Refused>, ComposeError> {
     let (usage, order) = progress;
     let plan = match plan(store, request, baseline, deliveries, usage)? {
@@ -1000,6 +1660,11 @@ fn build(
         Err(refusal) => return Ok(Err(refusal)),
     };
     order.extend(plan.steps.iter().map(|step| step.spec.id.clone()));
+    if let Some(seed) = seeded_conflict {
+        if let Err(refusal) = validate_seeded_plan(request, &plan, seed) {
+            return Ok(Err(refusal));
+        }
+    }
 
     let mut reader = Reader {
         store,
@@ -1013,9 +1678,40 @@ fn build(
     if let Err(refusal) = reader.within(usage, request) {
         return Ok(Err(refusal));
     }
-    let mut accumulator = baseline_entries.clone();
+    let mut accumulator = if let Some(seed) = seeded_conflict {
+        reader.entries(&seed.synthesis.candidate.subject)?
+    } else {
+        baseline_entries.clone()
+    };
+    if let Some(seed) = seeded_conflict {
+        for step in plan.steps.iter().take(seed.prefix_len) {
+            let base = reader.entries(&step.retained.base.snapshot_id)?;
+            let result = reader.entries(&step.retained.result.snapshot_id)?;
+            usage.paths += base
+                .keys()
+                .chain(result.keys())
+                .filter(|path| base.get(*path) != result.get(*path))
+                .collect::<BTreeSet<_>>()
+                .len();
+            if usage.paths > request.budget.max_paths {
+                return Ok(Err(refused(
+                    Refusal::BudgetExhausted,
+                    format!(
+                        "seed prefix reads {} changed paths, over the budget of {} in all",
+                        usage.paths, request.budget.max_paths
+                    ),
+                )));
+            }
+            if let Err(refusal) = reader.within(usage, request) {
+                return Ok(Err(refusal));
+            }
+        }
+    }
     let scratch = tempfile::tempdir().map_err(|source| io(Path::new("<tempdir>"), source))?;
-    for step in &plan.steps {
+    for (index, step) in plan.steps.iter().enumerate() {
+        if seeded_conflict.is_some_and(|seed| index < seed.prefix_len) {
+            continue;
+        }
         if profile
             .accepted_baseline
             .as_ref()
@@ -1163,7 +1859,11 @@ fn build(
         producer: Producer::Composer {
             profile: profile.name().to_string(),
         },
-        mode: profile.mode(),
+        mode: if seeded_conflict.is_some() {
+            CompositionMode::Hybrid
+        } else {
+            profile.mode()
+        },
     };
     Ok(Ok(Built::Candidate(candidate, plan)))
 }
@@ -2331,6 +3031,114 @@ fn merge_observation_record(observation: &MergeObservation) -> Value {
     ])
 }
 
+fn seeded_conflict_record(seed: &SeededConflict<'_>) -> Value {
+    expected_seeded_conflict_metadata(
+        seed.binding,
+        seed.result,
+        &seed.synthesis.request,
+        &seed.synthesis.candidate,
+        &seed.synthesis.input_manifest.sha256,
+    )
+}
+
+/// Reconstruct the exact immutable seeded-conflict recipe value from its
+/// strict resolver request, group candidate, and frozen source references.
+/// The caller is responsible for validating those records before comparison.
+pub(crate) fn expected_seeded_conflict_metadata(
+    binding: &crate::local_wave::CurrentConflictRequestBinding,
+    result: &crate::resolution::RecordRef,
+    request: &crate::resolution::ResolutionRequest,
+    candidate: &Candidate,
+    manifest_sha256: &str,
+) -> Value {
+    let reference = |record: &crate::resolution::RecordRef| {
+        object(vec![
+            ("record_id", text(record.id.as_str())),
+            ("object_sha256", text(&record.object.hex())),
+        ])
+    };
+    let payload = &binding.plan_payload;
+    let prefix_len = request.contents().len() + 1;
+    let decision_members = request
+        .decision_members()
+        .iter()
+        .map(|member| {
+            object(vec![
+                ("id", text(&member.id)),
+                ("lineage", text(member.lineage.as_str())),
+                ("base_snapshot", text(member.base.as_str())),
+                ("result_snapshot", text(member.result.as_str())),
+                ("base_commit", text(member.base_commit.as_str())),
+                ("result_commit", text(member.result_commit.as_str())),
+            ])
+        })
+        .collect();
+    let full_order = payload
+        .order
+        .iter()
+        .map(|item| {
+            let mut fields = vec![
+                ("id", text(&item.id)),
+                ("lineage", text(&item.lineage)),
+                ("base_snapshot", text(&item.base_snapshot)),
+                ("result_snapshot", text(&item.result_snapshot)),
+                ("base_commit", text(&item.base_commit)),
+                ("result_commit", text(&item.result_commit)),
+            ];
+            if let Some(revision) = &item.revision {
+                fields.push(("revision", text(revision)));
+            }
+            object(fields)
+        })
+        .collect();
+    object(vec![
+        ("schema", text(SEEDED_CONFLICT_RECIPE_SCHEMA_NAME)),
+        ("version", integer(1)),
+        ("trust", text("unverified")),
+        ("resolution_request", reference(&binding.request)),
+        ("composition_source", reference(&binding.source)),
+        ("composition_plan", reference(&binding.plan)),
+        ("resolution_result", reference(result)),
+        ("input_manifest_sha256", text(manifest_sha256)),
+        (
+            "seed_candidate",
+            object(vec![
+                ("subject", text(candidate.subject.as_str())),
+                ("tree", text(&candidate.tree)),
+                ("commit", text(candidate.commit.as_str())),
+            ]),
+        ),
+        ("prefix_len", integer(prefix_len)),
+        (
+            "selected",
+            Value::Array(payload.selected.iter().map(|id| text(id)).collect()),
+        ),
+        ("order", Value::Array(full_order)),
+        (
+            "suffix",
+            Value::Array(
+                payload
+                    .order
+                    .iter()
+                    .skip(prefix_len)
+                    .map(|item| text(&item.id))
+                    .collect(),
+            ),
+        ),
+        ("decision_members", Value::Array(decision_members)),
+        (
+            "profile_pins",
+            object(vec![
+                ("profile", text(&payload.profile)),
+                ("engine", text(&payload.engine.engine)),
+                ("version", text(&payload.engine.version)),
+                ("diff", text(&payload.engine.diff)),
+                ("move_window", integer(payload.engine.move_window)),
+            ]),
+        ),
+    ])
+}
+
 fn recipe_record(
     candidate: &Candidate,
     plan: &Plan,
@@ -2439,6 +3247,11 @@ fn recipe_record(
                 ),
             ]),
         ));
+    }
+    if let Some(seed) = inputs.seeded_conflict {
+        members.push(("seeded_conflict", seeded_conflict_record(seed)));
+    }
+    if profile.accepted_baseline.is_some() || inputs.seeded_conflict.is_some() {
         members.push((
             "requires",
             Value::Array(
