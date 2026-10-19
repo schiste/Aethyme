@@ -610,9 +610,9 @@ mod tests {
             let result = run_broker_quick_test(QuickTestMode::Generic);
             assert!(
                 matches!(
-                    result,
+                    &result,
                     Err(QuickTestError::BrokerDatabaseRedirected { resolved, .. })
-                        if resolved == external_database
+                        if resolved == &external_database
                 ),
                 "unexpected quick-test result: {result:?}"
             );
