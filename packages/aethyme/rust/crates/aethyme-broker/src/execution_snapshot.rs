@@ -17,6 +17,7 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const SCHEMA_NAME: &str = "aethyme.execution-snapshot/provisional-v0";
 pub const MATERIALIZATION_PROFILE: &str = "aethyme.raw-linux-inputs/provisional-v0";
+const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_FILES: usize = 8192;
 pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -27,6 +28,16 @@ const MAX_MATERIALIZED_FILES: usize = 8192;
 const MAX_MATERIALIZED_NODES: usize = 16_384;
 const MAX_MATERIALIZED_PATH_DEPTH: usize = 64;
 const MAX_MATERIALIZED_COMPONENT_BYTES: usize = 255;
+pub(crate) const RECONSTRUCTION_LIMITS: archive::ReconstructionLimits =
+    archive::ReconstructionLimits {
+        max_manifest_bytes: MAX_FILE_BYTES as usize,
+        max_file_bytes: MAX_FILE_BYTES as usize,
+        max_output_bytes: MAX_INPUT_BYTES as usize,
+        max_entries: MAX_MATERIALIZED_FILES,
+        max_nodes: MAX_MATERIALIZED_NODES,
+        max_path_depth: MAX_MATERIALIZED_PATH_DEPTH,
+        max_component_bytes: MAX_MATERIALIZED_COMPONENT_BYTES,
+    };
 static SCHEMA: RecordSchema = RecordSchema {
     name: SCHEMA_NAME,
     fields: &[
@@ -329,11 +340,7 @@ pub fn load(
 ) -> Result<ExecutionSnapshot, SnapshotError> {
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
-    let path = archive::object_path(store, &locator.object);
-    if std::fs::metadata(path)?.len() > 1024 * 1024 {
-        return Err(SnapshotError::Limit);
-    }
-    let bytes = archive::read_object(store, &locator.object)?;
+    let bytes = read_descriptor_object(store, &locator.object, MAX_DESCRIPTOR_BYTES)?;
     let value = Record::decode(&bytes, &[&SCHEMA]).map_err(|_| SnapshotError::Tampered)?;
     if value.id() != locator.id || value.canonical_bytes() != bytes {
         return Err(SnapshotError::Tampered);
@@ -360,6 +367,17 @@ pub fn load(
     })
 }
 
+fn read_descriptor_object(
+    store: &CollaborationStore,
+    digest: &ObjectDigest,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SnapshotError> {
+    match archive::read_object_bounded(store, digest, max_bytes) {
+        Err(archive::ArchiveError::ObjectTooLarge { .. }) => Err(SnapshotError::Limit),
+        result => result.map_err(Into::into),
+    }
+}
+
 fn inspect(
     store: &CollaborationStore,
     id: &SourceSnapshotId,
@@ -370,35 +388,27 @@ fn inspect(
     if retained.content_bytes > MAX_INPUT_BYTES || retained.entry_count > MAX_FILES as u64 {
         return Err(SnapshotError::Limit);
     }
-    let manifest_digest = ObjectDigest::of_snapshot(id);
-    if std::fs::metadata(archive::object_path(store, &manifest_digest))?.len() > MAX_FILE_BYTES {
-        return Err(SnapshotError::Limit);
+    let remaining = MAX_INPUT_BYTES
+        .checked_sub(*total)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or(SnapshotError::Limit)?;
+    let mut unresolved_pointer = false;
+    let validated = archive::validate_snapshot_bounded(
+        store,
+        id,
+        RECONSTRUCTION_LIMITS.with_max_output_bytes(remaining),
+        |contents| unresolved_pointer |= unresolved_lfs(contents),
+    )?;
+    if unresolved_pointer {
+        return Err(SnapshotError::Unsupported("unresolved LFS pointer".into()));
     }
-    let bytes = archive::read_object(store, &manifest_digest)?;
-    let snapshot = archive::parse_manifest(&bytes).ok_or(SnapshotError::Tampered)?;
-    if snapshot.id() != *id || snapshot.manifest_bytes() != bytes {
-        return Err(SnapshotError::Tampered);
-    }
-    if snapshot.entries().len() > MAX_FILES {
-        return Err(SnapshotError::Limit);
-    }
+    let snapshot = validated.snapshot().clone();
     portable(&snapshot)?;
-    for entry in snapshot.entries() {
-        let digest = ObjectDigest::from_bytes(*entry.content_sha256());
-        if std::fs::metadata(archive::object_path(store, &digest))?.len() > MAX_FILE_BYTES {
-            return Err(SnapshotError::Limit);
-        }
-        let contents =
-            archive::read_object(store, &ObjectDigest::from_bytes(*entry.content_sha256()))?;
-        if unresolved_lfs(&contents) {
-            return Err(SnapshotError::Unsupported("unresolved LFS pointer".into()));
-        }
-        *total = total
-            .checked_add(contents.len() as u64)
-            .ok_or(SnapshotError::Limit)?;
-        if contents.len() as u64 > MAX_FILE_BYTES || *total > MAX_INPUT_BYTES {
-            return Err(SnapshotError::Limit);
-        }
+    *total = total
+        .checked_add(validated.output_bytes())
+        .ok_or(SnapshotError::Limit)?;
+    if *total > MAX_INPUT_BYTES {
+        return Err(SnapshotError::Limit);
     }
     Ok(snapshot)
 }
@@ -541,7 +551,9 @@ fn materialize_in_inner(
             for role in plan.roles {
                 let path = workspace.path().join(role.name);
                 before_reconstruct(role.name, &path);
-                if let Err(error) = archive::reconstruct(store, &role.id, &path) {
+                if let Err(error) =
+                    archive::reconstruct_bounded(store, &role.id, &path, RECONSTRUCTION_LIMITS)
+                {
                     on_reconstruct_error(&error);
                     return Err(error.into());
                 }
