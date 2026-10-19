@@ -11,6 +11,13 @@ exit: 0
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
       Pass --include-active-gate-cache when the plan was made with it.
+  aethyme broker gc abandon --confirm <pending-digest> [--json]
+      Archive a schema 2 or 3 pending journal without resuming or removing
+      retained data. Requires a fresh plan review before later apply.
+  aethyme broker gc forget-abandoned --confirm <archived-plan-digest> [--json]
+      Forget the matching archive or its private interrupted staging files;
+      retained project data is not removed. Archives are bounded to 32 files
+      and 64 MiB total.
   aethyme broker gc sweep [--json]
       Run the unattended build-artifact sweep now with its full budget
       (scaled up when disk is below the gate headroom), ignoring its daily
