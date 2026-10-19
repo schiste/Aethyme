@@ -148,7 +148,6 @@ pub mod lease_liveness;
 pub mod lease_requests;
 pub mod session_guidance;
 pub mod session_holder;
-#[cfg(test)]
 mod test_storage;
 mod text_redaction;
 mod unpushed;

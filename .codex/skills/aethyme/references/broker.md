@@ -27,12 +27,19 @@ blocked.
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
+   For patch tools without a per-call worktree setting, use the reported
+   worktree's absolute path and verify the target path there before editing;
+   relative paths can resolve against the shared checkout.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
    If `status` shows another session holding leases on the files you plan
    to change, prefer working elsewhere first or say so in your report —
    overlapping edits will conflict at merge time.
+   Coordinate the exact shared hunk with its holder; a sibling session's PR
+   or branch is not automatically your upstream. Sync against the configured
+   upstream when required, and do not import or restack onto another session's
+   branch without separate authorization.
    When you edit a file another live session is changing, the broker tells you
    in context who, where and whether Git would conflict, never blocking the
    edit; `aethyme broker advanced note send --to-session <id>` reaches that
@@ -94,6 +101,22 @@ blocked.
    ```bash
    aethyme broker push --session <your-session-id> --pr
    ```
+
+   The draft body is composed from the session task, commit sections, and the
+   default pull-request template on the fetched base branch. Prepare the
+   reviewed body from the repository template, preserving its required
+   contract decision and justification fields. When a task has an exact
+   reviewed body, set it through the coordinated GitHub path:
+
+   ```bash
+   aethyme broker advanced gh --session <your-session-id> --repo <owner/name> \
+     --scope pull-request:<number> --effect write \
+     --reason "Apply the reviewed draft body" -- \
+     pr edit <number> --body-file <approved-body-file>
+   ```
+
+   Read the pull-request body back and compare it with the approved file before
+   handing the draft off for review.
 
    `--pr` opens a draft PR, or reports the one already open. The policy is
    the authorization for exactly these two things -- pushing your own session
