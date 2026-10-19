@@ -42,6 +42,7 @@ pub fn broker_cli(binary: &str, args: &[&str]) -> Command {
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
         .env_remove("AETHYME_HOST_STATE_DIR")
         .env_remove("AETHYME_HOST_CACHE_DIR")
+        .env_remove("AETHYME_PREPARATION_CACHE_ROOT")
         .env_remove("AETHYME_WORKTREE_ROOT")
         .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
         .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
@@ -93,10 +94,26 @@ pub fn fixture_host_cache_dir(fixture_root: &Path) -> PathBuf {
         .unwrap_or_else(|| fixture_root.join("host-cache"))
 }
 
+/// Preparation-cache placement owned by the fixture, outside tracked files.
+#[allow(dead_code)]
+pub fn fixture_preparation_cache_root(fixture_root: &Path) -> PathBuf {
+    fixture_git_common_dir(fixture_root)
+        .map(|git_dir| git_dir.join("aethyme-test-preparation-cache"))
+        .unwrap_or_else(|| fixture_root.join("preparation-cache"))
+}
+
+fn prepare_fixture_cache(fixture_root: &Path) -> PathBuf {
+    let root = fixture_preparation_cache_root(fixture_root);
+    std::fs::create_dir_all(&root).expect("create fixture preparation cache");
+    root.canonicalize()
+        .expect("canonicalize fixture preparation cache")
+}
+
 /// Set owned host paths after constructing a CLI command. These explicit
 /// paths take precedence over inherited XDG and user host-state locations.
 #[allow(dead_code)]
 pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
+    let preparation_cache = prepare_fixture_cache(fixture_root);
     command
         .env_remove("AETHYME_BROKER_DB")
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
@@ -113,7 +130,8 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
         .env(
             "AETHYME_HOST_CACHE_DIR",
             fixture_host_cache_dir(fixture_root),
-        );
+        )
+        .env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache);
 }
 
 #[allow(dead_code)]
@@ -236,6 +254,7 @@ pub fn open_fixture_broker(
     let options = BrokerOpenOptions::default()
         .with_host_state_dir(host_state_dir.clone())
         .with_host_cache_dir(fixture_host_cache_dir(fixture_root))
+        .with_preparation_cache_root(prepare_fixture_cache(fixture_root))
         .with_host_operation_database(host_state_dir.join("host-operations.db"))
         .with_worktree_root(worktree_root_path.clone())
         .with_collaboration_state(host_state_dir.join("collaboration"));
