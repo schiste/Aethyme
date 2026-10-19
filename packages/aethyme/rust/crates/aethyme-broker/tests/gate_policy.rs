@@ -15,9 +15,10 @@
 //! single-glob matcher built below is byte-identical to one member of the
 //! set the broker compiles.
 
-use aethyme_broker::{GATES_CONFIG_RELPATH, load_gates, select_gates};
+use aethyme_broker::{GATES_CONFIG_RELPATH, load_gates, parse_gates, select_gates};
 use aethyme_testkit::repo_root;
 use globset::Glob;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -100,6 +101,38 @@ fn gate_policy_changes_select_a_triggered_gate() {
         "{GATES_CONFIG_RELPATH} matches no gate trigger, so an entry that edits gate \
          policy runs only the always-on gates. Add it to the triggers of a gate whose \
          suites read it."
+    );
+}
+
+#[test]
+fn eval_gate_pins_pytest_and_hashes_the_pin_into_its_definition() {
+    const PIN: &str = "pytest==9.1.1";
+
+    let root = repo_root();
+    let gates = load_gates(&root).expect("the shipped gates.toml parses");
+    let gate = gates
+        .iter()
+        .find(|gate| gate.name == "pytest-aethyme-eval")
+        .expect("the eval gate is configured");
+    assert!(
+        gate.command.contains(PIN),
+        "pytest-aethyme-eval must install the reviewed exact version {PIN}"
+    );
+
+    let config = fs::read_to_string(root.join(GATES_CONFIG_RELPATH)).unwrap();
+    let changed_pin = config.replacen(PIN, "pytest==9.1.2", 1);
+    assert_ne!(
+        changed_pin, config,
+        "the exact pin must occur in the command"
+    );
+    let changed_gates = parse_gates(&changed_pin).expect("changing the pin keeps valid TOML");
+    let changed_gate = changed_gates
+        .iter()
+        .find(|candidate| candidate.name == "pytest-aethyme-eval")
+        .expect("the changed config still contains the eval gate");
+    assert_ne!(
+        gate.definition_hash, changed_gate.definition_hash,
+        "changing the pinned pytest version must invalidate cached verdicts"
     );
 }
 
@@ -235,4 +268,58 @@ fn every_trigger_glob_matches_a_tracked_file() {
         "trigger glob(s) match no tracked file, so the gate is unreachable by the path \
          it was written for: {dead:?}"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn eval_gate_repairs_a_wrong_warm_pytest_and_reuses_the_exact_version() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let eval = root.join("packages/aethyme-eval");
+    let bin = eval.join(".venv/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let python = bin.join("python");
+    fs::write(
+        &python,
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+  -c) test "$(cat "$MOCK_VERSION")" = '9.1.1' ;;
+  -m)
+    case "$2" in
+      pip) printf '9.1.1\n' > "$MOCK_VERSION"; printf 'install\n' >> "$MOCK_EVENTS" ;;
+      pytest) printf 'test\n' >> "$MOCK_EVENTS" ;;
+      *) exit 91 ;;
+    esac ;;
+  *) exit 92 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&python, fs::Permissions::from_mode(0o700)).unwrap();
+    let version = root.join("version");
+    let events = root.join("events");
+    fs::write(&version, "9.0.0\n").unwrap();
+    let gate = load_gates(&repo_root())
+        .unwrap()
+        .into_iter()
+        .find(|gate| gate.name == "pytest-aethyme-eval")
+        .unwrap();
+    for expected in ["install\ntest\n", "install\ntest\ntest\n"] {
+        let output = Command::new("/bin/sh")
+            .args(["-c", &gate.command])
+            .current_dir(root)
+            .env("MOCK_VERSION", &version)
+            .env("MOCK_EVENTS", &events)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&version).unwrap(), "9.1.1\n");
+        assert_eq!(fs::read_to_string(&events).unwrap(), expected);
+    }
 }
