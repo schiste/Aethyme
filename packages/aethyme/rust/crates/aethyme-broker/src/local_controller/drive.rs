@@ -186,7 +186,7 @@ fn reserve(
             deadline_ms: deadline,
         },
         AdmissionRoute::Direct,
-        || clock(),
+        clock,
     )
 }
 fn close(

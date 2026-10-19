@@ -1040,13 +1040,15 @@ pub fn begin_attempt(
 }
 
 /// Admit one issuer-owned request through the selected budget lineage and
-/// begin its first attempt. Both routes use the same request nonce; choosing a
+/// begin an allowed attempt. Both routes use the same request nonce; choosing a
 /// second route for an existing nonce cannot create another root or child.
 ///
 /// The clock is sampled once immediately before reservation and again after
-/// that durable write, immediately before beginning the attempt. A failure at
-/// either step leaves the recorded reservation for reconciliation; it is not
-/// rolled back or retried here.
+/// that durable write, immediately before beginning the attempt. A first-clock
+/// or reserve/delegate failure creates no new reservation. Once reserve or
+/// delegate returns, a later clock or attempt failure does not roll back that
+/// durable reservation or retry it here. An idempotently returned reservation
+/// may begin another attempt when the existing retry rules allow it.
 /// The clock error is preserved, while budget errors are converted into the
 /// caller's error type.
 pub fn admit<E, F>(
