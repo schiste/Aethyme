@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod common;
+
 use aethyme_broker::{BUDGET_EXHAUSTED_REASON, Broker, overlap_state_reads};
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 
@@ -114,9 +117,9 @@ fn classification_scales_with_sessions_skips_stale_ones_and_honours_its_budget()
 }
 
 fn reads_each_session_once_however_many_pairs_it_is_in() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let sessions = 6;
     sessions_sharing_one_file(tmp.path(), &mut broker, sessions);
 
@@ -136,9 +139,9 @@ fn reads_each_session_once_however_many_pairs_it_is_in() {
 }
 
 fn stale_sessions_are_neither_rescanned_nor_paired() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let all = sessions_sharing_one_file(tmp.path(), &mut broker, 5);
     // Record every session's lease while all are live, then let two go
     // quiet for three hours.
@@ -174,9 +177,9 @@ fn stale_sessions_are_neither_rescanned_nor_paired() {
 }
 
 fn an_exhausted_budget_leaves_pairs_unclassified_and_says_why() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     sessions_sharing_one_file(tmp.path(), &mut broker, 3);
     let overlaps = broker.lease_overlaps_snapshot().unwrap();
     let overlaps = if overlaps.is_empty() {
@@ -216,9 +219,9 @@ fn an_exhausted_budget_leaves_pairs_unclassified_and_says_why() {
 /// revive it for the next two hours, and every later pass paired it again.
 #[test]
 fn looking_at_a_stale_session_does_not_revive_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let all = sessions_sharing_one_file(tmp.path(), &mut broker, 2);
     broker.refresh_leases().unwrap();
     let (stale_id, stale_name) = &all[0];
@@ -262,9 +265,9 @@ fn looking_at_a_stale_session_does_not_revive_it() {
 /// submit audit rescans it even though it still reads as stale.
 #[test]
 fn a_session_back_from_a_long_pause_still_owns_its_new_work() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let name = "returning";
     let worktree = add_worktree(tmp.path(), name);
     let session = broker.adopt(&worktree, Some(name)).unwrap();

@@ -8,10 +8,13 @@
 //! classified because a worktree was mid-merge, and generated files every
 //! session regenerates conflicted in nearly every pair.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_broker::{Broker, DuplicateWorkReason, SessionStatus};
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 
@@ -105,24 +108,24 @@ fn make_stale(broker: &mut Broker, root: &Path, session_id: i64, name: &str) {
 
 #[test]
 fn sessions_whose_tasks_name_the_same_pr_are_reported_both_ways() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let fixture = FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let first = broker
         .adopt(
-            &add_worktree(tmp.path(), "first"),
+            &add_worktree(fixture.path(), "first"),
             Some("Resolve merge conflicts and refresh PR #1122 against current main"),
         )
         .unwrap();
     let second = broker
         .adopt(
-            &add_worktree(tmp.path(), "second"),
+            &add_worktree(fixture.path(), "second"),
             Some("Repair and merge PR1122 first in authorized order"),
         )
         .unwrap();
     let unrelated = broker
         .adopt(
-            &add_worktree(tmp.path(), "third"),
+            &add_worktree(fixture.path(), "third"),
             Some("Fix PR 1181 diagnostics"),
         )
         .unwrap();
@@ -157,16 +160,22 @@ fn sessions_whose_tasks_name_the_same_pr_are_reported_both_ways() {
 
 #[test]
 fn a_stale_duplicate_is_reported_but_only_as_info() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let fixture = FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let quiet = broker
-        .adopt(&add_worktree(tmp.path(), "quiet"), Some("refresh PR #1149"))
+        .adopt(
+            &add_worktree(fixture.path(), "quiet"),
+            Some("refresh PR #1149"),
+        )
         .unwrap();
     let live = broker
-        .adopt(&add_worktree(tmp.path(), "live"), Some("finish PR #1149"))
+        .adopt(
+            &add_worktree(fixture.path(), "live"),
+            Some("finish PR #1149"),
+        )
         .unwrap();
-    make_stale(&mut broker, tmp.path(), quiet.id, "quiet");
+    make_stale(&mut broker, fixture.path(), quiet.id, "quiet");
 
     let found = broker.duplicate_work_for(&live);
     assert_eq!(found.len(), 1, "{found:?}");
@@ -183,11 +192,11 @@ fn a_stale_duplicate_is_reported_but_only_as_info() {
 
 #[test]
 fn a_worktree_mid_merge_is_reported_instead_of_failing_classification() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let wt_stuck = add_worktree(tmp.path(), "stuck");
-    let wt_other = add_worktree(tmp.path(), "other");
+    let fixture = FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let wt_stuck = add_worktree(fixture.path(), "stuck");
+    let wt_other = add_worktree(fixture.path(), "other");
     let stuck = broker.adopt(&wt_stuck, None).unwrap();
     let other = broker.adopt(&wt_other, None).unwrap();
     edit_and_commit(&wt_stuck, "src/auth.py", (10, "stuck rewrote line ten"));
@@ -228,35 +237,31 @@ fn a_worktree_mid_merge_is_reported_instead_of_failing_classification() {
 
 #[test]
 fn lease_ignore_rules_come_from_the_committed_default_branch() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("repo");
-    let origin = tmp.path().join("origin.git");
-    std::fs::create_dir_all(&root).unwrap();
-    init_repo(&root);
+    let fixture = FixtureRepository::new();
+    let root = fixture.path();
+    let origin = fixture.owner_path().join("origin.git");
+    init_repo(root);
     std::fs::create_dir_all(root.join(".aethyme")).unwrap();
     std::fs::write(
         root.join(".aethyme/config.toml"),
         "schema = 1\n\n[leases]\nignore = [\"src/auth.py\"]\n",
     )
     .unwrap();
-    sh(&root, &["add", "-f", ".aethyme/config.toml"]);
-    sh(&root, &["commit", "-qm", "ignore the generated file"]);
+    sh(root, &["add", "-f", ".aethyme/config.toml"]);
+    sh(root, &["commit", "-qm", "ignore the generated file"]);
     sh(
-        tmp.path(),
+        fixture.owner_path(),
         &["init", "-q", "--bare", origin.to_str().unwrap()],
     );
-    sh(
-        &root,
-        &["remote", "add", "origin", origin.to_str().unwrap()],
-    );
-    sh(&root, &["push", "-q", "-u", "origin", "main"]);
-    sh(&root, &["remote", "set-head", "origin", "main"]);
+    sh(root, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    sh(root, &["push", "-q", "-u", "origin", "main"]);
+    sh(root, &["remote", "set-head", "origin", "main"]);
     // The main checkout's file is stale: it has not pulled the rule.
     std::fs::write(root.join(".aethyme/config.toml"), "schema = 1\n").unwrap();
 
-    let mut broker = Broker::open(&root).unwrap();
-    let wt_a = add_worktree(&root, "a");
-    let wt_b = add_worktree(&root, "b");
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let wt_a = add_worktree(root, "a");
+    let wt_b = add_worktree(root, "b");
     broker.adopt(&wt_a, None).unwrap();
     broker.adopt(&wt_b, None).unwrap();
     edit_and_commit(&wt_a, "src/auth.py", (3, "a"));
@@ -271,17 +276,17 @@ fn lease_ignore_rules_come_from_the_committed_default_branch() {
 
 #[test]
 fn a_verify_only_submit_warns_about_a_conflicting_lease_instead_of_refusing() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    let fixture = FixtureRepository::new();
+    init_repo(fixture.path());
+    std::fs::create_dir_all(fixture.path().join(".aethyme")).unwrap();
     std::fs::write(
-        tmp.path().join(".aethyme/config.toml"),
+        fixture.path().join(".aethyme/config.toml"),
         "schema = 1\n\n[promote]\nmode = \"verify-only\"\n",
     )
     .unwrap();
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let wt_owner = add_worktree(tmp.path(), "owner");
-    let wt_other = add_worktree(tmp.path(), "other");
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let wt_owner = add_worktree(fixture.path(), "owner");
+    let wt_other = add_worktree(fixture.path(), "other");
     let owner = broker.adopt(&wt_owner, None).unwrap();
     let other = broker.adopt(&wt_other, None).unwrap();
     broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
