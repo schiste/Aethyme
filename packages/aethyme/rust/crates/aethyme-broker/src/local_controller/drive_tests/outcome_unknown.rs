@@ -52,6 +52,32 @@ fn publication_operations(
         .collect()
 }
 
+fn restore_guard_counts(
+    store: &crate::collaboration_state::CollaborationStore,
+) -> (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) {
+    store
+        .read_connection()
+        .query_row(
+            "SELECT (SELECT count(*) FROM local_controller_services),(SELECT count(*) FROM local_controller_completions),(SELECT count(*) FROM local_controller_completion_roots),(SELECT count(*) FROM local_controller_runs),(SELECT count(*) FROM local_acceptance_receipts),(SELECT count(*) FROM local_acceptance_qualifications),(SELECT count(*) FROM local_budget_reservations),(SELECT coalesce(sum(attempts),0) FROM local_budget_reservations),(SELECT count(*) FROM local_budget_receipts),(SELECT count(*) FROM local_source_transports)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
 fn shell_quote(path: &Path) -> String {
     let path = path.to_str().expect("temporary path is UTF-8");
     shell_quote_text(path)
@@ -70,26 +96,57 @@ struct ReceiverHookPids {
 struct ReceiverHookProcess {
     started: PathBuf,
     finished: PathBuf,
+    release: PathBuf,
     marker: String,
     armed: bool,
-    attempted: bool,
     confirmed_exit: bool,
 }
 
 impl ReceiverHookProcess {
-    fn new(started: PathBuf, finished: PathBuf, marker: String) -> Self {
+    fn new(started: PathBuf, finished: PathBuf, release: PathBuf, marker: String) -> Self {
         Self {
             started,
             finished,
+            release,
             marker,
             armed: false,
-            attempted: false,
             confirmed_exit: false,
         }
     }
 
     fn arm(&mut self) {
         self.armed = true;
+    }
+
+    fn wait_until_live(&self) -> Result<ReceiverHookPids, String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last_problem = "receiver hook has not recorded its process identities".to_owned();
+        while Instant::now() < deadline {
+            if let Ok(record) = std::fs::read_to_string(&self.started)
+                && let Ok(pids) = parse_hook_pids(&record, &self.marker)
+            {
+                if self.finished.exists() {
+                    return Err("receiver hook finished before the restore barrier".into());
+                }
+                if process_is_alive(pids.hook) && process_is_alive(pids.delay) {
+                    return Ok(pids);
+                }
+                last_problem = format!(
+                    "receiver hook process IDs {} and {} did not both remain alive",
+                    pids.hook, pids.delay
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err(format!(
+            "could not prove receiver hook {:?} remained alive at the restore barrier: {last_problem}",
+            self.marker
+        ))
+    }
+
+    fn release(&self) -> Result<(), String> {
+        std::fs::write(&self.release, b"release\n")
+            .map_err(|error| format!("could not release receiver hook barrier: {error}"))
     }
 
     fn wait_for_exit(&mut self) -> Result<ReceiverHookPids, String> {
@@ -99,11 +156,6 @@ impl ReceiverHookProcess {
         if !self.armed {
             return Err("receiver hook cleanup guard was not armed".into());
         }
-        if self.attempted {
-            return Err("receiver hook cleanup wait already exhausted its bound".into());
-        }
-        self.attempted = true;
-
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut last_problem = "receiver hook has not recorded its process identities".to_owned();
         while Instant::now() < deadline {
@@ -148,12 +200,156 @@ impl ReceiverHookProcess {
 
 impl Drop for ReceiverHookProcess {
     fn drop(&mut self) {
-        if self.armed
-            && !self.attempted
-            && let Err(error) = self.wait_for_exit()
-        {
-            eprintln!("receiver hook cleanup was not proven: {error}");
+        if self.armed && !self.confirmed_exit {
+            if let Err(error) = self.release() {
+                eprintln!("receiver hook release was not proven: {error}");
+            }
+            if let Err(error) = self.wait_for_exit() {
+                eprintln!("receiver hook cleanup was not proven: {error}");
+            }
         }
+    }
+}
+
+struct AuthorityWorkerProcess {
+    child: std::process::Child,
+    host: PathBuf,
+    finished: bool,
+}
+
+impl AuthorityWorkerProcess {
+    fn spawn(host: &Path) -> Self {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "local_controller::drive::tests::outcome_unknown::actual_fx13_stale_worker_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AETHYME_FX13_AUTHORITY_CHILD_HOST", host)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn the stale FX13 controller worker child");
+        Self {
+            child,
+            host: host.to_owned(),
+            finished: false,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait_until_ready(&mut self) -> Result<String, String> {
+        let ready = self.host.join("fx13-worker-ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(epoch) = std::fs::read_to_string(&ready) {
+                if self
+                    .child
+                    .try_wait()
+                    .map_err(|error| format!("could not inspect FX13 worker child: {error}"))?
+                    .is_some()
+                {
+                    self.finished = true;
+                    return Err("FX13 worker child exited after recording readiness".into());
+                }
+                return Ok(epoch.trim().to_owned());
+            }
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("could not inspect FX13 worker child: {error}"))?
+            {
+                self.finished = true;
+                return Err(format!(
+                    "FX13 worker child exited before readiness with {status}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err("FX13 worker child did not become ready within 10 seconds".into())
+    }
+
+    fn is_alive(&mut self) -> Result<bool, String> {
+        match self.child.try_wait() {
+            Ok(None) => Ok(true),
+            Ok(Some(_)) => {
+                self.finished = true;
+                Ok(false)
+            }
+            Err(error) => Err(format!("could not inspect FX13 worker child: {error}")),
+        }
+    }
+
+    fn release_and_wait(&mut self) -> Result<i32, String> {
+        std::fs::write(
+            self.host.join("fx13-worker-go"),
+            b"restore finished frozen\n",
+        )
+        .map_err(|error| format!("could not release FX13 worker child: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("could not reap FX13 worker child: {error}"))?
+            {
+                self.finished = true;
+                if !status.success() {
+                    return Err(format!("FX13 worker child exited unsuccessfully: {status}"));
+                }
+                return Ok(status.code().unwrap_or_default());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err("FX13 worker child did not exit within 15 seconds after release".into())
+    }
+}
+
+impl Drop for AuthorityWorkerProcess {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = std::fs::write(self.host.join("fx13-worker-go"), b"test cleanup release\n");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.finished = true;
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    eprintln!("could not inspect FX13 worker during cleanup: {error}");
+                    break;
+                }
+            }
+        }
+        let child_pid = self.child.id();
+        if let Err(error) = self.child.kill() {
+            eprintln!("could not stop FX13 worker child during cleanup: {error}");
+        }
+        let reap_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < reap_deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.finished = true;
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    eprintln!("could not inspect FX13 worker child during bounded reap: {error}");
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "FX13 worker child cleanup remains unproven; process {child_pid} may still be running"
+        );
     }
 }
 
@@ -185,8 +381,61 @@ fn process_is_alive(pid: libc::pid_t) -> bool {
 }
 
 #[test]
+#[ignore = "spawned by actual_fx13_publication_survives_restore_and_old_worker_is_fenced"]
+fn actual_fx13_stale_worker_child() {
+    use crate::collaboration_state::{CollaborationRoot, ProjectKey};
+
+    let host = PathBuf::from(
+        std::env::var_os("AETHYME_FX13_AUTHORITY_CHILD_HOST")
+            .expect("appointed FX13 authority child host"),
+    );
+    let mut store = crate::collaboration_state::CollaborationStore::open(
+        &CollaborationRoot::under_host_state(&host),
+        &ProjectKey::parse("local-target-test").unwrap(),
+        &[],
+    )
+    .unwrap();
+    let owner = target::acquire_controller(&mut store, "target", "appointed").unwrap();
+    let epoch = owner.authority_epoch().as_str().to_owned();
+    drop(store);
+    std::fs::write(host.join("fx13-worker-ready"), format!("{epoch}\n")).unwrap();
+    for _ in 0..12000 {
+        if host.join("fx13-worker-go").exists() {
+            let mut restored = crate::collaboration_state::CollaborationStore::open(
+                &CollaborationRoot::under_host_state(&host),
+                &ProjectKey::parse("local-target-test").unwrap(),
+                &[],
+            )
+            .unwrap();
+            let witness = crate::local_authority::status(&restored).unwrap();
+            if witness.status != crate::local_authority::Status::Frozen {
+                std::fs::write(
+                    host.join("fx13-worker-not-frozen"),
+                    b"child released before freeze; mutation skipped\n",
+                )
+                .unwrap();
+                return;
+            }
+            assert!(matches!(
+                wave::available(&mut restored, &owner, "A", 2),
+                Err(crate::local_wave::WaveError::Target(
+                    crate::local_target::TargetError::Authority(
+                        crate::local_authority::AuthorityError::Frozen
+                    )
+                ))
+            ));
+            std::fs::write(host.join("fx13-worker-refused"), b"frozen authority\n").unwrap();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("parent did not release the FX13 stale-worker child within 120 seconds");
+}
+
+#[test]
 #[ignore = "actual appointed Docker build, independent verifier, native gates, and timed disposable bare-Git publication"]
-fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
+fn actual_fx13_publication_survives_restore_and_old_worker_is_fenced() {
+    use crate::collaboration_state::{CollaborationRoot, ProjectKey};
     use std::os::unix::fs::PermissionsExt;
 
     let host = tempfile::tempdir().unwrap().keep();
@@ -225,12 +474,7 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         source_host.display(),
         repo.display()
     );
-    let owner = target::acquire_controller(
-        &mut f.store,
-        "native-unknown-publication",
-        "appointed-local-operator",
-    )
-    .unwrap();
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
 
     let inventory = AssertionInventory::new(vec![AssertionCase {
         id: "retained-one".into(),
@@ -329,6 +573,7 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
     let hook_record = remote.join("hooks/post-receive-record");
     let hook_started = remote.join("hooks/post-receive-started");
     let hook_finished = remote.join("hooks/post-receive-finished");
+    let hook_release = remote.join("hooks/post-receive-release");
     let hook = remote.join("hooks/post-receive");
     let hook_marker = format!(
         "receiver-{}",
@@ -340,8 +585,9 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
     std::fs::write(
         &hook,
         format!(
-            "#!/bin/sh\nset -eu\n/bin/cat > {}\nhook_pid=$$\n/bin/sleep 5 &\ndelay_pid=$!\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\nwait \"$delay_pid\"\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\n",
+            "#!/bin/sh\nset -eu\n/bin/cat > {}\nhook_pid=$$\n/bin/sh -c 'i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 120 ]; do /bin/sleep 1; i=$((i + 1)); done' receiver-delay {} &\ndelay_pid=$!\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\nwait \"$delay_pid\"\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\n",
             shell_quote(&hook_record),
+            shell_quote(&hook_release),
             shell_quote_text(&hook_marker),
             shell_quote(&hook_started),
             shell_quote_text(&hook_marker),
@@ -353,6 +599,7 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
     let mut hook_process = ReceiverHookProcess::new(
         hook_started.clone(),
         hook_finished.clone(),
+        hook_release.clone(),
         hook_marker.clone(),
     );
 
@@ -377,6 +624,13 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
     )
     .unwrap();
 
+    let pre_effect_database = host.join("before-publication.db");
+    f.store
+        .connection()
+        .execute("VACUUM INTO ?1", [pre_effect_database.to_str().unwrap()])
+        .unwrap();
+    let pre_effect_database_sha256 = super::digest(&std::fs::read(&pre_effect_database).unwrap());
+
     wave::available(&mut f.store, &owner, "A", 0).unwrap();
     let appointment = ServicePolicy {
         nonce: "post-receive-timeout-1".into(),
@@ -398,9 +652,13 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    let hook_pids = hook_process
-        .wait_for_exit()
-        .expect("receiver hook recorded completion and both owned processes exited");
+    let live_hook_pids = hook_process
+        .wait_until_live()
+        .expect("receiver hook must remain alive at the restore barrier");
+    assert!(
+        !hook_finished.exists(),
+        "receiver hook must not finish before the restore/refusal checks"
+    );
 
     assert_eq!(service.outcome, ServiceOutcome::Held);
     assert!(service.completions.is_empty());
@@ -415,8 +673,10 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         )
         .unwrap();
     let intent = transport::load(&f.store, &RecordId::parse(&intent_id).unwrap()).unwrap();
-    let receiver_record = std::fs::read_to_string(&hook_record)
+    let receiver_receipt_bytes = std::fs::read(&hook_record)
         .expect("receiver-owned post-receive hook must record the moved ref before delaying");
+    let receiver_record = String::from_utf8(receiver_receipt_bytes.clone())
+        .expect("receiver hook record must be UTF-8");
     let receiver_update: Vec<&str> = receiver_record.split_whitespace().collect();
     assert_eq!(
         receiver_update,
@@ -638,6 +898,183 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         "receiver ref remains the exact candidate after replay refusal"
     );
 
+    let receipt_archive = host.join("receiver-post-receive.receipt");
+    std::fs::write(&receipt_archive, &receiver_receipt_bytes).unwrap();
+    std::fs::File::open(&receipt_archive)
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&receipt_archive).unwrap(),
+        receiver_receipt_bytes,
+        "the exact receiver-owned update record is archived outside restored project data"
+    );
+    let receiver_receipt_sha256 = super::digest(&receiver_receipt_bytes);
+
+    let unknown_database_archive = host.join("unknown-publication-before-freeze.db");
+    f.store
+        .connection()
+        .execute(
+            "VACUUM INTO ?1",
+            [unknown_database_archive.to_str().unwrap()],
+        )
+        .unwrap();
+    let unknown_database_sha256 = super::digest(&std::fs::read(&unknown_database_archive).unwrap());
+
+    let prior_epoch = owner.authority_epoch().clone();
+    let old_epoch = prior_epoch.as_str().to_owned();
+    drop(owner);
+    let mut old_worker = AuthorityWorkerProcess::spawn(&source_host);
+    let worker_epoch = old_worker
+        .wait_until_ready()
+        .expect("stale worker must acquire its old epoch before the announced restore");
+    assert_eq!(worker_epoch, old_epoch);
+    let old_worker_pid = old_worker.pid();
+    let frozen = crate::local_authority::freeze(
+        &mut f.store,
+        &prior_epoch,
+        "FX13 announced restore after an unknown disposable Git publication",
+    )
+    .unwrap();
+    assert_ne!(frozen.epoch.as_str(), old_epoch);
+    assert_eq!(
+        crate::local_authority::status(&f.store).unwrap(),
+        frozen,
+        "announced restore rotates the external authority witness before database replacement"
+    );
+    assert!(
+        process_is_alive(live_hook_pids.hook) && process_is_alive(live_hook_pids.delay),
+        "the receiver process stays alive through authority rotation"
+    );
+    assert!(
+        old_worker
+            .is_alive()
+            .expect("inspect the stale controller worker process"),
+        "the stale controller process stays alive through authority rotation"
+    );
+
+    let frozen_database_archive = host.join("frozen-unknown-publication.db");
+    f.store
+        .connection()
+        .execute(
+            "VACUUM INTO ?1",
+            [frozen_database_archive.to_str().unwrap()],
+        )
+        .unwrap();
+    let frozen_database_sha256 = super::digest(&std::fs::read(&frozen_database_archive).unwrap());
+    let archived_frozen_state = rusqlite::Connection::open(&frozen_database_archive).unwrap();
+    let archived_wave_phase: String = archived_frozen_state
+        .query_row(
+            "SELECT phase FROM local_waves WHERE wave=?1",
+            [wave_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let archived_run_state: String = archived_frozen_state
+        .query_row(
+            "SELECT state FROM local_controller_runs WHERE wave=?1",
+            [wave_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let archived_budget: (i64, i64, i64, i64) = archived_frozen_state
+        .query_row(
+            "SELECT count(*),sum(CASE WHEN phase='consumed' THEN 1 ELSE 0 END),coalesce(sum(attempts),0),(SELECT count(*) FROM local_budget_receipts WHERE reservation IN (SELECT reservation FROM local_budget_reservations WHERE wave=?1)) FROM local_budget_reservations WHERE wave=?1",
+            [wave_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let archived_completions: i64 = archived_frozen_state
+        .query_row(
+            "SELECT count(*) FROM local_controller_completions WHERE wave=?1",
+            [wave_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(archived_wave_phase, "outcome_unknown");
+    assert_eq!(archived_run_state, "unknown");
+    assert_eq!(archived_budget, (3, 3, 3, 3));
+    assert_eq!(archived_completions, 0);
+
+    let project_database = f.store.project_dir().join("state.db");
+    drop(f.store);
+    std::fs::copy(&pre_effect_database, &project_database).unwrap();
+    assert_eq!(
+        super::digest(&std::fs::read(&project_database).unwrap()),
+        pre_effect_database_sha256,
+        "restored project database must byte-match the exact archived pre-publication snapshot"
+    );
+    f.store = crate::collaboration_state::CollaborationStore::open(
+        &CollaborationRoot::under_host_state(&source_host),
+        &ProjectKey::parse("local-target-test").unwrap(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        crate::local_authority::status(&f.store).unwrap(),
+        frozen,
+        "the external frozen witness survives restoration of the older database"
+    );
+    assert!(matches!(
+        crate::local_authority::resume(&mut f.store, &frozen.epoch),
+        Err(crate::local_authority::AuthorityError::Stale)
+    ));
+    assert_eq!(
+        crate::local_authority::status(&f.store).unwrap(),
+        frozen,
+        "the archived effect cannot authorize resuming a database that lost its ledger history"
+    );
+    assert!(
+        old_worker
+            .is_alive()
+            .expect("inspect the stale controller worker after database restoration"),
+        "the stale controller process remains alive after restoring the older database"
+    );
+
+    let restored_counts_before = restore_guard_counts(&f.store);
+    let worker_exit_code = old_worker
+        .release_and_wait()
+        .expect("stale worker must be reaped after its post-restore mutation is refused");
+    assert_eq!(worker_exit_code, 0);
+    assert_eq!(
+        std::fs::read_to_string(source_host.join("fx13-worker-refused"))
+            .unwrap()
+            .trim(),
+        "frozen authority",
+        "the stale worker records exact frozen-authority refusal"
+    );
+    assert_eq!(
+        restore_guard_counts(&f.store),
+        restored_counts_before,
+        "the old controller worker cannot create a completion, run, budget attempt, or transport"
+    );
+    assert_eq!(
+        publication_operations(&broker, session.id, &intent.spec.commit).len(),
+        1,
+        "the restored old worker cannot cause a second external publication"
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/accepted"]),
+        intent.spec.commit,
+        "the exact published ref remains unchanged after restore refusal"
+    );
+    assert!(
+        process_is_alive(live_hook_pids.hook) && process_is_alive(live_hook_pids.delay),
+        "the receiver process remains alive until the stale worker is refused"
+    );
+    assert!(
+        !hook_finished.exists(),
+        "the receiver hook is held until after restore and refusal checks"
+    );
+
+    hook_process
+        .release()
+        .expect("release the exact owned receiver hook after restore checks");
+    let hook_pids = hook_process
+        .wait_for_exit()
+        .expect("receiver hook completion and both owned process exits are proven");
+    assert_eq!(hook_pids, live_hook_pids);
+
     let evidence = json!({
         "profile": "aethyme.local-controller/actual-publication-outcome-unknown-v1",
         "service": service,
@@ -656,15 +1093,40 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
             "candidate": intent.spec.commit,
         },
         "receiver_update": receiver_record.trim(),
+        "receiver_receipt_archive": {
+            "path": receipt_archive,
+            "sha256": receiver_receipt_sha256,
+            "bytes": receiver_receipt_bytes.len(),
+        },
         "receiver_process_cleanup": {
             "marker": hook_marker,
             "hook_pid": hook_pids.hook,
             "delay_pid": hook_pids.delay,
+            "alive_through_restore": true,
             "start_record": hook_started,
             "finish_record": hook_finished,
             "exited": true,
         },
+        "stale_worker_process": {
+            "pid": old_worker_pid,
+            "old_epoch": worker_epoch,
+            "alive_through_authority_rotation": true,
+            "alive_through_database_restore": true,
+            "post_restore_mutation_refused": true,
+            "exit_code": worker_exit_code,
+        },
         "remote_ref": remote_commit,
+        "restore_fence": {
+            "old_epoch": old_epoch,
+            "frozen_epoch": frozen.epoch.as_str(),
+            "pre_effect_database_sha256": pre_effect_database_sha256,
+            "unknown_database_archive_sha256": unknown_database_sha256,
+            "frozen_database_archive_sha256": frozen_database_sha256,
+            "restored_database_resume_refused": true,
+            "old_worker_mutation_refused": true,
+            "restored_counts_unchanged": true,
+            "remaining_frozen": true,
+        },
         "run_state": run_state,
         "native_roots": native_roots,
         "target_roots": target_roots,
