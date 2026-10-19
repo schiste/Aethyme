@@ -1585,9 +1585,8 @@ fn read_gc_state_file_with_link_limit(
     }
     let mut bytes = Vec::new();
     {
-        let mut bounded = file
-            .by_ref()
-            .take(GC_JOURNAL_ARCHIVE_MAX_BYTES.saturating_add(1));
+        let mut bounded =
+            std::io::Read::by_ref(&mut file).take(GC_JOURNAL_ARCHIVE_MAX_BYTES.saturating_add(1));
         bounded
             .read_to_end(&mut bytes)
             .map_err(|source| gc_io(path, source))?;
