@@ -733,16 +733,16 @@ impl Broker {
                     ),
                 });
             }
+            // The queue entry records the source base that was actually
+            // submitted and promoted. Session adoption fields are immutable
+            // ownership history and may predate an integration sync that
+            // refreshed this entry's base.
+            let source_base = entry.base_commit.as_str();
             let (independent_sha, changed_files) = build_ship_only_publication(
                 self,
                 &queue,
                 &entry,
-                session
-                    .adopted_head
-                    .as_deref()
-                    .or(session.adoption_base.as_deref())
-                    .or(session.diff_base.as_deref())
-                    .unwrap_or(&entry.base_commit),
+                source_base,
                 &promotion,
                 &remote_default.sha,
             )?;
@@ -785,13 +785,7 @@ impl Broker {
                 entry.session_id,
             )?;
             only_verification = Some(ShipOnlyVerification {
-                source_base_sha: session
-                    .adopted_head
-                    .as_deref()
-                    .or(session.adoption_base.as_deref())
-                    .or(session.diff_base.as_deref())
-                    .unwrap_or(&entry.base_commit)
-                    .into(),
+                source_base_sha: source_base.into(),
                 base_sha: remote_default.sha.clone(),
                 publication_tree_sha: self.repo_handle().commit_tree_id(&publication_sha)?,
                 changed_files,
