@@ -387,7 +387,7 @@ pub(crate) fn verify_historical_completion(
     )?;
     let completion_object = ObjectDigest::of(&completion_bytes);
     if archive::read_object(store, &completion_object)? != completion_bytes
-        || !completion_rooted(store, &completion_id, "object", completion_object.hex())?
+        || !completion_rooted(store, &completion_id, "object", &completion_object.hex())?
     {
         return Err(invalid("historical completion is not retained"));
     }
@@ -413,7 +413,7 @@ pub(crate) fn verify_historical_completion(
     let qualification_object = archive::ObjectDigest::of(&qualification_bytes);
     let qualification_object_retained = archive::read_object(store, &qualification_object)?;
     let qualification_rooted =
-        completion_rooted(store, &completion_id, "object", qualification_object.hex())?;
+        completion_rooted(store, &completion_id, "object", &qualification_object.hex())?;
     if qualification_record.id() != qualification_id
         || qualification_record.canonical_bytes() != qualification_bytes
         || qualification_object_retained != qualification_bytes
@@ -576,7 +576,7 @@ pub(crate) fn verify_historical_completion(
         ObjectDigest::of(&serde_json::to_vec(&execution.spec().build)?).hex()
     );
     let artifact_rooted =
-        completion_rooted(store, &completion_id, "object", artifact_object.hex())?;
+        completion_rooted(store, &completion_id, "object", &artifact_object.hex())?;
     let output_manifest_object = ObjectDigest::of_snapshot(&output_snapshot);
     let output_manifest_bytes = archive::read_object(store, &output_manifest_object)?;
     let output_manifest =
@@ -587,12 +587,12 @@ pub(crate) fn verify_historical_completion(
         store,
         &completion_id,
         "object",
-        output_manifest_object.hex(),
+        &output_manifest_object.hex(),
     )?;
     for entry in output_manifest.entries() {
         let digest = ObjectDigest::from_bytes(*entry.content_sha256());
         output_closure_retained &=
-            completion_rooted(store, &completion_id, "object", digest.hex())?;
+            completion_rooted(store, &completion_id, "object", &digest.hex())?;
         archive::read_object(store, &digest)?;
     }
     let artifact_matches = artifact_record.id() == artifact_id

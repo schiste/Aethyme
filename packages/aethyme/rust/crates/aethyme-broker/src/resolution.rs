@@ -573,6 +573,15 @@ impl ResolutionRequest {
     pub fn decision_key(&self) -> String {
         self.decision.key()
     }
+    /// Canonical decision fields used by the durable managed-attempt ledger.
+    pub(crate) fn managed_decision_fields(&self) -> (String, &'static str, String, String) {
+        (
+            self.decision.key(),
+            self.decision.kind,
+            join_set(&self.decision.members),
+            join_set(&self.decision.paths),
+        )
+    }
     /// The contributions the resolver decides between: for a conflict, those
     /// applied up to and including the conflicting step that touch a
     /// conflicting path; for failed checks, every contribution.
@@ -1144,8 +1153,9 @@ fn load_request_from_bytes(
     let mut baseline = collaboration_archive::retained(store, &baseline_snapshot)?
         .ok_or_else(|| mismatch("the baseline snapshot is no longer retained".into()))?;
     if let Some(repo) = repo {
-        let actual = composer::retain_commit(store, repo, &baseline_commit)?;
-        if actual.snapshot_id != baseline_snapshot {
+        if collaboration_archive::snapshot_of_commit(repo, &baseline_commit)?.id()
+            != baseline_snapshot
+        {
             return Err(mismatch(
                 "the baseline commit no longer names its snapshot".into(),
             ));

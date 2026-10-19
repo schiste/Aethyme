@@ -368,12 +368,12 @@ pub(crate) fn load_from_completion(
             "completion record is not canonically retained".into(),
         ));
     }
-    require_completion_root(store, completion, "object", completion_object.hex())?;
+    require_completion_root(store, completion, "object", &completion_object.hex())?;
     let (execution, inputs) = read_snapshot(store, locator)?;
     if completion_spec.revision != execution.target_revision().as_str() {
         return Err(SnapshotError::Stale);
     }
-    require_completion_root(store, completion, "object", locator.object.hex())?;
+    require_completion_root(store, completion, "object", &locator.object.hex())?;
     let mut total = 0;
     for input in inputs {
         require_completion_root(store, completion, "snapshot", input.as_str())?;

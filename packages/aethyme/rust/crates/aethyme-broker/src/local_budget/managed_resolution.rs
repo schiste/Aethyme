@@ -539,6 +539,7 @@ fn retained_status(
     let root_rows = root_statement
         .query_map([reservation_id.as_str()], |row| row.get::<_, String>(0))?
         .collect::<Result<BTreeSet<_>, _>>()?;
+    drop(root_statement);
     let stored_roots = root_rows
         .iter()
         .map(|root| RecordId::parse(root).map_err(|_| BudgetError::Stale))
@@ -670,7 +671,7 @@ fn load_retained_reservation(
     let state = parse_state(&row.1)?;
     let expected_nonce = reservation_nonce_for(&proof.target, &proof.issuer, &command.client_key);
     RecordId::parse(&spec.objective).map_err(|_| BudgetError::Stale)?;
-    if encoded.id() != reservation
+    if &encoded.id() != reservation
         || spec.issuer != proof.issuer
         || spec.target != proof.target
         || spec.revision != revision.as_str()
@@ -732,6 +733,8 @@ fn load_retained_attempt_binding(
     )?;
     let expected_binding = binding_id(reservation, row.1);
     let async_state: String;
+    let (decision_key, decision_kind, decision_members, decision_paths) =
+        request.managed_decision_fields();
     let attempt_matches: bool = connection.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM resolution_attempts
@@ -746,10 +749,10 @@ fn load_retained_attempt_binding(
          )",
         params![
             row.1,
-            request.decision.key(),
-            request.decision.kind,
-            canonical_set(&request.decision.members),
-            canonical_set(&request.decision.paths),
+            decision_key,
+            decision_kind,
+            decision_members,
+            decision_paths,
             command.request.id.as_str(),
             command.request.object.hex(),
             resolution::resolution_input_digest(request, &command.request.object),
@@ -824,10 +827,6 @@ fn conflict_trigger_digest(trigger: &Trigger) -> Result<String, BudgetError> {
         })).collect::<Vec<_>>(),
     }))?;
     Ok(ObjectDigest::of(&body).hex())
-}
-
-fn canonical_set(values: &BTreeSet<String>) -> String {
-    values.iter().cloned().collect::<Vec<_>>().join("\n")
 }
 
 fn parse_state(value: &str) -> Result<State, BudgetError> {
@@ -1176,7 +1175,7 @@ pub(super) fn admit_new(
                AND session_label IS NULL AND outcome IS NULL
                AND async_state IN ('dispatching','outcome_unknown')
          )",
-        params![validated.request.decision.key()],
+        params![validated.request.decision_key()],
         |row| row.get(0),
     )?;
     if unresolved_managed {
@@ -1497,6 +1496,7 @@ fn validate_digest(value: &str) -> Result<(), BudgetError> {
 mod tests {
     use super::*;
     use crate::collaboration_archive::{CommitOid, RetainedContribution};
+    use crate::local_budget::{authorize_objective, configure_project};
     use crate::local_target::{self, RequestedContribution};
     use std::cell::Cell;
 

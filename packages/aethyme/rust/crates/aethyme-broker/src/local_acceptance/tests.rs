@@ -714,7 +714,7 @@ fn age_archive_objects(store: &CollaborationStore) {
 
 #[test]
 fn historical_completion_roots_survive_revision_release_and_gc() {
-    let (mut v, mut broker, carrier, wave_id, intent, binding, receipt, evidence) =
+    let (mut v, mut broker, carrier, wave_id, _intent, binding, receipt, evidence) =
         accepted_wave_fixture();
     let grant = qualify_receipt(
         &mut v.f.store,
