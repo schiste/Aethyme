@@ -1,5 +1,7 @@
 # Local conflict-prefix continuation
 
+Last Updated: 2026-10-20
+
 Status: integration contract only. The composer helper, controller transition,
 retained readers and native gate join need combined source qualification before
 this path is enabled or described as complete. No provider dispatch or paid

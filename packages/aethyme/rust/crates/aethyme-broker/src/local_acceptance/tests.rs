@@ -1,4 +1,40 @@
 use super::*;
+
+#[test]
+fn legacy_historical_qualification_parses_but_missing_object_identity_fails_closed() {
+    let legacy: HistoricalQualificationSpec = serde_json::from_value(serde_json::json!({
+        "binding": "sha256:binding",
+        "receipt": "sha256:receipt",
+        "evidence": "sha256:evidence",
+        "execution": "sha256:execution",
+        "epoch": "sha256:epoch",
+        "expires_ms": 1
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        historical_object_digest(legacy.execution_object_sha256.as_deref(), "execution"),
+        Err(AcceptanceError::MissingHistoricalObjectIdentity(
+            "execution"
+        ))
+    ));
+    assert!(matches!(
+        historical_object_digest(
+            legacy.inventory_object_sha256.as_deref(),
+            "assertion inventory"
+        ),
+        Err(AcceptanceError::MissingHistoricalObjectIdentity(
+            "assertion inventory"
+        ))
+    ));
+    assert!(matches!(
+        historical_object_digest(legacy.artifact_object_sha256.as_deref(), "sealed artifact"),
+        Err(AcceptanceError::MissingHistoricalObjectIdentity(
+            "sealed artifact"
+        ))
+    ));
+}
+
 fn oid() -> String {
     "a".repeat(40)
 }
@@ -1391,6 +1427,34 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
     .unwrap();
     assert_eq!(grant.receipt(), &receipt);
     assert_eq!(grant.expires_ms(), evidence.expires_ms());
+
+    let qualification_body: Vec<u8> =
+        v.f.store
+            .read_connection()
+            .query_row(
+                "SELECT body FROM local_acceptance_qualifications WHERE id=?1",
+                [grant.id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    let qualification: serde_json::Value = serde_json::from_slice(&qualification_body).unwrap();
+    let expected_execution_object = v.execution.reference().object.hex();
+    let expected_inventory_object = inventory_object_for_execution(&v.f.store, &v.execution)
+        .unwrap()
+        .hex();
+    let expected_artifact_object = v.artifact.record_object().hex();
+    assert_eq!(
+        qualification["spec"]["execution_object_sha256"].as_str(),
+        Some(expected_execution_object.as_str())
+    );
+    assert_eq!(
+        qualification["spec"]["inventory_object_sha256"].as_str(),
+        Some(expected_inventory_object.as_str())
+    );
+    assert_eq!(
+        qualification["spec"]["artifact_object_sha256"].as_str(),
+        Some(expected_artifact_object.as_str())
+    );
 
     let current = current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant).unwrap();
     current.check_clock().unwrap();

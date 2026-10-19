@@ -169,10 +169,11 @@ fn generic_resolution_mutators_refuse_without_changing_pending_reservation() {
         )
         .unwrap();
 
-    assert!(matches!(
-        begin_attempt(&mut f.store, &owner, &reservation_id, 0),
-        Err(BudgetError::ResolutionRoute)
-    ));
+    let generic_attempt = begin_attempt(&mut f.store, &owner, &reservation_id, 0);
+    assert!(
+        matches!(&generic_attempt, Err(BudgetError::ResolutionRoute)),
+        "generic resolution attempt returned an unexpected error: {generic_attempt:?}"
+    );
     assert!(matches!(
         settle(&mut f.store, &owner, &attempt, units(1), &receipt()),
         Err(BudgetError::ResolutionRoute)

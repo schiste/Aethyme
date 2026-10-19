@@ -344,7 +344,14 @@ fn verify_historical_source_inner(
                 let proof = crate::resolution::read_retained_synthesized_result_for_refs(
                     store, request, result,
                 )?;
-                if proof.request.baseline().snapshot_id.as_str() != wave_spec.baseline
+                if proof.status.state != crate::resolution::ResolutionAttemptState::Settled
+                    || proof.status.outcome.as_deref() != Some("synthesized")
+                    || proof.status.response_sha256.is_none()
+                    || proof.status.request != *request
+                    || proof.status.request_sha256 != request.object.hex()
+                    || proof.status.result.as_ref() != Some(result)
+                    || proof.status.input_manifest_sha256 != proof.input_manifest.sha256
+                    || proof.request.baseline().snapshot_id.as_str() != wave_spec.baseline
                     || proof.group_record != *result
                 {
                     return Err(WaveError::Invalid(
@@ -1025,10 +1032,6 @@ fn verify_historical_seed_binding_git(
 impl Binding {
     pub(crate) fn key(&self) -> &RecordId {
         &self.key
-    }
-
-    pub(crate) fn source(&self) -> &SourceSnapshotId {
-        &self.source
     }
 
     /// The actual request baseline is the accepted commit. WaveSpec::baseline

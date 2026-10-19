@@ -1744,8 +1744,10 @@ struct AttemptChargeMetadata {
 }
 
 /// Insert one managed charge through the same decision/cap check as manual
-/// resolution. The caller owns the Immediate transaction and initializes the
-/// resolution ledger before invoking this helper.
+/// resolution. Managed rows begin as exported; the admission caller advances
+/// them to dispatching after it writes the reservation and its bindings. The
+/// caller owns the Immediate transaction and initializes the resolution
+/// ledger before invoking this helper.
 pub(crate) fn charge_managed_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     request: &ResolutionRequest,
@@ -1800,7 +1802,7 @@ fn charge_in_transaction_with_metadata(
              (decision_key, kind, members, paths, request_record_id, resolver, charged_ms,
               attempt_number, request_sha256, input_sha256, input_manifest_sha256,
               client_key, async_token, dispatch_limits, async_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'dispatching')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             decision.key(),
             decision.kind,
@@ -1816,6 +1818,11 @@ fn charge_in_transaction_with_metadata(
             client_key,
             async_token,
             dispatch_limits,
+            if metadata.is_some() {
+                "exported"
+            } else {
+                "dispatching"
+            },
         ],
     )?;
     let row = transaction.last_insert_rowid();

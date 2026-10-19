@@ -88,6 +88,10 @@ pub enum AcceptanceError {
     Invalid(String),
     #[error("acceptance binding is missing")]
     Missing,
+    #[error(
+        "historical qualification has no exact {0} object identity; legacy proof cannot be reused"
+    )]
+    MissingHistoricalObjectIdentity(&'static str),
     #[error("finite provider observation allowance exhausted; explicit new decision required")]
     Exhausted,
     #[error("provider is unavailable or its response is incomplete")]
@@ -267,6 +271,15 @@ struct HistoricalQualificationSpec {
     receipt: String,
     evidence: String,
     execution: String,
+    // `default` keeps old persisted specs readable for diagnostics. Historical
+    // verification refuses them when these raw CAS identities are absent; a
+    // domain-separated RecordId is not an object digest.
+    #[serde(default)]
+    execution_object_sha256: Option<String>,
+    #[serde(default)]
+    inventory_object_sha256: Option<String>,
+    #[serde(default)]
+    artifact_object_sha256: Option<String>,
     epoch: String,
     expires_ms: i64,
 }
@@ -303,12 +316,36 @@ struct HistoricalAssertionObservation {
     stderr: Option<String>,
 }
 
-fn object_for_record(record: &RecordId) -> Result<ObjectDigest, AcceptanceError> {
-    let hex = record
-        .as_str()
-        .strip_prefix("sha256:")
-        .ok_or_else(|| invalid("historical record ID"))?;
-    archive::parse_digest(hex).ok_or_else(|| invalid("historical record digest"))
+fn historical_object_digest(
+    value: Option<&str>,
+    kind: &'static str,
+) -> Result<ObjectDigest, AcceptanceError> {
+    let value = value.ok_or(AcceptanceError::MissingHistoricalObjectIdentity(kind))?;
+    archive::parse_digest(value).ok_or_else(|| invalid("historical object digest"))
+}
+
+fn inventory_object_for_execution(
+    store: &CollaborationStore,
+    execution: &ExecutionSnapshot,
+) -> Result<ObjectDigest, AcceptanceError> {
+    let harness_id =
+        aethyme_contracts::experimental_v0::SourceSnapshotId::parse(&execution.spec().harness)
+            .map_err(|_| invalid("historical verifier harness"))?;
+    let manifest_object = ObjectDigest::of_snapshot(&harness_id);
+    let manifest_bytes = archive::read_object(store, &manifest_object)?;
+    let manifest = archive::parse_manifest(&manifest_bytes).ok_or(AcceptanceError::Missing)?;
+    if manifest.id() != harness_id || manifest.manifest_bytes() != manifest_bytes {
+        return Err(invalid("historical verifier harness manifest"));
+    }
+    let entry = manifest
+        .entries()
+        .iter()
+        .find(|entry| entry.path() == b"harness/inventory.json")
+        .ok_or_else(|| invalid("historical verifier inventory file"))?;
+    if entry.kind() != aethyme_contracts::experimental_v0::source_snapshot::EntryKind::Regular {
+        return Err(invalid("historical verifier inventory file kind"));
+    }
+    Ok(ObjectDigest::from_bytes(*entry.content_sha256()))
 }
 
 fn lower_hex(value: &str, length: usize) -> bool {
@@ -410,6 +447,18 @@ pub(crate) fn verify_historical_completion(
     let binding_id = id(&qualification.binding)?;
     let evidence_id = id(&qualification.evidence)?;
     let execution_id = id(&qualification.execution)?;
+    let execution_object = historical_object_digest(
+        qualification.execution_object_sha256.as_deref(),
+        "execution",
+    )?;
+    let inventory_object = historical_object_digest(
+        qualification.inventory_object_sha256.as_deref(),
+        "assertion inventory",
+    )?;
+    let artifact_object = historical_object_digest(
+        qualification.artifact_object_sha256.as_deref(),
+        "sealed artifact",
+    )?;
     let qualification_object = archive::ObjectDigest::of(&qualification_bytes);
     let qualification_object_retained = archive::read_object(store, &qualification_object)?;
     let qualification_rooted =
@@ -487,7 +536,6 @@ pub(crate) fn verify_historical_completion(
         return Err(invalid("historical accepted receipt binding"));
     }
 
-    let execution_object = object_for_record(&execution_id)?;
     let execution = crate::execution_snapshot::load_from_completion(
         store,
         &crate::execution_snapshot::SnapshotRef {
@@ -548,9 +596,6 @@ pub(crate) fn verify_historical_completion(
     let rooted = completion_rooted(store, &completion_id, "object", &evidence_object_hex)?;
     let retained_evidence = archive::read_object(store, &evidence_object)?;
     let inventory_id = id(&execution.spec().assertion_inventory)?;
-    let inventory_object = object_for_record(&inventory_id)?;
-    let inventory_bytes = archive::read_object(store, &inventory_object)?;
-    let inventory = verifier::AssertionInventory::decode(&inventory_bytes)?;
     let harness_id =
         aethyme_contracts::experimental_v0::SourceSnapshotId::parse(&execution.spec().harness)
             .map_err(|_| invalid("historical verifier harness"))?;
@@ -566,7 +611,14 @@ pub(crate) fn verify_historical_completion(
     let inventory_embedded = inventory_entry.kind()
         == aethyme_contracts::experimental_v0::source_snapshot::EntryKind::Regular
         && ObjectDigest::from_bytes(*inventory_entry.content_sha256()) == inventory_object;
-    let artifact_object = object_for_record(&artifact_id)?;
+    if !inventory_embedded {
+        return Err(invalid("historical verifier inventory object identity"));
+    }
+    let inventory_bytes = archive::read_object_bounded(store, &inventory_object, 4 * 1024 * 1024)?;
+    let inventory = verifier::AssertionInventory::decode(&inventory_bytes)?;
+    if inventory.id() != inventory_id || inventory.canonical_bytes() != inventory_bytes {
+        return Err(invalid("historical verifier inventory record"));
+    }
     let artifact_bytes = archive::read_object(store, &artifact_object)?;
     let artifact_record = Record::decode(&artifact_bytes, &[&HISTORICAL_ARTIFACT])
         .map_err(|_| invalid("historical artifact record"))?;
@@ -1478,9 +1530,26 @@ fn qualify_receipt<'a>(
     {
         return Err(AcceptanceError::NotAccepted);
     }
+    let inventory_id = id(&execution.spec().assertion_inventory)?;
+    let inventory_object = inventory_object_for_execution(store, execution)?;
+    let inventory_bytes = archive::read_object_bounded(store, &inventory_object, 4 * 1024 * 1024)?;
+    let inventory = verifier::AssertionInventory::decode(&inventory_bytes)?;
+    if inventory.id() != inventory_id || inventory.canonical_bytes() != inventory_bytes {
+        return Err(invalid("verifier inventory object identity"));
+    }
     let record = canonical(
         &QUALIFICATION,
-        &serde_json::json!({"binding":binding.as_str(),"receipt":receipt.id.as_str(),"evidence":evidence.reference().id.as_str(),"execution":execution.id().as_str(),"epoch":owner.authority_epoch().as_str(),"expires_ms":evidence.expires_ms()}),
+        &serde_json::json!({
+            "binding":binding.as_str(),
+            "receipt":receipt.id.as_str(),
+            "evidence":evidence.reference().id.as_str(),
+            "execution":execution.id().as_str(),
+            "execution_object_sha256":execution.reference().object.hex(),
+            "inventory_object_sha256":inventory_object.hex(),
+            "artifact_object_sha256":artifact.record_object().hex(),
+            "epoch":owner.authority_epoch().as_str(),
+            "expires_ms":evidence.expires_ms()
+        }),
     )?;
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let object = archive::put_object(store, &record.canonical_bytes())?;
