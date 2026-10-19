@@ -8129,9 +8129,9 @@ mod tests {
         // Model a later journal with that same plan digest and newer progress.
         let mut next_journal: GcJournal = serde_json::from_slice(&first_bytes).unwrap();
         next_journal.rows_removed = next_journal.rows_removed.saturating_add(1);
-        let next_bytes = serde_json::to_vec_pretty(&next_journal).unwrap();
-        assert_ne!(next_bytes, first_bytes);
         write_journal(&journal_path, &next_journal).unwrap();
+        let next_bytes = std::fs::read(&journal_path).unwrap();
+        assert_ne!(next_bytes, first_bytes);
 
         let collision = broker.gc_abandon_pending(&digest).unwrap_err();
         assert!(matches!(
