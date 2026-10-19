@@ -79,6 +79,16 @@ fn fixture_worktree_registry_paths(host_state: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
+fn base_cli_helper_removes_inherited_preparation_cache() {
+    let command = common::broker_cli(CLI, &["status"]);
+    assert_eq!(
+        configured_env(&command).get(OsStr::new("AETHYME_PREPARATION_CACHE_ROOT")),
+        Some(&None),
+        "the unconfigured CLI helper must remove the inherited cache"
+    );
+}
+
+#[test]
 fn fixture_cli_replaces_poisoned_inherited_host_paths() {
     if std::env::var_os(CHILD_FLAG).is_some() {
         let poison_root = PathBuf::from(std::env::var_os("AETHYME_TEST_POISON_ROOT").unwrap());
@@ -99,6 +109,8 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             "poisoned-gate-database-scope"
         );
 
+        let poison_cache = poison_root.join("preparation-cache");
+        assert!(std::fs::read_dir(&poison_cache).unwrap().next().is_none());
         let repo = fixture();
         let unrelated = fixture();
         let mut command = common::broker_cli_for_fixture(
@@ -110,6 +122,9 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         let env = configured_env(&command);
         let fixture_state = common::fixture_host_state_dir(repo.path());
         let fixture_cache = common::fixture_host_cache_dir(repo.path());
+        let fixture_preparation_cache = common::fixture_preparation_cache_root(repo.path())
+            .canonicalize()
+            .unwrap();
 
         assert_eq!(
             env.get(OsStr::new("AETHYME_HOST_STATE_DIR")),
@@ -118,6 +133,10 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         assert_eq!(
             env.get(OsStr::new("AETHYME_HOST_CACHE_DIR")),
             Some(&Some(fixture_cache.clone().into_os_string()))
+        );
+        assert_eq!(
+            env.get(OsStr::new("AETHYME_PREPARATION_CACHE_ROOT")),
+            Some(&Some(fixture_preparation_cache.into_os_string()))
         );
         for removed in [
             "AETHYME_BROKER_DB",
@@ -196,10 +215,15 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
                 path.display()
             );
         }
+        assert!(
+            std::fs::read_dir(&poison_cache).unwrap().next().is_none(),
+            "fixture must not initialize the inherited preparation cache"
+        );
         return;
     }
 
     let poison_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(poison_root.path().join("preparation-cache")).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -208,6 +232,10 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         ])
         .env(CHILD_FLAG, "1")
         .env("AETHYME_TEST_POISON_ROOT", poison_root.path())
+        .env(
+            "AETHYME_PREPARATION_CACHE_ROOT",
+            poison_root.path().join("preparation-cache"),
+        )
         .env(
             "AETHYME_HOST_STATE_DIR",
             poison_root.path().join("host-state"),
@@ -239,9 +267,22 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
 fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
     if std::env::var_os(LIBRARY_CHILD_FLAG).is_some() {
         let poison_root = PathBuf::from(std::env::var_os("AETHYME_TEST_POISON_ROOT").unwrap());
+        let poison_cache = poison_root.join("preparation-cache");
+        assert!(std::fs::read_dir(&poison_cache).unwrap().next().is_none());
         let repo = fixture();
         let mut broker = common::open_fixture_repository_broker(&repo).unwrap();
         let owned_root_path = broker.worktree_root().to_path_buf();
+        let owned_cache = common::fixture_preparation_cache_root(repo.owner_path())
+            .canonicalize()
+            .unwrap();
+        let mut child_context = Command::new("not-executed");
+        broker
+            .configure_storage_context_for_child(&mut child_context)
+            .unwrap();
+        assert_eq!(
+            configured_env(&child_context).get(OsStr::new("AETHYME_PREPARATION_CACHE_ROOT")),
+            Some(&Some(owned_cache.clone().into_os_string()))
+        );
         let session = broker.start_worktree("library fixture", None).unwrap();
         let owned_root = owned_root_path.canonicalize().unwrap();
         let checkout = PathBuf::from(session.worktree_path);
@@ -288,14 +329,20 @@ fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
         .unwrap();
         drop(repo);
         assert!(!checkout.exists(), "fixture teardown retained its checkout");
+        assert!(!owned_cache.exists(), "fixture teardown retained its cache");
         assert!(
             !owned_root.exists(),
             "fixture teardown retained its worktree root"
+        );
+        assert!(
+            std::fs::read_dir(&poison_cache).unwrap().next().is_none(),
+            "fixture must not initialize the inherited preparation cache"
         );
         return;
     }
 
     let poison_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(poison_root.path().join("preparation-cache")).unwrap();
     let report = poison_root.path().join("paths.txt");
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -305,6 +352,10 @@ fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
         ])
         .env(LIBRARY_CHILD_FLAG, "1")
         .env("AETHYME_TEST_POISON_ROOT", poison_root.path())
+        .env(
+            "AETHYME_PREPARATION_CACHE_ROOT",
+            poison_root.path().join("preparation-cache"),
+        )
         .env("AETHYME_TEST_FIXTURE_LIBRARY_PATH_REPORT", &report)
         .env(
             "AETHYME_HOST_STATE_DIR",
