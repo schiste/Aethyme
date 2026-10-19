@@ -81,7 +81,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     let recipient = broker
         .adopt(&recipient_worktree, Some("recipient"))
         .unwrap();
-    let send_command = child_command(
+    let mut send_command = child_command(
         &broker,
         &sender_worktree,
         &[
@@ -123,7 +123,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     let payload = event.payload_json.unwrap();
     assert!(payload.contains(&format!("\"note_id\":{note_id}")));
     assert!(!payload.contains("coordinate"), "{payload}");
-    let agents_command = child_command(
+    let mut agents_command = child_command(
         &broker,
         &recipient_worktree,
         &["advanced", "agents", "--json"],
@@ -137,8 +137,8 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     assert!(surfaced_stderr.contains("coordinate src/router.rs before editing"));
     assert!(surfaced_stderr.contains(&format!("--session {} --id {note_id}", recipient.id)));
 
-    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
-    let listed_command = child_command(
+    let broker = open_fixture_repository_broker(&fixture).unwrap();
+    let mut listed_command = child_command(
         &broker,
         &recipient_worktree,
         &[
@@ -150,7 +150,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
             "--json",
         ],
     );
-    let wrong_recipient_command = child_command(
+    let mut wrong_recipient_command = child_command(
         &broker,
         &sender_worktree,
         &[
@@ -163,7 +163,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
             &note_id.to_string(),
         ],
     );
-    let acknowledged_command = child_command(
+    let mut acknowledged_command = child_command(
         &broker,
         &recipient_worktree,
         &[
@@ -177,12 +177,12 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
             "--json",
         ],
     );
-    let quiet_command = child_command(
+    let mut quiet_command = child_command(
         &broker,
         &recipient_worktree,
         &["advanced", "agents", "--json"],
     );
-    let multiline_command = child_command(
+    let mut multiline_command = child_command(
         &broker,
         &sender_worktree,
         &[

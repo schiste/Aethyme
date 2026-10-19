@@ -9,8 +9,6 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::Broker;
-
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)

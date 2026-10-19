@@ -8,8 +8,8 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
+use aethyme_broker::BrokerOpError;
 use aethyme_broker::composition::{CompositionOutcome, Refusal};
-use aethyme_broker::{Broker, BrokerOpError};
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
