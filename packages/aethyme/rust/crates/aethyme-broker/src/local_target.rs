@@ -1030,6 +1030,47 @@ pub fn retain_artifacts(
     retain_artifacts_under_guards(store, id, snapshots, objects, &permit)
 }
 
+/// Check that an artifact's record, manifest, and file objects are still
+/// retained by its unreleased target revision. The caller holds the archive
+/// guard through this check and reconstruction so GC cannot remove an object
+/// between the two steps.
+pub(crate) fn artifact_objects_are_retained(
+    store: &CollaborationStore,
+    revision: &RecordId,
+    objects: &[ObjectDigest],
+    archive: &crate::collaboration_gc::ArchiveUse,
+) -> Result<bool, TargetError> {
+    if !archive.covers(store) {
+        return Err(TargetError::Unauthorized);
+    }
+    let released: Option<bool> = store
+        .read_connection()
+        .query_row(
+            "SELECT released FROM local_target_revisions WHERE revision = ?1",
+            [revision.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match released {
+        None | Some(true) => return Ok(false),
+        Some(false) => {}
+    }
+    for object in objects {
+        let rooted: bool = store.read_connection().query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM local_target_roots
+                 WHERE revision = ?1 AND kind = 'object' AND reference = ?2
+             )",
+            rusqlite::params![revision.as_str(), object.hex()],
+            |row| row.get(0),
+        )?;
+        if !rooted {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) struct ArtifactRetentionPermit<'a> {
     owner: &'a ControllerOwner,
     _archive: &'a crate::collaboration_gc::ArchiveUse,

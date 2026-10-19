@@ -19,22 +19,84 @@ fn archive(entries: &[(&[u8], tar::EntryType, u32, &[u8])]) -> tempfile::NamedTe
 }
 
 #[test]
-fn artifact_reconstruction_obeys_persisted_build_output_limit() {
-    let f = Fixture::new();
-    let id = f.a.result.snapshot_id.clone();
-    let expected =
-        archive::validate_snapshot_bounded(&f.store, &id, snapshot::RECONSTRUCTION_LIMITS, |_| {})
+fn artifact_reconstruction_uses_target_rooted_objects_and_named_limits() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "artifact-output", "appointed").unwrap();
+    let revision_spec = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, revision_spec).unwrap();
+    let output = b"sealed build output\n";
+    let expected = SourceSnapshot::new(vec![
+        aethyme_contracts::experimental_v0::SourceEntry::from_content(
+            b"app.txt".to_vec(),
+            aethyme_contracts::experimental_v0::EntryKind::Regular,
+            output,
+        ),
+    ])
+    .unwrap();
+    let content_object = archive::put_object(&f.store, output).unwrap();
+    let manifest_object = archive::put_object(&f.store, &expected.manifest_bytes()).unwrap();
+    let record_object = archive::put_object(&f.store, b"sealed artifact record").unwrap();
+    assert_eq!(content_object, ObjectDigest::of(output));
+    assert_eq!(manifest_object, ObjectDigest::of_snapshot(&expected.id()));
+    assert!(
+        archive::retained(&f.store, &expected.id())
             .unwrap()
-            .snapshot()
-            .clone();
-    let output_bytes = f.a.result.content_bytes;
-    assert!(output_bytes > 0);
+            .is_none()
+    );
 
     let scratch = tempfile::tempdir().unwrap();
-    let refused_dest = scratch.path().join("refused");
-    let error =
-        reconstruct_artifact_output(&f.store, &id, &refused_dest, &expected, output_bytes - 1)
-            .unwrap_err();
+    let unrooted_dest = scratch.path().join("unrooted");
+    let error = reconstruct_artifact_output(
+        &f.store,
+        &revision.id,
+        &record_object,
+        &unrooted_dest,
+        &expected,
+        output.len() as u64,
+    )
+    .unwrap_err();
+    assert!(matches!(error, SupervisorError::Tampered(_)));
+    assert!(!unrooted_dest.exists());
+
+    target::retain_artifacts(
+        &mut f.store,
+        &owner,
+        &revision.id,
+        &[],
+        &[record_object, manifest_object],
+    )
+    .unwrap();
+    let unrooted_content_dest = scratch.path().join("unrooted-content");
+    let error = reconstruct_artifact_output(
+        &f.store,
+        &revision.id,
+        &record_object,
+        &unrooted_content_dest,
+        &expected,
+        output.len() as u64,
+    )
+    .unwrap_err();
+    assert!(matches!(error, SupervisorError::Tampered(_)));
+    assert!(!unrooted_content_dest.exists());
+
+    target::retain_artifacts(
+        &mut f.store,
+        &owner,
+        &revision.id,
+        &[],
+        &[record_object, manifest_object, content_object],
+    )
+    .unwrap();
+    let refused_dest = scratch.path().join("output-limit");
+    let error = reconstruct_artifact_output(
+        &f.store,
+        &revision.id,
+        &record_object,
+        &refused_dest,
+        &expected,
+        output.len() as u64 - 1,
+    )
+    .unwrap_err();
     assert!(matches!(
         error,
         SupervisorError::Archive(archive::ArchiveError::ReconstructionLimit {
@@ -44,15 +106,47 @@ fn artifact_reconstruction_obeys_persisted_build_output_limit() {
     ));
     assert!(!refused_dest.exists());
 
+    let archive_guard = crate::collaboration_gc::archive_use(&f.store).unwrap();
+    let objects = [record_object, manifest_object, content_object];
+    assert!(
+        target::artifact_objects_are_retained(&f.store, &revision.id, &objects, &archive_guard,)
+            .unwrap()
+    );
+    let mut file_limits = snapshot::RECONSTRUCTION_LIMITS.with_max_output_bytes(output.len());
+    file_limits.max_file_bytes = output.len() - 1;
+    let file_refused_dest = scratch.path().join("file-limit");
+    let error = archive::reconstruct_artifact_bounded_under_guard(
+        &f.store,
+        &expected,
+        &file_refused_dest,
+        file_limits,
+        &archive_guard,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        archive::ArchiveError::ReconstructionLimit {
+            resource: "file_bytes",
+            ..
+        }
+    ));
+    assert!(!file_refused_dest.exists());
+    drop(archive_guard);
+
     let accepted_dest = scratch.path().join("accepted");
-    std::fs::create_dir(&accepted_dest).unwrap();
-    let reconstructed =
-        reconstruct_artifact_output(&f.store, &id, &accepted_dest, &expected, output_bytes)
-            .unwrap();
+    let reconstructed = reconstruct_artifact_output(
+        &f.store,
+        &revision.id,
+        &record_object,
+        &accepted_dest,
+        &expected,
+        output.len() as u64,
+    )
+    .unwrap();
     assert_eq!(reconstructed, expected);
     assert_eq!(
-        std::fs::read(accepted_dest.join("one.txt")).unwrap(),
-        b"A\n"
+        std::fs::read(accepted_dest.join("app.txt")).unwrap(),
+        output
     );
 }
 

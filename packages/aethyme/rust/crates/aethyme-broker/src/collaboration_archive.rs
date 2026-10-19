@@ -2026,6 +2026,17 @@ fn validate_snapshot_bounded_inner(
         ));
     }
 
+    validate_manifest_bounded_inner(store, id, None, Some(&retained), limits, inspect_content)
+}
+
+fn validate_manifest_bounded_inner(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    expected: Option<&SourceSnapshot>,
+    expected_retained: Option<&RetainedSnapshot>,
+    limits: ReconstructionLimits,
+    inspect_content: &mut impl FnMut(&[u8]),
+) -> Result<ValidatedSnapshot, ArchiveError> {
     let manifest_digest = ObjectDigest::of_snapshot(id);
     let manifest_size = object_size(store, &manifest_digest)?;
     if manifest_size > limits.max_manifest_bytes as u64 {
@@ -2041,7 +2052,10 @@ fn validate_snapshot_bounded_inner(
         digest: manifest_digest.hex(),
     };
     let snapshot = parse_manifest(&manifest).ok_or_else(corrupt)?;
-    if snapshot.id() != *id || snapshot.manifest_bytes() != manifest {
+    if snapshot.id() != *id
+        || snapshot.manifest_bytes() != manifest
+        || expected.is_some_and(|expected| expected != &snapshot)
+    {
         return Err(corrupt());
     }
     validate_reconstruction_shape(&snapshot, limits)?;
@@ -2070,9 +2084,10 @@ fn validate_snapshot_bounded_inner(
             ));
         }
     }
-    if retained.entry_count != snapshot.entries().len() as u64
-        || retained.content_bytes != output_bytes
-    {
+    if expected_retained.is_some_and(|retained| {
+        retained.entry_count != snapshot.entries().len() as u64
+            || retained.content_bytes != output_bytes
+    }) {
         return Err(corrupt());
     }
 
@@ -2216,6 +2231,37 @@ pub(crate) fn reconstruct_bounded(
     })?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let validated = validate_snapshot_bounded_inner(store, id, limits, &mut |_| {})?;
+    prepare_empty_destination(dest)?;
+    materialize_bounded(store, &validated.snapshot, dest, limits)?;
+    Ok(validated.snapshot)
+}
+
+/// Reconstruct a build output manifest whose exact object references are
+/// rooted by the caller's target revision. Unlike source snapshots, artifact
+/// manifests are retained as target-rooted objects and have no
+/// `retained_snapshots` index row. The caller must verify those roots while
+/// holding `archive_use`.
+pub(crate) fn reconstruct_artifact_bounded_under_guard(
+    store: &CollaborationStore,
+    expected: &SourceSnapshot,
+    dest: &Path,
+    limits: ReconstructionLimits,
+    archive_use: &crate::collaboration_gc::ArchiveUse,
+) -> Result<SourceSnapshot, ArchiveError> {
+    let path = crate::collaboration_gc::lock_path(store);
+    if !archive_use.covers(store) {
+        return Err(ArchiveError::Io {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive-use guard belongs to a different collaboration store",
+            ),
+        });
+    }
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let id = expected.id();
+    let validated =
+        validate_manifest_bounded_inner(store, &id, Some(expected), None, limits, &mut |_| {})?;
     prepare_empty_destination(dest)?;
     materialize_bounded(store, &validated.snapshot, dest, limits)?;
     Ok(validated.snapshot)
@@ -3258,6 +3304,35 @@ mod tests {
             }
         ));
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn bounded_validation_rejects_retained_metadata_before_reading_content() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE retained_snapshots SET content_bytes=?1 WHERE snapshot_id=?2",
+                rusqlite::params![
+                    i64::try_from(retained.content_bytes - 1).unwrap(),
+                    retained.snapshot_id.as_str()
+                ],
+            )
+            .unwrap();
+
+        let mut inspected_entries = 0;
+        let error = validate_snapshot_bounded(
+            &store,
+            &retained.snapshot_id,
+            exact_fixture_limits(&store, &retained),
+            |_| inspected_entries += 1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ArchiveError::CorruptObject { .. }));
+        assert_eq!(inspected_entries, 0);
     }
 
     #[test]

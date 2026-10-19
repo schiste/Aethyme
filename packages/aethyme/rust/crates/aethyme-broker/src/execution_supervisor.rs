@@ -218,14 +218,37 @@ pub(crate) struct ObservedCommand {
 
 fn reconstruct_artifact_output(
     store: &CollaborationStore,
-    id: &aethyme_contracts::experimental_v0::SourceSnapshotId,
+    target_revision: &RecordId,
+    record: &ObjectDigest,
     dest: &Path,
     expected: &SourceSnapshot,
     max_output_bytes: u64,
 ) -> Result<SourceSnapshot, SupervisorError> {
     let max_output_bytes = usize::try_from(max_output_bytes).map_err(|_| SupervisorError::Limit)?;
     let limits = snapshot::RECONSTRUCTION_LIMITS.with_max_output_bytes(max_output_bytes);
-    let manifest = archive::reconstruct_bounded(store, id, dest, limits)?;
+    let archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let id = expected.id();
+    let mut objects = Vec::with_capacity(expected.entries().len() + 2);
+    objects.push(*record);
+    objects.push(ObjectDigest::of_snapshot(&id));
+    objects.extend(
+        expected
+            .entries()
+            .iter()
+            .map(|entry| ObjectDigest::from_bytes(*entry.content_sha256())),
+    );
+    if !target::artifact_objects_are_retained(store, target_revision, &objects, &archive_guard)? {
+        return Err(SupervisorError::Tampered(
+            "artifact objects are not retained by the target revision".into(),
+        ));
+    }
+    let manifest = archive::reconstruct_artifact_bounded_under_guard(
+        store,
+        expected,
+        dest,
+        limits,
+        &archive_guard,
+    )?;
     if manifest != *expected {
         return Err(SupervisorError::Tampered("sealed artifact mismatch".into()));
     }
@@ -276,7 +299,8 @@ impl DockerExecutor {
 
         let manifest = reconstruct_artifact_output(
             store,
-            &artifact.output_id(),
+            execution.target_revision(),
+            &artifact.record,
             &materialized,
             &artifact.output.manifest,
             spec.profile.build_limits.output_bytes,
