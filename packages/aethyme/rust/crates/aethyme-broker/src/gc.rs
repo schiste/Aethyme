@@ -4382,9 +4382,20 @@ impl Broker {
         }
 
         while !journal.remaining_rows.is_empty() && !check_deadline(deadline) {
-            let count = journal.remaining_rows.len().min(128);
+            let count = journal
+                .remaining_rows
+                .len()
+                .min(crate::error::GC_ROW_DELETE_BATCH_SIZE);
             let batch = journal.remaining_rows[..count].to_vec();
-            self.store().delete_gc_rows(&batch)?;
+            self.store().delete_gc_rows(
+                &batch,
+                cutoff(journal.evaluated_at, journal.policy.terminal_events_days),
+                cutoff(journal.evaluated_at, journal.policy.gate_results_days),
+                cutoff(
+                    journal.evaluated_at,
+                    journal.policy.terminal_merge_queue_days,
+                ),
+            )?;
             journal.rows_removed = journal.rows_removed.saturating_add(batch.len());
             journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(
                 batch

@@ -109,6 +109,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `AETHYME_WORKTREE_ROOT` as the parent container plus the broker's repository
   ID, and require the resolved broker root to match the plan root before apply.
   If they differ, stop and create a fresh plan from the captured environment.
+- For resumable GC row deletion, recheck current candidate metadata and every
+  retention protection inside the same immediate database transaction that
+  deletes each bounded batch. A saved journal records prior authorization but
+  does not freeze current eligibility; accept missing rows for crash replay only
+  after confirming they are absent. Test resume after a public state mutation
+  changes a row's protection.
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove
