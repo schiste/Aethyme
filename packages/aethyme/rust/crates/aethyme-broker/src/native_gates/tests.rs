@@ -3,7 +3,7 @@ use crate::collaboration_gc::{self as gc, GcHooks};
 use crate::collaboration_state::{CollaborationRoot, ProjectKey};
 use crate::local_target::tests::{Fixture, git};
 use rusqlite::{OptionalExtension, TransactionBehavior};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn checkout_source_bound_refuses_before_materialization_and_accepts_boundary() {
@@ -46,11 +46,12 @@ fn checkout_source_bound_refuses_before_materialization_and_accepts_boundary() {
 }
 
 struct Setup {
-    f: Fixture,
-    owner: Option<ControllerOwner>,
+    // Drop the broker, controller lock, and then fixture owners in that order.
     broker: Broker,
+    owner: Option<ControllerOwner>,
+    f: Fixture,
     wave: RecordId,
-    trust: std::path::PathBuf,
+    trust: PathBuf,
 }
 impl Drop for Setup {
     fn drop(&mut self) {
@@ -62,6 +63,64 @@ impl Setup {
         self.owner.take().expect("setup owner is present")
     }
 }
+
+fn open_fixture_broker(repo: &Path, fixture_owner: &Path) -> Broker {
+    let fixture_owner = fixture_owner.canonicalize().unwrap();
+    let host_cache = fixture_owner.join("broker-host-cache");
+    let preparation_cache = fixture_owner.join("preparation-cache");
+    let worktree_root = fixture_owner.join("worktrees");
+    let host_operation_db = fixture_owner.join("host-operations.db");
+    let collaboration_root = CollaborationRoot::under_host_state(&fixture_owner)
+        .path()
+        .to_path_buf();
+    for path in [
+        &host_cache,
+        &preparation_cache,
+        &worktree_root,
+        &collaboration_root,
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    let broker = Broker::open_with_options(
+        repo,
+        crate::BrokerOpenOptions::default()
+            .with_host_state_dir(&fixture_owner)
+            .with_host_cache_dir(&host_cache)
+            .with_preparation_cache_root(&preparation_cache)
+            .with_host_operation_database(host_operation_db.clone())
+            .with_worktree_root(worktree_root.clone())
+            .with_collaboration_state(collaboration_root.clone()),
+    )
+    .unwrap();
+    let captured = broker.storage_context();
+    assert_eq!(
+        captured.host_state_dir.as_deref(),
+        Some(fixture_owner.as_path())
+    );
+    assert_eq!(
+        captured.host_cache_dir.as_deref(),
+        Some(host_cache.as_path())
+    );
+    assert_eq!(
+        captured.preparation_cache_root_override.as_deref(),
+        Some(preparation_cache.as_path())
+    );
+    assert_eq!(
+        captured.host_operation_db_path.as_deref(),
+        Some(host_operation_db.as_path())
+    );
+    assert_eq!(
+        captured.worktree_root_override.as_deref(),
+        Some(worktree_root.as_path())
+    );
+    assert_eq!(
+        captured.collaboration_state_dir.as_deref(),
+        Some(collaboration_root.as_path())
+    );
+    broker
+}
+
 fn setup(config: Option<&str>) -> Setup {
     setup_with_legacy_candidate(config, false)
 }
@@ -137,17 +196,20 @@ fn setup_with_legacy_candidate(config: Option<&str>, legacy: bool) -> Setup {
         }
     };
     let p = policy(f._repo.path(), &base).unwrap();
-    let trust = crate::broker::gate_trust::record_trust(
+    let fixture_host_state = f._host.path().canonicalize().unwrap();
+    let trust = crate::broker::gate_trust::record_trust_for_host_state(
         f._repo.path(),
+        &fixture_host_state,
         &[&p.trust.policy_sha256],
         "independent synthetic test operator",
     )
     .unwrap();
-    let broker = Broker::open(f._repo.path()).unwrap();
+    assert!(trust.starts_with(&fixture_host_state));
+    let broker = open_fixture_broker(f._repo.path(), &fixture_host_state);
     Setup {
-        f,
-        owner: Some(owner),
         broker,
+        owner: Some(owner),
+        f,
         wave,
         trust,
     }
@@ -1182,13 +1244,16 @@ fn prepared_job_cannot_borrow_another_repository_trust_or_survive_revocation() {
         ],
     );
     let p = policy(&repo, &commit(&job.spec.base_commit).unwrap()).unwrap();
-    let trust = crate::broker::gate_trust::record_trust(
+    let foreign_host_state = other.path().canonicalize().unwrap();
+    let trust = crate::broker::gate_trust::record_trust_for_host_state(
         &repo,
+        &foreign_host_state,
         &[&p.trust.policy_sha256],
         "independent synthetic test operator",
     )
     .unwrap();
-    let mut foreign = Broker::open(&repo).unwrap();
+    assert!(trust.starts_with(&foreign_host_state));
+    let mut foreign = open_fixture_broker(&repo, &foreign_host_state);
     assert!(matches!(
         run(
             &mut s.f.store,
