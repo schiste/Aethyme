@@ -94,21 +94,17 @@ fn attach_gc_row_content_fingerprints(
     conn: &rusqlite::Connection,
     candidates: &mut [crate::GcRowCandidate],
 ) -> Result<(), BrokerError> {
-    let kinds = [
-        crate::GcRowKind::Event,
-        crate::GcRowKind::GateResult,
-        crate::GcRowKind::Advisory,
-        crate::GcRowKind::EntryExposure,
-        crate::GcRowKind::IntegrationReconciliationEntry,
-        crate::GcRowKind::MergeQueue,
-    ];
-    for kind in kinds {
-        let ids = candidates
-            .iter()
-            .filter(|candidate| candidate.kind == kind)
-            .map(|candidate| candidate.id)
-            .collect::<Vec<_>>();
-        if ids.is_empty() {
+    candidates.sort_by_key(|candidate| (candidate.kind, candidate.id));
+    let mut start = 0;
+    while start < candidates.len() {
+        let kind = candidates[start].kind;
+        let mut end = start + 1;
+        while end < candidates.len() && candidates[end].kind == kind {
+            end += 1;
+        }
+        let kind_candidates = &mut candidates[start..end];
+        start = end;
+        if kind_candidates.is_empty() {
             continue;
         }
 
@@ -118,7 +114,7 @@ fn attach_gc_row_content_fingerprints(
             .collect::<Vec<_>>()
             .join(", ");
         let mut statement = conn.prepare(&format!(
-            "SELECT * FROM {table} WHERE id IN ({placeholders})"
+            "SELECT * FROM {table} WHERE id IN ({placeholders}) ORDER BY id"
         ))?;
         let column_names = statement
             .column_names()
@@ -130,14 +126,13 @@ fn attach_gc_row_content_fingerprints(
             .position(|name| name == "id")
             .ok_or_else(|| BrokerError::GcRowEligibilityChanged {
                 kind: table.into(),
-                id: ids[0],
+                id: kind_candidates[0].id,
             })?;
-        let mut fingerprints = BTreeMap::new();
-        for chunk in ids.chunks(crate::error::GC_ROW_DELETE_BATCH_SIZE) {
+        for chunk in kind_candidates.chunks_mut(crate::error::GC_ROW_DELETE_BATCH_SIZE) {
             let mut parameters =
                 vec![rusqlite::types::Value::Null; crate::error::GC_ROW_DELETE_BATCH_SIZE];
-            for (index, id) in chunk.iter().enumerate() {
-                parameters[index] = rusqlite::types::Value::Integer(*id);
+            for (index, candidate) in chunk.iter().enumerate() {
+                parameters[index] = rusqlite::types::Value::Integer(candidate.id);
             }
             let rows = statement
                 .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
@@ -145,22 +140,28 @@ fn attach_gc_row_content_fingerprints(
                     let fingerprint = gc_row_content_fingerprint(kind, &column_names, row)?;
                     Ok((id, fingerprint))
                 })?
-                .collect::<Result<Vec<_>, _>>()?;
-            fingerprints.extend(rows);
-        }
-        for candidate in candidates
-            .iter_mut()
-            .filter(|candidate| candidate.kind == kind)
-        {
-            candidate.content_fingerprint =
-                Some(fingerprints.remove(&candidate.id).ok_or_else(|| {
-                    BrokerError::GcRowEligibilityChanged {
-                        kind: table.into(),
-                        id: candidate.id,
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter();
+            for candidate in chunk {
+                candidate.content_fingerprint = Some(match rows.next() {
+                    Some((id, fingerprint)) if id == candidate.id => fingerprint,
+                    _ => {
+                        return Err(BrokerError::GcRowEligibilityChanged {
+                            kind: table.into(),
+                            id: candidate.id,
+                        });
                     }
-                })?);
+                });
+            }
+            if let Some((id, _)) = rows.next() {
+                return Err(BrokerError::GcRowEligibilityChanged {
+                    kind: table.into(),
+                    id,
+                });
+            }
         }
     }
+    debug_assert_eq!(start, candidates.len());
     Ok(())
 }
 
@@ -1493,7 +1494,6 @@ impl BrokerStore {
         })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
         attach_gc_row_content_fingerprints(conn, &mut candidates)?;
-        candidates.sort_by_key(|row| (row.kind, row.id));
         Ok(candidates)
     }
 
