@@ -263,29 +263,17 @@ fn snapshot(store: &CollaborationStore, source: &str) -> Result<SourceSnapshot, 
     if archive::retained(store, &source)?.is_none() {
         return Err(invalid("source is not retained"));
     }
-    let bytes = archive::read_object(store, &ObjectDigest::of_snapshot(&source))?;
-    let manifest = archive::parse_manifest(&bytes).ok_or_else(|| invalid("source manifest"))?;
-    if manifest.id() != source || manifest.manifest_bytes() != bytes {
+    let validated = archive::validate_snapshot_bounded(
+        store,
+        &source,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS,
+        |_| {},
+    )?;
+    let manifest = validated.snapshot().clone();
+    if manifest.id() != source {
         return Err(invalid("source manifest digest"));
     }
     crate::execution_snapshot::portable(&manifest)?;
-    let mut size = 0usize;
-    if manifest.entries().len() > 8192 {
-        return Err(invalid("generation file limit"));
-    }
-    for entry in manifest.entries() {
-        let bytes =
-            archive::read_object(store, &ObjectDigest::from_bytes(*entry.content_sha256()))?;
-        if bytes.len() > 64 * 1024 * 1024 {
-            return Err(invalid("generation file size"));
-        }
-        size = size
-            .checked_add(bytes.len())
-            .ok_or_else(|| invalid("generation size"))?;
-        if size > 256 * 1024 * 1024 {
-            return Err(invalid("generation size"));
-        }
-    }
     Ok(manifest)
 }
 fn roots(
@@ -566,7 +554,12 @@ fn prepare_with(
         Err(e) => return Err(e.into()),
     }
     let root = dir.join("source");
-    archive::reconstruct(store, &manifest.id(), &root)?;
+    archive::reconstruct_bounded(
+        store,
+        &manifest.id(),
+        &root,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS,
+    )?;
     let scratch = tempfile::tempdir_in(&dir)?;
     let (tree, commit) =
         crate::composer::generation_checkout(store, &root, scratch.path(), &manifest)?;

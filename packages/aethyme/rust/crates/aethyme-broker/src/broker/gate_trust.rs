@@ -584,7 +584,7 @@ pub(crate) fn status(dir: &Path) -> Result<GateTrustStatus, BrokerOpError> {
         repository: main_root.to_string_lossy().into_owned(),
         record_path: path.to_string_lossy().into_owned(),
         trusted,
-        next_action: (!trusted).then(|| trust_command(&main_root)),
+        next_action: (!trusted).then(|| trust_command(&checkout_root)),
         sources,
         trusted_policies,
     })
