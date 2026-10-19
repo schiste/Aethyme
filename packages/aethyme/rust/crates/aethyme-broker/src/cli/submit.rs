@@ -355,7 +355,7 @@ pub(super) fn render_representation_scan(scan: &crate::RepresentationScan) {
 
 pub(super) fn render_submission_plan(plan: &crate::SubmissionPlan, checkout: &crate::GitRepo) {
     out!(
-        "Submitting session {} — HEAD {} onto integration {}",
+        "Planning session {} — HEAD {} against base {}",
         plan.session_id,
         short_sha(&plan.session_head),
         short_sha(&plan.integration_head)
