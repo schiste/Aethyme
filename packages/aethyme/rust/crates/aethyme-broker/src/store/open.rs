@@ -1226,6 +1226,18 @@ impl BrokerStore {
         result: &NewGateResult,
         environment: &GateEnvironment,
     ) -> Result<i64, BrokerError> {
+        self.record_gate_result_with_execution_profile(result, environment, None)
+    }
+
+    /// Record an executed gate result with the profile used by the cache key.
+    /// A missing profile is preserved as NULL and can never satisfy the
+    /// execution-profile cache lookup.
+    pub fn record_gate_result_with_execution_profile(
+        &mut self,
+        result: &NewGateResult,
+        environment: &GateEnvironment,
+        cache_provenance: Option<&crate::GateCacheProvenance>,
+    ) -> Result<i64, BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1233,9 +1245,10 @@ impl BrokerStore {
                                        failure_class, exit_code, duration_ms, log_path,
                                        session_id, created_at, wait_duration_ms,
                                        first_output_ms, output_bytes, load_avg_1m_start,
-                                       load_avg_1m_end, cpu_count, free_disk_bytes_start)
+                                       load_avg_1m_end, cpu_count, free_disk_bytes_start,
+                                       execution_profile_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17)",
+                     ?16, ?17, ?18)",
             params![
                 result.gate_name,
                 result.tree_hash,
@@ -1254,6 +1267,8 @@ impl BrokerStore {
                 environment.load_avg_1m_end,
                 environment.cpu_count,
                 environment.free_disk_bytes_start,
+                cache_provenance
+                    .and_then(|provenance| provenance.execution_profile_digest.as_deref()),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1266,6 +1281,8 @@ impl BrokerStore {
                 &result.gate_name,
                 &result.tree_hash,
                 result.failure_class,
+                id,
+                cache_provenance,
             )),
         )?;
         tx.commit()?;

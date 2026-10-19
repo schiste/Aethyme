@@ -658,10 +658,16 @@ pub fn select_gates<'g>(gates: &'g [Gate], changed: &[String]) -> Vec<Selection<
 #[derive(Debug, serde::Serialize)]
 pub struct GateRunOutcome {
     pub gate: String,
+    /// Stored result row that produced or was reused for this outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<i64>,
     /// Full Git tree object id proven by this result.
     pub tree_hash: String,
     /// Digest of the command, triggers, cache policy, and resource profile.
     pub definition_hash: String,
+    /// Execution profile that governs whether this result can be reused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_provenance: Option<crate::GateCacheProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_lease: Option<GateResourceProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2409,7 +2415,14 @@ where
 
     let mut outcomes = Vec::new();
     let mut expensive_advisories_surfaced = false;
+    let mut subprocess_path = None;
+    let mut subprocess_path_captured = false;
+    let mut execution_profile = None;
     for selection in selections {
+        if !subprocess_path_captured {
+            subprocess_path = crate::git::sanitized_subprocess_path();
+            subprocess_path_captured = true;
+        }
         let bounded_gate;
         let gate = if let Some(deadline) = runtime.deadline {
             bounded_gate = {
@@ -2424,22 +2437,49 @@ where
             selection.gate
         };
         let worker_id = gate_worker_id(session_id, &gate.name);
+        if gate.cache && execution_profile.is_none() {
+            execution_profile = Some(crate::gate_profile::ExecutionProfile::capture(
+                checkout.root(),
+                subprocess_path.as_deref(),
+            ));
+        }
+        let profile = if gate.cache {
+            execution_profile.as_ref()
+        } else {
+            None
+        };
+        let cache_provenance = profile.map(crate::gate_profile::ExecutionProfile::provenance);
         // Cache: conclusive result for this exact tree, any session. The
         // hit is recorded as an event so saved execution time is
         // measurable (kill-criterion accounting). Gates that inspect
         // commit metadata must opt out: the tree can stay identical while
         // commit bodies change.
-        if cache_policy == CachePolicy::Use
-            && gate.cache
-            && let Some(hit) =
-                store.cached_gate_result_for_definition(&gate.name, &tree, &gate.definition_hash)?
-        {
+        let cached_result = if cache_policy == CachePolicy::Use && gate.cache {
+            if let Some(profile_digest) = profile.and_then(|profile| profile.digest()) {
+                store.cached_gate_result_for_execution_profile(
+                    &gate.name,
+                    &tree,
+                    &gate.definition_hash,
+                    profile_digest,
+                )?
+            } else {
+                progress.report(&format!(
+                    "gate {} cache unavailable: execution profile could not be captured",
+                    gate.name
+                ));
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(hit) = cached_result {
             let saved_ms = hit.duration_ms.unwrap_or(0);
             progress.report(&format!(
-                "gate {} cached ({}, tree {}, saved {}ms)",
+                "gate {} cached ({}, tree {}, source run {}, saved {}ms)",
                 gate.name,
                 hit.status.as_str(),
                 short_tree_hash(&tree),
+                hit.id,
                 saved_ms
             ));
             if let Some(diagnostic) = database_write_admission(store, main_root) {
@@ -2459,6 +2499,10 @@ where
                             saved_ms,
                             hit.status,
                             cached_failure_class(hit.status),
+                            hit.id,
+                            cache_provenance
+                                .as_ref()
+                                .expect("profile-backed cache lookup has provenance"),
                         )),
                     ),
                 );
@@ -2466,8 +2510,10 @@ where
             let failed = hit.status == GateStatus::Fail;
             outcomes.push(GateRunOutcome {
                 gate: gate.name.clone(),
+                run_id: Some(hit.id),
                 tree_hash: tree.clone(),
                 definition_hash: gate.definition_hash.clone(),
+                cache_provenance: cache_provenance.clone(),
                 resource_lease: None,
                 managed_cache: None,
                 broker_database: None,
@@ -2671,7 +2717,7 @@ where
                 }
                 drop(owner_locks);
                 let log_path = preserve_failed_gate_log(&log_path, GateStatus::Error);
-                store.record_gate_result(&NewGateResult {
+                let run_id = store.record_gate_result(&NewGateResult {
                     gate_name: gate.name.clone(),
                     tree_hash: tree.clone(),
                     definition_hash: gate.definition_hash.clone(),
@@ -2687,8 +2733,10 @@ where
                 })?;
                 outcomes.push(GateRunOutcome {
                     gate: gate.name.clone(),
+                    run_id: Some(run_id),
                     tree_hash: tree.clone(),
                     definition_hash: gate.definition_hash.clone(),
+                    cache_provenance: None,
                     resource_lease: resource_provenance,
                     managed_cache: None,
                     broker_database: None,
@@ -2782,6 +2830,7 @@ where
                 tree: &tree,
                 worker_id: &worker_id,
                 owner_paths: &selection.owner_paths,
+                subprocess_path: subprocess_path.as_deref(),
                 configured_timeout_seconds: gate.timeout_seconds,
                 timeout_seconds,
                 absolute_deadline: runtime.deadline,
@@ -2850,20 +2899,28 @@ where
         // A deadline kill is the host's fault only the first time. A change
         // that hangs times out on every run of its tree, and deferring each one
         // would ask the agent to resubmit unchanged code forever.
-        if host_fault
-            && timed_out
-            && !has_capture_or_resource_error
-            && store.gate_timeouts_for_tree(&gate.name, &tree, &gate.definition_hash)? > 0
-        {
-            host_fault = false;
-            crate::warn_unrecorded(
-                "note a repeated timeout in the gate log",
-                append_gate_log(
-                    &log_path,
-                    "aethyme: this gate also timed out on an earlier run of the same tree; \
-                     treating the timeout as a verdict on the change\n",
-                ),
-            );
+        if host_fault && timed_out && !has_capture_or_resource_error {
+            let earlier_timeouts = if gate.cache {
+                store.gate_timeouts_for_execution_profile(
+                    &gate.name,
+                    &tree,
+                    &gate.definition_hash,
+                    profile.and_then(crate::gate_profile::ExecutionProfile::digest),
+                )?
+            } else {
+                store.gate_timeouts_for_tree(&gate.name, &tree, &gate.definition_hash)?
+            };
+            if earlier_timeouts > 0 {
+                host_fault = false;
+                crate::warn_unrecorded(
+                    "note a repeated timeout in the gate log",
+                    append_gate_log(
+                        &log_path,
+                        "aethyme: this gate also timed out on an earlier run of the same tree; \
+                         treating the timeout as a verdict on the change\n",
+                    ),
+                );
+            }
         }
         let (mut gate_status, mut failure_class, exit_code) =
             classify_gate_result(&gate.command, &log_path, status);
@@ -2903,7 +2960,7 @@ where
                 .map(|load| format!(" at load 1m {load:.1}{}", cpu_suffix(&environment)))
                 .unwrap_or_default()
         ));
-        store.record_gate_result_with_environment(
+        let run_id = store.record_gate_result_with_execution_profile(
             &NewGateResult {
                 gate_name: gate.name.clone(),
                 tree_hash: tree.clone(),
@@ -2919,12 +2976,15 @@ where
                 session_id,
             },
             &environment,
+            cache_provenance.as_ref(),
         )?;
         let failed = gate_status != GateStatus::Pass;
         outcomes.push(GateRunOutcome {
             gate: gate.name.clone(),
+            run_id: Some(run_id),
             tree_hash: tree.clone(),
             definition_hash: gate.definition_hash.clone(),
+            cache_provenance: cache_provenance.clone(),
             resource_lease: resource_provenance,
             managed_cache: managed_cache_runtime.map(|runtime| runtime.provenance),
             broker_database: broker_database.into_inner(),
@@ -2979,7 +3039,7 @@ fn record_gate_preflight_resource_failure(
     );
     progress.report(&format!("gate {} could not start: {diagnostic}", gate.name));
     let log_path = preserve_failed_gate_log(log_path, GateStatus::Error);
-    store.record_gate_result(&NewGateResult {
+    let run_id = store.record_gate_result(&NewGateResult {
         gate_name: gate.name.clone(),
         tree_hash: tree.to_string(),
         definition_hash: gate.definition_hash.clone(),
@@ -2995,8 +3055,10 @@ fn record_gate_preflight_resource_failure(
     })?;
     Ok(GateRunOutcome {
         gate: gate.name.clone(),
+        run_id: Some(run_id),
         tree_hash: tree.to_string(),
         definition_hash: gate.definition_hash.clone(),
+        cache_provenance: None,
         resource_lease: None,
         managed_cache: None,
         broker_database: None,
@@ -3027,13 +3089,14 @@ fn gate_storage_resource_failure(
     progress: &dyn GateProgressSink,
 ) -> Result<GateRunOutcome, crate::broker::BrokerOpError> {
     progress.report(&format!("gate {} could not start: {diagnostic}", gate.name));
-    if let Some(database_refusal) = database_refusal {
+    let run_id = if let Some(database_refusal) = database_refusal {
         progress.report(&format!(
             "Warning: gate {} storage refusal is unrecorded because {database_refusal}",
             gate.name
         ));
+        None
     } else {
-        store.record_gate_result(&NewGateResult {
+        Some(store.record_gate_result(&NewGateResult {
             gate_name: gate.name.clone(),
             tree_hash: tree.to_string(),
             definition_hash: gate.definition_hash.clone(),
@@ -3046,12 +3109,14 @@ fn gate_storage_resource_failure(
             output_bytes: None,
             log_path: None,
             session_id,
-        })?;
-    }
+        })?)
+    };
     Ok(GateRunOutcome {
         gate: gate.name.clone(),
+        run_id,
         tree_hash: tree.to_string(),
         definition_hash: gate.definition_hash.clone(),
+        cache_provenance: None,
         resource_lease: None,
         managed_cache: None,
         broker_database: None,
@@ -3376,6 +3441,8 @@ struct GateCommandContext<'a> {
     tree: &'a str,
     worker_id: &'a str,
     owner_paths: &'a [String],
+    /// Sanitized PATH shared by profile probes and the gate subprocess.
+    subprocess_path: Option<&'a std::ffi::OsStr>,
     configured_timeout_seconds: Option<u64>,
     timeout_seconds: Option<u64>,
     absolute_deadline: Option<Instant>,
@@ -3838,7 +3905,7 @@ fn run_gate_command(
     // this crate proved for itself, so a wrapper the broker routed around
     // still reaches the gate. Left alone when the probe proved nothing to
     // remove.
-    if let Some(path) = crate::git::sanitized_subprocess_path() {
+    if let Some(path) = context.subprocess_path {
         process.env("PATH", path);
     }
     let mut child = spawn_gate_command(&mut process, context.absolute_deadline)?;
@@ -4700,6 +4767,7 @@ mod tests {
             tree: "synthetic",
             worker_id: "deadline",
             owner_paths: &[],
+            subprocess_path: None,
             configured_timeout_seconds: Some(1),
             timeout_seconds: Some(1),
             absolute_deadline: deadline,
@@ -4779,6 +4847,7 @@ mod tests {
             tree: "synthetic",
             worker_id: "renewal-stop",
             owner_paths: &[],
+            subprocess_path: None,
             configured_timeout_seconds: Some(2),
             timeout_seconds: Some(2),
             absolute_deadline: None,
@@ -5669,6 +5738,7 @@ mod tests {
             tree: "synthetic",
             worker_id: "bounded-output-test",
             owner_paths: &[],
+            subprocess_path: None,
             configured_timeout_seconds: Some(10),
             timeout_seconds: Some(10),
             absolute_deadline: None,
