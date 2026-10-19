@@ -753,7 +753,7 @@ fn direct_synthesized_wave_fixture() -> (verifier::tests::Subject, RecordId) {
         &request,
         "direct-history-synthesis",
         "one.txt",
-        "410a",
+        "410a7265736f6c7665722061646a7573746d656e740a",
     );
     let expected_version = target::status(&v.f.store, v.owner.target())
         .unwrap()
@@ -772,13 +772,23 @@ fn direct_synthesized_wave_fixture() -> (verifier::tests::Subject, RecordId) {
     assert_eq!(attached.phase, crate::local_wave::WavePhase::Verifying);
     assert_eq!(attached.resolution_request.as_ref(), Some(&request));
     assert_eq!(attached.resolution_result.as_ref(), Some(&result));
+    let attached_candidate = attached
+        .candidate_snapshot
+        .as_ref()
+        .expect("direct synthesized candidate is attached");
+    let candidate_entries =
+        crate::composer::snapshot_entries(&v.f.store, attached_candidate).unwrap();
+    let (_, candidate_one) = candidate_entries
+        .get(b"one.txt".as_slice())
+        .expect("direct synthesized candidate retains A's file");
+    let candidate_one_bytes = crate::composer::blob(&v.f.store, candidate_one).unwrap();
+    assert_eq!(candidate_one_bytes.as_slice(), b"A\nresolver adjustment\n");
+    let attached_revision = RecordId::parse(&attached.spec.revision).unwrap();
+    v = retarget_verifier_subject(v, &attached_revision, attached_candidate.as_str());
     assert_eq!(
-        attached
-            .candidate_snapshot
-            .as_ref()
-            .map(ToString::to_string),
-        Some(v.execution.spec().candidate_source.clone()),
-        "the byte-identical synthesized tree fits the verifier fixture's retained source"
+        v.execution.spec().candidate_source,
+        attached_candidate.as_str(),
+        "verification is pinned to the exact synthesized candidate"
     );
     let (synthesis, provenance) =
         crate::local_wave::read_synthesized_wave_result(&mut v.f.store, &repo, &attached)
@@ -1168,6 +1178,17 @@ fn complete_synthesized_wave(
     )
     .unwrap();
     transport::publish(&mut v.f.store, &v.owner, &carrier, &mut broker, &intent.id).unwrap();
+    let transport_observation =
+        transport::inspect(&mut v.f.store, &v.owner, &carrier, &mut broker, &intent.id).unwrap();
+    assert_eq!(
+        transport_observation.spec.observation,
+        transport::Observation::Available
+    );
+    assert!(transport_observation.spec.content_checked);
+    assert_eq!(
+        transport_observation.spec.write_outcome.as_deref(),
+        Some("succeeded")
+    );
     let receipt = observe(
         &mut v.f.store,
         &v.owner,
