@@ -1,4 +1,4 @@
-//! Owned storage for library test fixtures, selected before broker startup.
+//! Owned storage for broker quick tests and library fixtures, selected before broker startup.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ pub(crate) struct TestStorage {
 }
 
 impl TestStorage {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::try_new().expect("create fixture storage owner")
     }
