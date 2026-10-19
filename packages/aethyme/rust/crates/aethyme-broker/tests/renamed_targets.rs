@@ -108,11 +108,11 @@ fn a_genuine_deletion_is_not_reported_as_a_rename() {
 fn an_unaffected_session_reports_nothing() {
     let fixture = FixtureRepository::new();
     let repo = fixture.path();
-    sh(&repo, &["init", "-q", "-b", "main"]);
+    sh(repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("keep.txt"), "stable\n").unwrap();
-    sh(&repo, &["add", "-A"]);
-    sh(&repo, &["commit", "-qm", "init"]);
+    sh(repo, &["add", "-A"]);
+    sh(repo, &["commit", "-qm", "init"]);
 
     let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let session = broker.start_worktree("ordinary work", None).unwrap();
