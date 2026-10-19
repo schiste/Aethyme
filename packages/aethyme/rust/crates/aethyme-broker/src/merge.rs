@@ -32,6 +32,8 @@ use crate::types::{
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
+const VERIFY_ONLY_FALLBACK_REASON: &str = "no fetched default branch to verify against; verified against the \
+     integration branch instead (set the main checkout's upstream or fetch it)";
 
 /// Materialize a typed candidate commit without invoking any gate or
 /// verification policy. The caller supplies the replay result and provenance.
@@ -198,6 +200,16 @@ pub struct PromoteConfig {
     pub mode: PromoteMode,
 }
 
+fn invalid_promote_mode_warning(value: Option<&str>) -> String {
+    let detail = value
+        .map(|value| format!("unknown value `{value}`"))
+        .unwrap_or_else(|| "expected a string".to_string());
+    format!(
+        "invalid [promote].mode ({detail}); using `verify-only` so it cannot enable promotion. \
+         Set it to `auto`, `manual`, `verify-only`, `none`, or `off`."
+    )
+}
+
 impl PromoteConfig {
     /// Load `[promote]` with the same trust rule as the push policy.
     ///
@@ -209,37 +221,49 @@ impl PromoteConfig {
     /// thing and the broker did another. As fresh as the last fetch; never
     /// fetches.
     pub fn load(main_root: &Path) -> Self {
+        Self::load_with_warning(main_root).0
+    }
+
+    pub(crate) fn load_with_warning(main_root: &Path) -> (Self, Option<String>) {
         Self::from_text(repository_config_text(main_root).as_deref())
     }
 
-    pub(crate) fn from_text(text: Option<&str>) -> Self {
+    pub(crate) fn from_text(text: Option<&str>) -> (Self, Option<String>) {
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
             mode: PromoteMode::Auto,
         };
+        let mut warning = None;
         let Some(text) = text else {
-            return config;
+            return (config, warning);
         };
         let Ok(value) = text.parse::<toml::Value>() else {
-            return config;
+            return (config, warning);
         };
         if let Some(promote) = value.get("promote") {
             if let Some(branch) = promote.get("branch").and_then(|v| v.as_str()) {
                 config.branch = branch.to_string();
             }
-            if let Some(mode) = promote.get("mode").and_then(|v| v.as_str()) {
-                // Unknown values keep the historical default rather than
-                // failing the load: a typo in this key must not make the
-                // broker unusable, and the mode is reported wherever it
-                // matters so a wrong value is visible.
-                config.mode = match mode {
-                    "manual" => PromoteMode::Manual,
-                    "verify-only" | "none" | "off" => PromoteMode::VerifyOnly,
-                    _ => PromoteMode::Auto,
+            if let Some(mode) = promote.get("mode") {
+                // Decision for #691: preserve broker diagnostics while failing
+                // closed. An unknown critical mode warns and disables promotion
+                // instead of silently restoring the permissive `auto` default.
+                config.mode = match mode.as_str() {
+                    Some("auto") => PromoteMode::Auto,
+                    Some("manual") => PromoteMode::Manual,
+                    Some("verify-only" | "none" | "off") => PromoteMode::VerifyOnly,
+                    Some(value) => {
+                        warning = Some(invalid_promote_mode_warning(Some(value)));
+                        PromoteMode::VerifyOnly
+                    }
+                    None => {
+                        warning = Some(invalid_promote_mode_warning(None));
+                        PromoteMode::VerifyOnly
+                    }
                 };
             }
         }
-        config
+        (config, warning)
     }
 }
 
@@ -461,6 +485,8 @@ pub struct SubmissionPlan {
     pub session_id: i64,
     pub recorded_baseline: Option<String>,
     pub session_head: String,
+    /// Effective commit used as the plan base: integration in promoting
+    /// repositories, or the fetched default branch in verify-only mode.
     pub integration_head: String,
     pub safe: bool,
     pub commits: Vec<SubmissionCommitProvenance>,
@@ -570,19 +596,38 @@ impl SubmissionReplay {
 
 impl Broker {
     /// Build the exact plan used by submission before creating a queue entry
-    /// or running gates. Replaying patches can create unreachable Git objects,
-    /// but this operation changes neither refs nor worktrees.
+    /// or running gates. Verify-only repositories use the same fetched-default
+    /// base as submit, while the plan remains read-only when falling back to
+    /// the integration branch. Replaying patches can create unreachable Git
+    /// objects, but this operation changes neither refs nor worktrees.
     pub fn submission_plan(&mut self, session_id: i64) -> Result<SubmissionPlan, BrokerOpError> {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let session_head = checkout.head_commit()?;
-        let (_, integration_head) = self.integration_head_snapshot()?;
-        let mut plan = self.build_submission_plan(&session, &session_head, &integration_head)?;
+        let config = PromoteConfig::load(&self.main_root_path());
+        let (integration_reference, integration_head) = self.integration_head_snapshot()?;
+        let base = if config.mode == PromoteMode::VerifyOnly {
+            self.upstream_verification_base()
+                .unwrap_or(VerificationBase {
+                    source: VERIFIED_AGAINST_INTEGRATION,
+                    reference: integration_reference,
+                    commit: integration_head,
+                    fallback_reason: Some(VERIFY_ONLY_FALLBACK_REASON.to_string()),
+                })
+        } else {
+            VerificationBase {
+                source: VERIFIED_AGAINST_INTEGRATION,
+                reference: integration_reference,
+                commit: integration_head,
+                fallback_reason: None,
+            }
+        };
+        let mut plan = self.build_submission_plan(&session, &session_head, &base.commit)?;
         let replay = self.replay_submission_plan(&plan)?;
         if replay.conflicts.is_empty() {
             plan.merged_tree_paths = self
                 .repo_handle()
-                .changed_between(&integration_head, &replay.tree)?;
+                .changed_between(&base.commit, &replay.tree)?;
         }
         Ok(plan)
     }
@@ -637,28 +682,28 @@ impl Broker {
     /// what a verified entry is promoted onto. Never fetches.
     pub(crate) fn submission_base(&mut self) -> Result<VerificationBase, BrokerOpError> {
         let config = PromoteConfig::load(&self.main_root_path());
-        let mut fallback_reason = None;
-        if config.mode == PromoteMode::VerifyOnly {
-            if let Some((reference, commit)) = self.repo_handle().upstream_default() {
-                return Ok(VerificationBase {
-                    source: VERIFIED_AGAINST_UPSTREAM,
-                    reference,
-                    commit,
-                    fallback_reason: None,
-                });
-            }
-            fallback_reason = Some(
-                "no fetched default branch to verify against; verified against the \
-                 integration branch instead (set the main checkout's upstream or fetch it)"
-                    .to_string(),
-            );
+        if config.mode == PromoteMode::VerifyOnly
+            && let Some(base) = self.upstream_verification_base()
+        {
+            return Ok(base);
         }
         let (reference, commit) = self.integration_head()?;
         Ok(VerificationBase {
             source: VERIFIED_AGAINST_INTEGRATION,
             reference,
             commit,
-            fallback_reason,
+            fallback_reason: (config.mode == PromoteMode::VerifyOnly)
+                .then(|| VERIFY_ONLY_FALLBACK_REASON.to_string()),
+        })
+    }
+
+    fn upstream_verification_base(&self) -> Option<VerificationBase> {
+        let (reference, commit) = self.repo_handle().upstream_default()?;
+        Some(VerificationBase {
+            source: VERIFIED_AGAINST_UPSTREAM,
+            reference,
+            commit,
+            fallback_reason: None,
         })
     }
 
@@ -734,8 +779,9 @@ impl Broker {
                 actual: head.into_boxed_str(),
             });
         }
-        // Before planning: a verify-only plan is measured against integration,
-        // and a stale one counts main's own commits as this session's (#352).
+        // Planning uses the same policy-aware base as submit: fetched upstream
+        // in verify-only mode, integration otherwise. This prevents upstream-only
+        // commits from being counted as session work when integration is stale (#352).
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
         progress.phase("auditing lease ownership");
         let ownership = self.audit_submit_ownership(session_id)?;
@@ -1305,13 +1351,15 @@ impl Broker {
             )?;
         }
 
-        let configured = PromoteConfig::load(&self.main_root_path()).mode;
+        let (promote_config, promotion_config_warning) =
+            PromoteConfig::load_with_warning(&self.main_root_path());
+        let configured = promote_config.mode;
         let effective = match intent {
             PromotionIntent::Configured => configured,
             PromotionIntent::VerifyOnly => PromoteMode::VerifyOnly,
         };
         let mut promoted = false;
-        let mut promotion_suppressed = None;
+        let mut promotion_suppressed = promotion_config_warning.clone();
         if all_pass {
             match effective {
                 PromoteMode::Auto => {
@@ -1326,7 +1374,7 @@ impl Broker {
                     ));
                 }
                 PromoteMode::VerifyOnly => {
-                    promotion_suppressed = Some(match intent {
+                    let reason = match intent {
                         PromotionIntent::VerifyOnly => {
                             "verified; --verify-only, so nothing was promoted".to_string()
                         }
@@ -1335,6 +1383,10 @@ impl Broker {
                              checked and nothing was moved"
                                 .to_string()
                         }
+                    };
+                    promotion_suppressed = Some(match promotion_config_warning.as_deref() {
+                        Some(warning) => format!("{reason}; {warning}"),
+                        None => reason,
                     });
                 }
             }

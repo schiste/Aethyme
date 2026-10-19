@@ -5,7 +5,9 @@ use crate::collaboration_archive::{self as archive, ObjectDigest};
 use crate::collaboration_state::CollaborationStore;
 use crate::execution_snapshot::{self as snapshot, ExecutionSnapshot, MaterializedInputs};
 use crate::local_target::{self as target, ControllerOwner};
-use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId, RecordSchema};
+use aethyme_contracts::experimental_v0::{
+    FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -213,6 +215,46 @@ pub(crate) struct ObservedCommand {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
+
+fn reconstruct_artifact_output(
+    store: &CollaborationStore,
+    target_revision: &RecordId,
+    record: &ObjectDigest,
+    dest: &Path,
+    expected: &SourceSnapshot,
+    max_output_bytes: u64,
+) -> Result<SourceSnapshot, SupervisorError> {
+    let max_output_bytes = usize::try_from(max_output_bytes).map_err(|_| SupervisorError::Limit)?;
+    let limits = snapshot::RECONSTRUCTION_LIMITS.with_max_output_bytes(max_output_bytes);
+    let archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let id = expected.id();
+    let mut objects = Vec::with_capacity(expected.entries().len() + 2);
+    objects.push(*record);
+    objects.push(ObjectDigest::of_snapshot(&id));
+    objects.extend(
+        expected
+            .entries()
+            .iter()
+            .map(|entry| ObjectDigest::from_bytes(*entry.content_sha256())),
+    );
+    if !target::artifact_objects_are_retained(store, target_revision, &objects, &archive_guard)? {
+        return Err(SupervisorError::Tampered(
+            "artifact objects are not retained by the target revision".into(),
+        ));
+    }
+    let manifest = archive::reconstruct_artifact_bounded_under_guard(
+        store,
+        expected,
+        dest,
+        limits,
+        &archive_guard,
+    )?;
+    if manifest != *expected {
+        return Err(SupervisorError::Tampered("sealed artifact mismatch".into()));
+    }
+    Ok(manifest)
+}
+
 impl DockerExecutor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn observe_cli<F, G>(
@@ -255,10 +297,14 @@ impl DockerExecutor {
             std::fs::set_permissions(&materialized, std::fs::Permissions::from_mode(0o755))?;
         }
 
-        let manifest = archive::reconstruct_manifest(store, &artifact.output_id(), &materialized)?;
-        if manifest != artifact.output.manifest {
-            return Err(SupervisorError::Tampered("sealed artifact mismatch".into()));
-        }
+        let manifest = reconstruct_artifact_output(
+            store,
+            execution.target_revision(),
+            &artifact.record,
+            &materialized,
+            &artifact.output.manifest,
+            spec.profile.build_limits.output_bytes,
+        )?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
