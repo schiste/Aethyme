@@ -354,14 +354,14 @@ impl OwnedProbeChild {
             return Err(io::Error::other("owned profile probe was already reaped"));
         }
 
-        let mut cleanup_error = None;
+        let mut term_error = None;
+        let mut kill_error = None;
         if !self.ownership_uncertain {
             if let Err(error) =
                 crate::gates::signal_owned_process_group(self.process_group, libc::SIGTERM)
+                && error.raw_os_error() != Some(libc::ESRCH)
             {
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    cleanup_error = Some(error);
-                }
+                term_error = Some(error);
             }
             // Keep the leader unreaped throughout this grace period, even if
             // it already exited. Its zombie still anchors the group ID while
@@ -369,10 +369,9 @@ impl OwnedProbeChild {
             std::thread::sleep(Duration::from_millis(75));
             if let Err(error) =
                 crate::gates::signal_owned_process_group(self.process_group, libc::SIGKILL)
+                && error.raw_os_error() != Some(libc::ESRCH)
             {
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    cleanup_error.get_or_insert(error);
-                }
+                kill_error = Some(error);
             }
         }
 
@@ -394,16 +393,14 @@ impl OwnedProbeChild {
                             return Err(error);
                         }
                     };
-                    if !crate::gates::gate_process_group_absent(self.process_group) {
-                        return Err(io::Error::other(
-                            "owned profile probe process group remained after reaping",
-                        ));
-                    }
-                    if let Some(error) = cleanup_error {
-                        return Err(io::Error::other(format!(
-                            "owned profile probe cleanup was uncertain: {error}"
-                        )));
-                    }
+                    let final_group_absence =
+                        Ok(crate::gates::gate_process_group_absent(self.process_group));
+                    validate_owned_probe_cleanup(
+                        self.reaped,
+                        final_group_absence,
+                        term_error,
+                        kill_error,
+                    )?;
                     return Ok(status);
                 }
                 Ok(false) if Instant::now() < reap_deadline => {
@@ -421,6 +418,42 @@ impl OwnedProbeChild {
                 }
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn validate_owned_probe_cleanup(
+    leader_reaped: bool,
+    final_group_absence: io::Result<bool>,
+    term_error: Option<io::Error>,
+    kill_error: Option<io::Error>,
+) -> io::Result<()> {
+    if !leader_reaped {
+        return Err(io::Error::other(
+            "owned profile probe group absence was checked before reaping its leader",
+        ));
+    }
+
+    let signal_errors = [("SIGTERM", term_error), ("SIGKILL", kill_error)]
+        .into_iter()
+        .filter_map(|(signal, error)| error.map(|error| format!("{signal}: {error}")))
+        .collect::<Vec<_>>();
+    let signal_note = if signal_errors.is_empty() {
+        String::new()
+    } else {
+        format!(" (signal errors: {})", signal_errors.join(", "))
+    };
+
+    match final_group_absence {
+        // A signal error is discharged only after the leader has been reaped
+        // and the final group-absence probe succeeds.
+        Ok(true) => Ok(()),
+        Ok(false) => Err(io::Error::other(format!(
+            "owned profile probe process group remained after reaping{signal_note}"
+        ))),
+        Err(error) => Err(io::Error::other(format!(
+            "could not prove owned profile probe process group absent after reaping: {error}{signal_note}"
+        ))),
     }
 }
 
@@ -601,6 +634,75 @@ mod tests {
             LimitedOutput::Deadline
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_probe_cleanup_discharges_kill_eperm_only_after_final_absence() {
+        // TERM succeeded; KILL can report EPERM when the only remaining group
+        // member is the unreaped zombie leader. That error is safe to discharge
+        // only after reaping and a successful final absence probe.
+        assert!(
+            validate_owned_probe_cleanup(
+                true,
+                Ok(true),
+                None,
+                Some(io::Error::from_raw_os_error(libc::EPERM)),
+            )
+            .is_ok()
+        );
+
+        assert!(
+            validate_owned_probe_cleanup(
+                true,
+                Ok(false),
+                None,
+                Some(io::Error::from_raw_os_error(libc::EPERM)),
+            )
+            .is_err(),
+            "a surviving member must remain an error"
+        );
+        assert!(
+            validate_owned_probe_cleanup(
+                true,
+                Err(io::Error::from_raw_os_error(libc::EPERM)),
+                None,
+                Some(io::Error::from_raw_os_error(libc::EPERM)),
+            )
+            .is_err(),
+            "an unknown final probe must remain an error"
+        );
+        assert!(
+            validate_owned_probe_cleanup(
+                false,
+                Ok(true),
+                None,
+                Some(io::Error::from_raw_os_error(libc::EPERM)),
+            )
+            .is_err(),
+            "absence cannot discharge an error before the leader is reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_probe_group_accepts_signal_error_after_successful_leader_exit() {
+        let started = Instant::now();
+        let output = output_limited_in_owned_group(
+            Command::new("sh").args(["-c", "exit 0"]),
+            Duration::from_secs(2),
+            64,
+        )
+        .expect("a final process-group absence proof should discharge a zombie-only signal error");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        match output {
+            LimitedOutput::Completed(output) => {
+                assert_eq!(output.status.code(), Some(0));
+                assert!(output.stdout.is_empty());
+                assert!(output.stderr.is_empty());
+            }
+            _ => panic!("an immediately exiting leader should return its output"),
+        }
     }
 
     #[cfg(unix)]

@@ -2552,7 +2552,6 @@ mod tests {
     /// installs profile-bound cache semantics.
     #[test]
     fn v51_is_a_compatible_marker_that_leaves_the_floor_alone() {
-        assert!(SCHEMA_VERSION >= 51);
         let conn = migrated_through(50);
         set_meta(&conn, "min_compatible_schema", 47);
         let tables: i64 = conn

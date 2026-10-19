@@ -4581,21 +4581,40 @@ mod tests {
         let mut store = BrokerStore::open(&database).unwrap();
         let gate = synthetic_gate("cached", true, "false");
         let tree = checkout.working_tree_hash().unwrap();
+        let subprocess_path = crate::git::sanitized_subprocess_path();
+        let execution_profile = crate::gate_profile::ExecutionProfile::capture(
+            checkout.root(),
+            subprocess_path.as_deref(),
+        );
+        let cache_provenance = execution_profile.provenance();
+        assert_eq!(
+            cache_provenance.execution_profile_digest.as_deref(),
+            execution_profile.digest(),
+            "the synthetic cached row must use the captured profile"
+        );
+        assert!(
+            execution_profile.digest().is_some(),
+            "this cache-hit regression requires complete bounded profile probes"
+        );
         store
-            .record_gate_result(&NewGateResult {
-                gate_name: gate.name.clone(),
-                tree_hash: tree,
-                definition_hash: gate.definition_hash.clone(),
-                status: GateStatus::Pass,
-                failure_class: None,
-                exit_code: Some(0),
-                duration_ms: Some(1),
-                wait_duration_ms: Some(0),
-                first_output_ms: None,
-                output_bytes: Some(0),
-                log_path: None,
-                session_id: None,
-            })
+            .record_gate_result_with_execution_profile(
+                &NewGateResult {
+                    gate_name: gate.name.clone(),
+                    tree_hash: tree,
+                    definition_hash: gate.definition_hash.clone(),
+                    status: GateStatus::Pass,
+                    failure_class: None,
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    wait_duration_ms: Some(0),
+                    first_output_ms: None,
+                    output_bytes: Some(0),
+                    log_path: None,
+                    session_id: None,
+                },
+                &crate::GateEnvironment::default(),
+                Some(&cache_provenance),
+            )
             .unwrap();
         let before = store.events_after(0, 100).unwrap();
         let progress = Lines::default();
