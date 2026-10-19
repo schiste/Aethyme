@@ -11,41 +11,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::{Broker, BrokerOpenOptions};
+use aethyme_broker::Broker;
 
-/// Own every host-scoped path a broker open and GC inventory can touch.
-/// The owner stays alive until each broker handle has dropped.
-struct FixtureStorage {
-    _owner: tempfile::TempDir,
-    root: PathBuf,
-}
-
-impl FixtureStorage {
-    fn new() -> Self {
-        let owner = tempfile::tempdir().unwrap();
-        let root = owner.path().canonicalize().unwrap();
-        std::fs::create_dir(root.join("preparation-cache")).unwrap();
-        Self {
-            _owner: owner,
-            root,
-        }
-    }
-
-    fn options(&self) -> BrokerOpenOptions {
-        let host_state = self.root.join("host-state");
-        BrokerOpenOptions::default()
-            .with_host_state_dir(host_state.clone())
-            .with_host_cache_dir(self.root.join("host-cache"))
-            .with_preparation_cache_root(self.root.join("preparation-cache"))
-            .with_host_operation_database(host_state.join("host-operations.db"))
-            .with_worktree_root(self.root.join("worktrees"))
-            .with_collaboration_state(self.root.join("collaboration"))
-    }
-
-    fn open(&self, repository: &Path) -> Result<Broker, aethyme_broker::BrokerOpError> {
-        Broker::open_with_options(repository, self.options())
-    }
-}
+mod common;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -112,10 +80,9 @@ fn drift_advice(broker: &mut Broker) -> Option<aethyme_broker::StatusAdvice> {
 
 #[test]
 fn a_directory_no_session_created_is_reported_rather_than_ignored() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     fixture(tmp.path());
-    let storage = FixtureStorage::new();
-    let mut broker = storage.open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let (_, root) = session_and_root(&mut broker);
 
     // Non-vacuity first: with only the session's own worktree there, the
@@ -140,10 +107,9 @@ fn a_directory_no_session_created_is_reported_rather_than_ignored() {
 
 #[test]
 fn the_session_that_owns_a_worktree_keeps_it_out_of_the_drift_count() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     fixture(tmp.path());
-    let storage = FixtureStorage::new();
-    let mut broker = storage.open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let (_, root) = session_and_root(&mut broker);
     plant(&root, "left-behind", false);
 
@@ -161,10 +127,9 @@ fn the_session_that_owns_a_worktree_keeps_it_out_of_the_drift_count() {
 
 #[test]
 fn a_closed_sessions_worktree_is_not_drift_merely_because_it_is_closed() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     fixture(tmp.path());
-    let storage = FixtureStorage::new();
-    let mut broker = storage.open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let session = broker.start_worktree("reconcile fixture", None).unwrap();
     std::fs::write(
         PathBuf::from(&session.worktree_path).join("done.txt"),
@@ -191,10 +156,9 @@ fn a_closed_sessions_worktree_is_not_drift_merely_because_it_is_closed() {
 
 #[test]
 fn status_counts_the_drift_and_gc_plan_measures_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     fixture(tmp.path());
-    let storage = FixtureStorage::new();
-    let mut broker = storage.open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let (_, root) = session_and_root(&mut broker);
     plant(&root, "left-behind", false);
 
@@ -233,10 +197,9 @@ fn status_counts_the_drift_and_gc_plan_measures_it() {
 
 #[test]
 fn a_former_worktree_reads_differently_from_a_stray_directory() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     fixture(tmp.path());
-    let storage = FixtureStorage::new();
-    let mut broker = storage.open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let (_, root) = session_and_root(&mut broker);
     plant(&root, "was-a-worktree", true);
     plant(&root, "just-a-directory", false);
@@ -257,10 +220,9 @@ fn a_former_worktree_reads_differently_from_a_stray_directory() {
 
 #[test]
 fn no_lane_removes_an_unclaimed_directory() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     fixture(tmp.path());
-    let storage = FixtureStorage::new();
-    let mut broker = storage.open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let (_, root) = session_and_root(&mut broker);
     let stray = plant(&root, "left-behind", true);
 
@@ -287,10 +249,9 @@ fn no_lane_removes_an_unclaimed_directory() {
 
 #[test]
 fn drift_does_not_invalidate_an_operators_authorization() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     fixture(tmp.path());
-    let storage = FixtureStorage::new();
-    let mut broker = storage.open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let (_, root) = session_and_root(&mut broker);
 
     let before = broker.gc_plan().unwrap();
@@ -317,16 +278,13 @@ fn a_worktree_reached_by_another_spelling_is_still_owned() {
     // through one spelling would match nothing read through the other, and a
     // perfectly healthy worktree would be reported as drift for a human to
     // investigate.
-    let tmp = tempfile::tempdir().unwrap();
-    let real = tmp.path().join("repo");
-    std::fs::create_dir(&real).unwrap();
+    let tmp = common::FixtureRepository::new();
+    let real = tmp.path().to_path_buf();
     fixture(&real);
-    let link = tmp.path().join("link");
+    let link = tmp.owner_path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
-    let storage = FixtureStorage::new();
-    let options = storage.options();
-    let mut through_link = Broker::open_with_options(&link, options.clone()).unwrap();
+    let mut through_link = common::open_fixture_broker(&link, tmp.owner_path()).unwrap();
     let session = through_link
         .start_worktree("reconcile fixture", None)
         .unwrap();
@@ -339,7 +297,7 @@ fn a_worktree_reached_by_another_spelling_is_still_owned() {
     );
     drop(through_link);
 
-    let through_real = Broker::open_with_options(&real, options).unwrap();
+    let through_real = common::open_fixture_repository_broker(&tmp).unwrap();
     let sweep = through_real.reconcile_worktree_directories(false).unwrap();
     assert_eq!(
         sweep.unclaimed_count, 0,
