@@ -688,3 +688,12 @@ paths in full. Human output says whether the command ran and whether edits
 remain, and shows at most eight changed paths. An ownership refusal can come
 after the command has already changed files, so a consumer must inspect the
 reported paths before retrying.
+
+### Push size accounting
+
+`broker push` JSON `pr_size.files` and `changed_lines` remain review-policy
+counts. `pr_size.excluded` lists omitted paths and reasons; optional
+`pr_size.diff_totals` contains unfiltered file and changed-line totals from
+the same complete local Git diff. Binary files contribute a file and zero
+lines. Human output labels the policy counts and reports full totals when
+exclusions apply. Advisory thresholds continue to use the policy counts.
