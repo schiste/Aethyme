@@ -1927,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn up_to_date_preflight_reports_unsupported_host_resource_schema() {
+    fn host_resource_preflight_reports_unsupported_schema() {
         let mut inspected = false;
         let error = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
             inspected = true;
@@ -1945,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn up_to_date_preflight_refuses_future_host_schema_without_writing() {
+    fn host_resource_preflight_refuses_future_schema_without_writing() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("host-resources.db");
         drop(crate::HostResourceCoordinator::open(&database).unwrap());
@@ -1967,21 +1967,24 @@ mod tests {
             )
             .unwrap()
         };
+        let before_hash = sha256_bytes(&fs::read(&database).unwrap());
         let before = read_schema();
         let error = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
             crate::HostResourceCoordinator::open_read_only(&database).map(drop)
         })
         .unwrap_err();
         let after = read_schema();
+        let after_hash = sha256_bytes(&fs::read(&database).unwrap());
 
         assert!(error.contains("unsupported host schema 3"));
         assert!(error.contains("no migration was attempted"));
         assert_eq!(before, after);
         assert_eq!(after, 3);
+        assert_eq!(before_hash, after_hash);
     }
 
     #[test]
-    fn up_to_date_preflight_does_not_create_missing_host_database() {
+    fn host_resource_preflight_does_not_create_missing_database() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("missing-host-resources.db");
 
@@ -1994,7 +1997,7 @@ mod tests {
     }
 
     #[test]
-    fn up_to_date_preflight_opens_compatible_host_state_read_only() {
+    fn host_resource_preflight_opens_compatible_state_read_only() {
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("host-resources.db");
         drop(crate::HostResourceCoordinator::open(&database).unwrap());
@@ -2019,11 +2022,21 @@ mod tests {
         let after = read_schema();
 
         assert!(result.is_ok());
+        assert_eq!(before, 2);
         assert_eq!(before, after);
     }
 
     #[test]
-    fn update_available_does_not_block_on_host_schema_preflight() {
+    fn host_resource_preflight_accepts_missing_state_directory() {
+        let result = preflight_up_to_date_host_resources(UpdateAction::UpToDate, || {
+            Err(crate::HostResourceError::StateDirectoryUnavailable)
+        });
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn host_resource_preflight_does_not_block_update_available() {
         let mut inspected = false;
         let result =
             preflight_up_to_date_host_resources(UpdateAction::ExecuteInstallerUpdate, || {
