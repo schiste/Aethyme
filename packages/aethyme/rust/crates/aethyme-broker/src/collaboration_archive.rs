@@ -2171,6 +2171,12 @@ pub(crate) fn reconstruct_manifest(
             });
         }
     }
+    prepare_empty_destination(dest)?;
+    materialize(store, &snapshot, dest)?;
+    Ok(snapshot)
+}
+
+fn prepare_empty_destination(dest: &Path) -> Result<(), ArchiveError> {
     if std::fs::symlink_metadata(dest).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(ArchiveError::DestinationIsSymlink {
             path: dest.to_path_buf(),
@@ -2189,8 +2195,7 @@ pub(crate) fn reconstruct_manifest(
         }
         Err(source) => return Err(io(dest, source)),
     }
-    materialize(store, &snapshot, dest)?;
-    Ok(snapshot)
+    Ok(())
 }
 
 /// Bounded counterpart to reconstruct. The complete manifest and every file
@@ -2209,6 +2214,7 @@ pub(crate) fn reconstruct_bounded(
     })?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let validated = validate_snapshot_bounded_inner(store, id, limits, &mut |_| {})?;
+    prepare_empty_destination(dest)?;
     materialize_bounded(store, &validated.snapshot, dest, limits)?;
     Ok(validated.snapshot)
 }
@@ -3108,6 +3114,24 @@ mod tests {
         let snapshot = reconstruct_bounded(&store, &retained.snapshot_id, &dest, limits).unwrap();
         assert_eq!(snapshot.id(), retained.snapshot_id);
         assert_eq!(oracle_id(&dest), retained.snapshot_id.as_str());
+        assert_eq!(std::fs::read(dest.join("README.md")).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    fn bounded_reconstruction_preserves_nonempty_destination_refusal() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        let limits = exact_fixture_limits(&store, &retained);
+        let dest = tempfile::tempdir().unwrap();
+        let keep = dest.path().join("keep");
+        std::fs::write(&keep, b"mine").unwrap();
+
+        let error =
+            reconstruct_bounded(&store, &retained.snapshot_id, dest.path(), limits).unwrap_err();
+
+        assert_eq!(error.code(), "destination_not_empty");
+        assert_eq!(std::fs::read(keep).unwrap(), b"mine");
     }
 
     #[test]
