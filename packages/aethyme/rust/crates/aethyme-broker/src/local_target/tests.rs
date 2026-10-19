@@ -234,6 +234,8 @@ impl Fixture {
 fn bounded_snapshot_requirement_refuses_above_supplied_limit() {
     let f = Fixture::new();
     let snapshot = f.a.base.snapshot_id.to_string();
+    super::require_snapshot(&f.store, &snapshot).unwrap();
+
     let mut tiny = crate::execution_snapshot::RECONSTRUCTION_LIMITS;
     tiny.max_output_bytes = 0;
 

@@ -1640,6 +1640,12 @@ mod tests {
             .expect("failed build debris remains available to the existing GC lifecycle");
         assert!(building.path().is_dir());
         assert!(!building.path().join("source").exists());
+
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let reader = open_view(&store, &view).unwrap();
+        assert_eq!(reader.manifest().snapshot, snapshot.to_string());
+        assert_eq!(reader.manifest().generation, 1);
+        assert!(!building.path().exists());
     }
 
     /// T90: a view answers only under the profile it was built with; another
