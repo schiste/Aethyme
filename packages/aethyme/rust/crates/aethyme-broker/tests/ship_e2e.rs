@@ -1125,6 +1125,31 @@ fn ship_plan_only_builds_and_gates_exactly_one_independent_entry() {
     );
     let refs_before = fixture.refs();
     let mut broker = fixture.broker();
+    let selected_entry = broker
+        .store()
+        .merge_queue_entry(selected)
+        .expect("selected promoted entry");
+    let submitted_base_is_not_head_ancestor = Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            selected_entry.base_commit.as_str(),
+            selected_entry.head_commit.as_str(),
+        ])
+        .current_dir(&fixture.repo)
+        .status()
+        .unwrap();
+    assert!(
+        !submitted_base_is_not_head_ancestor.success(),
+        "the later sibling's submitted integration base should not be its source head's ancestor"
+    );
+    // A later reuse can advance this session field after the queue entry was
+    // promoted. The queued promotion remains the immutable source of the
+    // selected patch.
+    broker
+        .store()
+        .set_session_diff_base(selected_entry.session_id, &integration)
+        .unwrap();
 
     let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
 
@@ -1144,6 +1169,10 @@ fn ship_plan_only_builds_and_gates_exactly_one_independent_entry() {
     );
     let verification = plan.only_verification.as_ref().unwrap();
     assert_eq!(verification.base_sha, fixture.remote_main());
+    let selected_promotion = plan.included_entries[0].promotion_sha.as_str();
+    let promotion_parent = format!("{selected_promotion}^1");
+    let promotion_parent = git_output(&fixture.repo, &["rev-parse", &promotion_parent]);
+    assert_eq!(verification.source_base_sha, promotion_parent);
     assert_eq!(verification.changed_files, vec!["second.txt"]);
     assert_eq!(verification.selected_gates.len(), 1);
     assert_eq!(verification.selected_gates[0].gate, "ship-only-selected");
