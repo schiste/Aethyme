@@ -26,6 +26,10 @@ const SCAN_MAX_DURATION: Duration = Duration::from_secs(3);
 /// A new reservation grants one materialization attempt. Existing rows are
 /// returned as status and never grant another attempt.
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "admission payloads are consumed only by the disabled managed preparation producer"
+)]
 pub(crate) enum ManagedStorageAdmission {
     Materialize(ManagedStorageGrowthPermit),
     Existing(ManagedStorageClaim),

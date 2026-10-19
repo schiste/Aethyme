@@ -359,6 +359,10 @@ pub(crate) struct VerifiedManagedStorageRemoval {
     receipt_digest: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "managed preparation cleanup consumer remains disabled pending ownership qualification"
+)]
 impl VerifiedManagedStorageRemoval {
     #[expect(
         clippy::too_many_arguments,
@@ -1504,6 +1508,10 @@ impl HostResourceCoordinator {
     }
 
     /// Keep a measured charge while its exact root awaits verified cleanup.
+    #[allow(
+        dead_code,
+        reason = "managed preparation cleanup consumer remains disabled pending ownership qualification"
+    )]
     pub(crate) fn mark_managed_storage_cleanup_pending(
         &mut self,
         request: &ManagedStorageClaimRequest,
@@ -1580,6 +1588,10 @@ impl HostResourceCoordinator {
     }
 
     /// Drop a charge only after complete no-follow removal of its exact root.
+    #[allow(
+        dead_code,
+        reason = "managed preparation cleanup consumer remains disabled pending ownership qualification"
+    )]
     pub(crate) fn release_managed_storage_claim(
         &mut self,
         receipt: &VerifiedManagedStorageRemoval,
