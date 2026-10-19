@@ -5,8 +5,8 @@ use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
-    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker, BrokerOpError,
-    DeliveryExecutionReport, EntryExposureResolutionKind, EntryExposureState,
+    AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker,
+    BrokerOpError, DeliveryExecutionReport, EntryExposureResolutionKind, EntryExposureState,
     IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance, OperationStatus,
     RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
 };
@@ -1196,6 +1196,91 @@ fn ship_plan_only_builds_and_gates_exactly_one_independent_entry() {
         "second"
     );
     assert_eq!(fixture.refs(), refs_before, "planning must not move refs");
+}
+
+#[test]
+fn ship_plan_only_uses_submitted_entry_base_after_reuse_sync() {
+    let fixture = Fixture::new();
+    let mut broker = fixture.broker();
+    let resumed = broker.start_worktree("ship-only-resumed", None).unwrap();
+    let resumed_worktree = PathBuf::from(&resumed.worktree_path);
+    let adopted_head = resumed.adopted_head.clone().unwrap();
+
+    let earlier = broker.start_worktree("ship-only-earlier", None).unwrap();
+    let earlier_worktree = PathBuf::from(&earlier.worktree_path);
+    std::fs::write(earlier_worktree.join("earlier.txt"), "earlier\n").unwrap();
+    git(&earlier_worktree, &["add", "earlier.txt"]);
+    git(
+        &earlier_worktree,
+        &["commit", "-qm", "feat: earlier promotion"],
+    );
+    let first = broker.submit(earlier.id).unwrap();
+    assert!(first.promoted);
+
+    let integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+    assert_ne!(integration, adopted_head);
+    git(&resumed_worktree, &["reset", "--hard", &integration]);
+    let reuse = broker
+        .adopt_with_options(
+            &resumed_worktree,
+            Some("replay after integration sync"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: true,
+                planned_paths: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        reuse.session.adopted_head.as_deref(),
+        Some(adopted_head.as_str())
+    );
+    assert_eq!(
+        reuse.session.diff_base.as_deref(),
+        Some(integration.as_str())
+    );
+
+    std::fs::write(resumed_worktree.join("selected.txt"), "selected\n").unwrap();
+    git(&resumed_worktree, &["add", "selected.txt"]);
+    git(
+        &resumed_worktree,
+        &["commit", "-qm", "feat: selected entry"],
+    );
+    let selected = broker.submit(resumed.id).unwrap();
+    assert!(selected.promoted);
+    assert_eq!(selected.entry.base_commit, integration);
+
+    let plan = broker
+        .ship_plan_only_with_delivery(selected.entry.id, None)
+        .unwrap();
+    let verification = plan.only_verification.unwrap();
+    assert_eq!(verification.source_base_sha, integration);
+    assert_eq!(verification.changed_files, vec!["selected.txt"]);
+    assert_eq!(plan.included_entries.len(), 1);
+    assert_eq!(plan.included_entries[0].queue_entry_id, selected.entry.id);
+    assert!(
+        plan.excluded_entries
+            .iter()
+            .any(|entry| entry.queue_entry_id == first.entry.id)
+    );
+    assert_eq!(
+        git_output(
+            &fixture.repo,
+            &["show", &format!("{}:selected.txt", plan.publication_sha)]
+        ),
+        "selected"
+    );
+    let earlier_in_tree = Command::new("git")
+        .args([
+            "cat-file",
+            "-e",
+            &format!("{}:earlier.txt", plan.publication_sha),
+        ])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(!earlier_in_tree.status.success());
 }
 
 #[cfg(unix)]
