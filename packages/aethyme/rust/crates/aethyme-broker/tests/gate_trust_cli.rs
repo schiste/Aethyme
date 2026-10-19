@@ -324,3 +324,76 @@ fn the_pre_commit_hook_refuses_an_untrusted_policy() {
     fixture.git(&root, &["commit", "-qm", "trusted"]);
     assert!(fixture.marker("gate.marker"));
 }
+
+#[test]
+fn trust_status_next_action_approves_the_exact_linked_checkout_policy() {
+    let fixture = Fixture::new("main.marker");
+    fixture.trust();
+    let root = fixture.root();
+    let checkout_owner = tempfile::tempdir().unwrap();
+    let checkout = checkout_owner
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("worktree with spaces");
+    fixture.git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "changed-policy",
+            checkout.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::write(
+        checkout.join(".aethyme/gates.toml"),
+        "[[gate]]\nname = 'changed'\ncommand = 'touch changed.marker'\ncost = 1\ncache = false\n",
+    )
+    .unwrap();
+    let status_args = [
+        "advanced",
+        "trust",
+        "status",
+        "--repo",
+        checkout.to_str().unwrap(),
+        "--json",
+    ];
+    let output = fixture.run(&root, &status_args);
+    succeeded(&output);
+    let before: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(before["trusted"], false);
+    assert_eq!(fixture.trust_status()["trusted"], true);
+    // Compare the complete suggestion, including quoting the requested checkout.
+    assert_eq!(
+        before["next_action"],
+        format!(
+            "aethyme broker advanced trust --repo '{}'",
+            checkout.display()
+        )
+    );
+    let approve = fixture
+        .command(CLI, &root)
+        .env(ESCAPE, "1")
+        .args([
+            "advanced",
+            "trust",
+            "--repo",
+            checkout.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    succeeded(&approve);
+    let report: serde_json::Value = serde_json::from_slice(&approve.stdout).unwrap();
+    assert!(!report["recorded"].as_array().unwrap().is_empty());
+    let output = fixture.run(&root, &status_args);
+    succeeded(&output);
+    let after: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(after["trusted"], true);
+    assert!(after["next_action"].is_null());
+    assert!(!fixture.marker("main.marker"));
+    assert!(!checkout.join("changed.marker").exists());
+}
