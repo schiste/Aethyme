@@ -52,6 +52,10 @@ pub(crate) struct ManagedStorageOwner<'a> {
     ttl_seconds: u64,
 }
 
+#[allow(
+    dead_code,
+    reason = "managed preparation consumer remains disabled until its ownership fences are qualified"
+)]
 impl<'a> ManagedStorageOwner<'a> {
     pub(super) fn new(
         coordinator: &'a mut HostResourceCoordinator,
@@ -673,12 +677,12 @@ impl RootBinding {
         hash.update(b"aethyme-managed-storage-root-v1\0");
         hash.update(&path_bytes);
         let identity = format!("path-v1:{:x}", hash.finalize());
-        let filesystem_id = filesystem_identity(parent_stat.st_dev as u64);
+        let filesystem_id = filesystem_identity(device_id(&parent_stat));
         Ok(Self {
             parent: canonical_parent,
             leaf: leaf_string,
             materialization: materialization.to_owned(),
-            parent_device: parent_stat.st_dev as u64,
+            parent_device: device_id(&parent_stat),
             parent_inode: parent_stat.st_ino as u64,
             identity,
             filesystem_id,
@@ -724,8 +728,8 @@ fn scan_complete(
         }
     };
     let expected_device = parse_filesystem_identity(&root.filesystem_id)?;
-    if parent_before.st_dev as u64 != expected_device
-        || parent_before.st_dev as u64 != root.parent_device
+    if device_id(&parent_before) != expected_device
+        || device_id(&parent_before) != root.parent_device
         || parent_before.st_ino != root.parent_inode
     {
         return Err(managed_storage_refusal(
@@ -737,7 +741,7 @@ fn scan_complete(
     let mut scanner = Scanner::new(expected_device, Instant::now() + SCAN_MAX_DURATION);
     let mut root_instance_id = None;
     let root_present = if let Some(root_stat) = root_stat {
-        if file_type(&root_stat) != libc::S_IFDIR || root_stat.st_dev as u64 != expected_device {
+        if file_type(&root_stat) != libc::S_IFDIR || device_id(&root_stat) != expected_device {
             return Err(managed_storage_refusal(
                 "managed_storage_root_invalid",
                 "managed root must remain a directory on the owner's filesystem",
@@ -863,7 +867,7 @@ impl Scanner {
         }
         self.check_deadline(path)?;
         let dir_stat = fstat(fd, path)?;
-        if dir_stat.st_dev as u64 != self.device || file_type(&dir_stat) != libc::S_IFDIR {
+        if device_id(&dir_stat) != self.device || file_type(&dir_stat) != libc::S_IFDIR {
             return Err(scan_refusal("directory crossed filesystem or changed type"));
         }
         if expected.is_some_and(|expected| !same_identity(expected, &dir_stat)) {
@@ -924,7 +928,7 @@ impl Scanner {
             let child_stat = stat_at(fd, &name, libc::AT_SYMLINK_NOFOLLOW).map_err(|_| {
                 scan_refusal("entry metadata could not be read without following links")
             })?;
-            if child_stat.st_dev as u64 != self.device {
+            if device_id(&child_stat) != self.device {
                 return Err(scan_refusal("entry crossed onto another filesystem"));
             }
             let child_path = path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
@@ -964,7 +968,7 @@ impl Scanner {
     }
 
     fn count_stat(&mut self, stat: &libc::stat, name: &[u8]) -> Result<(), HostResourceError> {
-        if self.seen_inodes.insert((stat.st_dev as u64, stat.st_ino)) {
+        if self.seen_inodes.insert((device_id(stat), stat.st_ino)) {
             let blocks = u64::try_from(stat.st_blocks)
                 .map_err(|_| scan_refusal("negative allocated block count"))?;
             let bytes = blocks
@@ -981,7 +985,7 @@ impl Scanner {
             .ok_or_else(|| scan_refusal("entry count overflowed"))?;
         self.digest.update((name.len() as u64).to_le_bytes());
         self.digest.update(name);
-        self.digest.update((stat.st_dev as u64).to_le_bytes());
+        self.digest.update(device_id(stat).to_le_bytes());
         self.digest.update(stat.st_ino.to_le_bytes());
         self.digest.update((stat.st_mode as u64).to_le_bytes());
         self.digest.update(stat.st_size.to_le_bytes());
@@ -1195,6 +1199,16 @@ fn parse_filesystem_identity(value: &str) -> Result<u64, HostResourceError> {
             "filesystem identity has an invalid device encoding",
         )
     })
+}
+
+// libc::dev_t is u64 on Linux and i32 on macOS. Normalize at one boundary.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "libc::dev_t differs across supported operating systems"
+)]
+fn device_id(stat: &libc::stat) -> u64 {
+    stat.st_dev as u64
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2106,8 +2120,7 @@ mod tests {
         let fd = open_absolute_directory_nofollow(&root).unwrap();
         let stat = fstat(fd.as_raw_fd(), &root).unwrap();
 
-        let mut entry_limited =
-            Scanner::new(stat.st_dev as u64, Instant::now() + SCAN_MAX_DURATION);
+        let mut entry_limited = Scanner::new(device_id(&stat), Instant::now() + SCAN_MAX_DURATION);
         entry_limited.entry_count = SCAN_MAX_ENTRIES;
         let error = entry_limited
             .count_stat(&stat, b"one-too-many")
@@ -2117,8 +2130,7 @@ mod tests {
             Some("managed_storage_inventory_incomplete")
         );
 
-        let mut depth_limited =
-            Scanner::new(stat.st_dev as u64, Instant::now() + SCAN_MAX_DURATION);
+        let mut depth_limited = Scanner::new(device_id(&stat), Instant::now() + SCAN_MAX_DURATION);
         let error = depth_limited
             .visit_directory(-1, Path::new("unopened"), SCAN_MAX_DEPTH + 1, None)
             .unwrap_err();
@@ -2128,7 +2140,7 @@ mod tests {
         );
 
         let deadline = Instant::now() - Duration::from_secs(1);
-        let expired = Scanner::new(stat.st_dev as u64, deadline);
+        let expired = Scanner::new(device_id(&stat), deadline);
         let error = expired.check_deadline(Path::new("expired")).unwrap_err();
         assert_eq!(
             conflict_code(&error),

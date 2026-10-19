@@ -360,6 +360,10 @@ pub(crate) struct VerifiedManagedStorageRemoval {
 }
 
 impl VerifiedManagedStorageRemoval {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "removal proof binds independent authority and identity fields explicitly"
+    )]
     fn after_complete_no_follow_removal(
         repository: String,
         filesystem_id: String,
@@ -745,6 +749,10 @@ impl HostResourceCoordinator {
     /// finite materialization directory. The caller supplies the resolved
     /// preparation-cache root from this broker's storage context; this API does
     /// not constrain arbitrary child-process writes or prove child quiescence.
+    #[allow(
+        dead_code,
+        reason = "managed preparation consumer remains disabled until its ownership fences are qualified"
+    )]
     pub(crate) fn begin_managed_storage_owner<'a>(
         &'a mut self,
         grant: HostResourceGrant,
@@ -765,6 +773,10 @@ impl HostResourceCoordinator {
 
     /// Read one exact durable claim so a restarted owner can distinguish an
     /// outstanding reservation from measured, uncertain, or released storage.
+    #[allow(
+        dead_code,
+        reason = "managed preparation consumer remains disabled until its ownership fences are qualified"
+    )]
     pub(crate) fn managed_storage_claim(
         &self,
         repository: &str,
@@ -892,6 +904,10 @@ impl HostResourceCoordinator {
 
     /// Install or update an explicit policy. Lowering a cap preserves existing
     /// charges; future reservations refuse until usage fits the new cap.
+    #[allow(
+        dead_code,
+        reason = "managed preparation consumer remains disabled until its ownership fences are qualified"
+    )]
     pub(crate) fn set_managed_storage_policy(
         &mut self,
         policy: &ManagedStoragePolicy,
