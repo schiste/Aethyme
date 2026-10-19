@@ -1219,8 +1219,16 @@ fn synthesized_conflict_suffix_recomposes_and_prepares_the_full_hybrid_candidate
     assert_eq!(fresh_job.spec.inputs, expected_inputs);
     assert_eq!(fresh_job.spec.synthesized_group.as_ref(), Some(&provenance));
     let candidate = validate_source(&mut s.f.store, owner, &repo, &fresh_job.spec).unwrap();
+    let (_, composition_source) =
+        wave::load_composition_source(&mut s.f.store, owner, &repo, &s.wave).unwrap();
+    let final_candidate = composition_source
+        .expect("the recomposed wave retains its exact composition source")
+        .composition
+        .outcome
+        .candidate()
+        .expect("the recomposed source has a candidate");
     assert_eq!(
-        seed.candidate.mode,
+        final_candidate.mode,
         crate::composition::CompositionMode::Hybrid
     );
     assert_eq!(candidate.commit.as_str(), fresh_job.spec.commit);

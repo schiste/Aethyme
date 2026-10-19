@@ -182,7 +182,7 @@ pub fn compose_structural(
 pub const COMPOSER_BASELINE_SOURCE: &str = "retained";
 
 pub const COMPOSITION_RECIPE_SCHEMA_NAME: &str = "aethyme.composition-recipe/experimental-v0";
-const SEEDED_CONFLICT_RECIPE_SCHEMA_NAME: &str =
+pub(crate) const SEEDED_CONFLICT_RECIPE_SCHEMA_NAME: &str =
     "aethyme.seeded-conflict-composition/experimental-v1";
 
 /// Consecutive non-blank lines (whitespace-insensitive) that must leave one

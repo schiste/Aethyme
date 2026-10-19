@@ -668,6 +668,8 @@ fn verify_historical_source_inner(
                 .ok_or_else(|| WaveError::Invalid("historical seed tree".into()))?;
             if seeded_request != *request
                 || seeded_result != *result
+                || seeded["schema"].as_str()
+                    != Some(composer::SEEDED_CONFLICT_RECIPE_SCHEMA_NAME)
                 || seeded["version"].as_u64() != Some(1)
                 || seeded["trust"].as_str() != Some("unverified")
                 || seeded["input_manifest_sha256"].as_str()
