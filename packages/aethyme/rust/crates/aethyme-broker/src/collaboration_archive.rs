@@ -58,7 +58,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use aethyme_contracts::experimental_v0::canonical_json::{Object, Value};
-use aethyme_contracts::experimental_v0::source_snapshot::{MAX_PATH_BYTES, PathRejection};
+use aethyme_contracts::experimental_v0::source_snapshot::{
+    MANIFEST_HEADER, MAX_PATH_BYTES, PathRejection,
+};
 use aethyme_contracts::experimental_v0::{
     EntryKind, FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceEntry, SourceSnapshot,
     SourceSnapshotError, SourceSnapshotId,
@@ -255,6 +257,12 @@ pub enum ArchiveError {
         String::from_utf8_lossy(path)
     )]
     MaterializationCollision { path: Vec<u8> },
+    #[error("bounded reconstruction {resource} is {observed}, above limit {limit}")]
+    ReconstructionLimit {
+        resource: &'static str,
+        observed: u64,
+        limit: u64,
+    },
     #[error("git: {detail}")]
     Git { detail: String },
     #[error("{}: {source}", path.display())]
@@ -291,6 +299,7 @@ impl ArchiveError {
             Self::DestinationNotEmpty { .. } => "destination_not_empty",
             Self::DestinationIsSymlink { .. } => "destination_is_symlink",
             Self::MaterializationCollision { .. } => "materialization_collision",
+            Self::ReconstructionLimit { .. } => "reconstruction_limit",
             Self::Git { .. } => "git",
             Self::Io { .. } => "io",
             Self::Sqlite(_) => "sqlite",
@@ -313,6 +322,45 @@ impl ArchiveError {
                     ..
                 }
         )
+    }
+}
+
+/// Explicit limits for a single retained snapshot reconstruction. These are
+/// supplied by the production caller so legacy archive reads keep their existing
+/// contract. Byte totals count every manifest entry, including repeated CAS IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReconstructionLimits {
+    pub(crate) max_manifest_bytes: usize,
+    pub(crate) max_file_bytes: usize,
+    pub(crate) max_output_bytes: usize,
+    pub(crate) max_entries: usize,
+    pub(crate) max_nodes: usize,
+    pub(crate) max_path_depth: usize,
+    pub(crate) max_component_bytes: usize,
+}
+
+impl ReconstructionLimits {
+    pub(crate) const fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.max_output_bytes = max_output_bytes;
+        self
+    }
+}
+
+/// A manifest and its checked logical output size. Validation reads one bounded
+/// object at a time and retains no file bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedSnapshot {
+    snapshot: SourceSnapshot,
+    output_bytes: u64,
+}
+
+impl ValidatedSnapshot {
+    pub(crate) fn snapshot(&self) -> &SourceSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn output_bytes(&self) -> u64 {
+        self.output_bytes
     }
 }
 
@@ -1844,6 +1892,225 @@ pub(crate) fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
     SourceSnapshot::new(entries).ok()
 }
 
+fn reconstruction_limit(resource: &'static str, observed: u64, limit: usize) -> ArchiveError {
+    ArchiveError::ReconstructionLimit {
+        resource,
+        observed,
+        limit: limit as u64,
+    }
+}
+
+fn validate_reconstruction_shape(
+    snapshot: &SourceSnapshot,
+    limits: ReconstructionLimits,
+) -> Result<(), ArchiveError> {
+    let entries = snapshot.entries();
+    if entries.len() > limits.max_entries {
+        return Err(reconstruction_limit(
+            "entries",
+            entries.len() as u64,
+            limits.max_entries,
+        ));
+    }
+
+    let mut nodes = 1usize; // The materialized snapshot root.
+    if nodes > limits.max_nodes {
+        return Err(reconstruction_limit(
+            "nodes",
+            nodes as u64,
+            limits.max_nodes,
+        ));
+    }
+    let mut previous_components: Vec<&[u8]> = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let depth = path.split(|byte| *byte == b'/').count();
+        if depth > limits.max_path_depth {
+            return Err(reconstruction_limit(
+                "path_depth",
+                depth as u64,
+                limits.max_path_depth,
+            ));
+        }
+        for component in path.split(|byte| *byte == b'/') {
+            if component.len() > limits.max_component_bytes {
+                return Err(reconstruction_limit(
+                    "component_bytes",
+                    component.len() as u64,
+                    limits.max_component_bytes,
+                ));
+            }
+        }
+        let components: Vec<&[u8]> = path.split(|byte| *byte == b'/').collect();
+        let directories = &components[..components.len().saturating_sub(1)];
+        let shared_directories = previous_components
+            .iter()
+            .zip(directories)
+            .take_while(|(previous, current)| previous == current)
+            .count();
+        let added_directories = directories.len().saturating_sub(shared_directories);
+        nodes = nodes
+            .checked_add(added_directories)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| reconstruction_limit("nodes", u64::MAX, limits.max_nodes))?;
+        if nodes > limits.max_nodes {
+            return Err(reconstruction_limit(
+                "nodes",
+                nodes as u64,
+                limits.max_nodes,
+            ));
+        }
+        previous_components = components;
+    }
+    Ok(())
+}
+
+fn check_manifest_entry_count(
+    manifest: &[u8],
+    limits: ReconstructionLimits,
+) -> Result<(), ArchiveError> {
+    if let Some(body) = manifest.strip_prefix(MANIFEST_HEADER) {
+        let entries = body.iter().filter(|byte| **byte == 0).count();
+        if entries > limits.max_entries {
+            return Err(reconstruction_limit(
+                "entries",
+                entries as u64,
+                limits.max_entries,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a retained snapshot using explicit caller-provided limits. The
+/// manifest is bounded before parsing, entry count is checked before building
+/// the parsed entry vector, and file bodies are read one at a time through the
+/// no-follow, digest-verifying bounded reader. Output bytes are counted per
+/// entry, even where multiple entries share one CAS object.
+pub(crate) fn validate_snapshot_bounded(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    limits: ReconstructionLimits,
+    mut inspect_content: impl FnMut(&[u8]),
+) -> Result<ValidatedSnapshot, ArchiveError> {
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ArchiveError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    validate_snapshot_bounded_inner(store, id, limits, &mut inspect_content)
+}
+
+fn validate_snapshot_bounded_inner(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    limits: ReconstructionLimits,
+    inspect_content: &mut impl FnMut(&[u8]),
+) -> Result<ValidatedSnapshot, ArchiveError> {
+    let retained =
+        retained(store, id)?.ok_or_else(|| ArchiveError::NotRetained { id: id.to_string() })?;
+    if retained.entry_count > limits.max_entries as u64 {
+        return Err(reconstruction_limit(
+            "entries",
+            retained.entry_count,
+            limits.max_entries,
+        ));
+    }
+    if retained.content_bytes > limits.max_output_bytes as u64 {
+        return Err(reconstruction_limit(
+            "output_bytes",
+            retained.content_bytes,
+            limits.max_output_bytes,
+        ));
+    }
+
+    let manifest_digest = ObjectDigest::of_snapshot(id);
+    let manifest_size = object_size(store, &manifest_digest)?;
+    if manifest_size > limits.max_manifest_bytes as u64 {
+        return Err(reconstruction_limit(
+            "manifest_bytes",
+            manifest_size,
+            limits.max_manifest_bytes,
+        ));
+    }
+    let manifest = read_object_bounded(store, &manifest_digest, limits.max_manifest_bytes)?;
+    check_manifest_entry_count(&manifest, limits)?;
+    let corrupt = || ArchiveError::CorruptObject {
+        digest: manifest_digest.hex(),
+    };
+    let snapshot = parse_manifest(&manifest).ok_or_else(corrupt)?;
+    if snapshot.id() != *id || snapshot.manifest_bytes() != manifest {
+        return Err(corrupt());
+    }
+    validate_reconstruction_shape(&snapshot, limits)?;
+
+    // First inspect every object length without allocating bodies. This makes
+    // aggregate and per-file refusals happen before any file body is read.
+    let mut output_bytes = 0u64;
+    for entry in snapshot.entries() {
+        let digest = ObjectDigest(*entry.content_sha256());
+        let size = object_size(store, &digest)?;
+        if size > limits.max_file_bytes as u64 {
+            return Err(reconstruction_limit(
+                "file_bytes",
+                size,
+                limits.max_file_bytes,
+            ));
+        }
+        output_bytes = output_bytes.checked_add(size).ok_or_else(|| {
+            reconstruction_limit("output_bytes", u64::MAX, limits.max_output_bytes)
+        })?;
+        if output_bytes > limits.max_output_bytes as u64 {
+            return Err(reconstruction_limit(
+                "output_bytes",
+                output_bytes,
+                limits.max_output_bytes,
+            ));
+        }
+    }
+    if retained.entry_count != snapshot.entries().len() as u64
+        || retained.content_bytes != output_bytes
+    {
+        return Err(corrupt());
+    }
+
+    // Then verify and inspect the actual bytes through the bounded reader.
+    // The memory bound is one file body, not the whole output tree.
+    let mut actual_output_bytes = 0u64;
+    for entry in snapshot.entries() {
+        let digest = ObjectDigest(*entry.content_sha256());
+        let bytes = read_object_bounded(store, &digest, limits.max_file_bytes)?;
+        if bytes.len() as u64 > limits.max_file_bytes as u64 {
+            return Err(reconstruction_limit(
+                "file_bytes",
+                bytes.len() as u64,
+                limits.max_file_bytes,
+            ));
+        }
+        actual_output_bytes = actual_output_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| {
+                reconstruction_limit("output_bytes", u64::MAX, limits.max_output_bytes)
+            })?;
+        if actual_output_bytes > limits.max_output_bytes as u64 {
+            return Err(reconstruction_limit(
+                "output_bytes",
+                actual_output_bytes,
+                limits.max_output_bytes,
+            ));
+        }
+        inspect_content(&bytes);
+    }
+    if actual_output_bytes != output_bytes {
+        return Err(corrupt());
+    }
+
+    Ok(ValidatedSnapshot {
+        snapshot,
+        output_bytes: actual_output_bytes,
+    })
+}
+
 /// Write snapshot `id` into `dest` from the archive alone, verifying every
 /// object before anything is written. `dest` must be absent or empty.
 /// Returns the snapshot, whose ID equals `id`.
@@ -1926,11 +2193,62 @@ pub(crate) fn reconstruct_manifest(
     Ok(snapshot)
 }
 
+/// Bounded counterpart to reconstruct. The complete manifest and every file
+/// body are checked before the destination is created. A later archive read or
+/// filesystem write failure may leave a partial destination; callers must treat
+/// it as incomplete and must not use or merge it.
+pub(crate) fn reconstruct_bounded(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    dest: &Path,
+    limits: ReconstructionLimits,
+) -> Result<SourceSnapshot, ArchiveError> {
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ArchiveError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let validated = validate_snapshot_bounded_inner(store, id, limits, &mut |_| {})?;
+    materialize_bounded(store, &validated.snapshot, dest, limits)?;
+    Ok(validated.snapshot)
+}
+
 #[cfg(unix)]
 fn materialize(
     store: &CollaborationStore,
     snapshot: &SourceSnapshot,
     dest: &Path,
+) -> Result<(), ArchiveError> {
+    materialize_with_reader(snapshot, dest, None, |digest| read_object(store, digest))
+}
+
+#[cfg(unix)]
+fn materialize_bounded(
+    store: &CollaborationStore,
+    snapshot: &SourceSnapshot,
+    dest: &Path,
+    limits: ReconstructionLimits,
+) -> Result<(), ArchiveError> {
+    validate_reconstruction_shape(snapshot, limits)?;
+    materialize_with_reader(snapshot, dest, Some(limits.max_output_bytes), |digest| {
+        let size = object_size(store, digest)?;
+        if size > limits.max_file_bytes as u64 {
+            return Err(reconstruction_limit(
+                "file_bytes",
+                size,
+                limits.max_file_bytes,
+            ));
+        }
+        read_object_bounded(store, digest, limits.max_file_bytes)
+    })
+}
+
+#[cfg(unix)]
+fn materialize_with_reader(
+    snapshot: &SourceSnapshot,
+    dest: &Path,
+    max_output_bytes: Option<usize>,
+    mut read_content: impl FnMut(&ObjectDigest) -> Result<Vec<u8>, ArchiveError>,
 ) -> Result<(), ArchiveError> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -1939,6 +2257,7 @@ fn materialize(
     // not in this set was created under another spelling and folded by the
     // filesystem: a collision, never a merge.
     let mut created: HashSet<Vec<u8>> = HashSet::new();
+    let mut written_bytes = 0u64;
     for entry in snapshot.entries() {
         let path = entry.path();
         let components: Vec<&[u8]> = path.split(|b| *b == b'/').collect();
@@ -1966,7 +2285,15 @@ fn materialize(
         }
         let target = dest.join(std::ffi::OsStr::from_bytes(path));
         let digest = ObjectDigest(*entry.content_sha256());
-        let bytes = read_object(store, &digest)?;
+        let bytes = read_content(&digest)?;
+        if let Some(limit) = max_output_bytes {
+            written_bytes = written_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| reconstruction_limit("output_bytes", u64::MAX, limit))?;
+            if written_bytes > limit as u64 {
+                return Err(reconstruction_limit("output_bytes", written_bytes, limit));
+            }
+        }
         let collision = |error: std::io::Error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ArchiveError::MaterializationCollision {
@@ -2009,6 +2336,18 @@ fn materialize(
     _store: &CollaborationStore,
     _snapshot: &SourceSnapshot,
     _dest: &Path,
+) -> Result<(), ArchiveError> {
+    Err(ArchiveError::Git {
+        detail: "materialization is supported on Unix only".into(),
+    })
+}
+
+#[cfg(not(unix))]
+fn materialize_bounded(
+    _store: &CollaborationStore,
+    _snapshot: &SourceSnapshot,
+    _dest: &Path,
+    _limits: ReconstructionLimits,
 ) -> Result<(), ArchiveError> {
     Err(ArchiveError::Git {
         detail: "materialization is supported on Unix only".into(),
@@ -2080,6 +2419,34 @@ mod tests {
 
     fn head(repo: &Path) -> CommitOid {
         pin_commit(repo, "HEAD").unwrap()
+    }
+
+    fn exact_fixture_limits(
+        store: &CollaborationStore,
+        retained: &RetainedSnapshot,
+    ) -> ReconstructionLimits {
+        let manifest =
+            read_object(store, &ObjectDigest::of_snapshot(&retained.snapshot_id)).unwrap();
+        let snapshot = parse_manifest(&manifest).unwrap();
+        let max_file_bytes = snapshot
+            .entries()
+            .iter()
+            .map(|entry| {
+                object_size(store, &ObjectDigest(*entry.content_sha256())).unwrap() as usize
+            })
+            .max()
+            .unwrap_or(0);
+        ReconstructionLimits {
+            max_manifest_bytes: manifest.len(),
+            max_file_bytes,
+            max_output_bytes: retained.content_bytes as usize,
+            max_entries: snapshot.entries().len(),
+            // repo() contains five files, three distinct directories and the
+            // snapshot root.
+            max_nodes: 9,
+            max_path_depth: 3,
+            max_component_bytes: 9,
+        }
     }
 
     fn object_count(store: &CollaborationStore) -> usize {
@@ -2720,6 +3087,226 @@ mod tests {
         let error = reconstruct(&store, &retained.snapshot_id, dest.path()).unwrap_err();
         assert_eq!(error.code(), "destination_not_empty");
         assert_eq!(std::fs::read(dest.path().join("keep")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn bounded_reconstruction_accepts_exact_limits_and_verifies_output() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        let limits = exact_fixture_limits(&store, &retained);
+        let mut inspected_entries = 0;
+        let validated = validate_snapshot_bounded(&store, &retained.snapshot_id, limits, |_| {
+            inspected_entries += 1
+        })
+        .unwrap();
+        assert_eq!(validated.output_bytes(), retained.content_bytes);
+        assert_eq!(inspected_entries, retained.entry_count as usize);
+
+        let place = tempfile::tempdir().unwrap();
+        let dest = place.path().join("exact");
+        let snapshot = reconstruct_bounded(&store, &retained.snapshot_id, &dest, limits).unwrap();
+        assert_eq!(snapshot.id(), retained.snapshot_id);
+        assert_eq!(oracle_id(&dest), retained.snapshot_id.as_str());
+    }
+
+    #[test]
+    fn bounded_reconstruction_refuses_each_limit_before_creating_destination() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        let exact = exact_fixture_limits(&store, &retained);
+        let cases = [
+            (
+                "manifest_bytes",
+                ReconstructionLimits {
+                    max_manifest_bytes: exact.max_manifest_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                "file_bytes",
+                ReconstructionLimits {
+                    max_file_bytes: exact.max_file_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                "output_bytes",
+                ReconstructionLimits {
+                    max_output_bytes: exact.max_output_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                "entries",
+                ReconstructionLimits {
+                    max_entries: exact.max_entries - 1,
+                    ..exact
+                },
+            ),
+            (
+                "nodes",
+                ReconstructionLimits {
+                    max_nodes: exact.max_nodes - 1,
+                    ..exact
+                },
+            ),
+            (
+                "path_depth",
+                ReconstructionLimits {
+                    max_path_depth: exact.max_path_depth - 1,
+                    ..exact
+                },
+            ),
+            (
+                "component_bytes",
+                ReconstructionLimits {
+                    max_component_bytes: exact.max_component_bytes - 1,
+                    ..exact
+                },
+            ),
+        ];
+
+        let place = tempfile::tempdir().unwrap();
+        for (index, (resource, limits)) in cases.into_iter().enumerate() {
+            let dest = place.path().join(format!("refused-{index}"));
+            let error =
+                reconstruct_bounded(&store, &retained.snapshot_id, &dest, limits).unwrap_err();
+            match error {
+                ArchiveError::ReconstructionLimit {
+                    resource: observed, ..
+                } => assert_eq!(observed, resource),
+                other => panic!("expected {resource} refusal, got {other}"),
+            }
+            assert!(!dest.exists(), "{resource} refusal created {dest:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_reconstruction_counts_manifest_entries_before_parsing() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE retained_snapshots SET entry_count=0 WHERE snapshot_id=?1",
+                [retained.snapshot_id.as_str()],
+            )
+            .unwrap();
+        let mut limits = exact_fixture_limits(&store, &retained);
+        limits.max_entries = retained.entry_count as usize - 1;
+
+        let place = tempfile::tempdir().unwrap();
+        let dest = place.path().join("too-many-entries");
+        let error = reconstruct_bounded(&store, &retained.snapshot_id, &dest, limits).unwrap_err();
+        assert!(matches!(
+            error,
+            ArchiveError::ReconstructionLimit {
+                resource: "entries",
+                observed: 5,
+                limit: 4,
+            }
+        ));
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn bounded_reconstruction_counts_shared_cas_bytes_per_entry() {
+        let source = tempfile::tempdir().unwrap();
+        let repo = source.path();
+        git_in(repo, &["init", "-q", "-b", "main"]);
+        write(repo, "one", b"same");
+        write(repo, "two", b"same");
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-qm", "shared object"]);
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, repo, &head(repo)).unwrap();
+        let manifest =
+            read_object(&store, &ObjectDigest::of_snapshot(&retained.snapshot_id)).unwrap();
+        let snapshot = parse_manifest(&manifest).unwrap();
+        assert_eq!(snapshot.entries().len(), 2);
+        assert_eq!(
+            snapshot.entries()[0].content_sha256(),
+            snapshot.entries()[1].content_sha256()
+        );
+        assert_eq!(retained.content_bytes, 8);
+
+        // Simulate underreported retained metadata. The implementation must
+        // still sum each entry's output rather than deduplicating by CAS name.
+        store
+            .connection()
+            .execute(
+                "UPDATE retained_snapshots SET content_bytes=?1 WHERE snapshot_id=?2",
+                rusqlite::params![4i64, retained.snapshot_id.as_str()],
+            )
+            .unwrap();
+        let limits = ReconstructionLimits {
+            max_manifest_bytes: manifest.len(),
+            max_file_bytes: 4,
+            max_output_bytes: 4,
+            max_entries: 2,
+            max_nodes: 3,
+            max_path_depth: 1,
+            max_component_bytes: 3,
+        };
+        let place = tempfile::tempdir().unwrap();
+        let dest = place.path().join("shared");
+        let error = reconstruct_bounded(&store, &retained.snapshot_id, &dest, limits).unwrap_err();
+        assert!(matches!(
+            error,
+            ArchiveError::ReconstructionLimit {
+                resource: "output_bytes",
+                observed: 8,
+                limit: 4,
+            }
+        ));
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn bounded_reconstruction_checks_hash_before_creating_destination() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        let limits = exact_fixture_limits(&store, &retained);
+        let manifest =
+            read_object(&store, &ObjectDigest::of_snapshot(&retained.snapshot_id)).unwrap();
+        let snapshot = parse_manifest(&manifest).unwrap();
+        let digest = ObjectDigest(*snapshot.entries()[0].content_sha256());
+        std::fs::write(object_path(&store, &digest), b"jello\n").unwrap();
+
+        let place = tempfile::tempdir().unwrap();
+        let dest = place.path().join("corrupt");
+        let error = reconstruct_bounded(&store, &retained.snapshot_id, &dest, limits).unwrap_err();
+        assert_eq!(error.code(), "corrupt_object");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn bounded_reconstruction_preserves_destination_refusals() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        let limits = exact_fixture_limits(&store, &retained);
+        let place = tempfile::tempdir().unwrap();
+
+        let occupied = place.path().join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("keep"), b"mine").unwrap();
+        let error =
+            reconstruct_bounded(&store, &retained.snapshot_id, &occupied, limits).unwrap_err();
+        assert_eq!(error.code(), "destination_not_empty");
+        assert_eq!(std::fs::read(occupied.join("keep")).unwrap(), b"mine");
+
+        let real = place.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = place.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = reconstruct_bounded(&store, &retained.snapshot_id, &link, limits).unwrap_err();
+        assert_eq!(error.code(), "destination_is_symlink");
+        assert_eq!(std::fs::read_dir(real).unwrap().count(), 0);
     }
 
     /// #652 keeps `A.txt` and `a.txt` distinct. On a case-insensitive
