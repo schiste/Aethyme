@@ -2,7 +2,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gates::GateRunOutcome;
 use crate::types::{GateFailureClass, GateStatus, MergeStatus};
@@ -10,7 +9,6 @@ use crate::{Broker, BrokerOpError};
 
 const CHAU7_SKIP_MESSAGE: &str = "this test is designed to run in Chau7";
 const FIXTURE_GATE_NAME: &str = "quick-test-fixture";
-static TEMP_REPO_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -86,6 +84,13 @@ pub enum QuickTestError {
     Git { args: String, stderr: String },
     #[error("aethyme init did not certify the temporary repo")]
     InitNotCertified,
+    #[error(
+        "quick-test broker database escaped its owned fixture: expected {expected}, resolved {resolved}"
+    )]
+    BrokerDatabaseRedirected {
+        expected: PathBuf,
+        resolved: PathBuf,
+    },
     #[error("broker submit did not promote the smoke commit: {reason}")]
     SubmitNotPromoted { reason: String },
     #[error("broker gated quick test did not run the fixture gate")]
@@ -125,7 +130,7 @@ pub fn run_broker_quick_test_with_options(
         });
     }
 
-    let mut temp_repo = TempRepo::create()?;
+    let temp_repo = TempRepo::create()?;
     let mut steps = Vec::new();
     steps.push(step(
         "create-temp-repo",
@@ -144,7 +149,9 @@ pub fn run_broker_quick_test_with_options(
     git(temp_repo.path(), &["commit", "-q", "-m", "initial commit"])?;
     steps.push(step("git-bootstrap", "pass", "initial commit on main"));
 
+    temp_repo.ensure_broker_database_is_owned()?;
     let init = crate::init::guided_init(temp_repo.path())?;
+    temp_repo.ensure_broker_database_is_owned()?;
     if !init.certified() {
         return Err(QuickTestError::InitNotCertified);
     }
@@ -173,17 +180,22 @@ pub fn run_broker_quick_test_with_options(
     }
 
     // The quick test wrote this repository's policy itself, so it approves
-    // it itself; the record goes with the repository at the end.
+    // it itself; the trust record lives in the owned fixture storage.
     let policy = crate::broker::gate_trust::policy_at_root(temp_repo.path())?;
     if policy.runs_commands() {
-        temp_repo.trust_record = Some(crate::broker::gate_trust::record_trust(
+        let record = crate::broker::gate_trust::record_path_for_host_state(
             temp_repo.path(),
+            &temp_repo.storage().host_state_dir(),
+        )?;
+        crate::broker::gate_trust::record_trust_at_path(
+            temp_repo.path(),
+            &record,
             &[&policy.policy_sha256],
             "quick_test",
-        )?);
+        )?;
     }
 
-    let mut broker = Broker::open(temp_repo.path())?;
+    let mut broker = temp_repo.open_broker()?;
     let session = broker.adopt(temp_repo.path(), Some("broker quick test"))?;
     steps.push(step(
         "broker-adopt",
@@ -287,6 +299,7 @@ pub fn run_broker_quick_test_with_options(
     };
 
     let temp_path = temp_repo.path().display().to_string();
+    drop(broker);
     temp_repo.remove()?;
 
     Ok(QuickTestReport {
@@ -436,66 +449,75 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, QuickTestError> {
 
 struct TempRepo {
     path: PathBuf,
-    remove_on_drop: bool,
-    /// Host-state trust record for the fixture policy, removed with the repo.
-    trust_record: Option<PathBuf>,
+    storage: Option<crate::test_storage::TestStorage>,
 }
 
 impl TempRepo {
     fn create() -> Result<Self, std::io::Error> {
-        for _ in 0..100 {
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "aethyme-broker-quick-test-{}-{}-{}",
-                std::process::id(),
-                now_ms(),
-                TEMP_REPO_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            match std::fs::create_dir(&path) {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        remove_on_drop: true,
-                        trust_record: None,
-                    });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(err),
-            }
+        let storage = crate::test_storage::TestStorage::try_new()?;
+        let path = storage.root().join("repository");
+        if let Err(error) = std::fs::create_dir(&path) {
+            crate::warn_unrecorded(
+                "remove incomplete quick-test fixture storage",
+                storage.close(),
+            );
+            return Err(error);
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate unique quick-test temp repo",
-        ))
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                crate::warn_unrecorded(
+                    "remove incomplete quick-test fixture storage",
+                    storage.close(),
+                );
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            path,
+            storage: Some(storage),
+        })
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
 
-    fn remove(mut self) -> Result<(), std::io::Error> {
-        std::fs::remove_dir_all(&self.path)?;
-        self.remove_on_drop = false;
+    fn storage(&self) -> &crate::test_storage::TestStorage {
+        self.storage.as_ref().expect("quick-test storage owner")
+    }
+
+    fn ensure_broker_database_is_owned(&self) -> Result<(), QuickTestError> {
+        let expected = self.path.join(crate::BROKER_DB_RELPATH);
+        let resolved = crate::broker_db_path(&self.path)
+            .map_err(|error| QuickTestError::Broker(BrokerOpError::from(error)))?;
+        if resolved != expected {
+            return Err(QuickTestError::BrokerDatabaseRedirected { expected, resolved });
+        }
         Ok(())
+    }
+
+    fn open_broker(&self) -> Result<Broker, QuickTestError> {
+        self.ensure_broker_database_is_owned()?;
+        self.storage()
+            .open(&self.path)
+            .map_err(QuickTestError::Broker)
+    }
+
+    fn remove(mut self) -> Result<(), std::io::Error> {
+        self.storage
+            .take()
+            .expect("quick-test storage owner")
+            .close()
     }
 }
 
 impl Drop for TempRepo {
     fn drop(&mut self) {
-        if let Some(record) = self.trust_record.take() {
-            crate::broker::gate_trust::forget_record(&record);
-        }
-        if self.remove_on_drop {
-            let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(storage) = self.storage.take() {
+            crate::warn_unrecorded("remove quick-test fixture storage", storage.close());
         }
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -528,6 +550,7 @@ mod tests {
         assert!(report.integration_head.is_some());
         assert!(report.gate_fixture.is_none());
         assert!(report.steps.iter().any(|step| step.name == "broker-submit"));
+        assert_fixture_container_removed(&report);
     }
 
     #[test]
@@ -541,6 +564,7 @@ mod tests {
         assert!(report.ok);
         assert!(report.with_gate);
         assert!(report.temp_repo_removed);
+        assert_fixture_container_removed(&report);
         let gate = report.gate_fixture.expect("gate fixture report");
         assert_eq!(gate.gate_name, FIXTURE_GATE_NAME);
         assert!(
@@ -564,6 +588,120 @@ mod tests {
                 .iter()
                 .any(|step| step.name == "broker-submit-failing-gate")
         );
+    }
+
+    #[test]
+    fn early_quick_test_failure_removes_the_owned_fixture_container() {
+        let temp_repo = TempRepo::create().unwrap();
+        let owner = temp_repo.storage().root().to_path_buf();
+        let failure = git(temp_repo.path(), &["not-a-real-git-subcommand"]);
+        assert!(matches!(failure, Err(QuickTestError::Git { .. })));
+
+        drop(temp_repo);
+
+        assert!(!owner.exists());
+    }
+
+    #[test]
+    fn hostile_broker_database_child_environment_is_refused_before_database_creation() {
+        const CHILD_MARKER: &str = "AETHYME_TEST_QUICK_TEST_BROKER_DB_CHILD";
+        if std::env::var(CHILD_MARKER).is_ok_and(|value| value == "child") {
+            let external_database = PathBuf::from(std::env::var_os(crate::BROKER_DB_ENV).unwrap());
+            let result = run_broker_quick_test(QuickTestMode::Generic);
+            assert!(
+                matches!(
+                    &result,
+                    Err(QuickTestError::BrokerDatabaseRedirected { resolved, .. })
+                        if resolved == &external_database
+                ),
+                "unexpected quick-test result: {result:?}"
+            );
+            assert!(!external_database.exists());
+            return;
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let external_database = parent.path().join("external-broker.db");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "quick_test::tests::hostile_broker_database_child_environment_is_refused_before_database_creation",
+            )
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "child")
+            .env(crate::BROKER_DB_ENV, &external_database)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!external_database.exists());
+    }
+
+    #[test]
+    fn failure_after_trust_and_broker_creation_removes_the_owned_container() {
+        let temp_repo = TempRepo::create().unwrap();
+        let owner = temp_repo.storage().root().to_path_buf();
+        git(temp_repo.path(), &["init", "-q", "-b", "main"]).unwrap();
+        git(
+            temp_repo.path(),
+            &["config", "user.email", "smoke@example.invalid"],
+        )
+        .unwrap();
+        git(temp_repo.path(), &["config", "user.name", "Aethyme Smoke"]).unwrap();
+        std::fs::write(temp_repo.path().join("README.md"), "hello\n").unwrap();
+        git(temp_repo.path(), &["add", "README.md"]).unwrap();
+        git(temp_repo.path(), &["commit", "-q", "-m", "initial commit"]).unwrap();
+
+        temp_repo.ensure_broker_database_is_owned().unwrap();
+        let init = crate::init::guided_init(temp_repo.path()).unwrap();
+        assert!(init.certified());
+        install_gate_fixture(temp_repo.path()).unwrap();
+        git(
+            temp_repo.path(),
+            &["add", ".aethyme/gates.toml", "PASS_GATE"],
+        )
+        .unwrap();
+        git(
+            temp_repo.path(),
+            &["commit", "-q", "-m", "test: add broker gate fixture"],
+        )
+        .unwrap();
+
+        let policy = crate::broker::gate_trust::policy_at_root(temp_repo.path()).unwrap();
+        let record = crate::broker::gate_trust::record_path_for_host_state(
+            temp_repo.path(),
+            &temp_repo.storage().host_state_dir(),
+        )
+        .unwrap();
+        crate::broker::gate_trust::record_trust_at_path(
+            temp_repo.path(),
+            &record,
+            &[&policy.policy_sha256],
+            "quick_test",
+        )
+        .unwrap();
+        assert!(record.is_file());
+
+        let failure = (|| -> Result<(), QuickTestError> {
+            let _broker = temp_repo.open_broker()?;
+            Err(QuickTestError::GateDidNotPass)
+        })();
+        assert!(matches!(failure, Err(QuickTestError::GateDidNotPass)));
+
+        drop(temp_repo);
+
+        assert!(!owner.exists());
+    }
+
+    fn assert_fixture_container_removed(report: &QuickTestReport) {
+        let repository = Path::new(&report.temp_repo);
+        let owner = repository.parent().expect("repository is inside its owner");
+        assert!(!repository.exists());
+        assert!(!owner.exists());
     }
 }
 
