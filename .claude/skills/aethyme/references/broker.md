@@ -27,6 +27,9 @@ blocked.
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
+   For patch tools without a per-call worktree setting, use the reported
+   worktree's absolute path and verify the target path there before editing;
+   relative paths can resolve against the shared checkout.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
