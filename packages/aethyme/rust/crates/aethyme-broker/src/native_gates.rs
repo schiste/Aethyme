@@ -879,6 +879,16 @@ struct Checkout {
     _root: tempfile::TempDir,
     repo: GitRepo,
 }
+
+fn reconstruct_checkout_source(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    dest: &Path,
+    limits: archive::ReconstructionLimits,
+) -> Result<SourceSnapshot, NativeGateError> {
+    archive::reconstruct_bounded(store, id, dest, limits).map_err(Into::into)
+}
+
 impl Checkout {
     fn new(store: &CollaborationStore, repo: &Path, spec: &Spec) -> Result<Self, NativeGateError> {
         refuse_git_redirects()?;
@@ -890,7 +900,12 @@ impl Checkout {
         if retained.entry_count > 8192 || retained.content_bytes > 256 * 1024 * 1024 {
             return Err(NativeGateError::Unsupported("retained source bound".into()));
         }
-        let manifest = archive::reconstruct(store, &snapshot(&spec.subject)?, &source)?;
+        let manifest = reconstruct_checkout_source(
+            store,
+            &snapshot(&spec.subject)?,
+            &source,
+            crate::execution_snapshot::RECONSTRUCTION_LIMITS,
+        )?;
         if manifest.entries().len() > 8192 {
             return Err(NativeGateError::Unsupported("source path bound".into()));
         }

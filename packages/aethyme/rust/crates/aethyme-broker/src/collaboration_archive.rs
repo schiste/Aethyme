@@ -201,6 +201,8 @@ pub enum ArchiveError {
         size: u64,
         limit: u64,
     },
+    #[error("archive object {digest} exceeds caller read budget of {limit} bytes")]
+    ObjectTooLarge { digest: String, limit: usize },
     #[error("source object {oid} matches its id but is not a well-formed {kind}")]
     MalformedSource { oid: String, kind: &'static str },
     #[error("{revision:?} does not name a commit in this repository")]
@@ -283,6 +285,7 @@ impl ArchiveError {
             Self::NotACommit { .. } => "not_a_commit",
             Self::PartialClone { .. } => "partial_clone",
             Self::SourceTooLarge { .. } => "source_too_large",
+            Self::ObjectTooLarge { .. } => "object_too_large",
             Self::MalformedSource { .. } => "malformed_source",
             Self::UnknownRevision { .. } => "unknown_revision",
             Self::UnsupportedEntry { .. } => "unsupported_entry",
@@ -610,14 +613,13 @@ fn read_object_unlocked(
     file.take(limit)
         .read_to_end(&mut bytes)
         .map_err(|source| io(&path, source))?;
-    if max_bytes.is_some_and(|max| bytes.len() > max) {
-        return Err(io(
-            &path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "object exceeds caller budget",
-            ),
-        ));
+    if let Some(limit) = max_bytes {
+        if bytes.len() > limit {
+            return Err(ArchiveError::ObjectTooLarge {
+                digest: digest.hex(),
+                limit,
+            });
+        }
     }
     if ObjectDigest::of(&bytes) != *digest {
         return Err(ArchiveError::CorruptObject {
@@ -3080,6 +3082,28 @@ mod tests {
         assert_eq!(
             reconstruct(&store, &unknown, &target).unwrap_err().code(),
             "not_retained"
+        );
+    }
+
+    #[test]
+    fn bounded_object_read_reports_overflow_and_accepts_exact_boundary() {
+        let (_host, store) = store();
+        let bytes = b"12345";
+        let digest = put_object(&store, bytes).unwrap();
+
+        let overflow = read_object_bounded(&store, &digest, bytes.len() - 1).unwrap_err();
+        let expected_digest = digest.hex();
+        assert!(matches!(
+            &overflow,
+            ArchiveError::ObjectTooLarge {
+                digest: observed,
+                limit: 4,
+            } if observed == &expected_digest
+        ));
+        assert_eq!(overflow.code(), "object_too_large");
+        assert_eq!(
+            read_object_bounded(&store, &digest, bytes.len()).unwrap(),
+            bytes
         );
     }
 

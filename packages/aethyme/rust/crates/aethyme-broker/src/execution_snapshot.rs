@@ -17,6 +17,7 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const SCHEMA_NAME: &str = "aethyme.execution-snapshot/provisional-v0";
 pub const MATERIALIZATION_PROFILE: &str = "aethyme.raw-linux-inputs/provisional-v0";
+const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_FILES: usize = 8192;
 pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -339,11 +340,7 @@ pub fn load(
 ) -> Result<ExecutionSnapshot, SnapshotError> {
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
-    let path = archive::object_path(store, &locator.object);
-    if std::fs::metadata(path)?.len() > 1024 * 1024 {
-        return Err(SnapshotError::Limit);
-    }
-    let bytes = archive::read_object(store, &locator.object)?;
+    let bytes = read_descriptor_object(store, &locator.object, MAX_DESCRIPTOR_BYTES)?;
     let value = Record::decode(&bytes, &[&SCHEMA]).map_err(|_| SnapshotError::Tampered)?;
     if value.id() != locator.id || value.canonical_bytes() != bytes {
         return Err(SnapshotError::Tampered);
@@ -368,6 +365,17 @@ pub fn load(
         target_revision: revision,
         spec,
     })
+}
+
+fn read_descriptor_object(
+    store: &CollaborationStore,
+    digest: &ObjectDigest,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SnapshotError> {
+    match archive::read_object_bounded(store, digest, max_bytes) {
+        Err(archive::ArchiveError::ObjectTooLarge { .. }) => Err(SnapshotError::Limit),
+        result => result.map_err(Into::into),
+    }
 }
 
 fn inspect(

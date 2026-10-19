@@ -5,6 +5,46 @@ use crate::local_target::tests::{Fixture, git};
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
+#[test]
+fn checkout_source_bound_refuses_before_materialization_and_accepts_boundary() {
+    let f = Fixture::new();
+    let id = f.a.result.snapshot_id.clone();
+    let output_bytes = usize::try_from(f.a.result.content_bytes).unwrap();
+    assert!(output_bytes > 0);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let refused_dest = scratch.path().join("refused");
+    let error = reconstruct_checkout_source(
+        &f.store,
+        &id,
+        &refused_dest,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS.with_max_output_bytes(output_bytes - 1),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        NativeGateError::Archive(archive::ArchiveError::ReconstructionLimit {
+            resource: "output_bytes",
+            ..
+        })
+    ));
+    assert!(!refused_dest.exists());
+
+    let accepted_dest = scratch.path().join("accepted");
+    let reconstructed = reconstruct_checkout_source(
+        &f.store,
+        &id,
+        &accepted_dest,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS.with_max_output_bytes(output_bytes),
+    )
+    .unwrap();
+    assert_eq!(reconstructed.id(), id);
+    assert_eq!(
+        std::fs::read(accepted_dest.join("one.txt")).unwrap(),
+        b"A\n"
+    );
+}
+
 struct Setup {
     f: Fixture,
     owner: Option<ControllerOwner>,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::local_target::tests::Fixture;
 use artifact::Purpose;
 use std::io::Write;
 fn archive(entries: &[(&[u8], tar::EntryType, u32, &[u8])]) -> tempfile::NamedTempFile {
@@ -16,6 +17,45 @@ fn archive(entries: &[(&[u8], tar::EntryType, u32, &[u8])]) -> tempfile::NamedTe
     builder.finish().unwrap();
     file
 }
+
+#[test]
+fn artifact_reconstruction_obeys_persisted_build_output_limit() {
+    let f = Fixture::new();
+    let id = f.a.result.snapshot_id.clone();
+    let expected =
+        archive::validate_snapshot_bounded(&f.store, &id, snapshot::RECONSTRUCTION_LIMITS, |_| {})
+            .unwrap()
+            .snapshot()
+            .clone();
+    let output_bytes = f.a.result.content_bytes;
+    assert!(output_bytes > 0);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let refused_dest = scratch.path().join("refused");
+    let error =
+        reconstruct_artifact_output(&f.store, &id, &refused_dest, &expected, output_bytes - 1)
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        SupervisorError::Archive(archive::ArchiveError::ReconstructionLimit {
+            resource: "output_bytes",
+            ..
+        })
+    ));
+    assert!(!refused_dest.exists());
+
+    let accepted_dest = scratch.path().join("accepted");
+    std::fs::create_dir(&accepted_dest).unwrap();
+    let reconstructed =
+        reconstruct_artifact_output(&f.store, &id, &accepted_dest, &expected, output_bytes)
+            .unwrap();
+    assert_eq!(reconstructed, expected);
+    assert_eq!(
+        std::fs::read(accepted_dest.join("one.txt")).unwrap(),
+        b"A\n"
+    );
+}
+
 #[test]
 fn output_bytes_and_modes_have_an_independent_manifest_identity() {
     let file = archive(&[
