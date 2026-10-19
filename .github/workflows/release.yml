@@ -148,7 +148,7 @@ jobs:
           test -f "$graph_repo/.aethyme/graph_store.redb"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: aethyme-${{ matrix.target }}
           path: packages/aethyme/rust/aethyme-*-${{ matrix.target }}.tar.gz
@@ -187,7 +187,7 @@ jobs:
           & "$env:GITHUB_WORKSPACE/scripts/windows-release-smoke.ps1" -RouterPath (Join-Path $smokeRoot "aethyme.exe") -EnginePath (Join-Path $smokeRoot "aethyme-engine-cli.exe") -IndexerPath (Join-Path (Join-Path $env:GITHUB_WORKSPACE "packages/aethyme/rust/target/x86_64-pc-windows-msvc/release") "aethyme-graph-index.exe")
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: aethyme-x86_64-pc-windows-msvc
           path: packages/aethyme/rust/aethyme-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
