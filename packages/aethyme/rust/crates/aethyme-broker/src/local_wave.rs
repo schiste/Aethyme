@@ -507,7 +507,8 @@ fn recipe_json_for_wave(
             object,
         },
     )?;
-    Ok(Some(recipe))
+    let value = serde_json::from_slice(&recipe.canonical_bytes())?;
+    Ok(Some(value))
 }
 
 fn seeded_recipe_record_ref(
@@ -611,7 +612,7 @@ fn validate_seeded_synthesis_prefix(
     binding: &CurrentConflictRequestBinding,
     result_ref: &resolution::RecordRef,
     synthesis: &resolution::UnverifiedSynthesis,
-) -> Result<BTreeMap<String, String>, WaveError> {
+) -> Result<(), WaveError> {
     let order = &binding.plan_payload.order;
     let request = &synthesis.request;
     let prefix_len = request
@@ -746,7 +747,7 @@ fn validate_seeded_synthesis_prefix(
             "seeded resolver inputs do not cover the exact frozen prefix".into(),
         ));
     }
-    Ok(request_ids)
+    Ok(())
 }
 
 /// Re-read an attached result through the exact settled ledger binding and
@@ -824,7 +825,7 @@ pub(crate) fn read_synthesized_wave_result(
                 "seed candidate was relabeled as the complete suffix candidate".into(),
             ));
         }
-        let _ = validate_seeded_synthesis_prefix(wave, binding, result_ref, &synthesis)?;
+        validate_seeded_synthesis_prefix(wave, binding, result_ref, &synthesis)?;
     } else if wave.candidate_snapshot.as_ref() != Some(&synthesis.candidate.subject)
         || wave.candidate_commit.as_ref() != Some(&synthesis.candidate.commit)
     {
@@ -2042,8 +2043,12 @@ fn validate_source_context(
                 && wave.candidate_commit.as_ref() == Some(&candidate.commit) => {}
         (true, true, false, CompositionMode::Text) => {}
         (true, true, true, CompositionMode::Hybrid) => {
-            let _ = read_synthesized_wave_result(store, repo, wave)?.ok_or(WaveError::Stale)?;
-            if wave.candidate_snapshot.as_ref() != Some(&candidate.subject)
+            let (seed, provenance) =
+                read_synthesized_wave_result(store, repo, wave)?.ok_or(WaveError::Stale)?;
+            if seed.candidate.subject == candidate.subject
+                || provenance.candidate_subject != seed.candidate.subject.as_str()
+                || provenance.candidate_commit != seed.candidate.commit.as_str()
+                || wave.candidate_snapshot.as_ref() != Some(&candidate.subject)
                 || wave.candidate_commit.as_ref() != Some(&candidate.commit)
             {
                 return Err(WaveError::Invalid(
