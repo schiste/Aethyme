@@ -6,7 +6,7 @@ use crate::execution_resources::{build_envelope, verify_envelope};
 use crate::execution_snapshot::{self as snapshot, ExecutionSpec};
 use crate::execution_supervisor::{DockerExecutor, Outcome};
 use crate::execution_verifier::{self as verifier, ProducerPermit, VerificationOutcome};
-use crate::local_budget::{self as budget, WorkKind};
+use crate::local_budget::{self as budget, AdmissionRoute, WorkKind};
 use crate::local_source_transport as transport;
 use crate::native_gates;
 use crate::resolution::FailedCheck;
@@ -173,7 +173,7 @@ fn reserve(
         )
         .as_bytes(),
     );
-    let r = budget::reserve(
+    budget::admit(
         store,
         owner,
         wave,
@@ -185,9 +185,9 @@ fn reserve(
             max_attempts: 1,
             deadline_ms: deadline,
         },
-        clock()?,
-    )?;
-    Ok(budget::begin_attempt(store, owner, &r.id, clock()?)?)
+        AdmissionRoute::Direct,
+        || clock(),
+    )
 }
 fn close(
     store: &mut CollaborationStore,
