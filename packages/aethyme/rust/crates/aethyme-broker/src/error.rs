@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+/// Maximum GC row count validated and deleted in one SQLite transaction.
+pub(crate) const GC_ROW_DELETE_BATCH_SIZE: usize = 128;
+
 /// Errors surfaced by the broker store.
 ///
 /// `SQLITE_BUSY` must never leak to callers as a raw code: the store opens
@@ -42,6 +45,14 @@ pub enum BrokerError {
 
     #[error("no session with id {0}")]
     SessionNotFound(i64),
+
+    #[error(
+        "GC retention candidate {kind} row {id} changed or is now protected; the pending batch stopped"
+    )]
+    GcRowEligibilityChanged { kind: String, id: i64 },
+
+    #[error("GC row batch has {requested} rows; the maximum is {max}")]
+    GcRowBatchTooLarge { requested: usize, max: usize },
 
     #[error(
         "session {session_id} checkpoint changed while recovery was being applied (expected {expected}, found {actual})"

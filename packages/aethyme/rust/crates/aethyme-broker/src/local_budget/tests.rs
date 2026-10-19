@@ -245,6 +245,180 @@ fn duplicate_reservation_and_dispatch_never_mint_another_allowance() {
 }
 
 #[test]
+fn direct_and_delegated_paths_share_one_nonce_identity() {
+    let reservation_rows = |store: &CollaborationStore| {
+        let connection = store.read_connection();
+        let mut statement = connection
+            .prepare("SELECT * FROM local_budget_reservations ORDER BY reservation")
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let ledger_counts = |store: &CollaborationStore| {
+        let connection = store.read_connection();
+        let roots = connection
+            .query_row(
+                "SELECT count(*) FROM local_budget_reservations WHERE parent IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let children = connection
+            .query_row(
+                "SELECT count(*) FROM local_budget_reservations WHERE parent IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let attempts = connection
+            .query_row(
+                "SELECT coalesce(sum(attempts), 0) FROM local_budget_reservations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let receipts = connection
+            .query_row("SELECT count(*) FROM local_budget_receipts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        (roots, children, attempts, receipts)
+    };
+
+    // The direct reservation exists first. Delegation with its nonce must
+    // refuse before any parent or project capacity accounting can change.
+    let (mut direct_first, direct_owner, direct_wave) = setup();
+    let parent = reserve(
+        &mut direct_first.store,
+        &direct_owner,
+        &direct_wave,
+        request('a', 4, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let shared = request('b', 1, WorkKind::Composition);
+    let direct = reserve(
+        &mut direct_first.store,
+        &direct_owner,
+        &direct_wave,
+        shared.clone(),
+        0,
+    )
+    .unwrap();
+    assert_ne!(parent.id, direct.id);
+    assert_eq!(direct.root, direct.id);
+    assert!(shared.units.within(parent.allocated));
+    let direct_rows = reservation_rows(&direct_first.store);
+    let direct_charge = charged(&direct_first.store, &direct_owner).unwrap();
+    let direct_counts = ledger_counts(&direct_first.store);
+    assert_eq!(direct_charge, units(5));
+    assert!(direct_charge.add(units(1)).unwrap().within(units(9)));
+    assert_eq!(direct_counts, (2, 0, 0, 0));
+    assert!(matches!(
+        delegate(
+            &mut direct_first.store,
+            &direct_owner,
+            &parent.id,
+            shared.clone(),
+            0
+        ),
+        Err(BudgetError::Immutable)
+    ));
+    assert_eq!(
+        reserve(
+            &mut direct_first.store,
+            &direct_owner,
+            &direct_wave,
+            shared,
+            1
+        )
+        .unwrap(),
+        direct
+    );
+    assert_eq!(reservation_rows(&direct_first.store), direct_rows);
+    assert_eq!(
+        charged(&direct_first.store, &direct_owner).unwrap(),
+        direct_charge
+    );
+    assert_eq!(ledger_counts(&direct_first.store), direct_counts);
+
+    // The delegated reservation exists first. Reserving its nonce as a new
+    // root also has spare project capacity, but remains the same identity.
+    let (mut delegated_first, delegated_owner, delegated_wave) = setup();
+    let parent = reserve(
+        &mut delegated_first.store,
+        &delegated_owner,
+        &delegated_wave,
+        request('a', 4, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let shared = request('b', 1, WorkKind::Composition);
+    let child = delegate(
+        &mut delegated_first.store,
+        &delegated_owner,
+        &parent.id,
+        shared.clone(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(child.root, parent.id);
+    assert_eq!(child.spec.parent.as_deref(), Some(parent.id.as_str()));
+    let delegated_rows = reservation_rows(&delegated_first.store);
+    let delegated_charge = charged(&delegated_first.store, &delegated_owner).unwrap();
+    let delegated_counts = ledger_counts(&delegated_first.store);
+    assert_eq!(delegated_charge, units(4));
+    assert!(delegated_charge.add(units(1)).unwrap().within(units(9)));
+    assert_eq!(delegated_counts, (1, 1, 0, 0));
+    assert!(matches!(
+        reserve(
+            &mut delegated_first.store,
+            &delegated_owner,
+            &delegated_wave,
+            shared.clone(),
+            0
+        ),
+        Err(BudgetError::Immutable)
+    ));
+    assert_eq!(
+        delegate(
+            &mut delegated_first.store,
+            &delegated_owner,
+            &parent.id,
+            shared,
+            1
+        )
+        .unwrap(),
+        child
+    );
+    assert_eq!(reservation_rows(&delegated_first.store), delegated_rows);
+    assert_eq!(
+        charged(&delegated_first.store, &delegated_owner).unwrap(),
+        delegated_charge
+    );
+    assert_eq!(ledger_counts(&delegated_first.store), delegated_counts);
+
+    // Reacquiring the appointed target under a different issuer still fails.
+    let before_wrong_issuer = reservation_rows(&direct_first.store);
+    let mut reopened = reopen(&direct_first);
+    drop(direct_owner);
+    assert!(matches!(
+        target::acquire_controller(&mut reopened, "target", "intruder"),
+        Err(TargetError::Unauthorized)
+    ));
+    assert_eq!(reservation_rows(&reopened), before_wrong_issuer);
+    assert_eq!(ledger_counts(&reopened), direct_counts);
+}
+
+#[test]
 fn retry_preserves_spent_units_and_one_finite_lineage_allowance() {
     let (mut f, owner, wave) = setup();
     let r = reserve(

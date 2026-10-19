@@ -485,6 +485,11 @@ pub struct GcRowCandidate {
     pub estimated_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_log_path: Option<String>,
+    /// SHA-256 of the complete reviewed SQLite row, including column names
+    /// and typed values. Older journals omit this field; a present row then
+    /// fails closed during replay, while an absent row remains idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

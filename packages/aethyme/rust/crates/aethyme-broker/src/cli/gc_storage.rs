@@ -871,17 +871,49 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| {
-            UsageError::Message("gc requires `plan`, `apply --confirm <sha256>` or `sweep`".into())
+            UsageError::Message(
+                "gc requires `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>` or `sweep`".into(),
+            )
         })?;
     if action == "__continue-artifacts" {
         return run_artifact_sweep_continuation_worker(parsed);
     }
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(
-            "gc accepts exactly one action: `plan`, `apply --confirm <sha256>` or `sweep`".into(),
+            "gc accepts exactly one action: `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>` or `sweep`".into(),
         ));
     }
-    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    if matches!(action, "abandon" | "forget-abandoned") && parsed.include_active_gate_cache {
+        return Err(UsageError::Message(format!(
+            "gc {action} does not accept --include-active-gate-cache"
+        )));
+    }
+    if matches!(action, "abandon" | "forget-abandoned") {
+        if parsed.read_only_snapshot {
+            return Err(UsageError::Message(format!(
+                "gc {action} changes the repository journal and does not accept --read-only-snapshot"
+            )));
+        }
+        if parsed.confirm.is_none() {
+            let required = if action == "abandon" {
+                "pending-digest"
+            } else {
+                "archived-plan-digest"
+            };
+            return Err(UsageError::Message(format!(
+                "gc {action} requires --confirm <{required}>"
+            )));
+        }
+    }
+    // A normal Broker::open resumes confirmed GC maintenance at startup. The
+    // journal-recovery commands must operate on the pending journal before
+    // any startup maintenance can consume it, so use its read-only DB snapshot
+    // while the command itself takes the repository GC lock for file changes.
+    let mut broker = if matches!(action, "abandon" | "forget-abandoned") {
+        open_broker(true)?
+    } else {
+        open_broker(parsed.read_only_snapshot)?
+    };
     match action {
         "plan" => {
             if parsed.confirm.is_some() {
@@ -924,6 +956,41 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                 )));
             }
         }
+        "abandon" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message("gc abandon requires --confirm <pending-digest>".into())
+            })?;
+            let report = broker.gc_abandon_pending(confirm)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                out!(
+                    "Archived the pending GC journal {} ({} bytes) at {}.",
+                    report.digest,
+                    report.bytes_archived,
+                    report.archive_path
+                );
+                out!("  no retained rows, files, worktrees or artifacts were removed");
+                out!("  next: review a fresh plan with `aethyme broker gc plan`");
+            }
+        }
+        "forget-abandoned" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "gc forget-abandoned requires --confirm <archived-plan-digest>".into(),
+                )
+            })?;
+            let report = broker.gc_forget_abandoned(confirm)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                out!(
+                    "Forgot GC archive or staging files for {} ({} bytes). No retained data was removed.",
+                    report.digest,
+                    report.bytes_forgotten
+                );
+            }
+        }
         "sweep" => {
             let report = broker.gc_sweep_artifacts()?;
             if parsed.json {
@@ -934,7 +1001,7 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown gc action {other:?}; expected `plan`, `apply` or `sweep`"
+                "unknown gc action {other:?}; expected `plan`, `apply`, `abandon`, `forget-abandoned` or `sweep`"
             )));
         }
     }

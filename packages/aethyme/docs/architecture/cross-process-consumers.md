@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-18
+Last Updated: 2026-10-19
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -58,6 +58,24 @@ strict record decoder may refuse the recovered record, so operators must keep
 host state and use a compatible runtime. See
 [the storage lifecycle recovery contract](local-v3-storage-lifecycle.md)
 before applying a plan.
+
+### GC journal recovery commands (#852)
+
+The operator-facing `aethyme broker gc abandon --confirm <pending-digest>`
+command archives a validated pending GC journal and clears the active journal
+while holding the GC lock. Schema 2 journals may be archived for recovery;
+this runtime resumes only schema 3 journals, whose row fingerprints bind the
+reviewed candidate contents. Unknown future schemas are refused. Abandonment
+never resumes deletion or removes project rows, files, worktrees, or artifacts.
+A fresh plan and a separate apply confirmation are required afterward; because
+plan digests are deterministic, a fresh plan can have the same digest.
+
+`aethyme broker gc forget-abandoned --confirm <archived-plan-digest>` explicitly
+retires only the matching private journal archive or validated interrupted
+staging files. The archive has a 32-file / 64 MiB admission limit, is never
+pruned automatically, and cannot be forgotten while its exact bytes are needed
+for active-journal crash recovery. Neither command accepts an arbitrary archive
+path or grants deletion authority.
 
 ### Detached automatic artifact continuation (#818)
 

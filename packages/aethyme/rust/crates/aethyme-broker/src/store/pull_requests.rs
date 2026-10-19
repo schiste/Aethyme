@@ -4,6 +4,255 @@ const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY: &str = "gc.artifact_sweep.v2.contex
 const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX: usize = 64;
 const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX_BYTES: usize = 8 * 1024;
 
+fn append_gc_id_filter(
+    sql: &mut String,
+    column: &str,
+    ids: Option<&[i64]>,
+    next_parameter: &mut usize,
+    values: &mut Vec<rusqlite::types::Value>,
+) {
+    let Some(ids) = ids else {
+        return;
+    };
+    if ids.is_empty() {
+        sql.push_str(" AND 0");
+        return;
+    }
+
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(" IN (");
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+        sql.push_str(&next_parameter.to_string());
+        *next_parameter += 1;
+        values.push(rusqlite::types::Value::Integer(*id));
+    }
+    sql.push(')');
+}
+
+fn gc_row_table(kind: crate::GcRowKind) -> (&'static str, &'static str) {
+    match kind {
+        crate::GcRowKind::Event => ("events", "event"),
+        crate::GcRowKind::GateResult => ("gate_results", "gate_result"),
+        crate::GcRowKind::Advisory => ("advisories", "advisory"),
+        crate::GcRowKind::EntryExposure => ("entry_path_exposures", "entry_exposure"),
+        crate::GcRowKind::IntegrationReconciliationEntry => (
+            "integration_reconciliation_entries",
+            "integration_reconciliation_entry",
+        ),
+        crate::GcRowKind::MergeQueue => ("merge_queue", "merge_queue"),
+    }
+}
+
+fn update_gc_fingerprint_bytes(digest: &mut sha2::Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+fn gc_row_content_fingerprint(
+    kind: crate::GcRowKind,
+    column_names: &[String],
+    row: &rusqlite::Row<'_>,
+) -> Result<String, rusqlite::Error> {
+    use rusqlite::types::ValueRef;
+    use sha2::Digest;
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"aethyme-gc-row/v1\0");
+    update_gc_fingerprint_bytes(&mut digest, gc_row_table(kind).1.as_bytes());
+    digest.update((column_names.len() as u64).to_be_bytes());
+    for (index, name) in column_names.iter().enumerate() {
+        update_gc_fingerprint_bytes(&mut digest, name.as_bytes());
+        match row.get_ref(index)? {
+            ValueRef::Null => digest.update([0]),
+            ValueRef::Integer(value) => {
+                digest.update([1]);
+                digest.update(value.to_be_bytes());
+            }
+            ValueRef::Real(value) => {
+                digest.update([2]);
+                digest.update(value.to_bits().to_be_bytes());
+            }
+            ValueRef::Text(value) => {
+                digest.update([3]);
+                update_gc_fingerprint_bytes(&mut digest, value);
+            }
+            ValueRef::Blob(value) => {
+                digest.update([4]);
+                update_gc_fingerprint_bytes(&mut digest, value);
+            }
+        }
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn attach_gc_row_content_fingerprints(
+    conn: &rusqlite::Connection,
+    candidates: &mut [crate::GcRowCandidate],
+) -> Result<(), BrokerError> {
+    candidates.sort_by_key(|candidate| (candidate.kind, candidate.id));
+    let mut start = 0;
+    while start < candidates.len() {
+        let kind = candidates[start].kind;
+        let mut end = start + 1;
+        while end < candidates.len() && candidates[end].kind == kind {
+            end += 1;
+        }
+        let kind_candidates = &mut candidates[start..end];
+        start = end;
+        if kind_candidates.is_empty() {
+            continue;
+        }
+
+        let (table, _) = gc_row_table(kind);
+        let placeholders = (1..=crate::error::GC_ROW_DELETE_BATCH_SIZE)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = conn.prepare(&format!(
+            "SELECT * FROM {table} WHERE id IN ({placeholders}) ORDER BY id"
+        ))?;
+        let column_names = statement
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let id_column = column_names
+            .iter()
+            .position(|name| name == "id")
+            .ok_or_else(|| BrokerError::GcRowEligibilityChanged {
+                kind: table.into(),
+                id: kind_candidates[0].id,
+            })?;
+        for chunk in kind_candidates.chunks_mut(crate::error::GC_ROW_DELETE_BATCH_SIZE) {
+            let mut parameters =
+                vec![rusqlite::types::Value::Null; crate::error::GC_ROW_DELETE_BATCH_SIZE];
+            for (index, candidate) in chunk.iter().enumerate() {
+                parameters[index] = rusqlite::types::Value::Integer(candidate.id);
+            }
+            let mut rows = statement
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                    let id = row.get::<_, i64>(id_column)?;
+                    let fingerprint = gc_row_content_fingerprint(kind, &column_names, row)?;
+                    Ok((id, fingerprint))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter();
+            for candidate in chunk {
+                candidate.content_fingerprint = Some(match rows.next() {
+                    Some((id, fingerprint)) if id == candidate.id => fingerprint,
+                    _ => {
+                        return Err(BrokerError::GcRowEligibilityChanged {
+                            kind: table.into(),
+                            id: candidate.id,
+                        });
+                    }
+                });
+            }
+            if let Some((id, _)) = rows.next() {
+                return Err(BrokerError::GcRowEligibilityChanged {
+                    kind: table.into(),
+                    id,
+                });
+            }
+        }
+    }
+    debug_assert_eq!(start, candidates.len());
+    Ok(())
+}
+
+fn gc_event_blocker_needs(kinds: impl IntoIterator<Item = String>) -> [bool; 4] {
+    let prefixes = ["advisory.", "exposure.", "operation.", "merge."];
+    let mut needed = [false; 4];
+    for kind in kinds {
+        for (index, prefix) in prefixes.iter().enumerate() {
+            needed[index] |= kind
+                .get(..prefix.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(prefix));
+        }
+    }
+    needed
+}
+
+fn gc_event_blocker_needs_for_ids(
+    conn: &rusqlite::Connection,
+    event_ids: Option<&[i64]>,
+) -> Result<[bool; 4], BrokerError> {
+    let Some(event_ids) = event_ids else {
+        return Ok([true; 4]);
+    };
+    if event_ids.is_empty() {
+        return Ok([false; 4]);
+    }
+
+    let mut sql = String::from("SELECT kind FROM events WHERE 1 = 1");
+    let mut values = Vec::new();
+    let mut next_parameter = 1;
+    append_gc_id_filter(
+        &mut sql,
+        "id",
+        Some(event_ids),
+        &mut next_parameter,
+        &mut values,
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let kinds = statement
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(gc_event_blocker_needs(kinds))
+}
+
+#[cfg(test)]
+mod gc_event_blocker_needs_tests {
+    use super::gc_event_blocker_needs_for_ids;
+
+    #[test]
+    fn bounded_batches_probe_only_blockers_for_current_event_prefixes() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, kind TEXT NOT NULL);
+             INSERT INTO events (id, kind) VALUES
+                 (1, 'gate.pass'),
+                 (2, 'Advisory.fixture'),
+                 (3, 'exposure.fixture'),
+                 (4, 'operation.fixture'),
+                 (5, 'merge.fixture');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[1])).unwrap(),
+            [false; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[])).unwrap(),
+            [false; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[2, 5])).unwrap(),
+            [true, false, false, true]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[2, 3, 4, 5])).unwrap(),
+            [true; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, Some(&[999])).unwrap(),
+            [false; 4]
+        );
+        assert_eq!(
+            gc_event_blocker_needs_for_ids(&conn, None).unwrap(),
+            [true; 4]
+        );
+    }
+}
+
 impl BrokerStore {
     /// Atomically register a bounded artifact-sweep namespace. IDs remain in
     /// the registry once created so another context's durable cursor or
@@ -865,33 +1114,93 @@ impl BrokerStore {
         gate_cutoff: i64,
         queue_cutoff: i64,
     ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
+        Self::gc_row_candidates_on(&self.conn, event_cutoff, gate_cutoff, queue_cutoff, None)
+    }
+
+    fn gc_row_candidates_on(
+        conn: &rusqlite::Connection,
+        event_cutoff: i64,
+        gate_cutoff: i64,
+        queue_cutoff: i64,
+        only: Option<&[crate::GcRowCandidate]>,
+    ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
         use crate::{GcRowCandidate, GcRowKind};
 
-        let mut candidates = Vec::new();
-        let unresolved_advisories: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM advisories WHERE resolution_state != 'resolved'",
-            [],
-            |row| row.get(0),
-        )?;
-        let outstanding_exposures: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entry_path_exposures WHERE state = 'outstanding'",
-            [],
-            |row| row.get(0),
-        )?;
-        let unresolved_operations: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM coordinated_operations
-             WHERE status IN ('prepared', 'running', 'outcome_unknown')",
-            [],
-            |row| row.get(0),
-        )?;
-        let unresolved_queue: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM merge_queue
-             WHERE status IN ('submitted', 'simulating', 'conflict', 'verified')",
-            [],
-            |row| row.get(0),
-        )?;
+        let event_ids = only.map(|rows| {
+            rows.iter()
+                .filter(|row| row.kind == GcRowKind::Event)
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        });
+        let gate_ids = only.map(|rows| {
+            rows.iter()
+                .filter(|row| row.kind == GcRowKind::GateResult)
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        });
+        let queue_ids = only.map(|rows| {
+            rows.iter()
+                .filter(|row| row.kind == GcRowKind::MergeQueue)
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        });
+        let advisory_ids = only.map(|rows| {
+            rows.iter()
+                .filter(|row| row.kind == GcRowKind::Advisory)
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        });
+        let exposure_ids = only.map(|rows| {
+            rows.iter()
+                .filter(|row| row.kind == GcRowKind::EntryExposure)
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        });
+        let reconciliation_ids = only.map(|rows| {
+            rows.iter()
+                .filter(|row| row.kind == GcRowKind::IntegrationReconciliationEntry)
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        });
 
-        let mut events = self.conn.prepare(
+        let mut candidates = Vec::new();
+        let blocker_needs = gc_event_blocker_needs_for_ids(conn, event_ids.as_deref())?;
+        let unresolved_advisories = blocker_needs[0]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM advisories WHERE resolution_state != 'resolved'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        let outstanding_exposures = blocker_needs[1]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM entry_path_exposures WHERE state = 'outstanding'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        let unresolved_operations = blocker_needs[2]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM coordinated_operations
+                     WHERE status IN ('prepared', 'running', 'outcome_unknown')
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        let unresolved_queue = blocker_needs[3]
+            && conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM merge_queue
+                     WHERE status IN ('submitted', 'simulating', 'conflict', 'verified')
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+
+        let mut event_sql = String::from(
             "SELECT e.id, e.ts,
                     length(e.kind) + COALESCE(length(e.payload_json), 0) + 32
              FROM events e
@@ -903,30 +1212,39 @@ impl BrokerStore {
                AND (?2 = 0 OR e.kind NOT LIKE 'advisory.%')
                AND (?3 = 0 OR e.kind NOT LIKE 'exposure.%')
                AND (?4 = 0 OR e.kind NOT LIKE 'operation.%')
-               AND (?5 = 0 OR e.kind NOT LIKE 'merge.%')
-             ORDER BY e.id",
-        )?;
-        let rows = events.query_map(
-            params![
-                event_cutoff,
-                unresolved_advisories,
-                outstanding_exposures,
-                unresolved_operations,
-                unresolved_queue
-            ],
-            |row| {
+               AND (?5 = 0 OR e.kind NOT LIKE 'merge.%')",
+        );
+        let mut event_parameters = vec![
+            rusqlite::types::Value::Integer(event_cutoff),
+            rusqlite::types::Value::Integer(i64::from(u8::from(unresolved_advisories))),
+            rusqlite::types::Value::Integer(i64::from(u8::from(outstanding_exposures))),
+            rusqlite::types::Value::Integer(i64::from(u8::from(unresolved_operations))),
+            rusqlite::types::Value::Integer(i64::from(u8::from(unresolved_queue))),
+        ];
+        let mut next_parameter = 6;
+        append_gc_id_filter(
+            &mut event_sql,
+            "e.id",
+            event_ids.as_deref(),
+            &mut next_parameter,
+            &mut event_parameters,
+        );
+        event_sql.push_str(" ORDER BY e.id");
+        let mut events = conn.prepare(&event_sql)?;
+        let rows =
+            events.query_map(rusqlite::params_from_iter(event_parameters.iter()), |row| {
                 Ok(GcRowCandidate {
                     kind: GcRowKind::Event,
                     id: row.get(0)?,
                     recorded_at: row.get(1)?,
                     estimated_bytes: row.get::<_, i64>(2)?.max(0) as u64,
                     gate_log_path: None,
+                    content_fingerprint: None,
                 })
-            },
-        )?;
+            })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
 
-        let mut gates = self.conn.prepare(
+        let mut gate_sql = String::from(
             "SELECT r.id, r.created_at,
                     length(r.gate_name) + length(r.tree_hash)
                       + COALESCE(length(r.definition_hash), 0)
@@ -937,21 +1255,94 @@ impl BrokerStore {
                AND NOT EXISTS (
                    SELECT 1 FROM sessions s
                    WHERE s.id = r.session_id AND s.cleanup_state = 'open'
-               )
-             ORDER BY r.id",
-        )?;
-        let rows = gates.query_map([gate_cutoff], |row| {
+               )",
+        );
+        let mut gate_parameters = vec![rusqlite::types::Value::Integer(gate_cutoff)];
+        let mut next_parameter = 2;
+        append_gc_id_filter(
+            &mut gate_sql,
+            "r.id",
+            gate_ids.as_deref(),
+            &mut next_parameter,
+            &mut gate_parameters,
+        );
+        gate_sql.push_str(" ORDER BY r.id");
+        let mut gates = conn.prepare(&gate_sql)?;
+        let rows = gates.query_map(rusqlite::params_from_iter(gate_parameters.iter()), |row| {
             Ok(GcRowCandidate {
                 kind: GcRowKind::GateResult,
                 id: row.get(0)?,
                 recorded_at: row.get(1)?,
                 estimated_bytes: row.get::<_, i64>(2)?.max(0) as u64,
                 gate_log_path: row.get(3)?,
+                content_fingerprint: None,
             })
         })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
 
-        let mut queue = self.conn.prepare(
+        let eligible_queue_ids = if only.is_some() {
+            let mut query = String::from(
+                "SELECT queue_entry_id FROM advisories WHERE 1 = 1
+                 UNION
+                 SELECT queue_entry_id FROM entry_path_exposures WHERE 1 = 1
+                 UNION
+                 SELECT queue_entry_id FROM integration_reconciliation_entries WHERE 1 = 1",
+            );
+            let mut values = Vec::new();
+            let mut next_parameter = 1;
+            let mut filter = String::new();
+            append_gc_id_filter(
+                &mut filter,
+                "id",
+                advisory_ids.as_deref(),
+                &mut next_parameter,
+                &mut values,
+            );
+            let anchor = "SELECT queue_entry_id FROM advisories WHERE 1 = 1";
+            let position = query.find(anchor).expect("advisory parent lookup") + anchor.len();
+            query.insert_str(position, &filter);
+
+            filter.clear();
+            append_gc_id_filter(
+                &mut filter,
+                "id",
+                exposure_ids.as_deref(),
+                &mut next_parameter,
+                &mut values,
+            );
+            let anchor = "SELECT queue_entry_id FROM entry_path_exposures WHERE 1 = 1";
+            let position = query.find(anchor).expect("exposure parent lookup") + anchor.len();
+            query.insert_str(position, &filter);
+
+            filter.clear();
+            append_gc_id_filter(
+                &mut filter,
+                "id",
+                reconciliation_ids.as_deref(),
+                &mut next_parameter,
+                &mut values,
+            );
+            let anchor =
+                "SELECT queue_entry_id FROM integration_reconciliation_entries WHERE 1 = 1";
+            let position = query.find(anchor).expect("reconciliation parent lookup") + anchor.len();
+            query.insert_str(position, &filter);
+
+            let mut statement = conn.prepare(&query)?;
+            let ids = statement
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut ids = ids;
+            ids.extend(queue_ids.as_deref().unwrap_or_default().iter().copied());
+            ids.sort_unstable();
+            ids.dedup();
+            Some(ids)
+        } else {
+            None
+        };
+
+        let mut queue_sql = String::from(
             "WITH eligible_queue AS (
             SELECT q.* FROM merge_queue q
             WHERE q.updated_at < ?1
@@ -987,18 +1378,21 @@ impl BrokerStore {
                      + COALESCE(length(q.merged_tree), 0)
                      + COALESCE(length(q.details_json), 0) + 96
             FROM eligible_queue q
+            WHERE 1 = 1
             UNION ALL
             SELECT 'advisory', a.id, q.updated_at,
                    length(a.identity) + length(a.paths_json) + length(a.evidence_json)
                      + COALESCE(length(a.resolution_evidence), 0) + 96
             FROM advisories a
             JOIN eligible_queue q ON q.id = a.queue_entry_id
+            WHERE 1 = 1
             UNION ALL
             SELECT 'entry_exposure', x.id, q.updated_at,
                    length(x.promotion_sha) + length(x.paths_json)
                      + COALESCE(length(x.resolution_evidence), 0) + 96
             FROM entry_path_exposures x
             JOIN eligible_queue q ON q.id = x.queue_entry_id
+            WHERE 1 = 1
             UNION ALL
             SELECT 'integration_reconciliation_entry', i.id, q.updated_at,
                    length(i.details_json) + length(i.old_merge_commit)
@@ -1006,9 +1400,76 @@ impl BrokerStore {
                      + COALESCE(length(i.replayed_commit), 0) + 64
             FROM integration_reconciliation_entries i
             JOIN eligible_queue q ON q.id = i.queue_entry_id
-            ORDER BY 1, 2",
-        )?;
-        let rows = queue.query_map([queue_cutoff], |row| {
+            WHERE 1 = 1",
+        );
+        let mut queue_parameters = vec![rusqlite::types::Value::Integer(queue_cutoff)];
+        let mut next_parameter = 2;
+        let mut filter = String::new();
+        append_gc_id_filter(
+            &mut filter,
+            "q.id",
+            eligible_queue_ids.as_deref(),
+            &mut next_parameter,
+            &mut queue_parameters,
+        );
+        let anchor = "WHERE q.updated_at < ?1";
+        let position = queue_sql.find(anchor).expect("eligible queue id anchor") + anchor.len();
+        queue_sql.insert_str(position, &filter);
+
+        filter.clear();
+        append_gc_id_filter(
+            &mut filter,
+            "q.id",
+            queue_ids.as_deref(),
+            &mut next_parameter,
+            &mut queue_parameters,
+        );
+        let anchor = "FROM eligible_queue q\n            WHERE 1 = 1";
+        let position = queue_sql.find(anchor).expect("queue parent filter anchor") + anchor.len();
+        queue_sql.insert_str(position, &filter);
+
+        filter.clear();
+        append_gc_id_filter(
+            &mut filter,
+            "a.id",
+            advisory_ids.as_deref(),
+            &mut next_parameter,
+            &mut queue_parameters,
+        );
+        let anchor = "FROM advisories a\n            JOIN eligible_queue q ON q.id = a.queue_entry_id\n            WHERE 1 = 1";
+        let position = queue_sql.find(anchor).expect("advisory filter anchor") + anchor.len();
+        queue_sql.insert_str(position, &filter);
+
+        filter.clear();
+        append_gc_id_filter(
+            &mut filter,
+            "x.id",
+            exposure_ids.as_deref(),
+            &mut next_parameter,
+            &mut queue_parameters,
+        );
+        let anchor = "FROM entry_path_exposures x\n            JOIN eligible_queue q ON q.id = x.queue_entry_id\n            WHERE 1 = 1";
+        let position = queue_sql.find(anchor).expect("exposure filter anchor") + anchor.len();
+        queue_sql.insert_str(position, &filter);
+
+        filter.clear();
+        append_gc_id_filter(
+            &mut filter,
+            "i.id",
+            reconciliation_ids.as_deref(),
+            &mut next_parameter,
+            &mut queue_parameters,
+        );
+        let anchor = "FROM integration_reconciliation_entries i\n            JOIN eligible_queue q ON q.id = i.queue_entry_id\n            WHERE 1 = 1";
+        let position = queue_sql
+            .find(anchor)
+            .expect("reconciliation filter anchor")
+            + anchor.len();
+        queue_sql.insert_str(position, &filter);
+
+        queue_sql.push_str(" ORDER BY 1, 2");
+        let mut queue = conn.prepare(&queue_sql)?;
+        let rows = queue.query_map(rusqlite::params_from_iter(queue_parameters.iter()), |row| {
             let kind = match row.get_ref(0)?.as_str()? {
                 "merge_queue" => GcRowKind::MergeQueue,
                 "advisory" => GcRowKind::Advisory,
@@ -1028,10 +1489,11 @@ impl BrokerStore {
                 recorded_at: row.get(2)?,
                 estimated_bytes: row.get::<_, i64>(3)?.max(0) as u64,
                 gate_log_path: None,
+                content_fingerprint: None,
             })
         })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
-        candidates.sort_by_key(|row| (row.kind, row.id));
+        attach_gc_row_content_fingerprints(conn, &mut candidates)?;
         Ok(candidates)
     }
 
@@ -1139,15 +1601,74 @@ impl BrokerStore {
             .map_err(Into::into)
     }
 
-    /// Delete one reviewed GC batch atomically. Child rows sort before their
-    /// merge-queue parent; missing rows are accepted for crash-idempotent
-    /// journal replay and primary keys are never reused.
-    pub fn delete_gc_rows(&mut self, rows: &[crate::GcRowCandidate]) -> Result<usize, BrokerError> {
+    /// Delete one reviewed GC batch atomically after rechecking its current
+    /// retention eligibility and complete candidate row contents in the same
+    /// transaction. Missing rows are accepted for crash-idempotent journal
+    /// replay; a present row without a matching content fingerprint fails closed.
+    pub fn delete_gc_rows(
+        &mut self,
+        rows: &[crate::GcRowCandidate],
+        event_cutoff: i64,
+        gate_cutoff: i64,
+        queue_cutoff: i64,
+    ) -> Result<usize, BrokerError> {
+        if rows.len() > crate::error::GC_ROW_DELETE_BATCH_SIZE {
+            return Err(BrokerError::GcRowBatchTooLarge {
+                requested: rows.len(),
+                max: crate::error::GC_ROW_DELETE_BATCH_SIZE,
+            });
+        }
         let mut rows = rows.to_vec();
         rows.sort_by_key(|row| (row.kind, row.id));
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let eligible =
+            Self::gc_row_candidates_on(&tx, event_cutoff, gate_cutoff, queue_cutoff, Some(&rows))?;
+        let eligible_by_id = eligible
+            .into_iter()
+            .map(|candidate| ((candidate.kind, candidate.id), candidate))
+            .collect::<BTreeMap<_, _>>();
+
+        // Validate the complete batch before the first delete or checkpoint
+        // pin release. A changed protection predicate must leave every row
+        // untouched so the journal can be reviewed again.
+        for row in &rows {
+            let table = match row.kind {
+                crate::GcRowKind::Event => "events",
+                crate::GcRowKind::GateResult => "gate_results",
+                crate::GcRowKind::Advisory => "advisories",
+                crate::GcRowKind::EntryExposure => "entry_path_exposures",
+                crate::GcRowKind::IntegrationReconciliationEntry => {
+                    "integration_reconciliation_entries"
+                }
+                crate::GcRowKind::MergeQueue => "merge_queue",
+            };
+            match eligible_by_id.get(&(row.kind, row.id)) {
+                Some(current) if current == row => {}
+                Some(_) => {
+                    return Err(BrokerError::GcRowEligibilityChanged {
+                        kind: table.into(),
+                        id: row.id,
+                    });
+                }
+                None => {
+                    let exists: bool = tx.query_row(
+                        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?1)"),
+                        [row.id],
+                        |record| record.get(0),
+                    )?;
+                    if exists {
+                        return Err(BrokerError::GcRowEligibilityChanged {
+                            kind: table.into(),
+                            id: row.id,
+                        });
+                    }
+                }
+            }
+        }
+
         let mut removed = 0_usize;
         for row in rows {
             if row.kind == crate::GcRowKind::MergeQueue {

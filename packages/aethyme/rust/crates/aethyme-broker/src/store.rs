@@ -619,13 +619,12 @@ mod gate_result_clear_metadata_tests {
             )
             .unwrap();
         let id = store.conn.last_insert_rowid();
-        let candidate = crate::GcRowCandidate {
-            kind: crate::GcRowKind::GateResult,
-            id,
-            recorded_at: 1,
-            estimated_bytes: 1,
-            gate_log_path: None,
-        };
+        let candidate = store
+            .gc_row_candidates(2, 2, 2)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.kind == crate::GcRowKind::GateResult && candidate.id == id)
+            .expect("old terminal gate result is eligible");
 
         assert!(
             store
@@ -634,7 +633,7 @@ mod gate_result_clear_metadata_tests {
                 .is_err(),
             "ordinary old-writer deletes remain fenced"
         );
-        assert_eq!(store.delete_gc_rows(&[candidate]).unwrap(), 1);
+        assert_eq!(store.delete_gc_rows(&[candidate], 2, 2, 2).unwrap(), 1);
         let remaining: i64 = store
             .conn
             .query_row(
@@ -651,6 +650,545 @@ mod gate_result_clear_metadata_tests {
             })
             .unwrap();
         assert_eq!(permits, 0);
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    }
+
+    fn insert_gc_fixture_event(store: &mut BrokerStore, kind: &str) -> i64 {
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (schema_version, ts, kind, session_id, payload_json)
+                 VALUES (1, 1, ?1, NULL, NULL)",
+                [kind],
+            )
+            .unwrap();
+        store.conn.last_insert_rowid()
+    }
+
+    fn insert_gc_fixture_session(store: &mut BrokerStore, worktree_path: &Path) -> i64 {
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (
+                     worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, 'main', 'spawned', 'active', 1, 1, 1)",
+                [worktree_path.to_string_lossy().into_owned()],
+            )
+            .unwrap();
+        store.conn.last_insert_rowid()
+    }
+
+    fn gc_candidate(store: &BrokerStore, kind: crate::GcRowKind, id: i64) -> crate::GcRowCandidate {
+        store
+            .gc_row_candidates(2, 2, 2)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.kind == kind && candidate.id == id)
+            .expect("fixture row is an old GC candidate")
+    }
+
+    #[test]
+    fn gc_row_revalidation_rejects_candidate_metadata_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO gate_results (
+                     gate_name, tree_hash, definition_hash, status, created_at
+                 ) VALUES ('unit', 'tree', 'definition', 'pass', 1)",
+                [],
+            )
+            .unwrap();
+        let id = store.conn.last_insert_rowid();
+        let candidate = gc_candidate(&store, crate::GcRowKind::GateResult, id);
+
+        store
+            .conn
+            .execute(
+                "UPDATE gate_results SET gate_name = 'renamed-gate' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        let error = store.delete_gc_rows(&[candidate], 2, 2, 2).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged {
+                id: changed_id,
+                kind
+            } if changed_id == id && kind == "gate_results"
+        ));
+        let present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM gate_results WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+    }
+
+    #[test]
+    fn gc_row_revalidation_rejects_content_drift_with_identical_candidate_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (schema_version, ts, kind, session_id, payload_json)
+                 VALUES (1, 1, 'gc.fixture.payload', NULL, 'old')",
+                [],
+            )
+            .unwrap();
+        let id = store.conn.last_insert_rowid();
+        let candidate = gc_candidate(&store, crate::GcRowKind::Event, id);
+
+        store
+            .conn
+            .execute("UPDATE events SET payload_json = 'new' WHERE id = ?1", [id])
+            .unwrap();
+        let current = gc_candidate(&store, crate::GcRowKind::Event, id);
+        assert_eq!(candidate.recorded_at, current.recorded_at);
+        assert_eq!(candidate.estimated_bytes, current.estimated_bytes);
+        assert_eq!(candidate.gate_log_path, current.gate_log_path);
+        assert_ne!(candidate.content_fingerprint, current.content_fingerprint);
+
+        let error = store.delete_gc_rows(&[candidate], 2, 2, 2).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged {
+                id: changed_id,
+                kind
+            } if changed_id == id && kind == "events"
+        ));
+        let present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+    }
+
+    #[test]
+    fn gc_row_revalidation_rejects_reused_queue_id_with_same_age_and_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let session_id = insert_gc_fixture_session(&mut store, &directory.path().join("session"));
+        store
+            .set_session_status(session_id, crate::SessionStatus::Closed, None)
+            .unwrap();
+        let queue = store
+            .submit(session_id, "fixture-head", "fixture-base")
+            .unwrap();
+        store
+            .set_merge_status(queue.id, crate::MergeStatus::Rejected, None, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE merge_queue SET updated_at = 1 WHERE id = ?1",
+                [queue.id],
+            )
+            .unwrap();
+        let candidate = gc_candidate(&store, crate::GcRowKind::MergeQueue, queue.id);
+
+        store
+            .conn
+            .execute("DELETE FROM merge_queue WHERE id = ?1", [queue.id])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO merge_queue (
+                     id, session_id, head_commit, base_commit, status,
+                     merged_tree, details_json, created_at, updated_at
+                 ) VALUES (?1, ?2, 'variant-head', 'variant-base', 'rejected', NULL, NULL, 1, 1)",
+                params![queue.id, session_id],
+            )
+            .unwrap();
+
+        let replacement = gc_candidate(&store, crate::GcRowKind::MergeQueue, queue.id);
+        assert_eq!(candidate.recorded_at, replacement.recorded_at);
+        assert_eq!(candidate.estimated_bytes, replacement.estimated_bytes);
+        assert_ne!(
+            candidate.content_fingerprint,
+            replacement.content_fingerprint
+        );
+        let error = store.delete_gc_rows(&[candidate], 2, 2, 2).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged {
+                id: changed_id,
+                kind
+            } if changed_id == queue.id && kind == "merge_queue"
+        ));
+        let present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM merge_queue WHERE id = ?1)",
+                [queue.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+    }
+
+    #[test]
+    fn legacy_gc_row_candidate_fails_closed_when_its_row_is_still_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let id = insert_gc_fixture_event(&mut store, "gc.fixture.legacy");
+        let current = gc_candidate(&store, crate::GcRowKind::Event, id);
+
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("candidate is a JSON object")
+            .remove("content_fingerprint");
+        let legacy: crate::GcRowCandidate = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.content_fingerprint, None);
+
+        let error = store
+            .delete_gc_rows(std::slice::from_ref(&legacy), 2, 2, 2)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged {
+                id: changed_id,
+                kind
+            } if changed_id == id && kind == "events"
+        ));
+        let present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+
+        store
+            .conn
+            .execute("DELETE FROM events WHERE id = ?1", [id])
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_gc_rows(std::slice::from_ref(&legacy), 2, 2, 2)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn gc_row_revalidation_accepts_missing_rows_on_crash_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let first_id = insert_gc_fixture_event(&mut store, "advisory.fixture.first");
+        let second_id = insert_gc_fixture_event(&mut store, "advisory.fixture.second");
+        let batch = vec![
+            gc_candidate(&store, crate::GcRowKind::Event, first_id),
+            gc_candidate(&store, crate::GcRowKind::Event, second_id),
+        ];
+
+        assert_eq!(store.delete_gc_rows(&batch, 2, 2, 2).unwrap(), 2);
+        store
+            .record_advisory(&crate::NewAdvisory {
+                identity: "gc-fixture-replay-protection".into(),
+                audience: crate::AdvisoryAudience::Session,
+                producer: crate::AdvisoryProducer::Coordination,
+                session_id: None,
+                severity: crate::AdvisorySeverity::Warning,
+                queue_entry_id: None,
+                integration_sha: None,
+                paths: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.delete_gc_rows(&batch, 2, 2, 2).unwrap(),
+            0,
+            "a fully deleted batch remains replayable when protection changes"
+        );
+    }
+
+    #[test]
+    fn gc_row_revalidation_rechecks_global_advisory_and_queue_protection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let advisory_event_id = insert_gc_fixture_event(&mut store, "advisory.fixture");
+        let merge_event_id = insert_gc_fixture_event(&mut store, "merge.fixture");
+        let advisory_event = gc_candidate(&store, crate::GcRowKind::Event, advisory_event_id);
+        let merge_event = gc_candidate(&store, crate::GcRowKind::Event, merge_event_id);
+
+        store
+            .record_advisory(&crate::NewAdvisory {
+                identity: "gc-fixture-advisory".into(),
+                audience: crate::AdvisoryAudience::Session,
+                producer: crate::AdvisoryProducer::Coordination,
+                session_id: None,
+                severity: crate::AdvisorySeverity::Warning,
+                queue_entry_id: None,
+                integration_sha: None,
+                paths: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        let error = store
+            .delete_gc_rows(&[advisory_event], 2, 2, 2)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged { id, kind }
+                if id == advisory_event_id && kind == "events"
+        ));
+
+        let session_id = insert_gc_fixture_session(&mut store, &directory.path().join("session"));
+        store
+            .submit(session_id, "fixture-head", "fixture-base")
+            .unwrap();
+        let error = store.delete_gc_rows(&[merge_event], 2, 2, 2).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged { id, kind }
+                if id == merge_event_id && kind == "events"
+        ));
+
+        for id in [advisory_event_id, merge_event_id] {
+            let present: bool = store
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present);
+        }
+    }
+
+    #[test]
+    fn gc_row_revalidation_filters_queue_parent_and_child_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let session_id = insert_gc_fixture_session(&mut store, &directory.path().join("session"));
+        store
+            .set_session_status(session_id, crate::SessionStatus::Closed, None)
+            .unwrap();
+        let queue = store
+            .submit(session_id, "fixture-head", "fixture-base")
+            .unwrap();
+        store
+            .set_merge_status(queue.id, crate::MergeStatus::Rejected, None, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE merge_queue SET updated_at = 1 WHERE id = ?1",
+                [queue.id],
+            )
+            .unwrap();
+        let advisory = store
+            .record_advisory(&crate::NewAdvisory {
+                identity: "gc-fixture-child-advisory".into(),
+                audience: crate::AdvisoryAudience::Session,
+                producer: crate::AdvisoryProducer::Coordination,
+                session_id: None,
+                severity: crate::AdvisorySeverity::Warning,
+                queue_entry_id: Some(queue.id),
+                integration_sha: None,
+                paths: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .unwrap();
+        let resolved = store
+            .resolve_entry_advisories_without_active_leases(&[queue.id], "fixture closed")
+            .unwrap();
+        assert!(resolved.iter().any(|item| item.id == advisory.id));
+
+        let parent = gc_candidate(&store, crate::GcRowKind::MergeQueue, queue.id);
+        let child = gc_candidate(&store, crate::GcRowKind::Advisory, advisory.id);
+        assert_eq!(store.delete_gc_rows(&[child], 2, 2, 2).unwrap(), 1);
+        assert_eq!(store.delete_gc_rows(&[parent], 2, 2, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn gc_row_delete_api_rejects_batches_over_the_transaction_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let id = insert_gc_fixture_event(&mut store, "gc.fixture.oversized");
+        let candidate = gc_candidate(&store, crate::GcRowKind::Event, id);
+        let rows = vec![candidate; crate::error::GC_ROW_DELETE_BATCH_SIZE + 1];
+
+        assert!(matches!(
+            store.delete_gc_rows(&rows, 2, 2, 2),
+            Err(BrokerError::GcRowBatchTooLarge { requested, max })
+                if requested == rows.len() && max == crate::error::GC_ROW_DELETE_BATCH_SIZE
+        ));
+    }
+
+    #[test]
+    fn gc_journal_resume_rechecks_session_protection_before_deleting_a_batch() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repository");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        std::fs::create_dir(repo.join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let mut broker = crate::Broker::open_for_compatibility_backfill(&repo).unwrap();
+
+        let session_id =
+            insert_gc_fixture_session(broker.store(), &fixture.path().join("session-worktree"));
+        broker
+            .store()
+            .set_session_status(session_id, crate::SessionStatus::Closed, None)
+            .unwrap();
+
+        let unassociated_event_id =
+            insert_gc_fixture_event(broker.store(), "gc.fixture.unassociated");
+        broker
+            .store()
+            .conn
+            .execute(
+                "INSERT INTO events (schema_version, ts, kind, session_id, payload_json)
+                 VALUES (1, 1, 'gc.fixture.session', ?1, NULL)",
+                [session_id],
+            )
+            .unwrap();
+        let protected_event_id = broker.store().conn.last_insert_rowid();
+
+        let plan = broker.gc_plan().unwrap();
+        assert!(
+            plan.rows.iter().any(|row| {
+                row.kind == crate::GcRowKind::Event && row.id == unassociated_event_id
+            })
+        );
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| { row.kind == crate::GcRowKind::Event && row.id == protected_event_id })
+        );
+        assert!(
+            !broker
+                .gc_apply_bounded(&plan.digest, Some(0))
+                .unwrap()
+                .complete,
+            "zero budget must leave the plan in its durable journal"
+        );
+
+        // The public lifecycle API reopens cleanup_state after planning. The
+        // older journal still names both event rows, but only the unassociated
+        // row remains eligible. Validation must reject the whole batch before
+        // that first row can be deleted.
+        broker
+            .store()
+            .set_session_status(session_id, crate::SessionStatus::Active, None)
+            .unwrap();
+        let error = broker.gc_apply_bounded(&plan.digest, None).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                crate::BrokerOpError::Store(crate::BrokerError::GcRowEligibilityChanged {
+                    id,
+                    kind
+                }) if *id == protected_event_id && kind.as_str() == "events"
+            ),
+            "unexpected resume error: {error}"
+        );
+
+        for id in [unassociated_event_id, protected_event_id] {
+            let present: bool = broker
+                .store()
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "event {id} must survive the rejected batch");
+        }
+        let journal_path = repo.join(".aethyme/gc-journal.json");
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        let remaining_rows: Vec<crate::GcRowCandidate> =
+            serde_json::from_value(journal["remaining_rows"].clone()).unwrap();
+        assert_eq!(
+            remaining_rows, plan.rows,
+            "failed batch must not advance the journal cursor"
+        );
+
+        // Explicitly abandon the frozen authorization after current session
+        // protection changed. This archives the exact journal and leaves both
+        // rows in place; a newly reviewed plan has a different candidate set.
+        let exact_journal_bytes = std::fs::read(&journal_path).unwrap();
+        let abandoned = broker.gc_abandon_pending(&plan.digest).unwrap();
+        assert_eq!(abandoned.digest, plan.digest);
+        assert!(!journal_path.exists());
+        assert_eq!(
+            std::fs::read(repo.join(&abandoned.archive_path)).unwrap(),
+            exact_journal_bytes
+        );
+        for id in [unassociated_event_id, protected_event_id] {
+            let present: bool = broker
+                .store()
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "event {id} must survive journal abandonment");
+        }
+        let fresh_plan = broker.gc_plan().unwrap();
+        assert_ne!(fresh_plan.digest, plan.digest);
+        assert!(
+            fresh_plan.rows.iter().any(|row| {
+                row.kind == crate::GcRowKind::Event && row.id == unassociated_event_id
+            })
+        );
+        assert!(
+            !fresh_plan
+                .rows
+                .iter()
+                .any(|row| { row.kind == crate::GcRowKind::Event && row.id == protected_event_id })
+        );
+        assert!(matches!(
+            broker.gc_apply_bounded(&plan.digest, None),
+            Err(crate::BrokerOpError::GcConfirmationMismatch { .. })
+        ));
+        assert!(
+            !journal_path.exists(),
+            "the abandoned confirmation cannot recreate its old journal"
+        );
     }
 
     #[test]
