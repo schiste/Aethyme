@@ -1,0 +1,16 @@
+{
+  "intent": "Add keyboard selection without breaking the downstream order summary.",
+  "decisions": [
+    {
+      "scope_ref": "selected-plan",
+      "choice": "Keep data-selected-plan as the plan selection contract.",
+      "reason": "The checkout summary reads that attribute to price the selected plan."
+    }
+  ],
+  "preserves": [
+    "Changing the active plan updates the order summary."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}

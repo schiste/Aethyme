@@ -1,0 +1,10 @@
+{
+  "task_id": "H01",
+  "task_checks": [
+    "category control is single-select",
+    "selection immediately displays one category"
+  ],
+  "decision_checks": [
+    "plants and minerals can both be selected and shown together"
+  ]
+}

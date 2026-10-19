@@ -1,0 +1,9 @@
+{
+  "check": "frozen runner wrapper using a fake Codex executable; no model invoked",
+  "runner_exit_code": 0,
+  "agent_started_event_from_shim": true,
+  "codex_cli_version_capture": "codex-cli test-shim 0.0",
+  "cost_sum_check": 87,
+  "artifact_dir_created": true,
+  "agent_model_invoked": false
+}

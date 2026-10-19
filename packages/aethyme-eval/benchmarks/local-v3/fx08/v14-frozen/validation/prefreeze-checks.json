@@ -1,0 +1,55 @@
+{
+  "source_revision": "fx08-v9-postrun-archive",
+  "baseline_oracle_runs": [
+    {
+      "task_id": "P01",
+      "task_pass": false,
+      "decision_survived": true,
+      "checks": {
+        "semantic_search_and_enter": false,
+        "shortcut_still_focuses_search": true
+      },
+      "application_errors": []
+    },
+    {
+      "task_id": "P02",
+      "task_pass": false,
+      "decision_survived": false,
+      "checks": {
+        "mobile_stack_and_clear_primary": false,
+        "quick_find_state_is_independent": false
+      },
+      "application_errors": []
+    },
+    {
+      "task_id": "P03",
+      "task_pass": false,
+      "decision_survived": false,
+      "checks": {
+        "category_filter_and_keyboard_selection": false,
+        "active_result_retained_if_visible": false
+      },
+      "application_errors": []
+    },
+    {
+      "task_id": "P04",
+      "task_pass": false,
+      "decision_survived": true,
+      "checks": {
+        "alt_enter_adds_valid_quantity_once": false,
+        "invalid_quantity_is_rejected": true
+      },
+      "application_errors": []
+    }
+  ],
+  "baseline_note": "P02/P03 decision checks require the new clear/filter control to exist; false on the unmodified A state means the decision is not yet exercised, not that A violates the decision. The scored B run checks the decision after the requested control is implemented.",
+  "handoff_framing_sha256": {
+    "P01": "1f92fc7b2f2f1e1e7a74d15a63d63630fce59a216b27d8c3c39404602c2090c1",
+    "P02": "1f92fc7b2f2f1e1e7a74d15a63d63630fce59a216b27d8c3c39404602c2090c1",
+    "P03": "1f92fc7b2f2f1e1e7a74d15a63d63630fce59a216b27d8c3c39404602c2090c1",
+    "P04": "1f92fc7b2f2f1e1e7a74d15a63d63630fce59a216b27d8c3c39404602c2090c1",
+    "H01": "1f92fc7b2f2f1e1e7a74d15a63d63630fce59a216b27d8c3c39404602c2090c1",
+    "H02": "1f92fc7b2f2f1e1e7a74d15a63d63630fce59a216b27d8c3c39404602c2090c1"
+  },
+  "brief_validation_record": "24/24 ok, carried forward unchanged from validation/brief-validation.json"
+}
