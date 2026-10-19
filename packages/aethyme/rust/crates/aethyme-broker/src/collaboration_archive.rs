@@ -613,13 +613,13 @@ fn read_object_unlocked(
     file.take(limit)
         .read_to_end(&mut bytes)
         .map_err(|source| io(&path, source))?;
-    if let Some(limit) = max_bytes {
-        if bytes.len() > limit {
-            return Err(ArchiveError::ObjectTooLarge {
-                digest: digest.hex(),
-                limit,
-            });
-        }
+    if let Some(limit) = max_bytes
+        && bytes.len() > limit
+    {
+        return Err(ArchiveError::ObjectTooLarge {
+            digest: digest.hex(),
+            limit,
+        });
     }
     if ObjectDigest::of(&bytes) != *digest {
         return Err(ArchiveError::CorruptObject {
