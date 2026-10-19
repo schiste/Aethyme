@@ -19,6 +19,7 @@ use crate::{
 use aethyme_contracts::experimental_v0::RecordId;
 use rusqlite::params;
 use serde_json::{Value, json};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -242,21 +243,34 @@ impl AuthorityWorkerProcess {
         self.child.id()
     }
 
-    fn wait_until_ready(&mut self) -> Result<String, String> {
+    fn wait_until_ready(&mut self, expected_epoch: &str) -> Result<String, String> {
         let ready = self.host.join("fx13-worker-ready");
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if let Ok(epoch) = std::fs::read_to_string(&ready) {
-                if self
-                    .child
-                    .try_wait()
-                    .map_err(|error| format!("could not inspect FX13 worker child: {error}"))?
-                    .is_some()
-                {
-                    self.finished = true;
-                    return Err("FX13 worker child exited after recording readiness".into());
+            match read_worker_ready_file(&ready, expected_epoch) {
+                Ok(bytes) => {
+                    if worker_ready_file_state(&bytes, expected_epoch)? {
+                        if self
+                            .child
+                            .try_wait()
+                            .map_err(|error| {
+                                format!("could not inspect FX13 worker child: {error}")
+                            })?
+                            .is_some()
+                        {
+                            self.finished = true;
+                            return Err("FX13 worker child exited after recording readiness".into());
+                        }
+                        return Ok(expected_epoch.to_owned());
+                    }
                 }
-                return Ok(epoch.trim().to_owned());
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err("FX13 worker readiness file exceeds its expected length".into());
+                }
+                Err(error) => {
+                    return Err(format!("could not read FX13 worker readiness: {error}"));
+                }
             }
             if let Some(status) = self
                 .child
@@ -307,6 +321,55 @@ impl AuthorityWorkerProcess {
         }
         Err("FX13 worker child did not exit within 15 seconds after release".into())
     }
+}
+
+fn worker_ready_file_state(contents: &[u8], expected_epoch: &str) -> Result<bool, String> {
+    let expected = format!("{expected_epoch}\n");
+    if contents.len() > expected.len() {
+        return Err("FX13 worker readiness exceeded its expected length".into());
+    }
+    if contents == expected.as_bytes() {
+        return Ok(true);
+    }
+    if !contents.ends_with(b"\n") {
+        return Ok(false);
+    }
+    Err("FX13 worker published an unexpected complete readiness identity".into())
+}
+
+fn read_worker_ready_file(path: &Path, expected_epoch: &str) -> std::io::Result<Vec<u8>> {
+    let record_limit = expected_epoch
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("FX13 readiness length overflow"))?;
+    let read_limit = record_limit
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("FX13 readiness length overflow"))?;
+    let read_limit_u64 = u64::try_from(read_limit)
+        .map_err(|_| std::io::Error::other("FX13 readiness length overflow"))?;
+    let mut contents = Vec::with_capacity(read_limit);
+    std::fs::File::open(path)?
+        .take(read_limit_u64)
+        .read_to_end(&mut contents)?;
+    if contents.len() > record_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "FX13 worker readiness exceeded its expected length",
+        ));
+    }
+    Ok(contents)
+}
+
+fn publish_worker_ready(host: &Path, epoch: &str) -> std::io::Result<()> {
+    let destination = host.join("fx13-worker-ready");
+    let mut temporary = tempfile::NamedTempFile::new_in(host)?;
+    temporary.write_all(format!("{epoch}\n").as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(&destination)
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 impl Drop for AuthorityWorkerProcess {
@@ -398,7 +461,7 @@ fn actual_fx13_stale_worker_child() {
     let owner = target::acquire_controller(&mut store, "target", "appointed").unwrap();
     let epoch = owner.authority_epoch().as_str().to_owned();
     drop(store);
-    std::fs::write(host.join("fx13-worker-ready"), format!("{epoch}\n")).unwrap();
+    publish_worker_ready(&host, &epoch).expect("publish the complete FX13 worker epoch atomically");
     for _ in 0..12000 {
         if host.join("fx13-worker-go").exists() {
             let mut restored = crate::collaboration_state::CollaborationStore::open(
@@ -430,6 +493,56 @@ fn actual_fx13_stale_worker_child() {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("parent did not release the FX13 stale-worker child within 120 seconds");
+}
+
+#[test]
+fn worker_readiness_waits_for_complete_identity_and_never_overwrites() {
+    let epoch = "sha256:9390a2d6456e445a0d1fb7df90f55ac9009531edf8766dd9718235546dfa4189";
+    let complete = format!("{epoch}\n");
+    assert_eq!(worker_ready_file_state(b"", epoch), Ok(false));
+    assert_eq!(
+        worker_ready_file_state(&complete.as_bytes()[..complete.len() - 1], epoch),
+        Ok(false)
+    );
+    assert_eq!(
+        worker_ready_file_state(complete.as_bytes(), epoch),
+        Ok(true)
+    );
+    assert_eq!(
+        worker_ready_file_state(b"sha256:wrong-epoch\n", epoch).unwrap_err(),
+        "FX13 worker published an unexpected complete readiness identity"
+    );
+    assert_eq!(
+        worker_ready_file_state(format!("{complete}x").as_bytes(), epoch).unwrap_err(),
+        "FX13 worker readiness exceeded its expected length"
+    );
+
+    let host = tempfile::tempdir().expect("private readiness host");
+    let ready = host.path().join("fx13-worker-ready");
+    publish_worker_ready(host.path(), epoch).expect("publish readiness file");
+    assert_eq!(std::fs::read(&ready).unwrap(), complete.as_bytes());
+    assert_eq!(
+        worker_ready_file_state(&std::fs::read(&ready).unwrap(), epoch),
+        Ok(true)
+    );
+
+    let existing = b"existing readiness\n";
+    std::fs::write(&ready, existing).unwrap();
+    let error = publish_worker_ready(host.path(), epoch).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&ready).unwrap(), existing);
+    std::fs::write(&ready, vec![b'x'; 4096]).unwrap();
+    let error = read_worker_ready_file(&ready, epoch).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "FX13 worker readiness exceeded its expected length"
+    );
+    let entries: Vec<_> = std::fs::read_dir(host.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, vec![std::ffi::OsString::from("fx13-worker-ready")]);
 }
 
 #[test]
@@ -931,7 +1044,7 @@ fn actual_fx13_publication_survives_restore_and_old_worker_is_fenced() {
     drop(owner);
     let mut old_worker = AuthorityWorkerProcess::spawn(&source_host);
     let worker_epoch = old_worker
-        .wait_until_ready()
+        .wait_until_ready(&old_epoch)
         .expect("stale worker must acquire its old epoch before the announced restore");
     assert_eq!(worker_epoch, old_epoch);
     let old_worker_pid = old_worker.pid();
