@@ -744,6 +744,161 @@ mod gate_result_clear_metadata_tests {
     }
 
     #[test]
+    fn gc_row_revalidation_rejects_content_drift_with_identical_candidate_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (schema_version, ts, kind, session_id, payload_json)
+                 VALUES (1, 1, 'gc.fixture.payload', NULL, 'old')",
+                [],
+            )
+            .unwrap();
+        let id = store.conn.last_insert_rowid();
+        let candidate = gc_candidate(&store, crate::GcRowKind::Event, id);
+
+        store
+            .conn
+            .execute("UPDATE events SET payload_json = 'new' WHERE id = ?1", [id])
+            .unwrap();
+        let current = gc_candidate(&store, crate::GcRowKind::Event, id);
+        assert_eq!(candidate.recorded_at, current.recorded_at);
+        assert_eq!(candidate.estimated_bytes, current.estimated_bytes);
+        assert_eq!(candidate.gate_log_path, current.gate_log_path);
+        assert_ne!(candidate.content_fingerprint, current.content_fingerprint);
+
+        let error = store.delete_gc_rows(&[candidate], 2, 2, 2).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged {
+                id: changed_id,
+                kind
+            } if changed_id == id && kind == "events"
+        ));
+        let present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+    }
+
+    #[test]
+    fn gc_row_revalidation_rejects_reused_queue_id_with_same_age_and_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let session_id = insert_gc_fixture_session(&mut store, &directory.path().join("session"));
+        store
+            .set_session_status(session_id, crate::SessionStatus::Closed, None)
+            .unwrap();
+        let queue = store
+            .submit(session_id, "fixture-head", "fixture-base")
+            .unwrap();
+        store
+            .set_merge_status(queue.id, crate::MergeStatus::Rejected, None, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE merge_queue SET updated_at = 1 WHERE id = ?1",
+                [queue.id],
+            )
+            .unwrap();
+        let candidate = gc_candidate(&store, crate::GcRowKind::MergeQueue, queue.id);
+
+        store
+            .conn
+            .execute("DELETE FROM merge_queue WHERE id = ?1", [queue.id])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO merge_queue (
+                     id, session_id, head_commit, base_commit, status,
+                     merged_tree, details_json, created_at, updated_at
+                 ) VALUES (?1, ?2, 'variant-head', 'variant-base', 'rejected', NULL, NULL, 1, 1)",
+                params![queue.id, session_id],
+            )
+            .unwrap();
+
+        let replacement = gc_candidate(&store, crate::GcRowKind::MergeQueue, queue.id);
+        assert_eq!(candidate.recorded_at, replacement.recorded_at);
+        assert_eq!(candidate.estimated_bytes, replacement.estimated_bytes);
+        assert_ne!(
+            candidate.content_fingerprint,
+            replacement.content_fingerprint
+        );
+        let error = store.delete_gc_rows(&[candidate], 2, 2, 2).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged {
+                id: changed_id,
+                kind
+            } if changed_id == queue.id && kind == "merge_queue"
+        ));
+        let present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM merge_queue WHERE id = ?1)",
+                [queue.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+    }
+
+    #[test]
+    fn legacy_gc_row_candidate_fails_closed_when_its_row_is_still_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let id = insert_gc_fixture_event(&mut store, "gc.fixture.legacy");
+        let current = gc_candidate(&store, crate::GcRowKind::Event, id);
+
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("candidate is a JSON object")
+            .remove("content_fingerprint");
+        let legacy: crate::GcRowCandidate = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.content_fingerprint, None);
+
+        let error = store
+            .delete_gc_rows(std::slice::from_ref(&legacy), 2, 2, 2)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::GcRowEligibilityChanged {
+                id: changed_id,
+                kind
+            } if changed_id == id && kind == "events"
+        ));
+        let present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present);
+
+        store
+            .conn
+            .execute("DELETE FROM events WHERE id = ?1", [id])
+            .unwrap();
+        assert_eq!(
+            store
+                .delete_gc_rows(std::slice::from_ref(&legacy), 2, 2, 2)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn gc_row_revalidation_accepts_missing_rows_on_crash_replay() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();

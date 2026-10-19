@@ -34,6 +34,136 @@ fn append_gc_id_filter(
     sql.push(')');
 }
 
+fn gc_row_table(kind: crate::GcRowKind) -> (&'static str, &'static str) {
+    match kind {
+        crate::GcRowKind::Event => ("events", "event"),
+        crate::GcRowKind::GateResult => ("gate_results", "gate_result"),
+        crate::GcRowKind::Advisory => ("advisories", "advisory"),
+        crate::GcRowKind::EntryExposure => ("entry_path_exposures", "entry_exposure"),
+        crate::GcRowKind::IntegrationReconciliationEntry => (
+            "integration_reconciliation_entries",
+            "integration_reconciliation_entry",
+        ),
+        crate::GcRowKind::MergeQueue => ("merge_queue", "merge_queue"),
+    }
+}
+
+fn update_gc_fingerprint_bytes(digest: &mut sha2::Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+fn gc_row_content_fingerprint(
+    kind: crate::GcRowKind,
+    column_names: &[String],
+    row: &rusqlite::Row<'_>,
+) -> Result<String, rusqlite::Error> {
+    use rusqlite::types::ValueRef;
+    use sha2::Digest;
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"aethyme-gc-row/v1\0");
+    update_gc_fingerprint_bytes(&mut digest, gc_row_table(kind).1.as_bytes());
+    digest.update((column_names.len() as u64).to_be_bytes());
+    for (index, name) in column_names.iter().enumerate() {
+        update_gc_fingerprint_bytes(&mut digest, name.as_bytes());
+        match row.get_ref(index)? {
+            ValueRef::Null => digest.update([0]),
+            ValueRef::Integer(value) => {
+                digest.update([1]);
+                digest.update(value.to_be_bytes());
+            }
+            ValueRef::Real(value) => {
+                digest.update([2]);
+                digest.update(value.to_bits().to_be_bytes());
+            }
+            ValueRef::Text(value) => {
+                digest.update([3]);
+                update_gc_fingerprint_bytes(&mut digest, value);
+            }
+            ValueRef::Blob(value) => {
+                digest.update([4]);
+                update_gc_fingerprint_bytes(&mut digest, value);
+            }
+        }
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn attach_gc_row_content_fingerprints(
+    conn: &rusqlite::Connection,
+    candidates: &mut [crate::GcRowCandidate],
+) -> Result<(), BrokerError> {
+    let kinds = [
+        crate::GcRowKind::Event,
+        crate::GcRowKind::GateResult,
+        crate::GcRowKind::Advisory,
+        crate::GcRowKind::EntryExposure,
+        crate::GcRowKind::IntegrationReconciliationEntry,
+        crate::GcRowKind::MergeQueue,
+    ];
+    for kind in kinds {
+        let ids = candidates
+            .iter()
+            .filter(|candidate| candidate.kind == kind)
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            continue;
+        }
+
+        let (table, _) = gc_row_table(kind);
+        let placeholders = (1..=crate::error::GC_ROW_DELETE_BATCH_SIZE)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = conn.prepare(&format!(
+            "SELECT * FROM {table} WHERE id IN ({placeholders})"
+        ))?;
+        let column_names = statement
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let id_column = column_names
+            .iter()
+            .position(|name| name == "id")
+            .ok_or_else(|| BrokerError::GcRowEligibilityChanged {
+                kind: table.into(),
+                id: ids[0],
+            })?;
+        let mut fingerprints = BTreeMap::new();
+        for chunk in ids.chunks(crate::error::GC_ROW_DELETE_BATCH_SIZE) {
+            let mut parameters =
+                vec![rusqlite::types::Value::Null; crate::error::GC_ROW_DELETE_BATCH_SIZE];
+            for (index, id) in chunk.iter().enumerate() {
+                parameters[index] = rusqlite::types::Value::Integer(*id);
+            }
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                    let id = row.get::<_, i64>(id_column)?;
+                    let fingerprint = gc_row_content_fingerprint(kind, &column_names, row)?;
+                    Ok((id, fingerprint))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            fingerprints.extend(rows);
+        }
+        for candidate in candidates
+            .iter_mut()
+            .filter(|candidate| candidate.kind == kind)
+        {
+            candidate.content_fingerprint =
+                Some(fingerprints.remove(&candidate.id).ok_or_else(|| {
+                    BrokerError::GcRowEligibilityChanged {
+                        kind: table.into(),
+                        id: candidate.id,
+                    }
+                })?);
+        }
+    }
+    Ok(())
+}
+
 fn gc_event_blocker_needs(kinds: impl IntoIterator<Item = String>) -> [bool; 4] {
     let prefixes = ["advisory.", "exposure.", "operation.", "merge."];
     let mut needed = [false; 4];
@@ -1108,6 +1238,7 @@ impl BrokerStore {
                     recorded_at: row.get(1)?,
                     estimated_bytes: row.get::<_, i64>(2)?.max(0) as u64,
                     gate_log_path: None,
+                    content_fingerprint: None,
                 })
             })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
@@ -1143,6 +1274,7 @@ impl BrokerStore {
                 recorded_at: row.get(1)?,
                 estimated_bytes: row.get::<_, i64>(2)?.max(0) as u64,
                 gate_log_path: row.get(3)?,
+                content_fingerprint: None,
             })
         })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
@@ -1356,9 +1488,11 @@ impl BrokerStore {
                 recorded_at: row.get(2)?,
                 estimated_bytes: row.get::<_, i64>(3)?.max(0) as u64,
                 gate_log_path: None,
+                content_fingerprint: None,
             })
         })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        attach_gc_row_content_fingerprints(conn, &mut candidates)?;
         candidates.sort_by_key(|row| (row.kind, row.id));
         Ok(candidates)
     }
@@ -1468,9 +1602,9 @@ impl BrokerStore {
     }
 
     /// Delete one reviewed GC batch atomically after rechecking its current
-    /// retention eligibility and candidate data in the same transaction.
-    /// Missing rows are accepted for crash-idempotent journal replay and
-    /// primary keys are never reused.
+    /// retention eligibility and complete candidate row contents in the same
+    /// transaction. Missing rows are accepted for crash-idempotent journal
+    /// replay; a present row without a matching content fingerprint fails closed.
     pub fn delete_gc_rows(
         &mut self,
         rows: &[crate::GcRowCandidate],
