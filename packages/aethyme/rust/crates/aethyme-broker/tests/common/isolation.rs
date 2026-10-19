@@ -46,11 +46,14 @@ pub fn worktree_root(repo: &Path) -> PathBuf {
 
 /// Scope storage and worktree allocation to the fixture before startup.
 pub fn open(repo: &Path) -> Broker {
-    let root = fixture_root(repo);
+    let root = fixture_root(repo).canonicalize().unwrap();
     let host_state_dir = root.join("host-state");
+    let preparation_cache = root.join("preparation-cache");
+    std::fs::create_dir_all(&preparation_cache).unwrap();
     let options = BrokerOpenOptions::default()
         .with_host_state_dir(host_state_dir.clone())
         .with_host_cache_dir(root.join("host-cache"))
+        .with_preparation_cache_root(preparation_cache)
         .with_host_operation_database(host_state_dir.join("host-operations.db"))
         .with_worktree_root(worktree_root(repo))
         .with_collaboration_state(host_state_dir.join("collaboration"));

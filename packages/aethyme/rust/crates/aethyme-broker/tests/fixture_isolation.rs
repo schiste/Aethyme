@@ -13,6 +13,9 @@ const REPORT_ENV: &str = "AETHYME_TEST_FIXTURE_ISOLATION_REPORT";
 fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
     if let Some(report) = std::env::var_os(REPORT_ENV) {
         let poison = PathBuf::from(std::env::var_os("AETHYME_WORKTREE_ROOT").unwrap());
+        let poison_cache =
+            PathBuf::from(std::env::var_os("AETHYME_PREPARATION_CACHE_ROOT").unwrap());
+        assert!(std::fs::read_dir(&poison_cache).unwrap().next().is_none());
         let fixture = isolation::FixtureRepo::new();
         for args in [
             vec!["init", "-q", "-b", "main"],
@@ -47,7 +50,9 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
         );
         assert!(!poison.exists(), "inherited placement must remain unused");
 
-        let root = fixture.path().parent().unwrap();
+        let root = fixture.path().parent().unwrap().canonicalize().unwrap();
+        let preparation_cache = root.join("preparation-cache");
+        assert!(preparation_cache.is_dir());
         let mut command = isolation::command(
             CLI,
             fixture.path(),
@@ -63,6 +68,7 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
         for (name, directory) in [
             ("AETHYME_HOST_STATE_DIR", "host-state"),
             ("AETHYME_HOST_CACHE_DIR", "host-cache"),
+            ("AETHYME_PREPARATION_CACHE_ROOT", "preparation-cache"),
         ] {
             let expected = root.join(directory);
             assert!(
@@ -85,7 +91,11 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
             .and_then(|value| value.to_str())
             .expect("child must receive the captured broker storage context");
         let captured_context: serde_json::Value = serde_json::from_str(captured_context).unwrap();
-        assert_eq!(captured_context["version"], 2);
+        assert_eq!(captured_context["version"], 4);
+        assert_eq!(
+            captured_context["preparation_cache_root"].as_str(),
+            preparation_cache.to_str()
+        );
         assert_eq!(
             captured_context["worktree_root_override"].as_str(),
             expected_root.to_str()
@@ -105,6 +115,10 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
                 .starts_with(&expected_root),
             "CLI checkout must stay under the fixture-owned worktree root"
         );
+        assert!(
+            std::fs::read_dir(&poison_cache).unwrap().next().is_none(),
+            "library and child CLI must leave the inherited cache empty"
+        );
         let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();
         drop(broker);
@@ -118,6 +132,7 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
             "retained checkout must share that owner"
         );
         assert!(!cli_worktree.exists(), "CLI checkout must share that owner");
+        assert!(!preparation_cache.exists(), "cache must share that owner");
         std::fs::write(
             report,
             serde_json::to_vec(&serde_json::json!({
@@ -134,6 +149,8 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
     let owner = tempfile::tempdir().unwrap();
     let report = owner.path().join("report.json");
     let poison = owner.path().join("poison-worktrees");
+    let poison_cache = owner.path().join("poison-preparation-cache");
+    std::fs::create_dir(&poison_cache).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -141,6 +158,7 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
             "--nocapture",
         ])
         .env(REPORT_ENV, &report)
+        .env("AETHYME_PREPARATION_CACHE_ROOT", &poison_cache)
         .env("AETHYME_WORKTREE_ROOT", &poison)
         .env(
             "AETHYME_HOST_STATE_DIR",
@@ -159,4 +177,5 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
     assert!(!PathBuf::from(report["worktree"].as_str().unwrap()).exists());
     assert!(!PathBuf::from(report["cli_worktree"].as_str().unwrap()).exists());
     assert!(!poison.exists());
+    assert!(std::fs::read_dir(poison_cache).unwrap().next().is_none());
 }
