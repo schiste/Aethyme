@@ -2516,11 +2516,26 @@ mod tests {
     #[test]
     fn v49_adds_agent_provenance_without_changing_its_historical_floor() {
         const { assert!(SCHEMA_VERSION >= 49) };
-        let conn = migrated_through(49);
+        let conn = migrated_through(48);
         set_meta(&conn, "min_compatible_schema", 47);
+        conn.execute_batch(MIGRATION_V49).unwrap();
+        set_meta(&conn, "schema_version", 49);
         assert_eq!(current_version(&conn).unwrap(), 49);
         assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
         assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
+        let floor: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, "47", "v49 must preserve its historical floor");
+
+        let from_v47 = migrated_through(49);
+        set_meta(&from_v47, "min_compatible_schema", 47);
+        assert_eq!(current_version(&from_v47).unwrap(), 49);
+        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
 
         let nullable: i64 = conn
             .query_row(
@@ -2531,13 +2546,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(nullable, 0);
-
-        // A v47 database keeps its historical floor while migrations through
-        // v49 remain additive. The later v52 profile migration raises it.
-        let from_v47 = migrated_through(49);
-        set_meta(&from_v47, "min_compatible_schema", 47);
-        assert_eq!(current_version(&from_v47).unwrap(), 49);
-        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
     }
 
     /// v51 changes nothing and retains the historical v47 floor until v52
@@ -2596,6 +2604,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_profile, None);
+    }
+
+    #[test]
+    fn v52_upgrades_v47_and_v48_gate_history_with_the_profile_floor() {
+        for from_version in [47, 48] {
+            let conn = migrated_through(from_version);
+            set_meta(&conn, "min_compatible_schema", 47);
+            conn.execute(
+                "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status, created_at)
+                 VALUES ('legacy', 'tree', 'definition', 'pass', 1)",
+                [],
+            )
+            .unwrap();
+
+            migrate(&conn).unwrap();
+
+            assert_eq!(current_version(&conn).unwrap(), 52);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                "52"
+            );
+            assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
+            assert!(!schema_is_compatible_with(&conn, 52, 51).unwrap());
+
+            let nullable: i64 = conn
+                .query_row(
+                    r#"SELECT "notnull" FROM pragma_table_info('gate_results')
+                       WHERE name = 'execution_profile_hash'"#,
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(nullable, 0);
+            let profile: Option<String> = conn
+                .query_row(
+                    "SELECT execution_profile_hash FROM gate_results WHERE gate_name = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(profile, None, "v{from_version} history remains unprofiled");
+        }
     }
 
     #[test]

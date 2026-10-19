@@ -3652,9 +3652,9 @@ fn wait_gate_child_with_signaler(
     (status, timed_out)
 }
 
-fn signal_owned_process_group(process_group: i32, signal: i32) -> std::io::Result<()> {
-    // SAFETY: callers invoke this only from the child waiter after observing
-    // `try_wait() == None`, so the unreaped child still owns this group id.
+pub(crate) fn signal_owned_process_group(process_group: i32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: callers invoke this only while the owned leader is unreaped, so
+    // its process-group ID has not been released for reuse.
     let result = unsafe { libc::killpg(process_group, signal) };
     if result == 0 {
         Ok(())
@@ -3681,7 +3681,7 @@ fn signal_group_and_note(
 /// This is an absence probe, never a signal to a possibly recycled group.
 /// Deliberately escaping the command's process group is outside the cooperative
 /// gate contract. A positive observation or any other error remains unknown.
-fn gate_process_group_absent(process_group: i32) -> bool {
+pub(crate) fn gate_process_group_absent(process_group: i32) -> bool {
     if process_group == 0 {
         return true;
     }

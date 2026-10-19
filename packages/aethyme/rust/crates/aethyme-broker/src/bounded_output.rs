@@ -8,7 +8,7 @@
 //! in a follow-up.
 
 use std::io::{self, Read};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -121,6 +121,317 @@ pub(crate) fn output_limited(
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
+        }
+    }
+}
+
+/// Run a short-lived profile probe in a process group owned by this call.
+///
+/// Unlike [`output_limited`], this path also stops cooperative descendants
+/// before releasing the unreaped leader that anchors the process-group ID.
+/// Descendants that leave the group are outside this cleanup guarantee.
+#[cfg(unix)]
+pub(crate) fn output_limited_in_owned_group(
+    command: &mut Command,
+    budget: Duration,
+    max_stream_bytes: usize,
+) -> io::Result<LimitedOutput> {
+    use std::os::unix::process::CommandExt;
+
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(budget)
+        .ok_or_else(|| io::Error::other("process deadline overflow"))?;
+    max_stream_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("process output limit overflow"))?;
+    if Instant::now() >= deadline {
+        return Ok(LimitedOutput::Deadline);
+    }
+
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let process_group = child.id() as i32;
+    let mut child = OwnedProbeChild::new(child, process_group);
+    let mut stdout_reader = child
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout"))?;
+    let mut stderr_reader = child
+        .child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr"))?;
+    set_probe_nonblocking(&stdout_reader)?;
+    set_probe_nonblocking(&stderr_reader)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    loop {
+        if Instant::now() >= deadline {
+            child.terminate_and_reap()?;
+            return Ok(LimitedOutput::Deadline);
+        }
+
+        if !stdout_closed {
+            stdout_closed = matches!(
+                read_probe_stream(&mut stdout_reader, &mut stdout, max_stream_bytes)?,
+                ProbeStreamRead::Closed
+            );
+            if stdout.len() > max_stream_bytes {
+                child.terminate_and_reap()?;
+                return Ok(LimitedOutput::OutputLimit);
+            }
+        }
+        if !stderr_closed {
+            stderr_closed = matches!(
+                read_probe_stream(&mut stderr_reader, &mut stderr, max_stream_bytes)?,
+                ProbeStreamRead::Closed
+            );
+            if stderr.len() > max_stream_bytes {
+                child.terminate_and_reap()?;
+                return Ok(LimitedOutput::OutputLimit);
+            }
+        }
+
+        if child.leader_exited_without_reaping()? {
+            // Even when the pipes are closed, a cooperative grandchild may
+            // still be doing work. Stop the group while the zombie leader
+            // still anchors its identity, then reap and verify group absence.
+            let status = child.terminate_and_reap()?;
+            let drain_deadline = Instant::now() + Duration::from_millis(250);
+            while !stdout_closed || !stderr_closed {
+                if !stdout_closed {
+                    stdout_closed = matches!(
+                        read_probe_stream(&mut stdout_reader, &mut stdout, max_stream_bytes)?,
+                        ProbeStreamRead::Closed
+                    );
+                }
+                if !stderr_closed {
+                    stderr_closed = matches!(
+                        read_probe_stream(&mut stderr_reader, &mut stderr, max_stream_bytes)?,
+                        ProbeStreamRead::Closed
+                    );
+                }
+                if stdout.len() > max_stream_bytes || stderr.len() > max_stream_bytes {
+                    return Ok(LimitedOutput::OutputLimit);
+                }
+                if stdout_closed && stderr_closed {
+                    break;
+                }
+                if Instant::now() >= drain_deadline {
+                    return Err(io::Error::other(
+                        "profile probe output remained open after owned-group cleanup",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return Ok(LimitedOutput::Completed(Output {
+                status,
+                stdout,
+                stderr,
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn output_limited_in_owned_group(
+    _command: &mut Command,
+    _budget: Duration,
+    _max_stream_bytes: usize,
+) -> io::Result<LimitedOutput> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owned process-group probes are unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+enum ProbeStreamRead {
+    Open,
+    Closed,
+}
+
+#[cfg(unix)]
+fn set_probe_nonblocking<R: std::os::fd::AsRawFd>(stream: &R) -> io::Result<()> {
+    let fd = stream.as_raw_fd();
+    // SAFETY: F_GETFL only reads flags for the owned pipe descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL changes only the owned pipe's status flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_probe_stream<R: Read>(
+    stream: &mut R,
+    bytes: &mut Vec<u8>,
+    max_stream_bytes: usize,
+) -> io::Result<ProbeStreamRead> {
+    let read_limit = max_stream_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("process output limit overflow"))?;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let remaining = read_limit.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Ok(ProbeStreamRead::Open);
+        }
+        let read_len = chunk.len().min(remaining);
+        match stream.read(&mut chunk[..read_len]) {
+            Ok(0) => return Ok(ProbeStreamRead::Closed),
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(ProbeStreamRead::Open);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct OwnedProbeChild {
+    child: Child,
+    process_group: i32,
+    reaped: bool,
+    ownership_uncertain: bool,
+}
+
+#[cfg(unix)]
+impl OwnedProbeChild {
+    fn new(child: Child, process_group: i32) -> Self {
+        Self {
+            child,
+            process_group,
+            reaped: false,
+            ownership_uncertain: false,
+        }
+    }
+
+    fn leader_exited_without_reaping(&mut self) -> io::Result<bool> {
+        // SAFETY: an all-zero siginfo_t is a valid output buffer for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: this invocation owns the unreaped child and uses WNOWAIT to
+        // observe its exit without releasing the process-group identity.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(info.si_signo != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        // ECHILD means another waiter released our process-group anchor.
+        // Other waitid failures do not reap, so Drop can still clean up
+        // while this Child remains the sole owner.
+        self.ownership_uncertain = error.raw_os_error() == Some(libc::ECHILD);
+        Err(error)
+    }
+
+    fn terminate_and_reap(&mut self) -> io::Result<ExitStatus> {
+        if self.reaped {
+            return Err(io::Error::other("owned profile probe was already reaped"));
+        }
+
+        let mut cleanup_error = None;
+        if !self.ownership_uncertain {
+            if let Err(error) =
+                crate::gates::signal_owned_process_group(self.process_group, libc::SIGTERM)
+            {
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    cleanup_error = Some(error);
+                }
+            }
+            // Keep the leader unreaped throughout this grace period, even if
+            // it already exited. Its zombie still anchors the group ID while
+            // cooperative descendants handle TERM.
+            std::thread::sleep(Duration::from_millis(75));
+            if let Err(error) =
+                crate::gates::signal_owned_process_group(self.process_group, libc::SIGKILL)
+            {
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    cleanup_error.get_or_insert(error);
+                }
+            }
+        }
+
+        // Never block in `Child::wait` unless WNOWAIT has already observed
+        // exit. A SIGKILLed process can remain stuck in uninterruptible kernel
+        // work; in that case this bounded cleanup reports uncertainty instead
+        // of waiting indefinitely or signaling again from Drop.
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.leader_exited_without_reaping() {
+                Ok(true) => {
+                    let status = match self.child.wait() {
+                        Ok(status) => {
+                            self.reaped = true;
+                            status
+                        }
+                        Err(error) => {
+                            self.ownership_uncertain = true;
+                            return Err(error);
+                        }
+                    };
+                    if !crate::gates::gate_process_group_absent(self.process_group) {
+                        return Err(io::Error::other(
+                            "owned profile probe process group remained after reaping",
+                        ));
+                    }
+                    if let Some(error) = cleanup_error {
+                        return Err(io::Error::other(format!(
+                            "owned profile probe cleanup was uncertain: {error}"
+                        )));
+                    }
+                    return Ok(status);
+                }
+                Ok(false) if Instant::now() < reap_deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(false) => {
+                    self.ownership_uncertain = true;
+                    return Err(io::Error::other(
+                        "owned profile probe leader did not exit before cleanup deadline",
+                    ));
+                }
+                Err(error) => {
+                    self.ownership_uncertain = true;
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OwnedProbeChild {
+    fn drop(&mut self) {
+        if !self.reaped && !self.ownership_uncertain {
+            crate::warn_unrecorded(
+                "cleanup owned profile probe group",
+                self.terminate_and_reap().map(|_| ()),
+            );
         }
     }
 }
@@ -290,6 +601,94 @@ mod tests {
             LimitedOutput::Deadline
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    fn assert_owned_probe_stops_cooperative_descendant(
+        script: &str,
+        budget: Duration,
+        max_stream_bytes: usize,
+        expected: fn(LimitedOutput),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant-survived");
+        let started = Instant::now();
+        let output = output_limited_in_owned_group(
+            Command::new("sh")
+                .args(["-c", script])
+                .env("PROFILE_PROBE_MARKER", &marker),
+            budget,
+            max_stream_bytes,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "owned-group cleanup must stay within its finite bound"
+        );
+        expected(output);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !marker.exists(),
+            "cooperative descendant must be stopped before the owned probe returns"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_probe_group_deadline_stops_cooperative_descendant() {
+        assert_owned_probe_stops_cooperative_descendant(
+            "(sleep 0.45; printf escaped > \"$PROFILE_PROBE_MARKER\") & wait",
+            Duration::from_millis(80),
+            64,
+            |output| assert!(matches!(output, LimitedOutput::Deadline)),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_probe_group_output_limit_stops_cooperative_descendant() {
+        assert_owned_probe_stops_cooperative_descendant(
+            "(sleep 0.45; printf escaped > \"$PROFILE_PROBE_MARKER\") & printf overflow; wait",
+            Duration::from_secs(2),
+            3,
+            |output| assert!(matches!(output, LimitedOutput::OutputLimit)),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_probe_group_cleans_closed_pipe_descendant_after_leader_exit() {
+        assert_owned_probe_stops_cooperative_descendant(
+            "(sleep 0.45; printf escaped > \"$PROFILE_PROBE_MARKER\") >/dev/null 2>&1 & exit 0",
+            Duration::from_secs(2),
+            64,
+            |output| match output {
+                LimitedOutput::Completed(output) => {
+                    assert_eq!(output.status.code(), Some(0));
+                    assert!(output.stdout.is_empty());
+                    assert!(output.stderr.is_empty());
+                }
+                _ => panic!("a finite leader exit should return its output"),
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_probe_group_cleans_pipe_holding_descendant_after_leader_exit() {
+        assert_owned_probe_stops_cooperative_descendant(
+            "(sleep 0.45; printf escaped > \"$PROFILE_PROBE_MARKER\") & printf leader; exit 0",
+            Duration::from_secs(2),
+            64,
+            |output| match output {
+                LimitedOutput::Completed(output) => {
+                    assert_eq!(output.status.code(), Some(0));
+                    assert_eq!(output.stdout, b"leader");
+                    assert!(output.stderr.is_empty());
+                }
+                _ => panic!("a finite leader exit should return its output"),
+            },
+        );
     }
 
     #[test]

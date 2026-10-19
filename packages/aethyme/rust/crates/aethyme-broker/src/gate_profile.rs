@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::GateCacheProvenance;
 
-pub(crate) const EXECUTION_PROFILE_SCOPE: &str = "v1 hashes OS/architecture, effective PATH, selected Cargo/Rust/compiler/Python/locale environment variables, and version output for sh, git, rustc, cargo, cargo-nextest, python, pytest, node and go. Probes run from the gate checkout so repository-local tool selectors affect their output; the worktree path itself is not hashed. Each version probe is limited to 2 seconds and 16 KiB on each output stream; incomplete probes disable cache reuse. It excludes arbitrary environment variables, ignored or generated inputs (including virtualenv contents), managed-cache contents, per-run gate variables and allocated host resources, executable bytes beyond reported versions, and OS library state.";
+pub(crate) const EXECUTION_PROFILE_SCOPE: &str = "v1 hashes OS/architecture, effective PATH, selected Cargo/Rust/compiler/Python/locale environment variables, and version output for sh, git, rustc, cargo, cargo-nextest, python, pytest, node and go. Probes run from the gate checkout so repository-local tool selectors affect their output; the worktree path itself is not hashed. Each version probe has a 2 second observation budget and 16 KiB limit on each output stream, followed by bounded cooperative process-group cleanup; incomplete or uncertain probes disable cache reuse. Cleanup covers only descendants that remain in the owned process group. It excludes arbitrary environment variables, ignored or generated inputs (including virtualenv contents), managed-cache contents, per-run gate variables and allocated host resources, executable bytes beyond reported versions, and OS library state.";
 
 const PROBE_BUDGET: Duration = Duration::from_secs(2);
 const PROBE_MAX_STREAM_BYTES: usize = 16 * 1024;
@@ -237,8 +237,11 @@ fn probe_version(
     if let Some(path) = subprocess_path {
         command.env("PATH", path);
     }
-    match crate::bounded_output::output_limited(&mut command, PROBE_BUDGET, PROBE_MAX_STREAM_BYTES)
-    {
+    match crate::bounded_output::output_limited_in_owned_group(
+        &mut command,
+        PROBE_BUDGET,
+        PROBE_MAX_STREAM_BYTES,
+    ) {
         Ok(crate::bounded_output::LimitedOutput::Deadline) => Err("timed out".into()),
         Ok(crate::bounded_output::LimitedOutput::OutputLimit) => {
             Err("output exceeded 16 KiB per stream".into())
@@ -360,6 +363,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_tool_probe_that_exceeds_its_output_budget_disables_cache_reuse() {
+        let directory = tempfile::tempdir().unwrap();
         let probe = ToolProbe {
             name: "large-output",
             program: "sh",
