@@ -1045,10 +1045,13 @@ pub fn begin_attempt(
 ///
 /// The clock is sampled once immediately before reservation and again after
 /// that durable write, immediately before beginning the attempt. A first-clock
-/// or reserve/delegate failure creates no new reservation. Once reserve or
-/// delegate returns, a later clock or attempt failure does not roll back that
-/// durable reservation or retry it here. An idempotently returned reservation
-/// may begin another attempt when the existing retry rules allow it.
+/// failure or reserve/delegate error before commit creates no new reservation.
+/// A commit or post-commit read-back error can leave the outcome ambiguous;
+/// reconcile using the same nonce before retrying, and never mint another nonce
+/// to bypass that uncertainty. Once reserve or delegate returns successfully,
+/// a later clock or attempt failure does not roll back that durable reservation
+/// or retry it here. An idempotently returned reservation may begin another
+/// attempt when the existing retry rules allow it.
 /// The clock error is preserved, while budget errors are converted into the
 /// caller's error type.
 pub fn admit<E, F>(
