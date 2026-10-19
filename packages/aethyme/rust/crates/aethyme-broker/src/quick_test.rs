@@ -130,7 +130,7 @@ pub fn run_broker_quick_test_with_options(
         });
     }
 
-    let mut temp_repo = TempRepo::create()?;
+    let temp_repo = TempRepo::create()?;
     let mut steps = Vec::new();
     steps.push(step(
         "create-temp-repo",
@@ -180,7 +180,7 @@ pub fn run_broker_quick_test_with_options(
     }
 
     // The quick test wrote this repository's policy itself, so it approves
-    // it itself; the record goes with the repository at the end.
+    // it itself; the trust record lives in the owned fixture storage.
     let policy = crate::broker::gate_trust::policy_at_root(temp_repo.path())?;
     if policy.runs_commands() {
         let record = crate::broker::gate_trust::record_path_for_host_state(
@@ -596,6 +596,101 @@ mod tests {
         let owner = temp_repo.storage().root().to_path_buf();
         let failure = git(temp_repo.path(), &["not-a-real-git-subcommand"]);
         assert!(matches!(failure, Err(QuickTestError::Git { .. })));
+
+        drop(temp_repo);
+
+        assert!(!owner.exists());
+    }
+
+    #[test]
+    fn hostile_broker_database_child_environment_is_refused_before_database_creation() {
+        const CHILD_MARKER: &str = "AETHYME_TEST_QUICK_TEST_BROKER_DB_CHILD";
+        if std::env::var(CHILD_MARKER).is_ok_and(|value| value == "child") {
+            let external_database = PathBuf::from(std::env::var_os(crate::BROKER_DB_ENV).unwrap());
+            let result = run_broker_quick_test(QuickTestMode::Generic);
+            assert!(
+                matches!(
+                    result,
+                    Err(QuickTestError::BrokerDatabaseRedirected { resolved, .. })
+                        if resolved == external_database
+                ),
+                "unexpected quick-test result: {result:?}"
+            );
+            assert!(!external_database.exists());
+            return;
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let external_database = parent.path().join("external-broker.db");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "quick_test::tests::hostile_broker_database_child_environment_is_refused_before_database_creation",
+            )
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "child")
+            .env(crate::BROKER_DB_ENV, &external_database)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!external_database.exists());
+    }
+
+    #[test]
+    fn failure_after_trust_and_broker_creation_removes_the_owned_container() {
+        let temp_repo = TempRepo::create().unwrap();
+        let owner = temp_repo.storage().root().to_path_buf();
+        git(temp_repo.path(), &["init", "-q", "-b", "main"]).unwrap();
+        git(
+            temp_repo.path(),
+            &["config", "user.email", "smoke@example.invalid"],
+        )
+        .unwrap();
+        git(temp_repo.path(), &["config", "user.name", "Aethyme Smoke"]).unwrap();
+        std::fs::write(temp_repo.path().join("README.md"), "hello\n").unwrap();
+        git(temp_repo.path(), &["add", "README.md"]).unwrap();
+        git(temp_repo.path(), &["commit", "-q", "-m", "initial commit"]).unwrap();
+
+        temp_repo.ensure_broker_database_is_owned().unwrap();
+        let init = crate::init::guided_init(temp_repo.path()).unwrap();
+        assert!(init.certified());
+        install_gate_fixture(temp_repo.path()).unwrap();
+        git(
+            temp_repo.path(),
+            &["add", ".aethyme/gates.toml", "PASS_GATE"],
+        )
+        .unwrap();
+        git(
+            temp_repo.path(),
+            &["commit", "-q", "-m", "test: add broker gate fixture"],
+        )
+        .unwrap();
+
+        let policy = crate::broker::gate_trust::policy_at_root(temp_repo.path()).unwrap();
+        let record = crate::broker::gate_trust::record_path_for_host_state(
+            temp_repo.path(),
+            &temp_repo.storage().host_state_dir(),
+        )
+        .unwrap();
+        crate::broker::gate_trust::record_trust_at_path(
+            temp_repo.path(),
+            &record,
+            &[&policy.policy_sha256],
+            "quick_test",
+        )
+        .unwrap();
+        assert!(record.is_file());
+
+        let failure = (|| -> Result<(), QuickTestError> {
+            let _broker = temp_repo.open_broker()?;
+            Err(QuickTestError::GateDidNotPass)
+        })();
+        assert!(matches!(failure, Err(QuickTestError::GateDidNotPass)));
 
         drop(temp_repo);
 
