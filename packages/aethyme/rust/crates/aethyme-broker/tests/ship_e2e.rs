@@ -1484,11 +1484,11 @@ fn ship_plan_only_refuses_an_unshipped_ancestor_only_dependency() {
     )
     .unwrap();
     let mut broker = fixture.broker();
+    let initial_integration = broker.integration_head().unwrap().1;
     let first_session = broker.start_worktree("ancestry-first", None).unwrap();
     let selected_session = broker.start_worktree("ancestry-selected", None).unwrap();
     let first_worktree = PathBuf::from(&first_session.worktree_path);
     let selected_worktree = PathBuf::from(&selected_session.worktree_path);
-    let initial_integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
 
     std::fs::write(first_worktree.join("first.txt"), "first\n").unwrap();
     git(&first_worktree, &["add", "first.txt"]);
