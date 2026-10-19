@@ -1,6 +1,6 @@
 //! Repository-declared, explicit dependency preparation for broker worktrees.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -88,6 +88,12 @@ pub enum PreparationError {
         "preparation output {path:?} is a symlink; cross-worktree dependency links are forbidden"
     )]
     SymlinkOutput { path: String },
+    #[error("managed preparation storage path {path:?} contains a symlink component")]
+    ManagedStorageSymlink { path: PathBuf },
+    #[error(
+        "managed preparation storage declares {paths} path(s) across {steps} step(s), but reservation and root adoption are not wired yet; no preparation command was started. Retry after managed-storage enforcement is available"
+    )]
+    ManagedStorageNotReady { paths: usize, steps: usize },
     #[error(
         "runtime executable for {name:?} is unavailable; install the declared tool, then retry `aethyme broker submit prepare --session {session_id}`"
     )]
@@ -152,6 +158,59 @@ pub struct PreparationConfig {
     /// ceiling, preserving existing behaviour.
     #[serde(default)]
     pub shared_cache: Option<SharedCacheBudget>,
+    /// Opt-in declared growth bounds for managed preparation outputs. The
+    /// profile is intentionally separate from `shared_cache.max_bytes`, which
+    /// remains a rotation threshold rather than a write quota.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_storage: Option<ManagedPreparationStorageProfile>,
+}
+
+/// Explicit per-step growth declarations for worktree outputs and the
+/// repository-shared preparation cache. Each configured output must match one
+/// output already declared by its preparation step.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPreparationStorageProfile {
+    pub steps: BTreeMap<String, ManagedPreparationStepStorage>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPreparationStepStorage {
+    /// Maximum declared growth for each exact path in `PreparationStep.outputs`.
+    #[serde(default)]
+    pub output_growth_bytes: BTreeMap<String, u64>,
+    /// Maximum growth in the digest-specific shared cache for this step.
+    /// Required exactly when the step uses `repository_shared`.
+    #[serde(default)]
+    pub shared_cache_growth_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPreparationStoragePlan {
+    worktree_root: PathBuf,
+    steps: Vec<ManagedPreparationStepStoragePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPreparationStepStoragePlan {
+    name: String,
+    outputs: Vec<ManagedPreparationOutputPlan>,
+    shared_cache: Option<ManagedPreparationCachePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPreparationOutputPlan {
+    relative_path: PathBuf,
+    absolute_path: PathBuf,
+    growth_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPreparationCachePlan {
+    path: PathBuf,
+    growth_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -541,6 +600,19 @@ impl Broker {
         })?;
         let source_digest = preparation_source_digest(&root, &config, session_id)?;
         let digest = preparation_digest(&root, &config, session_id)?;
+        let managed_shared_cache_path = if config.managed_storage.is_some()
+            && config
+                .steps
+                .iter()
+                .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
+        {
+            Some(preparation_cache_dir(self, &digest)?)
+        } else {
+            None
+        };
+        let managed_storage_plan =
+            managed_preparation_storage_plan(&root, &config, managed_shared_cache_path.as_deref())?;
+        require_managed_storage_execution_ready(managed_storage_plan.as_ref())?;
         let status = self.preparation_status(session_id)?;
         if status.state == PreparationState::Current {
             return Ok(PreparationReport {
@@ -1013,7 +1085,334 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
             validate_relative_path(path)?;
         }
     }
+    if let Some(profile) = &config.managed_storage {
+        validate_managed_storage_profile(config, profile)?;
+    }
     Ok(())
+}
+
+fn validate_managed_storage_profile(
+    config: &PreparationConfig,
+    profile: &ManagedPreparationStorageProfile,
+) -> Result<(), PreparationError> {
+    let configured_steps = config
+        .steps
+        .iter()
+        .map(|step| step.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for name in profile.steps.keys() {
+        if !configured_steps.contains(name.as_str()) {
+            return Err(invalid_config(format!(
+                "managed_storage.steps contains unknown preparation step {name:?}"
+            )));
+        }
+    }
+
+    let mut declared_output_roots = Vec::<(PathBuf, String, String)>::new();
+    let mut total_growth_bytes = 0_u64;
+    for step in &config.steps {
+        let storage = profile.steps.get(&step.name).ok_or_else(|| {
+            invalid_config(format!(
+                "managed_storage.steps is missing preparation step {:?}",
+                step.name
+            ))
+        })?;
+        if step.outputs.iter().collect::<BTreeSet<_>>().len() != step.outputs.len() {
+            return Err(invalid_config(format!(
+                "managed_storage step {:?} cannot bound duplicate declared output paths",
+                step.name
+            )));
+        }
+        let declared_outputs = step.outputs.iter().collect::<BTreeSet<_>>();
+        let bounded_outputs = storage.output_growth_bytes.keys().collect::<BTreeSet<_>>();
+        if declared_outputs != bounded_outputs {
+            return Err(invalid_config(format!(
+                "managed_storage.steps.{:?}.output_growth_bytes must cover exactly the step's declared outputs",
+                step.name
+            )));
+        }
+
+        for (output, growth_bytes) in &storage.output_growth_bytes {
+            if *growth_bytes == 0 {
+                return Err(invalid_config(format!(
+                    "managed growth for output {output:?} in step {:?} must be positive",
+                    step.name
+                )));
+            }
+            let relative_path = normalized_managed_output_path(output)?;
+            if let Some((_, other_step, other_output)) = declared_output_roots
+                .iter()
+                .find(|(existing, _, _)| paths_overlap(existing, &relative_path))
+            {
+                return Err(invalid_config(format!(
+                    "managed output roots {other_output:?} in step {other_step:?} and {output:?} in step {:?} overlap",
+                    step.name
+                )));
+            }
+            declared_output_roots.push((relative_path, step.name.clone(), output.clone()));
+            total_growth_bytes =
+                total_growth_bytes
+                    .checked_add(*growth_bytes)
+                    .ok_or_else(|| {
+                        invalid_config(
+                            "managed output growth total exceeds the supported u64 range",
+                        )
+                    })?;
+        }
+
+        match (step.cache, storage.shared_cache_growth_bytes) {
+            (PreparationCachePolicy::RepositoryShared, Some(growth_bytes)) if growth_bytes > 0 => {
+                total_growth_bytes =
+                    total_growth_bytes
+                        .checked_add(growth_bytes)
+                        .ok_or_else(|| {
+                            invalid_config(
+                                "managed shared-cache growth total exceeds the supported u64 range",
+                            )
+                        })?;
+            }
+            (PreparationCachePolicy::RepositoryShared, Some(_)) => {
+                return Err(invalid_config(format!(
+                    "managed shared-cache growth for step {:?} must be positive",
+                    step.name
+                )));
+            }
+            (PreparationCachePolicy::RepositoryShared, None) => {
+                return Err(invalid_config(format!(
+                    "managed_storage.steps.{:?}.shared_cache_growth_bytes is required for cache = \"repository_shared\"",
+                    step.name
+                )));
+            }
+            (PreparationCachePolicy::WorktreeLocal, Some(_)) => {
+                return Err(invalid_config(format!(
+                    "managed_storage.steps.{:?}.shared_cache_growth_bytes requires cache = \"repository_shared\"",
+                    step.name
+                )));
+            }
+            (PreparationCachePolicy::WorktreeLocal, None) => {}
+        }
+    }
+    if total_growth_bytes == 0 {
+        return Err(invalid_config(
+            "managed_storage must declare at least one positive output or shared-cache growth bound",
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_managed_output_path(path: &str) -> Result<PathBuf, PreparationError> {
+    validate_relative_path(path)?;
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(segment) => normalized.push(segment),
+            _ => {
+                return Err(invalid_config(format!(
+                    "managed output path {path:?} must contain only normal relative components"
+                )));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(invalid_config(format!(
+            "managed output path {path:?} must name a path below the worktree root"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn managed_preparation_storage_plan(
+    worktree_root: &Path,
+    config: &PreparationConfig,
+    shared_cache_path: Option<&Path>,
+) -> Result<Option<ManagedPreparationStoragePlan>, PreparationError> {
+    let Some(profile) = &config.managed_storage else {
+        return Ok(None);
+    };
+    validate_config(config)?;
+
+    if !worktree_root.is_absolute() {
+        return Err(invalid_config(
+            "the broker-captured preparation worktree root must be absolute",
+        ));
+    }
+    refuse_managed_storage_symlink_components(worktree_root)?;
+    let root_metadata =
+        fs::symlink_metadata(worktree_root).map_err(|source| PreparationError::Io {
+            path: worktree_root.to_path_buf(),
+            source,
+        })?;
+    if !root_metadata.is_dir() {
+        return Err(invalid_config(
+            "the broker-captured preparation worktree root is not a directory",
+        ));
+    }
+
+    let needs_shared_cache = config.steps.iter().any(|step| {
+        profile
+            .steps
+            .get(&step.name)
+            .is_some_and(|storage| storage.shared_cache_growth_bytes.is_some())
+    });
+    match (needs_shared_cache, shared_cache_path) {
+        (true, None) => {
+            return Err(invalid_config(
+                "managed shared-cache growth has no digest-specific cache path from captured broker storage context",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(invalid_config(
+                "a managed shared-cache path was supplied without a shared-cache growth declaration",
+            ));
+        }
+        _ => {}
+    }
+    if let Some(path) = shared_cache_path {
+        if !path.is_absolute() {
+            return Err(invalid_config(
+                "the broker-captured managed shared-cache path must be absolute",
+            ));
+        }
+        refuse_managed_storage_symlink_components(path)?;
+    }
+
+    let mut steps = Vec::with_capacity(config.steps.len());
+    for step in &config.steps {
+        let storage = profile.steps.get(&step.name).ok_or_else(|| {
+            invalid_config(format!(
+                "managed_storage.steps is missing preparation step {:?}",
+                step.name
+            ))
+        })?;
+        let mut outputs = Vec::with_capacity(step.outputs.len());
+        for output in &step.outputs {
+            let relative_path = normalized_managed_output_path(output)?;
+            let absolute_path = worktree_root.join(&relative_path);
+            refuse_managed_storage_symlink_components(&absolute_path)?;
+            if let Some(cache_path) = shared_cache_path
+                && paths_overlap(&absolute_path, cache_path)
+            {
+                return Err(invalid_config(format!(
+                    "managed output {output:?} overlaps the digest-specific shared-cache path"
+                )));
+            }
+            let growth_bytes = *storage.output_growth_bytes.get(output).ok_or_else(|| {
+                invalid_config(format!(
+                    "managed output {output:?} in step {:?} has no growth declaration",
+                    step.name
+                ))
+            })?;
+            outputs.push(ManagedPreparationOutputPlan {
+                relative_path,
+                absolute_path,
+                growth_bytes,
+            });
+        }
+        let shared_cache = if let Some(growth_bytes) = storage.shared_cache_growth_bytes {
+            let path = shared_cache_path.ok_or_else(|| {
+                invalid_config(
+                    "managed shared-cache growth has no digest-specific cache path from captured broker storage context",
+                )
+            })?;
+            Some(ManagedPreparationCachePlan {
+                path: path.to_path_buf(),
+                growth_bytes,
+            })
+        } else {
+            None
+        };
+        steps.push(ManagedPreparationStepStoragePlan {
+            name: step.name.clone(),
+            outputs,
+            shared_cache,
+        });
+    }
+
+    Ok(Some(ManagedPreparationStoragePlan {
+        worktree_root: worktree_root.to_path_buf(),
+        steps,
+    }))
+}
+
+fn refuse_managed_storage_symlink_components(path: &Path) -> Result<(), PreparationError> {
+    let components = path.components().collect::<Vec<_>>();
+    let mut candidate = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => candidate.push(component.as_os_str()),
+            Component::Normal(part) => candidate.push(part),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(invalid_config(format!(
+                    "managed storage path {path:?} contains parent traversal"
+                )));
+            }
+        }
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(PreparationError::ManagedStorageSymlink {
+                    path: path.to_path_buf(),
+                });
+            }
+            Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
+                return Err(invalid_config(format!(
+                    "managed storage path {path:?} has a non-directory component"
+                )));
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(PreparationError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_managed_storage_execution_ready(
+    plan: Option<&ManagedPreparationStoragePlan>,
+) -> Result<(), PreparationError> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    let mut path_count = 0_usize;
+    for step in &plan.steps {
+        if step.name.is_empty() {
+            return Err(invalid_config(
+                "managed storage plan contains an unnamed step",
+            ));
+        }
+        for output in &step.outputs {
+            if output.relative_path.is_absolute()
+                || !output.absolute_path.starts_with(&plan.worktree_root)
+                || output.growth_bytes == 0
+            {
+                return Err(invalid_config(
+                    "managed storage plan contains an invalid output reservation",
+                ));
+            }
+            path_count = path_count.saturating_add(1);
+        }
+        if let Some(cache) = &step.shared_cache {
+            if !cache.path.is_absolute() || cache.growth_bytes == 0 {
+                return Err(invalid_config(
+                    "managed storage plan contains an invalid shared-cache reservation",
+                ));
+            }
+            path_count = path_count.saturating_add(1);
+        }
+    }
+    Err(PreparationError::ManagedStorageNotReady {
+        paths: path_count,
+        steps: plan.steps.len(),
+    })
 }
 
 fn validate_name_and_command(
@@ -3520,7 +3919,24 @@ mod tests {
                 required_for_hooks: true,
             }],
             shared_cache: None,
+            managed_storage: None,
         }
+    }
+
+    fn managed_profile_config() -> PreparationConfig {
+        let mut config = config();
+        let mut output_growth_bytes = BTreeMap::new();
+        output_growth_bytes.insert("vendor/".into(), 4096);
+        config.managed_storage = Some(ManagedPreparationStorageProfile {
+            steps: BTreeMap::from([(
+                "deps".into(),
+                ManagedPreparationStepStorage {
+                    output_growth_bytes,
+                    shared_cache_growth_bytes: None,
+                },
+            )]),
+        });
+        config
     }
 
     fn shared_budget_config(shared: bool, max_bytes: u64) -> String {
@@ -4087,6 +4503,355 @@ mod tests {
         validate_config(&config).unwrap();
         config.steps[0].outputs = vec!["../elsewhere".into()];
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn absent_managed_storage_profile_preserves_legacy_serialization_and_execution_gate() {
+        let config = config();
+        assert!(config.managed_storage.is_none());
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("managed_storage")
+                .is_none()
+        );
+        let plan = managed_preparation_storage_plan(Path::new("."), &config, None).unwrap();
+        assert!(plan.is_none());
+        assert!(require_managed_storage_execution_ready(plan.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn managed_storage_plan_resolves_exact_outputs_and_refuses_before_command_start() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let config = managed_profile_config();
+        let plan = managed_preparation_storage_plan(&root, &config, None)
+            .unwrap()
+            .expect("explicit managed profile produces a plan");
+
+        assert_eq!(plan.worktree_root, root);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].name, "deps");
+        assert_eq!(plan.steps[0].outputs.len(), 1);
+        assert_eq!(plan.steps[0].outputs[0].relative_path, Path::new("vendor"));
+        assert_eq!(plan.steps[0].outputs[0].absolute_path, root.join("vendor"));
+        assert_eq!(plan.steps[0].outputs[0].growth_bytes, 4096);
+        assert!(plan.steps[0].shared_cache.is_none());
+
+        let command_started = Cell::new(false);
+        let result = require_managed_storage_execution_ready(Some(&plan)).map(|()| {
+            command_started.set(true);
+        });
+        assert!(matches!(
+            result,
+            Err(PreparationError::ManagedStorageNotReady { paths: 1, steps: 1 })
+        ));
+        assert!(
+            !command_started.get(),
+            "the managed-storage guard must stop before a preparation command starts"
+        );
+    }
+
+    #[test]
+    fn managed_shared_cache_plan_uses_the_captured_digest_specific_path() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache_root = cache_root.path().canonicalize().unwrap();
+        let cache_path = cache_root.join("repository").join("digest-prefix");
+        let mut config = managed_profile_config();
+        config.steps[0].cache = PreparationCachePolicy::RepositoryShared;
+        config
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .shared_cache_growth_bytes = Some(8192);
+
+        let plan = managed_preparation_storage_plan(&root, &config, Some(&cache_path))
+            .unwrap()
+            .expect("explicit managed profile produces a plan");
+        let cache = plan.steps[0]
+            .shared_cache
+            .as_ref()
+            .expect("repository-shared step has a bounded cache root");
+        assert_eq!(cache.path, cache_path);
+        assert_eq!(cache.growth_bytes, 8192);
+    }
+
+    #[test]
+    fn managed_storage_profile_requires_exact_positive_checked_growth_bounds() {
+        let mut missing_step = managed_profile_config();
+        missing_step.managed_storage.as_mut().unwrap().steps.clear();
+        assert!(validate_config(&missing_step).is_err());
+
+        let mut unknown_step = managed_profile_config();
+        unknown_step.managed_storage.as_mut().unwrap().steps.insert(
+            "other".into(),
+            ManagedPreparationStepStorage {
+                output_growth_bytes: BTreeMap::new(),
+                shared_cache_growth_bytes: None,
+            },
+        );
+        assert!(validate_config(&unknown_step).is_err());
+
+        let mut missing_output = managed_profile_config();
+        missing_output
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .output_growth_bytes
+            .clear();
+        assert!(validate_config(&missing_output).is_err());
+
+        let mut zero_growth = managed_profile_config();
+        zero_growth
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .output_growth_bytes
+            .insert("vendor/".into(), 0);
+        assert!(validate_config(&zero_growth).is_err());
+
+        let mut unknown_output = managed_profile_config();
+        unknown_output
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .output_growth_bytes
+            .insert("elsewhere/".into(), 1);
+        assert!(validate_config(&unknown_output).is_err());
+
+        let mut shared_growth_without_shared_cache = managed_profile_config();
+        shared_growth_without_shared_cache
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .shared_cache_growth_bytes = Some(1);
+        assert!(validate_config(&shared_growth_without_shared_cache).is_err());
+
+        let mut missing_shared_growth = managed_profile_config();
+        missing_shared_growth.steps[0].cache = PreparationCachePolicy::RepositoryShared;
+        assert!(validate_config(&missing_shared_growth).is_err());
+
+        let mut zero_shared_growth = managed_profile_config();
+        zero_shared_growth.steps[0].cache = PreparationCachePolicy::RepositoryShared;
+        zero_shared_growth
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .shared_cache_growth_bytes = Some(0);
+        assert!(validate_config(&zero_shared_growth).is_err());
+
+        let mut overflowing = managed_profile_config();
+        overflowing.steps.push(PreparationStep {
+            name: "tools".into(),
+            command: vec!["tool".into(), "install".into()],
+            offline_command: None,
+            inputs: Vec::new(),
+            outputs: vec![".venv/".into()],
+            cache: PreparationCachePolicy::WorktreeLocal,
+            required_for_hooks: false,
+        });
+        let profile = overflowing.managed_storage.as_mut().unwrap();
+        profile
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .output_growth_bytes
+            .insert("vendor/".into(), u64::MAX);
+        profile.steps.insert(
+            "tools".into(),
+            ManagedPreparationStepStorage {
+                output_growth_bytes: BTreeMap::from([(".venv/".into(), 1)]),
+                shared_cache_growth_bytes: None,
+            },
+        );
+        assert!(validate_config(&overflowing).is_err());
+    }
+
+    #[test]
+    fn managed_storage_profile_rejects_empty_steps_and_zero_resource_profiles() {
+        let mut empty_steps = config();
+        empty_steps.steps.clear();
+        let empty_profile = ManagedPreparationStorageProfile {
+            steps: BTreeMap::new(),
+        };
+        assert!(matches!(
+            validate_managed_storage_profile(&empty_steps, &empty_profile),
+            Err(PreparationError::InvalidConfig { .. })
+        ));
+
+        let mut zero_outputs = managed_profile_config();
+        zero_outputs.steps[0].outputs.clear();
+        zero_outputs
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .output_growth_bytes
+            .clear();
+        let profile = zero_outputs.managed_storage.as_ref().unwrap();
+        assert!(matches!(
+            validate_managed_storage_profile(&zero_outputs, profile),
+            Err(PreparationError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            validate_config(&zero_outputs),
+            Err(PreparationError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn prepare_session_opt_in_guard_prevents_command_start() {
+        let repository = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repository.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repository.path().join(PREPARATION_CONFIG_RELPATH),
+            "schema_version = 1\n\
+             [[steps]]\n\
+             name = \"deps\"\n\
+             command = [\"/bin/sh\", \"-c\", \"touch managed-storage-command-started && mkdir -p vendor\"]\n\
+             outputs = [\"vendor/\"]\n\
+             required_for_hooks = false\n\
+             [managed_storage.steps.deps.output_growth_bytes]\n\
+             \"vendor/\" = 4096\n",
+        )
+        .unwrap();
+        run_git(&["add", PREPARATION_CONFIG_RELPATH]);
+        run_git(&["commit", "-qm", "fixture"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(repository.path()).unwrap();
+        let session = broker
+            .start_worktree("managed preparation guard", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let config = load_config(&worktree)
+            .unwrap()
+            .expect("fixture declares managed preparation");
+        let policy = crate::broker::gate_trust::GatePolicy::from_parts(&[], Some(&config));
+        let host_state = storage.options().host_state_dir.unwrap();
+        crate::broker::gate_trust::record_trust_for_host_state(
+            repository.path(),
+            &host_state,
+            &[policy.policy_sha256.as_str()],
+            "managed preparation fixture",
+        )
+        .unwrap();
+
+        let sentinel = worktree.join("managed-storage-command-started");
+        assert!(!sentinel.exists());
+        let result = broker.prepare_session(session.id, false, Duration::ZERO);
+        assert!(
+            !sentinel.exists(),
+            "an opted-in preparation command must not start without managed-storage enforcement"
+        );
+        assert!(matches!(
+            result,
+            Err(BrokerOpError::Preparation(
+                PreparationError::ManagedStorageNotReady { paths: 1, steps: 1 }
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_storage_profile_rejects_overlapping_and_symlinked_output_roots() {
+        let mut overlapping = managed_profile_config();
+        overlapping.steps[0].outputs.push("vendor/nested/".into());
+        overlapping
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap()
+            .output_growth_bytes
+            .insert("vendor/nested/".into(), 1);
+        assert!(validate_config(&overlapping).is_err());
+
+        let mut duplicate = managed_profile_config();
+        duplicate.steps[0].outputs.push("vendor/".into());
+        assert!(validate_config(&duplicate).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("vendor")).unwrap();
+        let error = managed_preparation_storage_plan(&root, &managed_profile_config(), None)
+            .expect_err("a symlink in an output path must be refused");
+        assert!(matches!(
+            error,
+            PreparationError::ManagedStorageSymlink { .. }
+        ));
+    }
+
+    #[test]
+    fn managed_storage_toml_requires_integer_bounds_and_rejects_escaped_outputs() {
+        let text = "schema_version = 1\n\
+             [[steps]]\n\
+             name = \"deps\"\n\
+             command = [\"tool\", \"install\"]\n\
+             outputs = [\"vendor/\"]\n\
+             required_for_hooks = false\n\
+             [managed_storage.steps.deps]\n\
+             [managed_storage.steps.deps.output_growth_bytes]\n\
+             \"vendor/\" = 4096\n";
+        let parsed = parse_config(text).expect("documented managed-storage shape parses");
+        assert_eq!(
+            parsed.managed_storage.unwrap().steps["deps"].output_growth_bytes["vendor/"],
+            4096
+        );
+        assert!(parse_config(&text.replace("4096", "1.5")).is_err());
+
+        let mut escaped = managed_profile_config();
+        escaped.steps[0].outputs = vec!["../outside".into()];
+        let storage = escaped
+            .managed_storage
+            .as_mut()
+            .unwrap()
+            .steps
+            .get_mut("deps")
+            .unwrap();
+        storage.output_growth_bytes.clear();
+        storage.output_growth_bytes.insert("../outside".into(), 1);
+        assert!(validate_config(&escaped).is_err());
     }
 
     #[test]
