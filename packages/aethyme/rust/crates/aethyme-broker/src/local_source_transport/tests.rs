@@ -634,6 +634,27 @@ fn chained_url_rewrites_inspect_the_configured_peer_once() {
         git(t._remote.path(), &["rev-parse", "refs/heads/candidate"]),
         i.spec.commit
     );
+    let destinations = ["refs/heads/candidate".to_string()];
+    assert_eq!(
+        t.carrier
+            .repo
+            .remote_ref_oids("publication", &destinations)
+            .unwrap()["refs/heads/candidate"]
+            .as_deref(),
+        Some(i.spec.commit.as_str())
+    );
+    assert_eq!(
+        t.carrier
+            .repo
+            .checked_push_remote_ref_oids(
+                "publication",
+                &t.carrier.identity.coordination_key,
+                &destinations,
+            )
+            .unwrap()["refs/heads/candidate"]
+            .as_deref(),
+        Some(i.spec.commit.as_str())
+    );
     assert!(
         git(
             second.path(),
