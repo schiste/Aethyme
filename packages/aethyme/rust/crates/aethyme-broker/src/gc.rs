@@ -28,7 +28,32 @@ pub(crate) use tree_removal::{
     remove_condemned_tree_with_progress, remove_condemned_tree_with_progress_and_guard,
 };
 
-pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const GC_PLAN_SCHEMA_VERSION: u32 = 3;
+const GC_JOURNAL_ARCHIVE_DIRECTORY: &str = "gc-journal-archives";
+const GC_JOURNAL_ARCHIVE_PREFIX: &str = "gc-journal-abandoned-";
+const GC_JOURNAL_ARCHIVE_SUFFIX: &str = ".json";
+const GC_JOURNAL_ARCHIVE_MAX_COUNT: usize = 32;
+const GC_JOURNAL_ARCHIVE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const GC_JOURNAL_ARCHIVE_MAX_DIRECTORY_ENTRIES: usize = 64;
+
+fn gc_journal_archive_directory_scan_has_budget(entries_seen: usize) -> bool {
+    entries_seen <= GC_JOURNAL_ARCHIVE_MAX_DIRECTORY_ENTRIES
+}
+
+fn gc_journal_schema_is_revocable(version: u32) -> bool {
+    matches!(version, 2 | GC_PLAN_SCHEMA_VERSION)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn gc_journal_archive_budget_admits(count: usize, bytes: u64, incoming: u64) -> bool {
+    count < GC_JOURNAL_ARCHIVE_MAX_COUNT
+        && bytes
+            .checked_add(incoming)
+            .is_some_and(|total| total <= GC_JOURNAL_ARCHIVE_MAX_BYTES)
+}
 
 /// How deep below a worktree root a build directory is looked for. Deep enough
 /// for nested workspaces and package directories, shallow enough to keep the
@@ -908,6 +933,19 @@ struct GcJournal {
     reclaimed_bytes: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct GcJournalAbandonReport {
+    pub(crate) digest: String,
+    pub(crate) archive_path: String,
+    pub(crate) bytes_archived: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct GcJournalForgetReport {
+    pub(crate) digest: String,
+    pub(crate) bytes_forgotten: u64,
+}
+
 impl From<GcPlan> for GcJournal {
     fn from(plan: GcPlan) -> Self {
         Self {
@@ -1370,6 +1408,794 @@ fn load_journal(path: &Path) -> Result<Option<GcJournal>, BrokerOpError> {
         .map_err(|error| BrokerOpError::InvalidGcJournal {
             reason: error.to_string(),
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GcStateDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GcStateFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct GcStateFileSnapshot {
+    bytes: Vec<u8>,
+    identity: GcStateFileIdentity,
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+fn gc_state_file_link_count(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn gc_state_file_link_count(_metadata: &std::fs::Metadata) -> u64 {
+    1
+}
+
+fn gc_archive_refusal(reason: impl Into<String>) -> BrokerOpError {
+    BrokerOpError::GcJournalAbandonRefused {
+        reason: reason.into(),
+    }
+}
+
+fn gc_io(path: &Path, source: std::io::Error) -> BrokerOpError {
+    crate::BrokerError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+    .into()
+}
+
+#[cfg(unix)]
+fn gc_state_directory_identity(path: &Path) -> Result<GcStateDirectoryIdentity, BrokerOpError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| gc_io(path, source))?;
+    // SAFETY: geteuid has no pointer preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(gc_archive_refusal(format!(
+            "state directory is not an owned, non-writable real directory: {}",
+            path.display()
+        )));
+    }
+    Ok(GcStateDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn gc_state_directory_identity(_path: &Path) -> Result<GcStateDirectoryIdentity, BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn gc_state_file_identity_with_link_limit(
+    metadata: &std::fs::Metadata,
+    path: &Path,
+    max_links: u64,
+) -> Result<GcStateFileIdentity, BrokerOpError> {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid has no pointer preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.nlink() == 0
+        || metadata.nlink() > max_links
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(gc_archive_refusal(format!(
+            "journal path is not a private, owned regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(GcStateFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn gc_state_file_identity_with_link_limit(
+    _metadata: &std::fs::Metadata,
+    _path: &Path,
+    _max_links: u64,
+) -> Result<GcStateFileIdentity, BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn read_gc_state_file(
+    path: &Path,
+    parent: &Path,
+    parent_identity: GcStateDirectoryIdentity,
+) -> Result<Option<GcStateFileSnapshot>, BrokerOpError> {
+    read_gc_state_file_with_link_limit(path, parent, parent_identity, 1)
+}
+
+#[cfg(not(unix))]
+fn read_gc_state_file(
+    _path: &Path,
+    _parent: &Path,
+    _parent_identity: GcStateDirectoryIdentity,
+) -> Result<Option<GcStateFileSnapshot>, BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn read_gc_state_file_with_link_limit(
+    path: &Path,
+    parent: &Path,
+    parent_identity: GcStateDirectoryIdentity,
+    max_links: u64,
+) -> Result<Option<GcStateFileSnapshot>, BrokerOpError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if gc_state_directory_identity(parent)? != parent_identity {
+        return Err(gc_archive_refusal(
+            "state directory identity changed during journal archival",
+        ));
+    }
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(gc_io(path, source)),
+    };
+    let before_identity = gc_state_file_identity_with_link_limit(&before, path, max_links)?;
+    if before.len() > GC_JOURNAL_ARCHIVE_MAX_BYTES {
+        return Err(gc_archive_refusal(format!(
+            "journal file exceeds the {} byte archive limit: {}",
+            GC_JOURNAL_ARCHIVE_MAX_BYTES,
+            path.display()
+        )));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = options.open(path).map_err(|source| gc_io(path, source))?;
+    let opened = file.metadata().map_err(|source| gc_io(path, source))?;
+    let opened_identity = gc_state_file_identity_with_link_limit(&opened, path, max_links)?;
+    if opened_identity != before_identity {
+        return Err(gc_archive_refusal(format!(
+            "journal file identity changed while opening: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    {
+        let mut bounded = file
+            .by_ref()
+            .take(GC_JOURNAL_ARCHIVE_MAX_BYTES.saturating_add(1));
+        bounded
+            .read_to_end(&mut bytes)
+            .map_err(|source| gc_io(path, source))?;
+    }
+    if bytes.len() as u64 > GC_JOURNAL_ARCHIVE_MAX_BYTES {
+        return Err(gc_archive_refusal(format!(
+            "journal file grew beyond the {} byte archive limit while reading: {}",
+            GC_JOURNAL_ARCHIVE_MAX_BYTES,
+            path.display()
+        )));
+    }
+    let after = std::fs::symlink_metadata(path).map_err(|source| gc_io(path, source))?;
+    let after_identity = gc_state_file_identity_with_link_limit(&after, path, max_links)?;
+    let opened_after_read = file.metadata().map_err(|source| gc_io(path, source))?;
+    if after_identity != opened_identity
+        || after.len() != bytes.len() as u64
+        || opened_after_read.len() != bytes.len() as u64
+    {
+        return Err(gc_archive_refusal(format!(
+            "journal file changed while reading: {}",
+            path.display()
+        )));
+    }
+    if gc_state_directory_identity(parent)? != parent_identity {
+        return Err(gc_archive_refusal(
+            "state directory identity changed while reading the journal",
+        ));
+    }
+    Ok(Some(GcStateFileSnapshot {
+        bytes,
+        identity: opened_identity,
+        file,
+    }))
+}
+
+#[cfg(not(unix))]
+fn read_gc_state_file_with_link_limit(
+    _path: &Path,
+    _parent: &Path,
+    _parent_identity: GcStateDirectoryIdentity,
+    _max_links: u64,
+) -> Result<Option<GcStateFileSnapshot>, BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_gc_state_directory(
+    parent: &Path,
+    expected_identity: GcStateDirectoryIdentity,
+) -> Result<(), BrokerOpError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let directory = options
+        .open(parent)
+        .map_err(|source| gc_io(parent, source))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|source| gc_io(parent, source))?;
+    // SAFETY: geteuid has no pointer preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let identity = GcStateDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    if !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o022 != 0
+        || identity != expected_identity
+    {
+        return Err(gc_archive_refusal(
+            "state directory identity or ownership changed before it could be synced",
+        ));
+    }
+    directory.sync_all().map_err(|source| gc_io(parent, source))
+}
+
+#[cfg(not(unix))]
+fn sync_gc_state_directory(
+    _parent: &Path,
+    _expected_identity: GcStateDirectoryIdentity,
+) -> Result<(), BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn remove_interrupted_gc_archive_link(
+    parent: &Path,
+    parent_identity: GcStateDirectoryIdentity,
+    archive_path: &Path,
+    archive_identity: GcStateFileIdentity,
+    expected_bytes: &[u8],
+) -> Result<(), BrokerOpError> {
+    let file_name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| gc_archive_refusal("archive filename is not valid UTF-8"))?;
+    let temporary_prefix = format!(".{file_name}-");
+    let mut temporary_path = None;
+    let mut entries_seen = 0_usize;
+    for entry in std::fs::read_dir(parent).map_err(|source| gc_io(parent, source))? {
+        let entry = entry.map_err(|source| gc_io(parent, source))?;
+        entries_seen = entries_seen.saturating_add(1);
+        if !gc_journal_archive_directory_scan_has_budget(entries_seen) {
+            return Err(gc_archive_refusal(
+                "journal archive directory has too many entries to inspect safely",
+            ));
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&temporary_prefix) {
+            continue;
+        }
+        let Some(snapshot) =
+            read_gc_state_file_with_link_limit(&entry.path(), parent, parent_identity, 2)?
+        else {
+            return Err(gc_archive_refusal(
+                "interrupted archive publication link disappeared during recovery",
+            ));
+        };
+        if snapshot.identity != archive_identity || snapshot.bytes != expected_bytes {
+            return Err(gc_archive_refusal(
+                "archive temporary entry does not match the durable archive file",
+            ));
+        }
+        if temporary_path.replace(entry.path()).is_some() {
+            return Err(gc_archive_refusal(
+                "multiple temporary links match the interrupted archive publication",
+            ));
+        }
+    }
+    let Some(temporary_path) = temporary_path else {
+        return Err(gc_archive_refusal(
+            "durable archive has an unexpected hard link; refusing to clear the active journal",
+        ));
+    };
+    std::fs::remove_file(&temporary_path).map_err(|source| gc_io(&temporary_path, source))?;
+    sync_gc_state_directory(parent, parent_identity)?;
+    let Some(archive) = read_gc_state_file(archive_path, parent, parent_identity)? else {
+        return Err(gc_archive_refusal(
+            "archive disappeared while recovering its temporary link",
+        ));
+    };
+    if archive.identity != archive_identity || archive.bytes != expected_bytes {
+        return Err(gc_archive_refusal(
+            "archive changed while recovering its temporary link",
+        ));
+    }
+    archive
+        .file
+        .sync_all()
+        .map_err(|source| gc_io(archive_path, source))?;
+    sync_gc_state_directory(parent, parent_identity)
+}
+
+#[cfg(not(unix))]
+fn remove_interrupted_gc_archive_link(
+    _parent: &Path,
+    _parent_identity: GcStateDirectoryIdentity,
+    _archive_path: &Path,
+    _archive_identity: GcStateFileIdentity,
+    _expected_bytes: &[u8],
+) -> Result<(), BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn archive_gc_journal_bytes(
+    parent: &Path,
+    parent_identity: GcStateDirectoryIdentity,
+    archive_path: &Path,
+    bytes: &[u8],
+) -> Result<(), BrokerOpError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Some(existing) =
+        read_gc_state_file_with_link_limit(archive_path, parent, parent_identity, 2)?
+    {
+        if existing.bytes != bytes {
+            return Err(gc_archive_refusal(format!(
+                "archive path already contains different bytes: {}",
+                archive_path.display()
+            )));
+        }
+        let links = existing
+            .file
+            .metadata()
+            .map_err(|source| gc_io(archive_path, source))?
+            .nlink();
+        let identity = existing.identity;
+        if links == 2 {
+            drop(existing);
+            remove_interrupted_gc_archive_link(
+                parent,
+                parent_identity,
+                archive_path,
+                identity,
+                bytes,
+            )?;
+        } else if links == 1 {
+            existing
+                .file
+                .sync_all()
+                .map_err(|source| gc_io(archive_path, source))?;
+            sync_gc_state_directory(parent, parent_identity)?;
+        } else {
+            return Err(gc_archive_refusal(
+                "archive has an unexpected number of hard links",
+            ));
+        }
+        return Ok(());
+    }
+
+    let (archive_count, archive_bytes) = gc_journal_archive_inventory(parent, parent_identity)?;
+    if !gc_journal_archive_budget_admits(archive_count, archive_bytes, bytes.len() as u64) {
+        return Err(gc_archive_refusal(format!(
+            "journal archive budget is full ({} files / {} bytes); inspect an older archive and retire it with `aethyme broker gc forget-abandoned --confirm <archived-plan-digest>`",
+            GC_JOURNAL_ARCHIVE_MAX_COUNT, GC_JOURNAL_ARCHIVE_MAX_BYTES
+        )));
+    }
+
+    let publish = crate::atomic_file::with_synced_temporary(archive_path, bytes, |temporary| {
+        if gc_state_directory_identity(parent).ok() != Some(parent_identity) {
+            return Err(std::io::Error::other(
+                "GC state directory identity changed before archive publication",
+            ));
+        }
+        std::fs::hard_link(temporary, archive_path)
+    });
+    match publish {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let Some(existing) =
+                read_gc_state_file_with_link_limit(archive_path, parent, parent_identity, 2)?
+            else {
+                return Err(gc_archive_refusal(
+                    "archive path appeared and disappeared during publication",
+                ));
+            };
+            if existing.bytes != bytes {
+                return Err(gc_archive_refusal(format!(
+                    "archive path already contains different bytes: {}",
+                    archive_path.display()
+                )));
+            }
+            let links = existing
+                .file
+                .metadata()
+                .map_err(|source| gc_io(archive_path, source))?
+                .nlink();
+            let identity = existing.identity;
+            if links == 2 {
+                drop(existing);
+                remove_interrupted_gc_archive_link(
+                    parent,
+                    parent_identity,
+                    archive_path,
+                    identity,
+                    bytes,
+                )?;
+            } else if links == 1 {
+                existing
+                    .file
+                    .sync_all()
+                    .map_err(|source| gc_io(archive_path, source))?;
+            } else {
+                return Err(gc_archive_refusal(
+                    "archive has an unexpected number of hard links",
+                ));
+            }
+        }
+        Err(source) => return Err(gc_io(archive_path, source)),
+    }
+
+    sync_gc_state_directory(parent, parent_identity)?;
+    let Some(archived) = read_gc_state_file(archive_path, parent, parent_identity)? else {
+        return Err(gc_archive_refusal(
+            "archive disappeared before its durable readback",
+        ));
+    };
+    if archived.bytes != bytes {
+        return Err(gc_archive_refusal(
+            "archive readback did not match the pending journal bytes",
+        ));
+    }
+    archived
+        .file
+        .sync_all()
+        .map_err(|source| gc_io(archive_path, source))?;
+    sync_gc_state_directory(parent, parent_identity)
+}
+
+#[cfg(unix)]
+fn ensure_gc_journal_archive_directory(
+    state_directory: &Path,
+    state_identity: GcStateDirectoryIdentity,
+) -> Result<(PathBuf, GcStateDirectoryIdentity), BrokerOpError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    if gc_state_directory_identity(state_directory)? != state_identity {
+        return Err(gc_archive_refusal(
+            "state directory identity changed before archive setup",
+        ));
+    }
+    let archive_directory = state_directory.join(GC_JOURNAL_ARCHIVE_DIRECTORY);
+    match std::fs::symlink_metadata(&archive_directory) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&archive_directory) {
+                Ok(()) => {
+                    crate::host_state::protect_host_state_path(&archive_directory, true)
+                        .map_err(|source| gc_io(&archive_directory, source))?;
+                    sync_gc_state_directory(state_directory, state_identity)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(gc_io(&archive_directory, source)),
+            }
+        }
+        Err(source) => return Err(gc_io(&archive_directory, source)),
+    }
+    let identity = gc_state_directory_identity(&archive_directory)?;
+    let metadata = std::fs::symlink_metadata(&archive_directory)
+        .map_err(|source| gc_io(&archive_directory, source))?;
+    if metadata.mode() & 0o077 != 0 {
+        return Err(gc_archive_refusal(format!(
+            "journal archive directory is not private: {}",
+            archive_directory.display()
+        )));
+    }
+    if gc_state_directory_identity(state_directory)? != state_identity
+        || gc_state_directory_identity(&archive_directory)? != identity
+    {
+        return Err(gc_archive_refusal(
+            "journal archive directory identity changed during setup",
+        ));
+    }
+    Ok((archive_directory, identity))
+}
+
+#[cfg(not(unix))]
+fn ensure_gc_journal_archive_directory(
+    _state_directory: &Path,
+    _state_identity: GcStateDirectoryIdentity,
+) -> Result<(PathBuf, GcStateDirectoryIdentity), BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(unix)]
+fn existing_gc_journal_archive_directory(
+    state_directory: &Path,
+    state_identity: GcStateDirectoryIdentity,
+) -> Result<Option<(PathBuf, GcStateDirectoryIdentity)>, BrokerOpError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if gc_state_directory_identity(state_directory)? != state_identity {
+        return Err(gc_archive_refusal(
+            "state directory identity changed before archive inspection",
+        ));
+    }
+    let archive_directory = state_directory.join(GC_JOURNAL_ARCHIVE_DIRECTORY);
+    let metadata = match std::fs::symlink_metadata(&archive_directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(gc_io(&archive_directory, source)),
+    };
+    let identity = gc_state_directory_identity(&archive_directory)?;
+    if metadata.mode() & 0o077 != 0
+        || gc_state_directory_identity(state_directory)? != state_identity
+        || gc_state_directory_identity(&archive_directory)? != identity
+    {
+        return Err(gc_archive_refusal(format!(
+            "journal archive directory is not private or changed during inspection: {}",
+            archive_directory.display()
+        )));
+    }
+    Ok(Some((archive_directory, identity)))
+}
+
+#[cfg(not(unix))]
+fn existing_gc_journal_archive_directory(
+    _state_directory: &Path,
+    _state_identity: GcStateDirectoryIdentity,
+) -> Result<Option<(PathBuf, GcStateDirectoryIdentity)>, BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+#[cfg(not(unix))]
+fn archive_gc_journal_bytes(
+    _parent: &Path,
+    _parent_identity: GcStateDirectoryIdentity,
+    _archive_path: &Path,
+    _bytes: &[u8],
+) -> Result<(), BrokerOpError> {
+    Err(gc_archive_refusal(
+        "safe no-follow journal archival is supported only on Unix",
+    ))
+}
+
+fn gc_journal_archive_digest(name: &str) -> Option<&str> {
+    let digest = name
+        .strip_prefix(GC_JOURNAL_ARCHIVE_PREFIX)?
+        .strip_suffix(GC_JOURNAL_ARCHIVE_SUFFIX)?;
+    (digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && digest.bytes().all(|byte| !byte.is_ascii_uppercase()))
+    .then_some(digest)
+}
+
+fn gc_journal_archive_temporary_name(name: &str, archive_name: &str) -> bool {
+    let Some(suffix) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_prefix(archive_name))
+        .and_then(|name| name.strip_prefix('-'))
+    else {
+        return false;
+    };
+    (6..=64).contains(&suffix.len()) && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Explicitly retire only the private random temporary names emitted by
+/// `with_synced_temporary` for this exact archive. A temporary file was never
+/// published as an archive, so deleting it cannot revoke a journal; the
+/// active journal remains available for a fresh `abandon` retry.
+fn remove_gc_journal_archive_temporaries(
+    directory: &Path,
+    directory_identity: GcStateDirectoryIdentity,
+    archive_name: &str,
+    confirmed_digest: &str,
+) -> Result<u64, BrokerOpError> {
+    struct TemporarySnapshot {
+        path: PathBuf,
+        identity: GcStateFileIdentity,
+        bytes: Vec<u8>,
+    }
+
+    if gc_state_directory_identity(directory)? != directory_identity {
+        return Err(gc_archive_refusal(
+            "journal archive directory identity changed before temporary-file inspection",
+        ));
+    }
+    let mut temporaries = Vec::new();
+    let mut bytes_total = 0_u64;
+    let mut entries_seen = 0_usize;
+    for entry in std::fs::read_dir(directory).map_err(|source| gc_io(directory, source))? {
+        let entry = entry.map_err(|source| gc_io(directory, source))?;
+        entries_seen = entries_seen.saturating_add(1);
+        if !gc_journal_archive_directory_scan_has_budget(entries_seen) {
+            return Err(gc_archive_refusal(
+                "journal archive directory has too many entries to inspect safely",
+            ));
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let temporary_prefix = format!(".{archive_name}-");
+        if !name.starts_with(&temporary_prefix) {
+            continue;
+        }
+        if !gc_journal_archive_temporary_name(name, archive_name) {
+            return Err(gc_archive_refusal(format!(
+                "journal archive directory contains an unrecognized temporary entry: {name:?}"
+            )));
+        }
+        if temporaries.len() >= GC_JOURNAL_ARCHIVE_MAX_COUNT {
+            return Err(gc_archive_refusal(
+                "too many matching temporary archive files to retire safely",
+            ));
+        }
+        let path = entry.path();
+        let Some(snapshot) = read_gc_state_file(&path, directory, directory_identity)? else {
+            return Err(gc_archive_refusal(format!(
+                "temporary archive file disappeared during inspection: {name}"
+            )));
+        };
+        bytes_total = bytes_total
+            .checked_add(snapshot.bytes.len() as u64)
+            .ok_or_else(|| gc_archive_refusal("temporary archive byte count overflowed"))?;
+        if bytes_total > GC_JOURNAL_ARCHIVE_MAX_BYTES {
+            return Err(gc_archive_refusal(
+                "matching temporary archive files exceed the configured byte budget",
+            ));
+        }
+        // A fully written temp must carry the digest encoded by its exact
+        // archive name. A truncated temp from a crash may not parse yet.
+        if let Ok(journal) = serde_json::from_slice::<GcJournal>(&snapshot.bytes)
+            && (!gc_journal_schema_is_revocable(journal.schema_version)
+                || !journal.digest.eq_ignore_ascii_case(confirmed_digest))
+        {
+            return Err(gc_archive_refusal(format!(
+                "temporary archive file {name} contains a different journal"
+            )));
+        }
+        temporaries.push(TemporarySnapshot {
+            path,
+            identity: snapshot.identity,
+            bytes: snapshot.bytes,
+        });
+    }
+    if gc_state_directory_identity(directory)? != directory_identity {
+        return Err(gc_archive_refusal(
+            "journal archive directory identity changed after temporary-file inspection",
+        ));
+    }
+
+    for temporary in &temporaries {
+        let Some(current) = read_gc_state_file(&temporary.path, directory, directory_identity)?
+        else {
+            return Err(gc_archive_refusal(
+                "temporary archive file disappeared before it could be retired",
+            ));
+        };
+        if current.identity != temporary.identity || current.bytes != temporary.bytes {
+            return Err(gc_archive_refusal(
+                "temporary archive file changed before it could be retired",
+            ));
+        }
+    }
+    for temporary in &temporaries {
+        std::fs::remove_file(&temporary.path).map_err(|source| gc_io(&temporary.path, source))?;
+    }
+    if !temporaries.is_empty() {
+        sync_gc_state_directory(directory, directory_identity)?;
+    }
+    Ok(bytes_total)
+}
+
+fn gc_journal_archive_inventory(
+    directory: &Path,
+    directory_identity: GcStateDirectoryIdentity,
+) -> Result<(usize, u64), BrokerOpError> {
+    if gc_state_directory_identity(directory)? != directory_identity {
+        return Err(gc_archive_refusal(
+            "journal archive directory identity changed during inventory",
+        ));
+    }
+    let entries = std::fs::read_dir(directory).map_err(|source| gc_io(directory, source))?;
+    let mut count = 0_usize;
+    let mut bytes = 0_u64;
+    let mut entries_seen = 0_usize;
+    for entry in entries {
+        let entry = entry.map_err(|source| gc_io(directory, source))?;
+        entries_seen = entries_seen.saturating_add(1);
+        if !gc_journal_archive_directory_scan_has_budget(entries_seen) {
+            return Err(gc_archive_refusal(
+                "journal archive directory has too many entries to inspect safely",
+            ));
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(gc_archive_refusal(
+                "journal archive directory contains a non-UTF-8 entry",
+            ));
+        };
+        let Some(expected_digest) = gc_journal_archive_digest(name) else {
+            return Err(gc_archive_refusal(format!(
+                "journal archive directory contains an unrecognized entry: {name:?}"
+            )));
+        };
+        let Some(snapshot) = read_gc_state_file(&entry.path(), directory, directory_identity)?
+        else {
+            return Err(gc_archive_refusal(format!(
+                "journal archive disappeared during inventory: {name}"
+            )));
+        };
+        let journal: GcJournal = serde_json::from_slice(&snapshot.bytes).map_err(|error| {
+            gc_archive_refusal(format!("journal archive {name} is not valid JSON: {error}"))
+        })?;
+        if !gc_journal_schema_is_revocable(journal.schema_version)
+            || !journal.digest.eq_ignore_ascii_case(expected_digest)
+        {
+            return Err(gc_archive_refusal(format!(
+                "journal archive {name} does not match its name or a supported schema"
+            )));
+        }
+        count = count.saturating_add(1);
+        bytes = bytes
+            .checked_add(snapshot.bytes.len() as u64)
+            .ok_or_else(|| gc_archive_refusal("journal archive byte count overflowed"))?;
+        if count > GC_JOURNAL_ARCHIVE_MAX_COUNT || bytes > GC_JOURNAL_ARCHIVE_MAX_BYTES {
+            return Err(gc_archive_refusal(
+                "existing journal archives exceed the configured count or byte budget",
+            ));
+        }
+    }
+    if gc_state_directory_identity(directory)? != directory_identity {
+        return Err(gc_archive_refusal(
+            "journal archive directory identity changed after inventory",
+        ));
+    }
+    Ok((count, bytes))
 }
 
 fn runtime_path(main_root: &Path, relative: &str) -> Result<PathBuf, BrokerOpError> {
@@ -2079,6 +2905,241 @@ impl Broker {
     /// anything that runs on its own -- hence [`Broker::gc_plan_recorded`].
     pub fn gc_plan(&mut self) -> Result<GcPlan, BrokerOpError> {
         self.gc_plan_scanned(crate::SizeScan::Measure, false)
+    }
+
+    /// Retire an ineligible frozen journal after the operator confirms its
+    /// exact digest. This archives only the journal bytes: it never resumes,
+    /// replans, or removes any retained row, file, worktree, or artifact.
+    pub(crate) fn gc_abandon_pending(
+        &mut self,
+        confirm: &str,
+    ) -> Result<GcJournalAbandonReport, BrokerOpError> {
+        if !is_sha256_digest(confirm) {
+            return Err(BrokerOpError::GcConfirmationNotSha256);
+        }
+
+        let main_root = self.main_root().to_path_buf();
+        let _lock = GcLock::acquire(&main_root)?;
+        let state_directory = main_root.join(".aethyme");
+        let directory_identity = gc_state_directory_identity(&state_directory)?;
+        let journal_path = state_directory.join("gc-journal.json");
+        let Some(pending) =
+            read_gc_state_file(&journal_path, &state_directory, directory_identity)?
+        else {
+            return Err(gc_archive_refusal(
+                "no pending journal exists; review a fresh `aethyme broker gc plan`",
+            ));
+        };
+        let journal: GcJournal = serde_json::from_slice(&pending.bytes).map_err(|error| {
+            BrokerOpError::InvalidGcJournal {
+                reason: error.to_string(),
+            }
+        })?;
+        if !gc_journal_schema_is_revocable(journal.schema_version) {
+            return Err(BrokerOpError::InvalidGcJournal {
+                reason: format!(
+                    "schema {} is unknown and cannot be safely abandoned (supported schemas: 2 and {})",
+                    journal.schema_version, GC_PLAN_SCHEMA_VERSION,
+                ),
+            });
+        }
+        if !is_sha256_digest(&journal.digest) {
+            return Err(BrokerOpError::InvalidGcJournal {
+                reason: "pending journal digest is not a full SHA-256 value".into(),
+            });
+        }
+        if !journal.digest.eq_ignore_ascii_case(confirm) {
+            return Err(BrokerOpError::GcAbandonConfirmationMismatch {
+                expected: journal.digest,
+                actual: confirm.to_owned(),
+            });
+        }
+
+        let archive_name = format!(
+            "{GC_JOURNAL_ARCHIVE_PREFIX}{}{GC_JOURNAL_ARCHIVE_SUFFIX}",
+            journal.digest.to_ascii_lowercase()
+        );
+        let (archive_directory, archive_directory_identity) =
+            ensure_gc_journal_archive_directory(&state_directory, directory_identity)?;
+        let archive_path = archive_directory.join(&archive_name);
+        let bytes_archived = pending.bytes.len() as u64;
+        archive_gc_journal_bytes(
+            &archive_directory,
+            archive_directory_identity,
+            &archive_path,
+            &pending.bytes,
+        )?;
+
+        if gc_state_directory_identity(&state_directory)? != directory_identity {
+            return Err(gc_archive_refusal(
+                "state directory identity changed before clearing the active journal",
+            ));
+        }
+        let Some(current) =
+            read_gc_state_file(&journal_path, &state_directory, directory_identity)?
+        else {
+            return Err(gc_archive_refusal(
+                "active journal disappeared after it was archived",
+            ));
+        };
+        if current.identity != pending.identity || current.bytes != pending.bytes {
+            return Err(gc_archive_refusal(
+                "active journal changed after the archive was written; it was left in place",
+            ));
+        }
+        drop(current);
+        drop(pending);
+        std::fs::remove_file(&journal_path).map_err(|source| gc_io(&journal_path, source))?;
+        sync_gc_state_directory(&state_directory, directory_identity)?;
+
+        Ok(GcJournalAbandonReport {
+            digest: journal.digest,
+            archive_path: format!(".aethyme/{GC_JOURNAL_ARCHIVE_DIRECTORY}/{archive_name}"),
+            bytes_archived,
+        })
+    }
+
+    /// Remove only a previously abandoned journal or its known atomic-write
+    /// temporary files after the operator confirms its plan digest. This
+    /// never touches GC candidates or changes an active journal.
+    pub(crate) fn gc_forget_abandoned(
+        &mut self,
+        confirm: &str,
+    ) -> Result<GcJournalForgetReport, BrokerOpError> {
+        if !is_sha256_digest(confirm) {
+            return Err(BrokerOpError::GcConfirmationNotSha256);
+        }
+
+        let main_root = self.main_root().to_path_buf();
+        let _lock = GcLock::acquire(&main_root)?;
+        let state_directory = main_root.join(".aethyme");
+        let state_identity = gc_state_directory_identity(&state_directory)?;
+        let Some((archive_directory, archive_directory_identity)) =
+            existing_gc_journal_archive_directory(&state_directory, state_identity)?
+        else {
+            return Err(gc_archive_refusal(
+                "no matching abandoned journal exists; nothing was forgotten",
+            ));
+        };
+        let archive_name = format!(
+            "{GC_JOURNAL_ARCHIVE_PREFIX}{}{GC_JOURNAL_ARCHIVE_SUFFIX}",
+            confirm.to_ascii_lowercase()
+        );
+        let archive_path = archive_directory.join(&archive_name);
+        let archive = read_gc_state_file_with_link_limit(
+            &archive_path,
+            &archive_directory,
+            archive_directory_identity,
+            2,
+        )?;
+        let archive_journal = if let Some(archive) = &archive {
+            let journal: GcJournal = serde_json::from_slice(&archive.bytes).map_err(|error| {
+                gc_archive_refusal(format!("archived journal is not valid JSON: {error}"))
+            })?;
+            if !gc_journal_schema_is_revocable(journal.schema_version)
+                || !journal.digest.eq_ignore_ascii_case(confirm)
+            {
+                return Err(gc_archive_refusal(
+                    "archived journal schema or digest does not match the confirmation",
+                ));
+            }
+            Some(journal)
+        } else {
+            None
+        };
+
+        let active_path = state_directory.join("gc-journal.json");
+        if let Some(active) = read_gc_state_file(&active_path, &state_directory, state_identity)? {
+            let active_journal: GcJournal =
+                serde_json::from_slice(&active.bytes).map_err(|error| {
+                    gc_archive_refusal(format!(
+                        "active journal cannot be checked before forgetting an archive: {error}"
+                    ))
+                })?;
+            if !gc_journal_schema_is_revocable(active_journal.schema_version) {
+                return Err(gc_archive_refusal(
+                    "active journal has an unknown schema; no archive was forgotten",
+                ));
+            }
+            if archive
+                .as_ref()
+                .is_some_and(|archive| active.bytes == archive.bytes)
+            {
+                return Err(gc_archive_refusal(
+                    "the active journal still needs this exact archive for crash recovery; retry `gc abandon` first",
+                ));
+            }
+        }
+
+        let mut bytes_forgotten = 0_u64;
+        let temporary_bytes = if let Some(archive) = archive {
+            let links = gc_state_file_link_count(
+                &archive
+                    .file
+                    .metadata()
+                    .map_err(|source| gc_io(&archive_path, source))?,
+            );
+            if links == 2 {
+                remove_interrupted_gc_archive_link(
+                    &archive_directory,
+                    archive_directory_identity,
+                    &archive_path,
+                    archive.identity,
+                    &archive.bytes,
+                )?;
+            } else if links != 1 {
+                return Err(gc_archive_refusal(
+                    "archive has an unexpected number of hard links",
+                ));
+            }
+            // Validate and retire all remaining matching temporary entries
+            // before unlinking the durable archive. A suspicious temp entry
+            // must not make us lose the archive as evidence on refusal.
+            let temporary_bytes = remove_gc_journal_archive_temporaries(
+                &archive_directory,
+                archive_directory_identity,
+                &archive_name,
+                confirm,
+            )?;
+            let Some(current) = read_gc_state_file(
+                &archive_path,
+                &archive_directory,
+                archive_directory_identity,
+            )?
+            else {
+                return Err(gc_archive_refusal(
+                    "archive disappeared before it could be forgotten",
+                ));
+            };
+            if current.identity != archive.identity || current.bytes != archive.bytes {
+                return Err(gc_archive_refusal(
+                    "archive changed before it could be forgotten",
+                ));
+            }
+            bytes_forgotten = bytes_forgotten.saturating_add(current.bytes.len() as u64);
+            drop(current);
+            drop(archive);
+            std::fs::remove_file(&archive_path).map_err(|source| gc_io(&archive_path, source))?;
+            sync_gc_state_directory(&archive_directory, archive_directory_identity)?;
+            temporary_bytes
+        } else {
+            remove_gc_journal_archive_temporaries(
+                &archive_directory,
+                archive_directory_identity,
+                &archive_name,
+                confirm,
+            )?
+        };
+        if archive_journal.is_none() && temporary_bytes == 0 {
+            return Err(gc_archive_refusal(
+                "no matching abandoned journal or atomic-write temporary exists; nothing was forgotten",
+            ));
+        }
+        bytes_forgotten = bytes_forgotten.saturating_add(temporary_bytes);
+        Ok(GcJournalForgetReport {
+            digest: archive_journal.map_or_else(|| confirm.to_ascii_lowercase(), |j| j.digest),
+            bytes_forgotten,
+        })
     }
 
     /// [`Broker::gc_plan`], also proposing the most recently used entry of
@@ -4288,12 +5349,18 @@ impl Broker {
         let mut journal = match load_journal(&journal_path)? {
             Some(journal) => {
                 if journal.schema_version != GC_PLAN_SCHEMA_VERSION {
-                    return Err(BrokerOpError::InvalidGcJournal {
-                        reason: format!(
-                            "schema {} is unsupported (expected {})",
+                    let reason = if journal.schema_version == 2 {
+                        format!(
+                            "schema 2 is no longer resumable because schema {} adds required authorization fields; abandon this journal with `aethyme broker gc abandon --confirm {}` to archive it without removing retained data, then review a fresh `aethyme broker gc plan`",
+                            GC_PLAN_SCHEMA_VERSION, journal.digest
+                        )
+                    } else {
+                        format!(
+                            "schema {} is unsupported (expected {}); this unknown journal version cannot be safely resumed or abandoned",
                             journal.schema_version, GC_PLAN_SCHEMA_VERSION
-                        ),
-                    });
+                        )
+                    };
+                    return Err(BrokerOpError::InvalidGcJournal { reason });
                 }
                 if !journal.digest.eq_ignore_ascii_case(confirm) {
                     return Err(BrokerOpError::GcResumeConfirmationMismatch {
@@ -6936,6 +8003,329 @@ mod tests {
         );
         assert!(parsed.remaining_checkpoint_pin_releases.is_empty());
         assert!(parsed.remaining_publication_exposure_expiries.is_empty());
+    }
+
+    #[test]
+    fn gc_journal_archive_budget_has_literal_count_and_byte_boundaries() {
+        assert!(gc_journal_archive_budget_admits(31, 0, 67_108_864));
+        assert!(!gc_journal_archive_budget_admits(32, 0, 0));
+        assert!(!gc_journal_archive_budget_admits(31, 67_108_864, 1));
+        assert!(!gc_journal_archive_budget_admits(0, 0, 67_108_865));
+    }
+
+    #[test]
+    fn gc_journal_archive_scans_have_literal_64_65_entry_boundary() {
+        // Archive inventory, temporary cleanup, and hardlink recovery share
+        // this predicate so each directory scan stops after the same bound.
+        assert!(gc_journal_archive_directory_scan_has_budget(64));
+        assert!(!gc_journal_archive_directory_scan_has_budget(65));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_abandon_wrong_digest_preserves_the_pending_journal_without_archive() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let original = std::fs::read(&journal_path).unwrap();
+        let wrong_digest = if digest.starts_with('a') {
+            "b".repeat(64)
+        } else {
+            "a".repeat(64)
+        };
+
+        let error = broker.gc_abandon_pending(&wrong_digest).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerOpError::GcAbandonConfirmationMismatch { .. }
+        ));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), original);
+        assert!(
+            !broker
+                .main_root()
+                .join(".aethyme/gc-journal-archives")
+                .exists()
+        );
+        assert!(root.join("retained.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_abandon_refuses_a_mismatched_archive_collision_without_clearing_journal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let original = std::fs::read(&journal_path).unwrap();
+        let state_directory = broker.main_root().join(".aethyme");
+        let state_identity = gc_state_directory_identity(&state_directory).unwrap();
+        let (archive_directory, _) =
+            ensure_gc_journal_archive_directory(&state_directory, state_identity).unwrap();
+        let archive_path = archive_directory.join(format!(
+            "{GC_JOURNAL_ARCHIVE_PREFIX}{digest}{GC_JOURNAL_ARCHIVE_SUFFIX}"
+        ));
+        std::fs::write(&archive_path, b"different journal bytes").unwrap();
+        std::fs::set_permissions(&archive_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = broker.gc_abandon_pending(&digest).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerOpError::GcJournalAbandonRefused { .. }
+        ));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(&archive_path).unwrap(),
+            b"different journal bytes"
+        );
+        assert!(root.join("retained.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_abandon_revokes_schema_two_without_removing_retained_data() {
+        let (_fixture, mut broker, root, _initial_digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let mut old_plan = broker.gc_plan().unwrap();
+        old_plan.schema_version = 2;
+        old_plan.finish_digest().unwrap();
+        let old_digest = old_plan.digest.clone();
+        let mut old_journal = GcJournal::from(old_plan);
+        old_journal.schema_version = 2;
+        write_journal(&journal_path, &old_journal).unwrap();
+        let exact_legacy_bytes = std::fs::read(&journal_path).unwrap();
+
+        let resume_error = broker.gc_apply(&old_digest).unwrap_err();
+        assert!(matches!(
+            &resume_error,
+            BrokerOpError::InvalidGcJournal { reason }
+                if reason.contains("schema 2 is no longer resumable")
+                    && reason.contains("gc abandon --confirm")
+        ));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), exact_legacy_bytes);
+        assert!(root.join("retained.txt").is_file());
+
+        let report = broker.gc_abandon_pending(&old_digest).unwrap();
+        assert_eq!(report.digest, old_digest);
+        assert!(!journal_path.exists());
+        assert_eq!(
+            std::fs::read(broker.main_root().join(&report.archive_path)).unwrap(),
+            exact_legacy_bytes
+        );
+        assert!(root.join("retained.txt").is_file());
+        let fresh_plan = broker.gc_plan().unwrap();
+        assert_eq!(fresh_plan.schema_version, 3);
+        assert_ne!(fresh_plan.digest, old_digest);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_forget_abandoned_allows_same_digest_new_cursor_then_abandon() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let first_bytes = std::fs::read(&journal_path).unwrap();
+        let first = broker.gc_abandon_pending(&digest).unwrap();
+        let archive_path = broker.main_root().join(&first.archive_path);
+        assert_eq!(std::fs::read(&archive_path).unwrap(), first_bytes);
+
+        // A plan digest identifies the reviewed plan, not the journal cursor.
+        // Model a later journal with that same plan digest and newer progress.
+        let mut next_journal: GcJournal = serde_json::from_slice(&first_bytes).unwrap();
+        next_journal.rows_removed = next_journal.rows_removed.saturating_add(1);
+        let next_bytes = serde_json::to_vec_pretty(&next_journal).unwrap();
+        assert_ne!(next_bytes, first_bytes);
+        write_journal(&journal_path, &next_journal).unwrap();
+
+        let collision = broker.gc_abandon_pending(&digest).unwrap_err();
+        assert!(matches!(
+            collision,
+            BrokerOpError::GcJournalAbandonRefused { .. }
+        ));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), next_bytes);
+        assert_eq!(std::fs::read(&archive_path).unwrap(), first_bytes);
+
+        broker.gc_forget_abandoned(&digest).unwrap();
+        assert!(!archive_path.exists());
+        assert_eq!(std::fs::read(&journal_path).unwrap(), next_bytes);
+
+        let second = broker.gc_abandon_pending(&digest).unwrap();
+        assert!(!journal_path.exists());
+        assert_eq!(
+            std::fs::read(broker.main_root().join(second.archive_path)).unwrap(),
+            next_bytes
+        );
+        assert!(root.join("retained.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_abandon_reuses_exact_crash_window_archive_and_forget_only_removes_journal() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let exact_pending_bytes = std::fs::read(&journal_path).unwrap();
+        let state_directory = broker.main_root().join(".aethyme");
+        let state_identity = gc_state_directory_identity(&state_directory).unwrap();
+        let (archive_directory, archive_identity) =
+            ensure_gc_journal_archive_directory(&state_directory, state_identity).unwrap();
+        let archive_path = archive_directory.join(format!(
+            "{GC_JOURNAL_ARCHIVE_PREFIX}{digest}{GC_JOURNAL_ARCHIVE_SUFFIX}"
+        ));
+        archive_gc_journal_bytes(
+            &archive_directory,
+            archive_identity,
+            &archive_path,
+            &exact_pending_bytes,
+        )
+        .unwrap();
+
+        let forget_error = broker.gc_forget_abandoned(&digest).unwrap_err();
+        assert!(matches!(
+            forget_error,
+            BrokerOpError::GcJournalAbandonRefused { .. }
+        ));
+        assert!(
+            journal_path.exists(),
+            "the active crash-window journal remains"
+        );
+        assert_eq!(std::fs::read(&archive_path).unwrap(), exact_pending_bytes);
+
+        // Model termination after the synced temporary file was hard-linked
+        // into its deterministic archive name but before the temporary name
+        // was dropped. The public retry must verify and retire only this exact
+        // same-inode temporary link before it clears the active journal.
+        std::fs::remove_file(&archive_path).unwrap();
+        sync_gc_state_directory(&archive_directory, archive_identity).unwrap();
+        let archive_name = archive_path.file_name().unwrap().to_str().unwrap();
+        let temporary_path = archive_directory.join(format!(".{archive_name}-crash-window"));
+        let mut temporary = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .unwrap();
+        use std::io::Write;
+        temporary.write_all(&exact_pending_bytes).unwrap();
+        temporary.sync_all().unwrap();
+        drop(temporary);
+        std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&temporary_path, &archive_path).unwrap();
+        sync_gc_state_directory(&archive_directory, archive_identity).unwrap();
+
+        let report = broker.gc_abandon_pending(&digest).unwrap();
+        assert_eq!(report.digest, digest);
+        assert!(!journal_path.exists());
+        assert_eq!(std::fs::read(&archive_path).unwrap(), exact_pending_bytes);
+        assert!(!temporary_path.exists());
+        assert!(root.join("retained.txt").is_file());
+
+        let forgotten = broker.gc_forget_abandoned(&digest).unwrap();
+        assert_eq!(forgotten.digest, digest);
+        assert_eq!(forgotten.bytes_forgotten, exact_pending_bytes.len() as u64);
+        assert!(!archive_path.exists());
+        assert!(root.join("retained.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_forget_abandoned_retires_private_partial_and_synced_temporary_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let exact_active_bytes = std::fs::read(&journal_path).unwrap();
+        let state_directory = broker.main_root().join(".aethyme");
+        let state_identity = gc_state_directory_identity(&state_directory).unwrap();
+        let (archive_directory, archive_identity) =
+            ensure_gc_journal_archive_directory(&state_directory, state_identity).unwrap();
+        let archive_name =
+            format!("{GC_JOURNAL_ARCHIVE_PREFIX}{digest}{GC_JOURNAL_ARCHIVE_SUFFIX}");
+        let temporary_paths = [
+            archive_directory.join(format!(".{archive_name}-partial1")),
+            archive_directory.join(format!(".{archive_name}-synced1")),
+        ];
+        let partial_bytes = b"{\"schema_version\":";
+        for (path, bytes) in temporary_paths
+            .iter()
+            .zip([partial_bytes.as_slice(), exact_active_bytes.as_slice()])
+        {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        sync_gc_state_directory(&archive_directory, archive_identity).unwrap();
+
+        let blocked = broker.gc_abandon_pending(&digest).unwrap_err();
+        assert!(matches!(
+            blocked,
+            BrokerOpError::GcJournalAbandonRefused { .. }
+        ));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), exact_active_bytes);
+
+        let report = broker.gc_forget_abandoned(&digest).unwrap();
+        assert_eq!(report.digest, digest);
+        assert_eq!(
+            report.bytes_forgotten,
+            (partial_bytes.len() + exact_active_bytes.len()) as u64
+        );
+        assert!(temporary_paths.iter().all(|path| !path.exists()));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), exact_active_bytes);
+        let abandoned = broker.gc_abandon_pending(&digest).unwrap();
+        assert!(!journal_path.exists());
+        assert_eq!(
+            std::fs::read(broker.main_root().join(abandoned.archive_path)).unwrap(),
+            exact_active_bytes
+        );
+        assert!(root.join("retained.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_forget_refuses_suspicious_staging_without_unlinking_archive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let report = broker.gc_abandon_pending(&digest).unwrap();
+        let archive_path = broker.main_root().join(&report.archive_path);
+        let archive_bytes = std::fs::read(&archive_path).unwrap();
+        let archive_name = archive_path.file_name().unwrap().to_str().unwrap();
+        let temporary_path = archive_path
+            .parent()
+            .unwrap()
+            .join(format!(".{archive_name}-not_a_temp"));
+        std::fs::write(&temporary_path, b"suspicious staging bytes").unwrap();
+        std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = broker.gc_forget_abandoned(&digest).unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerOpError::GcJournalAbandonRefused { .. }
+        ));
+        assert_eq!(std::fs::read(&archive_path).unwrap(), archive_bytes);
+        assert_eq!(
+            std::fs::read(&temporary_path).unwrap(),
+            b"suspicious staging bytes"
+        );
+        assert!(root.join("retained.txt").is_file());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_abandon_refuses_unknown_future_journal_schema() {
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(4);
+        let mut unknown_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        unknown_bytes.push(b'\n');
+        std::fs::write(&journal_path, &unknown_bytes).unwrap();
+
+        let error = broker.gc_abandon_pending(&digest).unwrap_err();
+        assert!(matches!(error, BrokerOpError::InvalidGcJournal { .. }));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), unknown_bytes);
+        assert!(
+            !broker
+                .main_root()
+                .join(".aethyme/gc-journal-archives")
+                .exists()
+        );
+        assert!(root.join("retained.txt").is_file());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

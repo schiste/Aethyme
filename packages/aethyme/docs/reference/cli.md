@@ -716,6 +716,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--include-active-gate-cache] [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]`
+- `aethyme broker gc abandon --confirm <pending-digest> [--json]`
+- `aethyme broker gc forget-abandoned --confirm <archived-plan-digest> [--json]`
 - `aethyme broker gc sweep [--json]`
 - `aethyme broker gc storage [--json]`
 - `aethyme broker gc storage plan [--json]`
@@ -1832,6 +1834,23 @@ Subsequent broker startup may spend only the configured monotonic time budget
 resuming that already-confirmed journal; startup never authorizes a fresh plan.
 If a file changed or remains locked, it is retained and the exact recovery
 command remains available. Event IDs and operation cursors are not reused.
+
+Journal schema 3 includes the reviewed row-content fingerprint; schema 2
+journals cannot resume in this version. `gc abandon --confirm <pending-digest>`
+archives the exact schema 2 or 3 pending journal under
+`.aethyme/gc-journal-archives/` and clears only the active journal. It does not
+resume cleanup or remove retained rows, files, worktrees, or artifacts. The
+command uses a read-only broker snapshot so startup maintenance cannot resume
+the journal before it is archived. Review a fresh `gc plan` before any later
+apply; an identical plan may retain the same deterministic digest. Abandoned
+journals are capped at 32 files and 64 MiB total. When full, inspect an archive
+and use `gc forget-abandoned --confirm <archived-plan-digest>` to forget that
+exact archive or clean its private atomic-write staging files left by an
+interrupted archive operation. Forget refuses when the archive's exact bytes
+are still needed by the active journal for crash recovery. An older archive
+with the same plan digest but a different cursor can be forgotten while the
+newer active journal remains unchanged. Archives are never pruned
+automatically; forgetting one removes no project data.
 `broker status doctor` and `aethyme certify` report policy validity, eligible counts,
 bytes, blockers, and pending recovery without embedding retained content.
 

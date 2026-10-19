@@ -316,6 +316,12 @@ pub enum BrokerOpError {
          .aethyme/gc-journal.json; inspect it with `aethyme broker status doctor`"
     )]
     GcResumeConfirmationMismatch { expected: String, actual: String },
+    #[error(
+        "GC abandonment confirmation does not match the pending journal: expected {expected}, got {actual}; nothing was changed"
+    )]
+    GcAbandonConfirmationMismatch { expected: String, actual: String },
+    #[error("GC journal cannot be abandoned: {reason}")]
+    GcJournalAbandonRefused { reason: String },
     /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
     /// offered here (issue #142).
     #[error(

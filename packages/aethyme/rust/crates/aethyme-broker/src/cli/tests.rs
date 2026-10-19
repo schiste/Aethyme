@@ -492,6 +492,18 @@ fn parse_accepts_gc_plan_and_confirmed_apply() {
     };
     assert_eq!(apply.positional, vec!["apply"]);
     assert_eq!(apply.confirm.as_deref(), Some("aabb"));
+
+    let Ok(abandon) = super::parse(&args(&["abandon", "--confirm", "aabb"])) else {
+        panic!("gc abandon should parse");
+    };
+    assert_eq!(abandon.positional, vec!["abandon"]);
+    assert_eq!(abandon.confirm.as_deref(), Some("aabb"));
+
+    let Ok(forget) = super::parse(&args(&["forget-abandoned", "--confirm", "aabb"])) else {
+        panic!("gc forget-abandoned should parse");
+    };
+    assert_eq!(forget.positional, vec!["forget-abandoned"]);
+    assert_eq!(forget.confirm.as_deref(), Some("aabb"));
 }
 
 #[test]

@@ -1144,6 +1144,51 @@ mod gate_result_clear_metadata_tests {
             remaining_rows, plan.rows,
             "failed batch must not advance the journal cursor"
         );
+
+        // Explicitly abandon the frozen authorization after current session
+        // protection changed. This archives the exact journal and leaves both
+        // rows in place; a newly reviewed plan has a different candidate set.
+        let exact_journal_bytes = std::fs::read(&journal_path).unwrap();
+        let abandoned = broker.gc_abandon_pending(&plan.digest).unwrap();
+        assert_eq!(abandoned.digest, plan.digest);
+        assert!(!journal_path.exists());
+        assert_eq!(
+            std::fs::read(repo.join(&abandoned.archive_path)).unwrap(),
+            exact_journal_bytes
+        );
+        for id in [unassociated_event_id, protected_event_id] {
+            let present: bool = broker
+                .store()
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "event {id} must survive journal abandonment");
+        }
+        let fresh_plan = broker.gc_plan().unwrap();
+        assert_ne!(fresh_plan.digest, plan.digest);
+        assert!(
+            fresh_plan.rows.iter().any(|row| {
+                row.kind == crate::GcRowKind::Event && row.id == unassociated_event_id
+            })
+        );
+        assert!(
+            !fresh_plan
+                .rows
+                .iter()
+                .any(|row| { row.kind == crate::GcRowKind::Event && row.id == protected_event_id })
+        );
+        assert!(matches!(
+            broker.gc_apply_bounded(&plan.digest, None),
+            Err(crate::BrokerOpError::GcConfirmationMismatch { .. })
+        ));
+        assert!(
+            !journal_path.exists(),
+            "the abandoned confirmation cannot recreate its old journal"
+        );
     }
 
     #[test]
