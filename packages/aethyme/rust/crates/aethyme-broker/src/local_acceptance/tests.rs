@@ -932,7 +932,7 @@ fn seeded_synthesized_wave_fixture() -> (verifier::tests::Subject, RecordId) {
         .expect("the seeded candidate is backed by a recipe");
     let recipe_record = crate::composer::read_recipe(&v.f.store, recipe_ref).unwrap();
     let recipe: serde_json::Value =
-        serde_json::from_slice(recipe_record.canonical_bytes()).unwrap();
+        serde_json::from_slice(&recipe_record.canonical_bytes()).unwrap();
     let seeded = &recipe["seeded_conflict"];
     assert_eq!(
         seeded["schema"],
@@ -994,7 +994,8 @@ fn retarget_verifier_subject(
     } = subject;
     let mut execution_spec = prior_execution.spec().clone();
     execution_spec.candidate_source = candidate_source.into();
-    let execution = snapshot::freeze(&mut f.store, &owner, revision, execution_spec).unwrap();
+    let execution =
+        crate::execution_snapshot::freeze(&mut f.store, &owner, revision, execution_spec).unwrap();
 
     let output = prior_artifact.output;
     let generation = prior_artifact.generation;
