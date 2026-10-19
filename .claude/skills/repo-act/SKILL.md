@@ -72,8 +72,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   is unchanged. Refusal must preserve the previous identity record and data.
 - Keep authoritative frozen plans, validation helpers, inputs and receipts on
   durable storage before execution; use temporary directories for scratch only.
-  After a reboot, mark missing evidence interrupted or unavailable. Recorded
-  hashes do not recover missing bytes or recreate a trust record.
+  Before a long validation, choose a unique durable output directory outside
+  frozen input or proposal bundles and preflight that its parent can accept
+  output with an exclusive-create canary that is then removed. Refuse before
+  expensive work if the preflight fails; never chmod or unfreeze prior evidence
+  to make it writable. After a reboot, mark missing evidence interrupted or
+  unavailable. Recorded hashes do not recover missing bytes or recreate a trust
+  record.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Preserve earlier outputs before retrying.
   Freeze source for each invocation and record the exact head and dirty-state
@@ -109,6 +114,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `AETHYME_WORKTREE_ROOT` as the parent container plus the broker's repository
   ID, and require the resolved broker root to match the plan root before apply.
   If they differ, stop and create a fresh plan from the captured environment.
+- For resumable GC row deletion, recheck current candidate metadata and every
+  retention protection inside the same immediate database transaction that
+  deletes each bounded batch. A saved journal records prior authorization but
+  does not freeze current eligibility; accept missing rows for crash replay only
+  after confirming they are absent. Test resume after a public state mutation
+  changes a row's protection.
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove

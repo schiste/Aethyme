@@ -135,6 +135,40 @@ fn age_worktree_indexes(repo: &Path) {
     }
 }
 
+#[test]
+fn gc_abandon_without_a_journal_refuses_without_creating_an_archive() {
+    let (repo, container) = fixture("");
+    let digest = "a".repeat(64);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["gc", "abandon", "--confirm", digest.as_str()],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no pending journal exists"),
+        "unexpected refusal: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!repo.path().join(".aethyme/gc-journal.json").exists());
+    assert!(!repo.path().join(".aethyme/gc-journal-archives").exists());
+
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["gc", "forget-abandoned", "--confirm", digest.as_str()],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no matching abandoned journal exists"),
+        "unexpected refusal: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!repo.path().join(".aethyme/gc-journal-archives").exists());
+}
+
 fn plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     let output = run(repo, container, &["gc", "plan", "--json"]);
     assert!(

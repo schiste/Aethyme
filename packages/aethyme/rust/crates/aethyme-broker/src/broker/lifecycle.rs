@@ -1798,9 +1798,11 @@ impl Broker {
         broker.recover_interrupted_promotion()?;
         broker.recover_prepared_reconciliation()?;
         broker.backfill_promoted_path_exposures()?;
-        // Best effort and silent: only an already-confirmed journal may be
-        // resumed here. Doctor exposes any remaining work or artifact drift.
-        let _ = broker.resume_gc_maintenance();
+        // Best effort: only an already-confirmed journal may be resumed here.
+        // If current eligibility or an older journal's missing fingerprint
+        // prevents continuation, leave the journal for explicit review and
+        // report the refusal instead of hiding it.
+        crate::warn_unrecorded("resume GC maintenance", broker.resume_gc_maintenance());
         Ok(broker)
     }
 

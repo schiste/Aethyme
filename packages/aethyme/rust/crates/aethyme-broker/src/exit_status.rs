@@ -75,6 +75,8 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::GcConfirmationNotSha256
         | E::GcConfirmationMismatch { .. }
         | E::GcResumeConfirmationMismatch { .. }
+        | E::GcAbandonConfirmationMismatch { .. }
+        | E::GcJournalAbandonRefused { .. }
         | E::PromotionRecordConfirmationMismatch { .. }
         | E::GcLocked { .. }
         | E::UnsafeRepairPlan { .. }

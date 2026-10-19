@@ -119,6 +119,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
             CommandCapability::RecoveryWrite
         }
         (Some("storage"), Some("apply")) => CommandCapability::RecoveryWrite,
+        (Some("gc"), Some("abandon" | "forget-abandoned")) => CommandCapability::RecoveryWrite,
         (Some("storage"), Some("identity")) if args.get(2).map(String::as_str) == Some("apply") => {
             CommandCapability::RecoveryWrite
         }
@@ -651,6 +652,8 @@ Agent broker:
                               safely close a completed session
   broker unblock [<id>]       list blockers, or clear one
   broker gc plan|apply        reviewed cleanup of retained state and disk
+  broker gc abandon|forget-abandoned
+                              archive or retire a pending cleanup journal safely
   broker advanced <verb>      leases, git, gh, ship, review, operations, exec, ...
   hook <event>                agent-surface hook entry point (the plugin's only
                               entry point; reads event JSON on stdin)
@@ -1110,6 +1113,14 @@ mod compatibility_command_tests {
             ),
             (
                 &["broker", "gc", "storage", "apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "gc", "abandon", "--confirm", "aabb"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "gc", "forget-abandoned", "--confirm", "aabb"][..],
                 CommandCapability::RecoveryWrite,
             ),
             (
