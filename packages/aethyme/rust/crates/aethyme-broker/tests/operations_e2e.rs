@@ -2513,3 +2513,53 @@ fn a_successful_push_reports_the_commit_it_sent() {
     assert_eq!(report.pushed_refs[0].proposed_sha, head);
     assert_eq!(report.pushed_refs[0].destination_ref, "refs/heads/reported");
 }
+
+#[cfg(unix)]
+#[test]
+fn exact_push_inspection_refuses_a_changed_remote_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-inspect-identity");
+    commit_push_fixture(&fixture, "identity inspection\n");
+    write_executable(
+        &fixture.remote.join("hooks/update"),
+        "#!/bin/sh\nif [ \"$1\" = 'refs/heads/rejected' ]; then exit 1; fi\nexit 0\n",
+    );
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/accepted", "HEAD:refs/heads/rejected"],
+        ))
+        .unwrap();
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    let original = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap()
+        .operation;
+    let other = tmp.path().join("different-remote.git");
+    git(
+        tmp.path(),
+        &["init", "--bare", "-q", other.to_str().unwrap()],
+    );
+    git(
+        &fixture.worktree,
+        &["remote", "set-url", "origin", other.to_str().unwrap()],
+    );
+    assert!(
+        fixture
+            .broker
+            .inspect_coordinated_push_operation(report.operation.id, "inspect original push")
+            .is_err()
+    );
+    let current = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap()
+        .operation;
+    assert_eq!(
+        serde_json::to_value(current).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
+}

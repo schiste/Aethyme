@@ -1492,7 +1492,17 @@ impl GitRepo {
         remote: &str,
         destinations: &[String],
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
-        self.observe_remote_ref_oids(remote, destinations, true)
+        self.observe_remote_ref_oids(remote, destinations, true, None)
+    }
+
+    /// Bind the endpoint actually queried to the original operation identity.
+    pub(crate) fn checked_push_remote_ref_oids(
+        &self,
+        remote: &str,
+        recorded_repository: &str,
+        destinations: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, GitError> {
+        self.observe_remote_ref_oids(remote, destinations, true, Some(recorded_repository))
     }
 
     /// Observe a configured fetch endpoint directly. Git expands its URL once,
@@ -1503,7 +1513,7 @@ impl GitRepo {
         remote: &str,
         destinations: &[String],
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
-        self.observe_remote_ref_oids(remote, destinations, false)
+        self.observe_remote_ref_oids(remote, destinations, false, None)
     }
 
     fn observe_remote_ref_oids(
@@ -1511,11 +1521,21 @@ impl GitRepo {
         remote: &str,
         destinations: &[String],
         push_endpoint: bool,
+        recorded_repository: Option<&str>,
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
         let display_args = format!("ls-remote --refs <endpoint> {}", destinations.join(" "));
         let mut command = git_command();
         if push_endpoint {
-            let push_url = run_git(&self.root, &["remote", "get-url", "--push", remote])?;
+            let push_url = match recorded_repository {
+                Some(repository) => crate::remote_target::inspection_push_url(
+                    self, remote, repository,
+                )
+                .map_err(|_| GitError::Git {
+                    args: "inspect recorded push endpoint".into(),
+                    stderr: "push endpoint identity could not be verified".into(),
+                })?,
+                None => run_git(&self.root, &["remote", "get-url", "--push", remote])?,
+            };
             command
                 .args(["ls-remote", "--refs", "aethyme-push-evidence"])
                 .env("GIT_CONFIG_COUNT", "1")

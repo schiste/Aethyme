@@ -3065,7 +3065,7 @@ impl Broker {
                     });
                 }
             }
-            repo.remote_ref_oids(&plan.remote, &destination_refs)
+            repo.checked_push_remote_ref_oids(&plan.remote, &operation.repository, &destination_refs)
                 .map_err(|_| BrokerOpError::InvalidCoordinatedOperation {
                     reason: "could not inspect every exact destination on the push remote; operation remains outcome_unknown".into(),
                 })?
