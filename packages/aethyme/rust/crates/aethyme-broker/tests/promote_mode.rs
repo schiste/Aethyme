@@ -124,11 +124,15 @@ fn unknown_mode_warns_in_status_and_submit_and_falls_back_to_verify_only() {
         warning.summary
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
-        .args(["submit", "--session", &session.to_string(), "--json"])
-        .current_dir(tmp.path())
-        .output()
+    let session_id = session.to_string();
+    let mut command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["submit", "--session", &session_id, "--json"],
+    );
+    broker
+        .configure_storage_context_for_child(&mut command)
         .unwrap();
+    let output = command.current_dir(tmp.path()).output().unwrap();
     assert!(
         output.status.success(),
         "submit failed: {}",

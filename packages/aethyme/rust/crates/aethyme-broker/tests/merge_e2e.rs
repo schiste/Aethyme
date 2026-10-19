@@ -121,7 +121,7 @@ fn refresh_graph(root: &Path, repository: &str) {
 
 #[test]
 fn verify_only_submission_plan_and_submit_use_the_same_upstream_base() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
@@ -171,7 +171,9 @@ fn verify_only_submission_plan_and_submit_use_the_same_upstream_base() {
         aethyme_broker::PromoteMode::VerifyOnly
     ));
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let worktree = agent_worktree(tmp.path(), "verify-only-base-parity");
     let session = broker
         .adopt(&worktree, Some("verify-only base parity"))
@@ -3068,9 +3070,11 @@ fn reconcile_classifies_a_promotion_upstream_kept_by_ancestry() {
 
 #[test]
 fn landing_proof_agrees_when_a_later_squash_overwrites_an_earlier_contribution() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
 
     let worktree_a = agent_worktree(tmp.path(), "proof-overwritten-a");
     let session_a = broker.adopt(&worktree_a, Some("set a = 2")).unwrap();
