@@ -5,6 +5,173 @@ use crate::local_target::tests::{Fixture, git};
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 
+#[test]
+fn checkout_source_bound_refuses_before_materialization_and_accepts_boundary() {
+    let f = Fixture::new();
+    let id = f.a.result.snapshot_id.clone();
+    let output_bytes = usize::try_from(f.a.result.content_bytes).unwrap();
+    assert!(output_bytes > 0);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let refused_dest = scratch.path().join("refused");
+    let error = reconstruct_checkout_source(
+        &f.store,
+        &id,
+        &refused_dest,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS.with_max_output_bytes(output_bytes - 1),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        NativeGateError::Archive(archive::ArchiveError::ReconstructionLimit {
+            resource: "output_bytes",
+            ..
+        })
+    ));
+    assert!(!refused_dest.exists());
+
+    let accepted_dest = scratch.path().join("accepted");
+    let reconstructed = reconstruct_checkout_source(
+        &f.store,
+        &id,
+        &accepted_dest,
+        crate::execution_snapshot::RECONSTRUCTION_LIMITS.with_max_output_bytes(output_bytes),
+    )
+    .unwrap();
+    assert_eq!(reconstructed.id(), id);
+    assert_eq!(
+        std::fs::read(accepted_dest.join("one.txt")).unwrap(),
+        b"A\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn physical_snapshot_bounds_stream_reads_before_allocating_the_remainder() {
+    use std::io::{Cursor, Read};
+    struct Counted<'a> {
+        input: Cursor<Vec<u8>>,
+        consumed: &'a mut usize,
+    }
+    impl Read for Counted<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.input.read(buffer)?;
+            *self.consumed += count;
+            Ok(count)
+        }
+    }
+    let mut consumed = 0;
+    let error = read_source_bytes(
+        Counted {
+            input: Cursor::new(vec![b'x'; 1024]),
+            consumed: &mut consumed,
+        },
+        3,
+    )
+    .unwrap_err();
+    assert!(matches!(error, NativeGateError::Unsupported(_)));
+    assert_eq!(consumed, 4);
+    assert_eq!(read_source_bytes(Cursor::new(b"abc"), 3).unwrap(), b"abc");
+}
+
+#[cfg(unix)]
+#[test]
+fn physical_snapshot_enforces_file_and_aggregate_limits_at_the_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a"), b"ab").unwrap();
+    std::fs::write(root.path().join("b"), b"cd").unwrap();
+    let mut limits = crate::execution_snapshot::RECONSTRUCTION_LIMITS;
+    limits.max_file_bytes = 2;
+    limits.max_output_bytes = 4;
+    let expected = SourceSnapshot::new(vec![
+        SourceEntry::from_content(b"a", EntryKind::Regular, b"ab"),
+        SourceEntry::from_content(b"b", EntryKind::Regular, b"cd"),
+    ])
+    .unwrap();
+    assert_eq!(
+        physical_snapshot_with_limits(root.path(), limits)
+            .unwrap()
+            .id(),
+        expected.id()
+    );
+    limits.max_output_bytes = 3;
+    assert!(matches!(
+        physical_snapshot_with_limits(root.path(), limits),
+        Err(NativeGateError::Unsupported(_))
+    ));
+    limits.max_output_bytes = 4;
+    limits.max_file_bytes = 1;
+    assert!(matches!(
+        physical_snapshot_with_limits(root.path(), limits),
+        Err(NativeGateError::Unsupported(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn physical_snapshot_counts_empty_directories_and_path_depth() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("a/b")).unwrap();
+    let mut limits = crate::execution_snapshot::RECONSTRUCTION_LIMITS;
+    limits.max_nodes = 2;
+    limits.max_path_depth = 2;
+    assert!(physical_snapshot_with_limits(root.path(), limits).is_ok());
+    limits.max_nodes = 1;
+    assert!(matches!(
+        physical_snapshot_with_limits(root.path(), limits),
+        Err(NativeGateError::Unsupported(_))
+    ));
+    limits.max_nodes = 2;
+    limits.max_path_depth = 1;
+    assert!(matches!(
+        physical_snapshot_with_limits(root.path(), limits),
+        Err(NativeGateError::Unsupported(_))
+    ));
+    limits.max_path_depth = 2;
+    limits.max_nodes = 3;
+    std::fs::write(root.path().join("c"), b"").unwrap();
+    limits.max_entries = 0;
+    assert!(matches!(
+        physical_snapshot_with_limits(root.path(), limits),
+        Err(NativeGateError::Unsupported(_))
+    ));
+    limits.max_entries = 1;
+    assert!(physical_snapshot_with_limits(root.path(), limits).is_ok());
+    limits.max_component_bytes = 0;
+    assert!(matches!(
+        physical_snapshot_with_limits(root.path(), limits),
+        Err(NativeGateError::Unsupported(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn physical_snapshot_file_reader_rejects_symlinks_and_special_files() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("file");
+    std::fs::write(&file, b"abc").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        read_source_file(&file, 3).unwrap(),
+        (EntryKind::Executable, b"abc".to_vec())
+    );
+    let link = root.path().join("link");
+    symlink(&file, &link).unwrap();
+    assert!(read_source_file(&link, 3).is_err());
+    let pipe = root.path().join("pipe");
+    let pipe_name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+    // An empty FIFO must be rejected without waiting for a writer.
+    // SAFETY: pipe_name is a live, NUL-terminated CString for this temporary path.
+    let created = unsafe { libc::mkfifo(pipe_name.as_ptr(), 0o600) };
+    assert_eq!(created, 0);
+    assert!(matches!(
+        read_source_file(&pipe, 3),
+        Err(NativeGateError::Mismatch)
+    ));
+}
+
 struct Setup {
     // Drop the broker, controller lock, and then fixture owners in that order.
     broker: Broker,

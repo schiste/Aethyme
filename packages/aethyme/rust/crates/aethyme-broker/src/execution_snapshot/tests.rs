@@ -70,6 +70,26 @@ fn manifest(paths: impl IntoIterator<Item = String>) -> SourceSnapshot {
 }
 
 #[test]
+fn descriptor_reader_enforces_the_injected_byte_limit() {
+    let f = Fixture::new();
+    let bytes = b"12345";
+    let digest = archive::put_object(&f.store, bytes).unwrap();
+
+    assert!(matches!(
+        archive::read_object_bounded(&f.store, &digest, bytes.len() - 1),
+        Err(archive::ArchiveError::ObjectTooLarge { limit: 4, .. })
+    ));
+    assert!(matches!(
+        read_descriptor_object(&f.store, &digest, bytes.len() - 1),
+        Err(SnapshotError::Limit)
+    ));
+    assert_eq!(
+        read_descriptor_object(&f.store, &digest, bytes.len()).unwrap(),
+        bytes
+    );
+}
+
+#[test]
 fn materialization_rejects_aggregate_file_count_across_roles() {
     let source = manifest((0..4_097).map(|index| format!("source-{index:04}.txt")));
     let harness = manifest((0..4_097).map(|index| format!("harness-{index:04}.txt")));
