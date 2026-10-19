@@ -3237,6 +3237,20 @@ fn classify_gate_result(
             exit_code: Some(code),
             resource_error: None,
             ..
+        }) if code == 126
+            && !has_environment_error_diagnostic(log_path)
+            && complete_tap_failure(log_path) =>
+        {
+            (
+                GateStatus::Fail,
+                Some(GateFailureClass::TestFailure),
+                Some(code as i64),
+            )
+        }
+        Ok(GateCommandOutcome {
+            exit_code: Some(code),
+            resource_error: None,
+            ..
         }) if is_environment_error(code, log_path) => (
             GateStatus::Error,
             Some(GateFailureClass::Environment),
@@ -3372,10 +3386,162 @@ fn is_resource_contention_error(command: &str, log_path: &Path) -> bool {
     INFRA_PATTERNS.iter().any(|pattern| lower.contains(pattern))
 }
 
+/// Completed TAP failure evidence can disambiguate shell exit 126. This never
+/// creates a pass, and explicit timeout, resource and capture failures take
+/// precedence. Partial, contradictory or oversized reports remain inconclusive.
+fn complete_tap_failure(log_path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(file) = std::fs::File::open(log_path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(bounded_log::MAX_LOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > bounded_log::MAX_LOG_BYTES
+    {
+        return false;
+    }
+    let Ok(log) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    tap_failure_report(log)
+}
+
+fn tap_failure_report(log: &str) -> bool {
+    let mut header = false;
+    let mut plan = None;
+    let mut points = 0_u64;
+    let mut failed_point = false;
+    let mut summary_started = false;
+    let mut summary_metadata = [false; 2];
+    let mut counts = [None; 6];
+    for line in log.lines() {
+        if line.trim_start().starts_with("Bail out!") {
+            return false;
+        }
+        if line.starts_with("TAP version ") {
+            if header || !matches!(line, "TAP version 13" | "TAP version 14") {
+                return false;
+            }
+            header = true;
+            continue;
+        }
+        if !header {
+            if !line.is_empty() {
+                return false;
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("1..") {
+            let Ok(count) = value.parse::<u64>() else {
+                return false;
+            };
+            if summary_started || count == 0 || plan.replace(count).is_some() {
+                return false;
+            }
+        } else if let Some((failed, rest)) = line
+            .strip_prefix("not ok ")
+            .map(|rest| (true, rest))
+            .or_else(|| line.strip_prefix("ok ").map(|rest| (false, rest)))
+        {
+            let Some(number) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+            else {
+                return false;
+            };
+            if summary_started || points.checked_add(1) != Some(number) {
+                return false;
+            }
+            points = number;
+            let directive = rest
+                .split_once('#')
+                .map(|(_, tail)| tail.trim_start().to_ascii_uppercase());
+            failed_point |= failed
+                && !directive
+                    .as_deref()
+                    .is_some_and(|tail| tail.starts_with("TODO") || tail.starts_with("SKIP"));
+        } else if let Some(rest) = line.strip_prefix("# ") {
+            let mut recognized = false;
+            for (index, name) in ["tests", "pass", "fail", "cancelled", "skipped", "todo"]
+                .iter()
+                .enumerate()
+            {
+                if let Some(value) = rest
+                    .strip_prefix(name)
+                    .and_then(|value| value.strip_prefix(' '))
+                {
+                    recognized = true;
+                    if plan != Some(points) || points == 0 {
+                        return false;
+                    }
+                    summary_started = true;
+                    let Ok(count) = value.parse::<u64>() else {
+                        return false;
+                    };
+                    if counts[index].replace(count).is_some() {
+                        return false;
+                    }
+                }
+            }
+            if summary_started && !recognized {
+                let metadata = rest
+                    .strip_prefix("suites ")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .map(|_| 0)
+                    .or_else(|| {
+                        rest.strip_prefix("duration_ms ")
+                            .and_then(|n| n.parse::<f64>().ok())
+                            .filter(|n| n.is_finite() && *n >= 0.0)
+                            .map(|_| 1)
+                    });
+                let Some(index) = metadata else {
+                    return false;
+                };
+                if std::mem::replace(&mut summary_metadata[index], true) {
+                    return false;
+                }
+            }
+        } else if !line.is_empty() && (summary_started || !line.starts_with([' ', '\t'])) {
+            return false;
+        }
+    }
+    let [
+        Some(tests),
+        Some(passed),
+        Some(failed),
+        Some(cancelled),
+        Some(skipped),
+        Some(todo),
+    ] = counts
+    else {
+        return false;
+    };
+    let total = [passed, failed, skipped, todo]
+        .into_iter()
+        .try_fold(0_u64, u64::checked_add);
+    header
+        && plan == Some(points)
+        && points > 0
+        && failed_point
+        && tests >= points
+        && failed > 0
+        && cancelled == 0
+        && total == Some(tests)
+}
+
 fn is_environment_error(exit_code: i32, log_path: &Path) -> bool {
     if exit_code == 126 || exit_code == 127 {
         return true;
     }
+    has_environment_error_diagnostic(log_path)
+}
+
+fn has_environment_error_diagnostic(log_path: &Path) -> bool {
     log_contains_any(
         log_path,
         &[
@@ -6256,6 +6422,131 @@ mod tests {
         assert_eq!(status, GateStatus::Fail);
         assert_eq!(class, Some(GateFailureClass::TestFailure));
         assert_eq!(exit, Some(101));
+    }
+
+    const FAILED_TAP: &str = "TAP version 13\n# Subtest: computes a value\nnot ok 1 - computes a value\n  ---\n  error: assertion failed\n  ...\n1..1\n# tests 1\n# pass 0\n# fail 1\n# cancelled 0\n# skipped 0\n# todo 0\n";
+
+    #[test]
+    fn completed_tap_failure_disambiguates_exit_126_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        std::fs::write(&log, FAILED_TAP).unwrap();
+        for (code, status, class) in [
+            (126, GateStatus::Fail, GateFailureClass::TestFailure),
+            (127, GateStatus::Error, GateFailureClass::Environment),
+        ] {
+            assert_eq!(
+                classify_gate_result("node --test", &log, Ok(command_outcome(Some(code), false))),
+                (status, Some(class), Some(i64::from(code)))
+            );
+        }
+    }
+
+    #[test]
+    fn tap_failure_never_overrides_explicit_infrastructure_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        std::fs::write(&log, FAILED_TAP).unwrap();
+        for kind in ["timeout", "capture", "resource"] {
+            let mut outcome = command_outcome(Some(126), kind == "timeout");
+            if kind == "capture" {
+                outcome.capture_error = Some("incomplete pipe".into());
+            }
+            if kind == "resource" {
+                outcome.resource_error = Some("lease lost".into());
+            }
+            let (status, class, _) = classify_gate_result("node --test", &log, Ok(outcome));
+            assert_eq!(status, GateStatus::Error, "{kind}");
+            assert_ne!(class, Some(GateFailureClass::TestFailure), "{kind}");
+        }
+    }
+
+    #[test]
+    fn tap_failure_preserves_environment_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for diagnostic in [
+            "command not found",
+            "not found on PATH",
+            "executable file not found",
+            "Permission denied",
+            "cannot execute",
+        ] {
+            std::fs::write(&log, format!("{FAILED_TAP}# {diagnostic}\n")).unwrap();
+            assert_eq!(
+                classify_gate_result("node --test", &log, Ok(command_outcome(Some(126), false))),
+                (
+                    GateStatus::Error,
+                    Some(GateFailureClass::Environment),
+                    Some(126)
+                ),
+                "{diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn tap_failure_requires_complete_consistent_report() {
+        assert!(tap_failure_report(FAILED_TAP));
+        assert!(tap_failure_report(&format!(
+            "{FAILED_TAP}# duration_ms 1.5\n"
+        )));
+        for counter in [
+            "tests 1",
+            "pass 0",
+            "fail 1",
+            "cancelled 0",
+            "skipped 0",
+            "todo 0",
+        ] {
+            assert!(
+                !tap_failure_report(&FAILED_TAP.replace(&format!("# {counter}\n"), "")),
+                "omitted {counter}"
+            );
+        }
+        for malformed in [
+            format!("unrelated prefix\n{FAILED_TAP}"),
+            format!("{FAILED_TAP}unrelated suffix\n"),
+            format!("{FAILED_TAP}# unrelated suffix\n"),
+            format!("{FAILED_TAP}# duration_ms NaN\n"),
+            format!("{FAILED_TAP}# duration_ms 1\n# duration_ms 1\n"),
+            format!("{FAILED_TAP}  indented suffix\n"),
+            FAILED_TAP.replace("1..1", "1..1 garbage"),
+            FAILED_TAP.replace("TAP version 13\n", ""),
+            FAILED_TAP.replace("1..1\n", ""),
+            FAILED_TAP.replace("1..1\n", "1..1\n1..1\n"),
+            FAILED_TAP.replace("not ok 1", "not ok 2"),
+            FAILED_TAP.replace("# fail 1", "# fail 2"),
+            FAILED_TAP.replace("# pass 0", "# pass 0\n# pass 0"),
+            FAILED_TAP.replace("# tests 1", "# tests 2"),
+            FAILED_TAP.replace("# fail 1", "# fail 18446744073709551615"),
+            FAILED_TAP.replace("not ok 1", "ok 1"),
+            FAILED_TAP.replace("computes a value\n  ---", "computes a value # TODO\n  ---"),
+            format!("{FAILED_TAP}Bail out! broken transport\n"),
+        ] {
+            assert!(!tap_failure_report(&malformed), "accepted {malformed:?}");
+        }
+    }
+
+    #[test]
+    fn successful_or_incomplete_tap_does_not_reclassify_exit_126() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        for output in [
+            "TAP version 13\nok 1 - pass\n1..1\n# tests 1\n# pass 1\n# fail 0\n",
+            "TAP version 13\nnot ok 1 - assertion\n",
+            "sh: ./check: Permission denied\n",
+        ] {
+            std::fs::write(&log, output).unwrap();
+            assert_eq!(
+                classify_gate_result("node --test", &log, Ok(command_outcome(Some(126), false))),
+                (
+                    GateStatus::Error,
+                    Some(GateFailureClass::Environment),
+                    Some(126)
+                )
+            );
+        }
     }
 
     #[test]
