@@ -623,6 +623,32 @@ struct RetainedReservation {
     version: i64,
 }
 
+type RetainedReservationRow = (
+    Vec<u8>,
+    String,
+    u32,
+    i64,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+    Option<String>,
+);
+
+type CurrentConflictWaveRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn load_retained_reservation(
     connection: &rusqlite::Connection,
     reservation: &RecordId,
@@ -630,20 +656,7 @@ fn load_retained_reservation(
     command: &ManagedResolutionCommand,
     revision: &RecordId,
 ) -> Result<RetainedReservation, BudgetError> {
-    let row: (
-        Vec<u8>,
-        String,
-        u32,
-        i64,
-        String,
-        Option<String>,
-        String,
-        String,
-        String,
-        String,
-        Vec<u8>,
-        Option<String>,
-    ) = connection.query_row(
+    let row: RetainedReservationRow = connection.query_row(
         "SELECT body,phase,attempts,version,root,parent,target,revision,wave,nonce,spent,receipt
          FROM local_budget_reservations WHERE reservation=?1",
         [reservation.as_str()],
@@ -732,7 +745,6 @@ fn load_retained_attempt_binding(
         },
     )?;
     let expected_binding = binding_id(reservation, row.1);
-    let async_state: String;
     let (decision_key, decision_kind, decision_members, decision_paths) =
         request.managed_decision_fields();
     let attempt_matches: bool = connection.query_row(
@@ -766,7 +778,7 @@ fn load_retained_attempt_binding(
     if !attempt_matches {
         return Err(BudgetError::Stale);
     }
-    async_state = connection.query_row(
+    let async_state: String = connection.query_row(
         "SELECT async_state FROM resolution_attempts WHERE attempt_id=?1",
         [row.1],
         |row| row.get(0),
@@ -842,6 +854,8 @@ fn wall_clock_ms() -> Result<i64, BudgetError> {
     i64::try_from(millis).map_err(|_| BudgetError::Stale)
 }
 
+// Keep each independently checked dispatch identity explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_acknowledgement(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
@@ -1074,7 +1088,7 @@ fn revalidate_current_budget(
 /// holds archive, response, and active-authority guards in that order and has
 /// checked the exact current conflict binding before entering this function.
 /// A caller must not turn a nonce collision without a binding into a replay.
-pub(super) fn admit_new(
+fn admit_new(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
     validated: ValidatedConflict<'_>,
@@ -1168,15 +1182,9 @@ pub(super) fn admit_new(
     verify_current_wave(&transaction, owner, &validated)?;
 
     resolution::initialize_ledger_in_transaction(&transaction)?;
-    let unresolved_managed: bool = transaction.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM resolution_attempts
-             WHERE decision_key=?1 AND resolver='local-managed-resolution'
-               AND session_label IS NULL AND outcome IS NULL
-               AND async_state IN ('dispatching','outcome_unknown')
-         )",
-        params![validated.request.decision_key()],
-        |row| row.get(0),
+    let unresolved_managed = resolution::has_unresolved_managed_comparable_in_transaction(
+        &transaction,
+        validated.request,
     )?;
     if unresolved_managed {
         return Err(BudgetError::Pending);
@@ -1383,16 +1391,7 @@ fn verify_current_wave(
     let Some((active_revision, version, target_phase, resume_phase)) = target else {
         return Err(BudgetError::Stale);
     };
-    let row: Option<(
-        String,
-        String,
-        i64,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = transaction
+    let row: Option<CurrentConflictWaveRow> = transaction
         .query_row(
             "SELECT target,revision,sequence,phase,resolution_request_record_id,
                     resolution_request_object,composition_source_record_id,
@@ -1872,6 +1871,67 @@ mod tests {
             write_snapshot(&fixture.store, &target),
             after_epoch_rotation
         );
+    }
+
+    #[test]
+    fn unresolved_managed_superset_blocks_new_admission_without_writes() {
+        use sha2::{Digest, Sha256};
+
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        reset_acknowledgements();
+        let _adapter = register_test_adapter(acknowledge);
+        let first = begin(&mut fixture.store, fixture._repo.path(), &owner, &command).unwrap();
+        let ManagedResolutionOutcome::DispatchAcknowledged(status) = first else {
+            panic!("expected first acknowledgement, got {first:?}");
+        };
+        let request =
+            resolution::load_request(&mut fixture.store, fixture._repo.path(), &command.request)
+                .unwrap();
+        let (original_key, kind, members, paths) = request.managed_decision_fields();
+        let mut members: BTreeSet<String> = members.split('\n').map(str::to_owned).collect();
+        members.insert("additional-contribution".into());
+        let mut paths: BTreeSet<String> = paths.split('\n').map(str::to_owned).collect();
+        paths.insert("src/additional.rs".into());
+        // Independent encoding of the persisted decision identity. This row
+        // represents another unresolved decision that contains the new one.
+        let mut hash = Sha256::new();
+        hash.update(b"aethyme resolution decision v0\0");
+        hash.update(kind.as_bytes());
+        for member in &members {
+            hash.update(b"\0m");
+            hash.update(member.as_bytes());
+        }
+        for path in &paths {
+            hash.update(b"\0p");
+            hash.update(path.as_bytes());
+        }
+        let key = format!("{:x}", hash.finalize());
+        assert_ne!(key, original_key);
+        assert_eq!(
+            fixture
+                .store
+                .connection()
+                .execute(
+                    "UPDATE resolution_attempts SET decision_key=?1,members=?2,paths=?3
+             WHERE client_key=?4",
+                    params![
+                        key,
+                        members.into_iter().collect::<Vec<_>>().join("\n"),
+                        paths.into_iter().collect::<Vec<_>>().join("\n"),
+                        command.client_key.as_str()
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+        let before = write_snapshot(&fixture.store, owner.target());
+        let mut distinct = command.clone();
+        distinct.client_key = OperationId::mint().unwrap();
+        let outcome = begin(&mut fixture.store, fixture._repo.path(), &owner, &distinct);
+        assert!(matches!(outcome, Err(BudgetError::Pending)), "{outcome:?}");
+        assert_eq!(acknowledgements(), 1);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), before);
     }
 
     #[test]

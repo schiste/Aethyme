@@ -1152,14 +1152,13 @@ fn load_request_from_bytes(
     let baseline_commit = commit(&string("baseline_commit")?)?;
     let mut baseline = collaboration_archive::retained(store, &baseline_snapshot)?
         .ok_or_else(|| mismatch("the baseline snapshot is no longer retained".into()))?;
-    if let Some(repo) = repo {
-        if collaboration_archive::snapshot_of_commit(repo, &baseline_commit)?.id()
+    if let Some(repo) = repo
+        && collaboration_archive::snapshot_of_commit(repo, &baseline_commit)?.id()
             != baseline_snapshot
-        {
-            return Err(mismatch(
-                "the baseline commit no longer names its snapshot".into(),
-            ));
-        }
+    {
+        return Err(mismatch(
+            "the baseline commit no longer names its snapshot".into(),
+        ));
     }
     baseline.commit = baseline_commit;
     if baseline.snapshot_id.as_str() != string("baseline")? {
@@ -1171,14 +1170,13 @@ fn load_request_from_bytes(
     let accumulator_commit = commit(&string("accumulator_commit")?)?;
     let mut retained = collaboration_archive::retained(store, &accumulator_id)?
         .ok_or_else(|| mismatch("the accumulator is no longer retained".into()))?;
-    if let Some(repo) = repo {
-        if collaboration_archive::snapshot_of_commit(repo, &accumulator_commit)?.id()
+    if let Some(repo) = repo
+        && collaboration_archive::snapshot_of_commit(repo, &accumulator_commit)?.id()
             != accumulator_id
-        {
-            return Err(mismatch(
-                "the accumulator commit does not name its snapshot".into(),
-            ));
-        }
+    {
+        return Err(mismatch(
+            "the accumulator commit does not name its snapshot".into(),
+        ));
     }
     retained.commit = accumulator_commit;
     let accumulator = retained;
@@ -1627,7 +1625,8 @@ fn comparable_attempts(
 
 /// Whether one stored managed-attempt row is the exact canonical decision
 /// represented by this already validated request.
-pub(crate) fn managed_attempt_decision_matches(
+#[cfg(test)]
+fn managed_attempt_decision_matches(
     request: &ResolutionRequest,
     key: &str,
     kind: &str,

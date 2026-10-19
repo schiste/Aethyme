@@ -3101,6 +3101,8 @@ mod tests {
             )
         }
 
+        // Fixtures vary each persisted route and attempt binding independently.
+        #[allow(clippy::too_many_arguments)]
         fn insert_attempt_with_route(
             connection: &rusqlite::Connection,
             request_record_id: &str,
