@@ -5726,8 +5726,9 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn broker_open_keeps_missing_cache_parent_pending_with_positive_budget() {
+    fn an_open_broker_keeps_recovery_pending_when_explicit_cache_parent_disappears() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
@@ -5742,14 +5743,23 @@ mod tests {
         .unwrap();
 
         let storage = crate::test_storage::TestStorage::new();
-        let mut first = storage.open(&root).unwrap();
-        let cache_root = first
+        let cache_root_override = storage.root().join("cache-owner").join("preparation-cache");
+        let cache_parent = cache_root_override.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&cache_root_override).unwrap();
+        let options = storage
+            .options()
+            .with_preparation_cache_root(cache_root_override.clone());
+        let mut first = Broker::open_with_options(&root, options).unwrap();
+        let cache_namespace = first
             .storage_context()
             .preparation_cache_root()
             .expect("test storage has a captured preparation-cache root")
             .expect("captured cache root exists");
-        let cache_parent = cache_root.parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&cache_root).unwrap();
+        assert_eq!(
+            cache_namespace.parent(),
+            Some(cache_root_override.as_path())
+        );
+        std::fs::create_dir_all(&cache_namespace).unwrap();
         for key in [
             ARTIFACT_SWEEP_STAMP_KEY,
             ARTIFACT_SWEEP_PROGRESS_KEY,
@@ -5759,33 +5769,97 @@ mod tests {
         ] {
             first.store().meta_set(key, "").unwrap();
         }
+        let namespace = first.ensure_artifact_sweep_namespace().unwrap();
+        let requested_key =
+            scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY);
+        let completed_key =
+            scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY);
         first
-            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "0")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
         first
-            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "0")
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
             .unwrap();
-        drop(first);
         std::fs::remove_dir_all(&cache_parent).unwrap();
 
-        let mut reopened = storage.open(&root).unwrap();
-        let requested = reopened
-            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+        first.resume_gc_maintenance().unwrap();
+        let requested = first
+            .store()
+            .meta_get(&requested_key)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        let completed = reopened
-            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+        let completed = first
+            .store()
+            .meta_get(&completed_key)
             .unwrap()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         assert!(
             requested > completed,
-            "unknown cache location must remain pending"
+            "unknown cache location must leave its durable recovery request pending"
         );
         assert!(
             !cache_parent.exists(),
-            "a missing captured cache parent must not be recreated by maintenance"
+            "maintenance must not recreate a missing cache-owner directory"
+        );
+        assert!(
+            storage.root().is_dir(),
+            "removing the cache owner must not remove the TestStorage owner"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fresh_open_refuses_a_missing_explicit_cache_root_without_recreating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let cache_root_override = storage.root().join("cache-owner").join("preparation-cache");
+        let cache_parent = cache_root_override.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&cache_root_override).unwrap();
+        let options = storage
+            .options()
+            .with_preparation_cache_root(cache_root_override.clone());
+        let first = Broker::open_with_options(&root, options).unwrap();
+        let cache_namespace = first
+            .storage_context()
+            .preparation_cache_root()
+            .expect("test storage has a captured preparation-cache root")
+            .expect("captured cache root exists");
+        assert_eq!(
+            cache_namespace.parent(),
+            Some(cache_root_override.as_path())
+        );
+        drop(first);
+        std::fs::remove_dir_all(&cache_parent).unwrap();
+
+        let error = match Broker::open_with_options(
+            &root,
+            storage
+                .options()
+                .with_preparation_cache_root(cache_root_override.clone()),
+        ) {
+            Ok(_) => panic!("a fresh open must refuse a missing explicit cache root"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, crate::BrokerOpError::InvalidStorageContext { .. }),
+            "fresh open returned an unexpected error: {error:?}"
+        );
+        assert!(
+            !cache_root_override.exists(),
+            "fresh open must not recreate a missing explicit cache root"
+        );
+        assert!(
+            storage.root().is_dir(),
+            "removing the cache owner must not remove the TestStorage owner"
         );
     }
 

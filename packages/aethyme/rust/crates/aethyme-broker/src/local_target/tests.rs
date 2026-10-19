@@ -115,9 +115,10 @@ fn age_objects(store: &CollaborationStore) {
 }
 
 pub(crate) struct Fixture {
+    // Drop the open database connection before its temporary host-state owner.
+    pub(crate) store: CollaborationStore,
     pub(crate) _host: tempfile::TempDir,
     pub(crate) _repo: tempfile::TempDir,
-    pub(crate) store: CollaborationStore,
     pub(crate) a: RetainedContribution,
     pub(crate) b: RetainedContribution,
 }
