@@ -181,7 +181,7 @@ fn finish_cli_succeeds_for_a_clean_worktree_root_with_spaces() {
     assert!(worktree.starts_with(&worktree_root_path));
     assert!(worktree_root_path.is_dir());
 
-    let mut broker = isolation::open_with_worktree_root(tmp.path(), &worktree_root_path);
+    let broker = isolation::open_with_worktree_root(tmp.path(), &worktree_root_path);
     let session_arg = session_id.to_string();
     let mut command = Command::new(CLI);
     command
