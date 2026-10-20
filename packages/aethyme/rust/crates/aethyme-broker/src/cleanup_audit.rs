@@ -35,9 +35,10 @@ pub const CLEANUP_AUDIT_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CleanupTargetSnapshot {
     pub(crate) refs: Vec<String>,
-    /// `None` means the primary HEAD could not be resolved. The old per-item
-    /// target lookup then remains the authority and can report its error; an
-    /// empty target list would incorrectly look like a completed inspection.
+    /// `None` means the primary HEAD could not be resolved. Plan items whose
+    /// eligibility depends on delivery targets must then remain uninspected;
+    /// they cannot fall back to later targets that are absent from this digest.
+    /// Direct cleanup inspections still resolve their own fresh target set.
     pub(crate) delivery_targets: Option<Vec<String>>,
 }
 
