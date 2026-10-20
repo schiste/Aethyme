@@ -21,6 +21,23 @@ thread_local! {
     /// the general git timeout. Thread-local so one finish cannot shorten a
     /// concurrent operation running in another broker thread.
     static GIT_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// Counts timed-out Git subprocesses on this thread. Some read helpers
+    /// intentionally turn ordinary Git failures into `None`; a caller with a
+    /// stronger deadline can use this generation to distinguish a timeout
+    /// from an absent ref without changing those best-effort APIs.
+    static GIT_TIMEOUT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A snapshot for callers that must detect Git timeouts hidden by a
+/// best-effort `Option`-returning read helper.
+pub(crate) fn git_timeout_generation() -> u64 {
+    GIT_TIMEOUT_GENERATION.with(std::cell::Cell::get)
+}
+
+fn note_git_timeout() {
+    GIT_TIMEOUT_GENERATION.with(|generation| {
+        generation.set(generation.get().wrapping_add(1));
+    });
 }
 
 struct RestoreGitDeadline(Option<Instant>);
@@ -1020,6 +1037,7 @@ fn run_git_process_output(
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                note_git_timeout();
                 return Err(GitError::TimedOut {
                     args: args.join(" "),
                     seconds: 1,
@@ -1029,15 +1047,19 @@ fn run_git_process_output(
         }
         None => budget,
     };
-    let output = crate::bounded_output::output_within(&mut command, budget)
-        .map_err(|source| GitError::Spawn {
+    let output = crate::bounded_output::output_within(&mut command, budget).map_err(|source| {
+        GitError::Spawn {
             args: args.join(" "),
             source,
-        })?
-        .ok_or_else(|| GitError::TimedOut {
+        }
+    })?;
+    let Some(output) = output else {
+        note_git_timeout();
+        return Err(GitError::TimedOut {
             args: args.join(" "),
             seconds: budget.as_secs().max(1),
-        })?;
+        });
+    };
     Ok(output)
 }
 /// A commit's tree and parents, in Git's stored parent order.
@@ -4353,11 +4375,17 @@ mod timeout_tests {
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 30"]);
         let started = std::time::Instant::now();
+        let timeout_generation_before = git_timeout_generation();
         let error = run_git_command(command, &["fetch", "origin"], Duration::from_millis(300))
             .expect_err("a sleeping git must time out");
         assert!(
             matches!(&error, GitError::TimedOut { args, .. } if args == "fetch origin"),
             "{error:?}"
+        );
+        assert_ne!(
+            git_timeout_generation(),
+            timeout_generation_before,
+            "a real subprocess timeout must be observable by bounded callers"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");

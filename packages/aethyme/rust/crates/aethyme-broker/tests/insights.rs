@@ -21,10 +21,13 @@
 
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{
     Broker, BrokerStore, GateStatus, InsightsInput, InsightsQuery, InsightsReport, NewGateResult,
     NewSession, SessionOrigin, SessionStatus, insights,
 };
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn git(root: &std::path::Path, args: &[&str]) {
     let output = Command::new("git")
@@ -44,14 +47,14 @@ fn git(root: &std::path::Path, args: &[&str]) {
 }
 
 /// A repository with a broker and `count` registered sessions.
-fn fixture(count: usize) -> (tempfile::TempDir, Broker, Vec<i64>) {
-    let root = tempfile::tempdir().unwrap();
+fn fixture(count: usize) -> (FixtureRepository, common::FixtureBroker, Vec<i64>) {
+    let root = FixtureRepository::new();
     git(root.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(root.path().join("README.md"), "test\n").unwrap();
     git(root.path(), &["add", "README.md"]);
     git(root.path(), &["commit", "-qm", "initial"]);
 
-    let mut broker = Broker::open(root.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&root).unwrap();
     let mut ids = Vec::new();
     for index in 0..count {
         let session = broker

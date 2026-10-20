@@ -10,7 +10,10 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{Broker, CachePolicy, MergeStatus, PromotionIntent};
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -30,23 +33,23 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn fixture(promote_mode: Option<&str>) -> (tempfile::TempDir, Broker) {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+fn fixture(promote_mode: Option<&str>) -> (FixtureRepository, common::FixtureBroker) {
+    let fixture = FixtureRepository::new();
+    git(fixture.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(fixture.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(fixture.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::create_dir_all(fixture.path().join(".aethyme")).unwrap();
     if let Some(mode) = promote_mode {
         std::fs::write(
-            tmp.path().join(".aethyme/config.toml"),
+            fixture.path().join(".aethyme/config.toml"),
             format!("[promote]\nmode = \"{mode}\"\n"),
         )
         .unwrap();
     }
-    git(tmp.path(), &["add", "-A"]);
-    git(tmp.path(), &["commit", "-qm", "init"]);
-    let broker = Broker::open(tmp.path()).unwrap();
-    (tmp, broker)
+    git(fixture.path(), &["add", "-A"]);
+    git(fixture.path(), &["commit", "-qm", "init"]);
+    let broker = open_fixture_repository_broker(&fixture).unwrap();
+    (fixture, broker)
 }
 
 fn commit_work(broker: &mut Broker, task: &str) -> i64 {
@@ -61,7 +64,7 @@ fn commit_work(broker: &mut Broker, task: &str) -> i64 {
 /// The default is unchanged: a repository that says nothing still promotes.
 #[test]
 fn an_unconfigured_repository_still_promotes_automatically() {
-    let (_tmp, mut broker) = fixture(None);
+    let (_fixture, mut broker) = fixture(None);
     let session = commit_work(&mut broker, "default");
     let outcome = broker.submit(session).unwrap();
     assert!(outcome.promoted, "{outcome:?}");
@@ -73,8 +76,8 @@ fn an_unconfigured_repository_still_promotes_automatically() {
 /// verification, because the audit trail is the point of submitting at all.
 #[test]
 fn verify_only_repositories_verify_and_promote_nothing() {
-    let (tmp, mut broker) = fixture(Some("verify-only"));
-    let before = git(tmp.path(), &["rev-parse", "HEAD"]);
+    let (fixture, mut broker) = fixture(Some("verify-only"));
+    let before = git(fixture.path(), &["rev-parse", "HEAD"]);
     let session = commit_work(&mut broker, "verified");
 
     let outcome = broker.submit(session).unwrap();
@@ -87,7 +90,7 @@ fn verify_only_repositories_verify_and_promote_nothing() {
 
     // The integration branch must not exist or must not have moved.
     let integration = git(
-        tmp.path(),
+        fixture.path(),
         &["rev-parse", "--verify", "-q", "aethyme/integration"],
     );
     assert!(
@@ -121,11 +124,15 @@ fn unknown_mode_warns_in_status_and_submit_and_falls_back_to_verify_only() {
         warning.summary
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
-        .args(["submit", "--session", &session.to_string(), "--json"])
-        .current_dir(tmp.path())
-        .output()
+    let session_id = session.to_string();
+    let mut command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["submit", "--session", &session_id, "--json"],
+    );
+    broker
+        .configure_storage_context_for_child(&mut command)
         .unwrap();
+    let output = command.current_dir(tmp.path()).output().unwrap();
     assert!(
         output.status.success(),
         "submit failed: {}",
@@ -155,7 +162,7 @@ fn unknown_mode_warns_in_status_and_submit_and_falls_back_to_verify_only() {
 /// directly under a sentence saying it would not happen.
 #[test]
 fn the_next_action_does_not_contradict_the_suppression_reason() {
-    let (tmp, mut broker) = fixture(Some("verify-only"));
+    let (fixture, mut broker) = fixture(Some("verify-only"));
     let session = commit_work(&mut broker, "agreement");
     let outcome = broker.submit(session).unwrap();
     assert!(
@@ -165,15 +172,15 @@ fn the_next_action_does_not_contradict_the_suppression_reason() {
             .is_some_and(|r| r.contains("promotion is off"))
     );
 
-    let rendered = String::from_utf8_lossy(
-        &std::process::Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
-            .args(["submit", "--session", &session.to_string()])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .into_owned();
+    let mut command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["submit", "--session", &session.to_string()],
+    );
+    command.current_dir(fixture.path());
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    let rendered = String::from_utf8_lossy(&command.output().unwrap().stdout).into_owned();
     assert!(
         !rendered.contains("manual mode"),
         "a verify-only repository must not be told it is in manual mode: {rendered}"

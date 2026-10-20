@@ -58,6 +58,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::UpstreamRefNotFound { .. }
         | E::RepresentationUnavailable { .. }
         | E::MainReconcileUnavailable { .. }
+        | E::LeaseClaimPreparationTimedOut { .. }
         | E::ExposurePlanUnavailable { .. }
         | E::ShipPlanUnavailable { .. }
         | E::ShipDeliveryUnavailable { .. }
@@ -207,6 +208,10 @@ mod tests {
             stderr: "fatal: bad".to_string(),
         });
         assert_eq!(for_broker_error(&failed), FAILED);
+        assert_eq!(
+            for_broker_error(&BrokerOpError::LeaseClaimPreparationTimedOut { budget_ms: 30_000 }),
+            ENVIRONMENT
+        );
     }
 
     #[test]

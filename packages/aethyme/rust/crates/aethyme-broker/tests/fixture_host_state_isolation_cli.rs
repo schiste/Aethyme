@@ -9,6 +9,8 @@ const LIBRARY_CHILD_FLAG: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PLACEMENT_CHILD";
 const LIBRARY_PATH_REPORT: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PATH_REPORT";
 
 mod common;
+#[path = "common/isolation.rs"]
+mod isolation;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -142,6 +144,11 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             "AETHYME_BROKER_DB",
             "AETHYME_GATE_BROKER_DATABASES",
             "AETHYME_WORKTREE_ROOT",
+            "AETHYME_BROKER_STORAGE_CONTEXT_V1",
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
         ] {
             assert_eq!(env.get(OsStr::new(removed)), Some(&None), "{removed}");
         }
@@ -178,6 +185,11 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             String::from_utf8_lossy(&gate.stdout),
             String::from_utf8_lossy(&gate.stderr)
         );
+        assert!(
+            fixture_state.join("host-resources.db").is_file(),
+            "gate resource state was not written under {}",
+            fixture_state.display()
+        );
         let repositories: Vec<_> = std::fs::read_dir(fixture_cache.join("gates"))
             .unwrap()
             .map(Result::unwrap)
@@ -207,6 +219,9 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             poison_root.join("host-state"),
             poison_root.join("host-cache"),
             poison_root.join("broker.db"),
+            poison_root.join("host-operations.db"),
+            poison_root.join("private-worktrees"),
+            poison_root.join("collaboration"),
             poison_root.join("worktrees"),
         ] {
             assert!(
@@ -245,6 +260,23 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             poison_root.path().join("host-cache"),
         )
         .env("AETHYME_BROKER_DB", poison_root.path().join("broker.db"))
+        .env("AETHYME_BROKER_STORAGE_CONTEXT_V1", "poisoned-envelope")
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            poison_root.path().join("host-operations.db"),
+        )
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+            "poisoned-explicitness",
+        )
+        .env(
+            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+            poison_root.path().join("private-worktrees"),
+        )
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            poison_root.path().join("collaboration"),
+        )
         .env(
             "AETHYME_GATE_BROKER_DATABASES",
             "poisoned-gate-database-scope",
@@ -260,6 +292,58 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         "child stdout={}\nchild stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fixture_command_binds_captured_storage_context() {
+    let fixture = fixture();
+    let fixture_root = fixture.owner_path().canonicalize().unwrap();
+    let command = isolation::command(CLI, fixture.path(), &[]);
+    let env = configured_env(&command);
+
+    let value = |name: &str| {
+        env.get(OsStr::new(name))
+            .and_then(Option::as_deref)
+            .unwrap_or_else(|| panic!("{name} must be set for fixture children"))
+    };
+    assert_eq!(
+        value("AETHYME_HOST_STATE_DIR"),
+        fixture_root.join("host-state").as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_HOST_CACHE_DIR"),
+        fixture_root.join("host-cache").as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_OPEN_HOST_OPERATION_DB"),
+        fixture_root
+            .join("host-state/host-operations.db")
+            .as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_OPEN_COLLABORATION_ROOT"),
+        fixture_root.join("host-state/collaboration").as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT"),
+        OsStr::new("true")
+    );
+    assert!(
+        env.get(OsStr::new("AETHYME_BROKER_STORAGE_CONTEXT_V1"))
+            .and_then(Option::as_ref)
+            .is_some_and(|value| value != OsStr::new("poisoned-envelope"))
+    );
+    let captured_root = PathBuf::from(
+        env.get(OsStr::new("AETHYME_BROKER_OPEN_WORKTREE_ROOT"))
+            .and_then(Option::as_deref)
+            .expect("fixture child exact worktree root"),
+    );
+    let expected_root = fixture.worktree_root();
+    assert_eq!(captured_root, expected_root);
+    assert!(
+        env.get(OsStr::new("AETHYME_GATE_BROKER_DATABASES"))
+            .is_some_and(Option::is_none)
     );
 }
 

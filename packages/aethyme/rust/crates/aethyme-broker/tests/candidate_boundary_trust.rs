@@ -1,14 +1,15 @@
 //! The candidate boundary (#663) under a gate policy change nobody trusted.
 //!
 //! Its own test binary with one test: it removes the test-suite trust escape
-//! that `.cargo/config.toml` exports and points host state at a temporary
-//! directory, which is only sound while no other test shares the process.
+//! that `.cargo/config.toml` exports. Broker storage paths come from fixture
+//! options instead of process-wide host-state variables.
 
+mod common;
 use std::path::Path;
 use std::process::Command;
 
+use aethyme_broker::BrokerOpError;
 use aethyme_broker::composition::{CompositionOutcome, Refusal};
-use aethyme_broker::{Broker, BrokerOpError};
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -30,15 +31,15 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 #[test]
 fn an_untrusted_policy_on_the_baseline_is_refused_as_submit_refuses_it() {
-    let host_state = tempfile::tempdir().unwrap();
-    // SAFETY: the only test in this binary, so no other thread reads the
-    // environment concurrently.
+    // SAFETY: This is the sole test in this binary; no sibling test or child
+    // reads the trust escape while it is removed. Storage paths are supplied
+    // through fixture options rather than process-wide host variables.
     unsafe {
         std::env::remove_var("AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS");
-        std::env::set_var("AETHYME_HOST_STATE_DIR", host_state.path());
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
+    let host_state = common::fixture_host_state_dir(tmp.owner_path());
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(
@@ -53,7 +54,9 @@ fn an_untrusted_policy_on_the_baseline_is_refused_as_submit_refuses_it() {
     .unwrap();
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
-    let mut broker = Broker::open(root).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.start_worktree("a", None).unwrap();
     let worktree = Path::new(&session.worktree_path);
     std::fs::write(worktree.join("a.txt"), "a\n").unwrap();
@@ -88,12 +91,8 @@ fn an_untrusted_policy_on_the_baseline_is_refused_as_submit_refuses_it() {
         events
     );
     // Assessing trust records none.
-    let mut recorded = Vec::new();
-    for entry in walk(host_state.path()) {
-        if entry.to_string_lossy().contains("trust") {
-            recorded.push(entry);
-        }
-    }
+    // Inspect the production record directory, independent of fixture ancestor names.
+    let recorded = walk(&host_state.join("gate-trust"));
     assert!(recorded.is_empty(), "{recorded:?}");
 
     match broker.submit(session.id) {
