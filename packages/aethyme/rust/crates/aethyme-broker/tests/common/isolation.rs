@@ -46,6 +46,12 @@ pub fn worktree_root(repo: &Path) -> PathBuf {
 
 /// Scope storage and worktree allocation to the fixture before startup.
 pub fn open(repo: &Path) -> Broker {
+    open_with_worktree_root(repo, &worktree_root(repo))
+}
+
+/// Scope storage to the fixture and bind a caller-owned worktree root before
+/// startup.
+pub fn open_with_worktree_root(repo: &Path, worktree_root: &Path) -> Broker {
     let root = fixture_root(repo).canonicalize().unwrap();
     let host_state_dir = root.join("host-state");
     let preparation_cache = root.join("preparation-cache");
@@ -55,7 +61,7 @@ pub fn open(repo: &Path) -> Broker {
         .with_host_cache_dir(root.join("host-cache"))
         .with_preparation_cache_root(preparation_cache)
         .with_host_operation_database(host_state_dir.join("host-operations.db"))
-        .with_worktree_root(worktree_root(repo))
+        .with_worktree_root(worktree_root)
         .with_collaboration_state(host_state_dir.join("collaboration"));
     let broker = Broker::open_with_options(repo, options).unwrap();
     #[cfg(unix)]

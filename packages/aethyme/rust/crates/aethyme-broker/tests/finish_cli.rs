@@ -31,6 +31,12 @@ fn run(repo: &Path, args: &[&str]) -> Output {
 }
 
 fn promoted_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
+    promoted_fixture_with_worktree_root(None)
+}
+
+fn promoted_fixture_with_worktree_root(
+    worktree_root: Option<&Path>,
+) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
@@ -38,7 +44,10 @@ fn promoted_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, Strin
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
 
-    let mut broker = isolation::open(tmp.path());
+    let mut broker = match worktree_root {
+        Some(worktree_root) => isolation::open_with_worktree_root(tmp.path(), worktree_root),
+        None => isolation::open(tmp.path()),
+    };
     let session = broker.start_worktree("finish CLI fixture", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
@@ -144,6 +153,72 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     let payload = event.payload_json.unwrap();
     assert!(!payload.contains(tmp.path().to_str().unwrap()));
     assert!(!payload.contains("redacted/gate.log"));
+}
+
+#[test]
+fn finish_cli_succeeds_for_a_clean_worktree_root_with_spaces() {
+    let worktree_parent = tempfile::Builder::new()
+        .prefix("aethyme finish worktree parent ")
+        .tempdir()
+        .unwrap();
+    let worktree_root_path = worktree_parent
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("worktrees with spaces");
+    assert!(
+        !worktree_root_path.exists(),
+        "the selected worktree root must be absent before broker open: {}",
+        worktree_root_path.display()
+    );
+    let (tmp, session_id, worktree, _) =
+        promoted_fixture_with_worktree_root(Some(&worktree_root_path));
+    assert!(
+        worktree.to_string_lossy().contains(' '),
+        "fixture path must contain spaces: {}",
+        worktree.display()
+    );
+    assert!(worktree.starts_with(&worktree_root_path));
+    assert!(worktree_root_path.is_dir());
+
+    let broker = isolation::open_with_worktree_root(tmp.path(), &worktree_root_path);
+    let session_arg = session_id.to_string();
+    let mut command = Command::new(CLI);
+    command
+        .args(["finish", "--session", &session_arg, "--json"])
+        .current_dir(tmp.path())
+        .env(
+            "AETHYME_CHAU7_MCP_BRIDGE",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/no-chau7-bridge"),
+        );
+    for variable in [
+        "AETHYME_BROKER_DB",
+        "AETHYME_GATE_BROKER_DATABASES",
+        "AETHYME_HOST_STATE_DIR",
+        "AETHYME_HOST_CACHE_DIR",
+        "AETHYME_WORKTREE_ROOT",
+        "AETHYME_BROKER_STORAGE_CONTEXT_V1",
+        "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+        "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+        "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+        "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+    ] {
+        command.env_remove(variable);
+    }
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    drop(broker);
+
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["status"], "cleaned", "{stdout}");
+    assert_eq!(report["cleanup"]["completed"], true, "{stdout}");
+    assert_eq!(report["cleanup"]["worktree_removed"], true, "{stdout}");
+    assert!(!worktree.exists());
 }
 
 #[cfg(unix)]
