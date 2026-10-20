@@ -11,7 +11,17 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 const MAX_README_BYTES: u64 = 4 * 1024 * 1024;
 
 fn read_bounded(path: &Path) -> Result<String, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.len() > MAX_README_BYTES {
         return Err(format!(
             "{}: README must be a regular file no larger than 4 MiB",
@@ -19,9 +29,7 @@ fn read_bounded(path: &Path) -> Result<String, String> {
         ));
     }
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .take(MAX_README_BYTES + 1)
+    file.take(MAX_README_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_README_BYTES {
@@ -287,6 +295,20 @@ mod tests {
         fs::remove_file(repo.0.join("README.rst")).unwrap();
         fs::remove_file(repo.0.join("README.md")).unwrap();
         fs::create_dir(repo.0.join("README.md")).unwrap();
+        assert!(ensure_guidance(&repo.0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_read_refuses_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let repo = Repo::new();
+        let path = repo.0.join("README.md");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a live NUL-terminated path; mkfifo retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_bounded(&path).unwrap_err().contains("regular file"));
         assert!(ensure_guidance(&repo.0).is_err());
     }
 

@@ -323,9 +323,9 @@ fn check_retention_policy(main_root: &Path) -> Check {
     }
 }
 
-/// Deterministic scaffolding: ONLY what the broker needs to work, and
-/// ONLY artifacts whose content is identical for every repo (fixed
-/// config skeleton, fixed .gitignore block, fixed database schema).
+/// Fixed broker scaffolding plus a managed README learning section.
+/// Config, ignore rules and database schema are repository-independent;
+/// README updates preserve repository prose outside the owned section.
 /// Adaptive generation (gates drafting, docs, charts) lives elsewhere.
 pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let mut checks = Vec::new();
