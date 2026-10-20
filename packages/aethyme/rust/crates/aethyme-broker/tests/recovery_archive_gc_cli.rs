@@ -60,7 +60,13 @@ fn repo() -> common::FixtureRepository {
 }
 
 fn archive_root(repo: &Path) -> PathBuf {
-    repo.join(".aethyme/recovery-archives")
+    let broker = common::open_fixture_repository_path_broker(repo).unwrap();
+    let owner = repo.parent().expect("fixture repository owner");
+    // The fixture explicitly selects host state, so archives use that owned
+    // root even when the repository itself is under the system temp directory.
+    common::fixture_host_state_dir(owner)
+        .join("recovery-archives")
+        .join(broker.worktree_root_plan().unwrap().repository_key)
 }
 
 /// Close a session holding one unlanded commit and, when `dirty`, an
