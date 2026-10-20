@@ -2799,7 +2799,17 @@ mod submission_plan_empty_patch_tests {
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        let output = command
             .args(args)
             .current_dir(root)
             .env("GIT_AUTHOR_NAME", "Empty Patch Test")
@@ -2819,20 +2829,20 @@ mod submission_plan_empty_patch_tests {
     #[test]
     fn empty_and_no_patch_sessions_do_not_scan_integration_patch_history() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        git(root, &["init", "-q", "-b", "main"]);
-        git(root, &["config", "gc.auto", "0"]);
+        let root = temp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "gc.auto", "0"]);
         let base_file = root.join("base.txt");
         std::fs::write(&base_file, "base\n").unwrap();
-        git(root, &["add", "base.txt"]);
-        git(root, &["commit", "-qm", "base"]);
-        let base = git(root, &["rev-parse", "HEAD"]);
+        git(&root, &["add", "base.txt"]);
+        git(&root, &["commit", "-qm", "base"]);
+        let base = git(&root, &["rev-parse", "HEAD"]);
 
-        let mut broker = Broker::open(root).unwrap();
+        let mut broker = Broker::open(&root).unwrap();
         let worktree = root.join(".aethyme/worktrees/empty-patch-probe");
         let worktree_arg = worktree.to_string_lossy().into_owned();
         git(
-            root,
+            &root,
             &[
                 "worktree",
                 "add",
@@ -2854,17 +2864,17 @@ mod submission_plan_empty_patch_tests {
         // scan tries to read this blob and fails.
         let integration_file = root.join("integration-only.txt");
         std::fs::write(&integration_file, "integration only\n").unwrap();
-        git(root, &["add", "integration-only.txt"]);
-        git(root, &["commit", "-qm", "integration-only candidate"]);
-        let integration_head = git(root, &["rev-parse", "HEAD"]);
+        git(&root, &["add", "integration-only.txt"]);
+        git(&root, &["commit", "-qm", "integration-only candidate"]);
+        let integration_head = git(&root, &["rev-parse", "HEAD"]);
         let blob = git(
-            root,
+            &root,
             &[
                 "rev-parse",
                 &format!("{integration_head}:integration-only.txt"),
             ],
         );
-        let common = GitRepo::discover(root).unwrap().git_common_dir().unwrap();
+        let common = GitRepo::discover(&root).unwrap().git_common_dir().unwrap();
         let blob_object = common.join("objects").join(&blob[..2]).join(&blob[2..]);
         assert!(
             blob_object.is_file(),
