@@ -2294,9 +2294,13 @@ fn a_paused_removal_in_a_closed_session_is_finished_by_the_next_pass() {
     );
     assert!(target.exists(), "a 50 ms pass must pause part-way");
     let target_key = target.to_string_lossy().into_owned();
+    let queued = interrupted_paths(repo.path());
+    let partial = meta(repo.path(), SWEEP_PARTIAL);
+    let remaining_entries = count_entries(&target);
     assert!(
-        interrupted_paths(repo.path()).contains(&target_key),
-        "the paused tree is remembered"
+        queued.contains(&target_key),
+        "the paused tree is remembered: target={target_key:?}, queued={queued:?}, partial={partial:?}, target_exists={}, remaining_entries={remaining_entries}",
+        target.exists()
     );
 
     enable_sweep(repo.path());
