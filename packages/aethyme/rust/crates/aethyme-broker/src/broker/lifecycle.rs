@@ -1714,7 +1714,22 @@ struct FreshRootRecoveryInventory {
     root_mode: Option<u32>,
     entries: Vec<String>,
     marker_bytes_sha256: Option<String>,
+    marker_identity: Option<crate::worktree_registry::RecoveryArtifactIdentity>,
     cargo: Option<FreshRootRecoveryCargoInventory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshRootRecoveryApplyCheckpoint {
+    BeforeRegistryInitialization,
+    AfterRegistryInitializationBeforeMarker,
+    MarkerDurablyPublishedBeforeRegistryRecord,
+    RegistryRowDurablyRecordedBeforeBinding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshRootPublicationCheckpoint {
+    MarkerDurablyPublishedBeforeRegistryRecord,
+    RegistryRowDurablyRecorded,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1856,6 +1871,7 @@ fn fresh_root_recovery_inventory(
                 root_mode: None,
                 entries: Vec::new(),
                 marker_bytes_sha256: None,
+                marker_identity: None,
                 cargo: None,
             });
         }
@@ -1899,20 +1915,20 @@ fn fresh_root_recovery_inventory(
     }
     entries.sort();
     let marker_path = root.join(crate::broker::WORKTREE_ROOT_MARKER);
-    let marker_bytes_sha256 = if entries
+    let (marker_bytes_sha256, marker_identity) = if entries
         .iter()
         .any(|name| name == crate::broker::WORKTREE_ROOT_MARKER)
     {
-        let (bytes, _) = recovery_path_file_bytes(&marker_path)?;
+        let (bytes, identity) = recovery_path_file_bytes(&marker_path)?;
         let expected_bytes = fresh_root_recovery_marker_bytes(expected_marker)?;
         if bytes != expected_bytes {
             return Err(
                 "reserved-root marker bytes differ from the exact fresh reservation".into(),
             );
         }
-        Some(hex_digest(&bytes))
+        (Some(hex_digest(&bytes)), Some(identity))
     } else {
-        None
+        (None, None)
     };
     let cargo = if entries.iter().any(|name| name == ".cargo") {
         Some(fresh_root_recovery_cargo_inventory(&root.join(".cargo"))?)
@@ -1935,6 +1951,7 @@ fn fresh_root_recovery_inventory(
         root_mode: Some(root_mode),
         entries,
         marker_bytes_sha256,
+        marker_identity,
         cargo,
     })
 }
@@ -2083,11 +2100,14 @@ fn fresh_root_recovery_cargo_inventory(
 fn create_fresh_root_recovery_marker(
     root: &Path,
     marker: &WorktreeRootMarker,
-) -> Result<(), String> {
+    expected_root: &BoundDirectoryIdentity,
+) -> Result<crate::worktree_registry::RecoveryArtifactIdentity, String> {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    let expected_root = bound_directory_identity(root)?;
+    if &bound_directory_identity(root)? != expected_root {
+        return Err("reserved root identity changed before marker creation".into());
+    }
     let path = root.join(crate::broker::WORKTREE_ROOT_MARKER);
     let bytes = fresh_root_recovery_marker_bytes(marker)?;
     let mut options = std::fs::OpenOptions::new();
@@ -2121,9 +2141,60 @@ fn create_fresh_root_recovery_marker(
     let (actual, named_identity) = recovery_path_file_bytes(&path)?;
     if actual != bytes
         || named_identity != opened_identity
-        || bound_directory_identity(root)? != expected_root
+        || &bound_directory_identity(root)? != expected_root
     {
         return Err("fresh recovery marker or root changed during publication".into());
+    }
+    Ok(opened_identity)
+}
+
+#[cfg(unix)]
+fn sync_fresh_root_recovery_marker_file(
+    root: &Path,
+    marker: &WorktreeRootMarker,
+    expected_root: &BoundDirectoryIdentity,
+    expected_file: &crate::worktree_registry::RecoveryArtifactIdentity,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    if &bound_directory_identity(root)? != expected_root {
+        return Err("reserved root identity changed before marker file sync".into());
+    }
+    let path = root.join(crate::broker::WORKTREE_ROOT_MARKER);
+    let expected_bytes = fresh_root_recovery_marker_bytes(marker)?;
+    let (bytes, named_identity) = recovery_path_file_bytes(&path)?;
+    if bytes != expected_bytes || &named_identity != expected_file {
+        return Err("recovery marker bytes or file identity changed before file sync".into());
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("cannot open recovery marker without following links: {error}"))?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    let opened_identity = crate::worktree_registry::RecoveryArtifactIdentity {
+        device: opened.dev(),
+        inode: opened.ino(),
+        owner: opened.uid(),
+        mode: opened.mode() & 0o7777,
+        links: opened.nlink(),
+        bytes: opened.len(),
+    };
+    if !opened.is_file() || &opened_identity != expected_file {
+        return Err("recovery marker file identity changed while opening for sync".into());
+    }
+    file.sync_all()
+        .map_err(|error| format!("cannot durably sync recovery marker contents: {error}"))?;
+
+    let (bytes_after, identity_after) = recovery_path_file_bytes(&path)?;
+    if bytes_after != expected_bytes
+        || &identity_after != expected_file
+        || &bound_directory_identity(root)? != expected_root
+    {
+        return Err("recovery marker or root changed during marker file sync".into());
     }
     Ok(())
 }
@@ -2132,8 +2203,19 @@ fn create_fresh_root_recovery_marker(
 fn create_fresh_root_recovery_marker(
     _root: &Path,
     _marker: &WorktreeRootMarker,
-) -> Result<(), String> {
+    _expected_root: &BoundDirectoryIdentity,
+) -> Result<crate::worktree_registry::RecoveryArtifactIdentity, String> {
     Err("fresh-root recovery requires Unix no-follow marker creation".into())
+}
+
+#[cfg(not(unix))]
+fn sync_fresh_root_recovery_marker_file(
+    _root: &Path,
+    _marker: &WorktreeRootMarker,
+    _expected_root: &BoundDirectoryIdentity,
+    _expected_file: &crate::worktree_registry::RecoveryArtifactIdentity,
+) -> Result<(), String> {
+    Err("fresh-root recovery requires Unix no-follow marker sync".into())
 }
 
 #[cfg(not(unix))]
@@ -2146,6 +2228,21 @@ fn fresh_root_recovery_cargo_inventory(
 #[cfg(all(test, unix))]
 mod fresh_root_recovery_inventory_tests {
     use super::*;
+    use crate::store::repository_binding::{
+        FreshRepositoryRootReservation, RepositoryRootIdentity, RepositoryWorktreeBindingState,
+        RepositoryWorktreeRootLayout,
+    };
+    use std::process::Command;
+
+    struct FreshRootFixture {
+        _owner: tempfile::TempDir,
+        _storage: crate::test_storage::TestStorage,
+        broker: Broker,
+        root: PathBuf,
+        host_operation_database: PathBuf,
+        expected_parent: BoundDirectoryIdentity,
+        reservation: FreshRepositoryRootReservation,
+    }
 
     fn marker(repository_root: &Path) -> WorktreeRootMarker {
         WorktreeRootMarker {
@@ -2160,6 +2257,144 @@ mod fresh_root_recovery_inventory_tests {
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
         builder.create(path).unwrap();
+    }
+
+    fn git(repository: &Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .output()
+            .expect("run fixture git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn fresh_root_fixture(root_exists: bool) -> FreshRootFixture {
+        let owner = tempfile::tempdir().unwrap();
+        let owner_root = owner.path().canonicalize().unwrap();
+        let repository = owner_root.join("repository");
+        create_private_directory(&repository);
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(
+            &repository,
+            &[
+                "-c",
+                "user.name=Aethyme Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        );
+
+        let storage = crate::test_storage::TestStorage::new();
+        let host_operation_database = storage.host_state_dir().join("host-operations.db");
+        let parent = owner_root.join("managed-roots");
+        create_private_directory(&parent);
+        let root = parent.join("worktrees");
+        if root_exists {
+            create_private_directory(&root);
+        }
+        let options = storage.options().with_worktree_root(root.clone());
+        let mut broker = Broker::open_with_options(&repository, options).unwrap();
+        let binding = broker.store().repository_worktree_binding().unwrap();
+        assert_eq!(binding.state, RepositoryWorktreeBindingState::FreshUnbound);
+        let identity = RepositoryRootIdentity {
+            repository_root: binding.repository_root.unwrap(),
+            git_common_dir: binding.git_common_dir.unwrap(),
+            repository_key: binding.repository_key.unwrap(),
+            broker_db_path: binding.broker_db_path.unwrap(),
+            bootstrap_nonce: binding.bootstrap_nonce.unwrap(),
+        };
+        let expected_parent = bound_directory_identity(&parent).unwrap();
+        let parent_identity_json = serde_json::to_string(&expected_parent).unwrap();
+        let layout = RepositoryWorktreeRootLayout::DirectRoot;
+        let source = WorktreeRootSource::LibraryOverride;
+        let reservation_digest =
+            fresh_root_reservation_digest(&identity, &root, layout, source, &parent_identity_json)
+                .unwrap();
+        let reservation = FreshRepositoryRootReservation {
+            identity,
+            worktree_root: root.clone(),
+            layout,
+            source,
+            reservation_digest,
+            parent_identity_json,
+        };
+        broker
+            .store()
+            .reserve_fresh_repository_worktree_root(&reservation)
+            .unwrap();
+        FreshRootFixture {
+            _owner: owner,
+            _storage: storage,
+            broker,
+            root,
+            host_operation_database,
+            expected_parent,
+            reservation,
+        }
+    }
+
+    fn replace_root_with_empty_directory(root: &Path) -> PathBuf {
+        let moved = root.with_file_name("worktrees-replaced");
+        std::fs::rename(root, &moved).unwrap();
+        create_private_directory(root);
+        moved
+    }
+
+    fn assert_reserved_and_unregistered(fixture: &mut FreshRootFixture) {
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+        let plan = fixture
+            .broker
+            .fresh_worktree_root_recovery_plan()
+            .expect("read-only recovery plan after interrupted apply");
+        assert_ne!(
+            plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExactTargetRow
+        );
+    }
+
+    fn exact_marker_without_target_row(fixture: &mut FreshRootFixture) -> FreshRootRecoveryPlan {
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint(&plan.digest, |checkpoint, _| {
+                if checkpoint
+                    == FreshRootRecoveryApplyCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                {
+                    Err("injected interruption after marker durability".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("before registry record"));
+        let partial = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            partial.root_inventory.state,
+            FreshRootRecoveryPathState::ExactMarker
+        );
+        assert_eq!(
+            partial.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        partial
     }
 
     #[test]
@@ -2257,6 +2492,875 @@ mod fresh_root_recovery_inventory_tests {
         std::fs::remove_file(&config).unwrap();
         std::fs::write(&temporary_config, b"arbitrary cargo configuration").unwrap();
         assert!(fresh_root_recovery_inventory(&root, &expected_marker).is_err());
+    }
+
+    #[test]
+    fn recovery_apply_rejects_wrong_digest_without_creating_the_reserved_root() {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert!(plan.can_apply);
+        assert!(
+            fixture
+                .broker
+                .apply_fresh_worktree_root_recovery(&"0".repeat(64))
+                .is_err()
+        );
+        assert!(!fixture.root.exists());
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn full_registry_refuses_before_creating_a_missing_reserved_root() {
+        let mut fixture = fresh_root_fixture(false);
+        let admission =
+            crate::worktree_registry::admit(&fixture.host_operation_database, &fixture.root)
+                .unwrap();
+        drop(admission);
+        let registry_path =
+            crate::worktree_registry::registry_path(&fixture.host_operation_database).unwrap();
+        let mut connection = rusqlite::Connection::open(&registry_path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..crate::worktree_registry::MAX_RECORDS {
+            transaction
+                .execute(
+                    "INSERT INTO roots(key, payload) VALUES(?1, ?2)",
+                    rusqlite::params![format!("fixture-{index}"), "{}"],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert!(!plan.can_apply);
+        assert_eq!(
+            plan.registry.row_count,
+            Some(crate::worktree_registry::MAX_RECORDS)
+        );
+        assert!(
+            fixture
+                .broker
+                .apply_fresh_worktree_root_recovery(&plan.digest)
+                .is_err()
+        );
+        assert!(!fixture.root.exists());
+        let count: usize = rusqlite::Connection::open(&registry_path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM roots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, crate::worktree_registry::MAX_RECORDS);
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn recovery_marker_is_synced_before_registry_row_and_retry_completes_binding() {
+        let mut fixture = fresh_root_fixture(false);
+        let first_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint_and_sync_and_marker_file(
+                &first_plan.digest,
+                |checkpoint, _| {
+                    if checkpoint
+                        == FreshRootRecoveryApplyCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                    {
+                        events.borrow_mut().push("before-registry-record");
+                        Err("injected interruption after marker directory sync".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |path, expected| {
+                    if path == fixture.root.as_path() {
+                        events.borrow_mut().push("marker-root-sync");
+                    }
+                    sync_bound_directory(path, expected)
+                },
+                |root, marker, expected_root, expected_file| {
+                    events.borrow_mut().push("marker-file-sync");
+                    sync_fresh_root_recovery_marker_file(
+                        root,
+                        marker,
+                        expected_root,
+                        expected_file,
+                    )
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("before registry record"));
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "marker-file-sync",
+                "marker-root-sync",
+                "before-registry-record"
+            ]
+        );
+        let partial_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            partial_plan.root_inventory.state,
+            FreshRootRecoveryPathState::ExactMarker
+        );
+        assert_eq!(
+            partial_plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_reserved_and_unregistered(&mut fixture);
+
+        fixture
+            .broker
+            .apply_fresh_worktree_root_recovery(&partial_plan.digest)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::Bound
+        );
+    }
+
+    #[test]
+    fn recovery_syncs_existing_empty_root_parent_before_registry_initialization() {
+        let mut fixture = fresh_root_fixture(true);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(plan.root_inventory.state, FreshRootRecoveryPathState::Empty);
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint_and_sync(
+                &plan.digest,
+                |checkpoint, _| {
+                    if checkpoint == FreshRootRecoveryApplyCheckpoint::BeforeRegistryInitialization
+                    {
+                        events.borrow_mut().push("before-registry-initialization");
+                    }
+                    if checkpoint
+                        == FreshRootRecoveryApplyCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                    {
+                        events.borrow_mut().push("before-registry-record");
+                        Err("injected interruption after marker directory sync".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |path, expected| {
+                    if path == fixture.root.parent().unwrap() {
+                        events.borrow_mut().push("parent-sync");
+                    } else if path == fixture.root.as_path() {
+                        events.borrow_mut().push("marker-root-sync");
+                    }
+                    sync_bound_directory(path, expected)
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("before registry record"));
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "parent-sync",
+                "before-registry-initialization",
+                "marker-root-sync",
+                "before-registry-record"
+            ]
+        );
+        let partial_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            partial_plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_reserved_and_unregistered(&mut fixture);
+    }
+
+    #[test]
+    fn recovery_parent_sync_failure_on_existing_empty_root_leaves_no_target_row() {
+        let mut fixture = fresh_root_fixture(true);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint_and_sync(
+                &plan.digest,
+                |_, _| Ok(()),
+                |path, expected| {
+                    if path == fixture.root.parent().unwrap() {
+                        Err("injected parent directory sync failure".into())
+                    } else {
+                        sync_bound_directory(path, expected)
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("reviewed recovery root parent"));
+        let after = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            after.root_inventory.state,
+            FreshRootRecoveryPathState::Empty
+        );
+        assert_eq!(
+            after.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::MissingDatabase
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn recovery_marker_directory_sync_failure_leaves_no_target_row() {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint_and_sync(
+                &plan.digest,
+                |_, _| Ok(()),
+                |path, expected| {
+                    if path == fixture.root.as_path() {
+                        Err("injected marker directory sync failure".into())
+                    } else {
+                        sync_bound_directory(path, expected)
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durably sync recovery marker namespace")
+        );
+        let partial_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            partial_plan.root_inventory.state,
+            FreshRootRecoveryPathState::ExactMarker
+        );
+        assert_eq!(
+            partial_plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_reserved_and_unregistered(&mut fixture);
+    }
+
+    #[test]
+    fn exact_marker_retry_syncs_marker_file_before_root_directory_and_registry_row() {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = exact_marker_without_target_row(&mut fixture);
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint_and_sync_and_marker_file(
+                &plan.digest,
+                |checkpoint, _| {
+                    if checkpoint
+                        == FreshRootRecoveryApplyCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                    {
+                        events.borrow_mut().push("before-registry-record");
+                        Err("injected interruption after marker directory sync".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |path, expected| {
+                    if path == fixture.root.as_path() {
+                        events.borrow_mut().push("root-directory-sync");
+                    }
+                    sync_bound_directory(path, expected)
+                },
+                |root, marker, expected_root, expected_file| {
+                    events.borrow_mut().push("marker-file-sync");
+                    sync_fresh_root_recovery_marker_file(
+                        root,
+                        marker,
+                        expected_root,
+                        expected_file,
+                    )
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("before registry record"));
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "marker-file-sync",
+                "root-directory-sync",
+                "before-registry-record"
+            ]
+        );
+        let retry_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            retry_plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        fixture
+            .broker
+            .apply_fresh_worktree_root_recovery(&retry_plan.digest)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::Bound
+        );
+    }
+
+    #[test]
+    fn exact_marker_file_sync_failure_leaves_no_target_row() {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = exact_marker_without_target_row(&mut fixture);
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint_and_sync_and_marker_file(
+                &plan.digest,
+                |checkpoint, _| {
+                    if checkpoint
+                        == FreshRootRecoveryApplyCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                    {
+                        events.borrow_mut().push("before-registry-record");
+                        Err("checkpoint ran despite marker file sync failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |path, expected| {
+                    if path == fixture.root.as_path() {
+                        events.borrow_mut().push("root-directory-sync");
+                    }
+                    sync_bound_directory(path, expected)
+                },
+                |_, _, _, _| {
+                    events.borrow_mut().push("marker-file-sync");
+                    Err("injected marker file sync failure".into())
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durably sync recovery marker file")
+        );
+        assert_eq!(*events.borrow(), vec!["marker-file-sync"]);
+        let after = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            after.root_inventory.state,
+            FreshRootRecoveryPathState::ExactMarker
+        );
+        assert_eq!(
+            after.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn exact_marker_replacement_after_plan_is_refused_even_with_same_bytes() {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = exact_marker_without_target_row(&mut fixture);
+        let marker_path = fixture.root.join(WORKTREE_ROOT_MARKER);
+        let previous_marker = fixture.root.with_file_name("previous-marker");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        std::fs::rename(&marker_path, &previous_marker).unwrap();
+        std::fs::write(&marker_path, marker_bytes).unwrap();
+
+        let after_replacement = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            after_replacement.root_inventory.state,
+            FreshRootRecoveryPathState::ExactMarker
+        );
+        assert_ne!(
+            after_replacement.root_inventory.marker_identity,
+            plan.root_inventory.marker_identity
+        );
+        assert!(
+            fixture
+                .broker
+                .apply_fresh_worktree_root_recovery(&plan.digest)
+                .is_err()
+        );
+        assert_eq!(
+            after_replacement.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn durable_registry_row_before_binding_is_an_exact_retryable_prefix() {
+        let mut fixture = fresh_root_fixture(false);
+        let first_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint(
+                &first_plan.digest,
+                |checkpoint, _| {
+                    if checkpoint
+                        == FreshRootRecoveryApplyCheckpoint::RegistryRowDurablyRecordedBeforeBinding
+                    {
+                        Err("injected interruption after registry durability".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("before binding"));
+        let partial_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            partial_plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExactTargetRow
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+        fixture
+            .broker
+            .apply_fresh_worktree_root_recovery(&partial_plan.digest)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::Bound
+        );
+    }
+
+    #[test]
+    fn recovery_apply_refuses_replacement_of_reviewed_empty_root_after_registry_initialization() {
+        let mut fixture = fresh_root_fixture(true);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint(&plan.digest, |checkpoint, path| {
+                if checkpoint
+                    == FreshRootRecoveryApplyCheckpoint::AfterRegistryInitializationBeforeMarker
+                {
+                    replace_root_with_empty_directory(path);
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("identity"));
+        assert!(!fixture.root.join(WORKTREE_ROOT_MARKER).exists());
+        let after = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            after.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_eq!(
+            after.root_inventory.state,
+            FreshRootRecoveryPathState::Empty
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn recovery_apply_refuses_replacement_of_created_missing_root_before_admission() {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint(&plan.digest, |checkpoint, path| {
+                if checkpoint == FreshRootRecoveryApplyCheckpoint::BeforeRegistryInitialization {
+                    replace_root_with_empty_directory(path);
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("identity"));
+        assert!(!fixture.root.join(WORKTREE_ROOT_MARKER).exists());
+        let after = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            after.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::MissingDatabase
+        );
+        assert_eq!(
+            after.root_inventory.state,
+            FreshRootRecoveryPathState::Empty
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn recovery_apply_refuses_replacement_after_marker_sync_before_registry_row() {
+        let mut fixture = fresh_root_fixture(true);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let mut moved_root = None;
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint(&plan.digest, |checkpoint, path| {
+                if checkpoint
+                    == FreshRootRecoveryApplyCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                {
+                    moved_root = Some(replace_root_with_empty_directory(path));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("identity"));
+        let moved_root = moved_root.unwrap();
+        assert!(moved_root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert!(!fixture.root.join(WORKTREE_ROOT_MARKER).exists());
+        assert_reserved_and_unregistered(&mut fixture);
+    }
+
+    #[test]
+    fn recovery_apply_preserves_durable_exact_row_when_root_changes_before_binding() {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let mut moved_root = None;
+        let mut recorded_payload = None;
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint(&plan.digest, |checkpoint, path| {
+                if checkpoint
+                    == FreshRootRecoveryApplyCheckpoint::RegistryRowDurablyRecordedBeforeBinding
+                {
+                    let registry_path =
+                        crate::worktree_registry::registry_path(&fixture.host_operation_database)
+                            .unwrap();
+                    recorded_payload = Some(
+                        rusqlite::Connection::open(registry_path)
+                            .unwrap()
+                            .query_row("SELECT payload FROM roots", [], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .unwrap(),
+                    );
+                    moved_root = Some(replace_root_with_empty_directory(path));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("identity"));
+        assert!(moved_root.unwrap().join(WORKTREE_ROOT_MARKER).is_file());
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+        let registry_path =
+            crate::worktree_registry::registry_path(&fixture.host_operation_database).unwrap();
+        let persisted_payload: String = rusqlite::Connection::open(registry_path)
+            .unwrap()
+            .query_row("SELECT payload FROM roots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(Some(persisted_payload), recorded_payload);
+    }
+
+    #[test]
+    fn recovery_apply_refuses_parent_replacement_before_binding_and_preserves_row() {
+        let mut fixture = fresh_root_fixture(true);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let mut recorded_payload = None;
+        let mut root_identity_before_replacement = None;
+        let error = fixture
+            .broker
+            .apply_fresh_worktree_root_recovery_with_checkpoint(&plan.digest, |checkpoint, path| {
+                if checkpoint
+                    == FreshRootRecoveryApplyCheckpoint::RegistryRowDurablyRecordedBeforeBinding
+                {
+                    root_identity_before_replacement =
+                        Some(bound_directory_identity(path).unwrap());
+                    let registry_path =
+                        crate::worktree_registry::registry_path(&fixture.host_operation_database)
+                            .unwrap();
+                    recorded_payload = Some(
+                        rusqlite::Connection::open(registry_path)
+                            .unwrap()
+                            .query_row("SELECT payload FROM roots", [], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .unwrap(),
+                    );
+
+                    let parent = path.parent().unwrap().to_path_buf();
+                    let previous_parent = parent.with_file_name("managed-roots-replaced");
+                    std::fs::rename(&parent, &previous_parent).unwrap();
+                    create_private_directory(&parent);
+                    std::fs::rename(previous_parent.join("worktrees"), path).unwrap();
+                    assert_eq!(
+                        bound_directory_identity(path).unwrap(),
+                        root_identity_before_replacement.clone().unwrap()
+                    );
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("parent changed before binding"));
+        assert_eq!(
+            Some(bound_directory_identity(&fixture.root).unwrap()),
+            root_identity_before_replacement
+        );
+        assert!(fixture.root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+        let registry_path =
+            crate::worktree_registry::registry_path(&fixture.host_operation_database).unwrap();
+        let persisted_payload: String = rusqlite::Connection::open(registry_path)
+            .unwrap()
+            .query_row("SELECT payload FROM roots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(Some(persisted_payload), recorded_payload);
+    }
+
+    #[test]
+    fn normal_fresh_writer_syncs_marker_before_record_and_pins_created_inode() {
+        let mut fixture = fresh_root_fixture(false);
+        let events = std::cell::RefCell::new(Vec::new());
+        let error = fixture
+            .broker
+            .finish_fresh_worktree_root_with_checkpoint_and_sync(
+                &fixture.reservation.clone(),
+                &fixture.expected_parent,
+                |checkpoint, _| {
+                    if checkpoint
+                        == FreshRootPublicationCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                    {
+                        events.borrow_mut().push("before-registry-record");
+                        Err("injected interruption after marker directory sync".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |path, expected| {
+                    if path == fixture.root.as_path() {
+                        events.borrow_mut().push("marker-root-sync");
+                    }
+                    sync_bound_directory(path, expected)
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("before registry record"));
+        assert_eq!(
+            *events.borrow(),
+            vec!["marker-root-sync", "before-registry-record"]
+        );
+        assert!(fixture.root.join(WORKTREE_ROOT_MARKER).is_file());
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn normal_fresh_writer_marker_directory_sync_failure_leaves_no_target_row() {
+        let mut fixture = fresh_root_fixture(false);
+        let error = fixture
+            .broker
+            .finish_fresh_worktree_root_with_checkpoint_and_sync(
+                &fixture.reservation.clone(),
+                &fixture.expected_parent,
+                |_, _| Ok(()),
+                |path, expected| {
+                    if path == fixture.root.as_path() {
+                        Err("injected marker directory sync failure".into())
+                    } else {
+                        sync_bound_directory(path, expected)
+                    }
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durably sync worktree-root marker namespace")
+        );
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            plan.root_inventory.state,
+            FreshRootRecoveryPathState::ExactMarker
+        );
+        assert_eq!(
+            plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn normal_fresh_writer_refuses_replacement_after_marker_sync_before_record() {
+        let mut fixture = fresh_root_fixture(false);
+        let mut moved_root = None;
+        let error = fixture
+            .broker
+            .finish_fresh_worktree_root_with_checkpoint(
+                &fixture.reservation.clone(),
+                &fixture.expected_parent,
+                |checkpoint, path| {
+                    if checkpoint
+                        == FreshRootPublicationCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord
+                    {
+                        moved_root = Some(replace_root_with_empty_directory(path));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("identity"));
+        assert!(moved_root.unwrap().join(WORKTREE_ROOT_MARKER).is_file());
+        assert!(!fixture.root.join(WORKTREE_ROOT_MARKER).exists());
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(
+            plan.registry.state,
+            crate::worktree_registry::FreshRootRegistryState::ExistingNoTargetRow
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn normal_fresh_writer_refuses_replacement_after_row_before_build_defaults() {
+        let mut fixture = fresh_root_fixture(false);
+        let mut moved_root = None;
+        let mut recorded_payload = None;
+        let error = fixture
+            .broker
+            .finish_fresh_worktree_root_with_checkpoint(
+                &fixture.reservation.clone(),
+                &fixture.expected_parent,
+                |checkpoint, path| {
+                    if checkpoint == FreshRootPublicationCheckpoint::RegistryRowDurablyRecorded {
+                        let registry_path = crate::worktree_registry::registry_path(
+                            &fixture.host_operation_database,
+                        )
+                        .unwrap();
+                        recorded_payload = Some(
+                            rusqlite::Connection::open(registry_path)
+                                .unwrap()
+                                .query_row("SELECT payload FROM roots", [], |row| {
+                                    row.get::<_, String>(0)
+                                })
+                                .unwrap(),
+                        );
+                        moved_root = Some(replace_root_with_empty_directory(path));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("identity"));
+        let moved_root = moved_root.unwrap();
+        assert!(moved_root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert_eq!(std::fs::read_dir(&fixture.root).unwrap().count(), 0);
+        let registry_path =
+            crate::worktree_registry::registry_path(&fixture.host_operation_database).unwrap();
+        let persisted_payload: String = rusqlite::Connection::open(registry_path)
+            .unwrap()
+            .query_row("SELECT payload FROM roots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(Some(persisted_payload), recorded_payload);
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshReserved
+        );
     }
 }
 
@@ -2601,6 +3705,17 @@ fn bound_directory_identity(path: &Path) -> Result<BoundDirectoryIdentity, Strin
             "this platform cannot verify the persisted directory identity for {}",
             canonical_path.display()
         ))
+    }
+}
+
+fn require_bound_directory_identity(
+    path: &Path,
+    expected: &BoundDirectoryIdentity,
+) -> Result<(), String> {
+    if &bound_directory_identity(path)? == expected {
+        Ok(())
+    } else {
+        Err("directory identity changed at the reserved path".into())
     }
 }
 
@@ -4763,6 +5878,49 @@ impl Broker {
         &mut self,
         confirmed_digest: &str,
     ) -> Result<(), BrokerOpError> {
+        self.apply_fresh_worktree_root_recovery_with_checkpoint(confirmed_digest, |_, _| Ok(()))
+    }
+
+    fn apply_fresh_worktree_root_recovery_with_checkpoint(
+        &mut self,
+        confirmed_digest: &str,
+        checkpoint: impl FnMut(FreshRootRecoveryApplyCheckpoint, &Path) -> Result<(), String>,
+    ) -> Result<(), BrokerOpError> {
+        self.apply_fresh_worktree_root_recovery_with_checkpoint_and_sync(
+            confirmed_digest,
+            checkpoint,
+            |path, expected| sync_bound_directory(path, expected),
+        )
+    }
+
+    fn apply_fresh_worktree_root_recovery_with_checkpoint_and_sync(
+        &mut self,
+        confirmed_digest: &str,
+        checkpoint: impl FnMut(FreshRootRecoveryApplyCheckpoint, &Path) -> Result<(), String>,
+        sync_directory: impl FnMut(&Path, &BoundDirectoryIdentity) -> Result<(), String>,
+    ) -> Result<(), BrokerOpError> {
+        self.apply_fresh_worktree_root_recovery_with_checkpoint_and_sync_and_marker_file(
+            confirmed_digest,
+            checkpoint,
+            sync_directory,
+            |root, marker, expected_root, expected_file| {
+                sync_fresh_root_recovery_marker_file(root, marker, expected_root, expected_file)
+            },
+        )
+    }
+
+    fn apply_fresh_worktree_root_recovery_with_checkpoint_and_sync_and_marker_file(
+        &mut self,
+        confirmed_digest: &str,
+        mut checkpoint: impl FnMut(FreshRootRecoveryApplyCheckpoint, &Path) -> Result<(), String>,
+        mut sync_directory: impl FnMut(&Path, &BoundDirectoryIdentity) -> Result<(), String>,
+        mut sync_marker_file: impl FnMut(
+            &Path,
+            &WorktreeRootMarker,
+            &BoundDirectoryIdentity,
+            &crate::worktree_registry::RecoveryArtifactIdentity,
+        ) -> Result<(), String>,
+    ) -> Result<(), BrokerOpError> {
         let _binding_lock = crate::store::fresh_database::acquire_repository_binding_lock(
             &self.main_root,
             self.store.db_path(),
@@ -4828,7 +5986,7 @@ impl Broker {
             });
         }
 
-        let mut root_created = false;
+        let mut expected_root_identity = plan.root_inventory.root_identity.clone();
         if plan.root_inventory.state == FreshRootRecoveryPathState::Missing {
             let parent = plan.worktree_root.parent().ok_or_else(|| {
                 BrokerOpError::WorktreeRootUnavailable {
@@ -4859,6 +6017,15 @@ impl Broker {
                 path: plan.worktree_root.clone(),
                 reason: "fresh-root recovery requires Unix no-follow directory creation".into(),
             });
+            let created_identity =
+                bound_directory_identity(&plan.worktree_root).map_err(|reason| {
+                    BrokerOpError::WorktreeRootUnavailable {
+                        path: plan.worktree_root.clone(),
+                        reason: format!(
+                            "cannot capture newly created recovery root identity: {reason}"
+                        ),
+                    }
+                })?;
             crate::host_state::protect_host_state_path(&plan.worktree_root, true).map_err(
                 |error| BrokerOpError::WorktreeRootUnavailable {
                     path: plan.worktree_root.clone(),
@@ -4871,14 +6038,55 @@ impl Broker {
                     reason: format!("cannot verify recovered root permissions: {reason}"),
                 }
             })?;
-            sync_bound_directory(parent, &parent_identity).map_err(|reason| {
+            require_bound_directory_identity(&plan.worktree_root, &created_identity).map_err(
+                |reason| BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: format!(
+                        "newly created recovery root changed during protection: {reason}"
+                    ),
+                },
+            )?;
+            expected_root_identity = Some(created_identity);
+            sync_directory(parent, &parent_identity).map_err(|reason| {
                 BrokerOpError::WorktreeRootUnavailable {
                     path: parent.to_path_buf(),
                     reason: format!("cannot sync recovered root name: {reason}"),
                 }
             })?;
-            root_created = true;
         }
+
+        let root_identity =
+            expected_root_identity.ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "reviewed recovery root has no exact directory identity".into(),
+            })?;
+        let parent =
+            plan.worktree_root
+                .parent()
+                .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: "reserved root has no parent".into(),
+                })?;
+        sync_directory(parent, &parent_identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!("cannot sync reviewed recovery root parent: {reason}"),
+            }
+        })?;
+        checkpoint(
+            FreshRootRecoveryApplyCheckpoint::BeforeRegistryInitialization,
+            &plan.worktree_root,
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: plan.worktree_root.clone(),
+            reason: format!("recovery checkpoint refused before registry initialization: {reason}"),
+        })?;
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed before registry initialization: {reason}"),
+            },
+        )?;
 
         if registry_guard.observation().state
             == crate::worktree_registry::FreshRootRegistryState::MissingDatabase
@@ -4892,12 +6100,38 @@ impl Broker {
                     ),
                 })?;
         }
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed during registry initialization: {reason}"),
+            },
+        )?;
         registry_guard
             .check_capacity_before_marker()
             .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
                 path: plan.worktree_root.clone(),
                 reason: format!("recovery capacity check failed before marker creation: {error}"),
             })?;
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed during recovery preflight: {reason}"),
+            },
+        )?;
+        checkpoint(
+            FreshRootRecoveryApplyCheckpoint::AfterRegistryInitializationBeforeMarker,
+            &plan.worktree_root,
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: plan.worktree_root.clone(),
+            reason: format!("recovery checkpoint refused after registry initialization: {reason}"),
+        })?;
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed after registry initialization: {reason}"),
+            },
+        )?;
 
         let root_before_marker = fresh_root_recovery_inventory(&plan.worktree_root, &marker)
             .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
@@ -4913,53 +6147,166 @@ impl Broker {
             }
         } else if root_before_marker.state != FreshRootRecoveryPathState::Empty
             || root_before_marker.cargo.is_some()
+            || root_before_marker.root_identity.as_ref() != Some(&root_identity)
         {
             return Err(BrokerOpError::WorktreeRootUnavailable {
                 path: plan.worktree_root.clone(),
-                reason: "unmarked root changed before marker creation".into(),
+                reason: "unmarked root identity or inventory changed before marker creation".into(),
             });
         }
 
-        if plan.root_inventory.state != FreshRootRecoveryPathState::ExactMarker {
-            create_fresh_root_recovery_marker(&plan.worktree_root, &marker).map_err(|reason| {
-                BrokerOpError::WorktreeRootUnavailable {
-                    path: plan.worktree_root.join(WORKTREE_ROOT_MARKER),
-                    reason,
-                }
+        let marker_file_identity =
+            if plan.root_inventory.state == FreshRootRecoveryPathState::ExactMarker {
+                plan.root_inventory.marker_identity.clone().ok_or_else(|| {
+                    BrokerOpError::WorktreeRootUnavailable {
+                        path: plan.worktree_root.join(WORKTREE_ROOT_MARKER),
+                        reason: "reviewed exact marker has no file identity".into(),
+                    }
+                })?
+            } else {
+                create_fresh_root_recovery_marker(&plan.worktree_root, &marker, &root_identity)
+                    .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                        path: plan.worktree_root.join(WORKTREE_ROOT_MARKER),
+                        reason,
+                    })?
+            };
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed after marker publication: {reason}"),
+            },
+        )?;
+        let marker_inventory = fresh_root_recovery_inventory(&plan.worktree_root, &marker)
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("cannot verify published recovery marker: {reason}"),
             })?;
+        if marker_inventory.state != FreshRootRecoveryPathState::ExactMarker
+            || marker_inventory.root_identity.as_ref() != Some(&root_identity)
+            || marker_inventory.marker_identity.as_ref() != Some(&marker_file_identity)
+        {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "published marker does not belong to the reviewed recovery root".into(),
+            });
         }
+        sync_marker_file(
+            &plan.worktree_root,
+            &marker,
+            &root_identity,
+            &marker_file_identity,
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: plan.worktree_root.join(WORKTREE_ROOT_MARKER),
+            reason: format!("cannot durably sync recovery marker file: {reason}"),
+        })?;
+        let synced_marker_inventory = fresh_root_recovery_inventory(&plan.worktree_root, &marker)
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: plan.worktree_root.clone(),
+            reason: format!("cannot verify recovery marker after file sync: {reason}"),
+        })?;
+        if synced_marker_inventory.state != FreshRootRecoveryPathState::ExactMarker
+            || synced_marker_inventory.root_identity.as_ref() != Some(&root_identity)
+            || synced_marker_inventory.marker_identity.as_ref() != Some(&marker_file_identity)
+        {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "recovery marker changed during file sync".into(),
+            });
+        }
+        sync_directory(&plan.worktree_root, &root_identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("cannot durably sync recovery marker namespace: {reason}"),
+            }
+        })?;
+        checkpoint(
+            FreshRootRecoveryApplyCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord,
+            &plan.worktree_root,
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: plan.worktree_root.clone(),
+            reason: format!(
+                "recovery stopped after marker durability and before registry record: {reason}"
+            ),
+        })?;
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed before registry record: {reason}"),
+            },
+        )?;
         registry_guard.record_exact_target().map_err(|error| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: plan.worktree_root.clone(),
                 reason: format!("cannot durably record recovered worktree root: {error}"),
             }
         })?;
-        let root_identity = bound_directory_identity(&plan.worktree_root).map_err(|reason| {
-            BrokerOpError::WorktreeRootUnavailable {
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
                 path: plan.worktree_root.clone(),
-                reason: format!("cannot capture recovered root identity: {reason}"),
-            }
-        })?;
-        sync_bound_directory(&plan.worktree_root, &root_identity).map_err(|reason| {
-            BrokerOpError::WorktreeRootUnavailable {
+                reason: format!("reserved root changed after registry record: {reason}"),
+            },
+        )?;
+        let recorded_inventory = fresh_root_recovery_inventory(&plan.worktree_root, &marker)
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
                 path: plan.worktree_root.clone(),
-                reason: format!("cannot sync recovered root contents: {reason}"),
-            }
+                reason: format!("cannot verify recovery root after registry record: {reason}"),
+            })?;
+        if recorded_inventory.state != FreshRootRecoveryPathState::ExactMarker
+            || recorded_inventory.root_identity.as_ref() != Some(&root_identity)
+            || registry_guard.observation().state
+                != crate::worktree_registry::FreshRootRegistryState::ExactTargetRow
+        {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "durable registry row does not match the reviewed root marker and identity"
+                    .into(),
+            });
+        }
+        checkpoint(
+            FreshRootRecoveryApplyCheckpoint::RegistryRowDurablyRecordedBeforeBinding,
+            &plan.worktree_root,
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: plan.worktree_root.clone(),
+            reason: format!(
+                "recovery stopped after registry durability and before binding: {reason}"
+            ),
         })?;
-        if root_created {
-            let parent = plan.worktree_root.parent().ok_or_else(|| {
-                BrokerOpError::WorktreeRootUnavailable {
+        require_bound_directory_identity(&plan.worktree_root, &root_identity).map_err(
+            |reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed before binding completion: {reason}"),
+            },
+        )?;
+        let parent =
+            plan.worktree_root
+                .parent()
+                .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
                     path: plan.worktree_root.clone(),
                     reason: "reserved root has no parent".into(),
-                }
-            })?;
-            sync_bound_directory(parent, &parent_identity).map_err(|reason| {
-                BrokerOpError::WorktreeRootUnavailable {
-                    path: parent.to_path_buf(),
-                    reason: format!("cannot sync recovered root parent: {reason}"),
-                }
-            })?;
-        }
+                })?;
+        require_bound_directory_identity(parent, &parent_identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!("reserved root parent changed before binding completion: {reason}"),
+            }
+        })?;
+        sync_directory(parent, &parent_identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!("cannot sync recovered root parent before binding: {reason}"),
+            }
+        })?;
+        require_bound_directory_identity(parent, &parent_identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!(
+                    "reserved root parent changed while syncing before binding: {reason}"
+                ),
+            }
+        })?;
         let root_identity_json = serde_json::to_string(&root_identity).map_err(|error| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: plan.worktree_root.clone(),
@@ -5653,6 +7000,43 @@ impl Broker {
                     ),
                 })
                 .and_then(|()| {
+                    let expected_root: BoundDirectoryIdentity =
+                        serde_json::from_str(&root_identity_json).map_err(|error| {
+                            BrokerOpError::WorktreeRootUnavailable {
+                                path: reservation.worktree_root.clone(),
+                                reason: format!(
+                                    "created worktree-root identity is invalid: {error}"
+                                ),
+                            }
+                        })?;
+                    require_bound_directory_identity(&reservation.worktree_root, &expected_root)
+                        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                            path: reservation.worktree_root.clone(),
+                            reason: format!(
+                                "created worktree-root identity changed before binding: {reason}"
+                            ),
+                        })?;
+                    require_bound_directory_identity(
+                        reservation.worktree_root.parent().ok_or_else(|| {
+                            BrokerOpError::WorktreeRootUnavailable {
+                                path: reservation.worktree_root.clone(),
+                                reason: "reserved worktree root has no parent before binding"
+                                    .into(),
+                            }
+                        })?,
+                        &expected_parent,
+                    )
+                    .map_err(|reason| {
+                        BrokerOpError::WorktreeRootUnavailable {
+                            path: reservation.worktree_root.clone(),
+                            reason: format!(
+                                "worktree-root parent changed before binding: {reason}"
+                            ),
+                        }
+                    })?;
+                    Ok(())
+                })
+                .and_then(|()| {
                     self.store
                         .complete_fresh_repository_worktree_binding(
                             &identity,
@@ -5661,6 +7045,40 @@ impl Broker {
                         )
                         .map(|_| ())
                         .map_err(BrokerOpError::from)
+                })
+                .and_then(|()| {
+                    let expected_root: BoundDirectoryIdentity = serde_json::from_str(
+                        &root_identity_json,
+                    )
+                    .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                        path: reservation.worktree_root.clone(),
+                        reason: format!(
+                            "created worktree-root identity is invalid after binding: {error}"
+                        ),
+                    })?;
+                    require_bound_directory_identity(&reservation.worktree_root, &expected_root)
+                        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                            path: reservation.worktree_root.clone(),
+                            reason: format!(
+                                "created worktree-root identity changed after binding: {reason}"
+                            ),
+                        })?;
+                    require_bound_directory_identity(
+                        reservation.worktree_root.parent().ok_or_else(|| {
+                            BrokerOpError::WorktreeRootUnavailable {
+                                path: reservation.worktree_root.clone(),
+                                reason: "reserved worktree root has no parent after binding".into(),
+                            }
+                        })?,
+                        &expected_parent,
+                    )
+                    .map_err(|reason| {
+                        BrokerOpError::WorktreeRootUnavailable {
+                            path: reservation.worktree_root.clone(),
+                            reason: format!("worktree-root parent changed after binding: {reason}"),
+                        }
+                    })?;
+                    Ok(())
                 });
                 if let Err(error) = completion {
                     if let Err(recovery_error) =
@@ -5711,6 +7129,30 @@ impl Broker {
         reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
         expected_parent: &BoundDirectoryIdentity,
     ) -> Result<String, BrokerOpError> {
+        self.finish_fresh_worktree_root_with_checkpoint(reservation, expected_parent, |_, _| Ok(()))
+    }
+
+    fn finish_fresh_worktree_root_with_checkpoint(
+        &mut self,
+        reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
+        expected_parent: &BoundDirectoryIdentity,
+        checkpoint: impl FnMut(FreshRootPublicationCheckpoint, &Path) -> Result<(), String>,
+    ) -> Result<String, BrokerOpError> {
+        self.finish_fresh_worktree_root_with_checkpoint_and_sync(
+            reservation,
+            expected_parent,
+            checkpoint,
+            |path, expected| sync_bound_directory(path, expected),
+        )
+    }
+
+    fn finish_fresh_worktree_root_with_checkpoint_and_sync(
+        &mut self,
+        reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
+        expected_parent: &BoundDirectoryIdentity,
+        mut checkpoint: impl FnMut(FreshRootPublicationCheckpoint, &Path) -> Result<(), String>,
+        mut sync_directory: impl FnMut(&Path, &BoundDirectoryIdentity) -> Result<(), String>,
+    ) -> Result<String, BrokerOpError> {
         let root = &reservation.worktree_root;
         let parent = root
             .parent()
@@ -5743,6 +7185,12 @@ impl Broker {
                 reason: "fresh root creation requires Unix no-follow identity checks".into(),
             });
         }
+        let identity = bound_directory_identity(root).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot capture created worktree-root identity: {reason}"),
+            }
+        })?;
         if !matches!(root.canonicalize(), Ok(actual) if actual == *root) {
             return Err(BrokerOpError::WorktreeRootUnavailable {
                 path: root.clone(),
@@ -5762,6 +7210,20 @@ impl Broker {
                 reason: format!("cannot verify private worktree-root permissions: {reason}"),
             }
         })?;
+        require_bound_directory_identity(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!(
+                    "created worktree-root identity changed during protection: {reason}"
+                ),
+            }
+        })?;
+        sync_directory(parent, expected_parent).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!("cannot durably publish reserved worktree-root name: {reason}"),
+            }
+        })?;
         let admission =
             crate::worktree_registry::admit(&self.host_operation_database_path()?, root).map_err(
                 |error| BrokerOpError::WorktreeRootUnavailable {
@@ -5769,7 +7231,45 @@ impl Broker {
                     reason: format!("cannot retain worktree storage discovery: {error}"),
                 },
             )?;
+        require_bound_directory_identity(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!(
+                    "created worktree-root identity changed during admission: {reason}"
+                ),
+            }
+        })?;
         self.write_or_verify_worktree_root_marker(root)?;
+        require_bound_directory_identity(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!(
+                    "created worktree-root identity changed after marker publication: {reason}"
+                ),
+            }
+        })?;
+        sync_directory(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot durably sync worktree-root marker namespace: {reason}"),
+            }
+        })?;
+        checkpoint(
+            FreshRootPublicationCheckpoint::MarkerDurablyPublishedBeforeRegistryRecord,
+            root,
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason: format!("fresh-root publication stopped before registry record: {reason}"),
+        })?;
+        require_bound_directory_identity(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!(
+                    "created worktree-root identity changed before registry record: {reason}"
+                ),
+            }
+        })?;
         let marker = WorktreeRootMarker {
             schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
             repository_key: reservation.identity.repository_key.clone(),
@@ -5781,23 +7281,57 @@ impl Broker {
                 path: root.clone(),
                 reason: format!("cannot retain worktree storage discovery: {error}"),
             })?;
+        require_bound_directory_identity(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!(
+                    "created worktree-root identity changed after registry record: {reason}"
+                ),
+            }
+        })?;
+        checkpoint(
+            FreshRootPublicationCheckpoint::RegistryRowDurablyRecorded,
+            root,
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason: format!("fresh-root publication stopped after registry record: {reason}"),
+        })?;
+        require_bound_directory_identity(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!(
+                    "created worktree-root identity changed after registry record checkpoint: {reason}"
+                ),
+            }
+        })?;
+        require_bound_directory_identity(parent, expected_parent).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!(
+                    "worktree-root parent changed after registry record checkpoint: {reason}"
+                ),
+            }
+        })?;
         crate::warn_unrecorded(
             "write worktree build defaults",
             write_worktree_build_defaults(root),
         );
-        let identity = bound_directory_identity(root).map_err(|reason| {
+        require_bound_directory_identity(root, &identity).map_err(|reason| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: root.clone(),
-                reason: format!("cannot capture created worktree-root identity: {reason}"),
+                reason: format!(
+                    "created worktree-root identity changed after build defaults: {reason}"
+                ),
             }
         })?;
-        sync_bound_directory(root, &identity).map_err(|reason| {
+        sync_directory(root, &identity).map_err(|reason| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: root.clone(),
                 reason: format!("cannot durably sync created worktree-root entries: {reason}"),
             }
         })?;
-        sync_bound_directory(parent, expected_parent).map_err(|reason| {
+        sync_directory(parent, expected_parent).map_err(|reason| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: parent.to_path_buf(),
                 reason: format!("cannot durably sync reserved worktree-root parent: {reason}"),
