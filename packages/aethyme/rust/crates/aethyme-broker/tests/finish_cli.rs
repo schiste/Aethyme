@@ -174,7 +174,11 @@ fn finish_preserves_discovery_errors_before_closing_the_session() {
         .map(|directory| directory.join("git"))
         .find(|candidate| candidate.is_file())
         .expect("the test host has git on PATH");
-    let bin = tmp.path().join("slow-git-bin");
+    let bin = tmp
+        .path()
+        .parent()
+        .expect("fixture repo has an owning root")
+        .join("slow-git-bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shim = bin.join("git");
     std::fs::write(
