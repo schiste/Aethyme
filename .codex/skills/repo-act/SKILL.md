@@ -145,6 +145,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
+  Before freezing execution argv, check it against the actual helper parser
+  and environment allowlist; do not pass defaults already fixed by the runner as
+  caller overrides. Successful plan or intent generation alone does not prove
+  that execution accepts the same argv.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Check which filenames the delegated monitor
   owns; store caller summaries under distinct names instead of overwriting or
