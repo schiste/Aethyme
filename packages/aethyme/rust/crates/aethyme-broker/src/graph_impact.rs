@@ -1918,20 +1918,22 @@ mod tests {
     }
 
     fn covered_root(revision: &str, edge_kind: &str) -> tempfile::TempDir {
+        covered_root_with_tests_coverage(revision, edge_kind, true)
+    }
+
+    fn covered_root_without_tests_coverage(revision: &str, edge_kind: &str) -> tempfile::TempDir {
+        covered_root_with_tests_coverage(revision, edge_kind, false)
+    }
+
+    fn covered_root_with_tests_coverage(
+        revision: &str,
+        edge_kind: &str,
+        include_tests_coverage: bool,
+    ) -> tempfile::TempDir {
         use aethyme_engine::store::redb::graph_store::{GraphStore, RepoMetadata};
         use aethyme_graph_storage::write_coverage_artifacts;
 
         let root = tempfile::tempdir().unwrap();
-        let store = GraphStore::open(root.path()).unwrap();
-        store
-            .set_repo_metadata(&RepoMetadata {
-                root_path: root.path().display().to_string(),
-                commit_hash: Some(revision.into()),
-                indexed_at_unix: 0,
-                file_count: 1,
-                languages: vec!["rust".into()],
-            })
-            .unwrap();
         let mut coverage = GraphCoverage::unavailable("fixture-engine");
         coverage.available = true;
         coverage.source_revision = Some(revision.into());
@@ -1946,11 +1948,34 @@ mod tests {
             .by_language
             .insert("rust".into(), Default::default());
         coverage.edge_counts_by_kind.insert(edge_kind.into(), 1);
-        coverage
-            .edge_counts_by_kind
-            .entry("tests".into())
-            .or_insert(0);
+        if include_tests_coverage {
+            coverage
+                .edge_counts_by_kind
+                .entry("tests".into())
+                .or_insert(0);
+        }
+        assert_eq!(coverage.edge_counts_by_kind.get("calls"), Some(&1));
+        assert_eq!(
+            coverage.edge_counts_by_kind.get("tests").copied(),
+            include_tests_coverage.then_some(0)
+        );
+        assert!(!coverage.edge_counts_by_kind.contains_key("Calls"));
+        assert!(!coverage.edge_counts_by_kind.contains_key("Tests"));
         write_coverage_artifacts(root.path(), &coverage, &[]).unwrap();
+
+        // The production provider rejects graph fragments newer than the
+        // graph store. Finalize metadata after writing the synthetic coverage
+        // artifact so this fixture tests coverage semantics, not write order.
+        let store = GraphStore::open(root.path()).unwrap();
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.path().display().to_string(),
+                commit_hash: Some(revision.into()),
+                indexed_at_unix: 0,
+                file_count: 1,
+                languages: vec!["rust".into()],
+            })
+            .unwrap();
         drop(store);
         root
     }
@@ -1958,7 +1983,7 @@ mod tests {
     #[test]
     fn revision_contract_requires_tests_relationship_coverage() {
         let mut coverage = GraphCoverage::unavailable("fixture-engine");
-        coverage.edge_counts_by_kind.insert("Calls".into(), 0);
+        coverage.edge_counts_by_kind.insert("calls".into(), 0);
 
         assert_eq!(
             missing_edge_kinds(&coverage, GraphImpactMode::Calls),
@@ -1968,12 +1993,13 @@ mod tests {
 
     #[test]
     fn revision_contract_marks_missing_tests_coverage_partial() {
-        use aethyme_graph_storage::{read_coverage, write_coverage_artifacts};
+        use aethyme_graph_storage::read_coverage;
 
-        let root = covered_root("abc", "Calls");
-        let mut coverage = read_coverage(root.path()).unwrap();
-        coverage.edge_counts_by_kind.remove("tests");
-        write_coverage_artifacts(root.path(), &coverage, &[]).unwrap();
+        let root = covered_root_without_tests_coverage("abc", "calls");
+        let coverage = read_coverage(root.path()).unwrap();
+        assert_eq!(coverage.edge_counts_by_kind.get("calls"), Some(&1));
+        assert!(!coverage.edge_counts_by_kind.contains_key("Calls"));
+        assert!(!coverage.edge_counts_by_kind.contains_key("tests"));
 
         let report = revision_bound_impact_report(
             root.path(),
@@ -1994,7 +2020,7 @@ mod tests {
 
     #[test]
     fn revision_contract_distinguishes_complete_empty_from_unavailable() {
-        let root = covered_root("abc", "Calls");
+        let root = covered_root("abc", "calls");
         let report = revision_bound_impact_report(
             root.path(),
             "abc",
@@ -2032,7 +2058,7 @@ mod tests {
 
     #[test]
     fn revision_contract_withholds_stale_paths_and_marks_truncation() {
-        let stale_root = covered_root("old", "Calls");
+        let stale_root = covered_root("old", "calls");
         let stale = revision_bound_impact_report(
             stale_root.path(),
             "new",
@@ -2048,7 +2074,7 @@ mod tests {
         assert_eq!(stale.status, GraphImpactContractStatus::Stale);
         assert!(stale.impact.callers.is_empty());
 
-        let root = covered_root("abc", "Calls");
+        let root = covered_root("abc", "calls");
         let truncated = revision_bound_impact_report(
             root.path(),
             "abc",
