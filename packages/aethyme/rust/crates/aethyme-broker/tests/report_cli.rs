@@ -620,7 +620,7 @@ fn list_is_read_only_and_reports_corruption_without_hiding_valid_artifacts() {
         &["advanced", "report", "show", "corrupt.json", "--json"],
     );
     assert!(!shown.status.success());
-    assert!(String::from_utf8_lossy(&shown.stderr).contains("invalid report JSON"));
+    assert!(json_error::message(&shown).contains("invalid report JSON"));
 }
 
 #[test]
@@ -717,7 +717,7 @@ fn show_rejects_path_escape_and_symlinked_artifacts() {
         &["advanced", "report", "show", "link.json", "--json"],
     );
     assert!(!linked.status.success());
-    assert!(String::from_utf8_lossy(&linked.stderr).contains("regular file"));
+    assert!(json_error::message(&linked).contains("regular file"));
 }
 
 #[test]
@@ -1328,7 +1328,7 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
 
     let second = run_with_env(tmp.path(), &args, &environment);
     assert!(!second.status.success());
-    let stderr = String::from_utf8_lossy(&second.stderr);
+    let stderr = json_error::message(&second);
     assert!(stderr.contains("is now write-blocked"));
     assert!(stderr.contains(&format!("Operation ID: {operation_id}")));
     assert!(stderr.contains(&format!("--operation {operation_id} --outcome succeeded")));
@@ -1343,10 +1343,10 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
     drop(broker);
     let after_successful_reconciliation = run_with_env(tmp.path(), &args, &environment);
     assert!(!after_successful_reconciliation.status.success());
-    let reconciliation_stderr = String::from_utf8_lossy(&after_successful_reconciliation.stderr);
+    let reconciliation_message = json_error::message(&after_successful_reconciliation);
     assert!(
-        reconciliation_stderr.contains("already has completed filing operation"),
-        "{reconciliation_stderr}"
+        reconciliation_message.contains("already has completed filing operation"),
+        "{reconciliation_message}"
     );
     assert_eq!(issue_creates(&calls_path), 1);
 
@@ -1413,3 +1413,6 @@ fn successful_command_without_a_parseable_issue_url_is_ambiguous() {
             .contains("success_result_not_recorded")
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

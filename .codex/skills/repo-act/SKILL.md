@@ -87,6 +87,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   to make it writable. After a reboot, mark missing evidence interrupted or
   unavailable. Recorded hashes do not recover missing bytes or recreate a trust
   record.
+- Before an expensive run, invoke the exact frozen helper entrypoint in its
+  plan and offline-control modes. Require nonempty parsed output with the
+  expected identity, schedule and zero-Cargo result; exit zero alone can hide a
+  missing entrypoint. Bind redundant manifest fields to the same final bytes.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Preserve earlier outputs before retrying.
   Freeze source for each invocation and record the exact head and dirty-state
@@ -167,6 +171,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `incremental=0` from the outset; avoid changing profile settings on a warm
   target. Expand to verbose or workspace-wide runs only when explicitly needed
   or after a focused failure.
+- Before a long or frozen Rust inventory, verify each selected
+  `--package`/`--test` pair against the owning package's effective Cargo
+  targets: the `tests/` defaults and any `[[test]]` or `autotests` settings
+  in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
+  target is a setup failure; stop before Cargo instead of treating it as a
+  product failure or zero-test result.
 - Run the fastest relevant test command first.
   Check the complete selected test names and a nonzero executed count before
   treating a focused run as evidence. Rust filters match substrings, including
@@ -181,6 +191,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   matching tests does not validate the change. Automated focused-test runners
   should refuse a successful zero-test result; preserve the process exit
   separately from that validation refusal.
+- For CLI JSON stream tests, parse complete stdout as one JSON value and
+  check child output on the intended stream separately. A report may retain
+  the original command arguments, so searching its serialized text for a child
+  marker cannot establish output isolation. Assert command metadata separately.
 - For a production guard that must prevent side effects, test the real entrypoint
   with a fixture command that writes a unique sentinel. Assert the typed refusal
   and sentinel absence, then remove only the call-site guard in a mutation run

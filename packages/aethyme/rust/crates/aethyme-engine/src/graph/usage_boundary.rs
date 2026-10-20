@@ -629,6 +629,8 @@ fn collect_adjacency_candidate_paths(
 }
 
 fn is_usage_boundary_seed_edge(kind: &EdgeKind) -> bool {
+    // Test-to-subject links are useful impact evidence, not runtime usage
+    // boundaries; keep them out of this runtime-facing seed set.
     matches!(
         kind,
         EdgeKind::Calls

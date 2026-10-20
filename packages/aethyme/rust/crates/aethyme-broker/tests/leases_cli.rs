@@ -230,7 +230,7 @@ fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
         ],
     );
     assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
+    let error = json_error::message(&output);
     assert!(
         error.contains("is closed and cannot authorize coordinated operations"),
         "{error}"
@@ -260,10 +260,7 @@ fn lease_plan_cli_requires_paths_and_rejects_ambiguous_spelling() {
         &["advanced", "leases", "plan", "src/../outside", "--json"],
     );
     assert!(!ambiguous.status.success());
-    assert!(
-        String::from_utf8_lossy(&ambiguous.stderr)
-            .contains("`.` and `..` path segments are ambiguous")
-    );
+    assert!(json_error::message(&ambiguous).contains("`.` and `..` path segments are ambiguous"));
 }
 
 #[test]
@@ -476,7 +473,7 @@ fn lease_export_requires_a_selector_and_valid_bounds() {
 
     let missing = run(tmp.path(), &["advanced", "leases", "export", "--json"]);
     assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("requires --session"));
+    assert!(json_error::message(&missing).contains("requires --session"));
 
     let excessive = run(
         tmp.path(),
@@ -548,3 +545,6 @@ fn a_lease_refusal_names_the_holder_and_its_status() {
         "and the holder's status, which is what makes it actionable: {text}"
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

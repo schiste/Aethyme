@@ -301,9 +301,9 @@ cost = 0
     );
     assert!(!corrupted.status.success());
     assert!(
-        String::from_utf8_lossy(&corrupted.stderr).contains("gates.toml"),
+        json_error::message(&corrupted).contains("gates.toml"),
         "{}",
-        String::from_utf8_lossy(&corrupted.stderr)
+        json_error::message(&corrupted)
     );
     let missing = run(
         tmp.path(),
@@ -319,7 +319,7 @@ cost = 0
         ],
     );
     assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot resolve base ref"));
+    assert!(json_error::message(&missing).contains("cannot resolve base ref"));
     assert_eq!(
         git_output(tmp.path(), &["status", "--porcelain=v1"]),
         before
@@ -587,10 +587,10 @@ fn gate_refuses_invalid_inherited_database_scope_before_running_the_command() {
     // #361: an unreadable scope is refused where the database is resolved,
     // before this process opens any store -- ignoring it would resolve the
     // checkout's shared database, the fallback the scope exists to stop.
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error = json_error::message(&output);
     assert!(
-        stderr.contains("AETHYME_GATE_BROKER_DATABASES is set but unreadable"),
-        "{stderr}"
+        error.contains("AETHYME_GATE_BROKER_DATABASES is set but unreadable"),
+        "{error}"
     );
     assert!(!repo.path().join(".aethyme/broker.db").exists());
 }
@@ -1004,10 +1004,10 @@ fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
         ],
     );
     assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown broker submit subcommand \"status\""));
-    assert!(stderr.contains("aethyme broker status --json"));
-    assert!(stderr.contains("aethyme broker advanced queue --json"));
+    let error = json_error::message(&output);
+    assert!(error.contains("unknown broker submit subcommand \"status\""));
+    assert!(error.contains("aethyme broker status --json"));
+    assert!(error.contains("aethyme broker advanced queue --json"));
     assert!(!tmp.path().join("gate-runs.txt").exists());
     assert_eq!(broker_state(), state_before);
 
@@ -2006,3 +2006,6 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
         String::from_utf8_lossy(&repeated.stderr)
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;
