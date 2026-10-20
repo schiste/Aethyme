@@ -22,6 +22,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
+- Choose focused local Cargo checks by compilation target as well as test name.
+  A name filter selects cases at runtime; `--lib` still compiles the full unit-test
+  target. Start with a relevant integration-test target when available, keep one
+  Cargo worker, and retain the remaining unit coverage as pending qualification.
+  A resource-stopped compile provides no test result.
 - Smoke-test each binary against its own CLI contract. Run read-only probes
   outside a Git checkout with isolated home/state; preserve an unsupported
   command as a failed probe instead of treating it as a successful smoke check.
