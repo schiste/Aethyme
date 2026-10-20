@@ -18,6 +18,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Classify from the PR merge tree. Workflow-level path filters leave required
+  # checks pending; job-level conditions below preserve their check names.
+  classify_changes:
+    name: Classify PR changes
+    runs-on: ubuntu-latest
+    outputs:
+      docs_fast: ${{ steps.classify.outputs.docs_fast }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify classifier controls
+        run: bash .github/scripts/test-docs-fast-lane.sh
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "docs_fast=false" >> "$GITHUB_OUTPUT"
+            echo "Full suite selected for a non-PR event."
+            exit 0
+          fi
+
+          docs_fast="$(.github/scripts/docs-fast-lane.sh "$PR_BASE_SHA" "$EVENT_SHA")"
+          case "$docs_fast" in
+            true|false)
+              printf 'docs_fast=%s\n' "$docs_fast" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Classifier returned an invalid result; selecting the full suite." >&2
+              echo "docs_fast=false" >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
+          if [[ "$docs_fast" == "true" ]]; then
+            echo "Docs-only path: run the mirrored skill parity tests; skip product builds."
+          else
+            echo "Full validation path selected."
+          fi
+
   # ── Product path ────────────────────────────────────────────────────────
   # The exit criterion of the python-retirement (plan Phase 6): a user who
   # runs `cargo install` never needs Python. This job proves it by running
@@ -27,6 +74,8 @@ jobs:
   # again, this is the only job that fails.
   product-path-no-python:
     name: Product path (no Python on PATH)
+    needs: classify_changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -160,9 +209,12 @@ jobs:
   # own Python by design and its own gate.
   rust-tests:
     name: Rust workspace tests
+    needs: classify_changes
     # Main receives the same full workspace coverage through Aethyme Gates;
     # `warm-rust-cache` below compiles main's tests so this job starts warm.
-    if: github.event_name == 'pull_request'
+    # On mirrored Markdown-only PRs, this required check runs the exact skill
+    # parity tests with rustc directly; all uncertain diffs run the full suite.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -183,13 +235,24 @@ jobs:
       # not save: a cache written by a pull request is visible only to that
       # pull request, and would evict main's.
       - name: Cache Rust build
+        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: packages/aethyme/rust
           shared-key: rust-tests
           save-if: false
 
+      - name: Run mirrored skill parity tests without Cargo
+        if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast == 'true' }}
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --test .github/scripts/skill-parity-harness.rs \
+            -o "$RUNNER_TEMP/skill-parity-tests"
+          "$RUNNER_TEMP/skill-parity-tests" --test-threads=1
+
       - name: Install cargo-nextest
+        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.146
@@ -200,6 +263,7 @@ jobs:
       # lock for minutes each. Build once here; the test step sets
       # AETHYME_TESTKIT_PREBUILT_BINS=1 to use these binaries directly.
       - name: Build the product binaries
+        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
         run: cargo build --locked --workspace --bins
 
       # Compiling and running are separate steps so the job's log shows which
@@ -207,9 +271,11 @@ jobs:
       # download the `cargo-timings` artifact for the HTML report. nextest then
       # reuses these test binaries instead of building them.
       - name: Compile the workspace tests
+        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
         run: cargo test --locked --workspace --no-run --timings
 
       - name: Upload the compile timings
+        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cargo-timings
@@ -223,6 +289,7 @@ jobs:
       # The same command a workstation runs (#598): it sets the CI
       # environment, uses `--profile ci`, and prints the slowest tests.
       - name: Run workspace tests
+        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
         run: ../scripts/test-like-ci.sh --full
 
   # nextest runs neither example targets nor doctests. The release-manifest
@@ -230,7 +297,8 @@ jobs:
   # own so they run beside the workspace suite instead of after it.
   rust-examples-doctests:
     name: Rust examples and doctests
-    if: github.event_name == 'pull_request'
+    needs: classify_changes
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -265,8 +333,10 @@ jobs:
   # the trees differ and every gate runs.
   record-tested-tree:
     name: Record the tested tree
-    if: github.event_name == 'pull_request'
-    needs: [rust-tests, rust-examples-doctests]
+    # A docs-fast tree did not run the workspace/examples suites; never emit
+    # the artifact that tells Aethyme Gates those suites covered this tree.
+    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' }}
+    needs: [classify_changes, rust-tests, rust-examples-doctests]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -336,6 +406,8 @@ jobs:
   # keeps it that way. Runs on pull requests and on pushes to main.
   lint:
     name: Rust lint (fmt, clippy)
+    needs: classify_changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}
     runs-on: ubuntu-latest
     defaults:
       run:
