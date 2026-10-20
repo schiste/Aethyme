@@ -1457,7 +1457,7 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
                 .session(session)
                 .ok()
                 .map(|record| record.status);
-            return Err(finish_timeout_error(error, timeout_seconds, session, state));
+            return Err(finish_error_context(error, timeout_seconds, session, state));
         }
     };
     if report.status == crate::FinishStatus::Blocked {
@@ -1491,17 +1491,42 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
-fn finish_timeout_error(
+fn finish_error_context(
     error: UsageError,
     timeout_seconds: u64,
     session: i64,
     state: Option<crate::SessionStatus>,
 ) -> UsageError {
-    let message = match error {
-        UsageError::Message(message) if message.contains("did not finish within") => message,
-        UsageError::Exit { message, .. } if message.contains("did not finish within") => message,
+    let (message, exit_code) = match error {
+        UsageError::Message(message) => (message, None),
+        UsageError::Exit { message, code } => (message, Some(code)),
         other => return other,
     };
+    if !message.contains("did not finish within") {
+        let next = match state {
+            Some(state) if !state.is_closed() => format!(
+                "session {session} is still {} and nothing was closed; inspect \
+                 `aethyme broker status --json`, address the original error, then retry finish",
+                state.as_str()
+            ),
+            Some(state) => format!(
+                "session {session} is already {}; do not retry finish: inspect \
+                 `aethyme broker advanced handoff --session {session}` and \
+                 `aethyme broker status --json`",
+                state.as_str()
+            ),
+            None => format!(
+                "the session record could not be read back; inspect \
+                 `aethyme broker status --json` before retrying, and \
+                 `aethyme broker advanced handoff --session {session}` if the session is already closed"
+            ),
+        };
+        let message = format!("{message}; {next}");
+        return match exit_code {
+            Some(code) => UsageError::Exit { message, code },
+            None => UsageError::Message(message),
+        };
+    }
     // Name what was waited on (the Git command and its limit), what state the
     // session was left in, and the one next step that state allows (#494).
     let next = match state {
@@ -1524,9 +1549,12 @@ fn finish_timeout_error(
              session is already closed"
         ),
     };
-    UsageError::Message(format!(
-        "finish timed out after {timeout_seconds}s waiting on Git ({message}); {next}"
-    ))
+    let message =
+        format!("finish timed out after {timeout_seconds}s waiting on Git ({message}); {next}");
+    match exit_code {
+        Some(code) => UsageError::Exit { message, code },
+        None => UsageError::Message(message),
+    }
 }
 
 /// `--abandon --reason` as one decision: abandoning unpushed work without
@@ -1867,5 +1895,79 @@ mod worktree_root_display_tests {
             super::scanner_boundary_summary(false),
             "not verified outside the repository"
         );
+    }
+}
+
+#[cfg(test)]
+mod finish_error_context_tests {
+    use super::{UsageError, finish_error_context};
+
+    #[test]
+    fn unrelated_errors_retain_their_exit_code_and_actual_session_state() {
+        for state in [
+            Some(crate::SessionStatus::Active),
+            Some(crate::SessionStatus::Closed),
+            None,
+        ] {
+            let result = finish_error_context(
+                UsageError::Exit {
+                    message: "repository metadata is unreadable".into(),
+                    code: 7,
+                },
+                1,
+                42,
+                state,
+            );
+            let UsageError::Exit { message, code } = result else {
+                panic!("error class must be preserved");
+            };
+            assert_eq!(code, 7);
+            assert!(message.starts_with("repository metadata is unreadable;"));
+            assert!(message.contains("broker status --json"));
+            assert!(!message.contains("--timeout 2"));
+            match state {
+                Some(crate::SessionStatus::Active) => {
+                    assert!(message.contains("session 42 is still active and nothing was closed"));
+                }
+                Some(crate::SessionStatus::Closed) => {
+                    assert!(message.contains("session 42 is already closed; do not retry finish"));
+                }
+                None => assert!(message.contains("record could not be read back")),
+                _ => unreachable!(),
+            }
+        }
+    }
+    #[test]
+    fn message_errors_remain_message_errors_with_state_guidance() {
+        let result = finish_error_context(
+            UsageError::Message("repository metadata is unreadable".into()),
+            1,
+            42,
+            Some(crate::SessionStatus::Active),
+        );
+        let UsageError::Message(message) = result else {
+            panic!("message errors must retain their class");
+        };
+        assert!(message.starts_with("repository metadata is unreadable;"));
+        assert!(message.contains("session 42 is still active and nothing was closed"));
+    }
+
+    #[test]
+    fn timeout_errors_keep_their_exit_code_and_bounded_retry_guidance() {
+        let result = finish_error_context(
+            UsageError::Exit {
+                message: "git rev-parse --show-toplevel did not finish within 1s".into(),
+                code: 7,
+            },
+            1,
+            42,
+            Some(crate::SessionStatus::Active),
+        );
+        let UsageError::Exit { message, code } = result else {
+            panic!("timeout errors must retain their class");
+        };
+        assert_eq!(code, 7);
+        assert!(message.contains("finish timed out after 1s"));
+        assert!(message.contains("finish --session 42 --timeout 2"));
     }
 }

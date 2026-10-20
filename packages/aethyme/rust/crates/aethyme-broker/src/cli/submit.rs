@@ -1081,12 +1081,23 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
         && size.over_threshold
     {
         out!(
-            "  Warning: this change is large ({} files, {} changed lines; [review] pr_size is {} \
+            "  Warning: this change is large after review-policy exclusions ({} files, {} changed lines; [review] pr_size is {} \
              files, {} lines). Consider splitting it; the push was not refused.",
             size.files,
             size.changed_lines,
             size.max_files,
             size.max_changed_lines
+        );
+    }
+    if let Some(size) = &report.pr_size
+        && let Some(diff) = &size.diff_totals
+        && !size.excluded.is_empty()
+    {
+        out!(
+            "  Full diff: {} files, {} changed lines; review policy excludes {} file(s) from its size advisory.",
+            diff.files,
+            diff.changed_lines,
+            size.excluded.len()
         );
     }
     if let Some(run) = &report.review_run

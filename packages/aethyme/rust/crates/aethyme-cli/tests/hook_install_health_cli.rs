@@ -1,7 +1,7 @@
 //! `SessionStart` is where the broker tells an agent what it could not have
 //! known. Two things about the installation itself belong in that category:
-//! a router and engine built from different commits, and a release newer than
-//! the one installed.
+//! a router and engine built from different commits, a release newer than the
+//! one installed, and a stale Claude Code plugin cache.
 //!
 //! Both are reported, neither is acted on, and the hook has hard constraints
 //! that these exist to hold. Its stdout is parsed as an envelope, so a stray
@@ -67,7 +67,12 @@ impl Fixture {
     }
 
     fn session_start(&self) -> Output {
-        let mut child = Command::new(ROUTER)
+        self.session_start_with_plugin_root(None)
+    }
+
+    fn session_start_with_plugin_root(&self, plugin_root: Option<&Path>) -> Output {
+        let mut command = Command::new(ROUTER);
+        command
             .args(["hook", "SessionStart"])
             .current_dir(&self.repo)
             .env("PATH", &self.path_dir)
@@ -79,6 +84,11 @@ impl Fixture {
                 format!("file://{}", self.release.display()),
             )
             .env("AETHYME_HOST_CACHE_DIR", &self.cache)
+            .env_remove("CLAUDE_PLUGIN_ROOT");
+        if let Some(plugin_root) = plugin_root {
+            command.env("CLAUDE_PLUGIN_ROOT", plugin_root);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -197,6 +207,33 @@ fn a_healthy_pair_adds_nothing_about_the_installation() {
     assert!(
         !context.contains("is available"),
         "an unreachable release server must produce no release notice: {context}"
+    );
+}
+
+#[test]
+fn a_stale_claude_plugin_is_reported_at_session_start_with_repair_commands() {
+    let banner = format!("aethyme-engine-cli {}", router_build());
+    let fixture = Fixture::new().with_engine(&banner);
+    let plugin_root = fixture._temp.path().join("stale-plugin");
+    fs::create_dir_all(&plugin_root).unwrap();
+
+    let context = context(&fixture.session_start_with_plugin_root(Some(&plugin_root)))
+        .expect("stale plugin must be reported");
+    assert!(
+        context.contains("Claude Code's installed Aethyme plugin"),
+        "{context}"
+    );
+    assert!(
+        context.contains(
+            "claude plugin marketplace update aethyme && claude plugin update aethyme@aethyme"
+        ),
+        "the notice must name the update command: {context}"
+    );
+    assert!(
+        context.contains(
+            "claude plugin uninstall aethyme@aethyme && claude plugin install aethyme@aethyme"
+        ),
+        "the notice must name the reinstall fallback: {context}"
     );
 }
 

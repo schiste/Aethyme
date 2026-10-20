@@ -359,8 +359,11 @@ unavailable evidence fails closed without running the unlock mutation.
 Every GitHub write uses the coordinated operation journal. A failed or
 crash-ambiguous transition leaves lifecycle state unchanged and blocks blind
 retry until `broker advanced operations reconcile` resolves the external outcome.
-Cloud Build remains an external manual-trigger adapter boundary; the core
-state machine stores no GCP credential and performs no background polling.
+For a Git exact-ref push, `operations reconcile --inspect-remote` can record a
+broker-checked proposal from the current remote refs; it keeps the barrier in
+place. Confirm the outcome with the existing `--outcome` form after reviewing
+the evidence. Cloud Build remains an external manual-trigger adapter boundary;
+the core state machine stores no GCP credential and performs no background polling.
 
 ### Recover review ownership after a session closes
 

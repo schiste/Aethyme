@@ -1,0 +1,68 @@
+:root {
+  color: #1d2939;
+  background: #f8fafc;
+  font: 16px/1.5 system-ui, sans-serif;
+}
+body {
+  max-width: 58rem;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+header, main, section, form {
+  display: grid;
+  gap: 0.75rem;
+}
+header {
+  margin-bottom: 2rem;
+}
+button, input, select {
+  font: inherit;
+}
+button {
+  min-height: 2.5rem;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+}
+input, select {
+  min-height: 2.5rem;
+  padding: 0.35rem 0.6rem;
+}
+.panel {
+  padding: 1rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.65rem;
+  background: white;
+  margin-block: 1rem;
+}
+.search-row {
+  display: flex;
+  align-items: end;
+  gap: 0.5rem;
+}
+.search-row label {
+  display: grid;
+  gap: 0.25rem;
+}
+ul {
+  padding-left: 1.5rem;
+}
+.result-list {
+  min-height: 2rem;
+}
+[role="listbox"] {
+  padding: 0;
+  list-style: none;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.4rem;
+}
+[role="option"] {
+  padding: 0.4rem 0.65rem;
+}
+[role="option"][aria-selected="true"] {
+  background: #dbeafe;
+  outline: 2px solid #2563eb;
+}
+.status {
+  min-height: 1.5rem;
+  font-weight: 600;
+}
