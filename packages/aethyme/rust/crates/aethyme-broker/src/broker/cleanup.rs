@@ -2098,11 +2098,16 @@ mod registered_removal_failure_tests {
     use std::time::Duration;
 
     fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap();
+        let mut command = Command::new("git");
+        let git_keys = std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+            .collect::<Vec<_>>();
+        for key in git_keys {
+            command.env_remove(key);
+        }
+        let output = command.args(args).current_dir(root).output().unwrap();
         assert!(
             output.status.success(),
             "git {args:?}: {}",
