@@ -750,7 +750,47 @@ fn active_worktree_content_cannot_invent_canonical_enrollment() {
 fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
+
+    // The optional settings file is machine-local and the CLI subprocess uses
+    // an isolated XDG config directory. Give this fixture a repo-local exclude
+    // so its status is independent of the test runner's global Git ignores.
+    let exclude_path = repo.join(".git/info/exclude");
+    let mut exclude = fs::read_to_string(&exclude_path).unwrap();
+    if !exclude
+        .lines()
+        .any(|line| line.trim() == "/.claude/settings.local.json")
+    {
+        if !exclude.ends_with('\n') {
+            exclude.push('\n');
+        }
+        exclude.push_str("/.claude/settings.local.json\n");
+        fs::write(&exclude_path, exclude).unwrap();
+    }
+
     old_canonical_deployment(&repo);
+    let local_settings = repo.join(".claude/settings.local.json");
+    assert!(local_settings.is_file());
+    let empty_git_config = temp.path().join("empty-git-config");
+    fs::write(&empty_git_config, "").unwrap();
+    let ignored = Command::new("git")
+        .args(["check-ignore", "-v", "--", ".claude/settings.local.json"])
+        .current_dir(&repo)
+        .env("XDG_CONFIG_HOME", repo.join("empty-config"))
+        .env("GIT_CONFIG_GLOBAL", &empty_git_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        ignored.status.success(),
+        "repo-local exclude must ignore the generated machine-local settings file under controlled Git config: {}",
+        String::from_utf8_lossy(&ignored.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&ignored.stdout).contains(".git/info/exclude"),
+        "the exclusion must come from this fixture's repository-local exclude: {}",
+        String::from_utf8_lossy(&ignored.stdout)
+    );
+
     let session = register_version_pinned_session(&repo, "0.2.1");
     let session_arg = session.to_string();
 
@@ -782,6 +822,10 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
 
     let upgrade_plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
     assert_eq!(upgrade_plan["safe"], false);
+    assert_eq!(
+        upgrade_plan["dirty_paths"],
+        serde_json::json!(["mid-session-wip.txt"])
+    );
     assert!(
         upgrade_plan["blockers"][0]
             .as_str()
