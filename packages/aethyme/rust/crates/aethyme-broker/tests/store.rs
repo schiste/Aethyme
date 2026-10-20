@@ -2,6 +2,8 @@
 //! (issue #4 acceptance: schema applies fresh, per-table round trips;
 //! issue #5: migrations from empty and from v1).
 
+use std::process::Command;
+
 use aethyme_broker::{
     AdvisoryAction, AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryResolutionState,
     AdvisorySeverity, BrokerError, BrokerStore, EntryExposureState, GateCacheProvenance, GateDef,
@@ -12,8 +14,23 @@ use aethyme_broker::{
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
     let tmp = tempfile::tempdir().unwrap();
-    let store = BrokerStore::open_in_repo(tmp.path()).unwrap();
+    let store = BrokerStore::open(tmp.path().join("broker.db")).unwrap();
     (tmp, store)
+}
+
+fn temp_git_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tmp
 }
 
 fn sample_session(store: &mut BrokerStore) -> aethyme_broker::Session {
@@ -43,7 +60,7 @@ fn sample_session(store: &mut BrokerStore) -> aethyme_broker::Session {
 
 #[test]
 fn opens_in_repo_at_documented_path_and_reopens() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = temp_git_repo();
     let store = BrokerStore::open_in_repo(tmp.path()).unwrap();
     assert!(store.db_path().ends_with(aethyme_broker::BROKER_DB_RELPATH));
     drop(store);
@@ -142,7 +159,7 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
 /// sat inside a real checkout moved that checkout's database forward.
 #[test]
 fn a_metric_open_declines_a_repository_with_no_database_and_creates_none() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = temp_git_repo();
     let store = BrokerStore::open_current_in_repo(tmp.path()).unwrap();
     assert!(store.is_none(), "no database means nothing to write to");
     assert!(
@@ -153,7 +170,7 @@ fn a_metric_open_declines_a_repository_with_no_database_and_creates_none() {
 
 #[test]
 fn a_metric_open_accepts_a_database_at_this_binary_s_schema() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = temp_git_repo();
     drop(BrokerStore::open_in_repo(tmp.path()).unwrap());
     assert!(
         BrokerStore::open_current_in_repo(tmp.path())
@@ -172,7 +189,7 @@ fn a_metric_open_accepts_a_database_at_this_binary_s_schema() {
 /// exactly as it was found.
 #[test]
 fn a_metric_open_declines_a_database_from_another_binary_without_touching_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = temp_git_repo();
     drop(BrokerStore::open_in_repo(tmp.path()).unwrap());
     let path = tmp.path().join(aethyme_broker::BROKER_DB_RELPATH);
 

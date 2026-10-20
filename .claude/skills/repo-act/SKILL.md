@@ -49,6 +49,18 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+  If the broker creates the exact worktree root exclusively, keep the TempDir
+  as its owner and select a new absent child leaf; canonicalize the existing
+  parent before joining that leaf.
+  For parent/child CLI pairs and reopens, reuse the complete
+  BrokerOpenOptions and call configure_storage_context_for_child; copying only
+  AETHYME_HOST_STATE_DIR can leave a child with a different storage context.
+  When persisted origins have different physical trust rules, derive proof from
+  validated origin/state rather than a missing optional field; keep legacy
+  acceptance separate from Fresh strictness, validate before binding, and test
+  legacy acceptance, unsafe-mode refusal before binding, and a Fresh refusal.
+  Use BrokerStore::open(db_path) for repository-less store tests, and initialize
+  a real Git repository for tests of open_in_repo APIs.
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.

@@ -4,8 +4,10 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+mod common;
+
 use aethyme_broker::{
-    AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker,
+    AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity,
     BrokerOpError, DeliveryExecutionReport, EntryExposureResolutionKind, EntryExposureState,
     IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance, OperationStatus,
     RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
@@ -41,7 +43,6 @@ struct Fixture {
     _tmp: tempfile::TempDir,
     repo: PathBuf,
     remote: PathBuf,
-    host_operations: PathBuf,
 }
 
 impl Fixture {
@@ -63,23 +64,24 @@ impl Fixture {
         );
         git(&repo, &["push", "-qu", "origin", "main"]);
         Self {
-            host_operations: tmp.path().join("host-state/operations.db"),
             _tmp: tmp,
             repo,
             remote,
         }
     }
 
-    fn broker(&self) -> Broker {
-        Broker::open(&self.repo)
-            .unwrap()
-            .with_host_operation_database(&self.host_operations)
+    fn broker(&self) -> common::FixtureBroker {
+        common::open_fixture_broker(&self.repo, self._tmp.path()).unwrap()
     }
 
     fn promoted_entry(&self) -> (i64, i64, String) {
         let mut broker = self.broker();
         let session = broker.start_worktree("ship-plan", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
+        assert!(
+            worktree.starts_with(broker.worktree_root()),
+            "library-created checkout must use the fixture's serialized worktree root"
+        );
         std::fs::write(worktree.join("feature.txt"), "verified\n").unwrap();
         git(&worktree, &["add", "feature.txt"]);
         git(&worktree, &["commit", "-qm", "feat: verified"]);
@@ -162,6 +164,10 @@ impl Fixture {
             ),
         ] {
             let worktree = PathBuf::from(&session.worktree_path);
+            assert!(
+                worktree.starts_with(broker.worktree_root()),
+                "library-created checkout must use the fixture's serialized worktree root"
+            );
             let target = worktree.join(path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).unwrap();
@@ -384,14 +390,27 @@ exit 64
             fake_bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new(CLI)
-            .args(args)
+        let fixture_root = self._tmp.path();
+        let host_state_dir = common::fixture_host_state_dir(fixture_root);
+        let worktree_root = fixture_root
+            .canonicalize()
+            .expect("canonicalize fixture owner")
+            .join("worktrees");
+        let mut command = common::broker_cli_for_fixture(CLI, args, fixture_root);
+        command
+            .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+            .env(
+                "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+                host_state_dir.join("host-operations.db"),
+            )
+            .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", worktree_root)
+            .env(
+                "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+                host_state_dir.join("collaboration"),
+            );
+        command
             .current_dir(&self.repo)
             .env("PATH", path)
-            .env(
-                "AETHYME_HOST_STATE_DIR",
-                self.host_operations.parent().unwrap(),
-            )
             .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
             .env("AETHYME_TEST_REPO", &self.repo)
             .env("AETHYME_FAKE_PR_STATE", state)
