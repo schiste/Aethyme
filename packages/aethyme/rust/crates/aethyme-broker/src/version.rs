@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::git::GitRepo;
+use crate::git::{GitError, GitRepo};
 use crate::merge::PromoteConfig;
 
 /// Changes that can make an installed broker unsafe to use with the source
@@ -150,17 +150,31 @@ pub(crate) fn inspect_version_with_binary(
 ) -> VersionDriftReport {
     let integration_branch = PromoteConfig::load(main_root).branch;
     let repo_is_aethyme_source = is_aethyme_source_checkout(main_root);
-    let Ok(repo) = GitRepo::discover(main_root) else {
-        return VersionDriftReport {
-            binary,
-            repo_is_aethyme_source,
-            integration_branch,
-            integration_head: None,
-            integration_describe: None,
-            release_tag: None,
-            status: VersionDriftStatus::Unknown,
-            message: "not inside a git repository; cannot compare CLI build to repo state".into(),
-        };
+    let repo = match GitRepo::discover(main_root) {
+        Ok(repo) => repo,
+        Err(error) => {
+            let message = match error {
+                GitError::NotARepository { .. } => {
+                    "not inside a git repository; cannot compare CLI build to repo state"
+                }
+                GitError::TimedOut { .. } => {
+                    "Git repository inspection timed out; cannot compare CLI build to repo state"
+                }
+                _ => {
+                    "Git repository inspection unavailable; cannot compare CLI build to repo state"
+                }
+            };
+            return VersionDriftReport {
+                binary,
+                repo_is_aethyme_source,
+                integration_branch,
+                integration_head: None,
+                integration_describe: None,
+                release_tag: None,
+                status: VersionDriftStatus::Unknown,
+                message: message.into(),
+            };
+        }
     };
     let integration_ref = format!("refs/heads/{integration_branch}");
     let integration_head = repo.resolve_ref(&integration_ref);
@@ -330,9 +344,16 @@ fn short_commit(commit: &str) -> &str {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::time::Duration;
 
     fn sh(cwd: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let mut git = Command::new("git");
+        for (key, _) in
+            std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+        {
+            git.env_remove(key);
+        }
+        let status = git
             .args(args)
             .current_dir(cwd)
             .env("GIT_AUTHOR_NAME", "t")
@@ -449,6 +470,44 @@ mod tests {
 
         let report = inspect_version_with_binary(tmp.path(), binary(&head, "v0.1.1-1-g1234567"));
         assert_eq!(report.status, VersionDriftStatus::Current);
+    }
+
+    #[test]
+    fn expired_git_deadline_does_not_masquerade_as_missing_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        sh(&root, &["init", "-q", "-b", "main"]);
+        marker_source_checkout(&root);
+        sh(&root, &["add", "-A"]);
+        sh(&root, &["commit", "-qm", "source checkout"]);
+        assert!(GitRepo::discover(&root).is_ok());
+
+        let report = crate::git::with_git_deadline(Duration::ZERO, || {
+            inspect_version_with_binary(&root, binary("deadbeef", "v0.1.1"))
+        });
+
+        assert_eq!(report.status, VersionDriftStatus::Unknown);
+        assert!(report.repo_is_aethyme_source);
+        assert!(report.integration_head.is_none());
+        assert!(report.message.contains("timed out"), "{}", report.message);
+        assert!(
+            !report.message.contains("not inside a git repository"),
+            "{}",
+            report.message
+        );
+    }
+
+    #[test]
+    fn actual_non_repository_keeps_its_specific_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let report = inspect_version_with_binary(tmp.path(), binary("deadbeef", "v0.1.1"));
+
+        assert_eq!(report.status, VersionDriftStatus::Unknown);
+        assert_eq!(
+            report.message,
+            "not inside a git repository; cannot compare CLI build to repo state"
+        );
     }
 
     #[test]
