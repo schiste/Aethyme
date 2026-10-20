@@ -637,7 +637,7 @@ pub(crate) fn storage_apply_with_context(
     let preparation_cache_root = preparation_cache_root_binding
         .as_ref()
         .map(|binding| binding.path.clone());
-    let plan = build_plan(
+    let plan = build_apply_plan(
         &main_root,
         &storage_layout,
         preparation_cache_root.as_deref(),
@@ -649,7 +649,6 @@ pub(crate) fn storage_apply_with_context(
             .and_then(|binding| binding.instance_nonce.as_deref()),
         policy.orphan_worktree_roots_days,
         warnings,
-        crate::SizeScan::Measure,
         &mut records,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
@@ -661,10 +660,6 @@ pub(crate) fn storage_apply_with_context(
                 ),
             })?;
     }
-    // The apply revalidation has already paid for a complete walk. Keep those
-    // observations so the next routine plan can report them without paying
-    // for the same trees again.
-    let _ = crate::measurement::save_size_records(&main_root, &records);
     if !plan.digest.eq_ignore_ascii_case(confirm) {
         return Err(StorageError::ConfirmationMismatch);
     }
@@ -752,6 +747,33 @@ pub(crate) fn storage_apply_with_context(
         reclaimed_bytes,
         recovery_action: (!complete).then(|| "aethyme broker gc storage plan".into()),
     })
+}
+
+/// Rebuild the safety decision used by apply without recursively sizing every
+/// enrolled tree. Candidate eligibility and confirmation bind filesystem,
+/// Git, ledger, marker, and policy facts; byte estimates are reporting-only.
+#[allow(clippy::too_many_arguments)]
+fn build_apply_plan(
+    main_root: &Path,
+    storage_layout: &StorageRootLayout,
+    preparation_cache_root: Option<&Path>,
+    preparation_cache_root_identity: Option<&[u8]>,
+    preparation_cache_root_nonce: Option<&str>,
+    orphan_worktree_roots_days: u32,
+    warnings: Vec<String>,
+    records: &mut crate::measurement::SizeRecords,
+) -> Result<StoragePlan, StorageError> {
+    build_plan(
+        main_root,
+        storage_layout,
+        preparation_cache_root,
+        preparation_cache_root_identity,
+        preparation_cache_root_nonce,
+        orphan_worktree_roots_days,
+        warnings,
+        crate::SizeScan::Recorded,
+        records,
+    )
 }
 
 // Keep the captured preparation-cache identity components explicit here: the
@@ -6678,6 +6700,67 @@ mod tests {
                 &[],
                 &[]
             )
+        );
+    }
+
+    #[test]
+    fn apply_revalidation_uses_recorded_sizes_and_keeps_unknown_sizes_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository_root = tmp.path().join("repository");
+        let repository = init_storage_root_test_repository(&repository_root);
+        let owner = crate::test_storage::TestStorage::new();
+        let raw_storage_root = owner.root().join("orphan-worktrees");
+        let candidate_tree = raw_storage_root.join("session-tree");
+        std::fs::create_dir_all(&candidate_tree).unwrap();
+        let storage_root = normalise(&raw_storage_root);
+        let candidate_tree = storage_root.join("session-tree");
+        std::fs::write(candidate_tree.join("payload.bin"), vec![b'x'; 4096]).unwrap();
+        let marker = crate::broker::WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "removed-repository".into(),
+            repository_root: owner.root().join("removed-repository"),
+        };
+        std::fs::write(
+            storage_root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+
+        let root_key = storage_root.to_string_lossy().into_owned();
+        let mut records = crate::measurement::SizeRecords::default();
+        records.record_usage(&root_key, 0, Some(1), 1);
+        let plan = build_apply_plan(
+            repository.root(),
+            &StorageRootLayout::DirectRoot(storage_root.clone()),
+            None,
+            None,
+            None,
+            0,
+            Vec::new(),
+            &mut records,
+        )
+        .unwrap();
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].kind, StorageCandidateKind::OrphanRoot);
+        assert_eq!(plan.candidates[0].estimated_bytes, Some(0));
+        assert_eq!(plan.roots[0].estimated_bytes, Some(0));
+        assert_eq!(plan.roots[0].reconciliation.entries.len(), 1);
+        assert_eq!(
+            plan.roots[0].reconciliation.entries[0].estimated_bytes, None,
+            "a missing record must remain unknown during apply revalidation"
+        );
+        assert_eq!(
+            records.records.len(),
+            1,
+            "apply revalidation must not fill records by walking the inventory"
+        );
+        assert!(
+            std::fs::metadata(candidate_tree.join("payload.bin"))
+                .unwrap()
+                .len()
+                > plan.candidates[0].estimated_bytes.unwrap(),
+            "stale byte estimates are not a candidate-safety input"
         );
     }
 
