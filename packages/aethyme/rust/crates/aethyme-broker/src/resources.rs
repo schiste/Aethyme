@@ -4182,7 +4182,7 @@ fn preflight_existing_store_versions_through(
     Ok(())
 }
 
-fn migrate_managed_storage_schema(tx: &Transaction<'_>) -> Result<(), HostResourceError> {
+fn migrate_managed_storage_schema(tx: &rusqlite::Transaction<'_>) -> Result<(), HostResourceError> {
     let mut version: i64 = tx.query_row(
         "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
         [],
