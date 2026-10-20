@@ -323,3 +323,101 @@ esac
         assert_eq!(fs::read_to_string(&events).unwrap(), expected);
     }
 }
+
+/// Run the shipped shell commands against recording tools. A hostile inherited
+/// environment must not undo local resource bounds; no real build runs here.
+#[test]
+#[cfg(unix)]
+fn local_rust_gates_bound_build_and_test_workers() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, r#"#!/bin/sh
+set -eu
+printf '%s\t%s\t%s\t%s\n' "$CARGO_BUILD_JOBS" "$RUST_TEST_THREADS" "$NEXTEST_TEST_THREADS" "$*" >> "$MOCK_EVENTS"
+if [ "$*" = 'nextest --version' ]; then
+  test "$MOCK_NEXTEST" = available
+  exit $?
+fi
+case "$*" in
+  *"$MOCK_FAILURE"*) test "$MOCK_FAILURE" = none || exit 73 ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\nprintf '0000000000000000000000000000000000000000\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    let events = root.join("events");
+    let gates = load_gates(&repo_root()).unwrap();
+    let names = [
+        "fast-guards",
+        "cargo-test",
+        "script-contract",
+        "workflow-contract",
+        "gate-policy",
+        "cross-process-contract",
+    ];
+    for name in names {
+        let gate = gates.iter().find(|gate| gate.name == name).unwrap();
+        for nextest in ["available", "absent"] {
+            // Full-suite failures must propagate even though docs/examples still run.
+            let failures: &[&str] = if name == "cargo-test" {
+                if nextest == "available" {
+                    &["none", "build ", "nextest run", "--doc", "--examples"]
+                } else {
+                    &["none", "test --locked --workspace --quiet", "--examples"]
+                }
+            } else {
+                &["none"]
+            };
+            for failure in failures {
+                fs::write(&events, "").unwrap();
+                let output = Command::new("/bin/sh")
+                    .args(["-c", &gate.command])
+                    .current_dir(root)
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
+                    .env("CARGO_BUILD_JOBS", "99")
+                    .env("RUST_TEST_THREADS", "99")
+                    .env("NEXTEST_TEST_THREADS", "99")
+                    .env("MOCK_NEXTEST", nextest)
+                    .env("MOCK_FAILURE", failure)
+                    .env("MOCK_EVENTS", &events)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.success(),
+                    *failure == "none",
+                    "{name}/{nextest}/{failure}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let log = fs::read_to_string(&events).unwrap();
+                assert!(!log.is_empty(), "{name} must execute Cargo");
+                for line in log.lines() {
+                    assert!(
+                        line.starts_with("1\t2\t2\t"),
+                        "{name} inherited unbounded workers: {line}"
+                    );
+                }
+                if name == "cargo-test" && *failure == "none" {
+                    assert!(log.contains("--examples"));
+                    if nextest == "available" {
+                        assert!(log.contains("build --locked --workspace --bins"));
+                        assert!(log.contains("nextest run --locked --workspace --profile local --build-jobs 1 --no-fail-fast"));
+                        assert!(log.contains("--doc"));
+                    } else {
+                        assert!(!log.contains("nextest run"));
+                        assert!(log.contains("test --locked --workspace --quiet --no-fail-fast"));
+                    }
+                }
+            }
+        }
+    }
+}

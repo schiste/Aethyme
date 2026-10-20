@@ -199,6 +199,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
   target is a setup failure; stop before Cargo instead of treating it as a
   product failure or zero-test result.
+- Bound compilation and test execution separately: Cargo `-j1` limits build
+  jobs, not test workers. Select nextest’s `local` profile and an explicit
+  `--test-threads 2` cap (or `NEXTEST_TEST_THREADS=2`); for the Cargo test
+  harness use `-- --test-threads=2`. Verify the profile selected by the actual
+  gate command; a configured local profile has no effect when it is not selected.
 - Run the fastest relevant test command first.
   Check the complete selected test names and a nonzero executed count before
   treating a focused run as evidence. Rust filters match substrings, including
