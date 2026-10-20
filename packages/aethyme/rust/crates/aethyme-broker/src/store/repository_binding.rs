@@ -138,6 +138,63 @@ pub(crate) struct LegacyRepositoryRootConfirmation {
     pub worktree_identity_json: String,
 }
 
+/// Binding-state commits must survive a host power loss. The ordinary broker
+/// connection uses WAL/NORMAL for operational throughput, which can lose the
+/// last committed transaction after power loss. Raise synchronous before the
+/// immediate transaction, commit while FULL is active, then restore the
+/// connection's prior mode after a successful commit or a rolled-back body.
+/// If commit itself reports an error, leave FULL active because its outcome is
+/// uncertain and weakening subsequent writes would be unsafe.
+fn with_durable_binding_transaction<T>(
+    conn: &mut Connection,
+    operation: impl FnOnce(&Transaction<'_>) -> Result<T, BrokerError>,
+) -> Result<T, BrokerError> {
+    let previous_synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+    let raised_synchronous = previous_synchronous < 2;
+    if raised_synchronous {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+    }
+
+    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(error) => {
+            if raised_synchronous {
+                crate::warn_unrecorded(
+                    "restore SQLite synchronous mode after failed binding transaction start",
+                    conn.pragma_update(None, "synchronous", previous_synchronous),
+                );
+            }
+            return Err(error.into());
+        }
+    };
+
+    match operation(&tx) {
+        Ok(value) => {
+            // Do not restore NORMAL if commit fails: the transaction may have
+            // committed durably, and every later binding write must continue
+            // to use the stronger setting until the connection is reopened.
+            tx.commit()?;
+            if raised_synchronous {
+                crate::warn_unrecorded(
+                    "restore SQLite synchronous mode after durable binding commit",
+                    conn.pragma_update(None, "synchronous", previous_synchronous),
+                );
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            drop(tx);
+            if raised_synchronous {
+                crate::warn_unrecorded(
+                    "restore SQLite synchronous mode after rolled-back binding transaction",
+                    conn.pragma_update(None, "synchronous", previous_synchronous),
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 impl BrokerStore {
     /// Read the singleton binding record. A missing or malformed row is a
     /// recovery condition; callers must not infer a root from current config.
@@ -160,50 +217,49 @@ impl BrokerStore {
         identity: &RepositoryRootIdentity,
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
         validate_repository_identity(identity)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_current_v53(&tx)?;
-        let current = read_repository_worktree_binding(&tx)?;
-        ensure_state(
-            current.state,
-            RepositoryWorktreeBindingState::LegacyUnbound,
-            RepositoryWorktreeBindingState::FreshUnbound,
-        )?;
-        if current.origin != Some(RepositoryWorktreeBindingOrigin::Legacy)
-            || current.repository_root.is_some()
-            || current.bootstrap_nonce.is_some()
-            || current.worktree_root.is_some()
-            || current.reservation_digest.is_some()
-        {
-            return Err(invalid_binding(
-                "legacy-unbound row contains unexpected binding data".to_owned(),
-            ));
-        }
-        let now = super::now_ms();
-        let changed = tx.execute(
-            "UPDATE repository_worktree_binding
-             SET state = 'fresh_unbound', origin = 'fresh', path_encoding = ?1,
-                 repository_root = ?2, git_common_dir = ?3, repository_key = ?4,
-                 broker_db_path = ?5, bootstrap_nonce = ?6, updated_at_ms = ?7
-             WHERE singleton = 1 AND state = 'legacy_unbound' AND origin = 'legacy'",
-            params![
-                current_path_encoding(),
-                encode_path(&identity.repository_root),
-                encode_path(&identity.git_common_dir),
-                identity.repository_key,
-                encode_path(&identity.broker_db_path),
-                identity.bootstrap_nonce,
-                now,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(invalid_binding(
-                "fresh bootstrap lost its compare-and-set".to_owned(),
-            ));
-        }
-        crate::schema::record_min_compatible_schema_floor(&tx, 53)?;
-        tx.commit()?;
+        with_durable_binding_transaction(&mut self.conn, |tx| {
+            ensure_current_v53(tx)?;
+            let current = read_repository_worktree_binding(tx)?;
+            ensure_state(
+                current.state,
+                RepositoryWorktreeBindingState::LegacyUnbound,
+                RepositoryWorktreeBindingState::FreshUnbound,
+            )?;
+            if current.origin != Some(RepositoryWorktreeBindingOrigin::Legacy)
+                || current.repository_root.is_some()
+                || current.bootstrap_nonce.is_some()
+                || current.worktree_root.is_some()
+                || current.reservation_digest.is_some()
+            {
+                return Err(invalid_binding(
+                    "legacy-unbound row contains unexpected binding data".to_owned(),
+                ));
+            }
+            let now = super::now_ms();
+            let changed = tx.execute(
+                "UPDATE repository_worktree_binding
+                 SET state = 'fresh_unbound', origin = 'fresh', path_encoding = ?1,
+                     repository_root = ?2, git_common_dir = ?3, repository_key = ?4,
+                     broker_db_path = ?5, bootstrap_nonce = ?6, updated_at_ms = ?7
+                 WHERE singleton = 1 AND state = 'legacy_unbound' AND origin = 'legacy'",
+                params![
+                    current_path_encoding(),
+                    encode_path(&identity.repository_root),
+                    encode_path(&identity.git_common_dir),
+                    identity.repository_key,
+                    encode_path(&identity.broker_db_path),
+                    identity.bootstrap_nonce,
+                    now,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid_binding(
+                    "fresh bootstrap lost its compare-and-set".to_owned(),
+                ));
+            }
+            crate::schema::record_min_compatible_schema_floor(tx, 53)?;
+            Ok(())
+        })?;
         self.repository_worktree_binding()
     }
 
@@ -218,46 +274,47 @@ impl BrokerStore {
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
         validate_repository_identity(&reservation.identity)?;
         validate_reservation(reservation)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_current_v53(&tx)?;
-        let current = read_repository_worktree_binding(&tx)?;
-        ensure_state(
-            current.state,
-            RepositoryWorktreeBindingState::FreshUnbound,
-            RepositoryWorktreeBindingState::FreshReserved,
-        )?;
-        ensure_fresh_identity_matches(&current, &reservation.identity)?;
-        let now = super::now_ms();
-        let changed = tx.execute(
-            "UPDATE repository_worktree_binding
-             SET state = 'fresh_reserved', worktree_root = ?1, root_layout = ?2,
-                 root_source = ?3, reservation_digest = ?4,
-                 parent_identity_json = ?5, updated_at_ms = ?6
-             WHERE singleton = 1 AND state = 'fresh_unbound' AND origin = 'fresh'
-               AND bootstrap_nonce = ?7",
-            params![
-                encode_path(&reservation.worktree_root),
-                reservation.layout.as_str(),
-                root_source_db_value(reservation.source),
-                reservation.reservation_digest,
-                reservation.parent_identity_json,
-                now,
-                reservation.identity.bootstrap_nonce,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(invalid_binding(
-                "fresh root reservation lost its compare-and-set".to_owned(),
-            ));
-        }
-        crate::schema::record_min_compatible_schema_floor(&tx, 53)?;
-        tx.commit()?;
+        with_durable_binding_transaction(&mut self.conn, |tx| {
+            ensure_current_v53(tx)?;
+            let current = read_repository_worktree_binding(tx)?;
+            ensure_state(
+                current.state,
+                RepositoryWorktreeBindingState::FreshUnbound,
+                RepositoryWorktreeBindingState::FreshReserved,
+            )?;
+            ensure_fresh_identity_matches(&current, &reservation.identity)?;
+            let now = super::now_ms();
+            let changed = tx.execute(
+                "UPDATE repository_worktree_binding
+                 SET state = 'fresh_reserved', worktree_root = ?1, root_layout = ?2,
+                     root_source = ?3, reservation_digest = ?4,
+                     parent_identity_json = ?5, updated_at_ms = ?6
+                 WHERE singleton = 1 AND state = 'fresh_unbound' AND origin = 'fresh'
+                   AND bootstrap_nonce = ?7",
+                params![
+                    encode_path(&reservation.worktree_root),
+                    reservation.layout.as_str(),
+                    root_source_db_value(reservation.source),
+                    reservation.reservation_digest,
+                    reservation.parent_identity_json,
+                    now,
+                    reservation.identity.bootstrap_nonce,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid_binding(
+                    "fresh root reservation lost its compare-and-set".to_owned(),
+                ));
+            }
+            crate::schema::record_min_compatible_schema_floor(tx, 53)?;
+            Ok(())
+        })?;
         self.repository_worktree_binding()
     }
 
-    /// Record that the reserved fresh path needs manual or reviewed recovery.
+    /// Record that the reserved fresh path needs a future reviewed recovery.
+    /// No automated recovery command currently exists for this state; retain
+    /// the database and filesystem evidence rather than editing either one.
     /// This state is deliberately not a fallback: only the same reservation
     /// can later be completed.
     // Runtime callers are added with the reviewed bootstrap transition.
@@ -268,36 +325,35 @@ impl BrokerStore {
         reservation_digest: &str,
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
         validate_hex_digest(reservation_digest, "reservation digest")?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_current_v53(&tx)?;
-        let current = read_repository_worktree_binding(&tx)?;
-        ensure_state(
-            current.state,
-            RepositoryWorktreeBindingState::FreshReserved,
-            RepositoryWorktreeBindingState::RecoveryRequired,
-        )?;
-        if current.bootstrap_nonce.as_deref() != Some(bootstrap_nonce)
-            || current.reservation_digest.as_deref() != Some(reservation_digest)
-        {
-            return Err(invalid_binding(
-                "recovery identity does not match the reserved root".to_owned(),
-            ));
-        }
-        let changed = tx.execute(
-            "UPDATE repository_worktree_binding
-             SET state = 'recovery_required', updated_at_ms = ?1
-             WHERE singleton = 1 AND state = 'fresh_reserved'
-               AND bootstrap_nonce = ?2 AND reservation_digest = ?3",
-            params![super::now_ms(), bootstrap_nonce, reservation_digest],
-        )?;
-        if changed != 1 {
-            return Err(invalid_binding(
-                "recovery transition lost its compare-and-set".to_owned(),
-            ));
-        }
-        tx.commit()?;
+        with_durable_binding_transaction(&mut self.conn, |tx| {
+            ensure_current_v53(tx)?;
+            let current = read_repository_worktree_binding(tx)?;
+            ensure_state(
+                current.state,
+                RepositoryWorktreeBindingState::FreshReserved,
+                RepositoryWorktreeBindingState::RecoveryRequired,
+            )?;
+            if current.bootstrap_nonce.as_deref() != Some(bootstrap_nonce)
+                || current.reservation_digest.as_deref() != Some(reservation_digest)
+            {
+                return Err(invalid_binding(
+                    "recovery identity does not match the reserved root".to_owned(),
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE repository_worktree_binding
+                 SET state = 'recovery_required', updated_at_ms = ?1
+                 WHERE singleton = 1 AND state = 'fresh_reserved'
+                   AND bootstrap_nonce = ?2 AND reservation_digest = ?3",
+                params![super::now_ms(), bootstrap_nonce, reservation_digest],
+            )?;
+            if changed != 1 {
+                return Err(invalid_binding(
+                    "recovery transition lost its compare-and-set".to_owned(),
+                ));
+            }
+            Ok(())
+        })?;
         self.repository_worktree_binding()
     }
 
@@ -315,52 +371,51 @@ impl BrokerStore {
         validate_repository_identity(identity)?;
         validate_hex_digest(reservation_digest, "reservation digest")?;
         validate_identity_json(worktree_identity_json, "worktree identity")?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_current_v53(&tx)?;
-        let current = read_repository_worktree_binding(&tx)?;
-        if !matches!(
-            current.state,
-            RepositoryWorktreeBindingState::FreshReserved
-                | RepositoryWorktreeBindingState::RecoveryRequired
-        ) {
-            return Err(transition_error(
+        with_durable_binding_transaction(&mut self.conn, |tx| {
+            ensure_current_v53(tx)?;
+            let current = read_repository_worktree_binding(tx)?;
+            if !matches!(
                 current.state,
-                RepositoryWorktreeBindingState::Bound,
-            ));
-        }
-        ensure_fresh_identity_matches(&current, identity)?;
-        if current.reservation_digest.as_deref() != Some(reservation_digest)
-            || current.worktree_root.is_none()
-            || current.root_layout.is_none()
-            || current.root_source.is_none()
-            || current.parent_identity_json.is_none()
-        {
-            return Err(invalid_binding(
-                "completion does not match a complete root reservation".to_owned(),
-            ));
-        }
-        let changed = tx.execute(
-            "UPDATE repository_worktree_binding
-             SET state = 'bound', worktree_identity_json = ?1, updated_at_ms = ?2
-             WHERE singleton = 1 AND origin = 'fresh'
-               AND state IN ('fresh_reserved', 'recovery_required')
-               AND bootstrap_nonce = ?3 AND reservation_digest = ?4",
-            params![
-                worktree_identity_json,
-                super::now_ms(),
-                identity.bootstrap_nonce,
-                reservation_digest,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(invalid_binding(
-                "fresh root completion lost its compare-and-set".to_owned(),
-            ));
-        }
-        crate::schema::record_min_compatible_schema_floor(&tx, 53)?;
-        tx.commit()?;
+                RepositoryWorktreeBindingState::FreshReserved
+                    | RepositoryWorktreeBindingState::RecoveryRequired
+            ) {
+                return Err(transition_error(
+                    current.state,
+                    RepositoryWorktreeBindingState::Bound,
+                ));
+            }
+            ensure_fresh_identity_matches(&current, identity)?;
+            if current.reservation_digest.as_deref() != Some(reservation_digest)
+                || current.worktree_root.is_none()
+                || current.root_layout.is_none()
+                || current.root_source.is_none()
+                || current.parent_identity_json.is_none()
+            {
+                return Err(invalid_binding(
+                    "completion does not match a complete root reservation".to_owned(),
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE repository_worktree_binding
+                 SET state = 'bound', worktree_identity_json = ?1, updated_at_ms = ?2
+                 WHERE singleton = 1 AND origin = 'fresh'
+                   AND state IN ('fresh_reserved', 'recovery_required')
+                   AND bootstrap_nonce = ?3 AND reservation_digest = ?4",
+                params![
+                    worktree_identity_json,
+                    super::now_ms(),
+                    identity.bootstrap_nonce,
+                    reservation_digest,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid_binding(
+                    "fresh root completion lost its compare-and-set".to_owned(),
+                ));
+            }
+            crate::schema::record_min_compatible_schema_floor(tx, 53)?;
+            Ok(())
+        })?;
         self.repository_worktree_binding()
     }
 
@@ -380,55 +435,54 @@ impl BrokerStore {
             return Err(BrokerError::RepositoryWorktreeBindingConfirmationMismatch);
         }
         validate_legacy_binding(confirmation)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_current_v53(&tx)?;
-        let current = read_repository_worktree_binding(&tx)?;
-        ensure_state(
-            current.state,
-            RepositoryWorktreeBindingState::LegacyUnbound,
-            RepositoryWorktreeBindingState::Bound,
-        )?;
-        if current.origin != Some(RepositoryWorktreeBindingOrigin::Legacy)
-            || current.repository_root.is_some()
-            || current.worktree_root.is_some()
-        {
-            return Err(invalid_binding(
-                "legacy-unbound row contains unexpected binding data".to_owned(),
-            ));
-        }
-        let changed = tx.execute(
-            "UPDATE repository_worktree_binding
-             SET state = 'bound', origin = 'legacy', path_encoding = ?1,
-                 repository_root = ?2, git_common_dir = ?3, repository_key = ?4,
-                 broker_db_path = ?5, worktree_root = ?6, root_layout = ?7,
-                 root_source = ?8, reservation_digest = ?9,
-                 parent_identity_json = ?10, worktree_identity_json = ?11,
-                 updated_at_ms = ?12
-             WHERE singleton = 1 AND state = 'legacy_unbound' AND origin = 'legacy'",
-            params![
-                current_path_encoding(),
-                encode_path(&confirmation.repository_root),
-                encode_path(&confirmation.git_common_dir),
-                confirmation.repository_key,
-                encode_path(&confirmation.broker_db_path),
-                encode_path(&confirmation.worktree_root),
-                confirmation.layout.as_str(),
-                root_source_db_value(confirmation.source),
-                confirmation.plan_digest,
-                confirmation.parent_identity_json,
-                confirmation.worktree_identity_json,
-                super::now_ms(),
-            ],
-        )?;
-        if changed != 1 {
-            return Err(invalid_binding(
-                "legacy binding lost its compare-and-set".to_owned(),
-            ));
-        }
-        crate::schema::record_min_compatible_schema_floor(&tx, 53)?;
-        tx.commit()?;
+        with_durable_binding_transaction(&mut self.conn, |tx| {
+            ensure_current_v53(tx)?;
+            let current = read_repository_worktree_binding(tx)?;
+            ensure_state(
+                current.state,
+                RepositoryWorktreeBindingState::LegacyUnbound,
+                RepositoryWorktreeBindingState::Bound,
+            )?;
+            if current.origin != Some(RepositoryWorktreeBindingOrigin::Legacy)
+                || current.repository_root.is_some()
+                || current.worktree_root.is_some()
+            {
+                return Err(invalid_binding(
+                    "legacy-unbound row contains unexpected binding data".to_owned(),
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE repository_worktree_binding
+                 SET state = 'bound', origin = 'legacy', path_encoding = ?1,
+                     repository_root = ?2, git_common_dir = ?3, repository_key = ?4,
+                     broker_db_path = ?5, worktree_root = ?6, root_layout = ?7,
+                     root_source = ?8, reservation_digest = ?9,
+                     parent_identity_json = ?10, worktree_identity_json = ?11,
+                     updated_at_ms = ?12
+                 WHERE singleton = 1 AND state = 'legacy_unbound' AND origin = 'legacy'",
+                params![
+                    current_path_encoding(),
+                    encode_path(&confirmation.repository_root),
+                    encode_path(&confirmation.git_common_dir),
+                    confirmation.repository_key,
+                    encode_path(&confirmation.broker_db_path),
+                    encode_path(&confirmation.worktree_root),
+                    confirmation.layout.as_str(),
+                    root_source_db_value(confirmation.source),
+                    confirmation.plan_digest,
+                    confirmation.parent_identity_json,
+                    confirmation.worktree_identity_json,
+                    super::now_ms(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid_binding(
+                    "legacy binding lost its compare-and-set".to_owned(),
+                ));
+            }
+            crate::schema::record_min_compatible_schema_floor(tx, 53)?;
+            Ok(())
+        })?;
         self.repository_worktree_binding()
     }
 }
@@ -980,6 +1034,84 @@ mod tests {
     }
 
     #[test]
+    fn binding_transactions_use_full_synchronous_and_restore_after_commit_or_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(directory.path().join("state.db")).unwrap();
+        conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+        conn.execute_batch("CREATE TABLE binding_test_rows (value TEXT PRIMARY KEY);")
+            .unwrap();
+
+        let committed_mode = with_durable_binding_transaction(&mut conn, |tx| {
+            tx.execute(
+                "INSERT INTO binding_test_rows(value) VALUES('committed')",
+                [],
+            )?;
+            tx.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .map_err(BrokerError::from)
+        })
+        .unwrap();
+        assert_eq!(committed_mode, 2, "the transaction body must run at FULL");
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a successful transition restores the connection's prior mode"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM binding_test_rows", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a committed file-backed binding transaction persists its row"
+        );
+
+        let error = with_durable_binding_transaction(&mut conn, |tx| {
+            let synchronous = tx.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?;
+            assert_eq!(synchronous, 2);
+            tx.execute(
+                "INSERT INTO binding_test_rows(value) VALUES('rolled-back')",
+                [],
+            )?;
+            Err(invalid_binding("test rollback".to_owned()))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::InvalidRepositoryWorktreeBinding(message) if message == "test rollback"
+        ));
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a rolled-back transition restores the connection's prior mode"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM binding_test_rows", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a failed file-backed binding transaction rolls back its inserted row"
+        );
+
+        conn.pragma_update(None, "synchronous", "EXTRA").unwrap();
+        let preserved_extra_mode = with_durable_binding_transaction(&mut conn, |tx| {
+            tx.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .map_err(BrokerError::from)
+        })
+        .unwrap();
+        assert_eq!(
+            preserved_extra_mode, 3,
+            "the helper must preserve an already-stronger EXTRA setting"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3,
+            "successful binding work must not downgrade EXTRA"
+        );
+    }
+
+    #[test]
     fn fresh_binding_requires_exact_bootstrap_and_reservation_before_bound() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = open_store(&directory);
@@ -994,6 +1126,8 @@ mod tests {
         assert_eq!(fresh.origin, Some(RepositoryWorktreeBindingOrigin::Fresh));
         assert_eq!(floor(&store), "53");
 
+        let binding_before_wrong_nonce = store.repository_worktree_binding().unwrap();
+        let floor_before_wrong_nonce = floor(&store);
         let mut wrong_nonce = fresh_reservation(identity.clone());
         wrong_nonce.identity.bootstrap_nonce = "d4".repeat(32);
         assert!(matches!(
@@ -1001,8 +1135,14 @@ mod tests {
             Err(BrokerError::InvalidRepositoryWorktreeBinding(_))
         ));
         assert_eq!(
-            store.repository_worktree_binding().unwrap().state,
-            RepositoryWorktreeBindingState::FreshUnbound
+            store.repository_worktree_binding().unwrap(),
+            binding_before_wrong_nonce,
+            "a rejected binding transition must preserve every durable binding field"
+        );
+        assert_eq!(
+            floor(&store),
+            floor_before_wrong_nonce,
+            "a rejected binding transition must preserve the compatibility floor"
         );
 
         let reservation = fresh_reservation(identity.clone());
@@ -1217,6 +1357,21 @@ mod tests {
         assert_eq!(legacy.origin, Some(RepositoryWorktreeBindingOrigin::Legacy));
         assert!(legacy.repository_root.is_none());
 
+        // This deliberately creates malformed persisted data to exercise the
+        // reader's fail-closed path. Keep the production CHECK constraints in
+        // place everywhere else in the test.
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "ignore_check_constraints", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the malformed-row fixture must explicitly bypass only SQLite CHECK evaluation"
+        );
         store
             .conn
             .execute(
@@ -1224,11 +1379,34 @@ mod tests {
                 [],
             )
             .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "ignore_check_constraints", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert!(matches!(
             store.repository_worktree_binding(),
             Err(BrokerError::InvalidRepositoryWorktreeBinding(_))
         ));
 
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "ignore_check_constraints", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the malformed-row fixture must explicitly bypass only SQLite CHECK evaluation"
+        );
         store
             .conn
             .execute(
@@ -1237,6 +1415,17 @@ mod tests {
                 [],
             )
             .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "ignore_check_constraints", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert!(matches!(
             store.repository_worktree_binding(),
             Err(BrokerError::InvalidRepositoryWorktreeBinding(_))

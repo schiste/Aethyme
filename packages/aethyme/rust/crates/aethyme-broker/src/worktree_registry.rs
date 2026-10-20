@@ -285,6 +285,290 @@ fn regular_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Create a private directory chain one component at a time, syncing the
+/// parent that names each newly-created directory before descending into it.
+/// Existing ancestors are never chmodded or required to be owned by this user
+/// (the host-state parent may intentionally be shared, such as `/tmp`).
+#[cfg(unix)]
+fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const MAX_MISSING_COMPONENTS: usize = 256;
+
+    // `libc::stat` field widths vary between Unix targets; normalize them to
+    // the stable `MetadataExt` widths for a single identity comparison.
+    #[allow(clippy::unnecessary_cast)]
+    fn named_directory_matches(named: &libc::stat, opened: &Metadata) -> bool {
+        named.st_dev as u64 == opened.dev()
+            && named.st_ino as u64 == opened.ino()
+            && named.st_uid as u32 == opened.uid()
+            && named.st_mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    fn normalized_absolute(path: &Path) -> io::Result<PathBuf> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+                std::path::Component::RootDir => normalized.push(component.as_os_str()),
+                std::path::Component::CurDir => {}
+                // Removing `..` lexically before resolving symlink ancestors
+                // can create a different directory than the later filesystem
+                // open names. Reject it rather than guessing which path the
+                // caller intended.
+                std::path::Component::ParentDir => {
+                    return Err(invalid("directory path must not contain parent components"));
+                }
+                std::path::Component::Normal(name) => normalized.push(name),
+            }
+        }
+        if !normalized.is_absolute() {
+            return Err(invalid("directory path must be absolute"));
+        }
+        Ok(normalized)
+    }
+
+    fn open_directory(path: &Path) -> io::Result<fs::File> {
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+        options.open(path)
+    }
+
+    let target = normalized_absolute(path)?;
+    let mut missing = Vec::new();
+    let mut cursor = target.as_path();
+    let (existing, existing_identity) = loop {
+        match fs::metadata(cursor) {
+            Ok(metadata) if metadata.is_dir() => {
+                let canonical = fs::canonicalize(cursor)?;
+                let canonical_metadata = fs::metadata(&canonical)?;
+                if !canonical_metadata.is_dir()
+                    || metadata.dev() != canonical_metadata.dev()
+                    || metadata.ino() != canonical_metadata.ino()
+                    || metadata.uid() != canonical_metadata.uid()
+                {
+                    return Err(invalid(
+                        "existing directory ancestor changed while resolving its path",
+                    ));
+                }
+                break (canonical, canonical_metadata);
+            }
+            Ok(_) => return Err(invalid("directory path contains a non-directory")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = cursor
+                    .file_name()
+                    .ok_or_else(|| invalid("directory path has no existing ancestor"))?;
+                missing.push(name.to_os_string());
+                if missing.len() > MAX_MISSING_COMPONENTS {
+                    return Err(invalid("directory path exceeds the component limit"));
+                }
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| invalid("directory path has no existing ancestor"))?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    let mut parent = open_directory(&existing)?;
+    let parent_metadata = parent.metadata()?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.dev() != existing_identity.dev()
+        || parent_metadata.ino() != existing_identity.ino()
+        || parent_metadata.uid() != existing_identity.uid()
+    {
+        return Err(invalid("existing directory ancestor changed identity"));
+    }
+
+    for component in missing.into_iter().rev() {
+        let name = CString::new(component.as_bytes())
+            .map_err(|_| invalid("directory component contains a NUL byte"))?;
+        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
+        if !created {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error);
+            }
+        }
+
+        let child_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+            )
+        };
+        if child_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let child = unsafe { fs::File::from_raw_fd(child_fd) };
+        let child_metadata = child.metadata()?;
+        if !child_metadata.is_dir()
+            || child_metadata.uid() != unsafe { libc::geteuid() }
+            || child_metadata.mode() & 0o077 != 0
+        {
+            return Err(invalid(
+                "new host-state directory is not privately owned by this user",
+            ));
+        }
+
+        // Sync the parent after either our mkdir or a concurrent same-owner
+        // creation, then verify that the child name still resolves to the
+        // exact directory opened without following links.
+        parent.sync_all()?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        let stat_result = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                named.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat initialized the structure on success.
+        let named = unsafe { named.assume_init() };
+        if !named_directory_matches(&named, &child_metadata) {
+            return Err(invalid(
+                "new host-state directory name changed during durable creation",
+            ));
+        }
+        parent = child;
+    }
+    let opened_final = parent.metadata()?;
+    let named_final = fs::metadata(&target)?;
+    if !named_final.is_dir()
+        || opened_final.dev() != named_final.dev()
+        || opened_final.ino() != named_final.ino()
+        || opened_final.uid() != named_final.uid()
+    {
+        return Err(invalid(
+            "directory path changed while creating its durable component chain",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+fn ensure_registry_directory(host_operation_database: &Path) -> io::Result<PathBuf> {
+    let directory = registry_directory(host_operation_database)?;
+    ensure_durable_directory_chain(&directory)?;
+    real_directory(&directory)?;
+    crate::host_state::protect_host_state_path(&directory, true)?;
+    Ok(directory)
+}
+
+/// Sync the entries that name the host registry before its row can be used to
+/// complete a repository-root binding. SQLite's FULL commit makes registry
+/// contents durable; these directory syncs make a newly-created registry file
+/// and its containing directory reachable after a crash as well.
+#[cfg(unix)]
+fn sync_registry_namespace(host_operation_database: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn open_checked_directory(
+        path: &Path,
+        require_current_owner: bool,
+    ) -> io::Result<(fs::File, Metadata)> {
+        let named_before = fs::symlink_metadata(path)?;
+        if !named_before.is_dir() || named_before.file_type().is_symlink() {
+            return Err(invalid("worktree registry directory changed type"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+        let directory = options.open(path)?;
+        let opened = directory.metadata()?;
+        let named_after = fs::symlink_metadata(path)?;
+        if !opened.is_dir()
+            || !named_after.is_dir()
+            || named_after.file_type().is_symlink()
+            || opened.dev() != named_before.dev()
+            || opened.ino() != named_before.ino()
+            || opened.uid() != named_before.uid()
+            || opened.dev() != named_after.dev()
+            || opened.ino() != named_after.ino()
+            || opened.uid() != named_after.uid()
+            || (require_current_owner && opened.uid() != unsafe { libc::geteuid() })
+        {
+            return Err(invalid(
+                "worktree registry directory identity changed before syncing",
+            ));
+        }
+        Ok((directory, opened))
+    }
+
+    let host_parent = host_operation_database
+        .parent()
+        .ok_or_else(|| invalid("host operation database has no parent"))?;
+    let host_parent = fs::canonicalize(host_parent)?;
+    let directory_name = registry_directory(host_operation_database)?
+        .file_name()
+        .ok_or_else(|| invalid("worktree registry has no directory name"))?
+        .to_os_string();
+    let registry_directory = host_parent.join(directory_name);
+
+    // Open both names without following their final components. The registry
+    // directory is a child of the existing host database parent; syncing the
+    // child makes registry.sqlite3 durable, and syncing the parent makes the
+    // child directory name durable.
+    let (registry, registry_identity) = open_checked_directory(&registry_directory, true)?;
+    // The host database parent may be an intentionally shared, root-owned
+    // sticky directory such as /tmp. Pin its identity for the sync without
+    // changing its ownership or requiring it to belong to this user.
+    let (parent, parent_identity) = open_checked_directory(&host_parent, false)?;
+    registry.sync_all()?;
+    parent.sync_all()?;
+
+    for (path, opened) in [
+        (&registry_directory, registry_identity),
+        (&host_parent, parent_identity),
+    ] {
+        let named_after = fs::symlink_metadata(path)?;
+        if !named_after.is_dir()
+            || named_after.file_type().is_symlink()
+            || named_after.dev() != opened.dev()
+            || named_after.ino() != opened.ino()
+            || named_after.uid() != opened.uid()
+        {
+            return Err(invalid(
+                "worktree registry directory identity changed while syncing",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Fresh/bound repository-root provisioning is refused on non-Unix platforms,
+// where this module cannot open and sync directory entries without following
+// links. Ordinary legacy registry operations remain available there.
+#[cfg(not(unix))]
+fn sync_registry_namespace(_host_operation_database: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 fn registry_outside_root(host_database: &Path, root: &Path) -> io::Result<()> {
     let registry = crate::broker::lifecycle::canonical_prefix(&registry_directory(host_database)?)
         .map_err(invalid)?;
@@ -305,12 +589,11 @@ fn registry_lock(
 ) -> io::Result<crate::file_lock::ExclusiveFileLock> {
     let path = registry_path(host_database)?.with_extension("lock");
     if create {
+        ensure_registry_directory(host_database)?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("registry lock has no parent"))?;
-        fs::create_dir_all(parent)?;
         real_directory(parent)?;
-        crate::host_state::protect_host_state_path(parent, true)?;
     }
     let mut options = OpenOptions::new();
     options
@@ -405,12 +688,11 @@ fn open_registry_with_mode(
 ) -> io::Result<Connection> {
     let path = registry_path(host_database)?;
     if create {
+        ensure_registry_directory(host_database)?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("registry has no parent"))?;
-        fs::create_dir_all(parent)?;
         real_directory(parent)?;
-        crate::host_state::protect_host_state_path(parent, true)?;
     }
     match regular_file(&path) {
         Ok(()) => {}
@@ -476,6 +758,9 @@ fn open_registry_with_mode(
         return Err(invalid("unsupported worktree registry schema"));
     }
     regular_file(&path)?;
+    if create {
+        sync_registry_namespace(host_database)?;
+    }
     Ok(connection)
 }
 
@@ -1388,6 +1673,45 @@ pub(crate) fn inventory(host_database: &Path, deadline: Option<Instant>) -> Inve
     result
 }
 
+/// Verify that a bound repository root still has its exact retained
+/// registration. This is read-only: an absent or damaged record is a refusal,
+/// never an invitation to recreate ownership from the current environment.
+pub(crate) fn verify_exact_registration(
+    host_database: &Path,
+    root: &Path,
+    marker: &WorktreeRootMarker,
+    source: WorktreeRootSource,
+) -> io::Result<()> {
+    let registered_source = registered_source(host_database, root, marker)?;
+    if registered_source != source {
+        return Err(invalid("retained root source differs from binding"));
+    }
+    Ok(())
+}
+
+pub(crate) fn registered_source(
+    host_database: &Path,
+    root: &Path,
+    marker: &WorktreeRootMarker,
+) -> io::Result<WorktreeRootSource> {
+    // A bound repository needs only its exact retained row. A host-wide
+    // inventory here would make an unrelated damaged registration prevent
+    // this repository from opening, even though the inventory remains
+    // bounded and is still used for global discovery/GC.
+    let connection = open_registry(host_database, false)?;
+    let payload = retained_registration(&connection, root)?
+        .ok_or_else(|| invalid("bound root has no retained registry record"))?;
+    let record = validate_retained_registration(root, &payload)?;
+    if record.root != root
+        || record.repository_key != marker.repository_key
+        || record.repository_root != marker.repository_root
+    {
+        return Err(invalid("retained root registration differs from marker"));
+    }
+    marker_owner_matches(&record, marker)?;
+    Ok(record.source)
+}
+
 pub(crate) fn ownership_fingerprint(record: &RootRecord) -> io::Result<String> {
     if !root_still_present(record)? || !origin_is_missing(record)? {
         return Err(invalid("root is no longer an orphan"));
@@ -1621,6 +1945,50 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn exact_registration_ignores_an_unrelated_corrupt_registry_row() {
+        let fixture = Fixture::new();
+        let (root, marker) = fixture.root("bound");
+        fixture.register(&root, &marker);
+        let unrelated_key = record_key(&fixture._owned.path().join("unrelated"));
+        open_registry(&fixture.database, true)
+            .unwrap()
+            .execute(
+                "INSERT INTO roots(key, payload) VALUES(?1, ?2)",
+                params![unrelated_key, "{not-json"],
+            )
+            .unwrap();
+
+        assert!(
+            !inventory(&fixture.database, None).complete,
+            "the unrelated malformed row makes host-wide inventory incomplete"
+        );
+        assert_eq!(
+            registered_source(&fixture.database, &root, &marker).unwrap(),
+            WorktreeRootSource::LibraryOverride,
+            "a healthy exact row remains usable when a different registry row is malformed"
+        );
+    }
+
+    #[test]
+    fn exact_registration_refuses_its_own_corrupt_registry_row() {
+        let fixture = Fixture::new();
+        let (root, marker) = fixture.root("bound");
+        fixture.register(&root, &marker);
+        open_registry(&fixture.database, true)
+            .unwrap()
+            .execute(
+                "UPDATE roots SET payload=?1 WHERE key=?2",
+                params!["{not-json", record_key(&root)],
+            )
+            .unwrap();
+
+        assert!(
+            registered_source(&fixture.database, &root, &marker).is_err(),
+            "damage to the bound root's exact registry row must still fail closed"
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -3174,5 +3542,98 @@ mod tests {
         );
         assert!(!registry_directory(&database).unwrap().exists());
         assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+    }
+
+    #[test]
+    fn registry_creation_builds_a_missing_host_parent_chain() {
+        let owned = tempfile::tempdir().unwrap();
+        let host_database = owned
+            .path()
+            .join("missing-one/missing-two/host-operations.db");
+        let connection = open_registry(&host_database, true).unwrap();
+        drop(connection);
+
+        let host_parent = host_database.parent().unwrap();
+        assert!(host_parent.is_dir());
+        assert!(registry_directory(&host_database).unwrap().is_dir());
+        assert!(registry_path(&host_database).unwrap().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_creation_refuses_parent_components_around_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let owned = tempfile::tempdir().unwrap();
+        let base = owned.path().join("base");
+        let destination = owned.path().join("destination");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(&destination).unwrap();
+        symlink(&destination, base.join("alias")).unwrap();
+
+        let ambiguous = base.join("alias/../created");
+        assert!(ensure_durable_directory_chain(&ambiguous).is_err());
+        assert!(!base.join("created").exists());
+        assert!(!owned.path().join("created").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_namespace_sync_accepts_real_directories_and_refuses_symlinked_registry_dir() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let directory = registry_directory(&fixture.database).unwrap();
+        let registry = registry_path(&fixture.database).unwrap();
+        assert!(directory.is_dir());
+        assert!(registry.is_file());
+        // Admission invokes this sync before it can return the connection
+        // that writes a registry row used by root-binding completion.
+        sync_registry_namespace(&fixture.database).unwrap();
+
+        let retained = directory.with_extension("retained");
+        fs::rename(&directory, &retained).unwrap();
+        symlink(&retained, &directory).unwrap();
+        assert!(sync_registry_namespace(&fixture.database).is_err());
+        fs::remove_file(&directory).unwrap();
+        fs::rename(&retained, &directory).unwrap();
+        sync_registry_namespace(&fixture.database).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_namespace_sync_does_not_require_ownership_of_shared_parent() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let host_database = tempfile::NamedTempFile::new_in("/tmp").unwrap();
+        let parent = host_database.path().parent().unwrap();
+        let parent_metadata = fs::metadata(parent).unwrap();
+        let parent_owner = parent_metadata.uid();
+        let parent_mode = parent_metadata.permissions().mode() & 0o7777;
+        let current_owner = unsafe { libc::geteuid() };
+        if parent_owner == current_owner {
+            // Some test environments run as root and therefore cannot
+            // exercise the root-owned sticky-parent case.
+            return;
+        }
+
+        let directory = registry_directory(host_database.path()).unwrap();
+        assert!(
+            !directory.exists(),
+            "the random host DB name isolates this fixture"
+        );
+        let connection = open_registry(host_database.path(), true).unwrap();
+        drop(connection);
+        assert!(registry_path(host_database.path()).unwrap().is_file());
+        sync_registry_namespace(host_database.path()).unwrap();
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o7777,
+            parent_mode,
+            "shared parent permissions are preserved"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

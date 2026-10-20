@@ -2511,6 +2511,12 @@ fn preparation_cache_root_binding_for_broker(
         .preparation_cache_root_override
         .clone()
         .unwrap_or_else(|| PathBuf::from("preparation-cache"));
+    broker
+        .require_bound_repository_worktree_root("repository-shared preparation cache")
+        .map_err(|error| PreparationError::StorageUnavailable {
+            path: fallback.clone(),
+            reason: error.to_string(),
+        })?;
     context
         .preparation_cache_root_binding()
         .map_err(|error| PreparationError::StorageUnavailable {

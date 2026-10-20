@@ -1761,6 +1761,15 @@ impl Broker {
         {
             return;
         }
+        // This advice allocates a verification slot under the broker's
+        // repository worktree root. Skip it until that root has an explicit,
+        // verified binding; pull-request merge advice remains best-effort.
+        if self
+            .require_bound_repository_worktree_root("pull-request graph-integrity advice")
+            .is_err()
+        {
+            return;
+        }
         let Ok(worktree_root_plan) = self.worktree_root_plan() else {
             return;
         };

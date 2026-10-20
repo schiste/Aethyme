@@ -14,6 +14,164 @@ const POISONED_LEASE_ID: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_LEASE_ID"
 const POISONED_LEASE_GENERATION: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_LEASE_GENERATION";
 const PRIVATE_POLICY_DIGEST: &str = "AETHYME_TEST_STORAGE_CONTEXT_PRIVATE_POLICY_DIGEST";
 const POISONED_POLICY_DIGEST: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_POLICY_DIGEST";
+#[cfg(unix)]
+const FRESH_EXTERNAL_DB_PARENT_MODE: &str = "AETHYME_TEST_FRESH_EXTERNAL_DB_PARENT_MODE";
+
+/// A fresh database override must not make an explicit root start depend on
+/// either a preexisting host `worktrees` directory or a repository `.aethyme`
+/// directory. `Broker::open` stays read-only; the first explicit start may
+/// create only the standard repository fallback parent, then reserve the
+/// actual root before creating it.
+#[cfg(unix)]
+#[test]
+fn fresh_external_database_uses_the_repository_fallback_when_default_parents_are_absent() {
+    if std::env::var(FRESH_EXTERNAL_DB_PARENT_MODE).as_deref() == Ok("child") {
+        run_fresh_external_db_parent_child();
+        return;
+    }
+
+    let (repo, _) = super::landing_fixture();
+    let capsule = tempfile::tempdir().expect("isolated external database fixture");
+    let external_db_parent = capsule.path().join("external-database");
+    std::fs::create_dir(&external_db_parent).expect("external database parent");
+    let host_state = capsule.path().join("missing-host-state");
+    let host_cache = capsule.path().join("host-cache");
+    let preparation_cache = capsule.path().join("preparation-cache");
+    let collaboration = capsule.path().join("collaboration");
+    for directory in [&host_cache, &preparation_cache, &collaboration] {
+        std::fs::create_dir(directory).expect("captured storage directory");
+    }
+    let external_db = external_db_parent.join("broker.db");
+    let host_operation_db = capsule.path().join("host-operations.db");
+
+    assert!(!repo.path().join(".aethyme").exists());
+    assert!(!host_state.exists());
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .args([
+            "--exact",
+            "broker::tests::storage_context_startup::fresh_external_database_uses_the_repository_fallback_when_default_parents_are_absent",
+            "--nocapture",
+        ])
+        .env(FRESH_EXTERNAL_DB_PARENT_MODE, "child")
+        .env(TEST_REPOSITORY, repo.path())
+        .env("AETHYME_TEST_FRESH_EXTERNAL_DB_PATH", &external_db)
+        .env("AETHYME_TEST_FRESH_EXTERNAL_HOST_STATE", &host_state)
+        .env("AETHYME_TEST_FRESH_EXTERNAL_HOST_CACHE", &host_cache)
+        .env(
+            "AETHYME_TEST_FRESH_EXTERNAL_PREPARATION_CACHE",
+            &preparation_cache,
+        )
+        .env(
+            "AETHYME_TEST_FRESH_EXTERNAL_COLLABORATION",
+            &collaboration,
+        )
+        .env(
+            "AETHYME_TEST_FRESH_EXTERNAL_HOST_OPERATION_DB",
+            &host_operation_db,
+        )
+        .env(crate::BROKER_DB_ENV, &external_db)
+        .env("AETHYME_HOST_STATE_DIR", &host_state)
+        .env("HOME", capsule.path())
+        .env_remove("AETHYME_TEST_DB_SUFFIX")
+        .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("AETHYME_PREPARATION_CACHE_ROOT")
+        .env_remove("AETHYME_HOST_CACHE_DIR")
+        .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
+        .env_remove("AETHYME_GATE_BROKER_DATABASES")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CACHE_HOME");
+    let output = match crate::bounded_output::output_limited(
+        &mut command,
+        std::time::Duration::from_secs(30),
+        64 * 1024,
+    )
+    .expect("run isolated external-database child")
+    {
+        crate::bounded_output::LimitedOutput::Completed(output) => output,
+        crate::bounded_output::LimitedOutput::Deadline => {
+            panic!("isolated external-database child exceeded its 30-second budget")
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => {
+            panic!("isolated external-database child exceeded its 64 KiB stream limit")
+        }
+    };
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(external_db.is_file(), "the override database was opened");
+    assert!(
+        repo.path().join(".aethyme/worktrees").is_dir(),
+        "explicit start should create the repository fallback root"
+    );
+    assert!(
+        !host_state.join("worktrees").exists(),
+        "the absent host-state worktree container is not synthesized"
+    );
+}
+
+#[cfg(unix)]
+fn run_fresh_external_db_parent_child() {
+    let repository = PathBuf::from(std::env::var_os(TEST_REPOSITORY).expect("repository path"));
+    let external_db = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_FRESH_EXTERNAL_DB_PATH").expect("external database"),
+    );
+    let host_state = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_FRESH_EXTERNAL_HOST_STATE").expect("host state"),
+    );
+    let host_cache = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_FRESH_EXTERNAL_HOST_CACHE").expect("host cache"),
+    );
+    let preparation_cache = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_FRESH_EXTERNAL_PREPARATION_CACHE")
+            .expect("preparation cache"),
+    );
+    let collaboration = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_FRESH_EXTERNAL_COLLABORATION").expect("collaboration state"),
+    );
+    let host_operation_db = PathBuf::from(
+        std::env::var_os("AETHYME_TEST_FRESH_EXTERNAL_HOST_OPERATION_DB")
+            .expect("host operation database"),
+    );
+    let options = BrokerOpenOptions::default()
+        .with_host_state_dir(host_state.clone())
+        .with_host_cache_dir(host_cache)
+        .with_preparation_cache_root(preparation_cache)
+        .with_host_operation_database(host_operation_db)
+        .with_collaboration_state(collaboration);
+    let mut broker = Broker::open_with_options(&repository, options)
+        .expect("open fresh broker database outside the checkout");
+    assert!(
+        !repository.join(".aethyme").exists(),
+        "opening the fresh external database must not create a repository root parent"
+    );
+    assert!(
+        !host_state.exists(),
+        "opening the fresh external database must not create host-state directories"
+    );
+    let placement = broker
+        .start_worktree_with_planned_paths("external database root fixture", &[], None)
+        .expect("explicit first start should prepare the standard fallback root");
+    let expected_root = repository.join(".aethyme/worktrees");
+    assert_eq!(placement.worktree_placement.root, expected_root);
+    assert_eq!(
+        placement.worktree_placement.source,
+        crate::WorktreeRootSource::RepositoryFallback
+    );
+    assert_eq!(
+        broker
+            .validate_bound_repository_worktree_root()
+            .expect("reopen the completed root binding"),
+        Some(expected_root)
+    );
+}
 
 /// Broker open runs maintenance before returning. A child process gives this
 /// test poisoned ambient paths without mutating process-wide environment in

@@ -218,6 +218,12 @@ Usage:
       .aethyme/config.toml supersedes the per-user default while it exists,
       is outside the repository and has worktrees.min_free_bytes free;
       otherwise starts use the default and say why.
+  aethyme broker worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]
+      Review an existing marker- and registry-backed legacy root before binding.
+      This never discovers or creates a root; the emitted digest binds the exact
+      repository, database, root, layout, source and filesystem identities.
+  aethyme broker worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]
+      Bind that exact legacy root only if all planned identities still match.
   aethyme broker worktrees [--measure] [--json]
       List every worktree on this host with its repository, size, age and
       what removing it would lose (uncommitted, unpushed, recoverable).

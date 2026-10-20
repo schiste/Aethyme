@@ -1667,6 +1667,219 @@ fn prepare_worktree_root_directory(
     path.canonicalize().map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BoundDirectoryIdentity {
+    canonical_path: PathBuf,
+    device: u64,
+    inode: u64,
+    uid: u32,
+}
+
+struct FreshWorktreeRootCandidate {
+    root: PathBuf,
+    parent_identity_json: String,
+    layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
+    source: WorktreeRootSource,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LegacyWorktreeRootBindingPlan {
+    pub(crate) schema_version: u32,
+    pub(crate) repository_root: PathBuf,
+    pub(crate) git_common_dir: PathBuf,
+    pub(crate) repository_key: String,
+    pub(crate) broker_db_path: PathBuf,
+    pub(crate) worktree_root: PathBuf,
+    pub(crate) layout: String,
+    pub(crate) source: WorktreeRootSource,
+    pub(crate) parent_identity: BoundDirectoryIdentity,
+    pub(crate) worktree_identity: BoundDirectoryIdentity,
+    pub(crate) digest: String,
+}
+
+fn fresh_root_identity(
+    binding: &crate::store::repository_binding::RepositoryWorktreeBinding,
+    main_root: &Path,
+    repo: &GitRepo,
+    database_path: &Path,
+) -> Result<crate::store::repository_binding::RepositoryRootIdentity, BrokerOpError> {
+    use crate::store::repository_binding::{
+        RepositoryRootIdentity, RepositoryWorktreeBindingOrigin, RepositoryWorktreeBindingState,
+    };
+
+    let refusal = |reason: String| BrokerOpError::WorktreeRootUnavailable {
+        path: main_root.to_path_buf(),
+        reason,
+    };
+    if binding.state != RepositoryWorktreeBindingState::FreshUnbound
+        || binding.origin != Some(RepositoryWorktreeBindingOrigin::Fresh)
+    {
+        return Err(refusal(
+            "only a fresh-unbound database may reserve its first root".into(),
+        ));
+    }
+    let repository_root = binding
+        .repository_root
+        .clone()
+        .ok_or_else(|| refusal("fresh binding has no repository root".into()))?;
+    let git_common_dir = binding
+        .git_common_dir
+        .clone()
+        .ok_or_else(|| refusal("fresh binding has no Git common directory".into()))?;
+    let repository_key = binding
+        .repository_key
+        .clone()
+        .ok_or_else(|| refusal("fresh binding has no repository key".into()))?;
+    let broker_db_path = binding
+        .broker_db_path
+        .clone()
+        .ok_or_else(|| refusal("fresh binding has no broker database path".into()))?;
+    let bootstrap_nonce = binding
+        .bootstrap_nonce
+        .clone()
+        .ok_or_else(|| refusal("fresh binding has no bootstrap nonce".into()))?;
+    let current_repository_root = main_root
+        .canonicalize()
+        .map_err(|error| refusal(format!("cannot verify repository root: {error}")))?;
+    let current_git_common_dir = repo
+        .git_common_dir()?
+        .canonicalize()
+        .map_err(|error| refusal(format!("cannot verify Git common directory: {error}")))?;
+    let current_repository_key =
+        crate::host_state::repository_key(&current_repository_root, Some(&current_git_common_dir));
+    let current_database_path = database_path
+        .canonicalize()
+        .map_err(|error| refusal(format!("cannot verify broker database path: {error}")))?;
+    if repository_root != current_repository_root
+        || git_common_dir != current_git_common_dir
+        || repository_key != current_repository_key
+        || broker_db_path != current_database_path
+    {
+        return Err(refusal(
+            "fresh database identity differs from this repository or database path".into(),
+        ));
+    }
+    Ok(RepositoryRootIdentity {
+        repository_root,
+        git_common_dir,
+        repository_key,
+        broker_db_path,
+        bootstrap_nonce,
+    })
+}
+
+fn fresh_root_reservation_digest(
+    identity: &crate::store::repository_binding::RepositoryRootIdentity,
+    root: &Path,
+    layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
+    source: WorktreeRootSource,
+    parent_identity_json: &str,
+) -> Result<String, BrokerOpError> {
+    let payload = serde_json::json!({
+        "repository_root": identity.repository_root,
+        "git_common_dir": identity.git_common_dir,
+        "repository_key": identity.repository_key,
+        "broker_db_path": identity.broker_db_path,
+        "bootstrap_nonce": identity.bootstrap_nonce,
+        "worktree_root": root,
+        "layout": format!("{layout:?}"),
+        "source": source,
+        "parent_identity": parent_identity_json,
+    });
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+            path: root.to_path_buf(),
+            reason: format!("cannot encode root reservation identity: {error}"),
+        })?;
+    Ok(hex_digest(&bytes))
+}
+
+fn bound_directory_identity(path: &Path) -> Result<BoundDirectoryIdentity, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("path is not a real directory".into());
+    }
+    let canonical_path = path.canonicalize().map_err(|error| error.to_string())?;
+    if canonical_path != path {
+        return Err("path is not its canonical directory name".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(BoundDirectoryIdentity {
+            canonical_path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "this platform cannot verify the persisted directory identity for {}",
+            canonical_path.display()
+        ))
+    }
+}
+
+/// The bound worktree root is private state, not just a stable directory name.
+/// Its owner may read/write it, but group/other write access would allow another
+/// local user to alter retained worktrees after identity validation.
+#[cfg(unix)]
+fn verify_private_worktree_root_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("path is not a real directory".into());
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "worktree root is group- or world-writable (mode {mode:04o})"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_worktree_root_permissions(_path: &Path) -> Result<(), String> {
+    Err("this platform cannot verify private worktree-root permissions".into())
+}
+
+#[cfg(not(unix))]
+fn sync_bound_directory(_path: &Path, _expected: &BoundDirectoryIdentity) -> Result<(), String> {
+    Err("durable fresh-root publication requires Unix directory syncing".into())
+}
+
+#[cfg(unix)]
+fn sync_bound_directory(path: &Path, expected: &BoundDirectoryIdentity) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    if &bound_directory_identity(path)? != expected {
+        return Err("directory identity changed before syncing its entries".into());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let directory = options.open(path).map_err(|error| error.to_string())?;
+    let metadata = directory.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.dev() != expected.device
+        || metadata.ino() != expected.inode
+        || metadata.uid() != expected.uid
+    {
+        return Err("opened directory identity differs from the reserved identity".into());
+    }
+    directory.sync_all().map_err(|error| error.to_string())?;
+    if &bound_directory_identity(path)? != expected {
+        return Err("directory identity changed while syncing its entries".into());
+    }
+    Ok(())
+}
+
 impl Broker {
     pub fn open(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
         Self::open_with_options(path_inside_repo, BrokerOpenOptions::default())
@@ -1721,14 +1934,23 @@ impl Broker {
     /// does not reconcile prepared shared operations before compatibility has
     /// authorized the command itself.
     pub fn open_for_compatibility_backfill(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
-        let mut storage_context = BrokerStorageContext::capture(BrokerOpenOptions::default());
+        Self::open_for_compatibility_backfill_with_options(
+            path_inside_repo,
+            BrokerOpenOptions::default(),
+        )
+    }
+
+    pub(crate) fn open_for_compatibility_backfill_with_options(
+        path_inside_repo: &Path,
+        options: BrokerOpenOptions,
+    ) -> Result<Self, BrokerOpError> {
+        let mut storage_context = BrokerStorageContext::capture(options);
         storage_context.ensure_valid()?;
         let here = GitRepo::discover(path_inside_repo)?;
         let main_root = here.main_root()?;
         let repo = GitRepo::discover(&main_root)?;
         storage_context.bind_repository(&repo)?;
         let store = BrokerStore::open_in_repo(&main_root)?;
-        storage_context.initialize_preparation_cache_root(&repo)?;
         let mut broker = Self {
             repo,
             store,
@@ -1743,6 +1965,16 @@ impl Broker {
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
         };
+        // Opening an unbound v53 database is observational. In particular it
+        // must not initialize a shared preparation-cache root or run startup
+        // recovery from a root selected from today's environment. Those writes
+        // resume only after a reviewed repository-root binding exists.
+        if broker.validate_bound_repository_worktree_root()?.is_none() {
+            return Ok(broker);
+        }
+        broker
+            .storage_context
+            .initialize_preparation_cache_root(&broker.repo)?;
         broker.backfill_live_repository_contracts()?;
         Ok(broker)
     }
@@ -1774,7 +2006,6 @@ impl Broker {
         let repo = GitRepo::discover(&main_root)?;
         storage_context.bind_repository(&repo)?;
         let store = BrokerStore::open_in_repo(&main_root)?;
-        storage_context.initialize_preparation_cache_root(&repo)?;
         let mut broker = Self {
             repo,
             store,
@@ -1789,6 +2020,14 @@ impl Broker {
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
         };
+        // A fresh or legacy-unbound store remains available for non-root
+        // operations, but startup maintenance waits for an explicit binding.
+        if broker.validate_bound_repository_worktree_root()?.is_none() {
+            return Ok(broker);
+        }
+        broker
+            .storage_context
+            .initialize_preparation_cache_root(&broker.repo)?;
         // Fence pre-#660 binaries out of a repository whose committed config
         // requires collaboration capture. Best effort: the open never fails
         // because of it.
@@ -3349,14 +3588,427 @@ impl Broker {
             context.worktree_root_override = Some(root.clone());
             context.worktree_root_environment_override = None;
         }
-        Ok(plan_worktree_root_with_context(
-            &self.main_root,
-            Some(&git_common_dir),
-            &context,
-        ))
+        let mut plan =
+            plan_worktree_root_with_context(&self.main_root, Some(&git_common_dir), &context);
+        let binding = self.store.repository_worktree_binding()?;
+        if binding.state == crate::store::repository_binding::RepositoryWorktreeBindingState::Bound
+            && let Some(root) = binding.worktree_root
+        {
+            plan.preferred_root = Some(root);
+            plan.preferred_source = binding.root_source;
+            plan.preferred_outside_repository = plan
+                .preferred_root
+                .as_deref()
+                .is_some_and(|root| !self.path_is_inside_repository(root));
+            plan.host_state_fallback_root = None;
+            plan.preferred_unavailable_reason = None;
+            plan.root_container = if binding.root_layout
+                == Some(
+                    crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer,
+                ) {
+                plan.preferred_root
+                    .as_ref()
+                    .and_then(|root| root.parent().map(Path::to_path_buf))
+            } else {
+                None
+            };
+        }
+        Ok(plan)
     }
 
-    pub(super) fn prepare_broker_worktree_root(&self) -> Result<WorktreePlacement, BrokerOpError> {
+    /// Verify the durable root binding before any startup or root-dependent
+    /// operation writes. `None` means the database is readable but still
+    /// needs an explicit fresh reservation or legacy adoption.
+    pub(crate) fn validate_bound_repository_worktree_root(
+        &self,
+    ) -> Result<Option<PathBuf>, BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        let binding = self.store.repository_worktree_binding()?;
+        if binding.state != RepositoryWorktreeBindingState::Bound {
+            return Ok(None);
+        }
+        let refusal = |reason: String| BrokerOpError::WorktreeRootUnavailable {
+            path: binding
+                .worktree_root
+                .clone()
+                .unwrap_or_else(|| self.main_root.join(".aethyme/worktrees")),
+            reason,
+        };
+        let repository_root = binding
+            .repository_root
+            .as_deref()
+            .ok_or_else(|| refusal("bound record has no repository root".into()))?;
+        let git_common_dir = binding
+            .git_common_dir
+            .as_deref()
+            .ok_or_else(|| refusal("bound record has no Git common directory".into()))?;
+        let repository_key = binding
+            .repository_key
+            .as_deref()
+            .ok_or_else(|| refusal("bound record has no repository key".into()))?;
+        let database_path = binding
+            .broker_db_path
+            .as_deref()
+            .ok_or_else(|| refusal("bound record has no broker database path".into()))?;
+        let root = binding
+            .worktree_root
+            .as_deref()
+            .ok_or_else(|| refusal("bound record has no worktree root".into()))?;
+        let stored_parent = binding
+            .parent_identity_json
+            .as_deref()
+            .ok_or_else(|| refusal("bound record has no parent identity".into()))?;
+        let stored_root = binding
+            .worktree_identity_json
+            .as_deref()
+            .ok_or_else(|| refusal("bound record has no worktree identity".into()))?;
+        let current_repository_root = self
+            .main_root
+            .canonicalize()
+            .map_err(|error| refusal(format!("cannot verify repository root: {error}")))?;
+        let current_git_common_dir = self
+            .main_git_common_dir()?
+            .canonicalize()
+            .map_err(|error| refusal(format!("cannot verify Git common directory: {error}")))?;
+        let current_repository_key = crate::host_state::repository_key(
+            &current_repository_root,
+            Some(&current_git_common_dir),
+        );
+        let current_database_path = self
+            .store
+            .db_path()
+            .canonicalize()
+            .map_err(|error| refusal(format!("cannot verify broker database path: {error}")))?;
+        if repository_root != current_repository_root
+            || git_common_dir != current_git_common_dir
+            || repository_key != current_repository_key
+            || database_path != current_database_path
+        {
+            return Err(refusal(
+                "stored repository or database identity differs from this checkout".into(),
+            ));
+        }
+        let root_metadata = std::fs::symlink_metadata(root)
+            .map_err(|error| refusal(format!("cannot inspect bound worktree root: {error}")))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(refusal(
+                "bound worktree root is not a real directory".into(),
+            ));
+        }
+        let canonical_root = root.canonicalize().map_err(|error| {
+            refusal(format!("cannot canonicalize bound worktree root: {error}"))
+        })?;
+        if canonical_root != root {
+            return Err(refusal(
+                "bound worktree root no longer has its recorded canonical path".into(),
+            ));
+        }
+        verify_private_worktree_root_permissions(root).map_err(|reason| {
+            refusal(format!(
+                "cannot verify bound worktree-root permissions: {reason}"
+            ))
+        })?;
+        let parent = root
+            .parent()
+            .ok_or_else(|| refusal("bound worktree root has no parent".into()))?;
+        let observed_parent = bound_directory_identity(parent)
+            .map_err(|reason| refusal(format!("cannot verify bound root parent: {reason}")))?;
+        let observed_root = bound_directory_identity(root)
+            .map_err(|reason| refusal(format!("cannot verify bound root identity: {reason}")))?;
+        let expected_parent: BoundDirectoryIdentity = serde_json::from_str(stored_parent)
+            .map_err(|error| refusal(format!("stored parent identity is invalid: {error}")))?;
+        let expected_root: BoundDirectoryIdentity = serde_json::from_str(stored_root)
+            .map_err(|error| refusal(format!("stored worktree identity is invalid: {error}")))?;
+        if observed_parent != expected_parent || observed_root != expected_root {
+            return Err(refusal(
+                "bound worktree root or parent identity changed".into(),
+            ));
+        }
+        let expected_marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: current_repository_key.clone(),
+            repository_root: current_repository_root.clone(),
+        };
+        self.verify_worktree_root_marker(&root.join(WORKTREE_ROOT_MARKER), &expected_marker)?;
+        crate::worktree_registry::verify_exact_registration(
+            &self.host_operation_database_path()?,
+            root,
+            &expected_marker,
+            binding.root_source.ok_or_else(|| {
+                refusal("bound record has no recorded worktree-root source".into())
+            })?,
+        )
+        .map_err(|error| refusal(format!("cannot verify worktree-root registration: {error}")))?;
+        Ok(Some(root.to_path_buf()))
+    }
+
+    /// Require a verified durable root before an operation plans or mutates
+    /// repository worktree storage. An unbound database remains usable for
+    /// operations that do not depend on this root; current config and
+    /// environment are never treated as proof of an existing root.
+    pub(crate) fn require_bound_repository_worktree_root(
+        &self,
+        operation: &str,
+    ) -> Result<PathBuf, BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        let binding = self.store.repository_worktree_binding()?;
+        let path = binding
+            .worktree_root
+            .clone()
+            .unwrap_or_else(|| self.main_root.join(".aethyme/worktrees"));
+        let reason = match binding.state {
+            RepositoryWorktreeBindingState::Bound => {
+                return self
+                    .validate_bound_repository_worktree_root()?
+                    .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                        path,
+                        reason: format!("{operation} requires a verified worktree-root binding"),
+                    });
+            }
+            RepositoryWorktreeBindingState::LegacyUnbound => {
+                "legacy root requires explicit digest-confirmed binding plan/apply"
+            }
+            RepositoryWorktreeBindingState::FreshUnbound => {
+                "fresh root requires an explicit root-creating broker operation"
+            }
+            RepositoryWorktreeBindingState::FreshReserved
+            | RepositoryWorktreeBindingState::RecoveryRequired => {
+                "root reservation is incomplete; automatic fallback is disabled and this version has no recovery command. Preserve the database and filesystem evidence for a future reviewed recovery path"
+            }
+        };
+        Err(BrokerOpError::WorktreeRootUnavailable {
+            path,
+            reason: format!("{operation} is unavailable: {reason}"),
+        })
+    }
+
+    pub(crate) fn legacy_worktree_root_binding_plan(
+        &self,
+        requested_root: &Path,
+        layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
+    ) -> Result<LegacyWorktreeRootBindingPlan, BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        let refusal = |path: &Path, reason: String| BrokerOpError::WorktreeRootUnavailable {
+            path: path.to_path_buf(),
+            reason,
+        };
+        let binding = self.store.repository_worktree_binding()?;
+        if binding.state != RepositoryWorktreeBindingState::LegacyUnbound {
+            return Err(refusal(
+                requested_root,
+                format!(
+                    "explicit legacy adoption requires legacy_unbound state, found {:?}",
+                    binding.state
+                ),
+            ));
+        }
+        let root = requested_root
+            .canonicalize()
+            .map_err(|error| refusal(requested_root, format!("cannot resolve root: {error}")))?;
+        let root_identity = bound_directory_identity(&root)
+            .map_err(|reason| refusal(&root, format!("cannot verify legacy root: {reason}")))?;
+        verify_private_worktree_root_permissions(&root).map_err(|reason| {
+            refusal(
+                &root,
+                format!("cannot verify legacy root permissions: {reason}"),
+            )
+        })?;
+        let parent = root
+            .parent()
+            .ok_or_else(|| refusal(&root, "legacy root has no parent".into()))?;
+        let parent_identity = bound_directory_identity(parent).map_err(|reason| {
+            refusal(
+                parent,
+                format!("cannot verify legacy root parent: {reason}"),
+            )
+        })?;
+        let repository_root = self.main_root.canonicalize().map_err(|error| {
+            refusal(&self.main_root, format!("cannot verify checkout: {error}"))
+        })?;
+        let git_common_dir = self
+            .main_git_common_dir()?
+            .canonicalize()
+            .map_err(|error| {
+                refusal(
+                    &self.main_root,
+                    format!("cannot verify Git identity: {error}"),
+                )
+            })?;
+        let repository_key =
+            crate::host_state::repository_key(&repository_root, Some(&git_common_dir));
+        let broker_db_path = self.store.db_path().canonicalize().map_err(|error| {
+            refusal(
+                self.store.db_path(),
+                format!("cannot verify broker database: {error}"),
+            )
+        })?;
+        let expected_marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: repository_key.clone(),
+            repository_root: repository_root.clone(),
+        };
+        self.verify_worktree_root_marker(&root.join(WORKTREE_ROOT_MARKER), &expected_marker)?;
+        let source = crate::worktree_registry::registered_source(
+            &self.host_operation_database_path()?,
+            &root,
+            &expected_marker,
+        )
+        .map_err(|error| {
+            refusal(
+                &root,
+                format!("cannot verify retained root registration: {error}"),
+            )
+        })?;
+        let parent_json = serde_json::to_string(&parent_identity)
+            .map_err(|error| refusal(parent, format!("cannot encode parent identity: {error}")))?;
+        let worktree_json = serde_json::to_string(&root_identity)
+            .map_err(|error| refusal(&root, format!("cannot encode root identity: {error}")))?;
+        let layout_name = match layout {
+            crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer => {
+                "keyed_container"
+            }
+            crate::store::repository_binding::RepositoryWorktreeRootLayout::DirectRoot => {
+                "direct_root"
+            }
+        };
+        let digest_input = serde_json::json!({
+            "schema_version": 1,
+            "repository_root": &repository_root,
+            "git_common_dir": &git_common_dir,
+            "repository_key": &repository_key,
+            "broker_db_path": &broker_db_path,
+            "worktree_root": &root,
+            "layout": layout_name,
+            "source": source,
+            "parent_identity": &parent_json,
+            "worktree_identity": &worktree_json,
+        });
+        let digest_bytes = serde_json::to_vec(&digest_input).map_err(|error| {
+            refusal(&root, format!("cannot encode legacy binding plan: {error}"))
+        })?;
+        Ok(LegacyWorktreeRootBindingPlan {
+            schema_version: 1,
+            repository_root,
+            git_common_dir,
+            repository_key,
+            broker_db_path,
+            worktree_root: root,
+            layout: layout_name.to_owned(),
+            source,
+            parent_identity,
+            worktree_identity: root_identity,
+            digest: hex_digest(&digest_bytes),
+        })
+    }
+
+    pub(crate) fn apply_legacy_worktree_root_binding(
+        &mut self,
+        requested_root: &Path,
+        layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
+        confirmed_digest: &str,
+    ) -> Result<(), BrokerOpError> {
+        use crate::store::repository_binding::{
+            LegacyRepositoryRootConfirmation, RepositoryWorktreeBindingState,
+        };
+
+        let _bootstrap_lock = crate::store::fresh_database::acquire_repository_binding_lock(
+            &self.main_root,
+            self.store.db_path(),
+        )?;
+        let binding = self.store.repository_worktree_binding()?;
+        if binding.state != RepositoryWorktreeBindingState::LegacyUnbound {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: requested_root.to_path_buf(),
+                reason: format!(
+                    "explicit legacy adoption requires legacy_unbound state, found {:?}",
+                    binding.state
+                ),
+            });
+        }
+        let plan = self.legacy_worktree_root_binding_plan(requested_root, layout)?;
+        if plan.digest != confirmed_digest {
+            return Err(BrokerOpError::Store(
+                crate::error::BrokerError::RepositoryWorktreeBindingConfirmationMismatch,
+            ));
+        }
+        let confirmation = LegacyRepositoryRootConfirmation {
+            repository_root: plan.repository_root,
+            git_common_dir: plan.git_common_dir,
+            repository_key: plan.repository_key,
+            broker_db_path: plan.broker_db_path,
+            worktree_root: plan.worktree_root,
+            layout,
+            source: plan.source,
+            plan_digest: plan.digest,
+            confirmed_digest: confirmed_digest.to_owned(),
+            parent_identity_json: serde_json::to_string(&plan.parent_identity).map_err(
+                |error| BrokerOpError::WorktreeRootUnavailable {
+                    path: requested_root.to_path_buf(),
+                    reason: format!("cannot encode parent identity: {error}"),
+                },
+            )?,
+            worktree_identity_json: serde_json::to_string(&plan.worktree_identity).map_err(
+                |error| BrokerOpError::WorktreeRootUnavailable {
+                    path: requested_root.to_path_buf(),
+                    reason: format!("cannot encode root identity: {error}"),
+                },
+            )?,
+        };
+        self.store.bind_legacy_repository_worktree(&confirmation)?;
+        self.validate_bound_repository_worktree_root()?
+            .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                path: requested_root.to_path_buf(),
+                reason: "legacy root binding completed but did not validate".into(),
+            })?;
+        Ok(())
+    }
+
+    pub(super) fn prepare_broker_worktree_root(
+        &mut self,
+    ) -> Result<WorktreePlacement, BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        let binding = self.store.repository_worktree_binding()?;
+        match binding.state {
+            RepositoryWorktreeBindingState::Bound => {
+                let root = self
+                    .validate_bound_repository_worktree_root()?
+                    .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                        path: self.main_root.clone(),
+                        reason: "bound root identity is unavailable".into(),
+                    })?;
+                return Ok(WorktreePlacement {
+                    root,
+                    source: binding.root_source.ok_or_else(|| {
+                        BrokerOpError::WorktreeRootUnavailable {
+                            path: self.main_root.clone(),
+                            reason: "bound record has no worktree-root source".into(),
+                        }
+                    })?,
+                    outside_repository: binding.root_source
+                        != Some(WorktreeRootSource::RepositoryFallback),
+                    fallback_reason: None,
+                });
+            }
+            RepositoryWorktreeBindingState::LegacyUnbound => {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: self.main_root.join(".aethyme/worktrees"),
+                    reason: "legacy repository has no reviewed worktree-root binding; inspect `aethyme broker worktree-root`, then use the explicit binding plan/apply workflow".into(),
+                });
+            }
+            RepositoryWorktreeBindingState::FreshReserved
+            | RepositoryWorktreeBindingState::RecoveryRequired => {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: binding.worktree_root.unwrap_or_else(|| self.main_root.clone()),
+                    reason: "fresh worktree-root reservation is incomplete; automatic fallback is disabled and this version has no recovery command. Preserve the database and filesystem evidence for a future reviewed recovery path".into(),
+                });
+            }
+            RepositoryWorktreeBindingState::FreshUnbound => {}
+        }
+
         let plan = self.worktree_root_plan()?;
         let candidates = worktree_root_candidates_for(&plan);
         let strict_override = matches!(
@@ -3378,19 +4030,30 @@ impl Broker {
         };
         let mut last_error = None;
         for (path, source) in candidates {
-            match self.prepare_worktree_root(
-                &path,
-                source,
-                source != WorktreeRootSource::RepositoryFallback,
-            ) {
-                Ok(root) => {
-                    return Ok(WorktreePlacement {
-                        root,
-                        source,
-                        outside_repository: source != WorktreeRootSource::RepositoryFallback,
-                        fallback_reason,
-                    });
-                }
+            let bootstrap_lock =
+                match self.prepare_missing_default_fresh_root_parent(&plan, &path, source) {
+                    Ok(lock) => lock,
+                    Err(error) if strict_override => return Err(error),
+                    Err(error) => {
+                        let reason = match source {
+                            WorktreeRootSource::RepositoryConfig => {
+                                format!("configured worktree root is unavailable: {error}")
+                            }
+                            WorktreeRootSource::HostState
+                                if plan.preferred_source
+                                    == Some(WorktreeRootSource::RepositoryConfig) =>
+                            {
+                                fallback_reason.unwrap_or_else(|| error.to_string())
+                            }
+                            _ => error.to_string(),
+                        };
+                        fallback_reason = Some(reason);
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+            let candidate = match self.preflight_fresh_worktree_root(&plan, &path, source) {
+                Ok(candidate) => candidate,
                 Err(error) if strict_override => return Err(error),
                 Err(error) => {
                     let reason = match source {
@@ -3407,8 +4070,14 @@ impl Broker {
                     };
                     fallback_reason = Some(reason);
                     last_error = Some(error);
+                    continue;
                 }
-            }
+            };
+            return self.reserve_and_create_fresh_worktree_root(
+                candidate,
+                fallback_reason,
+                bootstrap_lock,
+            );
         }
         Err(
             last_error.unwrap_or_else(|| BrokerOpError::WorktreeRootUnavailable {
@@ -3416,6 +4085,530 @@ impl Broker {
                 reason: "no worktree-root candidates are available".into(),
             }),
         )
+    }
+
+    fn preflight_fresh_worktree_root(
+        &self,
+        plan: &WorktreeRootPlan,
+        requested_root: &Path,
+        source: WorktreeRootSource,
+    ) -> Result<FreshWorktreeRootCandidate, BrokerOpError> {
+        let name =
+            requested_root
+                .file_name()
+                .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                    path: requested_root.to_path_buf(),
+                    reason: "worktree root path has no final component".into(),
+                })?;
+        let requested_parent =
+            requested_root
+                .parent()
+                .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                    path: requested_root.to_path_buf(),
+                    reason: "worktree root path has no parent".into(),
+                })?;
+        let parent = requested_parent.canonicalize().map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: requested_parent.to_path_buf(),
+                reason: format!("fresh binding requires an existing root parent: {error}"),
+            }
+        })?;
+        let parent_identity = bound_directory_identity(&parent).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.clone(),
+                reason: format!("cannot verify root parent before reservation: {reason}"),
+            }
+        })?;
+        let root = parent.join(name);
+        match std::fs::symlink_metadata(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: root,
+                    reason: "fresh binding refuses an existing root; legacy roots require explicit digest-confirmed adoption".into(),
+                });
+            }
+            Err(error) => {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: root,
+                    reason: format!("cannot inspect fresh root candidate: {error}"),
+                });
+            }
+        }
+        let require_external = source != WorktreeRootSource::RepositoryFallback;
+        let min_free_bytes = self.configured_worktree_minimum(source)?;
+        preflight_worktree_root(
+            &self.main_root,
+            &root,
+            source,
+            require_external,
+            min_free_bytes,
+            crate::verification::removable_volume_unavailable_reason,
+            |candidate| {
+                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
+                    .map(|headroom| headroom.bytes)
+            },
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason,
+        })?;
+        let layout = if source != WorktreeRootSource::RepositoryFallback
+            && source != WorktreeRootSource::LibraryOverride
+            && (plan
+                .root_container
+                .as_deref()
+                .is_some_and(|container| container == parent)
+                || plan
+                    .host_state_fallback_root
+                    .as_deref()
+                    .is_some_and(|fallback| fallback == root))
+        {
+            crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer
+        } else {
+            crate::store::repository_binding::RepositoryWorktreeRootLayout::DirectRoot
+        };
+        Ok(FreshWorktreeRootCandidate {
+            root,
+            parent_identity_json: serde_json::to_string(&parent_identity).map_err(|error| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: parent,
+                    reason: format!("cannot encode root-parent identity: {error}"),
+                }
+            })?,
+            layout,
+            source,
+        })
+    }
+
+    /// Create only a missing, standard parent for an explicit fresh-root
+    /// operation. Repository fallback may create `.aethyme`; a host-state
+    /// candidate may create `worktrees` only beneath an existing captured
+    /// host-state directory. Overrides and arbitrary configured roots remain
+    /// strict, and an absent host-state base is never synthesized here.
+    fn prepare_missing_default_fresh_root_parent(
+        &self,
+        plan: &WorktreeRootPlan,
+        requested_root: &Path,
+        source: WorktreeRootSource,
+    ) -> Result<Option<std::fs::File>, BrokerOpError> {
+        let refusal = |path: &Path, reason: String| BrokerOpError::WorktreeRootUnavailable {
+            path: path.to_path_buf(),
+            reason,
+        };
+
+        let (parent, ancestor) = match source {
+            WorktreeRootSource::RepositoryFallback => {
+                let expected_parent = self.main_root.join(".aethyme");
+                if requested_root != plan.legacy_fallback_root
+                    || requested_root.parent() != Some(expected_parent.as_path())
+                {
+                    return Ok(None);
+                }
+                (expected_parent, self.main_root.as_path())
+            }
+            WorktreeRootSource::HostState => {
+                let Some(host_state) = self.storage_context.host_state_dir.as_deref() else {
+                    return Ok(None);
+                };
+                let parent = host_state.join("worktrees");
+                let expected_root = parent.join(&plan.repository_key);
+                if requested_root != expected_root {
+                    return Ok(None);
+                }
+                let host_state_metadata = match std::fs::symlink_metadata(host_state) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        return Err(refusal(
+                            host_state,
+                            format!("cannot inspect captured host-state parent: {error}"),
+                        ));
+                    }
+                };
+                if host_state_metadata.file_type().is_symlink() || !host_state_metadata.is_dir() {
+                    return Err(refusal(
+                        host_state,
+                        "captured host-state parent is not a real directory".into(),
+                    ));
+                }
+                (parent, host_state)
+            }
+            _ => return Ok(None),
+        };
+
+        match std::fs::symlink_metadata(&parent) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(refusal(
+                        &parent,
+                        "standard worktree-root parent is not a real directory".into(),
+                    ));
+                }
+                bound_directory_identity(&parent).map_err(|reason| {
+                    refusal(
+                        &parent,
+                        format!("cannot verify standard worktree-root parent: {reason}"),
+                    )
+                })?;
+                return Ok(None);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(refusal(
+                    &parent,
+                    format!("cannot inspect standard worktree-root parent: {error}"),
+                ));
+            }
+        }
+
+        let ancestor_identity = match bound_directory_identity(ancestor) {
+            Ok(identity) => identity,
+            Err(_reason) if source == WorktreeRootSource::HostState => {
+                // A missing or redirected host-state base is not created or
+                // repaired by worktree placement; the repository fallback
+                // remains available to the candidate loop.
+                return Ok(None);
+            }
+            Err(reason) => {
+                return Err(refusal(
+                    ancestor,
+                    format!("cannot verify parent of standard worktree root: {reason}"),
+                ));
+            }
+        };
+
+        let minimum = self.configured_worktree_minimum(source)?;
+        preflight_worktree_root(
+            &self.main_root,
+            requested_root,
+            source,
+            source != WorktreeRootSource::RepositoryFallback,
+            minimum,
+            crate::verification::removable_volume_unavailable_reason,
+            |candidate| {
+                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
+                    .map(|headroom| headroom.bytes)
+            },
+        )
+        .map_err(|reason| refusal(requested_root, reason))?;
+
+        let bootstrap_lock = crate::store::fresh_database::acquire_repository_binding_lock(
+            &self.main_root,
+            self.store.db_path(),
+        )?;
+        let binding = self.store.repository_worktree_binding()?;
+        fresh_root_identity(&binding, &self.main_root, &self.repo, self.store.db_path())?;
+        if bound_directory_identity(ancestor).as_ref() != Ok(&ancestor_identity) {
+            return Err(refusal(
+                ancestor,
+                "parent of standard worktree root changed before creation".into(),
+            ));
+        }
+        match std::fs::symlink_metadata(&parent) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(refusal(
+                    &parent,
+                    "standard worktree-root parent appeared before exclusive creation".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(refusal(
+                    &parent,
+                    format!("cannot recheck standard worktree-root parent: {error}"),
+                ));
+            }
+        }
+        // This is only the standard parent container. A crash before the
+        // reservation may leave it empty; no root identity is inferred from
+        // that directory, and the next explicit start revalidates it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&parent).map_err(|error| {
+                refusal(
+                    &parent,
+                    format!("cannot create standard worktree-root parent: {error}"),
+                )
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(refusal(
+                &parent,
+                "safe fresh worktree-root parent creation requires Unix no-follow checks".into(),
+            ));
+        }
+        let parent_identity = bound_directory_identity(&parent).map_err(|reason| {
+            refusal(&parent, format!("cannot verify created parent: {reason}"))
+        })?;
+        // This directory was created by the current process and must remain
+        // owned by the same user as the verified parent.
+        if parent_identity.uid != ancestor_identity.uid {
+            return Err(refusal(
+                &parent,
+                "created worktree-root parent has a different owner".into(),
+            ));
+        }
+        sync_bound_directory(&parent, &parent_identity)
+            .map_err(|reason| refusal(&parent, format!("cannot sync created parent: {reason}")))?;
+        sync_bound_directory(ancestor, &ancestor_identity)
+            .map_err(|reason| refusal(ancestor, format!("cannot sync parent name: {reason}")))?;
+        Ok(Some(bootstrap_lock))
+    }
+
+    fn reserve_and_create_fresh_worktree_root(
+        &mut self,
+        candidate: FreshWorktreeRootCandidate,
+        fallback_reason: Option<String>,
+        bootstrap_lock: Option<std::fs::File>,
+    ) -> Result<WorktreePlacement, BrokerOpError> {
+        use crate::store::repository_binding::{
+            FreshRepositoryRootReservation, RepositoryWorktreeBindingOrigin,
+            RepositoryWorktreeBindingState,
+        };
+
+        let binding = self.store.repository_worktree_binding()?;
+        let identity =
+            fresh_root_identity(&binding, &self.main_root, &self.repo, self.store.db_path())?;
+        let reservation_digest = fresh_root_reservation_digest(
+            &identity,
+            &candidate.root,
+            candidate.layout,
+            candidate.source,
+            &candidate.parent_identity_json,
+        )?;
+        let reservation = FreshRepositoryRootReservation {
+            identity: identity.clone(),
+            worktree_root: candidate.root.clone(),
+            layout: candidate.layout,
+            source: candidate.source,
+            reservation_digest: reservation_digest.clone(),
+            parent_identity_json: candidate.parent_identity_json.clone(),
+        };
+        let _bootstrap_lock = match bootstrap_lock {
+            Some(lock) => lock,
+            None => crate::store::fresh_database::acquire_repository_binding_lock(
+                &self.main_root,
+                self.store.db_path(),
+            )?,
+        };
+        let current = self.store.repository_worktree_binding()?;
+        if current.state != RepositoryWorktreeBindingState::FreshUnbound
+            || current.origin != Some(RepositoryWorktreeBindingOrigin::Fresh)
+            || current.repository_root.as_deref() != Some(identity.repository_root.as_path())
+            || current.git_common_dir.as_deref() != Some(identity.git_common_dir.as_path())
+            || current.repository_key.as_deref() != Some(identity.repository_key.as_str())
+            || current.broker_db_path.as_deref() != Some(identity.broker_db_path.as_path())
+            || current.bootstrap_nonce.as_deref() != Some(identity.bootstrap_nonce.as_str())
+        {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: candidate.root,
+                reason: "fresh database binding changed before root reservation".into(),
+            });
+        }
+        let parent =
+            candidate
+                .root
+                .parent()
+                .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                    path: candidate.root.clone(),
+                    reason: "reserved root has no parent".into(),
+                })?;
+        let expected_parent: BoundDirectoryIdentity =
+            serde_json::from_str(&candidate.parent_identity_json).map_err(|error| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: parent.to_path_buf(),
+                    reason: format!("reserved parent identity is invalid: {error}"),
+                }
+            })?;
+        let actual_parent = bound_directory_identity(parent).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!("root parent changed before reservation: {reason}"),
+            }
+        })?;
+        if actual_parent != expected_parent {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: "root parent identity changed before reservation".into(),
+            });
+        }
+        self.store
+            .reserve_fresh_repository_worktree_root(&reservation)?;
+
+        let result = self.finish_fresh_worktree_root(&reservation, &expected_parent);
+        match result {
+            Ok(root_identity_json) => {
+                let completion = verify_private_worktree_root_permissions(
+                    &reservation.worktree_root,
+                )
+                .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                    path: reservation.worktree_root.clone(),
+                    reason: format!(
+                        "cannot verify private worktree-root permissions before binding: {reason}"
+                    ),
+                })
+                .and_then(|()| {
+                    self.store
+                        .complete_fresh_repository_worktree_binding(
+                            &identity,
+                            &reservation_digest,
+                            &root_identity_json,
+                        )
+                        .map(|_| ())
+                        .map_err(BrokerOpError::from)
+                });
+                if let Err(error) = completion {
+                    if let Err(recovery_error) =
+                        self.store.mark_repository_worktree_recovery_required(
+                            &identity.bootstrap_nonce,
+                            &reservation_digest,
+                        )
+                    {
+                        crate::warn_unrecorded(
+                            "retain incomplete fresh worktree-root binding as recovery required",
+                            Err::<(), _>(recovery_error),
+                        );
+                    }
+                    return Err(error);
+                }
+                self.storage_context
+                    .initialize_preparation_cache_root(&self.repo)?;
+                self.validate_bound_repository_worktree_root()?
+                    .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                        path: reservation.worktree_root.clone(),
+                        reason: "root binding completed but could not be reopened".into(),
+                    })?;
+                Ok(WorktreePlacement {
+                    root: reservation.worktree_root,
+                    source: reservation.source,
+                    outside_repository: reservation.source
+                        != WorktreeRootSource::RepositoryFallback,
+                    fallback_reason,
+                })
+            }
+            Err(error) => {
+                if let Err(recovery_error) = self.store.mark_repository_worktree_recovery_required(
+                    &identity.bootstrap_nonce,
+                    &reservation_digest,
+                ) {
+                    crate::warn_unrecorded(
+                        "retain failed fresh worktree-root reservation as recovery required",
+                        Err::<(), _>(recovery_error),
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_fresh_worktree_root(
+        &mut self,
+        reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
+        expected_parent: &BoundDirectoryIdentity,
+    ) -> Result<String, BrokerOpError> {
+        let root = &reservation.worktree_root;
+        let parent = root
+            .parent()
+            .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: "reserved root has no parent".into(),
+            })?;
+        if bound_directory_identity(parent).as_ref() != Ok(expected_parent) {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: "root parent identity changed after reservation".into(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(root)
+                .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                    path: root.clone(),
+                    reason: format!("cannot create reserved root without replacement: {error}"),
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: "fresh root creation requires Unix no-follow identity checks".into(),
+            });
+        }
+        if !matches!(root.canonicalize(), Ok(actual) if actual == *root) {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: "created root did not retain its reserved canonical path".into(),
+            });
+        }
+        self.worktree_root_marker_exists_or_empty(root)?;
+        crate::host_state::protect_host_state_path(root, true).map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot apply private directory permissions: {error}"),
+            }
+        })?;
+        verify_private_worktree_root_permissions(root).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot verify private worktree-root permissions: {reason}"),
+            }
+        })?;
+        let admission =
+            crate::worktree_registry::admit(&self.host_operation_database_path()?, root).map_err(
+                |error| BrokerOpError::WorktreeRootUnavailable {
+                    path: root.clone(),
+                    reason: format!("cannot retain worktree storage discovery: {error}"),
+                },
+            )?;
+        self.write_or_verify_worktree_root_marker(root)?;
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: reservation.identity.repository_key.clone(),
+            repository_root: reservation.identity.repository_root.clone(),
+        };
+        admission
+            .record(root, &marker, reservation.source)
+            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot retain worktree storage discovery: {error}"),
+            })?;
+        crate::warn_unrecorded(
+            "write worktree build defaults",
+            write_worktree_build_defaults(root),
+        );
+        let identity = bound_directory_identity(root).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot capture created worktree-root identity: {reason}"),
+            }
+        })?;
+        sync_bound_directory(root, &identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: root.clone(),
+                reason: format!("cannot durably sync created worktree-root entries: {reason}"),
+            }
+        })?;
+        sync_bound_directory(parent, expected_parent).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: parent.to_path_buf(),
+                reason: format!("cannot durably sync reserved worktree-root parent: {reason}"),
+            }
+        })?;
+        serde_json::to_string(&identity).map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason: format!("cannot persist created worktree-root identity: {error}"),
+        })
     }
 
     fn configured_worktree_minimum(

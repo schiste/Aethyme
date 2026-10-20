@@ -113,6 +113,7 @@ impl Broker {
         sized: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<WorktreeReconciliation, BrokerOpError> {
+        self.require_bound_repository_worktree_root("worktree-directory reconciliation")?;
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             let mut summary = crate::worktree_reconcile::summarise(&[], 0);
             summary.complete = false;

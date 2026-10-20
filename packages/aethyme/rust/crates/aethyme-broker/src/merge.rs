@@ -757,6 +757,7 @@ impl Broker {
         intent: PromotionIntent,
         expected_head: Option<&str>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
+        self.require_bound_repository_worktree_root("session submission")?;
         // Recorded from the first step: lease auditing and planning can take
         // minutes on a busy repository, and a silent submit looks hung.
         let progress = crate::submit_progress::SubmitProgress::start(

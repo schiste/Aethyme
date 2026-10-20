@@ -833,15 +833,101 @@ fn scanner_boundary_summary(preferred_outside_repository: bool) -> &'static str 
 
 /// `broker worktree-root`.
 pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
-    if !parsed.positional.is_empty() {
+    if parsed.positional.is_empty() {
+        if parsed.confirm.is_some() {
+            return Err(UsageError::Message(
+                "worktree-root status does not accept --confirm".into(),
+            ));
+        }
+        let broker = open_broker(parsed.read_only_snapshot)?;
+        let plan = broker.worktree_root_plan()?;
+        return display_worktree_root_plan(&plan, parsed.json);
+    }
+    if parsed.positional.len() != 4 || parsed.positional[0] != "binding" {
         return Err(UsageError::Message(
-            "worktree-root does not accept positional arguments".into(),
+            "usage: aethyme broker worktree-root [binding plan <exact-root> <keyed_container|direct_root> | binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256>] [--json]".into(),
         ));
     }
-    let broker = open_broker(parsed.read_only_snapshot)?;
-    let plan = broker.worktree_root_plan()?;
-    if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&plan)?);
+    let action = parsed.positional[1].as_str();
+    if parsed.read_only_snapshot {
+        return Err(UsageError::Message(
+            "worktree-root binding requires the current writable repository database, not a compatibility snapshot".into(),
+        ));
+    }
+    let root = Path::new(&parsed.positional[2]);
+    let layout = match parsed.positional[3].as_str() {
+        "keyed_container" => {
+            crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer
+        }
+        "direct_root" => crate::store::repository_binding::RepositoryWorktreeRootLayout::DirectRoot,
+        _ => {
+            return Err(UsageError::Message(
+                "worktree-root binding layout must be keyed_container or direct_root".into(),
+            ));
+        }
+    };
+    match action {
+        "plan" => {
+            if parsed.confirm.is_some() {
+                return Err(UsageError::Message(
+                    "worktree-root binding plan does not accept --confirm".into(),
+                ));
+            }
+            let broker = open_broker(false)?;
+            let plan = broker.legacy_worktree_root_binding_plan(root, layout)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                out!("Legacy worktree-root binding plan");
+                out!("Repository: {}", plan.repository_root.display());
+                out!(
+                    "Exact root: {} ({})",
+                    plan.worktree_root.display(),
+                    plan.layout
+                );
+                out!("Retained root source: {}", plan.source.as_str());
+                out!("Plan digest: {}", plan.digest);
+                out!(
+                    "Apply only after reviewing this exact root and digest: aethyme broker worktree-root binding apply '{}' {} --confirm {}",
+                    plan.worktree_root.display(),
+                    plan.layout,
+                    plan.digest
+                );
+            }
+        }
+        "apply" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "worktree-root binding apply requires --confirm <sha256> from its plan".into(),
+                )
+            })?;
+            let mut broker = open_broker(false)?;
+            broker.apply_legacy_worktree_root_binding(root, layout, confirm)?;
+            if parsed.json {
+                let binding = broker.store().repository_worktree_binding()?;
+                out!("{}", serde_json::to_string_pretty(&binding)?);
+            } else {
+                out!("Legacy worktree root bound: {}", root.display());
+                out!(
+                    "Startup recovery will run on the next broker open after identity verification."
+                );
+            }
+        }
+        _ => {
+            return Err(UsageError::Message(
+                "worktree-root binding action must be plan or apply".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn display_worktree_root_plan(
+    plan: &crate::WorktreeRootPlan,
+    as_json: bool,
+) -> Result<(), UsageError> {
+    if as_json {
+        out!("{}", serde_json::to_string_pretty(plan)?);
     } else {
         out!("Repository: {}", plan.repository_root.display());
         out!("Repository key: {}", plan.repository_key);

@@ -7,6 +7,11 @@ pub(super) struct FreshDatabaseStagePermit {
     _private: (),
 }
 
+#[cfg(unix)]
+pub(super) fn fresh_database_stage_permit() -> FreshDatabaseStagePermit {
+    FreshDatabaseStagePermit { _private: () }
+}
+
 #[cfg(test)]
 pub(super) fn test_fresh_database_stage_permit() -> FreshDatabaseStagePermit {
     FreshDatabaseStagePermit { _private: () }
@@ -17,7 +22,7 @@ impl BrokerStore {
     /// repository root: `<repo>/.aethyme/broker.db`, or wherever
     /// [`crate::BROKER_DB_ENV`] points.
     pub fn open_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        Self::open(&crate::broker_db_path(repo_root)?)
+        super::fresh_database::open_in_repo(repo_root, &crate::broker_db_path(repo_root)?)
     }
 
     /// Open the current broker schema without creating, migrating, or
