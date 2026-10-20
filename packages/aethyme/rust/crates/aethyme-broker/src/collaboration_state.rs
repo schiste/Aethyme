@@ -3000,7 +3000,7 @@ mod tests {
         );
         drop(store);
 
-        let migrated = open(host.path(), &[]).unwrap();
+        let mut migrated = open(host.path(), &[]).unwrap();
         assert_eq!(migrated.schema_version(), 30);
         let floor: i64 = migrated
             .read_connection()
