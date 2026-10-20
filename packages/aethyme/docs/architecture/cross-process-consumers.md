@@ -731,3 +731,15 @@ counts. `pr_size.excluded` lists omitted paths and reasons; optional
 the same complete local Git diff. Binary files contribute a file and zero
 lines. Human output labels the policy counts and reports full totals when
 exclusions apply. Advisory thresholds continue to use the policy counts.
+
+### Managed README skill-learning guidance (#814)
+
+Canonical deployment and canonical scaffolding add or refresh a README section
+owned by `AETHYME:BEGIN skill-learning` / `AETHYME:END skill-learning` comments.
+The scaffold report includes `scaffold.readme-skills` (`created`, `pass`, or
+`fail` using the existing check-status envelope); deploy actions include the
+selected README path and the existing `created` / `updated` / `unchanged` action.
+Consumers must allow this additional check/action. Text outside the section is
+preserved. Local-only and supporting-artifact-only deployment do not write the
+shared README. See the repository deployment guide for supported formats and
+refusals. This adds guidance only, with no agent dispatch or session-log export.

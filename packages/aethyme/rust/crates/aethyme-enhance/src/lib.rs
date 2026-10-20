@@ -22,6 +22,7 @@ pub mod local;
 pub mod onboarding;
 pub mod path_references;
 pub mod pyjson;
+pub mod readme;
 pub mod render;
 pub mod repo_cli;
 pub mod skills;
