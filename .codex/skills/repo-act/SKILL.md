@@ -67,7 +67,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   clear inherited `GIT_*` variables; it only adds or overrides values. For
   isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
   preserve unrelated variables such as `PATH`, then set the fixture's intended
-  author/committer values. For tests scoped to artifact caches or reclaim, set
+  author/committer values. If a fixture PATH excludes real provider binaries,
+  retain required CLI dependencies: install a prevalidated Git executable beside
+  the fake provider instead of removing Git and failing before provider startup.
+  For tests scoped to artifact caches or reclaim, set
   `[cleanup] auto_remove = false` explicitly and
   keep it enabled in whole-checkout cleanup tests. A real offline `origin` can
   make a clean branch legitimately eligible for whole-checkout cleanup; do not
