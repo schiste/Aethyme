@@ -1,4 +1,4 @@
-//! `broker worktree-root`, `start`, `start-agent`, `adopt`, `prepare`, `agents`, `handoff`, `finish`, `close`, `cleanup` and `worktrees`: a session's life cycle.
+//! `broker advanced worktree-root`, `start`, `start-agent`, `adopt`, `prepare`, `agents`, `handoff`, `finish`, `close`, `cleanup` and `worktrees`: a session's life cycle.
 
 use super::*;
 
@@ -831,7 +831,7 @@ fn scanner_boundary_summary(preferred_outside_repository: bool) -> &'static str 
     }
 }
 
-/// `broker worktree-root`.
+/// `broker advanced worktree-root`.
 pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.positional.is_empty() {
         if parsed.confirm.is_some() {
@@ -876,7 +876,7 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
                     }
                     out!("Plan digest: {}", plan.digest);
                     out!(
-                        "Apply only after reviewing this exact recovery plan: aethyme broker worktree-root recovery apply --confirm {}",
+                        "Apply only after reviewing this exact recovery plan: aethyme broker advanced worktree-root recovery apply --confirm {}",
                         plan.digest
                     );
                 }
@@ -914,7 +914,7 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
     }
     if parsed.positional.len() != 4 || parsed.positional[0] != "binding" {
         return Err(UsageError::Message(
-            "usage: aethyme broker worktree-root [binding plan <exact-root> <keyed_container|direct_root> | binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256>] [--json]".into(),
+            "usage: aethyme broker advanced worktree-root [--json] | recovery plan [--json] | recovery apply --confirm <sha256> [--json] | binding plan <exact-root> <keyed_container|direct_root> [--json] | binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]".into(),
         ));
     }
     let action = parsed.positional[1].as_str();
@@ -957,7 +957,7 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
                 out!("Retained root source: {}", plan.source.as_str());
                 out!("Plan digest: {}", plan.digest);
                 out!(
-                    "Apply only after reviewing this exact root and digest: aethyme broker worktree-root binding apply '{}' {} --confirm {}",
+                    "Apply only after reviewing this exact root and digest: aethyme broker advanced worktree-root binding apply '{}' {} --confirm {}",
                     plan.worktree_root.display(),
                     plan.layout,
                     plan.digest

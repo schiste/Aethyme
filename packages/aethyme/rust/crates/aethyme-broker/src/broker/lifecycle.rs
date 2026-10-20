@@ -5671,7 +5671,7 @@ impl Broker {
             }
             RepositoryWorktreeBindingState::FreshReserved
             | RepositoryWorktreeBindingState::RecoveryRequired => {
-                "root reservation is incomplete; automatic fallback is disabled. Inspect `aethyme broker worktree-root recovery plan`, then apply only its exact digest-confirmed supported prefix"
+                "root reservation is incomplete; automatic fallback is disabled. Inspect `aethyme broker advanced worktree-root recovery plan`, then apply only its exact digest-confirmed supported prefix"
             }
         };
         Err(BrokerOpError::WorktreeRootUnavailable {
@@ -6541,14 +6541,14 @@ impl Broker {
             RepositoryWorktreeBindingState::LegacyUnbound => {
                 return Err(BrokerOpError::WorktreeRootUnavailable {
                     path: self.main_root.join(".aethyme/worktrees"),
-                    reason: "legacy repository has no reviewed worktree-root binding; inspect `aethyme broker worktree-root`, then use the explicit binding plan/apply workflow".into(),
+                    reason: "legacy repository has no reviewed worktree-root binding; inspect `aethyme broker advanced worktree-root`, then use the explicit binding plan/apply workflow".into(),
                 });
             }
             RepositoryWorktreeBindingState::FreshReserved
             | RepositoryWorktreeBindingState::RecoveryRequired => {
                 return Err(BrokerOpError::WorktreeRootUnavailable {
                     path: binding.worktree_root.unwrap_or_else(|| self.main_root.clone()),
-                    reason: "fresh worktree-root reservation is incomplete; automatic fallback is disabled. Inspect `aethyme broker worktree-root recovery plan`, then apply only its exact digest-confirmed supported prefix".into(),
+                    reason: "fresh worktree-root reservation is incomplete; automatic fallback is disabled. Inspect `aethyme broker advanced worktree-root recovery plan`, then apply only its exact digest-confirmed supported prefix".into(),
                 });
             }
             RepositoryWorktreeBindingState::FreshUnbound => {}
