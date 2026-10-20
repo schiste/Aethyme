@@ -1926,7 +1926,7 @@ mod retention_health_tests {
         assert_eq!(check_status(&bound, "certify.broker-db"), CheckStatus::Pass);
         assert_eq!(check_status(&bound, "certify.retention"), CheckStatus::Pass);
 
-        let broker = crate::Broker::open_with_options(repository.path(), options.clone())
+        let mut broker = crate::Broker::open_with_options(repository.path(), options.clone())
             .expect("open bound fixture broker");
         let doctor = broker.doctor().unwrap();
         assert_eq!(doctor.integrity, "ok");
