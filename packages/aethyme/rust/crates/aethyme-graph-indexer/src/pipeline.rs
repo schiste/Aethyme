@@ -177,6 +177,8 @@ pub fn index_repo_to_disk_with(
     options: &WalkOptions,
     registry: &LanguageRegistry,
 ) -> Result<IndexRepoSummary, IndexRepoError> {
+    aethyme_graph_storage::ensure_isolated_graph_write(ctx.repo_root())
+        .map_err(IndexRepoError::WriteGuard)?;
     let discovery_started = Instant::now();
     let walk = walk_source_tree(ctx, options).map_err(IndexRepoError::Walk)?;
     let source_discovery_elapsed_us = discovery_started.elapsed().as_micros();
@@ -378,7 +380,8 @@ pub fn index_repo_to_disk_with(
     // that path; only a direct `index_repo_to_disk` accumulated stale
     // artifacts. Pruning here makes both paths behave the same.
     let stale_artifacts =
-        prune_stale_artifacts(ctx.repo_root(), &previously_indexed, &currently_indexed);
+        prune_stale_artifacts(ctx.repo_root(), &previously_indexed, &currently_indexed)
+            .map_err(IndexRepoError::WriteGuard)?;
 
     let coverage = assemble(ctx, &walk, &observations, &built_fragments);
     let coverage_paths = if ctx.source_revision().is_some() {
@@ -500,7 +503,8 @@ fn prune_stale_artifacts(
     repo_root: &std::path::Path,
     previously_indexed: &std::collections::HashSet<String>,
     currently_indexed: &std::collections::HashSet<String>,
-) -> Vec<PathBuf> {
+) -> std::io::Result<Vec<PathBuf>> {
+    aethyme_graph_storage::ensure_isolated_graph_write(repo_root)?;
     let graph_root = repo_root.join(".aethyme").join("graph");
     let mut removed = Vec::new();
     let mut stale_modules = std::collections::HashSet::new();
@@ -513,6 +517,7 @@ fn prune_stale_artifacts(
             continue;
         }
         let fragment = graph_root.join(format!("{source_path}.bin"));
+        aethyme_graph_storage::write_guard::ensure_graph_write_target(repo_root, &fragment)?;
         if fragment.is_file() && std::fs::remove_file(&fragment).is_ok() {
             removed.push(fragment.clone());
         }
@@ -521,6 +526,7 @@ fn prune_stale_artifacts(
         // accumulate one empty directory per deleted file.
         let mut parent = fragment.parent().map(Path::to_path_buf);
         while let Some(directory) = parent {
+            aethyme_graph_storage::write_guard::ensure_graph_write_target(repo_root, &directory)?;
             if directory == graph_root || std::fs::remove_dir(&directory).is_err() {
                 break;
             }
@@ -547,17 +553,19 @@ fn prune_stale_artifacts(
             if current_modules.contains(stem) || !stale_modules.contains(stem) {
                 continue;
             }
+            aethyme_graph_storage::write_guard::ensure_graph_write_target(repo_root, &path)?;
             if std::fs::remove_file(&path).is_ok() {
                 removed.push(path);
             }
         }
     }
 
-    removed
+    Ok(removed)
 }
 
 #[derive(Debug)]
 pub enum IndexRepoError {
+    WriteGuard(std::io::Error),
     Walk(FilesystemIndexerError),
     Build(BuildFragmentError),
     FragmentWrite(FragmentWriteError),
@@ -578,6 +586,7 @@ pub enum IndexRepoError {
 impl std::fmt::Display for IndexRepoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::WriteGuard(e) => write!(f, "index_repo: {e}"),
             Self::Walk(e) => write!(f, "index_repo: {e}"),
             Self::Build(e) => write!(f, "index_repo: {e}"),
             Self::FragmentWrite(e) => write!(f, "index_repo: {e}"),
@@ -598,5 +607,22 @@ fn language_error_reason(error: &LanguageIndexError) -> ExclusionReason {
     match error {
         LanguageIndexError::Parse { .. } => ExclusionReason::ParseError,
         LanguageIndexError::NodeConstruction { .. } => ExclusionReason::NodeConstructionError,
+    }
+}
+
+#[cfg(test)]
+mod write_guard_tests {
+    #[test]
+    fn a_prune_only_run_cannot_mutate_a_managed_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".aethyme/graph")).unwrap();
+        let stale = root.join(".aethyme/graph/gone.rs.bin");
+        std::fs::write(&stale, b"preserved").unwrap();
+        aethyme_graph_storage::mark_broker_managed_graph(&root.join(".git")).unwrap();
+        let previous = std::collections::HashSet::from(["gone.rs".to_string()]);
+        assert!(super::prune_stale_artifacts(&root, &previous, &Default::default()).is_err());
+        assert_eq!(std::fs::read(stale).unwrap(), b"preserved");
     }
 }

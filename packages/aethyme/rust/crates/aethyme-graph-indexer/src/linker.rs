@@ -123,6 +123,8 @@ pub fn link_repo(ctx: &IndexerContext) -> Result<LinkSummary, LinkError> {
 /// [`FragmentStore`]. Useful for callers that want to reuse the
 /// store across phases.
 pub fn link_with_store(store: &FragmentStore) -> Result<LinkSummary, LinkError> {
+    aethyme_graph_storage::ensure_isolated_graph_write(store.repo_root())
+        .map_err(LinkError::WriteGuard)?;
     // Phase A: build the in-memory global symbol index.
     //
     // We deliberately materialize this once rather than calling
@@ -802,6 +804,7 @@ pub(crate) fn synthesize_module_name(source_path: &str) -> String {
 /// which fragment / module failed.
 #[derive(Debug)]
 pub enum LinkError {
+    WriteGuard(std::io::Error),
     OpenStore(StoreOpenError),
     ReadFragment {
         source_path: String,
@@ -824,6 +827,7 @@ pub enum LinkError {
 impl std::fmt::Display for LinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::WriteGuard(e) => write!(f, "link_repo: {e}"),
             Self::OpenStore(e) => write!(f, "link_repo: open store: {e}"),
             Self::ReadFragment { source_path, inner } => {
                 write!(f, "link_repo: read fragment {source_path:?}: {inner}")

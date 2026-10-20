@@ -8,6 +8,10 @@
       ],
       "retention": "string"
     },
+    "cache_provenance": {
+      "execution_profile_digest": "string",
+      "profile_scope": "string"
+    },
     "cached": "bool",
     "cpu_count": "integer",
     "definition_hash": "string",
@@ -21,6 +25,7 @@
     "load_avg_1m_start": "float",
     "log_path": "string",
     "output_bytes": "integer",
+    "run_id": "integer",
     "status": "string",
     "tree_hash": "string",
     "wait_duration_ms": "integer"
