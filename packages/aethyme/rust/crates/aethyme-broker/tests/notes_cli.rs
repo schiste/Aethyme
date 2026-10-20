@@ -3,7 +3,6 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::Broker;
 use common::{FixtureRepository, open_fixture_repository_broker};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -26,12 +25,30 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn child_command(broker: &Broker, repo: &Path, args: &[&str]) -> Command {
-    let mut command = common::broker_cli(CLI, args);
+fn child_command(fixture: &FixtureRepository, repo: &Path, args: &[&str]) -> Command {
+    let owner = fixture
+        .owner_path()
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let repository = fixture
+        .path()
+        .canonicalize()
+        .expect("canonicalize fixture repository");
+    let host_state = common::fixture_host_state_dir(&owner);
+    let mut command = common::broker_cli_for_fixture(CLI, args, &owner);
+    command
+        .env("AETHYME_BROKER_DB", repository.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", owner.join("worktrees"))
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        );
     command.current_dir(repo);
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
     command
 }
 
@@ -82,7 +99,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
         .adopt(&recipient_worktree, Some("recipient"))
         .unwrap();
     let mut send_command = child_command(
-        &broker,
+        &fixture,
         &sender_worktree,
         &[
             "advanced",
@@ -124,7 +141,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     assert!(payload.contains(&format!("\"note_id\":{note_id}")));
     assert!(!payload.contains("coordinate"), "{payload}");
     let mut agents_command = child_command(
-        &broker,
+        &fixture,
         &recipient_worktree,
         &["advanced", "agents", "--json"],
     );
@@ -139,7 +156,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
 
     let broker = open_fixture_repository_broker(&fixture).unwrap();
     let mut listed_command = child_command(
-        &broker,
+        &fixture,
         &recipient_worktree,
         &[
             "advanced",
@@ -151,7 +168,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
         ],
     );
     let mut wrong_recipient_command = child_command(
-        &broker,
+        &fixture,
         &sender_worktree,
         &[
             "advanced",
@@ -164,7 +181,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
         ],
     );
     let mut acknowledged_command = child_command(
-        &broker,
+        &fixture,
         &recipient_worktree,
         &[
             "advanced",
@@ -178,12 +195,12 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
         ],
     );
     let mut quiet_command = child_command(
-        &broker,
+        &fixture,
         &recipient_worktree,
         &["advanced", "agents", "--json"],
     );
     let mut multiline_command = child_command(
-        &broker,
+        &fixture,
         &sender_worktree,
         &[
             "advanced",
