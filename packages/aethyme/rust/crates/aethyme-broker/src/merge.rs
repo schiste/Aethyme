@@ -1748,21 +1748,6 @@ impl Broker {
         // asking it once per commit spawned several git processes each, and
         // a session cut from a main far ahead of integration carries every
         // commit of that drift, so submit grew to 45 minutes (#463).
-        let integration_candidates =
-            repo.first_parent_commits_excluding_oldest(integration_head, recorded_baseline)?;
-        let candidate_shapes = repo.commit_shapes(&integration_candidates)?;
-        let candidate_patch_ids =
-            repo.first_parent_patch_ids(&with_parent(&integration_candidates, &candidate_shapes))?;
-        let mut integration_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for commit in integration_candidates {
-            if let Some(patch_id) = candidate_patch_ids.get(&commit) {
-                integration_by_patch
-                    .entry(patch_id.clone())
-                    .or_default()
-                    .push(commit);
-            }
-        }
-
         let ordered = inherited
             .into_iter()
             .map(|commit| {
@@ -1783,6 +1768,29 @@ impl Broker {
             .collect::<Vec<_>>();
         let shapes = repo.commit_shapes(&names)?;
         let patch_ids = repo.first_parent_patch_ids(&with_parent(&names, &shapes))?;
+
+        // Integration patch identities can affect provenance only for a
+        // session commit that has a patch identity. Root and empty-diff
+        // commits have none, so avoid walking and hashing integration history
+        // when the session has no patch identities to compare. Ancestry and
+        // exact-merge classification below still runs for every session.
+        let mut integration_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if !patch_ids.is_empty() {
+            let integration_candidates =
+                repo.first_parent_commits_excluding_oldest(integration_head, recorded_baseline)?;
+            let candidate_shapes = repo.commit_shapes(&integration_candidates)?;
+            let candidate_patch_ids = repo
+                .first_parent_patch_ids(&with_parent(&integration_candidates, &candidate_shapes))?;
+            for commit in integration_candidates {
+                if let Some(patch_id) = candidate_patch_ids.get(&commit) {
+                    integration_by_patch
+                        .entry(patch_id.clone())
+                        .or_default()
+                        .push(commit);
+                }
+            }
+        }
+
         // Each commit here, and each parent of one, is reachable from the
         // session HEAD, so it is an ancestor of integration exactly when it
         // is not among the commits the session HEAD has and integration
@@ -2782,5 +2790,132 @@ mod owned_merge_history_tests {
                 "{control}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod submission_plan_empty_patch_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "Empty Patch Test")
+            .env("GIT_AUTHOR_EMAIL", "empty-patch@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Empty Patch Test")
+            .env("GIT_COMMITTER_EMAIL", "empty-patch@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn empty_and_no_patch_sessions_do_not_scan_integration_patch_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "gc.auto", "0"]);
+        let base_file = root.join("base.txt");
+        std::fs::write(&base_file, "base\n").unwrap();
+        git(root, &["add", "base.txt"]);
+        git(root, &["commit", "-qm", "base"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+
+        let mut broker = Broker::open(root).unwrap();
+        let worktree = root.join(".aethyme/worktrees/empty-patch-probe");
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/empty-patch-probe",
+                &worktree_arg,
+                &base,
+            ],
+        );
+        let session = broker
+            .adopt(&worktree, Some("empty patch id regression"))
+            .unwrap();
+        assert_eq!(session.diff_base.as_deref(), Some(base.as_str()));
+
+        // Make the integration-only candidate's commit and tree readable, but
+        // remove its loose content blob. Planning a session with no patch IDs
+        // does not need the candidate diff; an unconditional integration patch
+        // scan tries to read this blob and fails.
+        let integration_file = root.join("integration-only.txt");
+        std::fs::write(&integration_file, "integration only\n").unwrap();
+        git(root, &["add", "integration-only.txt"]);
+        git(root, &["commit", "-qm", "integration-only candidate"]);
+        let integration_head = git(root, &["rev-parse", "HEAD"]);
+        let blob = git(
+            root,
+            &[
+                "rev-parse",
+                &format!("{integration_head}:integration-only.txt"),
+            ],
+        );
+        let common = GitRepo::discover(root).unwrap().git_common_dir().unwrap();
+        let blob_object = common.join("objects").join(&blob[..2]).join(&blob[2..]);
+        assert!(
+            blob_object.is_file(),
+            "fixture blob should be loose at {}",
+            blob_object.display()
+        );
+        std::fs::remove_file(blob_object).unwrap();
+
+        let empty_plan = broker
+            .build_submission_plan(&session, &base, &integration_head)
+            .unwrap();
+        assert!(empty_plan.safe);
+        assert_eq!(empty_plan.recorded_baseline.as_deref(), Some(base.as_str()));
+        assert_eq!(empty_plan.session_head, base);
+        assert_eq!(empty_plan.integration_head, integration_head);
+        assert!(empty_plan.commits.is_empty());
+        assert!(empty_plan.warnings.is_empty());
+        assert_eq!(
+            serde_json::to_value(&empty_plan).unwrap()["commits"],
+            serde_json::json!([])
+        );
+
+        // A session with a real commit but no first-parent diff has the same
+        // empty patch-ID map and must retain its ordinary provenance fields.
+        git(
+            &worktree,
+            &["commit", "--allow-empty", "-qm", "empty session marker"],
+        );
+        let no_patch_head = git(&worktree, &["rev-parse", "HEAD"]);
+        let no_patch_plan = broker
+            .build_submission_plan(&session, &no_patch_head, &integration_head)
+            .unwrap();
+        assert!(no_patch_plan.safe);
+        assert_eq!(no_patch_plan.commits.len(), 1);
+        let provenance = &no_patch_plan.commits[0];
+        assert_eq!(provenance.commit, no_patch_head);
+        assert_eq!(
+            provenance.ownership,
+            SubmissionCommitOwnership::SessionOwned
+        );
+        assert_eq!(
+            provenance.integration_state,
+            SubmissionIntegrationState::Pending
+        );
+        assert_eq!(provenance.patch_id, None);
+        assert!(provenance.matching_integration_commits.is_empty());
+        let provenance_json = serde_json::to_value(provenance).unwrap();
+        assert!(provenance_json["patch_id"].is_null());
+        assert_eq!(
+            provenance_json["matching_integration_commits"],
+            serde_json::json!([])
+        );
     }
 }
