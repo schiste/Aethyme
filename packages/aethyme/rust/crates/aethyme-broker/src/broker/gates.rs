@@ -1005,35 +1005,56 @@ impl Broker {
         ),
         BrokerOpError,
     > {
-        let graph_read_started = std::time::Instant::now();
-        let session = self.store.session(session_id)?;
-        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        let graph_read_before_manifest = graph_read_started.elapsed();
+        let timeout_generation_before = crate::git::git_timeout_generation();
+        let (result, deadline_expired) = crate::git::with_git_deadline(
+            std::time::Duration::from_millis(GATES_AFFECTED_PHASE_BUDGET_MS),
+            || {
+                let result = (|| {
+                    let graph_read_started = std::time::Instant::now();
+                    let session = self.store.session(session_id)?;
+                    let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+                    let graph_read_before_manifest = graph_read_started.elapsed();
 
-        let manifest_started = std::time::Instant::now();
-        let config_root = checkout.root().to_path_buf();
-        let gates = self.load_and_sync_gates_from(&config_root)?;
-        let manifest_ms = manifest_started.elapsed().as_millis() as u64;
+                    let manifest_started = std::time::Instant::now();
+                    let config_root = checkout.root().to_path_buf();
+                    let gates = self.load_and_sync_gates_from(&config_root)?;
+                    let manifest_ms = manifest_started.elapsed().as_millis() as u64;
 
-        let diff_started = std::time::Instant::now();
-        let base = self
-            .session_change_base(&checkout)
-            .or(session.diff_base)
-            .unwrap_or_else(|| "HEAD".to_string());
-        let changed = checkout.changed_files(&base)?;
-        let graph_read_ms = graph_read_before_manifest
-            .saturating_add(diff_started.elapsed())
-            .as_millis() as u64;
+                    let diff_started = std::time::Instant::now();
+                    let base = self
+                        .session_change_base(&checkout)
+                        .or(session.diff_base)
+                        .unwrap_or_else(|| "HEAD".to_string());
+                    let changed = checkout.changed_files(&base)?;
+                    let graph_read_ms = graph_read_before_manifest
+                        .saturating_add(diff_started.elapsed())
+                        .as_millis() as u64;
 
-        // This inspection route intentionally skips `record_graph_integrity`;
-        // no repository-wide graph-integrity lock is acquired or waited on.
-        let phase_timings_ms = AffectedGatePhaseTimings {
-            graph_read: graph_read_ms,
-            manifest: manifest_ms,
-            selection: 0,
-            lock_wait: 0,
-        };
-        Ok((checkout, gates, changed, phase_timings_ms))
+                    // This inspection route intentionally skips `record_graph_integrity`;
+                    // no repository-wide graph-integrity lock is acquired or waited on.
+                    let phase_timings_ms = AffectedGatePhaseTimings {
+                        graph_read: graph_read_ms,
+                        manifest: manifest_ms,
+                        selection: 0,
+                        lock_wait: 0,
+                    };
+                    Ok((checkout, gates, changed, phase_timings_ms))
+                })();
+                let deadline_expired = crate::git::active_git_deadline()
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+                (result, deadline_expired)
+            },
+        );
+
+        if deadline_expired || crate::git::git_timeout_generation() != timeout_generation_before {
+            return Err(GitError::TimedOut {
+                args: "gates affected input selection".into(),
+                seconds: GATES_AFFECTED_PHASE_BUDGET_MS.div_ceil(1_000),
+            }
+            .into());
+        }
+
+        result
     }
 
     pub(super) fn gate_inputs_with_integrity(
@@ -1180,5 +1201,191 @@ impl Broker {
             })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod timeout_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    const CHILD_MODE: &str = "AETHYME_ISSUE_481_GIT_TIMEOUT_CHILD";
+    const REAL_GIT: &str = "AETHYME_ISSUE_481_REAL_GIT";
+    const ARM_PATH: &str = "AETHYME_ISSUE_481_ARM_PATH";
+    const HIT_PATH: &str = "AETHYME_ISSUE_481_HIT_PATH";
+    const SLEEP_SECONDS: &str = "AETHYME_ISSUE_481_SLEEP_SECONDS";
+    const TEST_NAME: &str =
+        "broker::gates::timeout_tests::affected_gate_selection_refuses_timed_out_git_reads";
+
+    #[test]
+    fn affected_gate_selection_refuses_timed_out_git_reads() {
+        if let Some(mode) = std::env::var_os(CHILD_MODE) {
+            run_child(mode.to_str().expect("UTF-8 test mode"));
+            return;
+        }
+
+        let real_git = find_real_git();
+        let executable = std::env::current_exe().expect("test executable");
+        for (mode, git_timeout_seconds, sleep_seconds) in [
+            ("swallowed-command-timeout", "1", "2"),
+            ("shared-phase-deadline", "10", "7"),
+        ] {
+            let owner = tempfile::tempdir().expect("fixture owner");
+            let shim_dir = owner.path().join("bin");
+            std::fs::create_dir(&shim_dir).expect("create Git shim directory");
+            let shim = shim_dir.join("git");
+            std::fs::write(
+                &shim,
+                "#!/bin/sh\n\
+                 if [ -f \"$AETHYME_ISSUE_481_ARM_PATH\" ] && [ \"$#\" -eq 4 ] &&\n\
+                    [ \"$1\" = rev-parse ] && [ \"$2\" = --verify ] &&\n\
+                    [ \"$3\" = --quiet ] &&\n\
+                    [ \"$4\" = 'refs/heads/aethyme/integration^{commit}' ]; then\n\
+                   : > \"$AETHYME_ISSUE_481_HIT_PATH\"\n\
+                   exec /bin/sleep \"$AETHYME_ISSUE_481_SLEEP_SECONDS\"\n\
+                 fi\n\
+                 exec \"$AETHYME_ISSUE_481_REAL_GIT\" \"$@\"\n",
+            )
+            .expect("write Git shim");
+            let mut permissions = std::fs::metadata(&shim)
+                .expect("stat Git shim")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&shim, permissions).expect("make Git shim executable");
+
+            let arm_path = owner.path().join("armed");
+            let hit_path = owner.path().join("hit");
+            let mut paths = vec![shim_dir.clone()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").expect("test PATH"),
+            ));
+            let child_path = std::env::join_paths(paths).expect("join child PATH");
+
+            let mut child = Command::new(&executable);
+            child
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_MODE, mode)
+                .env(REAL_GIT, &real_git)
+                .env(ARM_PATH, &arm_path)
+                .env(HIT_PATH, &hit_path)
+                .env(SLEEP_SECONDS, sleep_seconds)
+                .env("AETHYME_GIT_TIMEOUT_SECS", git_timeout_seconds)
+                .env("PATH", child_path);
+            let output = match crate::bounded_output::output_limited(
+                &mut child,
+                Duration::from_secs(30),
+                1024 * 1024,
+            )
+            .expect("observe isolated timeout child")
+            {
+                crate::bounded_output::LimitedOutput::Completed(output) => output,
+                crate::bounded_output::LimitedOutput::Deadline => {
+                    panic!("child mode {mode} exceeded the 30s observation budget")
+                }
+                crate::bounded_output::LimitedOutput::OutputLimit => {
+                    panic!("child mode {mode} exceeded the 1MiB per-stream output limit")
+                }
+            };
+            assert!(
+                output.status.success(),
+                "child mode {mode} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                hit_path.is_file(),
+                "child mode {mode} did not reach the guarded integration-ref lookup"
+            );
+        }
+    }
+
+    fn run_child(mode: &str) {
+        let (expected_git_timeout, maximum_call_elapsed) = match mode {
+            "swallowed-command-timeout" => ("1", Duration::from_secs(6)),
+            "shared-phase-deadline" => (
+                "10",
+                Duration::from_millis(GATES_AFFECTED_PHASE_BUDGET_MS + 1_500),
+            ),
+            _ => panic!("unexpected test mode {mode:?}"),
+        };
+        assert_eq!(
+            std::env::var("AETHYME_GIT_TIMEOUT_SECS").expect("per-command Git timeout"),
+            expected_git_timeout,
+            "use the per-command timeout selected by the parent"
+        );
+
+        let real_git = std::env::var_os(REAL_GIT).expect("real Git path");
+        let repository = tempfile::tempdir().expect("repository fixture");
+        let repository_root = repository
+            .path()
+            .canonicalize()
+            .expect("canonicalize repository fixture");
+        std::fs::create_dir(repository_root.join(".aethyme"))
+            .expect("create repository config directory");
+        std::fs::write(
+            repository_root.join(crate::gates::GATES_CONFIG_RELPATH),
+            "[[gate]]\nname = \"fixture\"\ncommand = \"true\"\n",
+        )
+        .expect("write gate configuration");
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Timeout Test"],
+            vec!["config", "user.email", "timeout@example.invalid"],
+            vec!["add", ".aethyme/gates.toml"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            let output = Command::new(&real_git)
+                .args(args)
+                .current_dir(&repository_root)
+                .output()
+                .expect("run fixture Git command");
+            assert!(
+                output.status.success(),
+                "fixture Git command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let storage = crate::test_storage::TestStorage::new();
+        let gates = crate::gates::load_gates(&repository_root).expect("load fixture gates");
+        let policy = crate::broker::gate_trust::GatePolicy::from_parts(&gates, None);
+        crate::broker::gate_trust::record_trust_for_host_state(
+            &repository_root,
+            &storage.host_state_dir(),
+            &[policy.policy_sha256.as_str()],
+            "fixture",
+        )
+        .expect("trust the fixture gate policy in fixture-owned host state");
+        let mut broker = storage.open(&repository_root).expect("open fixture broker");
+        let session = broker
+            .start_worktree("timeout fixture", None)
+            .expect("start fixture worktree");
+
+        std::fs::write(std::env::var_os(ARM_PATH).expect("arm path"), b"armed\n")
+            .expect("arm exact integration-ref shim");
+        let call_started = Instant::now();
+        let result = broker.affected_gates_with_timings(session.id);
+        let call_elapsed = call_started.elapsed();
+        assert!(
+            call_elapsed <= maximum_call_elapsed,
+            "mode {mode} exceeded the affected-gate call bound {maximum_call_elapsed:?}: {call_elapsed:?}"
+        );
+        match result {
+            Err(BrokerOpError::Git(GitError::TimedOut { args, .. })) => {
+                assert_eq!(args, "gates affected input selection");
+            }
+            other => panic!(
+                "timed-out gate input selection must return a typed Git timeout, got {other:?}"
+            ),
+        }
+    }
+
+    fn find_real_git() -> std::path::PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("find real Git executable on the parent PATH")
     }
 }
