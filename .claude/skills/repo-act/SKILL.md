@@ -27,6 +27,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   target. Start with a relevant integration-test target when available, keep one
   Cargo worker, and retain the remaining unit coverage as pending qualification.
   A resource-stopped compile provides no test result.
+- When substituting a prebuilt Rust test binary for Cargo, inspect the effective
+  Cargo `[env]` configuration: Cargo injects those values into test child
+  processes, while direct execution does not. Replay and record relevant values
+  explicitly, or classify the direct run as non-equivalent.
 - Smoke-test each binary against its own CLI contract. Run read-only probes
   outside a Git checkout with isolated home/state; preserve an unsupported
   command as a failed probe instead of treating it as a successful smoke check.
