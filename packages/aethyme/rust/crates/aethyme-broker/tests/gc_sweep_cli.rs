@@ -49,7 +49,10 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
         String::from_utf8_lossy(&head.stderr)
     );
     let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
-    git(repo.path(), &["update-ref", "refs/remotes/origin/main", &head]);
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &head],
+    );
     git(
         repo.path(),
         &[
@@ -139,14 +142,11 @@ fn run_as_is(repo: &Path, container: &Path, args: &[&str]) -> Output {
     run_from_fixture(repo, repo, container, args)
 }
 
-fn command_from_fixture(
-    owner: &Path,
-    cwd: &Path,
-    container: &Path,
-    args: &[&str],
-) -> Command {
+fn command_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Command {
     let owner = owner.canonicalize().expect("canonicalize fixture owner");
-    let cwd = cwd.canonicalize().expect("canonicalize fixture working tree");
+    let cwd = cwd
+        .canonicalize()
+        .expect("canonicalize fixture working tree");
     let container = container
         .canonicalize()
         .expect("canonicalize fixture worktree root");

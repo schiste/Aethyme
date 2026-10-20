@@ -6344,7 +6344,9 @@ mod tests {
             std::fs::read_to_string(detached_fixture_marker(root, "host-cache")).unwrap();
         let preparation_cache =
             std::fs::read_to_string(detached_fixture_marker(root, "preparation-cache")).unwrap();
-        let root = root.canonicalize().expect("canonicalize detached fixture root");
+        let root = root
+            .canonicalize()
+            .expect("canonicalize detached fixture root");
         command
             .args([
                 "--exact",
