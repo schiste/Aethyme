@@ -3840,7 +3840,7 @@ impl Broker {
         // is what makes them orphans -- so the budget rule has nothing extra
         // to say about them and routing them through it would be ordering
         // theatre. Bytes are the only fact available, and the largest
-        // abandoned root is the one a bounded sweep should reach first either
+        // abandoned root is the one a bounded apply should reach first either
         // way. Path breaks ties so the plan stays byte-identical run to run.
         orphans.sort_by(|left, right| {
             right
