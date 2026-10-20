@@ -457,11 +457,10 @@ fn patch_landing(
     // Non-merge session commits not on the branch, and whether each has an
     // equivalent there. A session commit missing from this list is a merge,
     // or is on the branch already.
-    let unmerged = repo
-        .cherry_marked(branch_tip, &content.head, crate::git::CherrySide::Right)
-        .map_err(unavailable)?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
+    let (branch_only, session_only) = repo
+        .cherry_marked_both(branch_tip, &content.head)
+        .map_err(unavailable)?;
+    let unmerged = session_only.into_iter().collect::<BTreeMap<_, _>>();
     if session_commits
         .iter()
         .any(|commit| unmerged.get(commit) == Some(&false))
@@ -471,9 +470,7 @@ fn patch_landing(
     // The branch commits carrying the equivalents, plus every session commit
     // that has none -- which the covering search below then requires to be
     // on the branch itself.
-    let mut carriers = repo
-        .cherry_marked(branch_tip, &content.head, crate::git::CherrySide::Left)
-        .map_err(unavailable)?
+    let mut carriers = branch_only
         .into_iter()
         .filter_map(|(commit, equivalent)| equivalent.then_some(commit))
         .collect::<Vec<_>>();

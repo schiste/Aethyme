@@ -3056,6 +3056,24 @@ impl GitRepo {
         Ok(answers)
     }
 
+    fn cherry_side_commits(
+        &self,
+        range: &str,
+        only: &str,
+    ) -> Result<Vec<(String, bool)>, GitError> {
+        Ok(run_git(
+            &self.root,
+            &["rev-list", "--no-merges", "--parents", only, range],
+        )?
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let commit = fields.next()?.to_string();
+            Some((commit, fields.next().is_some()))
+        })
+        .collect())
+    }
+
     /// Commits on one side of `left...right` with whether a patch-equivalent
     /// commit exists on the other side, newest first. Merges are excluded on
     /// both sides, as `--cherry-mark` does. Equivalence is decided with
@@ -3074,20 +3092,7 @@ impl GitRepo {
             CherrySide::Right => ("--right-only", "--left-only"),
         };
         let range = format!("{left}...{right}");
-        let side_commits = |only: &str| -> Result<Vec<(String, bool)>, GitError> {
-            Ok(run_git(
-                &self.root,
-                &["rev-list", "--no-merges", "--parents", only, &range],
-            )?
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                let commit = fields.next()?.to_string();
-                Some((commit, fields.next().is_some()))
-            })
-            .collect())
-        };
-        let listed = side_commits(listed)?;
+        let listed = self.cherry_side_commits(&range, listed)?;
         // A merged or fast-forwarded branch has nothing on the asked side.
         // Listing the other side and hashing every patch on it -- every
         // commit the default branch gained since the fork -- would answer a
@@ -3095,7 +3100,7 @@ impl GitRepo {
         if listed.is_empty() {
             return Ok(Vec::new());
         }
-        let other = side_commits(other)?;
+        let other = self.cherry_side_commits(&range, other)?;
         // No commit can have an equivalent patch on an empty opposite side.
         // In particular, a session directly ahead of integration needs no
         // binary patch stream merely to establish this fact (#892).
@@ -3125,6 +3130,69 @@ impl GitRepo {
                 (commit, equivalent)
             })
             .collect())
+    }
+
+    /// Both side-specific results for left...right, as
+    /// (left_only, right_only), each newest first.
+    ///
+    /// Callers that need both directions can share one patch-id stream. When
+    /// either side has no commits, neither side can have a patch-equivalent
+    /// commit, so the nonempty side is returned as non-equivalent without
+    /// generating patches.
+    pub(crate) fn cherry_marked_both(
+        &self,
+        left: &str,
+        right: &str,
+    ) -> Result<(Vec<(String, bool)>, Vec<(String, bool)>), GitError> {
+        let range = format!("{left}...{right}");
+        let left = self.cherry_side_commits(&range, "--left-only")?;
+        let right = self.cherry_side_commits(&range, "--right-only")?;
+        if left.is_empty() || right.is_empty() {
+            let left = left
+                .into_iter()
+                .map(|(commit, _)| (commit, false))
+                .collect();
+            let right = right
+                .into_iter()
+                .map(|(commit, _)| (commit, false))
+                .collect();
+            return Ok((left, right));
+        }
+
+        let with_parent = left
+            .iter()
+            .chain(right.iter())
+            .filter(|(_, has_parent)| *has_parent)
+            .map(|(commit, _)| commit.clone())
+            .collect::<Vec<_>>();
+        let patch_ids = self.first_parent_patch_ids(&with_parent)?;
+        let left_patch_ids = left
+            .iter()
+            .filter_map(|(commit, _)| patch_ids.get(commit).map(String::as_str))
+            .collect::<std::collections::HashSet<_>>();
+        let right_patch_ids = right
+            .iter()
+            .filter_map(|(commit, _)| patch_ids.get(commit).map(String::as_str))
+            .collect::<std::collections::HashSet<_>>();
+        let left = left
+            .into_iter()
+            .map(|(commit, _)| {
+                let equivalent = patch_ids
+                    .get(&commit)
+                    .is_some_and(|patch_id| right_patch_ids.contains(patch_id.as_str()));
+                (commit, equivalent)
+            })
+            .collect();
+        let right = right
+            .into_iter()
+            .map(|(commit, _)| {
+                let equivalent = patch_ids
+                    .get(&commit)
+                    .is_some_and(|patch_id| left_patch_ids.contains(patch_id.as_str()));
+                (commit, equivalent)
+            })
+            .collect();
+        Ok((left, right))
     }
 
     /// Commits reachable from `to` that descend from `from`, excluding
@@ -5705,6 +5773,9 @@ mod batched_commit_tests {
                         .unwrap()
                         .is_empty()
                 );
+                let (left, right) = repo.cherry_marked_both("base", "main").unwrap();
+                assert!(left.is_empty());
+                assert_eq!(right, expected);
             } else {
                 let copied = run(&root, &["rev-parse", "copied"]);
                 assert_eq!(
@@ -5771,6 +5842,94 @@ mod batched_commit_tests {
                 "patch stream for {mode}"
             );
         }
+    }
+
+    #[test]
+    fn paired_cherry_comparison_streams_patch_ids_once() {
+        const ROOT: &str = "AETHYME_PAIRED_CHERRY_TEST_ROOT";
+        const TEST: &str =
+            "git::batched_commit_tests::paired_cherry_comparison_streams_patch_ids_once";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let repo = GitRepo {
+                root: PathBuf::from(root),
+            };
+            let (left, right) = repo.cherry_marked_both("left", "main").unwrap();
+            assert_eq!(left.len(), 1);
+            assert!(left[0].1, "the cherry-picked patch is present on the right");
+            assert_eq!(
+                right
+                    .iter()
+                    .map(|(_, equivalent)| *equivalent)
+                    .collect::<Vec<_>>(),
+                vec![false, false, true],
+                "the empty and distinct patches do not match; the cherry-pick does"
+            );
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "base\n").unwrap();
+        run(root, &["add", "a.txt"]);
+        run(root, &["commit", "-qm", "base"]);
+        run(root, &["branch", "base"]);
+        run(root, &["switch", "-q", "-c", "left", "base"]);
+        std::fs::write(root.join("a.txt"), "shared patch\n").unwrap();
+        run(root, &["commit", "-qam", "left patch"]);
+        run(root, &["switch", "-q", "main"]);
+        run(root, &["cherry-pick", "-x", "left"]);
+        std::fs::write(root.join("b.txt"), "right-only change\n").unwrap();
+        run(root, &["add", "b.txt"]);
+        run(root, &["commit", "-qm", "right-only patch"]);
+        run(root, &["commit", "--allow-empty", "-qm", "empty patch"]);
+
+        let trace = root.join("paired-trace.json");
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", TEST, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                child.env_remove(key);
+            }
+        }
+        let output = child
+            .env(ROOT, root)
+            .env("GIT_TRACE2_EVENT", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let events = std::fs::read_to_string(trace).unwrap();
+        let (mut rev_lists, mut logs, mut patch_ids) = (0, 0, 0);
+        for line in events.lines() {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            if event["event"] != "start" {
+                continue;
+            }
+            let Some(argv) = event["argv"].as_array() else {
+                continue;
+            };
+            if argv.iter().any(|arg| arg == "rev-list") {
+                rev_lists += 1;
+            }
+            if argv.iter().any(|arg| arg == "log") {
+                logs += 1;
+            }
+            if argv.iter().any(|arg| arg == "patch-id") {
+                patch_ids += 1;
+            }
+        }
+        assert_eq!(rev_lists, 2, "one commit listing for each side");
+        assert_eq!(logs, 1, "all candidate patches share one git log stream");
+        assert_eq!(
+            patch_ids, 1,
+            "all candidate patches share one patch-id stream"
+        );
     }
 
     #[test]
@@ -5921,6 +6080,25 @@ mod batched_commit_tests {
         };
         assert_eq!(marked("tabbed"), vec![(tabbed, false)], "not landed");
         assert_eq!(marked("exact"), vec![(exact, true)], "landed");
+
+        let (tabbed_left, tabbed_right) = repo
+            .cherry_marked_both("main", "tabbed")
+            .expect("paired whitespace comparison");
+        assert_eq!(
+            tabbed_left,
+            repo.cherry_marked("main", "tabbed", CherrySide::Left)
+                .expect("left-side whitespace comparison")
+        );
+        assert_eq!(tabbed_right, marked("tabbed"));
+        let (exact_left, exact_right) = repo
+            .cherry_marked_both("main", "exact")
+            .expect("paired exact comparison");
+        assert_eq!(
+            exact_left,
+            repo.cherry_marked("main", "exact", CherrySide::Left)
+                .expect("left-side exact comparison")
+        );
+        assert_eq!(exact_right, marked("exact"));
     }
 }
 
