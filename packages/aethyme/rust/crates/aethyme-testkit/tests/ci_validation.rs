@@ -37,7 +37,8 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
         ]
     );
     let rust = block(&oss, "  rust-tests:");
-    assert!(rust.contains(&"    if: github.event_name == 'pull_request'"));
+    assert!(rust.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' }}"));
+    assert!(rust.contains(&"    needs: classify_changes"));
     // The workspace suite runs under nextest. `cargo test --workspace
     // --examples` once stood in for it, but a target flag narrows cargo's
     // selection to examples only, so it ran three binaries.
@@ -46,17 +47,39 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     // release-manifest assertions in
     // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
     // They run in a job of their own, beside the workspace suite, on every
-    // pull request.
+    // full-validation pull request. Docs-fast pull requests run only parity.
     let examples = block(&oss, "  rust-examples-doctests:");
-    assert!(examples.contains(&"    if: github.event_name == 'pull_request'"));
+    assert!(examples.contains(&"    needs: classify_changes"));
+    assert!(examples.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}"));
     assert!(examples.contains(&"        run: cargo test --locked --workspace --examples"));
     assert!(examples.contains(&"        run: cargo test --locked --workspace --doc"));
-    // No second condition can silently skip a step within this job.
+    // The job-level event guard and the full-suite/parity step guards are
+    // explicit. Unknown classifier results must select the full suite.
+    let rust_conditions = rust
+        .iter()
+        .filter(|line| line.trim_start().starts_with("if:"))
+        .map(|line| line.trim())
+        .collect::<Vec<_>>();
     assert_eq!(
-        rust.iter()
-            .filter(|line| line.trim_start().starts_with("if:"))
+        rust_conditions.len(),
+        8,
+        "the Rust job has one PR guard, six full-suite guards, and one docs-fast parity guard"
+    );
+    assert_eq!(
+        rust_conditions
+            .iter()
+            .filter(|line| **line == "if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}")
             .count(),
-        1
+        6,
+        "all expensive Rust steps must run when classification fails or selects the full suite"
+    );
+    assert_eq!(
+        rust_conditions
+            .iter()
+            .filter(|line| **line == "if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast == 'true' }}")
+            .count(),
+        1,
+        "only the mirrored parity step may run on the docs-fast path"
     );
 
     // The cache warm-up compiles on pushes and never runs tests, so main
@@ -101,8 +124,8 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
 fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     let oss = workflow("oss-ci.yml");
     let record = block(&oss, "  record-tested-tree:");
-    assert!(record.contains(&"    if: github.event_name == 'pull_request'"));
-    assert!(record.contains(&"    needs: [rust-tests, rust-examples-doctests]"));
+    assert!(record.contains(&"    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' }}"));
+    assert!(record.contains(&"    needs: [classify_changes, rust-tests, rust-examples-doctests]"));
     assert!(record.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
     assert!(record.contains(&"          name: tested-tree-${{ env.TESTED_TREE }}"));
 
@@ -210,14 +233,11 @@ fn duplicate_binary_suite_remains_available_manually() {
 }
 
 #[test]
-fn distinct_product_proof_remains_automatic_for_both_events() {
+fn product_proof_runs_on_main_and_falls_back_for_uncertain_or_full_prs() {
     let oss = workflow("oss-ci.yml");
     let product = block(&oss, "  product-path-no-python:");
-    assert!(
-        !product
-            .iter()
-            .any(|line| line.trim_start().starts_with("if:"))
-    );
+    assert!(product.contains(&"    needs: classify_changes"));
+    assert!(product.contains(&"    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}"));
     assert!(
         product
             .iter()
@@ -228,6 +248,62 @@ fn distinct_product_proof_remains_automatic_for_both_events() {
             .iter()
             .any(|line| line.contains("aethyme verify-targets --repo ."))
     );
+}
+
+#[test]
+fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
+    let oss = workflow("oss-ci.yml");
+    let classifier = block(&oss, "  classify_changes:");
+    assert!(classifier.contains(&"    outputs:"));
+    assert!(classifier.contains(&"      docs_fast: ${{ steps.classify.outputs.docs_fast }}"));
+    assert!(classifier.contains(&"      - name: Verify classifier controls"));
+    assert!(classifier.contains(&"        run: bash .github/scripts/test-docs-fast-lane.sh"));
+    assert!(classifier.contains(&"          EVENT_NAME: ${{ github.event_name }}"));
+    assert!(
+        classifier.contains(&"          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}")
+    );
+    assert!(classifier.contains(&"          EVENT_SHA: ${{ github.sha }}"));
+    assert!(classifier.contains(&"          if [[ \"$EVENT_NAME\" != \"pull_request\" ]]; then"));
+    assert!(classifier.contains(&"            echo \"docs_fast=false\" >> \"$GITHUB_OUTPUT\""));
+    assert!(classifier.contains(&"              echo \"docs_fast=false\" >> \"$GITHUB_OUTPUT\""));
+    assert!(classifier.contains(&"              exit 1"));
+
+    let rust = block(&oss, "  rust-tests:");
+    assert!(rust.contains(&"      - name: Run mirrored skill parity tests without Cargo"));
+    assert!(rust.iter().any(|line| {
+        line.contains("rustc --edition=2021 --test .github/scripts/skill-parity-harness.rs")
+    }));
+    assert!(rust.contains(&"      - name: Run workspace tests"));
+    assert!(rust.contains(&"        run: ../scripts/test-like-ci.sh --full"));
+
+    let examples = block(&oss, "  rust-examples-doctests:");
+    assert!(examples.contains(&"      - name: Run example tests"));
+    assert!(examples.contains(&"        run: cargo test --locked --workspace --examples"));
+    assert!(examples.contains(&"      - name: Run doctests"));
+    assert!(examples.contains(&"        run: cargo test --locked --workspace --doc"));
+
+    let record = block(&oss, "  record-tested-tree:");
+    assert!(record.contains(&"    needs: [classify_changes, rust-tests, rust-examples-doctests]"));
+    assert!(record.contains(&"    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' }}"));
+
+    let lint = block(&oss, "  lint:");
+    assert!(lint.contains(&"    needs: classify_changes"));
+    assert!(lint.contains(&"    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}"));
+
+    // These controls keep workflow classification tied to the shell
+    // classifier's own fail-closed path cases. The required product proof and
+    // full-suite checks run whenever classification is unavailable or false.
+    let classifier_script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(5)
+            .unwrap()
+            .join(".github/scripts/docs-fast-lane.sh"),
+    )
+    .unwrap();
+    assert!(classifier_script.contains("select_full_suite"));
+    assert!(classifier_script.contains("printf 'false\\n'"));
+    assert!(classifier_script.contains("records > 0"));
 }
 
 #[test]
