@@ -20,8 +20,8 @@ not establish execution. No product behavior, schema or gate policy is changed.
 
 The repo-selected CLI and engine both report build revision `61d34c0`; the global
 Cargo-installed CLI is older and was not used for this task. The maintained
-repository uses `verify-only`, authorizes session-branch pushes, and has graph
-authority disabled. Normal broker dogfooding is authorized here; destructive
+repository uses `verify-only`, authorizes session-branch pushes, has graph
+authority disabled, and sets collaboration capture to `advisory`. Normal broker dogfooding is authorized here; destructive
 cleanup and analysis evaluations remain confined to disposable Playgrounds.
 
 **Disposition:** accept the six L0 checklist items and D37's inventory with the
@@ -37,7 +37,7 @@ Paths in this section are relative to
 | Seam | Status at this revision | Evidence and boundary |
 |---|---|---|
 | Enrollment, start, leases, submit, finish, hooks, JSON and exit codes | **Changed** since slice E | Legacy fixtures remain in `tests/json_shape_snapshots.rs`, `tests/finish_cli.rs`, `tests/merge_e2e.rs` and CLI help snapshots. A current gate-policy refusal under `--json` returned `aethyme.broker-error/v1` with code 3, unlike slice E’s historical empty stdout. Slice E is not a current universal error/exit contract. |
-| Submit and composition | **Changed** | `collaboration_submit::submit` keeps capture-off on the legacy route and binds required capture to `submit_expecting_head`; `merge::require_capture_for_promotion` fences uncaptured heads. `composition.rs` and `composer.rs` now define a typed candidate and composer. Their existence does not prove the ordinary submit route uses multi-contribution composition. |
+| Submit and composition | **Changed** | `collaboration_submit::submit` keeps capture-off on the legacy route and binds required capture to `submit_expecting_head`; `collaboration_submit::require_capture_for_promotion` fences uncaptured heads. `composition.rs` and `composer.rs` now define a typed candidate and composer. Their existence does not prove the ordinary submit route uses multi-contribution composition. |
 | Policy trust | **Confirmed**, scoped | `merge::require_trusted_policy_at_commit` and `gate_trust::policy_at_commit` retain base-pinned policy and human trust. `gate_trust_cli` covers a new clone and a subsequently landed policy change. |
 | Gate invocation and evidence | **Changed**, scoped | Ordinary gates still use `gates::run_gate_command` / `spawn_gate_command`. The separate `execution_supervisor::DockerExecutor` is not evidence that ordinary gates run there. `gate_profile::ExecutionProfile::capture` now feeds profile-bound cache lookup. Test `execution_profile_cache_requires_definition_and_profile_and_names_its_source_run` covers definition/profile/source-run binding. |
 | Collaboration state and retention | **Changed** | `collaboration_state::CollaborationRoot::resolve` and `CollaborationStore::open` use a private marked root and separate `state.db` (schema 30). `collaboration_gc::plan/apply/resume` intentionally reclaim there under their own ownership rules. The old statement that no collaboration code exists is historical. |
@@ -71,7 +71,7 @@ Paths below are under [`rust/crates`](../../../rust/crates/).
 | Typed provenance | `aethyme-graph-schema/src/edge_struct.rs`: edges carry `Confidence` and method `Source`; nodes carry neither. Tests `source_serde_round_trip`, `confidence_deserialize_validates_range` | **Confirmed.** Method provenance is not producer/profile/snapshot provenance. |
 | Deterministic fragments | `aethyme-graph-storage/src/fragment.rs`: sorted bincode, schema 1. `fragment_binary` tests include `same_inputs_produce_byte_identical_fragments` and `different_input_order_produces_same_bytes` | **Confirmed.** No per-fragment content digest or producer/profile stamp. |
 | Overlay reads | `aethyme-graph-storage/src/overlay.rs::read_overlay_bytes`; `overlay_byte_reader_requires_the_expected_producer_version`, `overlay_byte_reader_rejects_an_empty_version_expectation` | **Changed.** Producer version is now checked; historical #699 gap is resolved at this seam. |
-| Cache / exact-source manifest | `aethyme-graph-storage/src/cache.rs::GraphStoreCacheKey`, `manifest.rs::committed_source_tree_digest`; `key_digest_binds_every_compatibility_dimension` | **Confirmed**, limited. Key binds source/fragments, engine, protocol and storage schema, not producer configuration. Source digest hashes Git tree/object records, not the raw-byte `SourceSnapshotId` preimage. |
+| Cache / exact-source manifest | `aethyme-graph-storage/src/cache.rs::GraphStoreCacheKey`, `manifest.rs::GraphAuthorityManifest` / `committed_source_tree_digest`, CLI `graph_refresh::validate_fragment_authority`; `key_digest_binds_every_compatibility_dimension`, `materialize_rebuilds_only_the_local_store_from_verified_committed_fragments`, `materialize_refuses_exact_head_drift_without_cloning_or_indexing` | **Confirmed**, limited. Key binds source/fragments, engine, protocol and storage schema, not producer configuration. Source digest hashes Git tree/object records, not the raw-byte `SourceSnapshotId` preimage. |
 | NodeId / FileId | `aethyme-graph-schema/src/identity.rs::NodeId::new`: length-prefixed repository/path/name/kind; file content hash stored separately | **Confirmed.** No separate `FileId`; body independence follows from inputs but lacks a dedicated test (#700 remains open). Do not silently replace this identity with Local source identity. |
 | Session refresh / library writes | CLI `graph_refresh::broker_preconditions`; storage `write_guard::ensure_isolated_graph_write`; `active_sessions_block_shared_fragment_writes`, `raw_shards_coverage_and_manifest_refuse_before_side_effects` | **Changed.** Raw writes are now denied in broker-managed repositories. This is a deny-only storage fence; session/lease awareness remains in the CLI, not a shared lower-level session guard. |
 | Linker / producers | `aethyme-graph-indexer/src/linker.rs::unique_call_target`; `ambiguous_name_only_match_stays_unresolved`, `rust_ambiguous_call_fails_closed_rather_than_guessing` | **Confirmed.** Conservative unique compatible match; no full type/name/cross-language resolution. Rust/TypeScript Calls exist; no SCIP implementation is established. |
@@ -79,8 +79,8 @@ Paths below are under [`rust/crates`](../../../rust/crates/).
 
 This inventories guarantees rather than adopting the old I3 assessment as proof.
 D37 is complete as an audit decision. NodeId body-independence coverage (#700),
-producer/profile provenance and the remaining refresh/analysis limits are explicit
-follow-ups feeding #213 and their Local owners, not new guarantees.
+producer/profile provenance and refresh/impact limits remain with #655/#684/#685
+and their Local owners. Emitted-edge status feeds #213. None is a new guarantee.
 
 ## Current reuse map for downstream Local work
 
@@ -107,14 +107,17 @@ this task does not manufacture replacement raw captures. Current source referenc
 above were rechecked at the pinned revision. Local focused validation passed all
 29 graph identity and 12 fragment tests. The first docs hygiene run found an
 anchored-link checker incompatibility (13 passed, one failed); the link was
-changed to the document target. Final docs rerun and delivery results are recorded
-in the PR test plan; until they complete they are pending.
+changed to the document target and all 14 docs tests passed on rerun. Any later
+review edits, final gate results and delivery are recorded separately in the PR
+test plan; source references are not execution claims.
 No destructive storage operation, model trial or held-out evaluation is needed
 for this documentation-only closeout.
 
 At the time of recheck, #688 and #700 remain open. `git.rs::GitRepo::discover` now
 preserves timeout/spawn/unrelated Git errors rather than calling them all
-`NotARepository`; the open #688 is not evidence that this old defect remains.
+`NotARepository` (tests `discovery_preserves_an_expired_deadline_instead_of_denying_the_repository`
+and `discovery_still_identifies_an_actual_non_repository`); the open #688 is not
+evidence that this old defect remains.
  Follow-ups #689–#699 and #701–#703 are closed on GitHub; source rechecks establish the particular
 cache, overlay, write-fence and edge-conversion deltas above, not all guarantees
 suggested by their titles. The stale inline-sweep comment and durable root
