@@ -44,10 +44,13 @@ fn promoted_fixture_with_worktree_root(
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
 
-    let mut broker = isolation::open(tmp.path());
-    if let Some(worktree_root) = worktree_root {
-        broker = broker.with_worktree_root(worktree_root);
-    }
+    let mut broker = match worktree_root {
+        Some(worktree_root) => {
+            let worktree_root = worktree_root.canonicalize().unwrap();
+            isolation::open_with_worktree_root(tmp.path(), &worktree_root)
+        }
+        None => isolation::open(tmp.path()),
+    };
     let session = broker.start_worktree("finish CLI fixture", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
@@ -161,16 +164,17 @@ fn finish_cli_succeeds_for_a_clean_worktree_root_with_spaces() {
         .prefix("aethyme finish worktrees with spaces ")
         .tempdir()
         .unwrap();
+    let worktree_root_path = worktree_root.path().canonicalize().unwrap();
     let (tmp, session_id, worktree, _) =
-        promoted_fixture_with_worktree_root(Some(worktree_root.path()));
+        promoted_fixture_with_worktree_root(Some(&worktree_root_path));
     assert!(
         worktree.to_string_lossy().contains(' '),
         "fixture path must contain spaces: {}",
         worktree.display()
     );
-    assert!(worktree.starts_with(worktree_root.path()));
+    assert!(worktree.starts_with(&worktree_root_path));
 
-    let mut broker = isolation::open(tmp.path()).with_worktree_root(worktree_root.path());
+    let mut broker = isolation::open_with_worktree_root(tmp.path(), &worktree_root_path);
     let session_arg = session_id.to_string();
     let mut command = Command::new(CLI);
     command
