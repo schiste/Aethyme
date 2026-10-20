@@ -882,6 +882,45 @@ the schema lock:
   explains why the cache layer must stay BSL-free; the same constraint
   applies to any library used to write/read fragments.
 
+
+## Broker-owned graph publication (#701)
+
+Canonical graph publication in broker-managed repositories uses the reviewed
+`aethyme graph refresh` plan/execute workflow. Raw fragment, overlay, shard,
+coverage, manifest, bootstrap, indexing and linking writes refuse managed
+checkouts below the CLI layer. Indexing also checks before stale-artifact
+removal, including runs that produce no new fragments. Derived query caches
+remain separate from these committed graph artifacts.
+
+Repository-aware mutable store opens enroll the Git common directory with a deny-only
+`aethyme-broker-managed-graph-v1` marker before SQLite opens or migrates broker storage. This includes direct
+store callers and best-effort writable opens; an unsuccessful mutable open can
+still leave this deny-only marker. Snapshot opens stay read-only. Raw producer checks inspect all ancestors (at most 256 directory levels), so nested input paths observe the same fence. Nested Git metadata does not exempt an output inside a managed checkout; generation uses a physically isolated temporary clone. The marker covers repositories whose
+broker database is configured outside the checkout; legacy local broker
+storage also triggers refusal. Raw writers conservatively refuse linked or
+indirect Git metadata even when that checkout has not been enrolled.
+
+Generation takes place in the refresh workflow's fresh private clone, which
+has its own Git metadata and does not inherit ignored broker state. Publication
+continues through the existing broker preconditions and reviewed journal; no
+library override grants canonical write permission. For first enrollment,
+`aethyme deploy --with-graph` scaffolds the graph policy and version pin;
+review and commit them before running refresh.
+
+Output checks reject observed symbolic links and unsupported path components,
+and temporary writes use exclusive creation. Marker contents are flushed on all
+platforms, with additional parent-directory synchronization on Unix. This does
+not assert portable directory-entry durability after a power loss. These checks
+provide coordination
+and observed-path validation, not atomic protection against hostile same-user
+filesystem replacement. Older binaries do not implement the new fence; writers
+must be quiesced during runtime rollout. An older overridden-database repository
+is enrolled by its next mutable open in the new broker before this marker can
+protect its database-independent identity. Refresh preconditions resolve the
+selected broker database rather than assuming its default checkout location;
+missing selected state in an enrolled repository is a refusal, not an empty
+session inventory.
+
 ## 11. Derived redb schema 10 and test relationships
 
 This section describes the local derived redb materialization, not a change

@@ -1574,13 +1574,46 @@ fn compare_graph_files(
         .collect()
 }
 
+fn broker_preconditions_required(
+    main_root: &Path,
+    common: &Path,
+    database: &Path,
+) -> Result<bool, String> {
+    let observed = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot inspect broker state {}: {error}",
+            path.display()
+        )),
+    };
+    let selected = observed(database)?;
+    let marker =
+        observed(&common.join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER))?;
+    let legacy = observed(&main_root.join(aethyme_broker::BROKER_DB_RELPATH))?;
+    if selected.is_none() && (marker.is_some() || legacy.is_some()) {
+        return Err("managed graph refresh requires its selected broker database; inspect the configured broker database path before retrying".into());
+    }
+    if selected
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return Err("selected broker database is not an ordinary file".into());
+    }
+    Ok(selected.is_some())
+}
+
 fn broker_preconditions(
     repo: &Path,
     planned_paths: &BTreeSet<String>,
 ) -> Result<(Vec<GraphSessionPrecondition>, Vec<GraphLeasePrecondition>), String> {
     let repository = GitRepo::discover(repo).map_err(|error| error.to_string())?;
     let main_root = repository.main_root().map_err(|error| error.to_string())?;
-    if !main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+    let database = aethyme_broker::broker_db_path(&main_root).map_err(|error| error.to_string())?;
+    let common = repository
+        .git_common_dir()
+        .map_err(|error| error.to_string())?;
+    if !broker_preconditions_required(&main_root, &common, &database)? {
         return Ok((Vec::new(), Vec::new()));
     }
     let broker = Broker::open_snapshot(repo).map_err(|error| error.to_string())?;
@@ -2546,6 +2579,26 @@ mod tests {
             sessions.iter().any(|s| s.session_id == other.id),
             "a session on another worktree must still block, got {sessions:?}"
         );
+    }
+
+    #[test]
+    fn external_database_and_missing_managed_database_do_not_skip_preconditions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap().join("repo");
+        let common = root.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        let database = temporary.path().join("external.db");
+        assert!(!broker_preconditions_required(&root, &common, &database).unwrap());
+        std::fs::write(&database, b"fixture").unwrap();
+        assert!(broker_preconditions_required(&root, &common, &database).unwrap());
+        assert!(!root.join(aethyme_broker::BROKER_DB_RELPATH).exists());
+        std::fs::remove_file(&database).unwrap();
+        std::fs::write(
+            common.join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER),
+            b"fixture",
+        )
+        .unwrap();
+        assert!(broker_preconditions_required(&root, &common, &database).is_err());
     }
 
     #[test]

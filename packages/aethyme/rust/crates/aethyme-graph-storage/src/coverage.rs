@@ -275,13 +275,13 @@ pub fn write_coverage_artifacts(
         units_bytes.push(b'\n');
     }
 
-    crate::disk::atomic_write(&coverage_path, &coverage_bytes).map_err(|source| {
+    crate::disk::atomic_write(repo_root, &coverage_path, &coverage_bytes).map_err(|source| {
         CoverageArtifactError::Io {
             path: coverage_path.clone(),
             source,
         }
     })?;
-    crate::disk::atomic_write(&units_path, &units_bytes).map_err(|source| {
+    crate::disk::atomic_write(repo_root, &units_path, &units_bytes).map_err(|source| {
         CoverageArtifactError::Io {
             path: units_path.clone(),
             source,
