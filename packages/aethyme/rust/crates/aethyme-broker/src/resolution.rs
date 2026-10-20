@@ -573,6 +573,15 @@ impl ResolutionRequest {
     pub fn decision_key(&self) -> String {
         self.decision.key()
     }
+    /// Canonical decision fields used by the durable managed-attempt ledger.
+    pub(crate) fn managed_decision_fields(&self) -> (String, &'static str, String, String) {
+        (
+            self.decision.key(),
+            self.decision.kind,
+            join_set(&self.decision.members),
+            join_set(&self.decision.paths),
+        )
+    }
     /// The contributions the resolver decides between: for a conflict, those
     /// applied up to and including the conflicting step that touch a
     /// conflicting path; for failed checks, every contribution.
@@ -991,22 +1000,22 @@ pub fn load_request(
     record: &RecordRef,
 ) -> Result<ResolutionRequest, ResolutionError> {
     let bytes = collaboration_archive::read_object(store, &record.object)?;
-    load_request_from_bytes(store, repo, record, &bytes)
+    load_request_from_bytes(store, Some(repo), record, &bytes)
 }
 
-fn load_request_bounded(
+pub(crate) fn load_request_bounded(
     store: &mut CollaborationStore,
     repo: &Path,
     record: &RecordRef,
     max_bytes: usize,
 ) -> Result<ResolutionRequest, ResolutionError> {
     let bytes = collaboration_archive::read_object_bounded(store, &record.object, max_bytes)?;
-    load_request_from_bytes(store, repo, record, &bytes)
+    load_request_from_bytes(store, Some(repo), record, &bytes)
 }
 
 fn load_request_from_bytes(
-    store: &mut CollaborationStore,
-    repo: &Path,
+    store: &CollaborationStore,
+    repo: Option<&Path>,
     record: &RecordRef,
     bytes: &[u8],
 ) -> Result<ResolutionRequest, ResolutionError> {
@@ -1016,7 +1025,7 @@ fn load_request_from_bytes(
         record: record.id.as_str().to_string(),
         detail,
     };
-    if decoded.id() != record.id {
+    if decoded.id() != record.id || decoded.canonical_bytes() != bytes {
         return Err(ResolutionError::Archive(ArchiveError::CorruptObject {
             digest: record.object.hex(),
         }));
@@ -1139,7 +1148,19 @@ fn load_request_from_bytes(
     };
 
     // The baseline and the accumulator, re-read and checked.
-    let baseline = composer::retain_commit(store, repo, &commit(&string("baseline_commit")?)?)?;
+    let baseline_snapshot = snapshot(&string("baseline")?)?;
+    let baseline_commit = commit(&string("baseline_commit")?)?;
+    let mut baseline = collaboration_archive::retained(store, &baseline_snapshot)?
+        .ok_or_else(|| mismatch("the baseline snapshot is no longer retained".into()))?;
+    if let Some(repo) = repo
+        && collaboration_archive::snapshot_of_commit(repo, &baseline_commit)?.id()
+            != baseline_snapshot
+    {
+        return Err(mismatch(
+            "the baseline commit no longer names its snapshot".into(),
+        ));
+    }
+    baseline.commit = baseline_commit;
     if baseline.snapshot_id.as_str() != string("baseline")? {
         return Err(mismatch(
             "the baseline commit no longer names its snapshot".into(),
@@ -1147,18 +1168,18 @@ fn load_request_from_bytes(
     }
     let accumulator_id = snapshot(&string("accumulator")?)?;
     let accumulator_commit = commit(&string("accumulator_commit")?)?;
-    let retained = collaboration_archive::retained(store, &accumulator_id)?
+    let mut retained = collaboration_archive::retained(store, &accumulator_id)?
         .ok_or_else(|| mismatch("the accumulator is no longer retained".into()))?;
-    if collaboration_archive::snapshot_of_commit(repo, &accumulator_commit)?.id() != accumulator_id
+    if let Some(repo) = repo
+        && collaboration_archive::snapshot_of_commit(repo, &accumulator_commit)?.id()
+            != accumulator_id
     {
         return Err(mismatch(
             "the accumulator commit does not name its snapshot".into(),
         ));
     }
-    let accumulator = RetainedSnapshot {
-        commit: accumulator_commit,
-        ..retained
-    };
+    retained.commit = accumulator_commit;
+    let accumulator = retained;
     if let Trigger::FailedChecks { candidate, .. } = &trigger
         && *candidate != accumulator.snapshot_id
     {
@@ -1602,6 +1623,77 @@ fn comparable_attempts(
     Ok(count)
 }
 
+/// Whether one stored managed-attempt row is the exact canonical decision
+/// represented by this already validated request.
+#[cfg(test)]
+fn managed_attempt_decision_matches(
+    request: &ResolutionRequest,
+    key: &str,
+    kind: &str,
+    members: &str,
+    paths: &str,
+) -> bool {
+    request.decision.key() == key
+        && request.decision.kind == kind
+        && join_set(&request.decision.members) == members
+        && join_set(&request.decision.paths) == paths
+}
+
+fn decode_canonical_decision_set(value: &str) -> Result<BTreeSet<String>, ResolutionError> {
+    if value.len() > MAX_DOCUMENT_BYTES {
+        return Err(invalid(
+            "managed attempt decision set exceeds the size limit",
+        ));
+    }
+    let set = split_set(value);
+    if join_set(&set) != value {
+        return Err(invalid("managed attempt decision set is not canonical"));
+    }
+    Ok(set)
+}
+
+/// Whether an unresolved async managed attempt reserves a comparable
+/// contribution/path decision. The durable key is rederived from its bounded,
+/// canonical member/path sets before it can block admission.
+pub(crate) fn has_unresolved_managed_comparable_in_transaction(
+    connection: &rusqlite::Connection,
+    request: &ResolutionRequest,
+) -> Result<bool, ResolutionError> {
+    let mut statement = connection.prepare(
+        "SELECT decision_key,members,paths FROM resolution_attempts
+         WHERE kind=?1 AND resolver='local-managed-resolution'
+           AND session_label IS NULL AND outcome IS NULL
+           AND async_state IN ('dispatching','outcome_unknown')
+         ORDER BY attempt_id",
+    )?;
+    let rows = statement.query_map([request.decision.kind], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (key, raw_members, raw_paths) = row?;
+        let members = decode_canonical_decision_set(&raw_members)?;
+        let paths = decode_canonical_decision_set(&raw_paths)?;
+        let stored = Decision {
+            kind: request.decision.kind,
+            members,
+            paths,
+        };
+        if stored.key() != key {
+            return Err(invalid(
+                "unresolved managed attempt decision key does not match",
+            ));
+        }
+        if request.decision.comparable(&stored.members, &stored.paths) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn attempts_used(store: &CollaborationStore, decision: &Decision) -> Result<u32, ResolutionError> {
     let connection = store.read_connection();
     let exists: Option<i64> = connection
@@ -1617,42 +1709,151 @@ fn attempts_used(store: &CollaborationStore, decision: &Decision) -> Result<u32,
     comparable_attempts(connection, decision)
 }
 
-/// Charge one attempt to `decision` before dispatch, so a crash never
-/// refunds it. `None` when the allowance is spent; otherwise the attempt
-/// number and the ledger row to settle.
-fn charge(
-    store: &mut CollaborationStore,
-    decision: &Decision,
-    request: &RecordId,
+/// Insert the comparable-decision charge into an already-open transaction.
+/// Callers supply the archived request, not a member/path summary, so the
+/// decision key and allowance query always come from the validated record.
+fn charge_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ResolutionRequest,
+    record: &RecordRef,
     resolver: &str,
 ) -> Result<Option<(u32, i64)>, ResolutionError> {
-    let transaction = store
-        .connection()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(LEDGER)?;
-    let used = comparable_attempts(&transaction, decision)?;
+    charge_in_transaction_with_metadata(transaction, request, record, resolver, None)
+}
+
+/// The managed route must preserve the exact manifest and stable idempotency
+/// key on the same shared comparable-attempt row used by manual resolution.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ManagedChargeContext<'a> {
+    pub(crate) input_manifest: ObjectDigest,
+    pub(crate) client_key: &'a OperationId,
+    pub(crate) async_token: &'a OperationId,
+    pub(crate) input_sha256: &'a str,
+    pub(crate) limits: DispatchLimits,
+}
+
+#[derive(Debug)]
+struct AttemptChargeMetadata {
+    request_sha256: String,
+    input_sha256: String,
+    input_manifest_sha256: String,
+    client_key: String,
+    async_token: String,
+    dispatch_limits: String,
+}
+
+/// Insert one managed charge through the same decision/cap check as manual
+/// resolution. Managed rows begin as exported; the admission caller advances
+/// them to dispatching after it writes the reservation and its bindings. The
+/// caller owns the Immediate transaction and initializes the resolution
+/// ledger before invoking this helper.
+pub(crate) fn charge_managed_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ResolutionRequest,
+    context: ManagedChargeContext<'_>,
+) -> Result<Option<(u32, i64)>, ResolutionError> {
+    validate_attempt_binding(context.client_key.as_str(), "client key")?;
+    validate_attempt_binding(context.async_token.as_str(), "attempt token")?;
+    let limits = context.limits.validate()?;
+    let record = request.record();
+    let metadata = AttemptChargeMetadata {
+        request_sha256: record.object.hex(),
+        input_sha256: context.input_sha256.to_owned(),
+        input_manifest_sha256: context.input_manifest.hex(),
+        client_key: context.client_key.as_str().to_owned(),
+        async_token: context.async_token.as_str().to_owned(),
+        dispatch_limits: limits.canonical_ledger_value(),
+    };
+    charge_in_transaction_with_metadata(
+        transaction,
+        request,
+        record,
+        "local-managed-resolution",
+        Some(&metadata),
+    )
+}
+
+fn charge_in_transaction_with_metadata(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ResolutionRequest,
+    record: &RecordRef,
+    resolver: &str,
+    metadata: Option<&AttemptChargeMetadata>,
+) -> Result<Option<(u32, i64)>, ResolutionError> {
+    if request.record() != record {
+        return Err(invalid(
+            "charged request reference differs from its archived record",
+        ));
+    }
+    let decision = &request.decision;
+    let used = comparable_attempts(transaction, decision)?;
     if used >= MAX_SYNTHESIS_ATTEMPTS {
         return Ok(None);
     }
+    let request_sha256 = metadata.map(|metadata| metadata.request_sha256.as_str());
+    let input_sha256 = metadata.map(|metadata| metadata.input_sha256.as_str());
+    let input_manifest_sha256 = metadata.map(|metadata| metadata.input_manifest_sha256.as_str());
+    let client_key = metadata.map(|metadata| metadata.client_key.as_str());
+    let async_token = metadata.map(|metadata| metadata.async_token.as_str());
+    let dispatch_limits = metadata.map(|metadata| metadata.dispatch_limits.as_str());
     transaction.execute(
         "INSERT INTO resolution_attempts
              (decision_key, kind, members, paths, request_record_id, resolver, charged_ms,
-              attempt_number, async_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'dispatching')",
+              attempt_number, request_sha256, input_sha256, input_manifest_sha256,
+              client_key, async_token, dispatch_limits, async_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             decision.key(),
             decision.kind,
             join_set(&decision.members),
             join_set(&decision.paths),
-            request.as_str(),
+            record.id.as_str(),
             resolver,
             now_ms(),
-            i64::from(used + 1)
+            i64::from(used + 1),
+            request_sha256,
+            input_sha256,
+            input_manifest_sha256,
+            client_key,
+            async_token,
+            dispatch_limits,
+            if metadata.is_some() {
+                "exported"
+            } else {
+                "dispatching"
+            },
         ],
     )?;
     let row = transaction.last_insert_rowid();
-    transaction.commit()?;
     Ok(Some((used + 1, row)))
+}
+
+/// Charge one attempt before dispatch, so a crash never refunds it. `None`
+/// means the shared allowance is spent; otherwise return its number and the
+/// ledger row to settle.
+fn charge(
+    store: &mut CollaborationStore,
+    request: &ResolutionRequest,
+    record: &RecordRef,
+    resolver: &str,
+) -> Result<Option<(u32, i64)>, ResolutionError> {
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    initialize_ledger_in_transaction(&transaction)?;
+    let charge = charge_in_transaction(&transaction, request, record, resolver)?;
+    transaction.commit()?;
+    Ok(charge)
+}
+
+/// Initialize the shared resolution-attempt ledger inside a caller-owned
+/// transaction. Managed Local admission uses this with its reservation and
+/// immutable binding writes so all authority commits atomically.
+pub(crate) fn initialize_ledger_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), ResolutionError> {
+    transaction.execute_batch(LEDGER)?;
+    Ok(())
 }
 
 fn settle(store: &mut CollaborationStore, row: i64, outcome: &str) -> Result<(), ResolutionError> {
@@ -1937,7 +2138,7 @@ impl DispatchLimits {
     }
 }
 
-fn request_record_limit(limits: DispatchLimits) -> Result<usize, ResolutionError> {
+pub(crate) fn request_record_limit(limits: DispatchLimits) -> Result<usize, ResolutionError> {
     usize::try_from(limits.max_manifest_bytes.min(MAX_DOCUMENT_BYTES as u64))
         .map_err(|_| invalid("resolution request byte limit"))
 }
@@ -1990,6 +2191,20 @@ pub struct UnverifiedSynthesis {
     pub request: ResolutionRequest,
     pub candidate: Candidate,
     pub group_record: RecordRef,
+    pub input_manifest: ResolutionInputManifest,
+}
+
+/// Historical provenance for an accepted synthesized source. It validates
+/// archive and ledger bindings without a repository, provider query, or
+/// authority grant. The candidate remains unverified; callers must bind it
+/// to the exact accepted completion and retained Local selection.
+#[derive(Debug, Clone)]
+pub(crate) struct RetainedSynthesisProof {
+    pub status: ResolutionAttemptStatus,
+    pub request: ResolutionRequest,
+    pub group_record: RecordRef,
+    pub candidate_subject: SourceSnapshotId,
+    pub candidate_commit: CommitOid,
     pub input_manifest: ResolutionInputManifest,
 }
 
@@ -2568,7 +2783,7 @@ fn account_manifest_entry(
     Ok(())
 }
 
-fn build_input_manifest(
+pub(crate) fn build_input_manifest(
     store: &CollaborationStore,
     request: &ResolutionRequest,
     limits: DispatchLimits,
@@ -2786,7 +3001,10 @@ fn encode_input_manifest(
     Ok(output)
 }
 
-fn resolution_input_digest(request: &ResolutionRequest, request_object: &ObjectDigest) -> String {
+pub(crate) fn resolution_input_digest(
+    request: &ResolutionRequest,
+    request_object: &ObjectDigest,
+) -> String {
     let (snapshots, contributions) = attempt_inputs(request);
     let mut hasher = Sha256::new();
     hasher.update(b"aethyme async resolution inputs v1\0");
@@ -2802,7 +3020,7 @@ fn resolution_input_digest(request: &ResolutionRequest, request_object: &ObjectD
     hex(&hasher.finalize())
 }
 
-fn retain_attempt_inputs(
+pub(crate) fn retain_attempt_inputs(
     transaction: &rusqlite::Transaction<'_>,
     token: &str,
     record: &RecordRef,
@@ -3736,6 +3954,130 @@ pub(crate) fn read_synthesized_attempt_result_for_refs(
     Ok(synthesis)
 }
 
+fn historical_synthesis_trigger_is_valid(
+    trigger: &Trigger,
+    accumulator: &SourceSnapshotId,
+) -> bool {
+    match trigger {
+        Trigger::Conflict(conflicts) => !conflicts.is_empty(),
+        Trigger::FailedChecks { candidate, checks } => {
+            !checks.is_empty() && candidate == accumulator
+        }
+    }
+}
+
+/// Revalidate the immutable synthesis ledger and its complete archived input
+/// closure for historical baseline provenance. This deliberately omits Git
+/// tree inspection and does not return a candidate accepted for execution;
+/// the completion reader must bind the subject/commit and selected lineages
+/// to the exact historical completion separately.
+pub(crate) fn read_retained_synthesized_result_for_refs(
+    store: &CollaborationStore,
+    request_ref: &RecordRef,
+    result_ref: &RecordRef,
+) -> Result<RetainedSynthesisProof, ResolutionError> {
+    let _archive = crate::collaboration_gc::archive_use(store)
+        .map_err(|error| invalid(format!("archive retention: {error}")))?;
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(|error| invalid(format!("response access: {error}")))?;
+    let (token, session_label): (String, String) = {
+        let connection = store.read_connection();
+        let count: i64 = connection.query_row(
+            "SELECT count(*) FROM resolution_attempts
+             WHERE async_state='settled' AND outcome='synthesized'
+               AND request_record_id=?1 AND request_sha256=?2
+               AND result_record_id=?3 AND result_sha256=?4
+               AND async_token IS NOT NULL AND session_label IS NOT NULL",
+            rusqlite::params![
+                request_ref.id.as_str(),
+                request_ref.object.hex(),
+                result_ref.id.as_str(),
+                result_ref.object.hex(),
+            ],
+            |row| row.get(0),
+        )?;
+        if count != 1 {
+            return Err(invalid(
+                "historical synthesis is not bound to one settled request attempt",
+            ));
+        }
+        connection.query_row(
+            "SELECT async_token,session_label FROM resolution_attempts
+             WHERE async_state='settled' AND outcome='synthesized'
+               AND request_record_id=?1 AND request_sha256=?2
+               AND result_record_id=?3 AND result_sha256=?4
+               AND async_token IS NOT NULL AND session_label IS NOT NULL",
+            rusqlite::params![
+                request_ref.id.as_str(),
+                request_ref.object.hex(),
+                result_ref.id.as_str(),
+                result_ref.object.hex(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+    };
+    let status = attempt_status(store, &token, &session_label)?;
+    if status.state != ResolutionAttemptState::Settled
+        || status.outcome.as_deref() != Some("synthesized")
+        || status.response_sha256.is_none()
+        || status.request != *request_ref
+        || status.result.as_ref() != Some(result_ref)
+        || status.request_sha256 != request_ref.object.hex()
+    {
+        return Err(invalid("historical synthesis ledger binding changed"));
+    }
+
+    let request_bytes = collaboration_archive::read_object_bounded(
+        store,
+        &request_ref.object,
+        request_record_limit(status.limits)?,
+    )?;
+    let request = load_request_from_bytes(store, None, request_ref, &request_bytes)?;
+    verify_attempt_inputs(&status, &request)?;
+    if request.record() != request_ref
+        || !historical_synthesis_trigger_is_valid(
+            request.trigger(),
+            &request.accumulator().snapshot_id,
+        )
+    {
+        return Err(invalid("historical synthesis request identity or trigger"));
+    }
+    let input_manifest = load_attempt_manifest(store, &status, &request)?;
+    verify_manifest_objects(store, &status, &input_manifest)?;
+
+    let group_bytes =
+        collaboration_archive::read_object_bounded(store, &result_ref.object, MAX_DOCUMENT_BYTES)?;
+    let group = Record::decode(&group_bytes, &[&SYNTHESIZED_GROUP_SCHEMA])
+        .map_err(|error| invalid(format!("synthesized group record: {error}")))?;
+    if group.id() != result_ref.id || group.canonical_bytes() != group_bytes {
+        return Err(ResolutionError::Archive(ArchiveError::CorruptObject {
+            digest: result_ref.object.hex(),
+        }));
+    }
+    validate_synthesized_group_shape(&group, &status, &request)?;
+    let subject_text = match group.get("candidate") {
+        Some(Value::String(value)) => value,
+        _ => return Err(invalid("historical synthesized candidate subject")),
+    };
+    let candidate_subject = SourceSnapshotId::parse(subject_text)
+        .map_err(|_| invalid("historical synthesized candidate subject"))?;
+    let candidate_commit = match group.get("candidate_commit") {
+        Some(Value::String(value)) => CommitOid::parse(value)?,
+        _ => return Err(invalid("historical synthesized candidate commit")),
+    };
+    collaboration_archive::retained(store, &candidate_subject)?
+        .ok_or_else(|| invalid("historical synthesized candidate is not retained"))?;
+
+    Ok(RetainedSynthesisProof {
+        status,
+        request,
+        group_record: result_ref.clone(),
+        candidate_subject,
+        candidate_commit,
+        input_manifest,
+    })
+}
+
 /// Read the exact synthesized result settled for one request and async token.
 /// The result reference comes from the immutable ledger row; caller-provided
 /// token/request data can only select that row, never retarget its group.
@@ -3970,7 +4312,7 @@ pub fn resolve(
             used: attempts_used(store, &request.decision)?,
         })
     };
-    let Some((attempt, row)) = charge(store, &request.decision, &record.id, &label)? else {
+    let Some((attempt, row)) = charge(store, &request, record, &label)? else {
         return Ok(Resolution {
             outcome: failed(
                 ResolutionFailure::BudgetExhausted,
@@ -4426,6 +4768,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn historical_synthesis_trigger_requires_nonempty_checks_and_matching_candidate() {
+        let accumulator = SourceSnapshotId::parse(&format!("sha256:{}", "0".repeat(64))).unwrap();
+        let other_candidate =
+            SourceSnapshotId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+        let input = CommitOid::parse(&"a".repeat(40)).unwrap();
+        let conflict = ConflictPath {
+            path: "src/lib.rs".into(),
+            input,
+            reason: "content".into(),
+        };
+        assert!(historical_synthesis_trigger_is_valid(
+            &Trigger::Conflict(vec![conflict]),
+            &accumulator,
+        ));
+        assert!(!historical_synthesis_trigger_is_valid(
+            &Trigger::Conflict(Vec::new()),
+            &accumulator,
+        ));
+        assert!(historical_synthesis_trigger_is_valid(
+            &Trigger::FailedChecks {
+                candidate: accumulator.clone(),
+                checks: vec![FailedCheck {
+                    check: "native-gate:unit".into(),
+                }],
+            },
+            &accumulator,
+        ));
+        assert!(!historical_synthesis_trigger_is_valid(
+            &Trigger::FailedChecks {
+                candidate: accumulator.clone(),
+                checks: Vec::new(),
+            },
+            &accumulator,
+        ));
+        assert!(!historical_synthesis_trigger_is_valid(
+            &Trigger::FailedChecks {
+                candidate: other_candidate,
+                checks: vec![FailedCheck {
+                    check: "native-gate:unit".into(),
+                }],
+            },
+            &accumulator,
+        ));
+    }
+
+    #[test]
     fn dispatch_limits_stay_within_existing_local_io_caps() {
         let limits = DispatchLimits {
             max_manifest_bytes: collaboration_archive::MAX_METADATA_OBJECT_BYTES,
@@ -4583,6 +4971,142 @@ mod tests {
             paths: set(&["x"]),
         };
         assert!(!conflict.comparable(&set(&["a", "b"]), &set(&["y"])));
+    }
+
+    fn managed_decision_request(members: &[&str], paths: &[&str]) -> ResolutionRequest {
+        let set = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect();
+        let baseline = RetainedSnapshot {
+            snapshot_id: SourceSnapshotId::parse(&format!("sha256:{}", "0".repeat(64))).unwrap(),
+            record_id: RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap(),
+            commit: CommitOid::parse(&"a".repeat(40)).unwrap(),
+            entry_count: 0,
+            content_bytes: 0,
+        };
+        ResolutionRequest {
+            record: None,
+            decision: Decision {
+                kind: "conflict",
+                members: set(members),
+                paths: set(paths),
+            },
+            decision_members: Vec::new(),
+            members: Vec::new(),
+            contents: Vec::new(),
+            trigger: Trigger::Conflict(Vec::new()),
+            baseline: baseline.clone(),
+            accumulator: baseline,
+            requirements: Vec::new(),
+            scope: Vec::new(),
+            protection: Protection {
+                harness: BTreeSet::new(),
+                gate_files: BTreeSet::new(),
+                security_patterns: Vec::new(),
+                security: None,
+            },
+            preference: None,
+            allowance: Allowance { limit: 3, used: 0 },
+        }
+    }
+
+    #[test]
+    fn managed_decision_fields_match_canonical_ledger_identity() {
+        let request = managed_decision_request(&["b", "a", "b"], &["src/z", "src/a"]);
+        let (key, kind, members, paths) = request.managed_decision_fields();
+        assert_eq!(key, request.decision_key());
+        assert_eq!(kind, "conflict");
+        assert_eq!(members, "a\nb");
+        assert_eq!(paths, "src/a\nsrc/z");
+        assert!(managed_attempt_decision_matches(
+            &request, &key, kind, &members, &paths,
+        ));
+    }
+
+    #[test]
+    fn managed_attempt_rows_match_exact_bindings_and_hold_subset_or_superset_decisions() {
+        let request = managed_decision_request(&["a", "b"], &["src/a", "src/b"]);
+        let key = request.decision.key();
+        assert!(managed_attempt_decision_matches(
+            &request,
+            &key,
+            "conflict",
+            "a\nb",
+            "src/a\nsrc/b",
+        ));
+        assert!(!managed_attempt_decision_matches(
+            &request,
+            &key,
+            "conflict",
+            "b\na",
+            "src/a\nsrc/b",
+        ));
+
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE resolution_attempts (
+                    attempt_id INTEGER PRIMARY KEY,
+                    decision_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    members TEXT NOT NULL,
+                    paths TEXT NOT NULL,
+                    resolver TEXT NOT NULL,
+                    session_label TEXT,
+                    outcome TEXT,
+                    async_state TEXT
+                );",
+            )
+            .unwrap();
+
+        let set = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect();
+        for (members, paths) in [
+            (vec!["a"], vec!["src/a"]),
+            (vec!["a", "b", "c"], vec!["src/a", "src/b", "src/c"]),
+        ] {
+            let stored = Decision {
+                kind: "conflict",
+                members: set(&members),
+                paths: set(&paths),
+            };
+            connection
+                .execute(
+                    "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,resolver,session_label,outcome,async_state)
+                     VALUES(?1,?2,?3,?4,'local-managed-resolution',NULL,NULL,'outcome_unknown')",
+                    rusqlite::params![
+                        stored.key(),
+                        stored.kind,
+                        join_set(&stored.members),
+                        join_set(&stored.paths),
+                    ],
+                )
+                .unwrap();
+            assert!(
+                has_unresolved_managed_comparable_in_transaction(&connection, &request).unwrap()
+            );
+            connection
+                .execute("DELETE FROM resolution_attempts", [])
+                .unwrap();
+        }
+
+        let unrelated = Decision {
+            kind: "conflict",
+            members: set(&["a", "b"]),
+            paths: set(&["src/c"]),
+        };
+        connection
+            .execute(
+                "INSERT INTO resolution_attempts
+                 (decision_key,kind,members,paths,resolver,session_label,outcome,async_state)
+                 VALUES(?1,?2,?3,?4,'local-managed-resolution',NULL,NULL,'dispatching')",
+                rusqlite::params![
+                    unrelated.key(),
+                    unrelated.kind,
+                    join_set(&unrelated.members),
+                    join_set(&unrelated.paths),
+                ],
+            )
+            .unwrap();
+        assert!(!has_unresolved_managed_comparable_in_transaction(&connection, &request).unwrap());
     }
 
     #[test]

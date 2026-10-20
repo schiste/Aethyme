@@ -1217,3 +1217,608 @@ fn host_journals_cannot_enter_the_project_backup_root() {
             .exists()
     );
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReservationLedgerRow {
+    reservation: String,
+    nonce: String,
+    target: String,
+    revision: String,
+    wave: String,
+    root: String,
+    parent: Option<String>,
+    body: String,
+    phase: String,
+    spent: String,
+    attempts: i64,
+    version: i64,
+    receipt: Option<String>,
+    detail: Option<String>,
+    observed_overrun: String,
+}
+type ReceiptLedgerRow = (String, String, i64, String);
+
+fn admission_ledger(
+    f: &Fixture,
+    owner: &ControllerOwner,
+) -> (Vec<ReservationLedgerRow>, Vec<ReceiptLedgerRow>, Units) {
+    let mut statement = f.store.read_connection().prepare(
+        "SELECT reservation,nonce,target,revision,wave,root,parent,hex(body),phase,hex(spent),attempts,version,receipt,detail,coalesce(hex(observed_overrun),'') FROM local_budget_reservations ORDER BY reservation",
+    ).unwrap();
+    let reservations = statement
+        .query_map([], |row| {
+            Ok(ReservationLedgerRow {
+                reservation: row.get(0)?,
+                nonce: row.get(1)?,
+                target: row.get(2)?,
+                revision: row.get(3)?,
+                wave: row.get(4)?,
+                root: row.get(5)?,
+                parent: row.get(6)?,
+                body: row.get(7)?,
+                phase: row.get(8)?,
+                spent: row.get(9)?,
+                attempts: row.get(10)?,
+                version: row.get(11)?,
+                receipt: row.get(12)?,
+                detail: row.get(13)?,
+                observed_overrun: row.get(14)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut statement = f.store.read_connection().prepare(
+        "SELECT receipt,reservation,attempt,hex(usage) FROM local_budget_receipts ORDER BY receipt",
+    ).unwrap();
+    let receipts = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let charged = budget::charged(&f.store, owner).unwrap();
+    (reservations, receipts, charged)
+}
+
+fn admission_request(
+    execution: &ExecutionSnapshot,
+    nonce: &[u8],
+    units: Units,
+    deadline_ms: i64,
+) -> budget::Request {
+    budget::Request {
+        nonce: digest(nonce),
+        recipe: execution.id().to_string(),
+        kind: budget::WorkKind::Verification,
+        units,
+        max_attempts: 1,
+        deadline_ms,
+    }
+}
+
+fn parent_request(execution: &ExecutionSnapshot, deadline_ms: i64) -> budget::Request {
+    let child = envelope().units().unwrap();
+    budget::Request {
+        nonce: digest(b"admission-parent"),
+        recipe: execution.id().to_string(),
+        kind: budget::WorkKind::Verification,
+        units: Units {
+            time_ms: child.time_ms * 4,
+            memory_bytes: child.memory_bytes * 4,
+            disk_bytes: child.disk_bytes * 4,
+            model_requests: child.model_requests * 4,
+            input_tokens: child.input_tokens * 4,
+            output_tokens: child.output_tokens * 4,
+            spend_microunits: child.spend_microunits * 4,
+            slots: child.slots * 4,
+            previews: child.previews * 4,
+        },
+        max_attempts: 2,
+        deadline_ms,
+    }
+}
+
+#[test]
+fn admission_direct_then_delegated_is_immutable() {
+    // Direct admission first: the same nonce cannot be admitted a second time
+    // through a parent, and the failed route leaves every ledger row unchanged.
+    let host = tempfile::tempdir().unwrap();
+    let p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let deadline = now() + 3_600_000;
+    let parent = budget::reserve(
+        &mut f.store,
+        &owner,
+        &wave,
+        parent_request(&execution, deadline),
+        now(),
+    )
+    .unwrap();
+    let request = admission_request(
+        &execution,
+        b"same-logical-work-direct-first",
+        envelope().units().unwrap(),
+        deadline,
+    );
+    let direct = budget::admit(
+        &mut f.store,
+        &owner,
+        &wave,
+        request.clone(),
+        budget::AdmissionRoute::Direct,
+        || Ok::<i64, budget::BudgetError>(now()),
+    )
+    .unwrap();
+    let guard = budget::execution_guard(
+        &f.store,
+        &owner,
+        &direct,
+        &execution,
+        envelope().units().unwrap(),
+    )
+    .unwrap();
+    drop(guard);
+    let direct_ledger = admission_ledger(&f, &owner);
+    assert!(matches!(
+        budget::admit(
+            &mut f.store,
+            &owner,
+            &wave,
+            request.clone(),
+            budget::AdmissionRoute::Delegated {
+                parent: parent.id.clone(),
+            },
+            || Ok::<i64, budget::BudgetError>(now()),
+        ),
+        Err(budget::BudgetError::Immutable)
+    ));
+    assert_eq!(admission_ledger(&f, &owner), direct_ledger);
+}
+
+#[test]
+fn admission_delegated_then_direct_is_immutable() {
+    // The same nonce cannot create a second root. The child reaches the same
+    // real guard; while it is pending the parent cannot start an overlapping
+    // attempt.
+    let host = tempfile::tempdir().unwrap();
+    let p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let deadline = now() + 3_600_000;
+    let parent = budget::reserve(
+        &mut f.store,
+        &owner,
+        &wave,
+        parent_request(&execution, deadline),
+        now(),
+    )
+    .unwrap();
+    let request = admission_request(
+        &execution,
+        b"same-logical-work-delegated-first",
+        envelope().units().unwrap(),
+        deadline,
+    );
+    let delegated = budget::admit(
+        &mut f.store,
+        &owner,
+        &wave,
+        request.clone(),
+        budget::AdmissionRoute::Delegated {
+            parent: parent.id.clone(),
+        },
+        || Ok::<i64, budget::BudgetError>(now()),
+    )
+    .unwrap();
+    let parent_key: Option<String> = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT parent FROM local_budget_reservations WHERE reservation=?1",
+            [delegated.reservation().as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_key.as_deref(), Some(parent.id.as_str()));
+    let guard = budget::execution_guard(
+        &f.store,
+        &owner,
+        &delegated,
+        &execution,
+        envelope().units().unwrap(),
+    )
+    .unwrap();
+    drop(guard);
+    assert!(matches!(
+        budget::begin_attempt(&mut f.store, &owner, &parent.id, now()),
+        Err(budget::BudgetError::Pending)
+    ));
+    let delegated_ledger = admission_ledger(&f, &owner);
+    assert!(matches!(
+        budget::admit(
+            &mut f.store,
+            &owner,
+            &wave,
+            request,
+            budget::AdmissionRoute::Direct,
+            || Ok::<i64, budget::BudgetError>(now()),
+        ),
+        Err(budget::BudgetError::Immutable)
+    ));
+    assert_eq!(admission_ledger(&f, &owner), delegated_ledger);
+}
+
+#[test]
+fn admission_rejects_wrong_wave_parent_and_owner() {
+    let host = tempfile::tempdir().unwrap();
+    let p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let deadline = now() + 3_600_000;
+    let parent = budget::reserve(
+        &mut f.store,
+        &owner,
+        &wave,
+        parent_request(&execution, deadline),
+        now(),
+    )
+    .unwrap();
+    let initial = admission_ledger(&f, &owner);
+
+    assert!(matches!(
+        budget::admit(
+            &mut f.store,
+            &owner,
+            &aethyme_contracts::experimental_v0::RecordId::parse(&digest(b"wrong-wave")).unwrap(),
+            admission_request(
+                &execution,
+                b"wrong-wave-child",
+                envelope().units().unwrap(),
+                deadline,
+            ),
+            budget::AdmissionRoute::Delegated {
+                parent: parent.id.clone(),
+            },
+            || Ok::<i64, budget::BudgetError>(now()),
+        ),
+        Err(budget::BudgetError::Immutable)
+    ));
+    assert_eq!(admission_ledger(&f, &owner), initial);
+
+    let missing_parent =
+        aethyme_contracts::experimental_v0::RecordId::parse(&digest(b"unowned-parent")).unwrap();
+    assert!(matches!(
+        budget::admit(
+            &mut f.store,
+            &owner,
+            &wave,
+            admission_request(
+                &execution,
+                b"missing-parent-child",
+                envelope().units().unwrap(),
+                deadline,
+            ),
+            budget::AdmissionRoute::Delegated {
+                parent: missing_parent,
+            },
+            || Ok::<i64, budget::BudgetError>(now()),
+        ),
+        Err(budget::BudgetError::Missing)
+    ));
+    assert_eq!(admission_ledger(&f, &owner), initial);
+
+    let mut other = Fixture::new();
+    let other_owner =
+        target::acquire_controller(&mut other.store, "resource-target", "appointed").unwrap();
+    assert!(matches!(
+        budget::admit(
+            &mut f.store,
+            &other_owner,
+            &wave,
+            admission_request(
+                &execution,
+                b"wrong-owner-direct",
+                envelope().units().unwrap(),
+                deadline,
+            ),
+            budget::AdmissionRoute::Direct,
+            || Ok::<i64, budget::BudgetError>(now()),
+        ),
+        Err(budget::BudgetError::Target(
+            target::TargetError::Unauthorized
+        ))
+    ));
+    assert_eq!(admission_ledger(&f, &owner), initial);
+}
+
+#[test]
+fn admission_rejects_stale_parent_revision() {
+    let host = tempfile::tempdir().unwrap();
+    let p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let deadline = now() + 3_600_000;
+    let parent = budget::reserve(
+        &mut f.store,
+        &owner,
+        &wave,
+        parent_request(&execution, deadline),
+        now(),
+    )
+    .unwrap();
+    let mut replacement = f.spec();
+    replacement.composer_profile.push_str("-other-revision");
+    let replacement = target::propose_revision(&mut f.store, &owner, replacement).unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_targets SET active_revision=?1 WHERE target=?2",
+            (replacement.id.as_str(), owner.target()),
+        )
+        .unwrap();
+    let stale_ledger = admission_ledger(&f, &owner);
+    assert!(matches!(
+        budget::admit(
+            &mut f.store,
+            &owner,
+            &wave,
+            admission_request(
+                &execution,
+                b"stale-parent-child",
+                envelope().units().unwrap(),
+                deadline,
+            ),
+            budget::AdmissionRoute::Delegated { parent: parent.id },
+            || Ok::<i64, budget::BudgetError>(now()),
+        ),
+        Err(budget::BudgetError::Stale)
+    ));
+    assert_eq!(admission_ledger(&f, &owner), stale_ledger);
+}
+
+#[test]
+fn admission_clock_failures_preserve_only_durable_reservations() {
+    let host = tempfile::tempdir().unwrap();
+    let p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let first_now = now();
+    let deadline = first_now + 3_600_000;
+    let request = admission_request(
+        &execution,
+        b"second-clock-failure",
+        envelope().units().unwrap(),
+        deadline,
+    );
+    let expected_units = request.units;
+    let mut samples = 0;
+    let result = budget::admit(
+        &mut f.store,
+        &owner,
+        &wave,
+        request,
+        budget::AdmissionRoute::Direct,
+        || {
+            samples += 1;
+            if samples == 1 {
+                Ok(first_now)
+            } else {
+                Err(budget::BudgetError::Invalid("clock unavailable".into()))
+            }
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(budget::BudgetError::Invalid(ref detail)) if detail == "clock unavailable"
+    ));
+    assert_eq!(samples, 2);
+    let rows = admission_ledger(&f, &owner);
+    assert_eq!(rows.0.len(), 1);
+    assert!(rows.1.is_empty());
+    assert_eq!(rows.2, expected_units);
+    assert_eq!(rows.0[0].phase, "reserved");
+    assert_eq!(rows.0[0].attempts, 0);
+
+    let first_clock_request = admission_request(
+        &execution,
+        b"first-clock-failure",
+        envelope().units().unwrap(),
+        now() + 3_600_000,
+    );
+    let before_first_clock_failure = admission_ledger(&f, &owner);
+    let mut samples = 0;
+    let result = budget::admit(
+        &mut f.store,
+        &owner,
+        &wave,
+        first_clock_request,
+        budget::AdmissionRoute::Direct,
+        || {
+            samples += 1;
+            Err(budget::BudgetError::Invalid("clock unavailable".into()))
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(budget::BudgetError::Invalid(ref detail)) if detail == "clock unavailable"
+    ));
+    assert_eq!(samples, 1);
+    assert_eq!(admission_ledger(&f, &owner), before_first_clock_failure);
+
+    let first_now = now();
+    let expired_deadline = first_now + 1_000;
+    let expired_request = admission_request(
+        &execution,
+        b"second-clock-expired",
+        envelope().units().unwrap(),
+        expired_deadline,
+    );
+    let expired_nonce = expired_request.nonce.clone();
+    let expired_units = expired_request.units;
+    let mut samples = 0;
+    let result = budget::admit(
+        &mut f.store,
+        &owner,
+        &wave,
+        expired_request,
+        budget::AdmissionRoute::Direct,
+        || {
+            samples += 1;
+            if samples == 1 {
+                Ok(first_now)
+            } else {
+                Ok(expired_deadline)
+            }
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(budget::BudgetError::Invalid(ref detail)) if detail == "deadline"
+    ));
+    assert_eq!(samples, 2);
+    let rows = admission_ledger(&f, &owner);
+    assert_eq!(rows.0.len(), 2);
+    assert!(rows.1.is_empty());
+    let expired = rows
+        .0
+        .iter()
+        .find(|row| row.nonce == expired_nonce)
+        .unwrap();
+    assert_eq!(expired.phase, "reserved");
+    assert_eq!(expired.attempts, 0);
+    assert_eq!(
+        rows.2.time_ms,
+        expected_units.time_ms + expired_units.time_ms
+    );
+    assert_eq!(
+        rows.2.memory_bytes,
+        expected_units.memory_bytes + expired_units.memory_bytes
+    );
+    assert_eq!(
+        rows.2.disk_bytes,
+        expected_units.disk_bytes + expired_units.disk_bytes
+    );
+
+    // Delegation has the same post-commit clock boundary. A failed second
+    // clock read keeps each child reservation durable while the parent stays
+    // reserved, unspent, and without an attempt. Root charging remains the
+    // parent's allocation; child allocations do not charge another root.
+    let delegated_host = tempfile::tempdir().unwrap();
+    let delegated_policy = policy(delegated_host.path());
+    let (mut delegated_fixture, delegated_owner, delegated_execution, delegated_wave) = subject(
+        delegated_policy.runtime.clone(),
+        delegated_policy.meter_image.clone(),
+    );
+    let parent_deadline = now() + 3_600_000;
+    let parent_request = parent_request(&delegated_execution, parent_deadline);
+    let parent_units = parent_request.units;
+    let parent = budget::reserve(
+        &mut delegated_fixture.store,
+        &delegated_owner,
+        &delegated_wave,
+        parent_request,
+        now(),
+    )
+    .unwrap();
+    let parent_before = admission_ledger(&delegated_fixture, &delegated_owner)
+        .0
+        .into_iter()
+        .find(|row| row.reservation == parent.id.as_str())
+        .unwrap();
+
+    let child_deadline = parent_deadline;
+    let child_request = admission_request(
+        &delegated_execution,
+        b"delegated-second-clock-failure",
+        envelope().units().unwrap(),
+        child_deadline,
+    );
+    let child_nonce = child_request.nonce.clone();
+    let mut samples = 0;
+    let result = budget::admit(
+        &mut delegated_fixture.store,
+        &delegated_owner,
+        &delegated_wave,
+        child_request,
+        budget::AdmissionRoute::Delegated {
+            parent: parent.id.clone(),
+        },
+        || {
+            samples += 1;
+            if samples == 1 {
+                Ok(now())
+            } else {
+                Err(budget::BudgetError::Invalid("clock unavailable".into()))
+            }
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(budget::BudgetError::Invalid(ref detail)) if detail == "clock unavailable"
+    ));
+    assert_eq!(samples, 2);
+    let rows = admission_ledger(&delegated_fixture, &delegated_owner);
+    assert_eq!(rows.0.len(), 2);
+    assert!(rows.1.is_empty());
+    assert_eq!(rows.2, parent_units);
+    let child = rows.0.iter().find(|row| row.nonce == child_nonce).unwrap();
+    assert_eq!(child.phase, "reserved");
+    assert_eq!(child.attempts, 0);
+    assert_eq!(child.parent.as_deref(), Some(parent.id.as_str()));
+    let parent_after_error = rows
+        .0
+        .iter()
+        .find(|row| row.reservation == parent.id.as_str())
+        .unwrap();
+    let mut expected_parent = parent_before.clone();
+    expected_parent.version += 1;
+    assert_eq!(parent_after_error, &expected_parent);
+
+    let expired_now = now();
+    let expired_deadline = expired_now + 1_000;
+    let expired_request = admission_request(
+        &delegated_execution,
+        b"delegated-second-clock-expired",
+        envelope().units().unwrap(),
+        expired_deadline,
+    );
+    let expired_nonce = expired_request.nonce.clone();
+    let mut samples = 0;
+    let result = budget::admit(
+        &mut delegated_fixture.store,
+        &delegated_owner,
+        &delegated_wave,
+        expired_request,
+        budget::AdmissionRoute::Delegated {
+            parent: parent.id.clone(),
+        },
+        || {
+            samples += 1;
+            if samples == 1 {
+                Ok(expired_now)
+            } else {
+                Ok(expired_deadline)
+            }
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(budget::BudgetError::Invalid(ref detail)) if detail == "deadline"
+    ));
+    assert_eq!(samples, 2);
+    let rows = admission_ledger(&delegated_fixture, &delegated_owner);
+    assert_eq!(rows.0.len(), 3);
+    assert!(rows.1.is_empty());
+    assert_eq!(rows.2, parent_units);
+    for nonce in [&child_nonce, &expired_nonce] {
+        let child = rows.0.iter().find(|row| &row.nonce == nonce).unwrap();
+        assert_eq!(child.phase, "reserved");
+        assert_eq!(child.attempts, 0);
+        assert_eq!(child.parent.as_deref(), Some(parent.id.as_str()));
+    }
+    let parent_after_expiry = rows
+        .0
+        .iter()
+        .find(|row| row.reservation == parent.id.as_str())
+        .unwrap();
+    expected_parent.version += 1;
+    assert_eq!(parent_after_expiry, &expected_parent);
+}
