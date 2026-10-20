@@ -174,35 +174,39 @@ fn generic_resolution_mutators_refuse_without_changing_pending_reservation() {
         matches!(&generic_attempt, Err(BudgetError::ResolutionRoute)),
         "generic resolution attempt returned an unexpected error: {generic_attempt:?}"
     );
-    assert!(matches!(
-        settle(&mut f.store, &owner, &attempt, units(1), &receipt()),
-        Err(BudgetError::ResolutionRoute)
-    ));
-    assert!(matches!(
-        reconcile(
-            &mut f.store,
-            &owner,
-            &reservation_id,
-            1,
-            units(1),
-            &receipt()
-        ),
-        Err(BudgetError::ResolutionRoute)
-    ));
-    assert!(matches!(
-        close(&mut f.store, &owner, &reservation_id, 1),
-        Err(BudgetError::ResolutionRoute)
-    ));
-    assert!(matches!(
-        delegate(
-            &mut f.store,
-            &owner,
-            &reservation_id,
-            request('b', 1, WorkKind::Composition),
-            0
-        ),
-        Err(BudgetError::ResolutionRoute)
-    ));
+    let generic_settle = settle(&mut f.store, &owner, &attempt, units(1), &receipt());
+    assert!(
+        matches!(&generic_settle, Err(BudgetError::ResolutionRoute)),
+        "generic settlement returned an unexpected error: {generic_settle:?}"
+    );
+    let generic_reconcile = reconcile(
+        &mut f.store,
+        &owner,
+        &reservation_id,
+        1,
+        units(1),
+        &receipt(),
+    );
+    assert!(
+        matches!(&generic_reconcile, Err(BudgetError::ResolutionRoute)),
+        "generic reconciliation returned an unexpected error: {generic_reconcile:?}"
+    );
+    let generic_close = close(&mut f.store, &owner, &reservation_id, 1);
+    assert!(
+        matches!(&generic_close, Err(BudgetError::ResolutionRoute)),
+        "generic close returned an unexpected error: {generic_close:?}"
+    );
+    let generic_delegate = delegate(
+        &mut f.store,
+        &owner,
+        &reservation_id,
+        request('b', 1, WorkKind::Composition),
+        0,
+    );
+    assert!(
+        matches!(&generic_delegate, Err(BudgetError::ResolutionRoute)),
+        "generic delegate returned an unexpected error: {generic_delegate:?}"
+    );
 
     let after: (String, i64, i64, i64) = f
         .store
