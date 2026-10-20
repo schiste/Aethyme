@@ -1,11 +1,13 @@
 # Local v3 — L0 baseline audit (#651)
 
-Last Updated: 2026-10-09
+Last Updated: 2026-10-20
 
 This is the revision-bound reuse and compatibility map that plan v3 requires before
 Local adds collaboration state or analysis contracts (plan §2.3, §6.1, §6.10, §15.1 L0;
-decisions D18 and D37; tests T33–T35). It records what the code does **today**. It does
-not change behavior, and it is not proof that any later Local capability works.
+decisions D18 and D37; tests T33–T35). Sections 1–8 and slices A–E record the **2026-10-09 baseline**, not the current
+implementation. The [current closeout](f-closeout-61d34c0.md) rechecks the seams at
+`61d34c0294a8b9add6787bb17d74a5a89e4a6487` and accepts the audit with explicit
+follow-ups. Neither audit changes behavior or qualifies later Local capabilities.
 
 | | |
 |---|---|
@@ -33,8 +35,9 @@ qualification belongs on Playground repositories (Cardinal Rule 1).
 | C | [c-state-cleanup-reach.md](c-state-cleanup-reach.md) | Every persistent root, every deleter and its reach, where new state can safely live (D09/T35), hooks |
 | D | [d-analysis-inventory-d37.md](d-analysis-inventory-d37.md) | D37: schema, fragments, overlays, redb, manifests and caches, session guard, NodeId, linker, emitted edges, `graph_impact`, SCIP |
 | E | [e-t33-cli-baseline.md](e-t33-cli-baseline.md) | T33: which CLI contracts are pinned by tests, plus a live JSON/exit-code capture on a disposable repository |
+| F | [f-closeout-61d34c0.md](f-closeout-61d34c0.md) | Current revision, D18/D37 disposition, implementation deltas, remaining evidence limits |
 
-## 1. Audit checklist (#651)
+## 1. Historical audit checklist (#651)
 
 | Item | Result |
 |---|---|
@@ -45,7 +48,7 @@ qualification belongs on Playground repositories (Cardinal Rule 1).
 | D37 analysis inventory | Done (slice D). The proposed D37 closure is in §4. |
 | Name a reuse seam or a gap for each L1–L9 and AQ0 capability | Done (§3). |
 
-## 2. Headline findings
+## 2. Historical headline findings
 
 These change the shape or order of later work. Each one links to its evidence.
 
@@ -126,7 +129,7 @@ scoped follow-up, not something fixed here.
 | **X2 #684** | Canonical `_overlays` namespace to stay out of; CLI session guard | A private-view root outside `_overlays/`, and a guard in the library layer |
 | **X3 #685** | `graph_impact` contract | Candidate subjects; lossless `Tests` edges |
 
-## 4. D37 — proposed closure record
+## 4. D37 — historical proposed closure record
 
 D37 asks which engine guarantees are actually implemented at the development revision.
 Slice D answers each I3 claim with file, function and tests:
@@ -138,7 +141,7 @@ Slice D answers each I3 claim with file, function and tests:
 Proposed D37 status: **ready to close** with this record, if the plan owner accepts the
 changed and unverified items as explicit work (listed in §6) rather than guarantees.
 
-## 5. D18 and the compatibility baseline (plan §6.8)
+## 5. D18 and the historical compatibility baseline (plan §6.8)
 
 | §6.8 situation | Baseline behavior today | Evidence |
 |---|---|---|
@@ -151,7 +154,7 @@ changed and unverified items as explicit work (listed in §6) rather than guaran
 | Optional semantic producer absent | No SCIP producer; `graph_impact` reports `Unavailable` or `Partial` rather than an empty result | D rows 10–11 |
 | Coordination or native acceptance unavailable | Not applicable; no such components exist | — |
 
-## 6. T33–T35 mapping
+## 6. Historical T33–T35 mapping
 
 | Test | Status at L0 | Where it can actually run |
 |---|---|---|
