@@ -2478,6 +2478,7 @@ mod tests {
     fn managed_storage_root_set_is_sorted_finite_and_refuses_duplicates() {
         let mut fixture = Fixture::new();
         let second_materialization = "cccccccccccc";
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
         std::fs::create_dir_all(fixture.repository_root.join(second_materialization)).unwrap();
         let first_order = capture_root_set(&fixture, &[MATERIALIZATION, second_materialization]);
         let reverse_order = capture_root_set(&fixture, &[second_materialization, MATERIALIZATION]);
@@ -2568,6 +2569,7 @@ mod tests {
     #[test]
     fn managed_storage_root_set_scan_refuses_root_replacement_and_cannot_resume() {
         let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
         for index in 0..8 {
             std::fs::write(
                 fixture.materialization_root.join(format!("entry-{index}")),
@@ -2615,6 +2617,7 @@ mod tests {
     #[test]
     fn managed_storage_root_set_polls_renew_the_exact_owner_lease() {
         let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
         for index in 0..16 {
             std::fs::write(
                 fixture.materialization_root.join(format!("entry-{index}")),
@@ -2650,6 +2653,7 @@ mod tests {
     #[test]
     fn managed_storage_root_set_refuses_a_stale_owner_grant() {
         let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
         let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
         let grant = fixture.coordinator.acquire(&fixture.lease_request).unwrap();
         let stale_grant = grant.clone();
