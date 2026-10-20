@@ -17,7 +17,7 @@ pub(crate) use managed_storage_inventory::{ManagedStorageOwner, ManagedStorageRo
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
 /// Additive ledger version, independent of the host-resource store version.
-pub(crate) const MANAGED_STORAGE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MANAGED_STORAGE_SCHEMA_VERSION: u32 = 4;
 pub const HOST_RESOURCE_REQUEST_SCHEMA_VERSION: u32 = 1;
 const HOST_RESOURCE_STORE_SCHEMA_VERSION: u32 = 2;
 const MIN_TTL_SECONDS: u64 = 15;
@@ -133,6 +133,715 @@ CREATE TABLE IF NOT EXISTS managed_storage_claim_lineage (
 CREATE INDEX IF NOT EXISTS managed_storage_lineage_by_predecessor
  ON managed_storage_claim_lineage(repository,filesystem_id,predecessor_claim_id);
 
+"#;
+
+/// Managed-storage migrations are additive. They never rewrite or drop legacy
+/// claims, lineage, or policy rows; admission and producer state live in
+/// separate tables.
+const MANAGED_STORAGE_GROUP_SCHEMA: &str = r#"
+CREATE TABLE managed_storage_claim_groups (
+ repository TEXT NOT NULL,
+ group_id TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ lease_id TEXT NOT NULL,
+ generation INTEGER NOT NULL CHECK (generation > 0),
+ materialization TEXT NOT NULL,
+ root_set_digest TEXT NOT NULL,
+ pre_inventory_digest TEXT NOT NULL,
+ member_manifest_digest TEXT NOT NULL,
+ manifest_digest TEXT NOT NULL,
+ member_count INTEGER NOT NULL CHECK (member_count BETWEEN 1 AND 32),
+ state TEXT NOT NULL CHECK (state IN ('reserved','uncertain','settled')),
+ receipt_digest TEXT,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, group_id),
+ UNIQUE (repository, request_id),
+ UNIQUE (repository, member_manifest_digest)
+);
+CREATE INDEX managed_storage_groups_by_request
+ ON managed_storage_claim_groups(repository, request_id);
+CREATE TABLE managed_storage_claim_group_members (
+ repository TEXT NOT NULL,
+ group_id TEXT NOT NULL,
+ ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 31),
+ filesystem_id TEXT NOT NULL,
+ claim_id TEXT NOT NULL,
+ root_identity TEXT NOT NULL,
+ claim_request_digest TEXT NOT NULL,
+ requested_bytes INTEGER NOT NULL CHECK (requested_bytes > 0),
+ reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes > 0),
+ predecessor_claim_id TEXT,
+ baseline_bytes INTEGER NOT NULL CHECK (baseline_bytes >= 0),
+ root_instance_id TEXT,
+ PRIMARY KEY (repository, group_id, ordinal),
+ UNIQUE (repository, filesystem_id, claim_id),
+ UNIQUE (repository, group_id, filesystem_id, root_identity),
+ FOREIGN KEY (repository, group_id)
+   REFERENCES managed_storage_claim_groups(repository, group_id),
+ FOREIGN KEY (repository, filesystem_id, claim_id)
+   REFERENCES managed_storage_claims(repository, filesystem_id, claim_id)
+);
+CREATE INDEX managed_storage_group_members_by_claim
+ ON managed_storage_claim_group_members(repository, filesystem_id, claim_id);
+CREATE INDEX IF NOT EXISTS managed_storage_group_members_by_root
+ ON managed_storage_claim_group_members(repository, filesystem_id, root_identity, group_id);
+CREATE INDEX IF NOT EXISTS managed_storage_group_members_by_root_global
+ ON managed_storage_claim_group_members(filesystem_id, root_identity, repository, group_id);
+"#;
+
+/// Additive managed-storage producer journal. The durable random producer id
+/// and immutable group/plan digests survive restart; a process-local helper id
+/// is never written here and no row in this schema grants settlement rights.
+const MANAGED_STORAGE_PRODUCER_SCHEMA: &str = r#"
+CREATE TABLE managed_storage_preparation_producers (
+ repository TEXT NOT NULL,
+ producer_id TEXT NOT NULL CHECK (length(producer_id)=64),
+ group_id TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ lease_id TEXT NOT NULL,
+ generation INTEGER NOT NULL CHECK (generation > 0),
+ materialization TEXT NOT NULL,
+ root_set_digest TEXT NOT NULL,
+ pre_inventory_digest TEXT NOT NULL,
+ member_manifest_digest TEXT NOT NULL,
+ manifest_digest TEXT NOT NULL,
+ plan_digest TEXT NOT NULL,
+ step_count INTEGER NOT NULL CHECK (step_count BETWEEN 1 AND 32),
+ next_step_ordinal INTEGER NOT NULL CHECK (next_step_ordinal BETWEEN 0 AND 32
+   AND next_step_ordinal <= step_count),
+ state TEXT NOT NULL CHECK (state IN ('active','intent','steps_complete','stopped','uncertain')),
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, producer_id),
+ UNIQUE (producer_id),
+ UNIQUE (repository, group_id),
+ FOREIGN KEY (repository, group_id)
+   REFERENCES managed_storage_claim_groups(repository, group_id)
+);
+CREATE INDEX managed_storage_preparation_producers_by_group
+ ON managed_storage_preparation_producers(repository, group_id);
+CREATE TABLE managed_storage_preparation_steps (
+ repository TEXT NOT NULL,
+ producer_id TEXT NOT NULL,
+ ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 31),
+ name TEXT NOT NULL,
+ step_digest TEXT NOT NULL,
+ state TEXT NOT NULL CHECK (state IN ('planned','intent','terminal','cleanup_unknown')),
+ intent_token TEXT UNIQUE,
+ outcome_code TEXT,
+ exit_code INTEGER,
+ terminal_digest TEXT,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, producer_id, ordinal),
+ FOREIGN KEY (repository, producer_id)
+   REFERENCES managed_storage_preparation_producers(repository, producer_id),
+ CHECK ((state IN ('planned','intent') AND outcome_code IS NULL AND terminal_digest IS NULL)
+     OR (state='terminal' AND outcome_code IS NOT NULL AND terminal_digest IS NOT NULL)
+     OR (state='cleanup_unknown' AND outcome_code='cleanup_unknown' AND terminal_digest IS NULL))
+);
+CREATE INDEX managed_storage_preparation_steps_by_state
+ ON managed_storage_preparation_steps(repository, producer_id, state, ordinal);
+"#;
+
+/// One immutable proof row binds the Rust-verified joined plan and fresh
+/// inventory to the only permitted producer-backed group transition. This is
+/// created in the same IMMEDIATE transaction as claim reconciliation.
+const MANAGED_STORAGE_PREPARATION_SETTLEMENT_PROOF_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS managed_storage_preparation_settlement_proofs (
+ repository TEXT NOT NULL,
+ group_id TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ lease_id TEXT NOT NULL,
+ generation INTEGER NOT NULL CHECK (generation > 0),
+ materialization TEXT NOT NULL,
+ root_set_digest TEXT NOT NULL,
+ pre_inventory_digest TEXT NOT NULL,
+ member_manifest_digest TEXT NOT NULL,
+ manifest_digest TEXT NOT NULL,
+ producer_id TEXT NOT NULL,
+ plan_digest TEXT NOT NULL CHECK (length(plan_digest)=64),
+ ordered_steps_digest TEXT NOT NULL CHECK (length(ordered_steps_digest)=64),
+ inventory_digest TEXT NOT NULL CHECK (length(inventory_digest)=64),
+ aggregate_digest TEXT NOT NULL CHECK (length(aggregate_digest)=64),
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, group_id),
+ UNIQUE (repository, producer_id),
+ FOREIGN KEY (repository, group_id)
+   REFERENCES managed_storage_claim_groups(repository, group_id),
+ FOREIGN KEY (repository, producer_id)
+   REFERENCES managed_storage_preparation_producers(repository, producer_id)
+);
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_settlement_proof_insert
+BEFORE INSERT ON managed_storage_preparation_settlement_proofs
+WHEN NOT EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN managed_storage_claim_groups g
+   ON g.repository=p.repository AND g.group_id=p.group_id
+ WHERE p.repository=NEW.repository AND p.group_id=NEW.group_id
+   AND p.producer_id=NEW.producer_id
+   AND p.request_id=NEW.request_id AND p.lease_id=NEW.lease_id
+   AND p.generation=NEW.generation
+   AND p.materialization=NEW.materialization
+   AND p.root_set_digest=NEW.root_set_digest
+   AND p.pre_inventory_digest=NEW.pre_inventory_digest
+   AND p.member_manifest_digest=NEW.member_manifest_digest
+   AND p.manifest_digest=NEW.manifest_digest
+   AND p.plan_digest=NEW.plan_digest
+   AND p.state='steps_complete' AND p.step_count>0
+   AND p.next_step_ordinal=p.step_count
+   AND g.repository=NEW.repository AND g.group_id=NEW.group_id
+   AND g.request_id=NEW.request_id AND g.lease_id=NEW.lease_id
+   AND g.generation=NEW.generation
+   AND g.materialization=NEW.materialization
+   AND g.root_set_digest=NEW.root_set_digest
+   AND g.pre_inventory_digest=NEW.pre_inventory_digest
+   AND g.member_manifest_digest=NEW.member_manifest_digest
+   AND g.manifest_digest=NEW.manifest_digest
+   AND g.state='reserved' AND g.receipt_digest IS NULL
+)
+BEGIN
+ SELECT RAISE(ABORT, 'preparation settlement proof does not match a reserved completed producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_settlement_proof_update
+BEFORE UPDATE ON managed_storage_preparation_settlement_proofs
+BEGIN
+ SELECT RAISE(ABORT, 'preparation settlement proofs are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_settlement_proof_delete
+BEFORE DELETE ON managed_storage_preparation_settlement_proofs
+BEGIN
+ SELECT RAISE(ABORT, 'preparation settlement proofs are retained');
+END;
+"#;
+
+/// Immutable first-use evidence for one exact operator-profile/root-set
+/// adoption. The JSON receipt carries all per-root measured identities and is
+/// retained within the existing per-repository row bound.
+const MANAGED_STORAGE_ADOPTION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS managed_storage_adoptions (
+ repository TEXT NOT NULL,
+ adoption_id TEXT NOT NULL,
+ profile_id TEXT NOT NULL,
+ profile_digest TEXT NOT NULL CHECK (length(profile_digest)=64),
+ root_set_digest TEXT NOT NULL CHECK (length(root_set_digest)=64),
+ inventory_digest TEXT NOT NULL CHECK (length(inventory_digest)=64),
+ receipt_json TEXT NOT NULL CHECK (length(receipt_json)<=65536),
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY (repository, adoption_id)
+);
+CREATE INDEX IF NOT EXISTS managed_storage_adoptions_by_profile
+ ON managed_storage_adoptions(repository, profile_id);
+CREATE TRIGGER IF NOT EXISTS managed_storage_adoption_update
+BEFORE UPDATE ON managed_storage_adoptions
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage adoption records are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_adoption_delete
+BEFORE DELETE ON managed_storage_adoptions
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage adoption records are retained');
+END;
+"#;
+
+/// SQLite triggers make producer-linked root and lease fences effective for
+/// older already-open writers. Reapply these idempotently when opening an
+/// existing schema-v3 ledger so an earlier unreleased v3 build stays fenced.
+const MANAGED_STORAGE_PRODUCER_FENCE_SCHEMA_TEMPLATE: &str = r#"
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_producer_identity_immutable
+BEFORE UPDATE OF repository,producer_id,group_id,request_id,lease_id,generation,
+ materialization,root_set_digest,pre_inventory_digest,member_manifest_digest,
+ manifest_digest,plan_digest,step_count
+ON managed_storage_preparation_producers
+BEGIN
+ SELECT RAISE(ABORT, 'preparation producer identity is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_producer_state_order
+BEFORE UPDATE OF state,next_step_ordinal ON managed_storage_preparation_producers
+WHEN NOT (
+ (OLD.state='active' AND NEW.state='intent'
+   AND NEW.next_step_ordinal=OLD.next_step_ordinal)
+ OR (OLD.state='intent' AND NEW.state IN ('active','steps_complete','stopped')
+   AND NEW.next_step_ordinal=OLD.next_step_ordinal+1)
+ OR (OLD.state='intent' AND NEW.state='uncertain'
+   AND NEW.next_step_ordinal=OLD.next_step_ordinal)
+)
+BEGIN
+ SELECT RAISE(ABORT, 'preparation producer state transition is invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_step_identity_immutable
+BEFORE UPDATE OF repository,producer_id,ordinal,name,step_digest
+ON managed_storage_preparation_steps
+BEGIN
+ SELECT RAISE(ABORT, 'preparation step identity is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_step_state_order
+BEFORE UPDATE OF state,intent_token,outcome_code,exit_code,terminal_digest
+ON managed_storage_preparation_steps
+WHEN NOT (
+ (OLD.state='planned' AND NEW.state='intent'
+   AND OLD.intent_token IS NULL AND NEW.intent_token IS NOT NULL
+   AND NEW.outcome_code IS NULL AND NEW.exit_code IS NULL AND NEW.terminal_digest IS NULL)
+ OR (OLD.state='intent' AND NEW.state='terminal'
+   AND OLD.intent_token IS NOT NULL AND NEW.intent_token=OLD.intent_token
+   AND NEW.outcome_code IS NOT NULL AND NEW.terminal_digest IS NOT NULL)
+ OR (OLD.state='intent' AND NEW.state='cleanup_unknown'
+   AND OLD.intent_token IS NOT NULL AND NEW.intent_token=OLD.intent_token
+   AND NEW.outcome_code='cleanup_unknown' AND NEW.exit_code IS NULL
+   AND NEW.terminal_digest IS NULL)
+)
+BEGIN
+ SELECT RAISE(ABORT, 'preparation step state transition is invalid');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_producer_retain
+BEFORE DELETE ON managed_storage_preparation_producers
+BEGIN
+ SELECT RAISE(ABORT, 'preparation producer tombstones are retained');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_step_retain
+BEFORE DELETE ON managed_storage_preparation_steps
+BEGIN
+ SELECT RAISE(ABORT, 'preparation step tombstones are retained');
+END;
+
+-- Producer-linked roots stay fenced until the owner commits the exact
+-- success-only aggregate settlement. These guards live in the additive schema
+-- so older already-open writers are fenced by SQLite itself. They protect only
+-- the exact linked root set and lease generation; quarantine remains allowed.
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_claim_insert_fence
+BEFORE INSERT ON managed_storage_claims
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers producer
+ JOIN managed_storage_claim_group_members m
+   ON m.repository=producer.repository AND m.group_id=producer.group_id
+ WHERE producer.repository=NEW.repository AND m.filesystem_id=NEW.filesystem_id
+   AND (m.claim_id=NEW.claim_id OR m.predecessor_claim_id=NEW.claim_id
+        OR m.root_identity=NEW.root_identity)
+   AND __ROOT_UNRESOLVED_PRODUCERS__
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage root is held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_claim_update_fence
+BEFORE UPDATE ON managed_storage_claims
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers producer
+ JOIN managed_storage_claim_group_members m
+   ON m.repository=producer.repository AND m.group_id=producer.group_id
+ WHERE ((producer.repository=OLD.repository AND m.filesystem_id=OLD.filesystem_id
+         AND (m.claim_id=OLD.claim_id OR m.predecessor_claim_id=OLD.claim_id
+              OR m.root_identity=OLD.root_identity)
+         AND __ROOT_UNRESOLVED_PRODUCERS__)
+    OR (producer.repository=NEW.repository AND m.filesystem_id=NEW.filesystem_id
+        AND (m.claim_id=NEW.claim_id OR m.predecessor_claim_id=NEW.claim_id
+             OR m.root_identity=NEW.root_identity)
+        AND __ROOT_UNRESOLVED_PRODUCERS__))
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage root is held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_claim_delete_fence
+BEFORE DELETE ON managed_storage_claims
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN managed_storage_claim_group_members m
+   ON m.repository=p.repository AND m.group_id=p.group_id
+ WHERE p.repository=OLD.repository AND m.filesystem_id=OLD.filesystem_id
+   AND (m.claim_id=OLD.claim_id OR m.predecessor_claim_id=OLD.claim_id
+        OR m.root_identity=OLD.root_identity)
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage root is held by an unresolved preparation producer');
+END;
+
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_lineage_insert_fence
+BEFORE INSERT ON managed_storage_claim_lineage
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers producer
+ JOIN managed_storage_claim_group_members m
+   ON m.repository=producer.repository AND m.group_id=producer.group_id
+ WHERE producer.repository=NEW.repository AND m.filesystem_id=NEW.filesystem_id
+   AND (m.claim_id IN (NEW.claim_id,NEW.predecessor_claim_id,NEW.superseded_by_claim_id)
+        OR m.predecessor_claim_id IN
+           (NEW.claim_id,NEW.predecessor_claim_id,NEW.superseded_by_claim_id))
+   AND __ROOT_UNRESOLVED_PRODUCERS__
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage lineage touches a root held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_lineage_update_fence
+BEFORE UPDATE ON managed_storage_claim_lineage
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers producer
+ JOIN managed_storage_claim_group_members m
+   ON m.repository=producer.repository AND m.group_id=producer.group_id
+ WHERE ((producer.repository=OLD.repository AND m.filesystem_id=OLD.filesystem_id
+         AND (m.claim_id IN (OLD.claim_id,OLD.predecessor_claim_id,OLD.superseded_by_claim_id)
+              OR m.predecessor_claim_id IN (OLD.claim_id,OLD.predecessor_claim_id,OLD.superseded_by_claim_id))
+         AND __ROOT_UNRESOLVED_PRODUCERS__)
+    OR (producer.repository=NEW.repository AND m.filesystem_id=NEW.filesystem_id
+        AND (m.claim_id IN (NEW.claim_id,NEW.predecessor_claim_id,NEW.superseded_by_claim_id)
+             OR m.predecessor_claim_id IN (NEW.claim_id,NEW.predecessor_claim_id,NEW.superseded_by_claim_id))
+        AND __ROOT_UNRESOLVED_PRODUCERS__))
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage lineage touches a root held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_lineage_delete_fence
+BEFORE DELETE ON managed_storage_claim_lineage
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN managed_storage_claim_group_members m
+   ON m.repository=p.repository AND m.group_id=p.group_id
+ WHERE p.repository=OLD.repository AND m.filesystem_id=OLD.filesystem_id
+   AND (m.claim_id IN (OLD.claim_id,OLD.predecessor_claim_id,OLD.superseded_by_claim_id)
+        OR m.predecessor_claim_id IN
+           (OLD.claim_id,OLD.predecessor_claim_id,OLD.superseded_by_claim_id))
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage lineage touches a root held by an unresolved preparation producer');
+END;
+
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_group_update_fence
+BEFORE UPDATE ON managed_storage_claim_groups
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ WHERE p.repository=OLD.repository AND p.group_id=OLD.group_id
+)
+AND NOT (
+ OLD.state='reserved' AND OLD.receipt_digest IS NULL
+ AND NEW.state='settled'
+ AND NEW.receipt_digest IS NOT NULL
+ AND length(NEW.receipt_digest)=64
+ AND NEW.receipt_digest NOT GLOB '*[^0-9a-f]*'
+ AND NEW.repository IS OLD.repository
+ AND NEW.group_id IS OLD.group_id
+ AND NEW.request_id IS OLD.request_id
+ AND NEW.lease_id IS OLD.lease_id
+ AND NEW.generation IS OLD.generation
+ AND NEW.materialization IS OLD.materialization
+ AND NEW.root_set_digest IS OLD.root_set_digest
+ AND NEW.pre_inventory_digest IS OLD.pre_inventory_digest
+ AND NEW.member_manifest_digest IS OLD.member_manifest_digest
+ AND NEW.manifest_digest IS OLD.manifest_digest
+ AND NEW.member_count IS OLD.member_count
+ AND NEW.created_at IS OLD.created_at
+ AND NEW.updated_at >= OLD.updated_at
+ AND (SELECT COUNT(*) FROM managed_storage_claim_group_members m
+      WHERE m.repository=OLD.repository AND m.group_id=OLD.group_id)=OLD.member_count
+ AND EXISTS (
+   SELECT 1 FROM managed_storage_preparation_producers p
+   WHERE p.repository=OLD.repository AND p.group_id=OLD.group_id
+     AND p.request_id=OLD.request_id AND p.lease_id=OLD.lease_id
+     AND p.generation=OLD.generation AND p.materialization=OLD.materialization
+     AND p.root_set_digest=OLD.root_set_digest
+     AND p.pre_inventory_digest=OLD.pre_inventory_digest
+     AND p.member_manifest_digest=OLD.member_manifest_digest
+     AND p.manifest_digest=OLD.manifest_digest
+     AND p.state='steps_complete' AND p.step_count>0
+     AND p.next_step_ordinal=p.step_count
+     AND (SELECT COUNT(*) FROM managed_storage_preparation_steps s
+          WHERE s.repository=p.repository AND s.producer_id=p.producer_id)=p.step_count
+     AND (SELECT MIN(ordinal) FROM managed_storage_preparation_steps s
+          WHERE s.repository=p.repository AND s.producer_id=p.producer_id)=0
+     AND (SELECT MAX(ordinal) FROM managed_storage_preparation_steps s
+          WHERE s.repository=p.repository AND s.producer_id=p.producer_id)=p.step_count-1
+     AND NOT EXISTS (
+       SELECT 1 FROM managed_storage_preparation_steps s
+       WHERE s.repository=p.repository AND s.producer_id=p.producer_id
+         AND (s.state IS NOT 'terminal' OR s.outcome_code IS NOT 'succeeded'
+              OR s.exit_code IS NOT 0 OR s.intent_token IS NULL
+              OR length(s.intent_token) IS NOT 64
+              OR s.intent_token GLOB '*[^0-9a-f]*'
+              OR s.step_digest IS NULL OR length(s.step_digest) IS NOT 64
+              OR s.step_digest GLOB '*[^0-9a-f]*'
+              OR s.terminal_digest IS NULL OR length(s.terminal_digest) IS NOT 64
+              OR s.terminal_digest GLOB '*[^0-9a-f]*')
+     )
+     AND EXISTS (
+       SELECT 1 FROM managed_storage_preparation_settlement_proofs proof
+       WHERE proof.repository=p.repository AND proof.group_id=p.group_id
+         AND proof.request_id=p.request_id AND proof.lease_id=p.lease_id
+         AND proof.generation=p.generation
+         AND proof.materialization=p.materialization
+         AND proof.root_set_digest=p.root_set_digest
+         AND proof.pre_inventory_digest=p.pre_inventory_digest
+         AND proof.member_manifest_digest=p.member_manifest_digest
+         AND proof.manifest_digest=p.manifest_digest
+         AND proof.producer_id=p.producer_id
+         AND proof.plan_digest=p.plan_digest
+         AND proof.aggregate_digest=NEW.receipt_digest
+     )
+ )
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage group is held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_group_delete_fence
+BEFORE DELETE ON managed_storage_claim_groups
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ WHERE p.repository=OLD.repository AND p.group_id=OLD.group_id
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage group is held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_group_member_insert_fence
+BEFORE INSERT ON managed_storage_claim_group_members
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers producer
+ JOIN managed_storage_claim_group_members held
+   ON held.repository=producer.repository AND held.group_id=producer.group_id
+ WHERE producer.repository=NEW.repository
+   AND (producer.group_id=NEW.group_id
+        OR (held.filesystem_id=NEW.filesystem_id
+            AND (held.claim_id IN (NEW.claim_id,NEW.predecessor_claim_id)
+                 OR held.predecessor_claim_id IN (NEW.claim_id,NEW.predecessor_claim_id)
+                 OR held.root_identity=NEW.root_identity)
+            AND __ROOT_UNRESOLVED_PRODUCERS__))
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage group members are held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_group_member_update_fence
+BEFORE UPDATE ON managed_storage_claim_group_members
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN managed_storage_claim_group_members held
+   ON held.repository=p.repository AND held.group_id=p.group_id
+ WHERE (p.repository=OLD.repository
+        AND (p.group_id=OLD.group_id
+             OR (held.filesystem_id=OLD.filesystem_id
+                 AND (held.claim_id IN (OLD.claim_id,OLD.predecessor_claim_id)
+                      OR held.predecessor_claim_id IN (OLD.claim_id,OLD.predecessor_claim_id)
+                      OR held.root_identity=OLD.root_identity))))
+    OR (p.repository=NEW.repository
+        AND (p.group_id=NEW.group_id
+             OR (held.filesystem_id=NEW.filesystem_id
+                 AND (held.claim_id IN (NEW.claim_id,NEW.predecessor_claim_id)
+                      OR held.predecessor_claim_id IN (NEW.claim_id,NEW.predecessor_claim_id)
+                      OR held.root_identity=NEW.root_identity))))
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage group members are held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_group_member_delete_fence
+BEFORE DELETE ON managed_storage_claim_group_members
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN managed_storage_claim_group_members held
+   ON held.repository=p.repository AND held.group_id=p.group_id
+ WHERE p.repository=OLD.repository
+   AND (p.group_id=OLD.group_id
+        OR (held.filesystem_id=OLD.filesystem_id
+            AND (held.claim_id IN (OLD.claim_id,OLD.predecessor_claim_id)
+                 OR held.predecessor_claim_id IN (OLD.claim_id,OLD.predecessor_claim_id)
+                 OR held.root_identity=OLD.root_identity)))
+)
+BEGIN
+ SELECT RAISE(ABORT, 'managed-storage group members are held by an unresolved preparation producer');
+END;
+
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_lease_identity_fence
+BEFORE UPDATE OF lease_id,request_id,request_digest,repository,worktree_fingerprint,
+ run_id,generation,ownership_token,holder_pid,created_at,released_at ON resource_leases
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ WHERE p.lease_id=OLD.lease_id AND p.generation=OLD.generation
+)
+ AND (NEW.lease_id IS NOT OLD.lease_id OR NEW.request_id IS NOT OLD.request_id
+      OR NEW.request_digest IS NOT OLD.request_digest OR NEW.repository IS NOT OLD.repository
+      OR NEW.worktree_fingerprint IS NOT OLD.worktree_fingerprint
+      OR NEW.run_id IS NOT OLD.run_id OR NEW.generation IS NOT OLD.generation
+      OR NEW.ownership_token IS NOT OLD.ownership_token
+      OR NEW.holder_pid IS NOT OLD.holder_pid
+      OR NEW.created_at IS NOT OLD.created_at
+      OR (NEW.released_at IS NOT OLD.released_at AND NOT (
+          OLD.state IN ('active','quarantined')
+          AND OLD.released_at IS NULL
+          AND NEW.state='released'
+          AND NEW.released_at IS NOT NULL
+          AND NEW.released_at=NEW.updated_at
+          AND NOT EXISTS (
+              SELECT 1 FROM resource_supervised_capacity_holds h
+              WHERE h.lease_id=OLD.lease_id AND h.generation=OLD.generation
+          )
+          AND NOT (__OLD_UNRESOLVED_PRODUCERS__)
+      )))
+BEGIN
+ SELECT RAISE(ABORT, 'resource lease identity is held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_lease_state_fence
+BEFORE UPDATE OF state ON resource_leases
+WHEN NEW.state IS NOT OLD.state
+ AND EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ WHERE p.lease_id=OLD.lease_id AND p.generation=OLD.generation
+)
+ AND NOT (
+     (NEW.state='quarantined' AND OLD.state!='released')
+     OR (OLD.state IN ('active','quarantined')
+         AND OLD.released_at IS NULL
+         AND NEW.state='released'
+         AND NEW.released_at IS NOT NULL
+         AND NEW.released_at=NEW.updated_at
+         AND NOT EXISTS (
+             SELECT 1 FROM resource_supervised_capacity_holds h
+             WHERE h.lease_id=OLD.lease_id AND h.generation=OLD.generation
+         )
+         AND NOT (__OLD_UNRESOLVED_PRODUCERS__))
+ )
+BEGIN
+ SELECT RAISE(ABORT, 'resource lease cannot leave quarantine-safe states while preparation is unresolved');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_lease_delete_fence
+BEFORE DELETE ON resource_leases
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ WHERE p.lease_id=OLD.lease_id AND p.generation=OLD.generation
+)
+BEGIN
+ SELECT RAISE(ABORT, 'resource lease is held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_allocation_insert_fence
+BEFORE INSERT ON resource_allocations
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN resource_leases l ON l.lease_id=p.lease_id AND l.generation=p.generation
+ WHERE l.lease_id=NEW.lease_id
+)
+BEGIN
+ SELECT RAISE(ABORT, 'resource allocations are held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_allocation_update_fence
+BEFORE UPDATE ON resource_allocations
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN resource_leases l ON l.lease_id=p.lease_id AND l.generation=p.generation
+ WHERE l.lease_id=OLD.lease_id OR l.lease_id=NEW.lease_id
+)
+BEGIN
+ SELECT RAISE(ABORT, 'resource allocations are held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_allocation_delete_fence
+BEFORE DELETE ON resource_allocations
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ JOIN resource_leases l ON l.lease_id=p.lease_id AND l.generation=p.generation
+ WHERE l.lease_id=OLD.lease_id
+)
+ AND NOT (
+     OLD.kind='capacity'
+     AND EXISTS (
+         SELECT 1 FROM resource_leases l
+         WHERE l.lease_id=OLD.lease_id AND l.state='quarantined'
+           AND EXISTS (
+               SELECT 1 FROM resource_reap_observations r
+               WHERE r.lease_id=l.lease_id AND r.generation=l.generation
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM resource_supervised_capacity_holds h
+               WHERE h.lease_id=l.lease_id AND h.generation=l.generation
+           )
+           AND NOT (__CURRENT_UNRESOLVED_PRODUCERS__)
+     )
+ )
+BEGIN
+ SELECT RAISE(ABORT, 'resource allocations are held by an unresolved preparation producer');
+END;
+CREATE TRIGGER IF NOT EXISTS managed_storage_preparation_reaper_skip
+BEFORE INSERT ON resource_reap_observations
+WHEN EXISTS (
+ SELECT 1 FROM managed_storage_preparation_producers p
+ WHERE p.lease_id=NEW.lease_id
+)
+ AND NOT EXISTS (
+     SELECT 1 FROM resource_leases l
+     WHERE l.lease_id=NEW.lease_id AND l.generation=NEW.generation
+       AND l.state='quarantined'
+       AND NOT EXISTS (
+           SELECT 1 FROM resource_supervised_capacity_holds h
+           WHERE h.lease_id=l.lease_id AND h.generation=l.generation
+       )
+       AND NOT (__CURRENT_UNRESOLVED_PRODUCERS__)
+ )
+BEGIN
+ SELECT RAISE(IGNORE);
+END;
+"#;
+
+/// This expression is shared by Rust admission/reaping and the SQLite
+/// old-writer triggers. Its SQL expression arguments are fixed source literals
+/// (or fixed bind placeholders), never caller-provided values.
+fn managed_storage_unresolved_producer_predicate_sql(
+    lease_id_sql: &str,
+    generation_sql: &str,
+) -> String {
+    format!(
+        r#"EXISTS (
+            SELECT 1 FROM managed_storage_preparation_producers p
+            WHERE p.lease_id={lease_id_sql} AND p.generation={generation_sql}
+              AND NOT (
+                  p.state='steps_complete' AND p.step_count>0
+                  AND p.next_step_ordinal=p.step_count
+                  AND EXISTS (
+                      SELECT 1
+                      FROM managed_storage_claim_groups g
+                      JOIN managed_storage_preparation_settlement_proofs proof
+                        ON proof.repository=g.repository AND proof.group_id=g.group_id
+                      WHERE g.repository=p.repository AND g.group_id=p.group_id
+                        AND g.request_id=p.request_id AND g.lease_id=p.lease_id
+                        AND g.generation=p.generation
+                        AND g.materialization=p.materialization
+                        AND g.root_set_digest=p.root_set_digest
+                        AND g.pre_inventory_digest=p.pre_inventory_digest
+                        AND g.member_manifest_digest=p.member_manifest_digest
+                        AND g.manifest_digest=p.manifest_digest AND g.state='settled'
+                        AND g.receipt_digest=proof.aggregate_digest
+                        AND proof.repository=p.repository AND proof.group_id=p.group_id
+                        AND proof.request_id=p.request_id AND proof.lease_id=p.lease_id
+                        AND proof.generation=p.generation
+                        AND proof.materialization=p.materialization
+                        AND proof.root_set_digest=p.root_set_digest
+                        AND proof.pre_inventory_digest=p.pre_inventory_digest
+                        AND proof.member_manifest_digest=p.member_manifest_digest
+                        AND proof.manifest_digest=p.manifest_digest
+                        AND proof.producer_id=p.producer_id
+                        AND proof.plan_digest=p.plan_digest
+                  )
+              )
+        )"#
+    )
+}
+
+fn managed_storage_producer_fence_schema() -> String {
+    let unresolved_old =
+        managed_storage_unresolved_producer_predicate_sql("OLD.lease_id", "OLD.generation");
+    let unresolved_current =
+        managed_storage_unresolved_producer_predicate_sql("l.lease_id", "l.generation");
+    let unresolved_root = managed_storage_unresolved_producer_predicate_sql(
+        "producer.lease_id",
+        "producer.generation",
+    );
+    MANAGED_STORAGE_PRODUCER_FENCE_SCHEMA_TEMPLATE
+        .replace("__OLD_UNRESOLVED_PRODUCERS__", &unresolved_old)
+        .replace("__CURRENT_UNRESOLVED_PRODUCERS__", &unresolved_current)
+        .replace("__ROOT_UNRESOLVED_PRODUCERS__", &unresolved_root)
+}
+
+// Replace the v3 guards only inside the explicit v3-to-v4 activation transaction, so every later v4 open is status-only.
+const MANAGED_STORAGE_PREPARATION_SETTLEMENT_TRIGGER_DROP: &str = r#"
+DROP TRIGGER IF EXISTS managed_storage_preparation_claim_insert_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_claim_update_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_lineage_insert_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_lineage_update_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_group_member_insert_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_group_update_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_lease_identity_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_lease_state_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_allocation_delete_fence;
+DROP TRIGGER IF EXISTS managed_storage_preparation_reaper_skip;
 "#;
 
 const SUPERVISED_HOLD_MIGRATION: &str = r#"
@@ -666,9 +1375,132 @@ pub enum HostResourceRunError {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostResourceDatabaseIdentity {
+    /// Absolute path supplied by the caller, captured before SQLite opens it.
+    requested_path: PathBuf,
+    canonical_path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl HostResourceDatabaseIdentity {
+    fn absolute_path(path: &Path) -> Result<PathBuf, HostResourceError> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()
+                .map_err(|source| HostResourceError::Io {
+                    path: PathBuf::from("."),
+                    source,
+                })?
+                .join(path))
+        }
+    }
+
+    fn capture_if_present(path: &Path) -> Result<Option<Self>, HostResourceError> {
+        match Self::capture(path) {
+            Ok(identity) => Ok(Some(identity)),
+            Err(HostResourceError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn capture(path: &Path) -> Result<Self, HostResourceError> {
+        let requested_path = Self::absolute_path(path)?;
+        let canonical_path =
+            requested_path
+                .canonicalize()
+                .map_err(|source| HostResourceError::Io {
+                    path: requested_path.clone(),
+                    source,
+                })?;
+        let metadata =
+            std::fs::metadata(&canonical_path).map_err(|source| HostResourceError::Io {
+                path: canonical_path.clone(),
+                source,
+            })?;
+        if !metadata.is_file() {
+            return Err(HostResourceError::InvalidRequest(
+                "host resource database path is not a regular file".into(),
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Ok(Self {
+                requested_path,
+                canonical_path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            // Other targets are bound to the canonical path only; this does
+            // not claim to detect replacement at the same path.
+            Ok(Self {
+                requested_path,
+                canonical_path,
+            })
+        }
+    }
+
+    fn ensure_current_path_identity(&self) -> Result<(), HostResourceError> {
+        let current = Self::capture(&self.requested_path)?;
+        if current != *self {
+            return Err(HostResourceError::InvalidRequest(
+                "host resource database path no longer identifies the database opened for managed-storage activation".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub struct HostResourceCoordinator {
     conn: Connection,
     path: PathBuf,
+    database_identity: Option<HostResourceDatabaseIdentity>,
+}
+
+/// A typed acknowledgement for the host-wide managed-storage floor change.
+/// The default coordinator open deliberately never creates this capability.
+#[allow(
+    dead_code,
+    reason = "managed-storage schema activation awaits coordinated host-wide writer quiescence"
+)]
+pub(crate) struct ManagedStorageSchemaActivationConfirmation {
+    database_identity: HostResourceDatabaseIdentity,
+}
+
+#[allow(
+    dead_code,
+    reason = "managed-storage schema activation awaits coordinated host-wide writer quiescence"
+)]
+impl ManagedStorageSchemaActivationConfirmation {
+    const ACKNOWLEDGEMENT: &'static str = "ACTIVATE_SHARED_HOST_MANAGED_STORAGE_SCHEMA_V4";
+
+    pub(crate) fn explicitly_confirmed(
+        database_path: &Path,
+        acknowledgement: &str,
+    ) -> Result<Self, HostResourceError> {
+        if acknowledgement != Self::ACKNOWLEDGEMENT {
+            return Err(HostResourceError::InvalidRequest(
+                "managed-storage schema activation requires the exact host-wide confirmation"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            database_identity: HostResourceDatabaseIdentity::capture(database_path)?,
+        })
+    }
 }
 
 impl HostResourceCoordinator {
@@ -688,7 +1520,12 @@ impl HostResourceCoordinator {
         path: &Path,
         busy_timeout: std::time::Duration,
     ) -> Result<Self, HostResourceError> {
-        if let Some(parent) = path.parent() {
+        // Anchor relative paths once, then pass that exact absolute path to
+        // SQLite and every identity check. Resolving the relative path again
+        // after open would let a process-wide cwd change bind the token to a
+        // different file than the connection opened.
+        let open_path = HostResourceDatabaseIdentity::absolute_path(path)?;
+        if let Some(parent) = open_path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| HostResourceError::Io {
                 path: parent.into(),
                 source,
@@ -700,10 +1537,20 @@ impl HostResourceCoordinator {
                 }
             })?;
         }
-        let mut conn = Connection::open(path)?;
-        crate::host_state::protect_host_state_path(path, false).map_err(|source| {
+        let identity_before_open = HostResourceDatabaseIdentity::capture_if_present(&open_path)?;
+        let mut conn = Connection::open(&open_path)?;
+        let database_identity = HostResourceDatabaseIdentity::capture(&open_path)?;
+        if identity_before_open
+            .as_ref()
+            .is_some_and(|identity| identity != &database_identity)
+        {
+            return Err(HostResourceError::InvalidRequest(
+                "host resource database path changed while SQLite was opening it".into(),
+            ));
+        }
+        crate::host_state::protect_host_state_path(&open_path, false).map_err(|source| {
             HostResourceError::Io {
-                path: path.into(),
+                path: open_path.clone(),
                 source,
             }
         })?;
@@ -714,10 +1561,11 @@ impl HostResourceCoordinator {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate_writable_schema(&mut conn)?;
         validate_schema(&conn)?;
-        validate_managed_storage_schema(&conn)?;
+        validate_managed_storage_schema_supported(&conn)?;
         Ok(Self {
             conn,
             path: path.into(),
+            database_identity: Some(database_identity),
         })
     }
 
@@ -728,25 +1576,86 @@ impl HostResourceCoordinator {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, HostResourceError> {
-        if !path.exists() {
+        let open_path = HostResourceDatabaseIdentity::absolute_path(path)?;
+        if !open_path.exists() {
             let conn = Connection::open_in_memory()?;
             conn.execute_batch(SCHEMA)?;
             return Ok(Self {
                 conn,
                 path: path.into(),
+                database_identity: None,
             });
         }
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let identity_before_open = HostResourceDatabaseIdentity::capture_if_present(&open_path)?
+            .ok_or_else(|| {
+                HostResourceError::InvalidRequest(
+                    "host resource database disappeared before read-only open".into(),
+                )
+            })?;
+        let conn = Connection::open_with_flags(&open_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let database_identity = HostResourceDatabaseIdentity::capture(&open_path)?;
+        if identity_before_open != database_identity {
+            return Err(HostResourceError::InvalidRequest(
+                "host resource database path changed while SQLite was opening it".into(),
+            ));
+        }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         validate_schema(&conn)?;
         Ok(Self {
             conn,
             path: path.into(),
+            database_identity: Some(database_identity),
         })
     }
 
     pub fn db_path(&self) -> &Path {
         &self.path
+    }
+
+    /// Explicitly advance the managed-storage floor on this already-open host
+    /// database. Ordinary coordinator opens preserve the shared schema-v1
+    /// floor so older repository worktrees remain usable until every writer is
+    /// coordinated for activation.
+    ///
+    /// The stored canonical path and, on Unix, device/inode are checked at
+    /// several transaction boundaries to detect observed alias drift or file
+    /// replacement. They cannot atomically pin SQLite's internal file handle
+    /// against a hostile replacement between checks. Callers must coordinate
+    /// host-wide writers and treat these checks as stale-path detection, not as
+    /// protection from an uncooperative path replacer.
+    #[allow(
+        dead_code,
+        reason = "managed-storage schema activation awaits coordinated host-wide writer quiescence"
+    )]
+    pub(crate) fn activate_managed_storage_schema(
+        &mut self,
+        confirmation: ManagedStorageSchemaActivationConfirmation,
+    ) -> Result<(), HostResourceError> {
+        let opened_identity = self.database_identity.as_ref().ok_or_else(|| {
+            HostResourceError::InvalidRequest(
+                "managed-storage activation requires an opened file-backed host database".into(),
+            )
+        })?;
+        if opened_identity != &confirmation.database_identity {
+            return Err(HostResourceError::InvalidRequest(
+                "managed-storage schema confirmation is bound to a different opened host database"
+                    .into(),
+            ));
+        }
+        opened_identity.ensure_current_path_identity()?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        opened_identity.ensure_current_path_identity()?;
+        preflight_existing_store_versions_through(&tx, MANAGED_STORAGE_SCHEMA_VERSION)?;
+        opened_identity.ensure_current_path_identity()?;
+        migrate_managed_storage_schema(&tx)?;
+        validate_schema(&tx)?;
+        validate_managed_storage_schema(&tx)?;
+        opened_identity.ensure_current_path_identity()?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Hold the exact preparation-cache exclusive lease while managing one
@@ -3090,6 +3999,54 @@ fn ensure_managed_storage_row_capacity(
     Ok(())
 }
 
+fn validate_managed_storage_schema_supported(conn: &Connection) -> Result<(), HostResourceError> {
+    preflight_managed_storage_schema_through(conn, MANAGED_STORAGE_SCHEMA_VERSION)?;
+    let version: i64 = conn.query_row(
+        "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut tables = vec![
+        "managed_storage_policies",
+        "managed_storage_claims",
+        "managed_storage_claim_lineage",
+    ];
+    if version >= 2 {
+        tables.extend([
+            "managed_storage_claim_groups",
+            "managed_storage_claim_group_members",
+        ]);
+    }
+    if version >= 3 {
+        tables.extend([
+            "managed_storage_preparation_producers",
+            "managed_storage_preparation_steps",
+        ]);
+    }
+    if version >= 4 {
+        tables.extend([
+            "managed_storage_preparation_settlement_proofs",
+            "managed_storage_adoptions",
+        ]);
+    }
+    for table in tables {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(HostResourceError::InvalidRequest(format!(
+                "managed-storage schema {version} is missing {table}"
+            )));
+        }
+    }
+    if version == i64::from(MANAGED_STORAGE_SCHEMA_VERSION) {
+        validate_managed_storage_schema(conn)?;
+    }
+    Ok(())
+}
+
 fn validate_managed_storage_schema(conn: &Connection) -> Result<(), HostResourceError> {
     let version: i64 = conn.query_row(
         "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
@@ -3101,13 +4058,113 @@ fn validate_managed_storage_schema(conn: &Connection) -> Result<(), HostResource
             "unsupported managed storage schema {version}"
         )));
     }
+    for table in [
+        "managed_storage_claim_groups",
+        "managed_storage_claim_group_members",
+        "managed_storage_preparation_producers",
+        "managed_storage_preparation_steps",
+        "managed_storage_preparation_settlement_proofs",
+        "managed_storage_adoptions",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(HostResourceError::InvalidRequest(format!(
+                "managed-storage schema {version} is missing {table}"
+            )));
+        }
+    }
+    for trigger in [
+        "managed_storage_preparation_producer_identity_immutable",
+        "managed_storage_preparation_producer_state_order",
+        "managed_storage_preparation_step_identity_immutable",
+        "managed_storage_preparation_step_state_order",
+        "managed_storage_preparation_producer_retain",
+        "managed_storage_preparation_step_retain",
+        "managed_storage_preparation_settlement_proof_insert",
+        "managed_storage_preparation_settlement_proof_update",
+        "managed_storage_preparation_settlement_proof_delete",
+        "managed_storage_adoption_update",
+        "managed_storage_adoption_delete",
+        "managed_storage_preparation_claim_insert_fence",
+        "managed_storage_preparation_claim_update_fence",
+        "managed_storage_preparation_claim_delete_fence",
+        "managed_storage_preparation_lineage_insert_fence",
+        "managed_storage_preparation_lineage_update_fence",
+        "managed_storage_preparation_lineage_delete_fence",
+        "managed_storage_preparation_group_update_fence",
+        "managed_storage_preparation_group_delete_fence",
+        "managed_storage_preparation_group_member_insert_fence",
+        "managed_storage_preparation_group_member_update_fence",
+        "managed_storage_preparation_group_member_delete_fence",
+        "managed_storage_preparation_lease_identity_fence",
+        "managed_storage_preparation_lease_state_fence",
+        "managed_storage_preparation_lease_delete_fence",
+        "managed_storage_preparation_allocation_insert_fence",
+        "managed_storage_preparation_allocation_update_fence",
+        "managed_storage_preparation_allocation_delete_fence",
+        "managed_storage_preparation_reaper_skip",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+            [trigger],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(HostResourceError::InvalidRequest(format!(
+                "managed-storage schema {version} is missing trigger {trigger}"
+            )));
+        }
+    }
     Ok(())
 }
 
-/// Refuse a future store before applying this binary's table/index definitions.
+/// Refuse unsupported managed schemas before applying this binary's table/index definitions.
 /// The writable migration repeats this under its transaction to close the
 /// race with another opener between preflight and acquiring the write lock.
+fn preflight_managed_storage_schema_through(
+    conn: &Connection,
+    max_supported_version: u32,
+) -> Result<(), HostResourceError> {
+    let version: Option<rusqlite::types::Value> = conn
+        .query_row(
+            "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let version = match version {
+        Some(rusqlite::types::Value::Integer(version)) => version,
+        Some(_) => {
+            return Err(HostResourceError::InvalidRequest(
+                "managed storage schema version is not an integer".into(),
+            ));
+        }
+        None => {
+            return Err(HostResourceError::InvalidRequest(
+                "managed storage schema version is missing".into(),
+            ));
+        }
+    };
+    if !(1..=i64::from(max_supported_version)).contains(&version) {
+        return Err(HostResourceError::InvalidRequest(format!(
+            "unsupported managed storage schema {version}"
+        )));
+    }
+    Ok(())
+}
+
 fn preflight_existing_store_versions(conn: &Connection) -> Result<(), HostResourceError> {
+    preflight_existing_store_versions_through(conn, MANAGED_STORAGE_SCHEMA_VERSION)
+}
+
+fn preflight_existing_store_versions_through(
+    conn: &Connection,
+    max_managed_schema_version: u32,
+) -> Result<(), HostResourceError> {
     for (table, managed) in [("meta", false), ("managed_storage_meta", true)] {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -3116,13 +4173,75 @@ fn preflight_existing_store_versions(conn: &Connection) -> Result<(), HostResour
         )?;
         if exists {
             if managed {
-                validate_managed_storage_schema(conn)?;
+                preflight_managed_storage_schema_through(conn, max_managed_schema_version)?;
             } else {
                 validate_schema(conn)?;
             }
         }
     }
     Ok(())
+}
+
+fn migrate_managed_storage_schema(tx: &Transaction<'_>) -> Result<(), HostResourceError> {
+    let mut version: i64 = tx.query_row(
+        "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    if version == i64::from(MANAGED_STORAGE_SCHEMA_VERSION) {
+        return validate_managed_storage_schema(tx);
+    }
+    if version == 1 {
+        tx.execute_batch(MANAGED_STORAGE_GROUP_SCHEMA)?;
+        let updated = tx.execute(
+            "UPDATE managed_storage_meta SET value=2
+             WHERE key='schema_version' AND value=1",
+            [],
+        )?;
+        if updated != 1 {
+            return Err(HostResourceError::InvalidRequest(
+                "managed-storage schema changed during its v1-to-v2 migration".into(),
+            ));
+        }
+        version = 2;
+    }
+    if version == 2 {
+        tx.execute_batch(MANAGED_STORAGE_PRODUCER_SCHEMA)?;
+        let updated = tx.execute(
+            "UPDATE managed_storage_meta SET value=?1
+             WHERE key='schema_version' AND value=2",
+            [3_i64],
+        )?;
+        if updated != 1 {
+            return Err(HostResourceError::InvalidRequest(
+                "managed-storage schema changed during its v2-to-v3 migration".into(),
+            ));
+        }
+        version = 3;
+    }
+    if version == 3 {
+        tx.execute_batch(MANAGED_STORAGE_PREPARATION_SETTLEMENT_PROOF_SCHEMA)?;
+        tx.execute_batch(MANAGED_STORAGE_PREPARATION_SETTLEMENT_TRIGGER_DROP)?;
+        tx.execute_batch(&managed_storage_producer_fence_schema())?;
+        tx.execute_batch(MANAGED_STORAGE_ADOPTION_SCHEMA)?;
+        let updated = tx.execute(
+            "UPDATE managed_storage_meta SET value=?1
+             WHERE key='schema_version' AND value=3",
+            [i64::from(MANAGED_STORAGE_SCHEMA_VERSION)],
+        )?;
+        if updated != 1 {
+            return Err(HostResourceError::InvalidRequest(
+                "managed-storage schema changed during its v3-to-v4 migration".into(),
+            ));
+        }
+        version = i64::from(MANAGED_STORAGE_SCHEMA_VERSION);
+    }
+    if version != i64::from(MANAGED_STORAGE_SCHEMA_VERSION) {
+        return Err(HostResourceError::InvalidRequest(format!(
+            "unsupported managed storage schema {version}"
+        )));
+    }
+    validate_managed_storage_schema(tx)
 }
 
 fn migrate_writable_schema(conn: &mut Connection) -> Result<(), HostResourceError> {
@@ -3146,7 +4265,7 @@ fn migrate_writable_schema(conn: &mut Connection) -> Result<(), HostResourceErro
         }
     }
     validate_schema(&tx)?;
-    validate_managed_storage_schema(&tx)?;
+    validate_managed_storage_schema_supported(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -4068,6 +5187,353 @@ mod tests {
         }
     }
 
+    fn migration_snapshot_tables(version: i64) -> Vec<&'static str> {
+        let mut tables = vec![
+            "managed_storage_policies",
+            "managed_storage_claims",
+            "managed_storage_claim_lineage",
+        ];
+        if version >= 2 {
+            tables.extend([
+                "managed_storage_claim_groups",
+                "managed_storage_claim_group_members",
+            ]);
+        }
+        if version >= 3 {
+            tables.extend([
+                "managed_storage_preparation_producers",
+                "managed_storage_preparation_steps",
+            ]);
+        }
+        tables
+    }
+
+    fn table_rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let column_count = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..column_count)
+                    .map(|column| row.get(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn migration_snapshot(
+        conn: &Connection,
+        version: i64,
+    ) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        migration_snapshot_tables(version)
+            .into_iter()
+            .map(|table| (table.to_owned(), table_rows(conn, table)))
+            .collect()
+    }
+
+    fn seed_migration_legacy_rows(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO managed_storage_policies
+                (repository,filesystem_id,managed_cap_bytes,free_reserve_bytes,policy_digest,updated_at)
+             VALUES ('migration-repo','migration-fs',16384,512,'policy-v1',101);
+             INSERT INTO managed_storage_claims
+                (repository,filesystem_id,claim_id,request_digest,policy_digest,
+                 policy_cap_bytes,policy_free_reserve_bytes,materialization,root_identity,
+                 state,requested_bytes,reserved_bytes,measured_bytes,release_receipt_digest,
+                 created_at,updated_at)
+             VALUES ('migration-repo','migration-fs','legacy-claim','request-v1','policy-v1',
+                     16384,512,'session-worktree','root-v1','charged',4096,0,3000,NULL,102,103);
+             INSERT INTO managed_storage_claim_lineage
+                (repository,filesystem_id,claim_id,predecessor_claim_id,baseline_bytes,
+                 root_instance_id,superseded_by_claim_id,updated_at)
+             VALUES ('migration-repo','migration-fs','legacy-claim',NULL,3000,
+                     'legacy-root-instance',NULL,104);",
+        )
+        .unwrap();
+    }
+
+    fn seed_v3_managed_rows(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO managed_storage_claim_groups
+                (repository,group_id,request_id,lease_id,generation,materialization,
+                 root_set_digest,pre_inventory_digest,member_manifest_digest,manifest_digest,
+                 member_count,state,receipt_digest,created_at,updated_at)
+             VALUES ('migration-repo','legacy-group','legacy-request','legacy-lease',7,
+                     'session-worktree',printf('%064d',1),printf('%064d',2),
+                     printf('%064d',3),printf('%064d',4),1,'reserved',NULL,201,202);
+             INSERT INTO managed_storage_claim_group_members
+                (repository,group_id,ordinal,filesystem_id,claim_id,root_identity,
+                 claim_request_digest,requested_bytes,reserved_bytes,predecessor_claim_id,
+                 baseline_bytes,root_instance_id)
+             VALUES ('migration-repo','legacy-group',0,'migration-fs','legacy-claim',
+                     'root-v1',printf('%064d',5),4096,2048,NULL,3000,
+                     'legacy-root-instance');
+             INSERT INTO managed_storage_preparation_producers
+                (repository,producer_id,group_id,request_id,lease_id,generation,
+                 materialization,root_set_digest,pre_inventory_digest,member_manifest_digest,
+                 manifest_digest,plan_digest,step_count,next_step_ordinal,state,created_at,updated_at)
+             VALUES ('migration-repo',printf('%064d',6),'legacy-group','legacy-request',
+                     'legacy-lease',7,'session-worktree',printf('%064d',1),
+                     printf('%064d',2),printf('%064d',3),printf('%064d',4),
+                     printf('%064d',7),1,0,'active',203,204);
+             INSERT INTO managed_storage_preparation_steps
+                (repository,producer_id,ordinal,name,step_digest,state,intent_token,
+                 outcome_code,exit_code,terminal_digest,created_at,updated_at)
+             VALUES ('migration-repo',printf('%064d',6),0,'legacy-step',
+                     printf('%064d',8),'planned',NULL,NULL,NULL,NULL,205,206);",
+        )
+        .unwrap();
+    }
+
+    fn seed_v3_root_mutation_rows(conn: &Connection, settled_without_proof: bool) {
+        conn.execute_batch(
+            "INSERT INTO managed_storage_claims
+                (repository,filesystem_id,claim_id,request_digest,policy_digest,
+                 policy_cap_bytes,policy_free_reserve_bytes,materialization,root_identity,
+                 state,requested_bytes,reserved_bytes,measured_bytes,release_receipt_digest,
+                 created_at,updated_at)
+             VALUES ('migration-repo','migration-fs','legacy-next','request-next','policy-v1',
+                     16384,512,'session-worktree','root-v1','reserved',1024,1024,NULL,NULL,210,211);
+             INSERT INTO managed_storage_claim_groups
+                (repository,group_id,request_id,lease_id,generation,materialization,
+                 root_set_digest,pre_inventory_digest,member_manifest_digest,manifest_digest,
+                 member_count,state,receipt_digest,created_at,updated_at)
+             VALUES ('migration-repo','successor-group','successor-request','successor-lease',8,
+                     'session-worktree',printf('%064d',11),printf('%064d',12),
+                     printf('%064d',13),printf('%064d',14),1,'reserved',NULL,212,213);
+             INSERT INTO resource_leases
+                (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id,
+                 generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at,released_at)
+             VALUES ('legacy-lease','legacy-request','legacy-digest','migration-repo',
+                     'legacy-worktree','legacy-run',7,'legacy-token','active',123,200,400,201,NULL);",
+        )
+        .unwrap();
+        if settled_without_proof {
+            conn.execute_batch(
+                "DROP TRIGGER managed_storage_preparation_group_update_fence;
+                 UPDATE managed_storage_preparation_steps
+                    SET state='terminal',intent_token=printf('%064d',15),
+                        outcome_code='succeeded',exit_code=0,
+                        terminal_digest=printf('%064d',16),updated_at=214
+                  WHERE repository='migration-repo' AND producer_id=printf('%064d',6) AND ordinal=0;
+                 UPDATE managed_storage_preparation_producers
+                    SET state='steps_complete',next_step_ordinal=1,updated_at=215
+                  WHERE repository='migration-repo' AND producer_id=printf('%064d',6);
+                 UPDATE managed_storage_claim_groups
+                    SET state='settled',receipt_digest=printf('%064d',17),updated_at=216
+                  WHERE repository='migration-repo' AND group_id='legacy-group';",
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_valid_settled_producer(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO managed_storage_claims
+                (repository,filesystem_id,claim_id,request_digest,policy_digest,
+                 policy_cap_bytes,policy_free_reserve_bytes,materialization,root_identity,
+                 state,requested_bytes,reserved_bytes,measured_bytes,release_receipt_digest,
+                 created_at,updated_at)
+             VALUES ('proof-repo','proof-fs','proof-claim','request-proof','policy-proof',
+                     16384,512,'session-worktree','root-proof','charged',4096,0,3000,NULL,301,302);
+             INSERT INTO managed_storage_claim_lineage
+                (repository,filesystem_id,claim_id,predecessor_claim_id,baseline_bytes,
+                 root_instance_id,superseded_by_claim_id,updated_at)
+             VALUES ('proof-repo','proof-fs','proof-claim',NULL,3000,
+                     'root-instance-proof',NULL,303);
+             INSERT INTO managed_storage_claim_groups
+                (repository,group_id,request_id,lease_id,generation,materialization,
+                 root_set_digest,pre_inventory_digest,member_manifest_digest,manifest_digest,
+                 member_count,state,receipt_digest,created_at,updated_at)
+             VALUES ('proof-repo','proof-group','proof-request','proof-lease',12,
+                     'session-worktree',printf('%064d',21),printf('%064d',22),
+                     printf('%064d',23),printf('%064d',24),1,'reserved',NULL,304,305);
+             INSERT INTO managed_storage_claim_group_members
+                (repository,group_id,ordinal,filesystem_id,claim_id,root_identity,
+                 claim_request_digest,requested_bytes,reserved_bytes,predecessor_claim_id,
+                 baseline_bytes,root_instance_id)
+             VALUES ('proof-repo','proof-group',0,'proof-fs','proof-claim','root-proof',
+                     printf('%064d',25),4096,2048,NULL,3000,'root-instance-proof');
+             INSERT INTO managed_storage_preparation_producers
+                (repository,producer_id,group_id,request_id,lease_id,generation,
+                 materialization,root_set_digest,pre_inventory_digest,member_manifest_digest,
+                 manifest_digest,plan_digest,step_count,next_step_ordinal,state,created_at,updated_at)
+             VALUES ('proof-repo',printf('%064d',26),'proof-group','proof-request',
+                     'proof-lease',12,'session-worktree',printf('%064d',21),
+                     printf('%064d',22),printf('%064d',23),printf('%064d',24),
+                     printf('%064d',27),1,0,'active',306,307);
+             INSERT INTO managed_storage_preparation_steps
+                (repository,producer_id,ordinal,name,step_digest,state,intent_token,
+                 outcome_code,exit_code,terminal_digest,created_at,updated_at)
+             VALUES ('proof-repo',printf('%064d',26),0,'proof-step',printf('%064d',28),
+                     'planned',NULL,NULL,NULL,NULL,308,309);
+             UPDATE managed_storage_preparation_producers
+                SET state='intent',updated_at=310
+              WHERE repository='proof-repo' AND producer_id=printf('%064d',26);
+             UPDATE managed_storage_preparation_steps
+                SET state='intent',intent_token=printf('%064d',29),updated_at=311
+              WHERE repository='proof-repo' AND producer_id=printf('%064d',26) AND ordinal=0;
+             UPDATE managed_storage_preparation_steps
+                SET state='terminal',outcome_code='succeeded',exit_code=0,
+                    terminal_digest=printf('%064d',30),updated_at=312
+              WHERE repository='proof-repo' AND producer_id=printf('%064d',26) AND ordinal=0;
+             UPDATE managed_storage_preparation_producers
+                SET state='steps_complete',next_step_ordinal=1,updated_at=313
+              WHERE repository='proof-repo' AND producer_id=printf('%064d',26);
+             INSERT INTO managed_storage_preparation_settlement_proofs
+                (repository,group_id,request_id,lease_id,generation,materialization,
+                 root_set_digest,pre_inventory_digest,member_manifest_digest,manifest_digest,
+                 producer_id,plan_digest,ordered_steps_digest,inventory_digest,
+                 aggregate_digest,created_at)
+             VALUES ('proof-repo','proof-group','proof-request','proof-lease',12,
+                     'session-worktree',printf('%064d',21),printf('%064d',22),
+                     printf('%064d',23),printf('%064d',24),printf('%064d',26),
+                     printf('%064d',27),printf('%064d',31),printf('%064d',32),
+                     printf('%064d',33),314);
+             UPDATE managed_storage_claim_groups
+                SET state='settled',receipt_digest=printf('%064d',33),updated_at=315
+              WHERE repository='proof-repo' AND group_id='proof-group';",
+        )
+        .unwrap();
+    }
+
+    fn seed_old_v3_replaced_triggers(conn: &Connection) {
+        for (name, event, table) in [
+            (
+                "managed_storage_preparation_claim_update_fence",
+                "UPDATE",
+                "managed_storage_claims",
+            ),
+            (
+                "managed_storage_preparation_lineage_update_fence",
+                "UPDATE",
+                "managed_storage_claim_lineage",
+            ),
+            (
+                "managed_storage_preparation_group_update_fence",
+                "UPDATE",
+                "managed_storage_claim_groups",
+            ),
+            (
+                "managed_storage_preparation_lease_identity_fence",
+                "UPDATE",
+                "resource_leases",
+            ),
+            (
+                "managed_storage_preparation_lease_state_fence",
+                "UPDATE",
+                "resource_leases",
+            ),
+            (
+                "managed_storage_preparation_allocation_delete_fence",
+                "DELETE",
+                "resource_allocations",
+            ),
+            (
+                "managed_storage_preparation_reaper_skip",
+                "INSERT",
+                "resource_reap_observations",
+            ),
+        ] {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER {name} BEFORE {event} ON {table}
+                 BEGIN SELECT RAISE(ABORT, 'old schema-v3 fence'); END;"
+            ))
+            .unwrap();
+        }
+    }
+
+    fn create_managed_schema_fixture(
+        path: &std::path::Path,
+        managed_version: i64,
+    ) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        assert!((1..=4).contains(&managed_version));
+        let mut conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(SUPERVISED_HOLD_MIGRATION).unwrap();
+        conn.execute("UPDATE meta SET value=2 WHERE key='schema_version'", [])
+            .unwrap();
+        seed_migration_legacy_rows(&conn);
+
+        if managed_version >= 2 {
+            conn.execute_batch(MANAGED_STORAGE_GROUP_SCHEMA).unwrap();
+            conn.execute(
+                "UPDATE managed_storage_meta SET value=2 WHERE key='schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        if managed_version >= 3 {
+            conn.execute_batch(MANAGED_STORAGE_PRODUCER_SCHEMA).unwrap();
+            seed_v3_managed_rows(&conn);
+            seed_old_v3_replaced_triggers(&conn);
+            conn.execute(
+                "UPDATE managed_storage_meta SET value=3 WHERE key='schema_version'",
+                [],
+            )
+            .unwrap();
+        }
+        if managed_version == 4 {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            migrate_managed_storage_schema(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let snapshot = migration_snapshot(&conn, managed_version);
+        drop(conn);
+        snapshot
+    }
+
+    fn directory_entries(path: &std::path::Path) -> Vec<String> {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    fn managed_schema_objects(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT type,name,sql FROM sqlite_master
+                 WHERE name GLOB 'managed_storage_*' ORDER BY type,name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn managed_schema_row_counts(conn: &Connection) -> Vec<(String, i64)> {
+        [
+            "managed_storage_policies",
+            "managed_storage_claims",
+            "managed_storage_claim_lineage",
+            "managed_storage_claim_groups",
+            "managed_storage_claim_group_members",
+            "managed_storage_preparation_producers",
+            "managed_storage_preparation_steps",
+            "managed_storage_preparation_settlement_proofs",
+            "managed_storage_adoptions",
+        ]
+        .into_iter()
+        .map(|table| {
+            let count = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (table.to_owned(), count)
+        })
+        .collect()
+    }
+
     #[test]
     fn managed_storage_tables_are_additive_to_host_schema_v1() {
         let temp = tempfile::tempdir().unwrap();
@@ -4099,7 +5565,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(host_version, i64::from(HOST_RESOURCE_STORE_SCHEMA_VERSION));
-        assert_eq!(ledger_version, i64::from(MANAGED_STORAGE_SCHEMA_VERSION));
+        assert_eq!(ledger_version, 1);
+        preflight_managed_storage_schema_through(&coordinator.conn, 1).unwrap();
     }
 
     #[test]
@@ -4125,8 +5592,632 @@ mod tests {
             store_schema_version(&coordinator.conn).unwrap(),
             HOST_RESOURCE_STORE_SCHEMA_VERSION
         );
-        validate_managed_storage_schema(&coordinator.conn).unwrap();
+        validate_managed_storage_schema_supported(&coordinator.conn).unwrap();
         validate_schema(&coordinator.conn).unwrap();
+        let managed_version: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(managed_version, 1);
+    }
+
+    fn assert_managed_schema_migrates_from(version: i64) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let before = create_managed_schema_fixture(&db, version);
+        let before_connection = Connection::open(&db).unwrap();
+        let before_objects = managed_schema_objects(&before_connection);
+        let before_schema_cookie: i64 = before_connection
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        drop(before_connection);
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        assert_eq!(managed_schema_objects(&coordinator.conn), before_objects);
+        let opened_schema_cookie: i64 = coordinator
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(opened_schema_cookie, before_schema_cookie);
+        assert_eq!(
+            store_schema_version(&coordinator.conn).unwrap(),
+            HOST_RESOURCE_STORE_SCHEMA_VERSION
+        );
+        assert_eq!(MANAGED_STORAGE_SCHEMA_VERSION, 4);
+        let opened_version: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            opened_version, version,
+            "ordinary open must preserve the managed floor"
+        );
+        assert_eq!(migration_snapshot(&coordinator.conn, version), before);
+        let confirmation = ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+            &db,
+            ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+        )
+        .unwrap();
+        coordinator
+            .activate_managed_storage_schema(confirmation)
+            .unwrap();
+        validate_schema(&coordinator.conn).unwrap();
+        validate_managed_storage_schema(&coordinator.conn).unwrap();
+        assert_eq!(
+            migration_snapshot(&coordinator.conn, version),
+            before,
+            "legacy rows must retain their SQLite values while explicitly migrating v{version} to v4"
+        );
+        if version == 3 {
+            let old_guard_count: i64 = coordinator
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='trigger' AND sql LIKE '%old schema-v3 fence%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(old_guard_count, 0, "v3 fence triggers must be replaced");
+        }
+    }
+
+    #[test]
+    fn managed_storage_schema_v1_migrates_to_v4_preserving_legacy_rows() {
+        assert_managed_schema_migrates_from(1);
+    }
+
+    #[test]
+    fn managed_storage_schema_v2_migrates_to_v4_preserving_legacy_rows() {
+        assert_managed_schema_migrates_from(2);
+    }
+
+    #[test]
+    fn managed_storage_schema_v3_migrates_to_v4_preserving_legacy_rows() {
+        assert_managed_schema_migrates_from(3);
+    }
+
+    #[test]
+    fn managed_storage_schema_v4_open_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let expected_legacy = create_managed_schema_fixture(&db, 4);
+
+        let first = HostResourceCoordinator::open(&db).unwrap();
+        let first_objects = managed_schema_objects(&first.conn);
+        let first_counts = managed_schema_row_counts(&first.conn);
+        let first_schema_cookie: i64 = first
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            store_schema_version(&first.conn).unwrap(),
+            HOST_RESOURCE_STORE_SCHEMA_VERSION
+        );
+        assert_eq!(migration_snapshot(&first.conn, 4), expected_legacy);
+        drop(first);
+
+        let second = HostResourceCoordinator::open(&db).unwrap();
+        assert_eq!(
+            store_schema_version(&second.conn).unwrap(),
+            HOST_RESOURCE_STORE_SCHEMA_VERSION
+        );
+        validate_managed_storage_schema(&second.conn).unwrap();
+        let second_schema_cookie: i64 = second
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(second_schema_cookie, first_schema_cookie);
+        assert_eq!(managed_schema_objects(&second.conn), first_objects);
+        assert_eq!(managed_schema_row_counts(&second.conn), first_counts);
+        assert_eq!(migration_snapshot(&second.conn, 4), expected_legacy);
+    }
+
+    #[test]
+    fn managed_storage_schema_activation_requires_exact_confirmation_and_same_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_db = temp.path().join("first.db");
+        let second_db = temp.path().join("second.db");
+        create_managed_schema_fixture(&first_db, 1);
+        create_managed_schema_fixture(&second_db, 1);
+        let mut first = HostResourceCoordinator::open(&first_db).unwrap();
+        let mut second = HostResourceCoordinator::open(&second_db).unwrap();
+
+        assert!(
+            ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+                &first_db,
+                "not-an-activation-confirmation",
+            )
+            .is_err()
+        );
+        let first_confirmation = ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+            &first_db,
+            ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+        )
+        .unwrap();
+        assert!(
+            second
+                .activate_managed_storage_schema(first_confirmation)
+                .is_err()
+        );
+        for coordinator in [&first, &second] {
+            let version: i64 = coordinator
+                .conn
+                .query_row(
+                    "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, 1);
+        }
+
+        first
+            .activate_managed_storage_schema(
+                ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+                    &first_db,
+                    ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let activated_version: i64 = first
+            .conn
+            .query_row(
+                "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(activated_version, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_storage_schema_activation_refuses_database_alias_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let opened_db = temp.path().join("opened.db");
+        let replacement_db = temp.path().join("replacement.db");
+        let alias = temp.path().join("host.db");
+        create_managed_schema_fixture(&opened_db, 1);
+        create_managed_schema_fixture(&replacement_db, 1);
+        symlink(&opened_db, &alias).unwrap();
+
+        let mut coordinator = HostResourceCoordinator::open(&alias).unwrap();
+        let confirmation = ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+            &alias,
+            ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+        )
+        .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&replacement_db, &alias).unwrap();
+
+        assert!(
+            coordinator
+                .activate_managed_storage_schema(confirmation)
+                .is_err()
+        );
+        for path in [&opened_db, &replacement_db] {
+            let connection =
+                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let version: i64 = connection
+                .query_row(
+                    "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                version, 1,
+                "replacement refusal must not migrate either file"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_storage_schema_activation_anchors_relative_path_at_open() {
+        let current_dir = std::env::current_dir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("managed-schema-activation-")
+            .tempdir_in(&current_dir)
+            .unwrap();
+        let relative_db = temp
+            .path()
+            .strip_prefix(&current_dir)
+            .unwrap()
+            .join("host.db");
+        let absolute_db = current_dir.join(&relative_db);
+        create_managed_schema_fixture(&absolute_db, 1);
+
+        let mut coordinator = HostResourceCoordinator::open(&relative_db).unwrap();
+        assert_eq!(
+            coordinator
+                .database_identity
+                .as_ref()
+                .unwrap()
+                .requested_path,
+            absolute_db
+        );
+        let confirmation = ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+            &relative_db,
+            ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+        )
+        .unwrap();
+        coordinator
+            .activate_managed_storage_schema(confirmation)
+            .unwrap();
+    }
+
+    fn assert_v3_root_mutations_fenced(settled_without_proof: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("legacy-v3.db");
+        create_managed_schema_fixture(&db, 3);
+        let seed = Connection::open(&db).unwrap();
+        seed_v3_root_mutation_rows(&seed, settled_without_proof);
+        drop(seed);
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        let opened_version: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(opened_version, 3, "ordinary open must retain legacy v3");
+        coordinator
+            .activate_managed_storage_schema(
+                ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+                    &db,
+                    ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let proof_count: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_storage_preparation_settlement_proofs
+                 WHERE repository='migration-repo' AND group_id='legacy-group'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proof_count, 0, "migration must not fabricate a v4 proof");
+
+        let insert_claim = coordinator.conn.execute(
+            "INSERT INTO managed_storage_claims
+                (repository,filesystem_id,claim_id,request_digest,policy_digest,
+                 policy_cap_bytes,policy_free_reserve_bytes,materialization,root_identity,
+                 state,requested_bytes,reserved_bytes,measured_bytes,release_receipt_digest,
+                 created_at,updated_at)
+             VALUES ('migration-repo','migration-fs','future-claim','request-future','policy-v1',
+                     16384,512,'session-worktree','root-v1','reserved',512,512,NULL,NULL,301,302)",
+            [],
+        );
+        assert!(
+            insert_claim.is_err(),
+            "unresolved producer must block claim insertion"
+        );
+
+        let update_claim = coordinator.conn.execute(
+            "UPDATE managed_storage_claims SET state='cleanup_pending',updated_at=303
+             WHERE repository='migration-repo' AND filesystem_id='migration-fs'
+               AND claim_id='legacy-claim'",
+            [],
+        );
+        assert!(
+            update_claim.is_err(),
+            "unresolved producer must block claim update"
+        );
+
+        let insert_lineage = coordinator.conn.execute(
+            "INSERT INTO managed_storage_claim_lineage
+                (repository,filesystem_id,claim_id,predecessor_claim_id,baseline_bytes,
+                 root_instance_id,superseded_by_claim_id,updated_at)
+             VALUES ('migration-repo','migration-fs','legacy-next','legacy-claim',3000,
+                     'legacy-root-instance',NULL,304)",
+            [],
+        );
+        assert!(
+            insert_lineage.is_err(),
+            "unresolved producer must block lineage insertion"
+        );
+
+        let update_lineage = coordinator.conn.execute(
+            "UPDATE managed_storage_claim_lineage SET baseline_bytes=3001,updated_at=305
+             WHERE repository='migration-repo' AND filesystem_id='migration-fs'
+               AND claim_id='legacy-claim'",
+            [],
+        );
+        assert!(
+            update_lineage.is_err(),
+            "unresolved producer must block lineage update"
+        );
+
+        let insert_member = coordinator.conn.execute(
+            "INSERT INTO managed_storage_claim_group_members
+                (repository,group_id,ordinal,filesystem_id,claim_id,root_identity,
+                 claim_request_digest,requested_bytes,reserved_bytes,predecessor_claim_id,
+                 baseline_bytes,root_instance_id)
+             VALUES ('migration-repo','successor-group',0,'migration-fs','legacy-next','root-v1',
+                     printf('%064d',18),1024,512,'legacy-claim',3000,'legacy-root-instance')",
+            [],
+        );
+        assert!(
+            insert_member.is_err(),
+            "unresolved producer must block successor membership"
+        );
+
+        let release_lease = coordinator.conn.execute(
+            "UPDATE resource_leases SET state='released',released_at=306,updated_at=306
+             WHERE lease_id='legacy-lease' AND generation=7",
+            [],
+        );
+        assert!(
+            release_lease.is_err(),
+            "unresolved producer must block lease release"
+        );
+
+        let claim_state: String = coordinator
+            .conn
+            .query_row(
+                "SELECT state FROM managed_storage_claims
+                 WHERE repository='migration-repo' AND filesystem_id='migration-fs'
+                   AND claim_id='legacy-claim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_state, "charged");
+        let lineage_baseline: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT baseline_bytes FROM managed_storage_claim_lineage
+                 WHERE repository='migration-repo' AND filesystem_id='migration-fs'
+                   AND claim_id='legacy-claim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lineage_baseline, 3000);
+        let member_count: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_storage_claim_group_members
+                 WHERE repository='migration-repo' AND group_id='successor-group'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(member_count, 0);
+        let lease_state: String = coordinator
+            .conn
+            .query_row(
+                "SELECT state FROM resource_leases WHERE lease_id='legacy-lease'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_state, "active");
+    }
+
+    #[test]
+    fn managed_storage_unresolved_producer_blocks_root_mutations_and_release() {
+        assert_v3_root_mutations_fenced(false);
+    }
+
+    #[test]
+    fn migrated_v3_settlement_without_proof_remains_root_fenced() {
+        assert_v3_root_mutations_fenced(true);
+    }
+
+    #[test]
+    fn valid_settlement_proof_allows_successor_root_claim_and_lineage() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("proof-settled.db");
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        coordinator
+            .activate_managed_storage_schema(
+                ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+                    &db,
+                    ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        seed_valid_settled_producer(&coordinator.conn);
+
+        coordinator
+            .conn
+            .execute(
+                "UPDATE managed_storage_claims SET state='cleanup_pending',updated_at=316
+                 WHERE repository='proof-repo' AND filesystem_id='proof-fs'
+                   AND claim_id='proof-claim'",
+                [],
+            )
+            .unwrap();
+        coordinator
+            .conn
+            .execute(
+                "UPDATE managed_storage_claim_lineage SET baseline_bytes=3001,updated_at=317
+                 WHERE repository='proof-repo' AND filesystem_id='proof-fs'
+                   AND claim_id='proof-claim'",
+                [],
+            )
+            .unwrap();
+        coordinator
+            .conn
+            .execute(
+                "INSERT INTO managed_storage_claims
+                    (repository,filesystem_id,claim_id,request_digest,policy_digest,
+                     policy_cap_bytes,policy_free_reserve_bytes,materialization,root_identity,
+                     state,requested_bytes,reserved_bytes,measured_bytes,release_receipt_digest,
+                     created_at,updated_at)
+                 VALUES ('proof-repo','proof-fs','successor-claim','request-successor','policy-proof',
+                         16384,512,'session-worktree','root-proof','reserved',2048,1024,NULL,NULL,318,319)",
+                [],
+            )
+            .unwrap();
+        coordinator
+            .conn
+            .execute(
+                "INSERT INTO managed_storage_claim_lineage
+                    (repository,filesystem_id,claim_id,predecessor_claim_id,baseline_bytes,
+                     root_instance_id,superseded_by_claim_id,updated_at)
+                 VALUES ('proof-repo','proof-fs','successor-claim','proof-claim',3001,
+                         'root-instance-proof',NULL,320)",
+                [],
+            )
+            .unwrap();
+        coordinator
+            .conn
+            .execute(
+                "INSERT INTO managed_storage_claim_groups
+                    (repository,group_id,request_id,lease_id,generation,materialization,
+                     root_set_digest,pre_inventory_digest,member_manifest_digest,manifest_digest,
+                     member_count,state,receipt_digest,created_at,updated_at)
+                 VALUES ('proof-repo','successor-group','successor-request','successor-lease',13,
+                         'session-worktree',printf('%064d',34),printf('%064d',35),
+                         printf('%064d',36),printf('%064d',37),1,'reserved',NULL,321,322)",
+                [],
+            )
+            .unwrap();
+        coordinator
+            .conn
+            .execute(
+                "INSERT INTO managed_storage_claim_group_members
+                    (repository,group_id,ordinal,filesystem_id,claim_id,root_identity,
+                     claim_request_digest,requested_bytes,reserved_bytes,predecessor_claim_id,
+                     baseline_bytes,root_instance_id)
+                 VALUES ('proof-repo','successor-group',0,'proof-fs','successor-claim','root-proof',
+                         printf('%064d',38),2048,1024,'proof-claim',3001,'root-instance-proof')",
+                [],
+            )
+            .unwrap();
+
+        let group_member_count: i64 = coordinator
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_storage_claim_group_members
+                 WHERE repository='proof-repo' AND group_id='successor-group'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(group_member_count, 1);
+    }
+
+    #[test]
+    fn managed_storage_schema_v1_preflight_refuses_v4_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        create_managed_schema_fixture(&db, 4);
+        let coordinator = HostResourceCoordinator::open(&db).unwrap();
+        let bytes_before = std::fs::read(&db).unwrap();
+        let entries_before = directory_entries(temp.path());
+
+        // Model the exact v1 reader boundary: the old binary accepted only managed schema 1.
+        let error = preflight_existing_store_versions_through(&coordinator.conn, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            HostResourceError::InvalidRequest(message)
+                if message.contains("unsupported managed storage schema 4")
+        ));
+        assert_eq!(std::fs::read(&db).unwrap(), bytes_before);
+        assert_eq!(directory_entries(temp.path()), entries_before);
+    }
+
+    #[test]
+    fn managed_storage_schema_migration_rolls_back_partial_ddl() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("host.db");
+        let expected_legacy = create_managed_schema_fixture(&db, 1);
+        let legacy = Connection::open(&db).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE INDEX managed_storage_groups_by_request
+                 ON managed_storage_claims(repository,claim_id);",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let mut coordinator = HostResourceCoordinator::open(&db).unwrap();
+        assert!(
+            coordinator
+                .activate_managed_storage_schema(
+                    ManagedStorageSchemaActivationConfirmation::explicitly_confirmed(
+                        &db,
+                        ManagedStorageSchemaActivationConfirmation::ACKNOWLEDGEMENT,
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+        );
+        drop(coordinator);
+        let after = Connection::open(&db).unwrap();
+        let managed_version: i64 = after
+            .query_row(
+                "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(managed_version, 1);
+        assert_eq!(migration_snapshot(&after, 1), expected_legacy);
+        let created_group: i64 = after
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN ('managed_storage_claim_groups',
+                                                  'managed_storage_claim_group_members')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_group, 0, "partial migration DDL must roll back");
+    }
+
+    #[test]
+    fn managed_storage_schema_missing_or_noninteger_version_refuses_without_writes() {
+        for (name, insert, expected_message) in [
+            ("missing", "", "managed storage schema version is missing"),
+            (
+                "noninteger",
+                "INSERT INTO managed_storage_meta VALUES('schema_version','not-an-integer');",
+                "managed storage schema version is not an integer",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = temp.path().join(format!("{name}.db"));
+            let malformed = Connection::open(&db).unwrap();
+            malformed
+                .execute_batch(&format!(
+                    "CREATE TABLE managed_storage_meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);{insert}"
+                ))
+                .unwrap();
+            drop(malformed);
+            let bytes_before = std::fs::read(&db).unwrap();
+            let entries_before = directory_entries(temp.path());
+
+            let error = HostResourceCoordinator::open(&db).err().unwrap();
+            assert!(matches!(
+                error,
+                HostResourceError::InvalidRequest(message) if message.contains(expected_message)
+            ));
+            assert_eq!(std::fs::read(&db).unwrap(), bytes_before);
+            assert_eq!(directory_entries(temp.path()), entries_before);
+        }
     }
 
     #[test]
@@ -4137,22 +6228,68 @@ mod tests {
         future
             .execute_batch(
                 "CREATE TABLE managed_storage_meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
-             INSERT INTO managed_storage_meta VALUES('schema_version',2);
+             INSERT INTO managed_storage_meta VALUES('schema_version',5);
              CREATE TABLE managed_storage_claims (future_column TEXT);",
             )
             .unwrap();
         drop(future);
         let before = std::fs::read(&db).unwrap();
+        let entries_before = directory_entries(temp.path());
         let error = HostResourceCoordinator::open(&db).err().unwrap();
         assert!(
-            matches!(error, HostResourceError::InvalidRequest(message) if message.contains("unsupported managed storage schema 2"))
+            matches!(error, HostResourceError::InvalidRequest(message) if message.contains("unsupported managed storage schema 5"))
         );
         assert_eq!(std::fs::read(&db).unwrap(), before);
+        assert_eq!(directory_entries(temp.path()), entries_before);
         let readonly = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let created: i64 = readonly.query_row(
             "SELECT count(*) FROM sqlite_master WHERE name IN ('meta','resource_leases','managed_storage_policies')", [], |row| row.get(0)
         ).unwrap();
         assert_eq!(created, 0);
+    }
+
+    #[test]
+    fn future_managed_schema_with_wal_refuses_without_changing_database_or_wal() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("future-managed-wal.db");
+        let future = Connection::open(&db).unwrap();
+        let journal_mode: String = future
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        future.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        future
+            .execute_batch(
+                "CREATE TABLE managed_storage_meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
+                 INSERT INTO managed_storage_meta VALUES('schema_version',5);
+                 CREATE TABLE future_managed_data (value TEXT);
+                 INSERT INTO future_managed_data VALUES('preserve this WAL-backed row');",
+            )
+            .unwrap();
+        let wal = PathBuf::from(format!("{}-wal", db.display()));
+        assert!(wal.is_file(), "fixture must retain an existing WAL");
+        let db_before = std::fs::read(&db).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+
+        let error = match HostResourceCoordinator::open(&db) {
+            Err(error) => error,
+            Ok(_) => panic!("future managed schema unexpectedly opened"),
+        };
+        assert!(matches!(
+            error,
+            HostResourceError::InvalidRequest(message)
+                if message.contains("unsupported managed storage schema 5")
+        ));
+        assert_eq!(std::fs::read(&db).unwrap(), db_before);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        let version: i64 = future
+            .query_row(
+                "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 5);
     }
 
     #[test]
