@@ -1091,17 +1091,7 @@ impl Broker {
         // a plain `worktree remove` refuses.
         self.repo_handle()
             .worktree_remove_registered(&candidate.worktree, true)?;
-        if candidate.worktree.exists() {
-            let outcome = crate::removal::remove_tree(&candidate.worktree);
-            if !outcome.removed {
-                return Err(BrokerOpError::Git(crate::GitError::Git {
-                    args: format!("remove {}", candidate.worktree.display()),
-                    stderr: outcome
-                        .error
-                        .unwrap_or_else(|| "the directory is still present".into()),
-                }));
-            }
-        }
+        ensure_auto_cleanup_path_absent(&candidate.worktree)?;
         if let Some(branch) = candidate.branch()
             && self
                 .repo_handle()
@@ -1286,9 +1276,30 @@ mod tests {
     }
 }
 
+fn ensure_auto_cleanup_path_absent(path: &Path) -> Result<(), BrokerOpError> {
+    let args = format!("remove {}", path.display());
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(BrokerOpError::Git(crate::GitError::Git {
+            args,
+            stderr: format!(
+                "Git reported worktree removal but {} still exists; retained it because its identity is unproven",
+                path.display()
+            ),
+        })),
+        Err(error) => Err(BrokerOpError::Git(crate::GitError::Git {
+            args,
+            stderr: format!(
+                "could not verify that {} is absent after Git worktree removal; retained it: {error}",
+                path.display()
+            ),
+        })),
+    }
+}
+
 #[cfg(test)]
 mod fail_closed_removal_tests {
-    use super::{AutoCleanupCandidate, ContainmentProof};
+    use super::{AutoCleanupCandidate, ContainmentProof, ensure_auto_cleanup_path_absent};
     use crate::{SessionCleanupState, git::with_git_deadline};
     use std::path::Path;
     use std::process::Command;
@@ -1357,5 +1368,19 @@ mod fail_closed_removal_tests {
             SessionCleanupState::Closed,
             "failed removal must leave the candidate available for retry"
         );
+    }
+
+    #[test]
+    fn auto_cleanup_preserves_a_path_git_left_after_removal() {
+        let owner = tempfile::tempdir().unwrap();
+        let replacement = owner.path().join("replacement-worktree");
+        std::fs::create_dir(&replacement).unwrap();
+        let evidence = replacement.join("keep.txt");
+        std::fs::write(&evidence, b"preserve replacement").unwrap();
+
+        let result = ensure_auto_cleanup_path_absent(&replacement);
+
+        assert!(result.is_err(), "a remaining path is not proof of removal");
+        assert_eq!(std::fs::read(evidence).unwrap(), b"preserve replacement");
     }
 }

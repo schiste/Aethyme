@@ -3045,14 +3045,24 @@ impl Broker {
             Ok(session) => session,
             Err(error) => {
                 let worktree_path = worktree.root().to_path_buf();
-                let removed = self
-                    .repo
-                    .worktree_remove_registered(&worktree_path, true)
-                    .is_ok()
-                    && !worktree_path.exists();
-                if removed {
-                    let _ = self.repo.delete_branch_ref_checked(&branch, &base);
+                let removal = self.repo.worktree_remove_registered(&worktree_path, true);
+                if let Err(removal_error) = removal {
+                    return Err(BrokerOpError::Git(crate::GitError::Git {
+                        args: format!("remove {}", worktree_path.display()),
+                        stderr: format!(
+                            "session registration failed: {error}; rollback failed: {removal_error}; retained worktree and branch {branch} for inspection"
+                        ),
+                    }));
                 }
+                if !path_is_explicitly_absent(&worktree_path) {
+                    return Err(BrokerOpError::Git(crate::GitError::Git {
+                        args: format!("remove {}", worktree_path.display()),
+                        stderr: format!(
+                            "session registration failed: {error}; Git reported removal but the path is not positively absent; retained worktree and branch {branch} for inspection"
+                        ),
+                    }));
+                }
+                let _ = self.repo.delete_branch_ref_checked(&branch, &base);
                 return Err(error.into());
             }
         };
@@ -4462,9 +4472,9 @@ pub(super) fn rollback_unregistered_start(
             worktree_path.display()
         )];
     }
-    if worktree_path.exists() {
+    if !path_is_explicitly_absent(worktree_path) {
         return vec![format!(
-            "Git reported removal but path {} remains; retained branch {branch} and log for inspection",
+            "Git reported removal but could not prove path {} absent; retained branch {branch} and log for inspection",
             worktree_path.display()
         )];
     }
@@ -4504,6 +4514,47 @@ fn same_path(left: &Path, right: &Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
     left == right
+}
+
+fn path_is_explicitly_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+#[cfg(test)]
+mod explicit_path_absence_tests {
+    use super::path_is_explicitly_absent;
+
+    #[test]
+    fn absence_requires_metadata_to_report_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert!(path_is_explicitly_absent(&missing));
+
+        let present = root.path().join("present");
+        std::fs::write(&present, b"present").unwrap();
+        assert!(!path_is_explicitly_absent(&present));
+
+        #[cfg(unix)]
+        {
+            let non_directory_ancestor = present.join("child");
+            assert!(!path_is_explicitly_absent(&non_directory_ancestor));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_not_treated_as_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let dangling = root.path().join("dangling");
+        symlink(root.path().join("missing-target"), &dangling).unwrap();
+
+        assert!(!path_is_explicitly_absent(&dangling));
+    }
 }
 
 #[cfg(test)]
