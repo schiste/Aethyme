@@ -1297,7 +1297,7 @@ fn schema_edge_kind_to_model(kind: SchemaEdgeKind) -> EdgeKind {
         | SchemaEdgeKind::Mocks
         | SchemaEdgeKind::Reads
         | SchemaEdgeKind::Uses
-        | SchemaEdgeKind::Writes
+        | SchemaEdgeKind::Writes => EdgeKind::References,
     }
 }
 
