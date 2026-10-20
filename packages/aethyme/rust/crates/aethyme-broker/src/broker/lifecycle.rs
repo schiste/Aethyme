@@ -2522,7 +2522,19 @@ impl Broker {
         if options.sync_integration && options.mode != AdoptMode::Reuse {
             return Err(BrokerOpError::ReuseSyncRequiresReuse);
         }
+        // All ownership changes in this repository share one cross-process
+        // claim. Rediscover after acquiring it because cleanup may have
+        // removed or replaced this checkout while this caller was waiting.
+        let observed_checkout = GitRepo::discover(worktree)?;
+        let observed_root = observed_checkout.root().to_path_buf();
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
         let checkout = GitRepo::discover(worktree)?;
+        if checkout.root() != observed_root.as_path() {
+            return Err(GitError::UntrustedOutput {
+                detail: "worktree path changed while waiting for its lifecycle claim".into(),
+            }
+            .into());
+        }
         let branch = checkout.current_branch()?;
         let worktree_path = checkout.root().to_string_lossy().into_owned();
         let existing = self.store.session_for_worktree(&worktree_path)?;
@@ -3006,9 +3018,8 @@ impl Broker {
     ) -> Result<StartReport, BrokerOpError> {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
-        self.ensure_planned_paths_available(&planned_paths, None)?;
-        let (_slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task, explicit_base)?;
+        let (_slug, branch, start_base, worktree, worktree_placement, _lifecycle_claim) =
+            self.create_session_worktree(task, explicit_base, &planned_paths)?;
         let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
@@ -3034,8 +3045,31 @@ impl Broker {
             Ok(session) => session,
             Err(error) => {
                 let worktree_path = worktree.root().to_path_buf();
-                let _ = self.repo.worktree_remove(&worktree_path, true);
-                let _ = self.repo.delete_branch_ref_checked(&branch, &base);
+                let removal = self.repo.worktree_remove_registered(&worktree_path, true);
+                if let Err(removal_error) = removal {
+                    return Err(BrokerOpError::Git(crate::GitError::Git {
+                        args: format!("remove {}", worktree_path.display()),
+                        stderr: format!(
+                            "session registration failed: {error}; rollback failed: {removal_error}; retained worktree and branch {branch} for inspection"
+                        ),
+                    }));
+                }
+                if !path_is_explicitly_absent(&worktree_path) {
+                    return Err(BrokerOpError::Git(crate::GitError::Git {
+                        args: format!("remove {}", worktree_path.display()),
+                        stderr: format!(
+                            "session registration failed: {error}; Git reported removal but the path is not positively absent; retained worktree and branch {branch} for inspection"
+                        ),
+                    }));
+                }
+                if let Err(branch_error) = self.repo.delete_branch_ref_checked(&branch, &base) {
+                    return Err(BrokerOpError::Git(crate::GitError::Git {
+                        args: format!("delete refs/heads/{branch}"),
+                        stderr: format!(
+                            "session registration failed: {error}; worktree was removed, but branch rollback could not be confirmed: {branch_error}"
+                        ),
+                    }));
+                }
                 return Err(error.into());
             }
         };
@@ -3099,8 +3133,8 @@ impl Broker {
                 source,
             })?;
         let context = self.session_context(context);
-        let (slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task, explicit_base)?;
+        let (slug, branch, start_base, worktree, worktree_placement, _lifecycle_claim) =
+            self.create_session_worktree(task, explicit_base, &[])?;
         let base = start_base.commit.clone();
         let worktree_path = worktree.root().to_path_buf();
         let repository_contract = match self.capture_repository_contract(&worktree_path, false) {
@@ -3296,12 +3330,19 @@ impl Broker {
         &mut self,
         task: &str,
         explicit_base: Option<&str>,
-    ) -> Result<(String, String, SessionStartBase, GitRepo, WorktreePlacement), BrokerOpError> {
+        planned_paths: &[String],
+    ) -> Result<
+        (
+            String,
+            String,
+            SessionStartBase,
+            GitRepo,
+            WorktreePlacement,
+            crate::file_lock::ExclusiveFileLock,
+        ),
+        BrokerOpError,
+    > {
         let placement = self.prepare_broker_worktree_root()?;
-        let slug = self.next_worktree_slug(task, &placement.root);
-        let worktree_path = placement.root.join(&slug);
-        self.refuse_nested_worktree_path(&worktree_path)?;
-        let branch = format!("agent/{slug}");
         let refresh = self.refresh_default_branch_before_start();
         // Verify-only sessions start from the fetched default branch either
         // way; advancing a disposable integration here keeps it from feeding
@@ -3309,8 +3350,17 @@ impl Broker {
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Start);
         let mut start_base = self.select_session_start_base(explicit_base)?;
         refresh.record(&mut start_base);
-        // Refresh may wait on another process or a remote. Sample the actual
-        // destination again immediately before allocating a Git checkout.
+        // Refresh may wait on another process or a remote. Acquire the
+        // repository lifecycle claim only after that work, then choose the
+        // unique branch and recheck the destination immediately before the
+        // checkout is allocated. The returned guard stays held until the
+        // caller registers the session or rolls the checkout back.
+        let lifecycle_claim = self.claim_worktree_lifecycle()?;
+        self.ensure_planned_paths_available(planned_paths, None)?;
+        let slug = self.next_worktree_slug(task, &placement.root);
+        let worktree_path = placement.root.join(&slug);
+        self.refuse_nested_worktree_path(&worktree_path)?;
+        let branch = format!("agent/{slug}");
         self.preflight_session_checkout_storage(&placement)?;
         let worktree = match self
             .repo
@@ -3338,7 +3388,14 @@ impl Broker {
                 self.repo.worktree_lock(&worktree_path),
             );
         }
-        Ok((slug, branch, start_base, worktree, placement))
+        Ok((
+            slug,
+            branch,
+            start_base,
+            worktree,
+            placement,
+            lifecycle_claim,
+        ))
     }
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
@@ -4422,9 +4479,9 @@ pub(super) fn rollback_unregistered_start(
             worktree_path.display()
         )];
     }
-    if worktree_path.exists() {
+    if !path_is_explicitly_absent(worktree_path) {
         return vec![format!(
-            "Git reported removal but path {} remains; retained branch {branch} and log for inspection",
+            "Git reported removal but could not prove path {} absent; retained branch {branch} and log for inspection",
             worktree_path.display()
         )];
     }
@@ -4464,6 +4521,47 @@ fn same_path(left: &Path, right: &Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
     left == right
+}
+
+fn path_is_explicitly_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+#[cfg(test)]
+mod explicit_path_absence_tests {
+    use super::path_is_explicitly_absent;
+
+    #[test]
+    fn absence_requires_metadata_to_report_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert!(path_is_explicitly_absent(&missing));
+
+        let present = root.path().join("present");
+        std::fs::write(&present, b"present").unwrap();
+        assert!(!path_is_explicitly_absent(&present));
+
+        #[cfg(unix)]
+        {
+            let non_directory_ancestor = present.join("child");
+            assert!(!path_is_explicitly_absent(&non_directory_ancestor));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_not_treated_as_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let dangling = root.path().join("dangling");
+        symlink(root.path().join("missing-target"), &dangling).unwrap();
+
+        assert!(!path_is_explicitly_absent(&dangling));
+    }
 }
 
 #[cfg(test)]

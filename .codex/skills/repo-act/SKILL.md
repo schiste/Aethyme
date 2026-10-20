@@ -85,6 +85,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.
+- In shell shims that branch on a child process's working directory, inspect it
+  with `pwd -P` and compare it with an explicitly passed canonical fixture path.
+  Rust `Command::current_dir` changes the child's directory without rewriting
+  inherited `$PWD`, which can otherwise misclassify calls that operate on another
+  repository.
 - When exercising no-follow storage paths, canonicalize the fixture-owned
   temporary root before deriving its database and cache paths. Platform aliases
   such as macOS `/var` must not turn a valid fixture into a symlink traversal;
@@ -114,6 +119,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   producer encodings, and bind the exact observed bytes across plan/apply when
   an operator confirmation spans invocations; test re-encoding drift and
   rollback after the write-side recheck.
+- For recovery fixtures, exercise the production entry point that persists the
+  recovery intent, assert that the intent exists, and only then simulate the
+  interruption. An option that skips cleanup or a hand-seeded event does not
+  test the producer-to-consumer path.
 - For storage ownership and reclamation changes, test replacement of a root and
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem

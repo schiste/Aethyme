@@ -1,17 +1,37 @@
 #[path = "common/isolation.rs"]
 mod isolation;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use aethyme_broker::{GateStatus, NewGateResult, events};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
+fn git_command(repo: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    let git_keys = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+        .collect::<Vec<_>>();
+    for key in git_keys {
+        command.env_remove(key);
+    }
+    command.args(args).current_dir(repo);
+    command
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    let reference = format!("refs/heads/{branch}");
+    git_command(repo, &["show-ref", "--verify", "--quiet", &reference])
+        .status()
+        .unwrap()
+        .success()
+}
+
 fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
+    let output = git_command(repo, args)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
@@ -30,6 +50,73 @@ fn run(repo: &Path, args: &[&str]) -> Output {
     isolation::command(CLI, repo, args).output().unwrap()
 }
 
+#[cfg(unix)]
+fn run_with_transient_git_removal_failure(
+    repo: &Path,
+    worktree: &Path,
+    args: &[&str],
+    artifacts: &Path,
+) -> (Output, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(artifacts).unwrap();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("the test runner PATH contains Git");
+    let shim_dir = artifacts.join("git-shim");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    std::fs::write(
+        &shim,
+        r##"#!/bin/sh
+case "$*" in
+  *"worktree remove"*)
+    : > "$AETHYME_TEST_GIT_REMOVE_MARKER"
+    echo 'injected transient worktree removal failure' >&2
+    exit 73
+    ;;
+esac
+if [ -e "$AETHYME_TEST_GIT_REMOVE_MARKER" ]; then
+  case "$*" in
+    *"rev-parse --show-toplevel"*)
+      if [ "$(pwd -P)" = "$AETHYME_TEST_GIT_WORKTREE_ROOT" ]; then
+        : > "$AETHYME_TEST_GIT_DISCOVERY_MARKER"
+        echo 'injected transient worktree discovery failure' >&2
+        exit 74
+      fi
+      ;;
+  esac
+fi
+exec "$AETHYME_TEST_REAL_GIT" "$@"
+"##,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+
+    let prior_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(shim_dir).chain(std::env::split_paths(&prior_path)))
+            .unwrap();
+    let removal_marker = artifacts.join("git-removal-attempted");
+    let discovery_marker = artifacts.join("git-discovery-attempted");
+    let mut command = isolation::command(CLI, repo, args);
+    let output = command
+        .env("PATH", path)
+        .env("AETHYME_TEST_REAL_GIT", real_git)
+        .env("AETHYME_TEST_GIT_REMOVE_MARKER", &removal_marker)
+        .env("AETHYME_TEST_GIT_DISCOVERY_MARKER", &discovery_marker)
+        .env(
+            "AETHYME_TEST_GIT_WORKTREE_ROOT",
+            worktree.canonicalize().expect("fixture worktree exists"),
+        )
+        .output()
+        .unwrap();
+    (output, removal_marker, discovery_marker)
+}
+
 fn promoted_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
     promoted_fixture_with_worktree_root(None)
 }
@@ -37,10 +124,23 @@ fn promoted_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, Strin
 fn promoted_fixture_with_worktree_root(
     worktree_root: Option<&Path>,
 ) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
+    promoted_fixture_with_worktree_root_and_gitignore(worktree_root, "/.aethyme/\n")
+}
+
+fn promoted_fixture_with_gitignore(
+    gitignore: &str,
+) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
+    promoted_fixture_with_worktree_root_and_gitignore(None, gitignore)
+}
+
+fn promoted_fixture_with_worktree_root_and_gitignore(
+    worktree_root: Option<&Path>,
+    gitignore: &str,
+) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::write(tmp.path().join(".gitignore"), gitignore).unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
 
@@ -79,6 +179,29 @@ fn promoted_fixture_with_worktree_root(
     let session_id = session.id;
     let branch = session.branch;
     (tmp, session_id, worktree, branch)
+}
+
+fn interrupt_finish_cleanup(tmp: &isolation::FixtureRepo, session_id: i64, worktree: &Path) {
+    git(
+        tmp.path(),
+        &["worktree", "lock", worktree.to_str().unwrap()],
+    );
+    let first = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["status"], "closed");
+    assert_eq!(first["cleanup"]["completed"], false);
+    git(
+        tmp.path(),
+        &["worktree", "unlock", worktree.to_str().unwrap()],
+    );
 }
 
 #[test]
@@ -121,20 +244,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert_eq!(report["cleanup"]["worktree_removed"], true);
     assert_eq!(report["cleanup"]["branch_removed"], true);
     assert!(!worktree.exists());
-    assert!(
-        !Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(!branch_exists(tmp.path(), &branch));
     assert!(
         report["recommended_next_action"]
             .as_str()
@@ -550,20 +660,7 @@ fn finish_cli_keep_worktree_closes_state_without_reclaiming_artifacts() {
     assert_eq!(report["cleanup"]["kept"], true);
     assert_eq!(report["cleanup"]["attempted"], false);
     assert!(worktree.exists());
-    assert!(
-        Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -594,29 +691,303 @@ fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
         tmp.path(),
         &["worktree", "unlock", worktree.to_str().unwrap()],
     );
+    // A real interrupted `git worktree remove` can leave only deleted tracked
+    // files. The durable finish intent binds this retry to the same checkout.
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
     let resumed = run(
         tmp.path(),
-        &["finish", "--session", &session_id.to_string(), "--json"],
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
     );
     assert!(resumed.status.success());
     let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
-    assert_eq!(resumed["status"], "cleaned");
-    assert_eq!(resumed["cleanup"]["completed"], true);
+    assert_eq!(resumed["cleaned"], session_id);
     assert!(!worktree.exists());
-    assert!(
-        !Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
+    assert!(!branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_refuses_partial_deletions_without_a_proof_bearing_intent() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    {
+        let mut broker = isolation::open(tmp.path());
+        broker
+            .store()
+            .begin_finish_cleanup(
+                session_id,
+                r#"{"worktree_present":true,"branch_present":true}"#,
+            )
+            .unwrap();
+    }
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
     );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert!(!worktree.join("README.md").exists());
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_untracked_files() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    git(
+        tmp.path(),
+        &["worktree", "lock", worktree.to_str().unwrap()],
+    );
+    let first = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(first.status.success());
+    git(
+        tmp.path(),
+        &["worktree", "unlock", worktree.to_str().unwrap()],
+    );
+    std::fs::write(worktree.join("untracked.txt"), "keep me\n").unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("untracked.txt")).unwrap(),
+        "keep me\n"
+    );
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_a_replacement_checkout_at_the_same_path() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    git(
+        tmp.path(),
+        &["worktree", "lock", worktree.to_str().unwrap()],
+    );
+    let first = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(first.status.success());
+    git(
+        tmp.path(),
+        &["worktree", "unlock", worktree.to_str().unwrap()],
+    );
+
+    git(
+        tmp.path(),
+        &["worktree", "remove", worktree.to_str().unwrap()],
+    );
+    git(
+        tmp.path(),
+        &["worktree", "add", "--", worktree.to_str().unwrap(), &branch],
+    );
+    let replacement_sentinel = worktree.join("replacement-owned.txt");
+    std::fs::write(&replacement_sentinel, "preserve replacement checkout\n").unwrap();
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(&replacement_sentinel).unwrap(),
+        "preserve replacement checkout\n"
+    );
+    assert!(!worktree.join("README.md").exists());
+    assert!(
+        git(tmp.path(), &["worktree", "list", "--porcelain"]).contains(worktree.to_str().unwrap()),
+        "Git must still list the replacement checkout after recovery refuses it"
+    );
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_resumes_with_managed_runtime_and_witnessed_build_artifacts() {
+    let mut gitignore = aethyme_broker::broker_runtime_ignore_patterns()
+        .collect::<Vec<_>>()
+        .join("\n");
+    gitignore.push_str("\ntarget/\n");
+    let (tmp, session_id, worktree, branch) = promoted_fixture_with_gitignore(&gitignore);
+    let managed_status = worktree.join(".aethyme/generated/experience-status.md");
+    std::fs::create_dir_all(managed_status.parent().unwrap()).unwrap();
+    std::fs::write(&managed_status, "generated status\n").unwrap();
+    let broker_log = worktree.join(".aethyme/logs/broker.log");
+    std::fs::create_dir_all(broker_log.parent().unwrap()).unwrap();
+    std::fs::write(&broker_log, "broker log\n").unwrap();
+    let target = worktree.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+
+    let resumed = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(
+        resumed.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["cleaned"], session_id);
+    assert!(!worktree.exists());
+    assert!(!managed_status.exists());
+    assert!(!broker_log.exists());
+    assert!(!target.exists());
+    assert!(!branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_a_same_named_ignored_runtime_file() {
+    // The slash-free ignore rule makes a regular file at this name ignored.
+    // The runtime catalog permits only the directory form `.aethyme/logs/`.
+    let (tmp, session_id, worktree, branch) = promoted_fixture_with_gitignore("/.aethyme/logs\n");
+    let log_file = worktree.join(".aethyme/logs");
+    std::fs::create_dir_all(log_file.parent().unwrap()).unwrap();
+    std::fs::write(&log_file, "preserve this file\n").unwrap();
+    assert!(git(&worktree, &["check-ignore", "--quiet", ".aethyme/logs"]).is_empty());
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert!(!worktree.join("README.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(&log_file).unwrap(),
+        "preserve this file\n"
+    );
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_arbitrary_ignored_files() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture_with_gitignore("/.env\n");
+    let secret = worktree.join(".env");
+    std::fs::write(&secret, "KEEP=me\n").unwrap();
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert!(!worktree.join("README.md").exists());
+    assert_eq!(std::fs::read_to_string(secret).unwrap(), "KEEP=me\n");
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_a_staged_deletion() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+    git(&worktree, &["add", "-u", "README.md"]);
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert!(!worktree.join("README.md").exists());
+    assert_eq!(
+        git(&worktree, &["diff", "--cached", "--name-status"]),
+        "D\tREADME.md"
+    );
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_a_mixed_modification() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+    std::fs::write(worktree.join("done.txt"), "local edit\n").unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert!(!worktree.join("README.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("done.txt")).unwrap(),
+        "local edit\n"
+    );
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_a_moved_unrepresented_head() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    std::fs::write(worktree.join("late.txt"), "committed after close\n").unwrap();
+    git(&worktree, &["add", "late.txt"]);
+    git(&worktree, &["commit", "-qm", "unrepresented after close"]);
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+    let moved_head = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), moved_head);
+    assert!(worktree.join("late.txt").exists());
+    assert!(!worktree.join("README.md").exists());
+    assert!(branch_exists(tmp.path(), &branch));
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_a_live_replacement_session() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    let live = {
+        let mut broker = isolation::open(tmp.path());
+        broker
+            .adopt_with(
+                &worktree,
+                Some("new owner of interrupted checkout"),
+                aethyme_broker::AdoptMode::ReplaceStale,
+                None,
+            )
+            .unwrap()
+            .session
+    };
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert!(!worktree.join("README.md").exists());
+    let mut broker = isolation::open(tmp.path());
+    assert!(!broker.store().session(live.id).unwrap().status.is_closed());
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -677,21 +1048,71 @@ fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() 
     let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(resumed["status"], "cleaned");
     assert_eq!(resumed["cleanup"]["completed"], true);
-    assert!(
-        !Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(!branch_exists(tmp.path(), &branch));
 }
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[cfg(unix)]
+#[test]
+fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[cleanup]\nauto_remove = false\n",
+    )
+    .unwrap();
+
+    let session = session_id.to_string();
+    let finish = run(
+        tmp.path(),
+        &["finish", "--session", &session, "--keep-worktree", "--json"],
+    );
+    assert!(
+        finish.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finish.stderr)
+    );
+    assert!(worktree.exists());
+    {
+        let mut broker = isolation::open(tmp.path());
+        // This legacy intent has no immutable proof. The complete checkout is
+        // still eligible through ordinary cleanup, which must retain it when
+        // Git cannot establish that registered removal succeeded.
+        broker
+            .store()
+            .begin_finish_cleanup(
+                session_id,
+                r#"{"worktree_present":true,"branch_present":true}"#,
+            )
+            .unwrap();
+    }
+
+    let artifacts = tmp.path().join("transient-git-failure");
+    let (output, removal_marker, discovery_marker) = run_with_transient_git_removal_failure(
+        tmp.path(),
+        &worktree,
+        &["finish", "cleanup", &session, "--json"],
+        &artifacts,
+    );
+    assert!(
+        !output.status.success(),
+        "transient Git failure must be reported, not converted to success"
+    );
+    assert!(
+        removal_marker.exists(),
+        "the registered removal was attempted"
+    );
+    assert!(
+        !discovery_marker.exists(),
+        "ordinary cleanup must not use an unrelated discovery error as orphan proof"
+    );
+    assert!(worktree.join("README.md").is_file());
+    assert!(worktree.exists());
+    assert!(
+        branch_exists(tmp.path(), &branch),
+        "a failed cleanup must preserve the branch"
+    );
+}
