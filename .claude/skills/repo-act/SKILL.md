@@ -20,6 +20,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For deadline-bounded cleanup, separate candidate discovery from the
+  assertion that partial work completed. One short wall-clock budget may expire
+  during discovery. Use a deterministic deadline seam to prove partial progress
+  and a seeded persisted marker to test fresh-process resume; assert the marker
+  before invoking the resume path.
+
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
 - Choose focused local Cargo checks by compilation target as well as test name.
@@ -27,6 +33,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   target. Start with a relevant integration-test target when available, keep one
   Cargo worker, and retain the remaining unit coverage as pending qualification.
   A resource-stopped compile provides no test result.
+- When substituting a prebuilt Rust test binary for Cargo, inspect the effective
+  Cargo `[env]` configuration: Cargo injects those values into test child
+  processes, while direct execution does not. Replay and record relevant values
+  explicitly, or classify the direct run as non-equivalent.
 - Smoke-test each binary against its own CLI contract. Run read-only probes
   outside a Git checkout with isolated home/state; preserve an unsupported
   command as a failed probe instead of treating it as a successful smoke check.

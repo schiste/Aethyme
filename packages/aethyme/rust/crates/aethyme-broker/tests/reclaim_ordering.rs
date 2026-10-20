@@ -5,9 +5,9 @@
 //! only in principle: the plan's candidate order follows the budget, and the
 //! plan says whether applying all of it would actually get back under budget.
 //!
-//! Order is not cosmetic. `gc apply --budget-ms` drains the plan's lists in
-//! order and stops at its deadline, so the front of the list is the part of a
-//! bounded sweep that is real.
+//! Order is not cosmetic. `Broker::gc_apply_bounded` drains the plan's lists in
+//! order and stops at its deadline, so the front of the list determines what a
+//! bounded apply can reclaim.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -286,7 +286,7 @@ fn an_unset_budget_is_off_rather_than_permanently_exceeded() {
 /// Build caches record idleness rather than a closing time, so the plan has to
 /// convert one into the other to rank them by the same rule as everything
 /// else. If it did not, this list would keep its old session-id order while
-/// the worktree list moved, and a bounded sweep would spend its deadline on
+/// the worktree list moved, and a bounded apply would spend its deadline on
 /// whichever cache happened to be created first.
 #[test]
 fn build_caches_follow_the_same_rule_the_worktrees_do() {

@@ -9,20 +9,105 @@ use std::process::{Command, Output};
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
-fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
+fn git_output(repo: &Path, args: &[&str]) -> Output {
+    git_output_with_env(
+        repo,
+        args,
+        std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
+    )
+}
+
+fn git_output_with_env(
+    repo: &Path,
+    args: &[&str],
+    extra_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Output {
+    let mut command = Command::new("git");
+    command.envs(extra_env).args(args).current_dir(repo);
+    clear_git_environment(&mut command);
+    command
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+fn clear_git_environment(command: &mut Command) {
+    let git_keys = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+        .collect::<Vec<_>>();
+    for key in git_keys {
+        command.env_remove(key);
+    }
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = git_output(repo, args);
     assert!(
         output.status.success(),
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_selector_overrides(repo: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vec![
+        ("GIT_DIR".into(), repo.join(".git").into_os_string()),
+        ("GIT_WORK_TREE".into(), repo.as_os_str().to_owned()),
+        (
+            "GIT_INDEX_FILE".into(),
+            repo.join(".git/index").into_os_string(),
+        ),
+    ]
+}
+
+#[test]
+fn fixture_git_commands_ignore_configured_git_selectors() {
+    let fixture_repo = tempfile::tempdir().unwrap();
+    let selected_repo = tempfile::tempdir().unwrap();
+    for (repo, content) in [
+        (fixture_repo.path(), "fixture before\n"),
+        (selected_repo.path(), "selected before\n"),
+    ] {
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("selector.txt"), content).unwrap();
+        git(repo, &["add", "selector.txt"]);
+        git(repo, &["commit", "-qm", "initial"]);
+    }
+    std::fs::write(fixture_repo.path().join("selector.txt"), "fixture staged\n").unwrap();
+    std::fs::write(
+        selected_repo.path().join("selector.txt"),
+        "selected staged\n",
+    )
+    .unwrap();
+
+    let added = git_output_with_env(
+        fixture_repo.path(),
+        &["add", "selector.txt"],
+        git_selector_overrides(selected_repo.path()),
+    );
+    assert!(
+        added.status.success(),
+        "git add: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let fixture_index = git_output(fixture_repo.path(), &["show", ":selector.txt"]);
+    assert!(fixture_index.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&fixture_index.stdout),
+        "fixture staged\n"
+    );
+    let selected_index = git_output(selected_repo.path(), &["show", ":selector.txt"]);
+    assert!(selected_index.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&selected_index.stdout),
+        "selected before\n",
+        "Git selectors from the caller must not redirect fixture writes"
     );
 }
 
@@ -38,6 +123,39 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
     .unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "init"]);
+    let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+    assert!(
+        head.status.success(),
+        "read fixture HEAD: {}",
+        String::from_utf8_lossy(&head.stderr)
+    );
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &head],
+    );
+    git(
+        repo.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(repo.path(), &["config", "remote.origin.url", "."]);
+    git(
+        repo.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(repo.path(), &["config", "branch.main.remote", "origin"]);
+    git(
+        repo.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
     std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
     std::fs::write(repo.path().join(".aethyme/broker.toml"), retention).unwrap();
     discover_artifact_sweep_namespace(repo.path(), container.path());
@@ -105,10 +223,35 @@ fn run_as_is(repo: &Path, container: &Path, args: &[&str]) -> Output {
     run_from_fixture(repo, repo, container, args)
 }
 
-fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Output {
-    common::broker_cli(CLI, args)
+fn command_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Command {
+    command_from_fixture_with_env(
+        owner,
+        cwd,
+        container,
+        args,
+        std::iter::empty::<(std::ffi::OsString, std::ffi::OsString)>(),
+    )
+}
+
+fn command_from_fixture_with_env(
+    owner: &Path,
+    cwd: &Path,
+    container: &Path,
+    args: &[&str],
+    extra_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Command {
+    let owner = owner.canonicalize().expect("canonicalize fixture owner");
+    let cwd = cwd
+        .canonicalize()
+        .expect("canonicalize fixture working tree");
+    let container = container
+        .canonicalize()
+        .expect("canonicalize fixture worktree root");
+    let mut command = common::broker_cli(CLI, args);
+    command
+        .envs(extra_env)
         .current_dir(cwd)
-        .env("AETHYME_WORKTREE_ROOT", container)
+        .env("AETHYME_WORKTREE_ROOT", &container)
         .env(
             "AETHYME_HOST_STATE_DIR",
             owner.join(".git/aethyme-test-state"),
@@ -116,7 +259,13 @@ fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -
         .env(
             "AETHYME_HOST_CACHE_DIR",
             owner.join(".git/aethyme-test-cache"),
-        )
+        );
+    clear_git_environment(&mut command);
+    command
+}
+
+fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Output {
+    command_from_fixture(owner, cwd, container, args)
         .output()
         .unwrap()
 }
@@ -535,14 +684,12 @@ fn a_reviewed_worktree_that_became_active_is_skipped() {
     let digest = plan["digest"].as_str().unwrap().to_string();
     assert!(worktree.join("rust/target").exists());
 
-    let adopted = common::broker_cli(
-        CLI,
+    let adopted = run_from_fixture(
+        repo.path(),
+        &worktree,
+        container.path(),
         &["start", "--adopt", "--task", "resume work", "--json"],
-    )
-    .current_dir(&worktree)
-    .env("AETHYME_WORKTREE_ROOT", container.path())
-    .output()
-    .unwrap();
+    );
     assert!(
         adopted.status.success(),
         "adopt: {}",
@@ -2106,12 +2253,15 @@ fn gc_sweep_reports_the_pressure_scaled_budget_when_disk_is_low() {
     assert_eq!(routine["budget_ms"], 5000, "{routine}");
     assert_eq!(routine["disk_pressured"], false, "{routine}");
 
-    let output = common::broker_cli(CLI, &["gc", "sweep", "--json"])
-        .current_dir(repo.path())
-        .env("AETHYME_WORKTREE_ROOT", container.path())
-        .env("AETHYME_TEST_AVAILABLE_BYTES", "1024")
-        .output()
-        .unwrap();
+    let output = command_from_fixture(
+        repo.path(),
+        repo.path(),
+        container.path(),
+        &["gc", "sweep", "--json"],
+    )
+    .env("AETHYME_TEST_AVAILABLE_BYTES", "1024")
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -2219,45 +2369,96 @@ fn populate_large_cache(target: &Path) {
     }
 }
 
-/// Unlinking a tree's contents is resumable for a closed session after a short
-/// pass pauses part-way through the cache.
+/// A fresh CLI pass resumes a persisted canonical cache marker in a closed
+/// session. Actual partial removal is covered by
+/// gc::tests::inline_partial_cache_removal_respects_spacing_and_resumes_afterward.
 #[test]
-fn a_paused_removal_in_a_closed_session_is_finished_by_the_next_pass() {
+fn a_closed_session_with_a_persisted_interrupted_cache_is_resumed_by_the_next_pass() {
     let (repo, container) = fixture(
         "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
     );
-    let (worktree, _id) = closed_session_with_target(repo.path(), container.path(), "paused");
-    let target = worktree.join("rust/target");
-    std::fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
-    populate_large_cache(&target);
-    backdate_tree_top(&target, 30);
-    std::fs::write(
-        repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
-    )
-    .unwrap();
+    let (worktree, id) = closed_session_with_target(repo.path(), container.path(), "interrupted");
+    let worktree = worktree.canonicalize().unwrap();
+    let session_id = id.parse().unwrap();
+    assert_eq!(session_status(repo.path(), session_id), "closed");
+    assert!(worktree.is_dir(), "the closed checkout is retained");
+
+    let target = worktree.join("rust/target").canonicalize().unwrap();
     assert!(
-        run(repo.path(), container.path(), &["status"])
-            .status
-            .success()
+        target.starts_with(&worktree),
+        "the resumed cache must be inside its closed session worktree"
     );
-    assert!(target.exists(), "a 50 ms pass must pause part-way");
+    assert!(target.join("artifact").is_file());
+    backdate_tree_top(&target, 30);
+
     let target_key = target.to_string_lossy().into_owned();
-    assert!(
-        interrupted_paths(repo.path()).contains(&target_key),
-        "the paused tree is remembered"
+    remember_interrupted_tree(repo.path(), &target);
+    assert_eq!(
+        interrupted_paths(repo.path()),
+        vec![target_key],
+        "the persisted marker is present before the fresh CLI pass"
     );
 
+    let selected_repo = tempfile::tempdir().unwrap();
+    git(selected_repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(selected_repo.path().join("selector.txt"), "preserve\n").unwrap();
+    git(selected_repo.path(), &["add", "selector.txt"]);
+    git(selected_repo.path(), &["commit", "-qm", "initial"]);
+    let selected_head = git_output(selected_repo.path(), &["rev-parse", "HEAD"]);
+    assert!(selected_head.status.success());
+    let selected_index = std::fs::read(selected_repo.path().join(".git/index")).unwrap();
+    let selected_content = std::fs::read(selected_repo.path().join("selector.txt")).unwrap();
+
     enable_sweep(repo.path());
-    let report = sweep(repo.path(), container.path());
+    let output = command_from_fixture_with_env(
+        repo.path(),
+        repo.path(),
+        container.path(),
+        &["gc", "sweep", "--json"],
+        git_selector_overrides(selected_repo.path()),
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "gc sweep: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["complete"], true, "{report}");
     assert!(
         !target.exists(),
-        "the sweep's own partial removal is not a writer: {report}"
+        "the next CLI pass resumes the cache: {report}"
+    );
+    assert!(
+        !selected_repo.path().join(".aethyme").exists(),
+        "the CLI child leaves the alternate repository untouched"
+    );
+    let selected_head_after = git_output(selected_repo.path(), &["rev-parse", "HEAD"]);
+    assert!(selected_head_after.status.success());
+    assert_eq!(selected_head_after.stdout, selected_head.stdout);
+    assert_eq!(
+        std::fs::read(selected_repo.path().join(".git/index")).unwrap(),
+        selected_index
+    );
+    assert_eq!(
+        std::fs::read(selected_repo.path().join("selector.txt")).unwrap(),
+        selected_content
+    );
+    assert!(
+        worktree.join("README.md").is_file(),
+        "resuming cache cleanup preserves the closed worktree"
+    );
+    assert_eq!(
+        session_status(repo.path(), session_id),
+        "closed",
+        "cache cleanup does not remove the closed session"
     );
     assert_eq!(
         meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
         Some("")
     );
+    assert!(interrupted_paths(repo.path()).is_empty());
 }
 
 /// A cache witnessed only by being non-empty stops classifying once a paused
