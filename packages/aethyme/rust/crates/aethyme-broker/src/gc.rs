@@ -7138,6 +7138,17 @@ mod tests {
         broker
             .artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "1")
             .unwrap();
+        let queued_paths = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+            .unwrap();
+        assert_eq!(
+            decode_interrupted_paths(queued_paths.as_deref()).unwrap(),
+            vec![cache_key.clone()]
+        );
+        assert!(cache.join("CACHEDIR.TAG").is_file());
+        std::fs::remove_file(cache.join("CACHEDIR.TAG")).unwrap();
+        assert!(!cache.join("CACHEDIR.TAG").exists());
+        assert!(cache.join("payload").is_file());
         assert!(broker.artifact_sweep_backlog_pending().unwrap());
 
         let report = broker
@@ -7172,14 +7183,6 @@ mod tests {
             .unwrap()
             .is_empty()
         );
-        assert_eq!(
-            broker
-                .artifact_sweep_meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("0")
-        );
-
         let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
         let selected = plan.selected_worktrees();
         assert!(
