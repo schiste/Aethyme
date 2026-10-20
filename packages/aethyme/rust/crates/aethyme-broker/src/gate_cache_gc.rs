@@ -105,7 +105,7 @@ pub(crate) fn retired_rotation(name: &str) -> Option<(&str, i64)> {
 /// every build. Deeper than that is a full walk, which sizing already pays for
 /// but routine ranking must not.
 fn last_used_at_ms(path: &Path) -> Option<i64> {
-    last_used_at_ms_until(path, || false).ok().flatten()
+    last_used_at_ms_until(path, &mut || false).ok().flatten()
 }
 
 fn last_used_at_ms_until(
