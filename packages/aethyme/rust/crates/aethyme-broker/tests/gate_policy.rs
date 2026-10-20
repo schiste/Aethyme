@@ -406,14 +406,19 @@ esac
                         "{name} inherited unbounded workers: {line}"
                     );
                 }
-                if name == "cargo-test" && *failure == "none" {
+                if name == "cargo-test" {
                     assert!(log.contains("--examples"));
                     if nextest == "available" {
                         assert!(log.contains("build --locked --workspace --bins"));
-                        assert!(log.contains("nextest run --locked --workspace --profile local --build-jobs 1 --no-fail-fast"));
+                        if *failure == "build " {
+                            assert!(!log.contains("nextest run"));
+                        } else {
+                            assert!(log.contains("nextest run --locked --workspace --profile local --build-jobs 1 --no-fail-fast"));
+                        }
                         assert!(log.contains("--doc"));
                     } else {
                         assert!(!log.contains("nextest run"));
+                        assert!(!log.contains("build --locked"));
                         assert!(log.contains("test --locked --workspace --quiet --no-fail-fast"));
                     }
                 }
