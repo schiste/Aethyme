@@ -90,6 +90,8 @@ pub struct ResolvedRemoteTarget {
 pub enum RemoteTargetError {
     #[error(transparent)]
     Git(#[from] GitError),
+    #[error("push endpoint does not match the operation's recorded repository identity")]
+    RecordedIdentityMismatch,
     #[error("remote name must be non-empty and contain no control characters")]
     InvalidRemoteName,
     #[error("{role} remote URL uses an unsupported or invalid Git URL form: {reason}")]
@@ -137,6 +139,29 @@ struct ParsedRemoteUrl {
     coordination_key: String,
     sanitized_url: String,
     syntax: RemoteUrlSyntax,
+}
+
+/// Return the exact transport URL whose identity was checked. Callers must
+/// query this value directly instead of resolving the mutable alias again.
+pub(crate) fn inspection_push_url(
+    repo: &GitRepo,
+    remote: &str,
+    recorded_repository: &str,
+) -> Result<String, RemoteTargetError> {
+    validate_remote_name(remote)?;
+    let mut urls = repo.remote_push_urls(remote)?;
+    if urls.len() != 1 {
+        return Err(RemoteTargetError::AmbiguousPushUrls {
+            remote: remote.into(),
+            count: urls.len(),
+        });
+    }
+    let url = urls.remove(0);
+    let parsed = parse_remote_url(&url, repo.root(), "push")?;
+    if parsed.coordination_key != recorded_repository {
+        return Err(RemoteTargetError::RecordedIdentityMismatch);
+    }
+    Ok(url)
 }
 
 pub fn resolve_remote_target(

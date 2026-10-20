@@ -71,8 +71,10 @@ mod file_lock;
 mod gate_admission;
 mod gate_cache_gc;
 mod gate_database;
+mod outbox;
 pub use gate_database::GateBrokerDatabase;
 mod gate_debris;
+mod gate_profile;
 pub use gate_debris::{
     CONTAINER_RUNTIME_ENV, CliContainerRuntime, ContainerRuntime, DOCTOR_PLAN_SCHEMA_VERSION,
     DOCTOR_REMOVED, DebrisAction, DebrisApplyOutcome, DebrisApplyReport, DebrisItem, DebrisOwner,
@@ -626,15 +628,15 @@ pub use types::{
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,
     AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
     DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind, EntryExposureState,
-    EntryPathExposure, Event, GateDef, GateEnvironment, GateFailureClass, GateResult, GateStatus,
-    Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT, MAX_SESSION_SHORT_NAME_CHARS,
-    MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry, MergeQueueHistoryPage,
-    MergeQueueStatusCount, MergeStatus, NewAdvisory, NewCoordinatedOperation, NewGateResult,
-    NewPrWatchState, NewSession, OperationEffect, OperationHistoryPage, OperationHistoryQuery,
-    OperationIdentityProvenance, OperationProvider, OperationStatus, PrWatchState, ScopeKind,
-    ScopeOperation, ScopeSource, Session, SessionCleanupState, SessionContext, SessionNote,
-    SessionNoteList, SessionOrigin, SessionScope, SessionStatus, derive_session_short_name,
-    validate_session_short_name,
+    EntryPathExposure, Event, GateCacheProvenance, GateDef, GateEnvironment, GateFailureClass,
+    GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
+    MAX_SESSION_SHORT_NAME_CHARS, MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry,
+    MergeQueueHistoryPage, MergeQueueStatusCount, MergeStatus, NewAdvisory,
+    NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
+    OperationHistoryPage, OperationHistoryQuery, OperationIdentityProvenance, OperationProvider,
+    OperationStatus, PrWatchState, ScopeKind, ScopeOperation, ScopeSource, Session,
+    SessionCleanupState, SessionContext, SessionNote, SessionNoteList, SessionOrigin, SessionScope,
+    SessionStatus, derive_session_short_name, validate_session_short_name,
 };
 pub use unpushed::{UnpublishedIntegrationWork, UnpushedSessionWork, UnpushedWorkReport};
 pub use update::{

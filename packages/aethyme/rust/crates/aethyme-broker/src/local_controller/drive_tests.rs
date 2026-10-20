@@ -93,44 +93,6 @@ fn seed_private_completion(
     completion
 }
 
-fn attach_prior_completion(
-    f: &mut Fixture,
-    admitted: &wave::Wave,
-    completion: &CompletionSpec,
-) -> RecordId {
-    use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordSchema};
-
-    static WAVE_SCHEMA: RecordSchema = RecordSchema {
-        name: "aethyme.local-wave/provisional-v0",
-        fields: &[FieldSpec {
-            name: "spec",
-            required: true,
-            kind: FieldKind::Opaque,
-            capability: None,
-        }],
-        capabilities: &[],
-    };
-
-    let mut spec = admitted.spec.clone();
-    spec.prior_completion = Some(completion.record().unwrap().id().to_string());
-    let record = Record::decode(
-        &serde_json::to_vec(&json!({"schema":WAVE_SCHEMA.name,"spec":spec})).unwrap(),
-        &[&WAVE_SCHEMA],
-    )
-    .unwrap();
-    let id = record.id();
-    let changed = f
-        .store
-        .connection()
-        .execute(
-            "UPDATE local_waves SET wave=?2,body=?3 WHERE wave=?1 AND phase='frozen'",
-            rusqlite::params![admitted.id.as_str(), id.as_str(), record.canonical_bytes()],
-        )
-        .unwrap();
-    assert_eq!(changed, 1);
-    id
-}
-
 fn feature_b_based_on(
     f: &mut Fixture,
     base: &CommitOid,
@@ -223,7 +185,7 @@ fn seed_same_source_completion(
 }
 
 #[test]
-fn cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease() {
+fn cross_revision_duplicate_locator_lookup_does_not_replace_historical_proof() {
     let mut f = Fixture::new();
     let owner = target::acquire_controller(&mut f.store, "cross-revision", "operator").unwrap();
     let mut first_spec = f.spec();
@@ -303,127 +265,10 @@ fn cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease
     let second_revision = target::propose_revision(&mut f.store, &owner, second_spec).unwrap();
     target::select_revision(&mut f.store, &owner, &second_revision.id).unwrap();
     wave::available(&mut f.store, &owner, "B", 1).unwrap();
-    let wave::Admission::Frozen(second_wave) =
-        wave::admit(&mut f.store, &owner, policy().wave_policy, 1).unwrap()
-    else {
-        panic!("cross-revision wave was not frozen")
-    };
-    assert_eq!(
-        second_wave.spec.prior_completion.as_deref(),
-        Some(latest_id.as_str())
-    );
-    assert_eq!(second_wave.spec.baseline, first_completion.source);
-    let second_wave = wave::compose(&mut f.store, &owner, f._repo.path(), &second_wave.id).unwrap();
-    assert_eq!(
-        second_wave.phase,
-        wave::WavePhase::Verifying,
-        "cross-revision composition did not produce a candidate: {second_wave:#?}"
-    );
-    let candidate = second_wave.candidate_commit.as_ref().unwrap();
-    assert_eq!(
-        git(
-            f._repo.path(),
-            &["rev-parse", &format!("{}^", candidate.as_str())],
-        ),
-        latest_completion.accepted_commit,
-        "the candidate must descend from the actual latest accepted commit"
-    );
-    assert_eq!(
-        git(
-            f._repo.path(),
-            &["show", &format!("{}:one.txt", candidate.as_str())],
-        ),
-        "A"
-    );
-    assert_eq!(
-        git(
-            f._repo.path(),
-            &["show", &format!("{}:two.txt", candidate.as_str())],
-        ),
-        "B"
-    );
-    let recipe_bytes = archive::read_object(
-        &f.store,
-        &second_wave.recipe_object.as_ref().unwrap().clone(),
-    )
-    .unwrap();
-    let recipe: serde_json::Value = serde_json::from_slice(&recipe_bytes).unwrap();
-    assert_eq!(
-        recipe["accepted_baseline"]["completion"],
-        latest_id.as_str()
-    );
-    assert_eq!(recipe["accepted_baseline"]["members"], json!([]));
-
-    let status = target::status(&f.store, owner.target()).unwrap();
-    target::resume(&mut f.store, &owner, status.version).unwrap();
-    let mut broker = Broker::open(f._repo.path())
-        .unwrap()
-        .with_host_operation_database(f._host.path().join("operations.db"))
-        .with_worktree_root(f._host.path().join("worktrees"));
-    let native = native_gates::prepare(&mut f.store, &owner, &mut broker, &second_wave.id).unwrap();
-    assert_eq!(native.spec.base_commit, latest_completion.accepted_commit);
-
-    let remote = tempfile::tempdir().unwrap();
-    git(
-        remote.path(),
-        &["init", "--bare", "-q", "--initial-branch=accepted"],
-    );
-    git(
-        f._repo.path(),
-        &[
-            "remote",
-            "add",
-            "cross-revision-accepted",
-            remote.path().to_str().unwrap(),
-        ],
-    );
-    git(
-        f._repo.path(),
-        &[
-            "push",
-            "-q",
-            "cross-revision-accepted",
-            &format!("{}:refs/heads/accepted", latest_completion.accepted_commit),
-        ],
-    );
-    let session = broker
-        .adopt(
-            f._repo.path(),
-            Some("cross-revision accepted-baseline fixture"),
-        )
-        .unwrap();
-    let carrier = GitCarrier::new(
-        &mut broker,
-        session.id,
-        "cross-revision-accepted",
-        "refs/heads/accepted",
-        30,
-        "fixture authorizes one conditional local publication intent",
-        true,
-    )
-    .unwrap();
-    let expected_old = CommitOid::parse(&native.spec.base_commit).unwrap();
-    let mut wrong_epoch = native.spec.clone();
-    wrong_epoch.epoch = format!("sha256:{}", "f".repeat(64));
     assert!(matches!(
-        crate::native_gates::validate_source(&mut f.store, &owner, f._repo.path(), &wrong_epoch,),
-        Err(crate::native_gates::NativeGateError::Binding(
-            "accepted-baseline recipe differs from prior private completion"
-        ))
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 1),
+        Err(wave::WaveError::Stale)
     ));
-    let intent = transport::prepare(
-        &mut f.store,
-        &owner,
-        &carrier,
-        &second_wave.id,
-        &"a".repeat(64),
-        Some(&expected_old),
-    )
-    .unwrap();
-    assert_eq!(
-        intent.spec.expected_old.as_deref(),
-        Some(latest_completion.accepted_commit.as_str())
-    );
 }
 
 #[test]
@@ -528,7 +373,7 @@ fn cross_revision_lookup_rejects_wrong_source_target_and_epoch() {
 }
 
 #[test]
-fn cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use() {
+fn cross_revision_unverified_completion_is_refused_before_admission() {
     let mut f = Fixture::new();
     let owner =
         target::acquire_controller(&mut f.store, "stale-baseline-epoch", "operator").unwrap();
@@ -563,31 +408,11 @@ fn cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_complet
     let next_revision = target::propose_revision(&mut f.store, &owner, next_spec).unwrap();
     target::select_revision(&mut f.store, &owner, &next_revision.id).unwrap();
     wave::available(&mut f.store, &owner, "B", 1).unwrap();
-    let wave::Admission::Frozen(admitted) =
-        wave::admit(&mut f.store, &owner, policy().wave_policy, 1).unwrap()
-    else {
-        panic!("new revision wave was not frozen")
-    };
-    assert!(
-        admitted.spec.prior_completion.is_none(),
-        "an old authority epoch cannot be selected as a current baseline"
-    );
-
-    let wave_id = attach_prior_completion(&mut f, &admitted, &completion);
-    let stale_wave = wave::load(&f.store, &wave_id).unwrap();
     assert!(matches!(
-        completion_prior_members(&f.store, &stale_wave, owner.authority_epoch().as_str()),
-        Err(ControllerError::Mismatch)
-    ));
-    assert!(matches!(
-        wave::compose(&mut f.store, &owner, f._repo.path(), &wave_id),
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 1),
         Err(wave::WaveError::Stale)
     ));
-    assert_eq!(
-        wave::load(&f.store, &wave_id).unwrap().phase,
-        wave::WavePhase::Frozen,
-        "composition rejects an epoch mismatch before recording a dispatch"
-    );
+    assert_eq!(completion.epoch, old_epoch);
 }
 
 #[test]

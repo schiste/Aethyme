@@ -1,0 +1,2519 @@
+{
+  "suite": "Local v3 FX08 brief usefulness pilot",
+  "version": "v10 frozen rerun",
+  "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+  "freeze_tag": "fx08-v10-frozen",
+  "freeze_precedes_v10_rerun": true,
+  "freeze_precedes_first_ever_run": false,
+  "runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+  "model_version": null,
+  "limitations": [
+    "The v10 freeze precedes this rerun but follows the earlier 56-run series; the prior archive cannot satisfy first-ever freeze ordering.",
+    "H01 and H02 and their outcomes were already exposed; no held-out runs are claimed, leaving an 8-run shortfall.",
+    "This uses fixed-file HANDOFF delivery rather than L3 retrieval and therefore does not close D30.",
+    "The runner JSONL does not expose a model identifier; model_version is null unless run events provide one."
+  ],
+  "pilot_summary": {
+    "absent": {
+      "runs": 12,
+      "task_pass_rate": 0.0,
+      "decision_survival_rate": 0.5,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": 0.04,
+      "median_uncached_input_plus_output_tokens": null
+    },
+    "correct": {
+      "runs": 12,
+      "task_pass_rate": 0.0,
+      "decision_survival_rate": 0.5,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": 0.04,
+      "median_uncached_input_plus_output_tokens": null
+    },
+    "incomplete": {
+      "runs": 12,
+      "task_pass_rate": 0.0,
+      "decision_survival_rate": 0.5,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": 0.0395,
+      "median_uncached_input_plus_output_tokens": null
+    },
+    "misleading": {
+      "runs": 12,
+      "task_pass_rate": 0.0,
+      "decision_survival_rate": 0.5,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": 0.039,
+      "median_uncached_input_plus_output_tokens": null
+    }
+  },
+  "heldout_summary": {
+    "planned_runs": 8,
+    "completed_runs": 0,
+    "shortfall": 8,
+    "reason": "prior exposure invalidates H01/H02 as held-out tasks"
+  },
+  "runs": [
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-absent-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/absent/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.038,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-absent-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/absent/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.041,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-absent-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/absent/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the search input id as global-search."
+      },
+      "cost": {
+        "wall_time_seconds": 0.043,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-correct-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/correct/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the search input id as global-search."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-correct-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/correct/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the search input id as global-search."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-correct-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/correct/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the visible search label clear and the magnifier decorative."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/incomplete/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the visible search label clear and the magnifier decorative."
+      },
+      "cost": {
+        "wall_time_seconds": 0.044,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/incomplete/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the visible search label clear and the magnifier decorative."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/incomplete/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Rename global-search to header-search during the markup cleanup."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/misleading/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Rename global-search to header-search during the markup cleanup."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/misleading/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Rename global-search to header-search during the markup cleanup."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P01-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P01/misleading/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-absent-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/absent/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.041,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-absent-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/absent/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-absent-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/absent/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep Quick Find backed by independent query and result state."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-correct-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/correct/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep Quick Find backed by independent query and result state."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-correct-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/correct/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep Quick Find backed by independent query and result state."
+      },
+      "cost": {
+        "wall_time_seconds": 0.038,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-correct-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/correct/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+      },
+      "cost": {
+        "wall_time_seconds": 0.041,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/incomplete/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+      },
+      "cost": {
+        "wall_time_seconds": 0.038,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/incomplete/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/incomplete/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Use one shared query state for primary search and Quick Find."
+      },
+      "cost": {
+        "wall_time_seconds": 0.042,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": true,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/misleading/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Use one shared query state for primary search and Quick Find."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": true,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/misleading/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Use one shared query state for primary search and Quick Find."
+      },
+      "cost": {
+        "wall_time_seconds": 0.038,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": true,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P02-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P02/misleading/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-absent-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/absent/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.042,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-absent-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/absent/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.041,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-absent-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/absent/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-correct-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/correct/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+      },
+      "cost": {
+        "wall_time_seconds": 0.037,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-correct-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/correct/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+      },
+      "cost": {
+        "wall_time_seconds": 0.042,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-correct-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/correct/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep result categories understandable and selection available from the keyboard."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/incomplete/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep result categories understandable and selection available from the keyboard."
+      },
+      "cost": {
+        "wall_time_seconds": 0.041,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/incomplete/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep result categories understandable and selection available from the keyboard."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/incomplete/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Reset the active descendant to the first item after each filter change."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": true,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/misleading/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Reset the active descendant to the first item after each filter change."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": true,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/misleading/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "category_filter_and_keyboard_selection": false,
+          "active_result_retained_if_visible": false
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": false,
+          "decision_survived": false,
+          "checks": {
+            "category_filter_and_keyboard_selection": false,
+            "active_result_retained_if_visible": false
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Reset the active descendant to the first item after each filter change."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": true,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P03-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P03/misleading/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-absent-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/absent/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-absent-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/absent/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 0.042,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-absent-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/absent/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Submit the quantity form through its native submit path."
+      },
+      "cost": {
+        "wall_time_seconds": 0.038,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-correct-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/correct/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Submit the quantity form through its native submit path."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-correct-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/correct/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Submit the quantity form through its native submit path."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-correct-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/correct/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the quantity control labeled and announce cart updates."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/incomplete/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the quantity control labeled and announce cart updates."
+      },
+      "cost": {
+        "wall_time_seconds": 0.038,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/incomplete/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Keep the quantity control labeled and announce cart updates."
+      },
+      "cost": {
+        "wall_time_seconds": 0.04,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/incomplete/r3/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Call the cart action directly from the Alt+Enter key handler."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/misleading/r1/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Call the cart action directly from the Alt+Enter key handler."
+      },
+      "cost": {
+        "wall_time_seconds": 0.038,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/misleading/r2/repo",
+      "final_message": ""
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "WARNING: proceeding, even though we could not create PATH aliases: Operation not permitted (os error 1)"
+      },
+      "model_version": null,
+      "frozen_revision": "aca6407b6ffafa037d578bd8e4ab8d12aa685c2b",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": false,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": false,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": false,
+        "evidence": [],
+        "expected_marker": "Call the cart action directly from the Alt+Enter key handler."
+      },
+      "cost": {
+        "wall_time_seconds": 0.039,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 1,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v10-raw-runs/pilot-P04-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v10-playgrounds/P04/misleading/r3/repo",
+      "final_message": ""
+    }
+  ],
+  "failures": []
+}

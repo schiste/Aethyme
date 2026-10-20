@@ -1,0 +1,6 @@
+[
+  {
+    "gate": "string",
+    "triggered_by": "string"
+  }
+]

@@ -3,12 +3,15 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
+mod common;
+
 use aethyme_broker::{
     Broker, BrokerOpError, DeliveryCompletion, DeliveryPolicy, DeliveryStatus, NewSession,
     PullRequestActivityKind, PullRequestActivityMetadata, PullRequestBatchAckOutcome,
     PullRequestBatchStatus, PullRequestSnapshot, PullRequestWatchError, PullRequestWatchProvider,
     PullRequestWatchRequest, PullRequestWatchStatus, SessionOrigin,
 };
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -27,13 +30,13 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
-fn broker_fixture() -> (tempfile::TempDir, Broker, i64) {
-    let root = tempfile::tempdir().unwrap();
+fn broker_fixture() -> (FixtureRepository, common::FixtureBroker, i64) {
+    let root = FixtureRepository::new();
     git(root.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(root.path().join("README.md"), "test\n").unwrap();
     git(root.path(), &["add", "README.md"]);
     git(root.path(), &["commit", "-qm", "initial"]);
-    let mut broker = Broker::open(root.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&root).unwrap();
     let session = broker
         .store()
         .register_session(&NewSession {
@@ -606,13 +609,15 @@ fn a_delivery_that_is_always_deferred_is_eventually_dead_lettered() {
 fn an_empty_delivery_poll_records_no_command_telemetry() {
     const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
     let (root, mut broker, session_id) = broker_fixture();
-    let run = |args: &[&str]| {
-        Command::new(CLI)
-            .args(args)
+    let run = |broker: &Broker, args: &[&str]| {
+        let mut command = common::broker_cli(CLI, args);
+        command
             .current_dir(root.path())
-            .env_remove("AETHYME_MEASURE_OUTPUT")
-            .output()
-            .unwrap()
+            .env_remove("AETHYME_MEASURE_OUTPUT");
+        broker
+            .configure_storage_context_for_child(&mut command)
+            .unwrap();
+        command.output().unwrap()
     };
     let metrics_path = root.path().join(".aethyme/logs/command-metrics.jsonl");
     let metric_lines = || {
@@ -657,7 +662,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
     ];
 
     for args in [&claim[..], &dispatch[..]] {
-        let output = run(args);
+        let output = run(&broker, args);
         assert!(
             output.status.success(),
             "{}",
@@ -668,7 +673,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
                 || String::from_utf8_lossy(&output.stdout).contains("\"claimed\":false")
         );
     }
-    let listed = run(&["advanced", "deliveries", "list", "--json"]);
+    let listed = run(&broker, &["advanced", "deliveries", "list", "--json"]);
     assert!(listed.status.success());
     assert_eq!(
         metric_lines(),
@@ -709,7 +714,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
         .poll_pull_request_watch(watch.id, &provider, 61_000)
         .unwrap();
 
-    let claimed = run(&claim);
+    let claimed = run(&broker, &claim);
     assert!(
         claimed.status.success(),
         "{}",
@@ -725,14 +730,125 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
     );
     assert_eq!(command_events(&mut broker), 1);
 
-    let failed = run(&[
-        "advanced",
-        "deliveries",
-        "claim",
-        "--adapter",
-        "test-adapter",
-    ]);
+    let failed = run(
+        &broker,
+        &[
+            "advanced",
+            "deliveries",
+            "claim",
+            "--adapter",
+            "test-adapter",
+        ],
+    );
     assert!(!failed.status.success());
     assert_eq!(metric_lines(), 2, "a failed poll is recorded");
     assert_eq!(command_events(&mut broker), 2);
+}
+
+struct FakeRepositoryProvider(Mutex<VecDeque<Vec<aethyme_broker::RepositoryPullRequest>>>);
+
+impl aethyme_broker::RepositoryWatchProvider for FakeRepositoryProvider {
+    fn list_open(
+        &self,
+        _repository: &str,
+        _limit: usize,
+    ) -> Result<Vec<aethyme_broker::RepositoryPullRequest>, aethyme_broker::PullRequestWatchError>
+    {
+        self.0.lock().unwrap().pop_front().ok_or_else(|| {
+            aethyme_broker::PullRequestWatchError::Provider("fixture exhausted".into())
+        })
+    }
+}
+
+#[test]
+fn repository_delivery_uses_shared_backoff_and_generation_fencing() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let provider = FakeRepositoryProvider(Mutex::new(VecDeque::from([vec![
+        aethyme_broker::RepositoryPullRequest {
+            number: 42,
+            title: "Review me".into(),
+            author: Some("reviewer".into()),
+            url: Some("https://github.com/owner/repo/pull/42".into()),
+            head_sha: "b".repeat(40),
+            is_draft: false,
+        },
+    ]])));
+    let watch = broker
+        .start_repository_watch(
+            session_id,
+            "owner/repo",
+            &aethyme_broker::RepositoryWatchOptions {
+                include_existing: true,
+                ..Default::default()
+            },
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    broker
+        .subscribe_repository_delivery(
+            watch.id,
+            "test-adapter",
+            "recipient-1",
+            aethyme_broker::RepositoryDeliveryPolicy::Review,
+            2_000,
+        )
+        .unwrap();
+    let pr_provider = FakeProvider(Mutex::new(VecDeque::new()));
+    let tick = broker
+        .tick_repository_watches(&provider, &pr_provider, 61_000, 1)
+        .unwrap();
+    assert_eq!(tick.event_count, 1);
+
+    let first = broker
+        .claim_next_repository_delivery("test-adapter", "worker-1", 120, 61_100)
+        .unwrap()
+        .expect("new repository event is queued");
+    let retried = broker
+        .complete_repository_delivery(
+            first.item.id,
+            "worker-1",
+            first.item.generation,
+            DeliveryCompletion::Retry,
+            Some("recipient_busy"),
+            61_200,
+        )
+        .unwrap();
+    assert_eq!(retried.status, DeliveryStatus::Pending);
+    assert!(
+        broker
+            .claim_next_repository_delivery("test-adapter", "worker-2", 120, 61_201)
+            .unwrap()
+            .is_none(),
+        "a retry must observe the same backoff as the pull-request outbox"
+    );
+
+    let second = broker
+        .claim_next_repository_delivery("test-adapter", "worker-2", 120, 76_200)
+        .unwrap()
+        .expect("the shared retry delay eventually expires");
+    assert_eq!(second.item.generation, first.item.generation + 1);
+    assert!(
+        broker
+            .complete_repository_delivery(
+                second.item.id,
+                "worker-2",
+                first.item.generation,
+                DeliveryCompletion::Delivered,
+                None,
+                76_300,
+            )
+            .is_err()
+    );
+    let delivered = broker
+        .complete_repository_delivery(
+            second.item.id,
+            "worker-2",
+            second.item.generation,
+            DeliveryCompletion::Delivered,
+            None,
+            76_300,
+        )
+        .unwrap();
+    assert_eq!(delivered.status, DeliveryStatus::Delivered);
 }

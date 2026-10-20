@@ -518,9 +518,9 @@ fn target_advancement_after_review_invalidates_the_apply_digest() {
     );
     assert!(!stale.status.success(), "a stale digest must not apply");
     assert!(
-        String::from_utf8_lossy(&stale.stderr).contains("no longer matches current state"),
+        json_error::message(&stale).contains("no longer matches current state"),
         "{}",
-        String::from_utf8_lossy(&stale.stderr)
+        json_error::message(&stale)
     );
     assert!(worktree.exists());
 
@@ -599,3 +599,6 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
     let refused = cli(&repo, &["finish", "cleanup", "audit", "12"]);
     assert!(!refused.status.success());
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

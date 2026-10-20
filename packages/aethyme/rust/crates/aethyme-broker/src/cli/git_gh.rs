@@ -194,7 +194,7 @@ pub(super) fn operation_history_query(
 
 pub(super) fn operations_reconcile_error(detail: impl std::fmt::Display) -> UsageError {
     UsageError::Message(format!(
-        "{detail}\noperations reconcile requires every field: --operation <id|host-operation-id>, --outcome <succeeded|failed>, and --reason <text>.\n{OPERATIONS_RECONCILE_USAGE}"
+        "{detail}\noperations reconcile requires --operation and --reason, plus exactly one of --outcome <succeeded|failed> or --inspect-remote.\n{OPERATIONS_RECONCILE_USAGE}"
     ))
 }
 
@@ -253,6 +253,12 @@ pub(super) fn render_operation_show(report: &crate::OperationShowReport) {
     out!("Automatic retry: forbidden");
     if let Some(evidence) = &report.reconciliation.evidence {
         out!("Evidence:       {evidence}");
+    }
+    if let Some(inspection) = &report.reconciliation.remote_inspection {
+        out!("Remote inspection: {inspection}");
+    }
+    if let Some(source) = &report.reconciliation.source {
+        out!("Outcome source:   {source}");
     }
     if let Some(reason) = &report.reconciliation.operator_reason {
         out!("Operator reason: {reason}");
@@ -441,20 +447,91 @@ fn changed_paths_remaining(report: &crate::GuardedExecReport) -> Vec<String> {
     paths
 }
 
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecOutcome {
+    Passed,
+    CommandFailed,
+    OwnershipFailed,
+    CommandAndOwnershipFailed,
+}
+
+fn exec_outcome(report: &crate::GuardedExecReport) -> ExecOutcome {
+    match (report.command_success, report.ownership_ok) {
+        (true, true) => ExecOutcome::Passed,
+        (false, true) => ExecOutcome::CommandFailed,
+        (true, false) => ExecOutcome::OwnershipFailed,
+        (false, false) => ExecOutcome::CommandAndOwnershipFailed,
+    }
+}
+
+fn exec_ownership_next_actions(report: &crate::GuardedExecReport) -> Vec<String> {
+    let mut actions = Vec::new();
+    for path in &report.outside_lease_paths {
+        if report
+            .conflicting_leases
+            .iter()
+            .any(|blocker| crate::leases::paths_overlap(&blocker.path, path))
+            || report
+                .foreign_paths
+                .iter()
+                .any(|foreign| crate::leases::paths_overlap(foreign, path))
+        {
+            continue;
+        }
+        if path.starts_with('-') {
+            actions.push(format!(
+                "Coordinate ownership of the leading-dash path {}; preserve its existing changes before proceeding.",
+                crate::broker::shell_quote(path),
+            ));
+        } else {
+            actions.push(format!(
+                "aethyme broker advanced leases claim {} --session {}",
+                crate::broker::shell_quote(path),
+                report.session_id,
+            ));
+        }
+    }
+    for blocker in &report.conflicting_leases {
+        actions.push(format!(
+            "Coordinate with session {} before changing {} again; preserve the existing edits.",
+            blocker.session_id,
+            crate::broker::shell_quote(&blocker.path),
+        ));
+    }
+    for path in &report.foreign_paths {
+        actions.push(format!(
+            "Preserve the adoption-time foreign changes in {} and coordinate with their owner before proceeding.",
+            crate::broker::shell_quote(path),
+        ));
+    }
+    actions
+}
+
 /// `broker exec`.
 pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = broker.guarded_exec(session, &parsed.exec_command)?;
+    let report = if parsed.json {
+        broker.guarded_exec_for_json(session, &parsed.exec_command)?
+    } else {
+        broker.guarded_exec(session, &parsed.exec_command)?
+    };
     let changed_paths = changed_paths_remaining(&report);
+    let next_actions = exec_ownership_next_actions(&report);
     if parsed.json {
         let mut value = serde_json::to_value(&report)?;
         let object = value
             .as_object_mut()
             .expect("guarded exec report is an object");
         object.insert("command_ran".into(), serde_json::Value::Bool(true));
+        object.insert(
+            "outcome".into(),
+            serde_json::to_value(exec_outcome(&report))?,
+        );
+        object.insert("next_actions".into(), serde_json::to_value(&next_actions)?);
         object.insert(
             "edits_remain".into(),
             serde_json::Value::Bool(!changed_paths.is_empty()),
@@ -479,6 +556,14 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
                 .unwrap_or_default()
         );
         out!("  command ran: yes");
+        out!(
+            "  ownership audit after execution: {}",
+            if report.ownership_ok {
+                "passed"
+            } else {
+                "failed; the command already ran and its changes remain"
+            }
+        );
         out!(
             "  edits remain after command: {}",
             if changed_paths.is_empty() {
@@ -519,19 +604,28 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
             );
         }
     }
+    if !parsed.json {
+        for action in next_actions.iter().take(8) {
+            out!("  next: {action}");
+        }
+        if next_actions.len() > 8 {
+            out!(
+                "  next: {} additional actions are available with --json",
+                next_actions.len() - 8
+            );
+        }
+    }
     if !report.ok {
         // `ok` is `command_success && audit.ok`, so the two causes are
         // already separable. Reporting both as an ownership failure
         // sends the reader to debug leases when the wrapped command
         // simply exited non-zero for its own reasons.
-        let guard_refused = !report.outside_lease_paths.is_empty()
-            || !report.foreign_paths.is_empty()
-            || !report.modified_preexisting_dirty_paths.is_empty();
+        let guard_refused = !report.ownership_ok;
         return Err(UsageError::Message(
             match (report.command_success, guard_refused) {
                 (true, _) => {
-                    "guarded exec refused: the command ran and left changed paths outside \
-                          this session's ownership (listed above)"
+                    "guarded exec ownership audit failed after execution: the command already ran \
+                          and its changes remain; follow the next actions above"
                         .to_string()
                 }
                 (false, false) => format!(
@@ -995,7 +1089,7 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
         }
         Some("reconcile") => {
             if parsed.operation.is_none()
-                || parsed.outcome.is_none()
+                || (parsed.inspect_remote == parsed.outcome.is_some())
                 || parsed.reason.as_deref().is_none_or(str::is_empty)
             {
                 return Err(operations_reconcile_error(
@@ -1006,6 +1100,41 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
                 parsed.operation.as_deref().expect("validated operation id"),
             )
             .map_err(operations_reconcile_error)?;
+            let reason = parsed.reason.as_deref().expect("validated reason");
+            if parsed.inspect_remote {
+                let operation_id = match identifier {
+                    OperationIdentifier::Coordinated(id) => id,
+                    OperationIdentifier::Host(host_id) => broker
+                        .store()
+                        .coordinated_operation_id_for_host_operation(&host_id)?
+                        .ok_or_else(|| {
+                            operations_reconcile_error(
+                                "remote inspection requires a linked coordinated Git operation; use an operator outcome for an unlinked host operation",
+                            )
+                        })?,
+                };
+                let report = broker
+                    .inspect_coordinated_push_operation(operation_id, reason)
+                    .map_err(operations_reconcile_error)?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&report)?);
+                } else if let Some(outcome) = report.outcome.as_deref() {
+                    out!(
+                        "operation {} remote inspection proposes {outcome}; state remains {}: {}",
+                        report.operation.id,
+                        report.operation.status.as_str(),
+                        report.reason,
+                    );
+                } else {
+                    out!(
+                        "operation {} remote inspection has no safe proposal; state remains {}: {}",
+                        report.operation.id,
+                        report.operation.status.as_str(),
+                        report.reason,
+                    );
+                }
+                return Ok(());
+            }
             let outcome = parsed.outcome.as_deref().expect("validated outcome");
             let succeeded = match outcome {
                 "succeeded" => true,
@@ -1016,7 +1145,6 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
                     ));
                 }
             };
-            let reason = parsed.reason.as_deref().expect("validated reason");
             let operation_id = match identifier {
                 OperationIdentifier::Coordinated(id) => Some(id),
                 OperationIdentifier::Host(host_id) => {
@@ -1097,13 +1225,14 @@ pub(super) fn run_blockers(parsed: Parsed) -> Result<(), UsageError> {
 mod exec_report_tests {
     use super::*;
 
-    #[test]
-    fn remaining_changed_paths_include_untracked_and_tracked_edits_once() {
-        let report = crate::GuardedExecReport {
+    fn completed_report() -> crate::GuardedExecReport {
+        crate::GuardedExecReport {
             session_id: 1,
             command: vec!["test".into()],
             exit_code: Some(0),
             command_success: true,
+            ownership_ok: true,
+            conflicting_leases: Vec::new(),
             before_dirty_paths: Vec::new(),
             after_dirty_paths: Vec::new(),
             newly_dirty_paths: vec!["src/changed.rs".into()],
@@ -1113,11 +1242,89 @@ mod exec_report_tests {
             outside_lease_paths: Vec::new(),
             foreign_paths: Vec::new(),
             ok: true,
-        };
+        }
+    }
 
+    #[test]
+    fn remaining_changed_paths_include_untracked_and_tracked_edits_once() {
+        let report = completed_report();
         assert_eq!(
             changed_paths_remaining(&report),
             vec!["notes.txt".to_string(), "src/changed.rs".to_string()]
         );
+    }
+
+    #[test]
+    fn outcomes_use_the_actual_audit_independently_of_dirty_paths_and_child_status() {
+        let mut report = completed_report();
+        assert_eq!(exec_outcome(&report), ExecOutcome::Passed);
+        report.command_success = false;
+        report.exit_code = Some(7);
+        report
+            .modified_preexisting_dirty_paths
+            .push("claimed.txt".into());
+        assert_eq!(exec_outcome(&report), ExecOutcome::CommandFailed);
+        report.ownership_ok = false;
+        assert_eq!(
+            exec_outcome(&report),
+            ExecOutcome::CommandAndOwnershipFailed
+        );
+        report.command_success = true;
+        assert_eq!(exec_outcome(&report), ExecOutcome::OwnershipFailed);
+    }
+
+    #[test]
+    fn recovery_guidance_quotes_paths_and_preserves_foreign_changes() {
+        let mut report = completed_report();
+        report.outside_lease_paths =
+            vec!["a'b.txt".into(), "--generated".into(), "foreign.txt".into()];
+        report.foreign_paths = vec!["foreign.txt".into()];
+        let actions = exec_ownership_next_actions(&report);
+        assert_eq!(actions.len(), 3);
+        assert_eq!(
+            actions[0],
+            format!(
+                "aethyme broker advanced leases claim {} --session 1",
+                crate::broker::shell_quote("a'b.txt"),
+            )
+        );
+        assert!(!actions[1].contains("leases claim"));
+        assert!(actions[1].contains("--generated"));
+        assert!(!actions[2].contains("leases claim"));
+        assert!(actions[2].contains("foreign.txt"));
+        assert!(actions[2].contains("Preserve"));
+    }
+
+    #[test]
+    fn blocking_and_foreign_directory_owners_receive_coordination_instead_of_claims() {
+        let mut report = completed_report();
+        report.outside_lease_paths = vec![
+            "generated/new.txt".into(),
+            "generated-sibling.txt".into(),
+            "foreign/edited.txt".into(),
+        ];
+        report.foreign_paths = vec!["foreign/".into()];
+        report.conflicting_leases.push(crate::LeaseBlocker {
+            session_id: 2,
+            path: "generated/".into(),
+            kind: crate::LeaseKind::Explicit,
+            holder_status: Some("working".into()),
+            holder_context: None,
+            severity: None,
+            reason: None,
+        });
+        let actions = exec_ownership_next_actions(&report);
+        assert_eq!(actions.len(), 3);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.contains("leases claim"))
+                .count(),
+            1
+        );
+        assert!(actions[0].contains("generated-sibling.txt"));
+        assert!(actions[1].contains("session 2"));
+        assert!(actions[1].contains("generated/"));
+        assert!(actions[2].contains("foreign/"));
     }
 }

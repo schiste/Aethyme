@@ -187,16 +187,16 @@ fn an_undefined_label_is_refused_before_the_create_is_sent() {
     let refused = fixture.create(&["dette"]);
 
     assert!(!refused.status.success());
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let error = json_error::message(&refused);
     assert!(
-        stderr.contains("does not define the label \"dette\""),
-        "{stderr}"
+        error.contains("does not define the label \"dette\""),
+        "{error}"
     );
     assert!(
-        stderr.contains("nothing was sent and nothing was created"),
-        "{stderr}"
+        error.contains("nothing was sent and nothing was created"),
+        "{error}"
     );
-    assert!(stderr.contains("area:broker, bug"), "{stderr}");
+    assert!(error.contains("area:broker, bug"), "{error}");
 
     let log = fixture.log();
     assert!(log.contains("label list"), "{log}");
@@ -353,3 +353,6 @@ impl Fixture {
         ])
     }
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

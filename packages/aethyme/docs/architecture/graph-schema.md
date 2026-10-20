@@ -345,9 +345,13 @@ Overlay fragments are the storage shape for that data.
   the bump must land with a coordinated re-index. It is **not**
   the producer's logic version.
 - `producer_version` is the producer's own version string
-  (e.g. `"structure-producer/0.3.2"`); it is recorded for
-  provenance and re-derivation triggers but is **not** load-bearing
-  for decode.
+  (e.g. `"structure-producer/0.3.2"`). Overlay reads at the byte, disk,
+  and `FragmentStore` layers require a nonempty expected producer version
+  and compare it exactly. A mismatch returns `ProducerVersionMismatch`
+  before exposing a payload; the caller must rerun the producer. An empty
+  expectation returns `EmptyExpectedProducerVersion`. A refused read does
+  not rewrite or delete the old overlay. This changes read validation,
+  without changing the envelope fields, serialization, or schema version.
 - `payload` is the producer-defined type `P`. Each `<kind>.bin`
   carries its own payload type; there is no global discriminant.
 
@@ -877,3 +881,63 @@ the schema lock:
 - BSL constraint: [Phase 3 redb plan](phase3-redb-graph-store-plan.md)
   explains why the cache layer must stay BSL-free; the same constraint
   applies to any library used to write/read fragments.
+
+
+## Broker-owned graph publication (#701)
+
+Canonical graph publication in broker-managed repositories uses the reviewed
+`aethyme graph refresh` plan/execute workflow. Raw fragment, overlay, shard,
+coverage, manifest, bootstrap, indexing and linking writes refuse managed
+checkouts below the CLI layer. Indexing also checks before stale-artifact
+removal, including runs that produce no new fragments. Derived query caches
+remain separate from these committed graph artifacts.
+
+Repository-aware mutable store opens enroll the Git common directory with a deny-only
+`aethyme-broker-managed-graph-v1` marker before SQLite opens or migrates broker storage. This includes direct
+store callers and best-effort writable opens; an unsuccessful mutable open can
+still leave this deny-only marker. Snapshot opens stay read-only. Raw producer checks inspect all ancestors (at most 256 directory levels), so nested input paths observe the same fence. Nested Git metadata does not exempt an output inside a managed checkout; generation uses a physically isolated temporary clone. The marker covers repositories whose
+broker database is configured outside the checkout; legacy local broker
+storage also triggers refusal. Raw writers conservatively refuse linked or
+indirect Git metadata even when that checkout has not been enrolled.
+
+Generation takes place in the refresh workflow's fresh private clone, which
+has its own Git metadata and does not inherit ignored broker state. Publication
+continues through the existing broker preconditions and reviewed journal; no
+library override grants canonical write permission. For first enrollment,
+`aethyme deploy --with-graph` scaffolds the graph policy and version pin;
+review and commit them before running refresh.
+
+Output checks reject observed symbolic links and unsupported path components,
+and temporary writes use exclusive creation. Marker contents are flushed on all
+platforms, with additional parent-directory synchronization on Unix. This does
+not assert portable directory-entry durability after a power loss. These checks
+provide coordination
+and observed-path validation, not atomic protection against hostile same-user
+filesystem replacement. Older binaries do not implement the new fence; writers
+must be quiesced during runtime rollout. An older overridden-database repository
+is enrolled by its next mutable open in the new broker before this marker can
+protect its database-independent identity. Refresh preconditions resolve the
+selected broker database rather than assuming its default checkout location;
+missing selected state in an enrolled repository is a refusal, not an empty
+session inventory.
+
+## 11. Derived redb schema 10 and test relationships
+
+This section describes the local derived redb materialization, not a change
+to the committed-fragment source of truth. The redb schema is version 10.
+Its engine `EdgeKind::Tests` variant is appended after the existing variants
+so their bincode discriminants stay stable. A schema-9 redb file is rejected
+with `SchemaMismatch`; it is not decoded as schema 10 or migrated in place.
+Rebuild the derived store from the committed graph fragments.
+
+The canonical edge name is lowercase `tests`, with direction
+`test_function → tested_symbol`. Coverage records include `tests: 0` when the
+current indexer checked this relationship kind and found none. A missing
+`tests` key means that coverage is unavailable, not that there are no test
+edges; graph-impact reports that case as partial.
+
+Bounded graph-impact lookup follows indexed `Tests` edges from impacted
+targets to test source paths. It does not infer test relationships from
+filenames. Incoming-adjacency limits count raw rows before filtering by edge
+kind and share the lookup's traversal limits. If a limit truncates the walk,
+the report is partial and cannot authorize the complete-result fast path.

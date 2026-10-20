@@ -109,6 +109,31 @@ pub(super) fn collect_adjacency<D: ReadableDatabase>(
     Ok(out)
 }
 
+pub(super) fn collect_adjacency_limited<D: ReadableDatabase>(
+    db: &D,
+    table: MultimapTableDefinition<&str, &[u8]>,
+    key: &str,
+    max_raw_rows: usize,
+) -> Result<(Vec<AdjacencyRecord>, usize, bool), GraphStoreError> {
+    let txn = db.begin_read()?;
+    let t = match txn.open_multimap_table(table) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), 0, false)),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    let mut raw_rows_scanned = 0;
+    for row in t.get(key)?.take(max_raw_rows) {
+        let row = row?;
+        raw_rows_scanned += 1;
+        out.push(bincode::deserialize(row.value())?);
+    }
+    // Do not use a lookahead row to refine this result: exactly exhausting
+    // the budget is conservatively incomplete, even if the table ended there.
+    let truncated = max_raw_rows == 0 || raw_rows_scanned == max_raw_rows;
+    Ok((out, raw_rows_scanned, truncated))
+}
+
 pub(super) fn edge_count_from<D: ReadableDatabase>(db: &D) -> Result<u64, GraphStoreError> {
     let txn = db.begin_read()?;
     let t = txn.open_multimap_table(EDGES_OUT)?;

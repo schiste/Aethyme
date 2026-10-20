@@ -1,0 +1,1984 @@
+{
+  "suite": "Local v3 FX08 brief usefulness pilot",
+  "version": "v12 frozen rerun (schema and freeze tag configured)",
+  "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+  "freeze_tag": "fx08-v12-frozen",
+  "freeze_precedes_current_rerun": true,
+  "freeze_precedes_first_ever_run": false,
+  "runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+  "model_version": null,
+  "limitations": [
+    "The current freeze precedes this rerun but follows the earlier 56-run series; the prior archive cannot satisfy first-ever freeze ordering.",
+    "H01 and H02 and their outcomes were already exposed; no held-out runs are claimed, leaving an 8-run shortfall.",
+    "This uses fixed-file HANDOFF delivery rather than L3 retrieval and therefore does not close D30.",
+    "The runner JSONL does not expose a model identifier; model_version is null unless run events provide one."
+  ],
+  "pilot_summary": {
+    "absent": {
+      "runs": 12,
+      "agent_runs": 0,
+      "task_pass_rate": null,
+      "decision_survival_rate": null,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": null,
+      "median_uncached_input_plus_output_tokens": null
+    },
+    "correct": {
+      "runs": 12,
+      "agent_runs": 0,
+      "task_pass_rate": null,
+      "decision_survival_rate": null,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": null,
+      "median_uncached_input_plus_output_tokens": null
+    },
+    "incomplete": {
+      "runs": 12,
+      "agent_runs": 0,
+      "task_pass_rate": null,
+      "decision_survival_rate": null,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": null,
+      "median_uncached_input_plus_output_tokens": null
+    },
+    "misleading": {
+      "runs": 12,
+      "agent_runs": 0,
+      "task_pass_rate": null,
+      "decision_survival_rate": null,
+      "handoff_access_rate": 0.0,
+      "median_wall_time_seconds": null,
+      "median_uncached_input_plus_output_tokens": null
+    }
+  },
+  "heldout_summary": {
+    "planned_runs": 8,
+    "completed_runs": 0,
+    "shortfall": 8,
+    "reason": "prior exposure invalidates H01/H02 as held-out tasks"
+  },
+  "runs": [
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-absent-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-absent-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-absent-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-correct-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-correct-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-correct-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-incomplete-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-incomplete-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-incomplete-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-misleading-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-misleading-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P01-misleading-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-absent-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-absent-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-absent-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-correct-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-correct-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-correct-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-incomplete-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-incomplete-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-incomplete-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-misleading-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-misleading-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P02-misleading-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-absent-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-absent-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-absent-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-correct-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-correct-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-correct-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-incomplete-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-incomplete-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-incomplete-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-misleading-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-misleading-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P03-misleading-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-absent-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-absent-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-absent-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-correct-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-correct-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-correct-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-incomplete-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-incomplete-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-incomplete-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-misleading-r1')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-misleading-r2')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": null,
+      "model_version": null,
+      "agent_started": false,
+      "frozen_revision": "9ecd0a21fc0105732607a0e0cab934f1105e1a3c",
+      "oracle": {
+        "task_pass": null,
+        "decision_survived": null,
+        "status": "driver_failed"
+      },
+      "access": {
+        "read": false,
+        "evidence": []
+      },
+      "cost": {
+        "wall_time_seconds": null,
+        "uncached_input_tokens": null,
+        "output_tokens": null,
+        "uncached_input_plus_output_tokens": null,
+        "retries": null,
+        "turns": 0
+      },
+      "harm": null,
+      "runner_exit_code": null,
+      "runner_error": "RuntimeError('refusing to overwrite prior run: pilot-P04-misleading-r3')",
+      "artifact_dir": null,
+      "target_repo": null,
+      "final_message": null
+    }
+  ],
+  "failures": [
+    {
+      "job": [
+        "P03",
+        "absent",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-absent-r2')"
+    },
+    {
+      "job": [
+        "P04",
+        "absent",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-absent-r3')"
+    },
+    {
+      "job": [
+        "P02",
+        "correct",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-correct-r1')"
+    },
+    {
+      "job": [
+        "P03",
+        "absent",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-absent-r1')"
+    },
+    {
+      "job": [
+        "P01",
+        "correct",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-correct-r3')"
+    },
+    {
+      "job": [
+        "P03",
+        "absent",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-absent-r3')"
+    },
+    {
+      "job": [
+        "P02",
+        "correct",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-correct-r3')"
+    },
+    {
+      "job": [
+        "P03",
+        "misleading",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-misleading-r3')"
+    },
+    {
+      "job": [
+        "P03",
+        "incomplete",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-incomplete-r2')"
+    },
+    {
+      "job": [
+        "P04",
+        "incomplete",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-incomplete-r1')"
+    },
+    {
+      "job": [
+        "P02",
+        "incomplete",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-incomplete-r1')"
+    },
+    {
+      "job": [
+        "P02",
+        "absent",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-absent-r2')"
+    },
+    {
+      "job": [
+        "P02",
+        "correct",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-correct-r2')"
+    },
+    {
+      "job": [
+        "P01",
+        "absent",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-absent-r3')"
+    },
+    {
+      "job": [
+        "P03",
+        "correct",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-correct-r3')"
+    },
+    {
+      "job": [
+        "P02",
+        "misleading",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-misleading-r1')"
+    },
+    {
+      "job": [
+        "P04",
+        "correct",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-correct-r2')"
+    },
+    {
+      "job": [
+        "P01",
+        "correct",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-correct-r2')"
+    },
+    {
+      "job": [
+        "P01",
+        "incomplete",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-incomplete-r1')"
+    },
+    {
+      "job": [
+        "P02",
+        "misleading",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-misleading-r3')"
+    },
+    {
+      "job": [
+        "P04",
+        "correct",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-correct-r3')"
+    },
+    {
+      "job": [
+        "P04",
+        "incomplete",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-incomplete-r3')"
+    },
+    {
+      "job": [
+        "P02",
+        "absent",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-absent-r3')"
+    },
+    {
+      "job": [
+        "P03",
+        "incomplete",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-incomplete-r1')"
+    },
+    {
+      "job": [
+        "P01",
+        "incomplete",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-incomplete-r2')"
+    },
+    {
+      "job": [
+        "P01",
+        "misleading",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-misleading-r2')"
+    },
+    {
+      "job": [
+        "P01",
+        "correct",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-correct-r1')"
+    },
+    {
+      "job": [
+        "P04",
+        "misleading",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-misleading-r1')"
+    },
+    {
+      "job": [
+        "P03",
+        "correct",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-correct-r1')"
+    },
+    {
+      "job": [
+        "P03",
+        "incomplete",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-incomplete-r3')"
+    },
+    {
+      "job": [
+        "P03",
+        "correct",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-correct-r2')"
+    },
+    {
+      "job": [
+        "P04",
+        "misleading",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-misleading-r3')"
+    },
+    {
+      "job": [
+        "P04",
+        "correct",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-correct-r1')"
+    },
+    {
+      "job": [
+        "P03",
+        "misleading",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-misleading-r2')"
+    },
+    {
+      "job": [
+        "P01",
+        "misleading",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-misleading-r3')"
+    },
+    {
+      "job": [
+        "P01",
+        "misleading",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-misleading-r1')"
+    },
+    {
+      "job": [
+        "P04",
+        "absent",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-absent-r1')"
+    },
+    {
+      "job": [
+        "P01",
+        "absent",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-absent-r2')"
+    },
+    {
+      "job": [
+        "P04",
+        "misleading",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-misleading-r2')"
+    },
+    {
+      "job": [
+        "P02",
+        "incomplete",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-incomplete-r2')"
+    },
+    {
+      "job": [
+        "P02",
+        "misleading",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-misleading-r2')"
+    },
+    {
+      "job": [
+        "P02",
+        "absent",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-absent-r1')"
+    },
+    {
+      "job": [
+        "P01",
+        "absent",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-absent-r1')"
+    },
+    {
+      "job": [
+        "P04",
+        "incomplete",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-incomplete-r2')"
+    },
+    {
+      "job": [
+        "P02",
+        "incomplete",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P02-incomplete-r3')"
+    },
+    {
+      "job": [
+        "P04",
+        "absent",
+        2
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P04-absent-r2')"
+    },
+    {
+      "job": [
+        "P01",
+        "incomplete",
+        3
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P01-incomplete-r3')"
+    },
+    {
+      "job": [
+        "P03",
+        "misleading",
+        1
+      ],
+      "error": "RuntimeError('refusing to overwrite prior run: pilot-P03-misleading-r1')"
+    }
+  ]
+}

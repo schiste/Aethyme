@@ -8,6 +8,8 @@ use aethyme_broker::{
     QueueWait,
 };
 
+mod common;
+
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -103,9 +105,9 @@ fn push_fixture(root: &Path, name: &str) -> PushFixture {
     );
     git(&repo, &["push", "-q", "origin", "main"]);
     let worktree = add_worktree(&repo, name);
-    let mut broker = Broker::open(&repo)
+    let mut broker = common::open_fixture_broker(&repo, root)
         .unwrap()
-        .with_host_operation_database(root.join("host-operations.db"));
+        .into_broker();
     let session_id = broker.adopt(&worktree, None).unwrap().id;
     PushFixture {
         remote,
@@ -182,10 +184,12 @@ fn github_request(session_id: i64, repository: &str, args: &[&str]) -> Coordinat
 
 #[test]
 fn successful_operation_is_durably_journaled_with_events() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "journal");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let report = broker
@@ -249,11 +253,13 @@ fn successful_operation_is_durably_journaled_with_events() {
 
 #[test]
 fn closed_and_missing_sessions_cannot_authorize_coordinated_operations() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let low_level_worktree = add_worktree(tmp.path(), "low-level-closed");
     let finished_worktree = add_worktree(tmp.path(), "finished");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let low_level = broker.adopt(&low_level_worktree, None).unwrap();
     let finished = broker.adopt(&finished_worktree, None).unwrap();
 
@@ -285,10 +291,12 @@ fn closed_and_missing_sessions_cannot_authorize_coordinated_operations() {
 
 #[test]
 fn destructive_and_ambiguous_operations_fail_closed() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "closed");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let destructive = broker
@@ -457,10 +465,12 @@ fn closed_owner_and_own_branch_need_no_cross_session() {
 
 #[test]
 fn unknown_mutating_git_commands_are_recorded_as_outcome_unknown() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "unknown-command");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     let mut command = request(session.id, &["-c", "core.test=true", "unknown-extension"]);
     command.declared_effect = Some(OperationEffect::Write);
@@ -470,14 +480,23 @@ fn unknown_mutating_git_commands_are_recorded_as_outcome_unknown() {
 
     assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
     assert!(!report.command_success);
+    assert!(
+        broker
+            .inspect_coordinated_push_operation(report.operation.id, "inspect unknown write")
+            .unwrap_err()
+            .to_string()
+            .contains("no recorded exact-ref push plan")
+    );
 }
 
 #[test]
 fn leading_git_directory_selects_a_linked_worktree_but_refuses_other_repositories() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "selected");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let selected_path = worktree.to_str().unwrap();
@@ -504,7 +523,7 @@ fn leading_git_directory_selects_a_linked_worktree_but_refuses_other_repositorie
 
 #[test]
 fn remote_git_journals_resolved_identity_and_assertion_evidence() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -516,7 +535,9 @@ fn remote_git_journals_resolved_identity_and_assertion_evidence() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "remote-identity");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     let mut command = request(session.id, &["ls-remote", "--get-url", "origin"]);
     command.repository = Some("Owner/Repo".into());
@@ -540,7 +561,7 @@ fn remote_git_journals_resolved_identity_and_assertion_evidence() {
 
 #[test]
 fn remote_git_refuses_mismatched_assertions_and_multiple_push_urls() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -552,7 +573,9 @@ fn remote_git_refuses_mismatched_assertions_and_multiple_push_urls() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "remote-refusal");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let mut mismatch = request(session.id, &["ls-remote", "--get-url", "origin"]);
@@ -598,10 +621,12 @@ fn remote_git_refuses_mismatched_assertions_and_multiple_push_urls() {
 
 #[test]
 fn github_operations_journal_normalized_identity_and_display_spelling() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "github-identity");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let report = broker
@@ -631,7 +656,7 @@ fn repository_unrelated_to_the_session_is_refused_before_journaling() {
     // Session ids are numbered per repository and resolved against the broker
     // of the caller's directory: `--session N --repo owner/other` run from the
     // wrong checkout picks up *this* repository's session N.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -652,7 +677,9 @@ fn repository_unrelated_to_the_session_is_refused_before_journaling() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "wrong-repository");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let github = broker
@@ -689,10 +716,12 @@ fn repository_unrelated_to_the_session_is_refused_before_journaling() {
 
 #[test]
 fn closed_session_error_names_the_broker_it_resolved_against() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "closed-names-broker");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     broker.close(session.id).unwrap();
 
@@ -710,10 +739,12 @@ fn closed_session_error_names_the_broker_it_resolved_against() {
 
 #[test]
 fn github_api_mismatch_is_refused_before_execution_or_journaling() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "github-mismatch");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let error = broker
@@ -958,6 +989,37 @@ fn mixed_exact_destinations_remain_partial_and_write_blocking() {
             .to_string()
             .contains("Blind retry is forbidden")
     );
+    let partial_inspection = fixture
+        .broker
+        .inspect_coordinated_push_operation(report.operation.id, "inspect the two destination refs")
+        .unwrap();
+    assert_eq!(partial_inspection.source, "remote_inspection");
+    assert_eq!(partial_inspection.outcome, None);
+    assert!(!partial_inspection.reconciled);
+    assert_eq!(
+        partial_inspection.operation.status,
+        OperationStatus::OutcomeUnknown
+    );
+    assert_eq!(
+        partial_inspection.evidence.as_ref().unwrap()["classification"],
+        "partial"
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "-d", "refs/heads/accepted"],
+    );
+    let failed_proposal = fixture
+        .broker
+        .inspect_coordinated_push_operation(
+            report.operation.id,
+            "inspect refs after remote rollback",
+        )
+        .unwrap();
+    assert_eq!(failed_proposal.outcome.as_deref(), Some("failed"));
+    assert_eq!(
+        failed_proposal.operation.status,
+        OperationStatus::OutcomeUnknown
+    );
     fixture
         .broker
         .reconcile_coordinated_operation(
@@ -981,6 +1043,108 @@ fn mixed_exact_destinations_remain_partial_and_write_blocking() {
     assert_eq!(
         reconciled.reconciliation.operator_reason.as_deref(),
         Some("reviewed both destination refs")
+    );
+    assert_eq!(
+        reconciled.reconciliation.source.as_deref(),
+        Some("operator_assertion")
+    );
+    let reconciled_details: serde_json::Value = serde_json::from_str(
+        reconciled
+            .operation
+            .details_json
+            .as_deref()
+            .expect("reconciliation details are journaled"),
+    )
+    .unwrap();
+    assert_eq!(
+        reconciled_details["reconciliation"]["source"],
+        "operator_assertion"
+    );
+    assert_eq!(
+        reconciled_details["remote_inspection"]["evidence"]["proposed_outcome"],
+        "failed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_push_inspection_proposes_success_without_clearing_the_write_barrier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-inspect-success");
+    commit_push_fixture(&fixture, "inspection proposal\n");
+    write_executable(
+        &fixture.remote.join("hooks/update"),
+        "#!/bin/sh\nif [ \"$1\" = 'refs/heads/rejected' ]; then exit 1; fi\nexit 0\n",
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/accepted", "HEAD:refs/heads/rejected"],
+        ))
+        .unwrap();
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    std::fs::remove_file(fixture.remote.join("hooks/update")).unwrap();
+    git(
+        &fixture.worktree,
+        &["push", "origin", "HEAD:refs/heads/rejected"],
+    );
+
+    let inspected = fixture
+        .broker
+        .inspect_coordinated_push_operation(report.operation.id, "verify the exact remote refs")
+        .unwrap();
+    assert_eq!(inspected.source, "remote_inspection");
+    assert_eq!(inspected.outcome.as_deref(), Some("succeeded"));
+    assert!(!inspected.reconciled);
+    assert_eq!(inspected.operation.status, OperationStatus::OutcomeUnknown);
+    assert_eq!(
+        inspected.evidence.as_ref().unwrap()["classification"],
+        "succeeded"
+    );
+    let recorded: serde_json::Value = serde_json::from_str(
+        inspected
+            .operation
+            .details_json
+            .as_deref()
+            .expect("remote inspection is recorded"),
+    )
+    .unwrap();
+    assert_eq!(
+        recorded["remote_inspection"]["evidence"]["destinations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.remote_inspection.as_ref().unwrap()["evidence"]["proposed_outcome"],
+        "succeeded"
+    );
+
+    let reconciled = fixture
+        .broker
+        .reconcile_coordinated_operation(
+            report.operation.id,
+            true,
+            "accept the broker's exact-ref inspection",
+        )
+        .unwrap();
+    assert_eq!(reconciled.source, "operator_assertion");
+    assert_eq!(reconciled.outcome.as_deref(), Some("succeeded"));
+    assert!(reconciled.reconciled);
+    let details: serde_json::Value =
+        serde_json::from_str(reconciled.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["reconciliation"]["source"], "operator_assertion");
+    assert_eq!(
+        details["remote_inspection"]["evidence"]["proposed_outcome"],
+        "succeeded"
     );
 }
 
@@ -1090,10 +1254,12 @@ fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
 
 #[test]
 fn bounded_local_write_timeout_is_failed_without_remote_recovery() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "local-timeout");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     // Inline `-c alias.*` is refused for coordinated git, so the slow command
     // is a repository alias instead.
@@ -1126,10 +1292,12 @@ fn bounded_local_write_timeout_is_failed_without_remote_recovery() {
 #[cfg(unix)]
 #[test]
 fn a_read_that_times_out_reports_the_phase_and_needs_no_reconciliation() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "read-timeout");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     // A recognized read that stalls: `git status` waits on the repository's
     // fsmonitor hook, the way `gh api` waits on a provider that never answers.
@@ -1194,18 +1362,22 @@ fn a_read_that_times_out_reports_the_phase_and_needs_no_reconciliation() {
 /// write blocks every other write.
 #[test]
 fn a_read_does_not_wait_behind_a_held_lock_or_a_blocked_repository() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let writer = add_worktree(tmp.path(), "lane-writer");
     let reader = add_worktree(tmp.path(), "lane-reader");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let writer_session = broker.adopt(&writer, None).unwrap();
     let reader_session = broker.adopt(&reader, None).unwrap();
     git(tmp.path(), &["config", "alias.pause", "!sleep 4"]);
 
     let root = tmp.path().to_path_buf();
     let holder = std::thread::spawn(move || {
-        let mut broker = Broker::open(&root).unwrap();
+        let mut broker = common::open_fixture_repository_path_broker(&root)
+            .unwrap()
+            .into_broker();
         let mut command = request(writer_session.id, &["pause"]);
         command.declared_effect = Some(OperationEffect::Write);
         command.scope = Some("test:lane".into());
@@ -1383,10 +1555,12 @@ fn complex_unplannable_push_is_refused_before_remote_contact() {
 
 #[test]
 fn crashed_write_blocks_until_operator_reconciliation() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "crash");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     let repository = format!("local:{}", broker.main_root().display());
 
@@ -1455,12 +1629,14 @@ fn crashed_write_blocks_until_operator_reconciliation() {
 
 #[test]
 fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "prepared-reap");
     let operation_id;
     {
-        let mut broker = Broker::open(tmp.path()).unwrap();
+        let mut broker = common::open_fixture_repository_broker(&tmp)
+            .unwrap()
+            .into_broker();
         let session = broker.adopt(&worktree, None).unwrap();
         let repository = format!("local:{}", broker.main_root().display());
         operation_id = broker
@@ -1481,7 +1657,9 @@ fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
             .id;
     }
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let operation = broker
         .store()
         .coordinated_operation(operation_id)
@@ -1496,10 +1674,12 @@ fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
 
 #[test]
 fn local_git_conflict_is_failed_without_remote_recovery_or_write_block() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "partial");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let report = broker
@@ -1539,11 +1719,13 @@ fn local_git_conflict_is_failed_without_remote_recovery_or_write_block() {
 
 #[test]
 fn repository_write_lock_serializes_independent_process_clients() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree_a = add_worktree(tmp.path(), "lock-a");
     let worktree_b = add_worktree(tmp.path(), "lock-b");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session_a = broker.adopt(&worktree_a, None).unwrap();
     let session_b = broker.adopt(&worktree_b, None).unwrap();
     git(tmp.path(), &["config", "alias.pause", "!sleep 1"]);
@@ -1552,7 +1734,9 @@ fn repository_write_lock_serializes_independent_process_clients() {
     let root_b = root_a.clone();
     let run = |root: std::path::PathBuf, session_id| {
         std::thread::spawn(move || {
-            let mut broker = Broker::open(&root).unwrap();
+            let mut broker = common::open_fixture_repository_path_broker(&root)
+                .unwrap()
+                .into_broker();
             broker
                 .run_coordinated_operation(CoordinatedCommand {
                     session_id,
@@ -1968,10 +2152,12 @@ fn a_mixed_push_is_verified_and_tells_the_hook_it_is_mixed() {
 /// authoritative and concluded nothing was pending.
 #[test]
 fn status_names_the_holder_and_who_is_parked_behind_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "wedged");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     let repository = format!("local:{}", broker.main_root().display());
 
@@ -2064,7 +2250,7 @@ fn status_names_the_holder_and_who_is_parked_behind_it() {
 /// `repository` could relate the two.
 #[test]
 fn local_and_remote_git_operations_share_one_repository_key() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -2076,7 +2262,9 @@ fn local_and_remote_git_operations_share_one_repository_key() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "one-key");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let mut remote = request(session.id, &["ls-remote", "--get-url", "origin"]);
@@ -2116,7 +2304,7 @@ fn local_and_remote_git_operations_share_one_repository_key() {
 /// later remote write on the same repository (issue #166).
 #[test]
 fn an_unreconciled_local_write_blocks_a_later_remote_write() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -2128,7 +2316,9 @@ fn an_unreconciled_local_write_blocks_a_later_remote_write() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "blocks");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     // A local write, journaled under whatever key the broker computes for it.
@@ -2162,7 +2352,7 @@ fn an_unreconciled_local_write_blocks_a_later_remote_write() {
 /// nothing else uses (issue #166).
 #[test]
 fn a_local_command_refuses_a_repository_assertion_that_contradicts_origin() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -2174,7 +2364,9 @@ fn a_local_command_refuses_a_repository_assertion_that_contradicts_origin() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "mismatch");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let mut command = request(session.id, &["tag", "--list"]);
@@ -2193,10 +2385,12 @@ fn a_local_command_refuses_a_repository_assertion_that_contradicts_origin() {
 /// its key, because no remote operation can resolve there either (issue #166).
 #[test]
 fn a_checkout_without_a_remote_falls_back_to_a_local_key() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "no-remote");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
 
     let mut command = request(session.id, &["tag", "--list"]);
@@ -2256,7 +2450,7 @@ fn wedge(broker: &mut Broker, session_id: i64, repository: &str, args: &[&str]) 
 /// write in the repository.
 #[test]
 fn a_wedged_comment_write_does_not_block_a_ref_scoped_operation() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -2268,7 +2462,9 @@ fn a_wedged_comment_write_does_not_block_a_ref_scoped_operation() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "comment-scope");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     let repository = canonical_github_key(&mut broker, session.id);
 
@@ -2299,7 +2495,7 @@ fn a_wedged_comment_write_does_not_block_a_ref_scoped_operation() {
 /// comment — naming the push would mean it had serialised on ref work.
 #[test]
 fn a_ref_scoped_block_is_invisible_to_a_comment_write_on_its_own_thread() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     git(
         tmp.path(),
@@ -2311,7 +2507,9 @@ fn a_ref_scoped_block_is_invisible_to_a_comment_write_on_its_own_thread() {
         ],
     );
     let worktree = add_worktree(tmp.path(), "both-wedged");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     let session = broker.adopt(&worktree, None).unwrap();
     let repository = canonical_github_key(&mut broker, session.id);
 
@@ -2372,4 +2570,54 @@ fn a_successful_push_reports_the_commit_it_sent() {
     );
     assert_eq!(report.pushed_refs[0].proposed_sha, head);
     assert_eq!(report.pushed_refs[0].destination_ref, "refs/heads/reported");
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_push_inspection_refuses_a_changed_remote_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-inspect-identity");
+    commit_push_fixture(&fixture, "identity inspection\n");
+    write_executable(
+        &fixture.remote.join("hooks/update"),
+        "#!/bin/sh\nif [ \"$1\" = 'refs/heads/rejected' ]; then exit 1; fi\nexit 0\n",
+    );
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/accepted", "HEAD:refs/heads/rejected"],
+        ))
+        .unwrap();
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    let original = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap()
+        .operation;
+    let other = tmp.path().join("different-remote.git");
+    git(
+        tmp.path(),
+        &["init", "--bare", "-q", other.to_str().unwrap()],
+    );
+    git(
+        &fixture.worktree,
+        &["remote", "set-url", "origin", other.to_str().unwrap()],
+    );
+    assert!(
+        fixture
+            .broker
+            .inspect_coordinated_push_operation(report.operation.id, "inspect original push")
+            .is_err()
+    );
+    let current = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap()
+        .operation;
+    assert_eq!(
+        serde_json::to_value(current).unwrap(),
+        serde_json::to_value(original).unwrap()
+    );
 }

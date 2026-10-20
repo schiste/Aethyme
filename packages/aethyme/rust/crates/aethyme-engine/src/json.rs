@@ -267,6 +267,7 @@ fn edge_kind(kind: &EdgeKind) -> &'static str {
         EdgeKind::ValidatesCredential => "validates_credential",
         EdgeKind::RewritesHeader => "rewrites_header",
         EdgeKind::TestedBy => "tested_by",
+        EdgeKind::Tests => "tests",
     }
 }
 
@@ -1465,6 +1466,7 @@ mod tests {
         );
         assert_eq!(edge_kind(&EdgeKind::RewritesHeader), "rewrites_header");
         assert_eq!(edge_kind(&EdgeKind::TestedBy), "tested_by");
+        assert_eq!(edge_kind(&EdgeKind::Tests), "tests");
     }
 
     #[test]

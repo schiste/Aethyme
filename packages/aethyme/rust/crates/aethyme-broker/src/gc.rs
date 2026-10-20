@@ -4021,10 +4021,10 @@ impl Broker {
     /// Continue only a GC plan that an operator already authorized, then run
     /// the autonomous artifact sweep.
     ///
-    /// Startup never invents or confirms a plan that removes committed work.
-    /// The artifact sweep is exempt from that rule because it only removes
-    /// git-ignored build caches, which hold no contribution and are recovered
-    /// by rebuilding.
+    /// Startup resumes only a durable GC plan that an operator already
+    /// authorized. Its bounded autonomous sweep may reclaim rebuildable
+    /// artifacts and remove a closed checkout only when the existing policy
+    /// and ownership proofs pass; it does not create cleanup authority.
     pub(crate) fn resume_gc_maintenance(&mut self) -> Result<Option<GcApplyReport>, BrokerOpError> {
         let continuation_worker = std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some();
         if continuation_worker {

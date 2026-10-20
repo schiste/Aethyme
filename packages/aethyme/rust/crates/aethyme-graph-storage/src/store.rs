@@ -113,7 +113,8 @@ impl FragmentStore {
         Ok(modules)
     }
 
-    /// Read a typed overlay fragment for the given kind.
+    /// Read a typed overlay fragment for the given kind and expected
+    /// producer logic version. The expectation must be nonempty.
     ///
     /// The caller supplies the payload type `P` they expect; a
     /// `KindMismatch` from the decoder means either the wrong `P`
@@ -122,8 +123,9 @@ impl FragmentStore {
     pub fn read_overlay<P: DeserializeOwned>(
         &self,
         kind: &str,
+        expected_producer_version: &str,
     ) -> Result<OverlayFragment<P>, OverlayReadError> {
-        read_overlay(&self.repo_root, kind)
+        read_overlay(&self.repo_root, kind, expected_producer_version)
     }
 
     /// Write a typed overlay fragment for the given kind. The kind

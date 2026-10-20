@@ -1,0 +1,9 @@
+{
+  "name": "fx08-playground-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node serve.mjs"
+  }
+}

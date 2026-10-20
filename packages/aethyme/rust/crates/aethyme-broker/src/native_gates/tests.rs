@@ -342,6 +342,86 @@ fn setup_with_legacy_candidate(config: Option<&str>, legacy: bool) -> Setup {
     }
 }
 
+fn setup_with_middle_conflict(config: Option<&str>) -> Setup {
+    let mut f = Fixture::new();
+    let original = f.a.base.commit.clone();
+    git(
+        f._repo.path(),
+        &["checkout", "-q", "--detach", original.as_str()],
+    );
+    if let Some(config) = config {
+        std::fs::create_dir_all(f._repo.path().join(".aethyme")).unwrap();
+        std::fs::write(f._repo.path().join(".aethyme/gates.toml"), config).unwrap();
+        git(f._repo.path(), &["add", ".aethyme/gates.toml"]);
+        git(
+            f._repo.path(),
+            &["commit", "-qm", "trusted independent Playground gates"],
+        );
+    }
+    let base = archive::pin_commit(f._repo.path(), "HEAD").unwrap();
+    git(
+        f._repo.path(),
+        &["switch", "-qc", "A-conflict-base", base.as_str()],
+    );
+    std::fs::write(f._repo.path().join("one.txt"), "A\n").unwrap();
+    git(f._repo.path(), &["add", "one.txt"]);
+    git(f._repo.path(), &["commit", "-qm", "A"]);
+    let a_commit = CommitOid::parse(&git(f._repo.path(), &["rev-parse", "HEAD"])).unwrap();
+    f.a = archive::retain_contribution(&mut f.store, f._repo.path(), &base, &a_commit).unwrap();
+    git(
+        f._repo.path(),
+        &["switch", "-qc", "B-conflict", base.as_str()],
+    );
+    std::fs::write(f._repo.path().join("one.txt"), "B\n").unwrap();
+    git(f._repo.path(), &["add", "one.txt"]);
+    git(f._repo.path(), &["commit", "-qm", "B conflicts with A"]);
+    let b_commit = CommitOid::parse(&git(f._repo.path(), &["rev-parse", "HEAD"])).unwrap();
+    f.b = archive::retain_contribution(&mut f.store, f._repo.path(), &base, &b_commit).unwrap();
+    let c = f.feature(&base);
+
+    let owner = target::acquire_controller(&mut f.store, "native-gates", "appointed").unwrap();
+    let mut spec = f.spec();
+    spec.contributions.push(c);
+    spec.selected = vec!["A".into(), "B".into(), "C".into()];
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    for (index, contribution) in ["A", "B", "C"].iter().enumerate() {
+        wave::available(&mut f.store, &owner, contribution, index as i64).unwrap();
+    }
+    let blocked = match wave::tick(
+        &mut f.store,
+        &owner,
+        f._repo.path(),
+        wave::WavePolicy {
+            debounce_ms: 0,
+            ..Default::default()
+        },
+        3,
+    )
+    .unwrap()
+    {
+        wave::Run::Blocked(wave) => wave,
+        other => panic!("the A/B line collision must block the full A/B/C wave: {other:?}"),
+    };
+    let policy = policy(f._repo.path(), &base).unwrap();
+    let fixture_host_state = f._host.path().canonicalize().unwrap();
+    let trust = crate::broker::gate_trust::record_trust_for_host_state(
+        f._repo.path(),
+        &fixture_host_state,
+        &[&policy.trust.policy_sha256],
+        "independent synthetic test operator",
+    )
+    .unwrap();
+    let broker = open_fixture_broker(f._repo.path(), &fixture_host_state);
+    Setup {
+        broker,
+        owner: Some(owner),
+        f,
+        wave: blocked.id,
+        trust,
+    }
+}
+
 /// Build the schema-22 shape directly: the wave has a candidate and composer
 /// recipe but no schema-27 request/source references. This models a real
 /// pre-migration row instead of clearing provenance from a current wave.
@@ -1096,6 +1176,268 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
 }
 
 #[test]
+fn synthesized_conflict_suffix_recomposes_and_prepares_the_full_hybrid_candidate() {
+    if run_in_clean_git_child(
+        "native_gates::tests::synthesized_conflict_suffix_recomposes_and_prepares_the_full_hybrid_candidate",
+    ) {
+        return;
+    }
+    let mut s = setup_with_middle_conflict(Some(METADATA_GATES));
+    let repo = s.f._repo.path().to_path_buf();
+    let owner = s.owner.as_ref().expect("setup owner is present");
+    let blocked = wave::load(&s.f.store, &s.wave).unwrap();
+    assert_eq!(blocked.phase, WavePhase::Blocked);
+    assert_eq!(blocked.spec.selected, ["A", "B", "C"]);
+    let request_ref = blocked
+        .resolution_request
+        .clone()
+        .expect("the real middle conflict has a request");
+    let expected_version = target::status(&s.f.store, owner.target()).unwrap().version;
+    let session_label = "session-middle-conflict-suffix-test";
+    let started = crate::resolution::begin_attempt(
+        &mut s.f.store,
+        &repo,
+        &request_ref,
+        session_label,
+        "client-middle-conflict-suffix-test",
+        crate::resolution::DispatchLimits {
+            max_manifest_bytes: 1_000_000,
+            max_manifest_entries: 256,
+            max_file_bytes: 1_000_000,
+            max_total_input_bytes: 4_000_000,
+            max_response_bytes: 1_000_000,
+        },
+    )
+    .unwrap();
+    let crate::resolution::BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("the focused test must create exactly one resolver attempt");
+    };
+    crate::resolution::mark_attempt_dispatching(&mut s.f.store, &status.token, session_label)
+        .unwrap();
+    let envelope = json!({
+        "schema": crate::resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": session_label,
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {
+            "kind": "proposal",
+            "detail": null,
+            "brief": "resolve the conflicting prefix before replaying C",
+            "writes": [{
+                "path": "one.txt",
+                "delete": false,
+                "kind": "regular",
+                "bytes_hex": "41420a"
+            }]
+        }
+    });
+    let bound = crate::resolution::decode_attempt_response_envelope(
+        &status,
+        &serde_json::to_vec(&envelope).unwrap(),
+    )
+    .unwrap();
+    let settled = crate::resolution::finish_bound_attempt(&mut s.f.store, &repo, &bound).unwrap();
+    assert!(matches!(
+        settled.outcome,
+        crate::resolution::ResolutionOutcome::Synthesized(_)
+    ));
+    let ledger =
+        crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
+    assert_eq!(
+        ledger.state,
+        crate::resolution::ResolutionAttemptState::Settled
+    );
+    let result_ref = ledger
+        .result
+        .expect("the settled ledger names its exact result");
+    assert_eq!(
+        target::status(&s.f.store, owner.target()).unwrap().version,
+        expected_version
+    );
+
+    let stale = wave::recompose_synthesized_conflict(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version - 1,
+        &result_ref,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert!(matches!(stale, Err(wave::WaveError::Stale)));
+    let mut tampered_result = result_ref.clone();
+    tampered_result.object = ObjectDigest::of(b"not the retained resolver result");
+    assert!(
+        wave::recompose_synthesized_conflict(
+            &mut s.f.store,
+            owner,
+            &repo,
+            &s.wave,
+            expected_version,
+            &tampered_result,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .is_err()
+    );
+    assert_eq!(wave::load(&s.f.store, &s.wave).unwrap(), blocked);
+    assert_eq!(
+        target::status(&s.f.store, owner.target()).unwrap().version,
+        expected_version
+    );
+
+    let recomposed = wave::recompose_synthesized_conflict(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version,
+        &result_ref,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(recomposed.phase, WavePhase::Verifying);
+    assert_eq!(recomposed.resolution_result.as_ref(), Some(&result_ref));
+    let verifying_status = target::status(&s.f.store, owner.target()).unwrap();
+    assert_eq!(verifying_status.version, expected_version + 1);
+    assert_eq!(verifying_status.phase, target::Phase::Verifying);
+
+    let (seed, provenance) = wave::read_synthesized_wave_result(&mut s.f.store, &repo, &recomposed)
+        .unwrap()
+        .expect("the verifying hybrid wave preserves its exact resolver seed");
+    let revision = target::load_revision(
+        &s.f.store,
+        &RecordId::parse(&recomposed.spec.revision).unwrap(),
+    )
+    .unwrap();
+    let expected_inputs = revision
+        .spec
+        .selected
+        .iter()
+        .map(|selected| {
+            let contribution = revision
+                .spec
+                .contributions
+                .iter()
+                .find(|contribution| contribution.id == *selected)
+                .unwrap();
+            let lineage = RecordId::parse(&contribution.lineage).unwrap();
+            archive::retained_contribution(&s.f.store, &lineage)
+                .unwrap()
+                .unwrap()
+                .result
+                .commit
+                .as_str()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expected_inputs.len(), 3);
+    assert_ne!(
+        seed.candidate.commit.as_str(),
+        recomposed.candidate_commit.as_ref().unwrap().as_str()
+    );
+
+    let jobs_before: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_jobs WHERE wave=?1",
+                [&s.wave.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    s.f.store
+        .connection()
+        .execute(
+            "DELETE FROM local_target_roots WHERE revision=?1 AND kind='object' AND reference=?2",
+            params![recomposed.spec.revision, provenance.request_object],
+        )
+        .unwrap();
+    assert!(prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).is_err());
+    let jobs_after_refusal: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_jobs WHERE wave=?1",
+                [&s.wave.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        jobs_after_refusal, jobs_before,
+        "missing provenance roots must refuse before a job is prepared"
+    );
+    s.f.store
+        .connection()
+        .execute(
+            "INSERT OR IGNORE INTO local_target_roots VALUES (?1,'object',?2)",
+            params![recomposed.spec.revision, provenance.request_object],
+        )
+        .unwrap();
+
+    let fresh_job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
+    assert_eq!(fresh_job.state, "prepared");
+    assert_ne!(fresh_job.spec.commit, seed.candidate.commit.as_str());
+    assert_eq!(
+        fresh_job.spec.commit,
+        recomposed.candidate_commit.as_ref().unwrap().as_str()
+    );
+    assert_eq!(fresh_job.spec.inputs, expected_inputs);
+    assert_eq!(fresh_job.spec.synthesized_group.as_ref(), Some(&provenance));
+    let candidate = validate_source(&mut s.f.store, owner, &repo, &fresh_job.spec).unwrap();
+    let (_, composition_source) =
+        wave::load_composition_source(&mut s.f.store, owner, &repo, &s.wave).unwrap();
+    let composition_source =
+        composition_source.expect("the recomposed wave retains its exact composition source");
+    let final_candidate = composition_source
+        .composition
+        .outcome
+        .candidate()
+        .expect("the recomposed source has a candidate");
+    assert_eq!(
+        final_candidate.mode,
+        crate::composition::CompositionMode::Hybrid
+    );
+    assert_eq!(candidate.commit.as_str(), fresh_job.spec.commit);
+    assert_eq!(candidate.inputs.len(), 3);
+    assert_eq!(
+        git(
+            &repo,
+            &["show", &format!("{}:one.txt", fresh_job.spec.commit)]
+        ),
+        "AB"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &["show", &format!("{}:three.txt", fresh_job.spec.commit)]
+        ),
+        "C"
+    );
+    let settled_after_recompose =
+        crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
+    assert_eq!(
+        settled_after_recompose.state,
+        crate::resolution::ResolutionAttemptState::Settled
+    );
+    assert_eq!(settled_after_recompose.result.as_ref(), Some(&result_ref));
+    let attempts: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
+                [&status.token],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        attempts, 1,
+        "suffix recomposition must not charge a second resolver attempt"
+    );
+}
+
+#[test]
 fn exact_spec_identity_preserves_old_job_and_separates_same_wave_synthesis() {
     let mut s = setup(Some(GATES));
     let job = prepare(
@@ -1589,8 +1931,8 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
         )
         .unwrap();
     assert_eq!(
-        migrated_floor,
-        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+        migrated_floor, 29,
+        "schema 30 keeps schema 29 as its minimum compatible floor"
     );
     let roots_before = root_count(&s.f.store, &job.id);
     assert!(roots_before > 0);

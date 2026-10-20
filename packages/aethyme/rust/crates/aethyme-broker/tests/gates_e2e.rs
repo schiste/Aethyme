@@ -168,6 +168,10 @@ fn commit_all(root: &Path, message: &str) {
 }
 
 fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
+    add_worktree_at(root, name, "main")
+}
+
+fn add_worktree_at(root: &Path, name: &str, revision: &str) -> std::path::PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     sh(
@@ -179,7 +183,7 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
             "-b",
             &format!("agent/{name}"),
             path.to_str().unwrap(),
-            "main",
+            revision,
         ],
     );
     path
@@ -217,16 +221,38 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
     bootstrap_repo(tmp.path(), env!("CARGO_PKG_VERSION")).unwrap();
     commit_all(tmp.path(), "enroll authoritative graph");
     refresh_committed_graph(tmp.path());
-    commit_all(tmp.path(), "commit authoritative graph");
+    commit_all(tmp.path(), "commit initial authoritative graph");
+    let initial_graph_commit = GitRepo::discover(tmp.path())
+        .unwrap()
+        .head_commit()
+        .unwrap();
+
+    // Produce the updated graph history before Broker::open enrolls the graph
+    // directory as broker-managed. The source-only commit is the stale point;
+    // the following graph commit is the fresh point used by a second session.
+    std::fs::write(tmp.path().join("src/app.py"), "x = 2\n").unwrap();
+    commit_all(tmp.path(), "commit source edit before graph refresh");
+    let stale_graph_commit = GitRepo::discover(tmp.path())
+        .unwrap()
+        .head_commit()
+        .unwrap();
+    refresh_committed_graph(tmp.path());
+    commit_all(tmp.path(), "refresh authoritative graph after source edit");
+    let refreshed_graph_commit = GitRepo::discover(tmp.path())
+        .unwrap()
+        .head_commit()
+        .unwrap();
 
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let full_tree = broker.run_all_gates(tmp.path()).unwrap();
+    let full_tree_checkout =
+        add_worktree_at(tmp.path(), "full-tree-graph-gates", &initial_graph_commit);
+    let full_tree = broker.run_all_gates(&full_tree_checkout).unwrap();
     assert_eq!(full_tree.len(), 1, "fresh CI-equivalent tree passes");
-    std::fs::remove_file(tmp.path().join("gate-markers.txt")).unwrap();
+    std::fs::remove_file(full_tree_checkout.join("gate-markers.txt")).unwrap();
 
-    let worktree = add_worktree(tmp.path(), "stale-graph-gates");
+    let worktree = add_worktree_at(tmp.path(), "stale-graph-gates", &stale_graph_commit);
     let session = broker.adopt(&worktree, None).unwrap();
-    std::fs::write(worktree.join("src/app.py"), "x = 2\n").unwrap();
+    std::fs::write(worktree.join("src/app.py"), "x = 3\n").unwrap();
     let status_before = GitRepo::discover(&worktree).unwrap().dirty_paths().unwrap();
 
     // #280: a stale graph is recorded and reported, never a refusal. The
@@ -254,14 +280,14 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
         row.evidence
     );
 
-    commit_all(&worktree, "commit source edit before graph refresh");
-    refresh_committed_graph(&worktree);
-    // Refreshing the graph updates the authority artifacts in the worktree;
-    // gates are intentionally checked against committed graph state, so the
-    // fixture must commit the new coverage, manifest, and units together.
-    commit_all(&worktree, "refresh authoritative graph after source edit");
-    let refreshed = broker.run_gates(session.id).unwrap();
-    assert_eq!(refreshed.len(), 1);
+    // The refreshed artifacts were committed in the primary checkout before
+    // Broker::open. Run that exact committed tree through the CI full-tree
+    // path; a session adopted at the same commit would have no diff for
+    // trigger-based gate selection.
+    let refreshed_worktree =
+        add_worktree_at(tmp.path(), "fresh-graph-gates", &refreshed_graph_commit);
+    let refreshed = broker.run_all_gates(&refreshed_worktree).unwrap();
+    assert_eq!(refreshed.len(), 1, "full-tree mode runs configured gates");
     assert_eq!(refreshed[0].status, GateStatus::Pass);
     assert!(
         !broker
@@ -269,16 +295,28 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
             .unwrap()
             .advice
             .iter()
-            .any(|row| row.id.starts_with("graph.") && row.session_id == Some(session.id)),
-        "a fresh graph raises no advice"
+            .any(|row| row.id.starts_with("graph.") && row.session_id.is_none()),
+        "a fresh full-tree graph raises no global advice"
     );
     assert!(!refreshed[0].cached);
-    let cached = broker.run_gates(session.id).unwrap();
+    let cached = broker.run_all_gates(&refreshed_worktree).unwrap();
     assert_eq!(cached.len(), 1);
     assert!(
         cached[0].cached,
         "identical verified tree reuses gate proof"
     );
+    assert_eq!(cached[0].run_id, refreshed[0].run_id);
+    let provenance = cached[0]
+        .cache_provenance
+        .as_ref()
+        .expect("cache hit reports the execution profile that matched");
+    assert!(
+        provenance
+            .execution_profile_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    assert!(provenance.profile_scope.contains("managed-cache contents"));
 }
 
 #[test]
@@ -742,13 +780,26 @@ triggers = ["**/*.py"]
     // Same tree, same session, run again: pure cache, no re-execution.
     // (gate-markers.txt is gitignored, so writing it did not change the
     // working-tree hash — the real-world contract for gate outputs.)
-    let outcomes = broker.run_gates(py.id).unwrap();
-    assert!(outcomes.iter().all(|o| o.cached), "all cache hits");
-    assert_eq!(outcomes[0].failure_class, None);
+    let producing_run_ids = outcomes
+        .iter()
+        .map(|outcome| outcome.run_id)
+        .collect::<Vec<_>>();
+    let cached_outcomes = broker.run_gates(py.id).unwrap();
+    assert!(cached_outcomes.iter().all(|o| o.cached), "all cache hits");
+    assert_eq!(cached_outcomes[0].failure_class, None);
     assert_eq!(
-        outcomes[1].failure_class,
+        cached_outcomes[1].failure_class,
         Some(GateFailureClass::CachedPriorFail)
     );
+    for (cached, producing_run_id) in cached_outcomes.iter().zip(producing_run_ids) {
+        assert_eq!(cached.run_id, producing_run_id);
+        assert!(cached.cache_provenance.as_ref().is_some_and(|provenance| {
+            provenance
+                .execution_profile_digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        }));
+    }
     let markers_after = std::fs::read_to_string(wt_py.join("gate-markers.txt")).unwrap();
     assert_eq!(markers, markers_after, "cached rerun executed nothing");
 

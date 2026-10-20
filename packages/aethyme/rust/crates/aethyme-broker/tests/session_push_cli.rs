@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
+mod common;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -75,7 +75,7 @@ fn write_executable(path: &Path, contents: &str) {
 }
 
 struct Fixture {
-    tmp: tempfile::TempDir,
+    storage: common::FixtureRepository,
     repo: PathBuf,
     remote: PathBuf,
     bin: PathBuf,
@@ -83,10 +83,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        let remote = tmp.path().join("remote.git");
-        let bin = tmp.path().join("bin");
+        let temp_repo = tempfile::tempdir().unwrap();
+        let storage = common::FixtureRepository::from_tempdir(temp_repo);
+        let repo = storage.path().to_path_buf();
+        let remote = storage.owner_path().join("remote.git");
+        let bin = storage.owner_path().join("bin");
         for dir in [&repo, &remote, &bin] {
             std::fs::create_dir_all(dir).unwrap();
         }
@@ -118,7 +119,7 @@ impl Fixture {
             ],
         );
         let fixture = Self {
-            tmp,
+            storage,
             repo,
             remote,
             bin,
@@ -154,10 +155,8 @@ impl Fixture {
         self.git_env(&["push", "-q", "origin", "main"]);
     }
 
-    fn broker(&self) -> Broker {
-        Broker::open(&self.repo)
-            .unwrap()
-            .with_host_operation_database(self.tmp.path().join("host-state/operations.db"))
+    fn broker(&self) -> common::FixtureBroker {
+        common::open_fixture_repository_broker(&self.storage).unwrap()
     }
 
     /// A live session with one committed change. Returns (id, worktree).
@@ -228,8 +227,9 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(CLI)
-            .args(args)
+        let broker = self.broker();
+        let mut command = common::broker_cli(CLI, args);
+        command
             .current_dir(&self.repo)
             .env(
                 "PATH",
@@ -239,13 +239,24 @@ impl Fixture {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
-            .env("AETHYME_HOST_STATE_DIR", self.tmp.path().join("host-state"))
             .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
-            .env("AETHYME_TEST_HOOK_LOG", self.tmp.path().join("hook-log"))
-            .env("AETHYME_FAKE_GH_LOG", self.tmp.path().join("gh-log"))
-            .env("AETHYME_FAKE_PR_STATE", self.tmp.path().join("pr-state"))
-            .output()
-            .unwrap()
+            .env(
+                "AETHYME_TEST_HOOK_LOG",
+                self.storage.owner_path().join("hook-log"),
+            )
+            .env(
+                "AETHYME_FAKE_GH_LOG",
+                self.storage.owner_path().join("gh-log"),
+            )
+            .env(
+                "AETHYME_FAKE_PR_STATE",
+                self.storage.owner_path().join("pr-state"),
+            );
+        broker
+            .configure_storage_context_for_child(&mut command)
+            .unwrap();
+        drop(broker);
+        command.output().unwrap()
     }
 
     fn push(&self, session: i64, extra: &[&str]) -> Output {
@@ -273,7 +284,7 @@ impl Fixture {
     }
 
     fn gh_log(&self) -> String {
-        std::fs::read_to_string(self.tmp.path().join("gh-log")).unwrap_or_default()
+        std::fs::read_to_string(self.storage.owner_path().join("gh-log")).unwrap_or_default()
     }
 }
 
@@ -344,15 +355,17 @@ fn push_is_refused_until_the_repository_authorizes_it() {
     let refused = fixture.push(session, &[]);
     assert!(!refused.status.success());
     assert!(
-        stderr(&refused).contains("delivery.push_session_branches"),
+        json_error::message(&refused).contains("delivery.push_session_branches"),
         "{}",
-        stderr(&refused)
+        json_error::message(&refused)
     );
     assert_eq!(fixture.remote_branch(&branch), None);
 
     // Enabling it in a worktree is not authorization: only the default branch is.
     fixture.authorize(false);
-    assert!(!fixture.push(session, &[]).status.success());
+    let refused_again = fixture.push(session, &[]);
+    assert!(!refused_again.status.success());
+    assert!(json_error::message(&refused_again).contains("delivery.push_session_branches"));
     assert_eq!(fixture.remote_branch(&branch), None);
 }
 
@@ -425,9 +438,9 @@ fn the_lease_refuses_when_the_remote_branch_moved_underneath() {
     let first = json(&fixture.push(session, &[]));
     let branch = first["branch"].as_str().unwrap().to_string();
 
-    let outsider = fixture.tmp.path().join("outsider");
+    let outsider = fixture.storage.owner_path().join("outsider");
     git(
-        fixture.tmp.path(),
+        fixture.storage.owner_path(),
         &[
             "clone",
             "-q",
@@ -469,7 +482,11 @@ fn a_closed_session_cannot_push() {
 
     let refused = fixture.push(session, &[]);
     assert!(!refused.status.success());
-    assert!(stderr(&refused).contains("closed"), "{}", stderr(&refused));
+    assert!(
+        json_error::message(&refused).contains("closed"),
+        "{}",
+        json_error::message(&refused)
+    );
     assert_eq!(fixture.remote_branch(&branch), None);
 }
 
@@ -628,7 +645,7 @@ fn broker_and_advanced_git_push_use_session_hooks_and_caller_path() {
         "broker push should use the session checkout and caller PATH: {}",
         stderr(&broker_push)
     );
-    let hook_log = fixture.tmp.path().join("hook-log");
+    let hook_log = fixture.storage.owner_path().join("hook-log");
     let log = std::fs::read_to_string(&hook_log).unwrap();
     assert_eq!(log.lines().collect::<Vec<_>>(), ["session hook ran"]);
 
@@ -661,7 +678,7 @@ fn both_push_paths_surface_hook_streams_and_missing_path_guidance() {
 
     let broker_push = fixture.push(session, &[]);
     assert!(!broker_push.status.success());
-    let push_error = stderr(&broker_push);
+    let push_error = json_error::message(&broker_push);
     assert!(
         push_error.contains("hook stdout: checks could not start"),
         "{push_error}"
@@ -713,7 +730,7 @@ fn opted_in_pre_push_refusals_show_hook_stderr_and_path_guidance_on_both_pushes(
 
     let broker_push = fixture.push(session, &[]);
     assert!(!broker_push.status.success());
-    let push_error = stderr(&broker_push);
+    let push_error = json_error::message(&broker_push);
     assert!(
         push_error.contains("env: node: No such file or directory"),
         "{push_error}"
@@ -737,3 +754,6 @@ fn opted_in_pre_push_refusals_show_hook_stderr_and_path_guidance_on_both_pushes(
     let branch = fixture.broker().store().session(session).unwrap().branch;
     assert_eq!(fixture.remote_branch(&branch), None);
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

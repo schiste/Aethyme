@@ -9,6 +9,8 @@ use std::process::Command;
 
 use aethyme_broker::{AutoCleanupReport, Broker};
 
+mod common;
+
 fn git_out(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -138,7 +140,7 @@ fn kept_reason<'a>(report: &'a AutoCleanupReport, worktree: &Path) -> &'a str {
 #[test]
 fn a_merged_closed_checkout_is_removed_by_ancestry_and_journaled() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (session_id, worktree, head) = merged_closed_session(&fx, &mut broker, true);
     // Regenerable output and Finder metadata do not keep it.
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
@@ -183,7 +185,7 @@ fn a_merged_closed_checkout_is_removed_by_ancestry_and_journaled() {
 #[test]
 fn a_squash_landing_is_removed_through_the_deep_proof() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let session = broker.start_worktree("squashed", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(&worktree, "feature.txt", "work\n", "feature");
@@ -208,7 +210,7 @@ fn a_squash_landing_is_removed_through_the_deep_proof() {
 #[test]
 fn a_deep_proof_the_budget_cannot_afford_is_deferred_not_removed() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let session = broker.start_worktree("squashed", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(&worktree, "feature.txt", "work\n", "feature");
@@ -236,7 +238,7 @@ fn a_deep_proof_the_budget_cannot_afford_is_deferred_not_removed() {
 #[test]
 fn an_open_session_keeps_its_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, false);
     let report = run(&mut broker);
     assert!(report.removed.is_empty(), "{report:#?}");
@@ -246,7 +248,7 @@ fn an_open_session_keeps_its_checkout() {
 #[test]
 fn a_tracked_change_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::write(worktree.join("feature.txt"), "edited\n").unwrap();
     let report = run(&mut broker);
@@ -257,7 +259,7 @@ fn a_tracked_change_keeps_the_checkout() {
 #[test]
 fn an_untracked_file_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::write(worktree.join("notes.md"), "mine\n").unwrap();
     let report = run(&mut broker);
@@ -268,7 +270,7 @@ fn an_untracked_file_keeps_the_checkout() {
 #[test]
 fn a_valuable_ignored_file_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::write(worktree.join(".env"), "SECRET=1\n").unwrap();
     let report = run(&mut broker);
@@ -279,7 +281,7 @@ fn a_valuable_ignored_file_keeps_the_checkout() {
 #[test]
 fn a_stash_made_on_the_branch_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::write(worktree.join("feature.txt"), "stashed\n").unwrap();
     git(&worktree, &["stash", "-q"]);
@@ -291,7 +293,7 @@ fn a_stash_made_on_the_branch_keeps_the_checkout() {
 #[test]
 fn a_rebase_in_progress_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let git_dir = git_out(&worktree, &["rev-parse", "--absolute-git-dir"]);
     std::fs::create_dir_all(Path::new(&git_dir).join("rebase-merge")).unwrap();
@@ -303,7 +305,7 @@ fn a_rebase_in_progress_keeps_the_checkout() {
 #[test]
 fn a_commit_not_on_the_remote_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let session = broker.start_worktree("unpushed", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(&worktree, "feature.txt", "work\n", "feature");
@@ -316,7 +318,7 @@ fn a_commit_not_on_the_remote_keeps_the_checkout() {
 #[test]
 fn a_commit_only_in_a_local_branch_is_not_contained() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let session = broker.start_worktree("local only", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     let head = commit(&worktree, "feature.txt", "work\n", "feature");
@@ -332,7 +334,7 @@ fn a_commit_only_in_a_local_branch_is_not_contained() {
 #[test]
 fn no_fetched_remote_default_keeps_everything() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     git(
         &fx.repo,
@@ -346,7 +348,7 @@ fn no_fetched_remote_default_keeps_everything() {
 #[test]
 fn a_running_gate_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let run_dir = fx.repo.join(".aethyme/run/gates");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -364,7 +366,7 @@ fn a_running_gate_keeps_the_checkout() {
 #[test]
 fn a_process_in_the_checkout_keeps_it() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let mut child = Command::new("sleep")
         .arg("30")
@@ -388,7 +390,7 @@ fn closing_releases_leases_so_none_can_hold_a_closed_checkout() {
     // closed checkout never has a holding lease of its own. The lease proof
     // stays as a guard; this pins the invariant it relies on.
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (session_id, worktree, _) = merged_closed_session(&fx, &mut broker, false);
     broker.claim_lease(session_id, "feature.txt", None).unwrap();
     broker.close(session_id).unwrap();
@@ -407,7 +409,7 @@ fn closing_releases_leases_so_none_can_hold_a_closed_checkout() {
 #[test]
 fn a_live_session_that_adopted_the_closed_checkout_keeps_it() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let adopted = broker.adopt(&worktree, Some("picked up again")).unwrap();
     let report = run(&mut broker);
@@ -422,7 +424,7 @@ fn a_live_session_that_adopted_the_closed_checkout_keeps_it() {
 #[test]
 fn a_change_between_selection_and_removal_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
     assert_eq!(plan.selected_worktrees().len(), 1);
@@ -436,7 +438,7 @@ fn a_change_between_selection_and_removal_keeps_the_checkout() {
 #[test]
 fn a_head_moved_after_selection_is_proved_again_not_reused() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
     assert_eq!(plan.selected_worktrees().len(), 1);
@@ -452,7 +454,7 @@ fn a_head_moved_after_selection_is_proved_again_not_reused() {
 #[test]
 fn removal_past_the_selection_deadline_defers_all_but_the_first() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, first, _) = merged_closed_session(&fx, &mut broker, true);
     let (_, second, _) = merged_closed_session(&fx, &mut broker, true);
     // Removal finds the budget already spent, as it does when a broker open
@@ -475,7 +477,7 @@ fn removal_past_the_selection_deadline_defers_all_but_the_first() {
 #[test]
 fn auto_remove_false_disables_it_and_keep_pins_and_regenerable_globs_apply() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::create_dir_all(fx.repo.join(".aethyme")).unwrap();
     let config = fx.repo.join(".aethyme/config.toml");
@@ -521,7 +523,7 @@ fn auto_remove_false_disables_it_and_keep_pins_and_regenerable_globs_apply() {
 #[test]
 fn the_primary_checkout_and_non_broker_worktrees_are_never_removed() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     // A worktree the broker did not create, adopted and closed.
     let foreign = fx.repo.parent().unwrap().join("foreign");
     git(
@@ -560,7 +562,7 @@ fn ignore(fx: &Fixture, pattern: &str) {
 #[test]
 fn ignored_code_under_build_without_a_manifest_keeps_the_checkout() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     ignore(&fx, "build/");
     std::fs::create_dir_all(worktree.join("build")).unwrap();
@@ -576,7 +578,7 @@ fn ignored_code_under_build_without_a_manifest_keeps_the_checkout() {
 #[test]
 fn a_prefix_named_directory_is_not_build_output() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     ignore(&fx, "target-notes/");
     std::fs::create_dir_all(worktree.join("target-notes")).unwrap();
@@ -593,7 +595,7 @@ fn a_prefix_named_directory_is_not_build_output() {
 #[test]
 fn a_symlink_leaving_the_worktree_keeps_it() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let elsewhere = tempfile::tempdir().unwrap();
     std::fs::write(elsewhere.path().join("precious.txt"), "keep\n").unwrap();
@@ -610,7 +612,7 @@ fn a_symlink_leaving_the_worktree_keeps_it() {
 #[test]
 fn a_regenerable_glob_that_could_match_a_secret_is_rejected() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::create_dir_all(fx.repo.join(".aethyme")).unwrap();
     std::fs::write(
@@ -634,7 +636,7 @@ fn a_regenerable_glob_that_could_match_a_secret_is_rejected() {
 #[test]
 fn an_unreadable_checkout_status_keeps_it() {
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     // A corrupt index makes `git status` fail: not knowing is not clean.
     let git_dir = git_out(&worktree, &["rev-parse", "--absolute-git-dir"]);
@@ -654,7 +656,7 @@ fn a_live_session_recorded_through_a_symlinked_root_keeps_the_checkout() {
     // `/private/tmp`) records a live session's worktree under a different
     // spelling than the closed one. It is still the same checkout.
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let alias_root = fx.repo.parent().unwrap().join("host-state-alias");
     std::os::unix::fs::symlink(worktree.parent().unwrap(), &alias_root).unwrap();
@@ -691,7 +693,7 @@ fn an_unclaimed_worktree_is_never_removed() {
     // live session's own checkout the broker failed to match -- has no owner
     // the proofs can be about, so it is never a candidate.
     let fx = fixture();
-    let mut broker = Broker::open(&fx.repo).unwrap();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, owned, _) = merged_closed_session(&fx, &mut broker, true);
     let stray = owned.parent().unwrap().join("unclaimed-stray");
     git(

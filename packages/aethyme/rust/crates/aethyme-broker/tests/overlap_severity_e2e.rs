@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{Broker, OverlapSeverity};
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 
@@ -112,9 +115,9 @@ fn aethyme_now_ms() -> i64 {
 /// refreshed; a new event only when the pair's severity changes.
 #[test]
 fn a_pair_is_announced_once_and_again_only_when_its_severity_changes() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let wt_a = add_worktree(tmp.path(), "a");
     let wt_b = add_worktree(tmp.path(), "b");
     broker.adopt(&wt_a, Some("a")).unwrap();
@@ -160,9 +163,9 @@ fn a_pair_is_announced_once_and_again_only_when_its_severity_changes() {
 
 #[test]
 fn disjoint_hunks_in_one_file_are_low_and_do_not_block_submit() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let wt_owner = add_worktree(tmp.path(), "owner");
     let wt_other = add_worktree(tmp.path(), "other");
     let owner = broker.adopt(&wt_owner, None).unwrap();
@@ -191,9 +194,9 @@ fn disjoint_hunks_in_one_file_are_low_and_do_not_block_submit() {
 /// The owner's edit is uncommitted: classification must see it anyway.
 #[test]
 fn overlapping_hunks_with_an_active_holder_block_submit() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let wt_owner = add_worktree(tmp.path(), "owner");
     let wt_other = add_worktree(tmp.path(), "other");
     let owner = broker.adopt(&wt_owner, None).unwrap();
@@ -226,9 +229,9 @@ fn overlapping_hunks_with_an_active_holder_block_submit() {
 /// make it look active again.
 #[test]
 fn a_conflict_with_a_stale_holder_only_warns() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let wt_owner = add_worktree(tmp.path(), "owner");
     let wt_other = add_worktree(tmp.path(), "other");
     let owner = broker.adopt(&wt_owner, None).unwrap();
@@ -255,9 +258,9 @@ fn a_conflict_with_a_stale_holder_only_warns() {
 
 #[test]
 fn a_directory_claim_over_a_file_its_holder_never_edited_is_low() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let wt_owner = add_worktree(tmp.path(), "owner");
     let wt_other = add_worktree(tmp.path(), "other");
     let owner = broker.adopt(&wt_owner, None).unwrap();

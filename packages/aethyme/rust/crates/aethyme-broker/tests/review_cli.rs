@@ -697,7 +697,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
         None,
     );
     assert!(!premature.status.success());
-    assert!(String::from_utf8_lossy(&premature.stderr).contains("successful broker submission"));
+    assert!(json_error::message(&premature).contains("successful broker submission"));
     assert!(fixture.writes().is_empty());
 
     let submit = fixture.run(&["submit", "--session", &id, "--json"], &head, true, None);
@@ -733,7 +733,7 @@ fn review_cli_requires_submission_revalidates_evidence_and_unlocks_once() {
         None,
     );
     assert!(!drift.status.success());
-    assert!(String::from_utf8_lossy(&drift.stderr).contains("head drifted"));
+    assert!(json_error::message(&drift).contains("head drifted"));
     assert_eq!(
         fixture
             .writes()
@@ -955,7 +955,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
         None,
     );
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("exact pull request head"));
+    assert!(json_error::message(&refused).contains("exact pull request head"));
 
     let truncated = r#"{"total_count":101,"check_runs":[]}"#;
     let refused = fixture.run_with_check(
@@ -966,7 +966,7 @@ fn trusted_check_run_can_satisfy_review_without_an_approval_webhook() {
         None,
     );
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("truncated"));
+    assert!(json_error::message(&refused).contains("truncated"));
 
     let satisfied = check_run_evidence(&head, "github-actions", "success");
     let unlocked = fixture.run_with_check(
@@ -1177,7 +1177,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
         Some("outage"),
     );
     assert!(!mutate_closed.status.success());
-    let closed_error = String::from_utf8_lossy(&mutate_closed.stderr);
+    let closed_error = json_error::message(&mutate_closed);
     assert!(closed_error.contains("session") && closed_error.contains("is closed"));
     assert!(closed_error.contains("review reassign"));
     assert!(closed_error.contains("review abandon"));
@@ -1211,7 +1211,7 @@ fn closed_review_lifecycle_can_be_reassigned_or_abandoned_without_losing_audit_h
         None,
     );
     assert!(!duplicate.status.success());
-    let duplicate_error = String::from_utf8_lossy(&duplicate.stderr);
+    let duplicate_error = json_error::message(&duplicate);
     assert!(
         duplicate_error.contains("already owned by session"),
         "{duplicate_error}"
@@ -2137,3 +2137,6 @@ fn a_refusal_a_later_request_superseded_stops_being_reported() {
             .any(|item| item["id"] == "review.provider-refusals")
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

@@ -5,8 +5,8 @@ use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
-    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker, BrokerOpError,
-    DeliveryExecutionReport, EntryExposureResolutionKind, EntryExposureState,
+    AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker,
+    BrokerOpError, DeliveryExecutionReport, EntryExposureResolutionKind, EntryExposureState,
     IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance, OperationStatus,
     RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
 };
@@ -1125,6 +1125,31 @@ fn ship_plan_only_builds_and_gates_exactly_one_independent_entry() {
     );
     let refs_before = fixture.refs();
     let mut broker = fixture.broker();
+    let selected_entry = broker
+        .store()
+        .merge_queue_entry(selected)
+        .expect("selected promoted entry");
+    let submitted_base_is_not_head_ancestor = Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            selected_entry.base_commit.as_str(),
+            selected_entry.head_commit.as_str(),
+        ])
+        .current_dir(&fixture.repo)
+        .status()
+        .unwrap();
+    assert!(
+        !submitted_base_is_not_head_ancestor.success(),
+        "the later sibling's submitted integration base should not be its source head's ancestor"
+    );
+    // A later reuse can advance this session field after the queue entry was
+    // promoted. The queued promotion remains the immutable source of the
+    // selected patch.
+    broker
+        .store()
+        .set_session_diff_base(selected_entry.session_id, &integration)
+        .unwrap();
 
     let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
 
@@ -1144,6 +1169,10 @@ fn ship_plan_only_builds_and_gates_exactly_one_independent_entry() {
     );
     let verification = plan.only_verification.as_ref().unwrap();
     assert_eq!(verification.base_sha, fixture.remote_main());
+    let selected_promotion = plan.included_entries[0].promotion_sha.as_str();
+    let promotion_parent = format!("{selected_promotion}^1");
+    let promotion_parent = git_output(&fixture.repo, &["rev-parse", &promotion_parent]);
+    assert_eq!(verification.source_base_sha, promotion_parent);
     assert_eq!(verification.changed_files, vec!["second.txt"]);
     assert_eq!(verification.selected_gates.len(), 1);
     assert_eq!(verification.selected_gates[0].gate, "ship-only-selected");
@@ -1167,6 +1196,91 @@ fn ship_plan_only_builds_and_gates_exactly_one_independent_entry() {
         "second"
     );
     assert_eq!(fixture.refs(), refs_before, "planning must not move refs");
+}
+
+#[test]
+fn ship_plan_only_uses_submitted_entry_base_after_reuse_sync() {
+    let fixture = Fixture::new();
+    let mut broker = fixture.broker();
+    let resumed = broker.start_worktree("ship-only-resumed", None).unwrap();
+    let resumed_worktree = PathBuf::from(&resumed.worktree_path);
+    let adopted_head = resumed.adopted_head.clone().unwrap();
+
+    let earlier = broker.start_worktree("ship-only-earlier", None).unwrap();
+    let earlier_worktree = PathBuf::from(&earlier.worktree_path);
+    std::fs::write(earlier_worktree.join("earlier.txt"), "earlier\n").unwrap();
+    git(&earlier_worktree, &["add", "earlier.txt"]);
+    git(
+        &earlier_worktree,
+        &["commit", "-qm", "feat: earlier promotion"],
+    );
+    let first = broker.submit(earlier.id).unwrap();
+    assert!(first.promoted);
+
+    let integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+    assert_ne!(integration, adopted_head);
+    git(&resumed_worktree, &["reset", "--hard", &integration]);
+    let reuse = broker
+        .adopt_with_options(
+            &resumed_worktree,
+            Some("replay after integration sync"),
+            AdoptOptions {
+                mode: AdoptMode::Reuse,
+                sync_integration: true,
+                planned_paths: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        reuse.session.adopted_head.as_deref(),
+        Some(adopted_head.as_str())
+    );
+    assert_eq!(
+        reuse.session.diff_base.as_deref(),
+        Some(integration.as_str())
+    );
+
+    std::fs::write(resumed_worktree.join("selected.txt"), "selected\n").unwrap();
+    git(&resumed_worktree, &["add", "selected.txt"]);
+    git(
+        &resumed_worktree,
+        &["commit", "-qm", "feat: selected entry"],
+    );
+    let selected = broker.submit(resumed.id).unwrap();
+    assert!(selected.promoted);
+    assert_eq!(selected.entry.base_commit, integration);
+
+    let plan = broker
+        .ship_plan_only_with_delivery(selected.entry.id, None)
+        .unwrap();
+    let verification = plan.only_verification.unwrap();
+    assert_eq!(verification.source_base_sha, integration);
+    assert_eq!(verification.changed_files, vec!["selected.txt"]);
+    assert_eq!(plan.included_entries.len(), 1);
+    assert_eq!(plan.included_entries[0].queue_entry_id, selected.entry.id);
+    assert!(
+        plan.excluded_entries
+            .iter()
+            .any(|entry| entry.queue_entry_id == first.entry.id)
+    );
+    assert_eq!(
+        git_output(
+            &fixture.repo,
+            &["show", &format!("{}:selected.txt", plan.publication_sha)]
+        ),
+        "selected"
+    );
+    let earlier_in_tree = Command::new("git")
+        .args([
+            "cat-file",
+            "-e",
+            &format!("{}:earlier.txt", plan.publication_sha),
+        ])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(!earlier_in_tree.status.success());
 }
 
 #[cfg(unix)]
@@ -1361,30 +1475,226 @@ fn ship_plan_only_publishes_the_promotion_message_and_identities() {
 }
 
 #[test]
+fn ship_plan_only_refuses_an_unshipped_ancestor_only_dependency() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        fixture.repo.join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    let mut broker = fixture.broker();
+    let initial_integration = broker.integration_head().unwrap().1;
+    let first_session = broker.start_worktree("ancestry-first", None).unwrap();
+    let selected_session = broker.start_worktree("ancestry-selected", None).unwrap();
+    let first_worktree = PathBuf::from(&first_session.worktree_path);
+    let selected_worktree = PathBuf::from(&selected_session.worktree_path);
+
+    std::fs::write(first_worktree.join("first.txt"), "first\n").unwrap();
+    git(&first_worktree, &["add", "first.txt"]);
+    git(
+        &first_worktree,
+        &["commit", "-qm", "feat: earlier independent entry"],
+    );
+    let first = broker.submit(first_session.id).unwrap();
+    assert!(!first.promoted, "manual mode keeps the candidate unshipped");
+    assert_eq!(first.entry.base_commit, initial_integration);
+    let first_details: serde_json::Value = serde_json::from_str(
+        first
+            .entry
+            .details_json
+            .as_deref()
+            .expect("verified first entry has candidate details"),
+    )
+    .unwrap();
+    let earlier_candidate = first_details["merge_commit"]
+        .as_str()
+        .expect("verified first entry records its candidate commit")
+        .to_owned();
+
+    std::fs::write(selected_worktree.join("second.txt"), "second\n").unwrap();
+    git(&selected_worktree, &["add", "second.txt"]);
+    git(
+        &selected_worktree,
+        &["commit", "-qm", "feat: selected without Depends-On"],
+    );
+    git(
+        &selected_worktree,
+        &[
+            "merge",
+            "--no-ff",
+            "-m",
+            "include verified earlier promotion candidate",
+            earlier_candidate.as_str(),
+        ],
+    );
+    let selected = broker.submit(selected_session.id).unwrap();
+    assert!(!selected.promoted, "manual mode leaves both entries queued");
+    assert_eq!(selected.entry.base_commit, initial_integration);
+    let selected_queued_entry = broker
+        .store()
+        .merge_queue_entry(selected.entry.id)
+        .expect("selected queued entry");
+    assert_eq!(selected_queued_entry.base_commit, initial_integration);
+    assert_eq!(
+        selected_queued_entry.head_commit,
+        selected.entry.head_commit
+    );
+
+    broker.promote(first.entry.id).unwrap();
+    let earlier_promotion = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+    assert_eq!(earlier_promotion, earlier_candidate);
+    broker.promote(selected.entry.id).unwrap();
+    let selected_promotion = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
+
+    let earlier_parent = format!("{earlier_promotion}^1");
+    let earlier_paths = git_output(
+        &fixture.repo,
+        &["diff", "--name-only", &earlier_parent, &earlier_promotion],
+    );
+    let selected_parent = git_output(
+        &fixture.repo,
+        &["rev-parse", &format!("{selected_promotion}^1")],
+    );
+    let selected_paths = git_output(
+        &fixture.repo,
+        &["diff", "--name-only", &selected_parent, &selected_promotion],
+    );
+    assert_eq!(earlier_paths, "first.txt");
+    assert_eq!(selected_paths, "second.txt");
+
+    let selected_entry = broker
+        .store()
+        .merge_queue_entry(selected.entry.id)
+        .expect("selected promoted entry");
+    let base_contains_earlier = Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            earlier_promotion.as_str(),
+            selected_entry.base_commit.as_str(),
+        ])
+        .current_dir(&fixture.repo)
+        .status()
+        .unwrap()
+        .success();
+    let head_contains_earlier = Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            earlier_promotion.as_str(),
+            selected_entry.head_commit.as_str(),
+        ])
+        .current_dir(&fixture.repo)
+        .status()
+        .unwrap()
+        .success();
+    assert_eq!(selected_entry.base_commit, initial_integration);
+    assert!(
+        !base_contains_earlier,
+        "the selected entry base predates the earlier promotion"
+    );
+    assert!(
+        head_contains_earlier,
+        "the selected source head carries the earlier promotion"
+    );
+    assert!(
+        !git_output(
+            &fixture.repo,
+            &["show", "-s", "--format=%B", &selected_entry.head_commit]
+        )
+        .contains("Depends-On:")
+    );
+
+    let refs_before = fixture.refs();
+    let error = broker
+        .ship_plan_only_with_delivery(selected.entry.id, None)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("ancestry dependency"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(fixture.refs(), refs_before, "a refusal must not move refs");
+}
+
+#[test]
 fn ship_plan_only_allows_an_entry_based_on_an_earlier_independent_promotion() {
     let fixture = Fixture::new();
-    let (first, selected, _) = fixture.promoted_siblings(
-        "first.txt",
-        "first\n",
-        "second.txt",
-        "second\n",
-        "feat: second based on integration",
-    );
     let mut broker = fixture.broker();
+    let first_session = broker.start_worktree("inherited-first", None).unwrap();
+    let first_worktree = PathBuf::from(&first_session.worktree_path);
+    std::fs::write(first_worktree.join("first.txt"), "first\n").unwrap();
+    git(&first_worktree, &["add", "first.txt"]);
+    git(
+        &first_worktree,
+        &["commit", "-qm", "feat: earlier independent entry"],
+    );
+    let first = broker.submit(first_session.id).unwrap();
+    assert!(first.promoted);
+    let earlier_promotion = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
 
-    let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
+    let selected_session = broker.start_worktree("inherited-selected", None).unwrap();
+    let selected_worktree = PathBuf::from(&selected_session.worktree_path);
+    std::fs::write(selected_worktree.join("second.txt"), "second\n").unwrap();
+    git(&selected_worktree, &["add", "second.txt"]);
+    git(
+        &selected_worktree,
+        &["commit", "-qm", "feat: second based on integration"],
+    );
+    let selected = broker.submit(selected_session.id).unwrap();
+    assert!(selected.promoted);
+    let selected_entry = broker
+        .store()
+        .merge_queue_entry(selected.entry.id)
+        .expect("selected promoted entry");
+
+    for descendant in [
+        selected_entry.base_commit.as_str(),
+        selected_entry.head_commit.as_str(),
+    ] {
+        assert!(
+            Command::new("git")
+                .args([
+                    "merge-base",
+                    "--is-ancestor",
+                    earlier_promotion.as_str(),
+                    descendant,
+                ])
+                .current_dir(&fixture.repo)
+                .status()
+                .unwrap()
+                .success(),
+            "the earlier promotion should be inherited by {descendant}"
+        );
+    }
+    assert!(
+        !git_output(
+            &fixture.repo,
+            &["show", "-s", "--format=%B", &selected_entry.head_commit]
+        )
+        .contains("Depends-On:")
+    );
+
+    let plan = broker
+        .ship_plan_only_with_delivery(selected.entry.id, None)
+        .unwrap();
 
     assert_eq!(
         plan.included_entries
             .iter()
             .map(|entry| entry.queue_entry_id)
             .collect::<Vec<_>>(),
-        vec![selected]
+        vec![selected.entry.id]
     );
     assert!(
         plan.excluded_entries
             .iter()
-            .any(|entry| entry.queue_entry_id == first)
+            .any(|entry| entry.queue_entry_id == first.entry.id)
+    );
+    assert_eq!(
+        plan.only_verification.as_ref().unwrap().changed_files,
+        vec!["second.txt"]
     );
 }
 

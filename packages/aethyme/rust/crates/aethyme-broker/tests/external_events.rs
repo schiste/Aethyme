@@ -1,11 +1,14 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{
     Broker, ExternalEventEnvelope, ExternalEventProvider, ExternalEventReconciliation,
     ExternalEventStatus, ExternalVerificationMethod, NewPrWatchState, SessionStatus,
     VerifiedExternalSource, external_event_digest,
 };
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const NOW: i64 = 2_000_000_000_000;
 
@@ -27,15 +30,15 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "initial\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    git(tmp.path(), &["add", "-A"]);
-    git(tmp.path(), &["commit", "-qm", "initial"]);
+fn fixture() -> FixtureRepository {
+    let fixture = FixtureRepository::new();
+    git(fixture.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(fixture.path().join("README.md"), "initial\n").unwrap();
+    std::fs::write(fixture.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(fixture.path(), &["add", "-A"]);
+    git(fixture.path(), &["commit", "-qm", "initial"]);
     git(
-        tmp.path(),
+        fixture.path(),
         &[
             "remote",
             "add",
@@ -43,7 +46,7 @@ fn fixture() -> tempfile::TempDir {
             "https://adapter:credential@github.com/acme/product.git",
         ],
     );
-    tmp
+    fixture
 }
 
 fn worktree(root: &Path, name: &str) -> std::path::PathBuf {
@@ -101,9 +104,9 @@ fn known_pr(broker: &mut Broker, pr_number: i64, session_id: Option<i64>) {
 
 #[test]
 fn allowlisted_events_create_non_blocking_advisories_and_redelivery_is_idempotent() {
-    let tmp = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let wt = worktree(tmp.path(), "SECRET-host-path");
+    let fixture = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let wt = worktree(fixture.path(), "SECRET-host-path");
     let session = broker
         .adopt(&wt, Some("SECRET task text and comment body"))
         .unwrap();
@@ -111,7 +114,7 @@ fn allowlisted_events_create_non_blocking_advisories_and_redelivery_is_idempoten
     git(&wt, &["add", "README.md"]);
     git(&wt, &["commit", "-qm", "owned"]);
     let owned_commit = git(&wt, &["rev-parse", "HEAD"]);
-    let base = git(tmp.path(), &["rev-parse", "main"]);
+    let base = git(fixture.path(), &["rev-parse", "main"]);
     let queue = broker
         .store()
         .submit(session.id, &owned_commit, &base)
@@ -176,23 +179,23 @@ fn allowlisted_events_create_non_blocking_advisories_and_redelivery_is_idempoten
         );
     }
     let projection =
-        std::fs::read_to_string(tmp.path().join(".aethyme/broker-advisory.md")).unwrap();
+        std::fs::read_to_string(fixture.path().join(".aethyme/broker-advisory.md")).unwrap();
     assert!(projection.contains("external_event_type"));
 }
 
 #[test]
 fn ownership_resolution_handles_rewrites_closure_ambiguity_unknown_prs_and_staleness() {
-    let tmp = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let first_wt = worktree(tmp.path(), "first");
-    let second_wt = worktree(tmp.path(), "second");
+    let fixture = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let first_wt = worktree(fixture.path(), "first");
+    let second_wt = worktree(fixture.path(), "second");
     let first = broker.adopt(&first_wt, None).unwrap();
     let second = broker.adopt(&second_wt, None).unwrap();
     std::fs::write(first_wt.join("README.md"), "first\n").unwrap();
     git(&first_wt, &["add", "README.md"]);
     git(&first_wt, &["commit", "-qm", "first"]);
     let old_commit = git(&first_wt, &["rev-parse", "HEAD"]);
-    let base = git(tmp.path(), &["rev-parse", "main"]);
+    let base = git(fixture.path(), &["rev-parse", "main"]);
     broker.store().submit(first.id, &old_commit, &base).unwrap();
     std::fs::write(first_wt.join("README.md"), "rewritten followup\n").unwrap();
     git(&first_wt, &["add", "README.md"]);
@@ -254,9 +257,9 @@ fn ownership_resolution_handles_rewrites_closure_ambiguity_unknown_prs_and_stale
 
 #[test]
 fn unresolved_events_require_explicit_redacted_reconciliation_and_strict_inputs() {
-    let tmp = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let wt = worktree(tmp.path(), "operator");
+    let fixture = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let wt = worktree(fixture.path(), "operator");
     let session = broker.adopt(&wt, None).unwrap();
     let unknown_commit = "a".repeat(40);
     known_pr(&mut broker, 55, None);

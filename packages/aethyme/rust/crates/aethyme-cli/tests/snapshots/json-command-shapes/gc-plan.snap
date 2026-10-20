@@ -1,0 +1,122 @@
+{
+  "artifacts": [],
+  "auto_cleanup": {
+    "deferred": "integer",
+    "enabled": "bool",
+    "evaluated_at_ms": "integer",
+    "kept": [
+      {
+        "reason": "string",
+        "sessions": [
+          "integer"
+        ],
+        "worktree": "string"
+      }
+    ],
+    "removed": []
+  },
+  "blocker_summary": [
+    {
+      "age_exceeded": "bool",
+      "age_policy_days": "integer",
+      "count": "integer",
+      "kind": "string",
+      "oldest_age_days": "integer",
+      "oldest_id": "integer",
+      "oldest_recorded_at": "integer",
+      "retained_bytes": "integer"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "integer",
+      "kind": "string",
+      "reason": "string"
+    }
+  ],
+  "budget_verdict": "string",
+  "clears_retained_bytes_budget": "bool",
+  "closed_worktrees": {
+    "adopted_count": "integer",
+    "command": "string",
+    "count": "integer",
+    "eligibility_not_inspected_count": "integer",
+    "estimated_bytes": "integer",
+    "unmeasured_count": "integer"
+  },
+  "declined_artifacts": [],
+  "digest": "string",
+  "estimated_blocked_bytes": "integer",
+  "estimated_blocked_inodes": "integer",
+  "estimated_build_output_reclaimable_bytes": "integer",
+  "estimated_build_output_reclaimable_inodes": "integer",
+  "estimated_declined_artifact_bytes": "integer",
+  "estimated_declined_artifact_inodes": "integer",
+  "estimated_reclaimable_bytes": "integer",
+  "estimated_reclaimable_inodes": "integer",
+  "estimated_retained_bytes": "integer",
+  "estimated_retained_inodes": "integer",
+  "evaluated_at": "integer",
+  "files": [],
+  "gate_cache": {
+    "active_bytes": "integer",
+    "active_inodes": "integer",
+    "budget_bytes": "integer",
+    "entries": [],
+    "held_bytes": "integer",
+    "held_inodes": "integer",
+    "holders": [
+      "string"
+    ],
+    "include_active": "bool",
+    "reclaimable_bytes": "integer",
+    "reclaimable_inodes": "integer",
+    "repository_key": "string",
+    "root": "string",
+    "total_bytes": "integer",
+    "total_inodes": "integer"
+  },
+  "gate_caches": [],
+  "orphans": [],
+  "policy": {
+    "artefact_directories": [],
+    "artifact_reclaim_days": "integer",
+    "artifact_sweep_budget_ms": "integer",
+    "artifact_sweep_interval_hours": "integer",
+    "auto_cleanup_worktrees_on_finish": "bool",
+    "closed_worktree_grace_hours": "integer",
+    "closed_worktrees_days": "integer",
+    "command_metrics_days": "integer",
+    "gate_cache_bytes_budget": "integer",
+    "gate_results_days": "integer",
+    "idle_session_artifact_hours": "integer",
+    "orphan_worktree_roots_days": "integer",
+    "publication_exposure_days": "integer",
+    "recovery_archive_days": "integer",
+    "retained_bytes_budget": "integer",
+    "routine_size_budget_ms": "integer",
+    "schema_version": "integer",
+    "session_abandoned_after_hours": "integer",
+    "size_record_ttl_hours": "integer",
+    "startup_budget_ms": "integer",
+    "terminal_events_days": "integer",
+    "terminal_merge_queue_days": "integer"
+  },
+  "reclaim_order": "string",
+  "reconciliation": {
+    "claimed_count": "integer",
+    "directory_count": "integer",
+    "scanned_root_count": "integer",
+    "schema_version": "integer",
+    "sized": "bool",
+    "unclaimed": [],
+    "unclaimed_bytes": "integer",
+    "unclaimed_count": "integer"
+  },
+  "retained_bytes_deficit": "integer",
+  "rows": [],
+  "schema_version": "integer",
+  "sizes_measured_at_ms": "null",
+  "unmeasured_directory_count": "integer",
+  "worktrees": []
+}

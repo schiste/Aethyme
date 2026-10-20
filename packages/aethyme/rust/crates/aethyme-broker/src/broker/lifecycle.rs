@@ -1324,7 +1324,7 @@ fn refused_worktree_root_plan(
     }
 }
 
-fn plan_worktree_root_with_context(
+pub(crate) fn plan_worktree_root_with_context(
     main_root: &Path,
     git_common_dir: Option<&Path>,
     context: &BrokerStorageContext,
@@ -5047,5 +5047,45 @@ mod artifact_sweep_namespace_tests {
             !missing.exists(),
             "capture must not create the override root"
         );
+    }
+}
+
+#[cfg(test)]
+mod graph_write_fence_tests {
+    #[test]
+    fn mutable_open_enrolls_graph_fence_and_snapshot_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["commit", "--allow-empty", "-qm", "init"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root).unwrap();
+        let marker = root
+            .join(".git")
+            .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER);
+        assert!(marker.is_file());
+        drop(broker);
+        std::fs::remove_file(&marker).unwrap();
+        let snapshot = super::Broker::open_snapshot(&root).unwrap();
+        assert!(
+            !marker.exists(),
+            "read-only snapshot must not enroll a marker"
+        );
+        drop(snapshot);
+        let _broker = storage.open(&root).unwrap();
+        assert!(marker.is_file());
     }
 }

@@ -155,6 +155,8 @@ impl RedbSignalContext {
 }
 
 fn is_surface_flow_edge(kind: &EdgeKind) -> bool {
+    // Tests edges describe verification relationships, not runtime surface
+    // flow or coupling, so they intentionally stay outside these signals.
     matches!(
         kind,
         EdgeKind::Authorizes

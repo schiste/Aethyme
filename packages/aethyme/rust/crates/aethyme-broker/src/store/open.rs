@@ -5,7 +5,13 @@ impl BrokerStore {
     /// repository root: `<repo>/.aethyme/broker.db`, or wherever
     /// [`crate::BROKER_DB_ENV`] points.
     pub fn open_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        Self::open(&crate::broker_db_path(repo_root)?)
+        let path = crate::broker_db_path(repo_root)?;
+        Self::open_repository_path(repo_root, &path)
+    }
+
+    fn open_repository_path(repo_root: &Path, path: &Path) -> Result<Self, BrokerError> {
+        enroll_repository_graph_fence(repo_root)?;
+        Self::open(path)
     }
 
     /// Open the current broker schema without creating, migrating, or
@@ -137,6 +143,7 @@ impl BrokerStore {
         if !path.is_file() {
             return Ok(None);
         }
+        enroll_repository_graph_fence(repo_root)?;
         // No `SQLITE_OPEN_CREATE`: an absent database stays absent even if it
         // is deleted between the check above and this open.
         let conn = Connection::open_with_flags(
@@ -1226,6 +1233,18 @@ impl BrokerStore {
         result: &NewGateResult,
         environment: &GateEnvironment,
     ) -> Result<i64, BrokerError> {
+        self.record_gate_result_with_execution_profile(result, environment, None)
+    }
+
+    /// Record an executed gate result with the profile used by the cache key.
+    /// A missing profile is preserved as NULL and can never satisfy the
+    /// execution-profile cache lookup.
+    pub fn record_gate_result_with_execution_profile(
+        &mut self,
+        result: &NewGateResult,
+        environment: &GateEnvironment,
+        cache_provenance: Option<&crate::GateCacheProvenance>,
+    ) -> Result<i64, BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1233,9 +1252,10 @@ impl BrokerStore {
                                        failure_class, exit_code, duration_ms, log_path,
                                        session_id, created_at, wait_duration_ms,
                                        first_output_ms, output_bytes, load_avg_1m_start,
-                                       load_avg_1m_end, cpu_count, free_disk_bytes_start)
+                                       load_avg_1m_end, cpu_count, free_disk_bytes_start,
+                                       execution_profile_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17)",
+                     ?16, ?17, ?18)",
             params![
                 result.gate_name,
                 result.tree_hash,
@@ -1254,6 +1274,8 @@ impl BrokerStore {
                 environment.load_avg_1m_end,
                 environment.cpu_count,
                 environment.free_disk_bytes_start,
+                cache_provenance
+                    .and_then(|provenance| provenance.execution_profile_digest.as_deref()),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1266,9 +1288,108 @@ impl BrokerStore {
                 &result.gate_name,
                 &result.tree_hash,
                 result.failure_class,
+                id,
+                cache_provenance,
             )),
         )?;
         tx.commit()?;
         Ok(id)
+    }
+}
+
+// The repository-aware mutable open is the enrollment boundary, including
+// callers that use BrokerStore directly. Resolve gate scope before reaching
+// this helper; enroll before SQLite can create or migrate any file.
+fn enroll_repository_graph_fence(repo_root: &Path) -> Result<(), BrokerError> {
+    let enroll = || -> std::io::Result<()> {
+        let root = repo_root.canonicalize()?;
+        for (depth, ancestor) in root.ancestors().enumerate() {
+            if depth >= 256 {
+                return Err(std::io::Error::other(
+                    "Git metadata search exceeds component budget",
+                ));
+            }
+            let git = ancestor.join(".git");
+            match std::fs::symlink_metadata(&git) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    return aethyme_graph_storage::mark_broker_managed_graph(&git);
+                }
+                Ok(_) => {
+                    let common =
+                        crate::git::with_git_deadline(std::time::Duration::from_secs(1), || {
+                            crate::git::GitRepo::discover(&root)?.git_common_dir()
+                        })
+                        .map_err(std::io::Error::other)?;
+                    return aethyme_graph_storage::mark_broker_managed_graph(&common);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // Explicit repository-less stores remain useful for isolated ledgers.
+        // They have no Git canonical graph publication namespace to enroll.
+        Ok(())
+    };
+    enroll().map_err(|source| BrokerError::Io {
+        path: repo_root.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(test)]
+mod graph_fence_tests {
+    use super::*;
+
+    #[test]
+    fn direct_mutable_store_with_external_database_enrolls_before_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let database = temp.path().join("external/broker.db");
+        let store = BrokerStore::open_repository_path(&root, &database).unwrap();
+        assert!(database.is_file());
+        assert!(!root.join(crate::BROKER_DB_RELPATH).exists());
+        let marker = root
+            .join(".git")
+            .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER);
+        assert!(marker.is_file());
+        assert!(aethyme_graph_storage::write_index_shard(&root, "fixture", &[]).is_err());
+        assert!(!root.join(".aethyme").exists());
+        drop(store);
+    }
+
+    #[test]
+    fn nested_repository_path_with_external_database_cannot_bypass_graph_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let nested = root.join("nested/output");
+        std::fs::create_dir_all(&nested).unwrap();
+        let database = temp.path().join("external/broker.db");
+        let store = BrokerStore::open_repository_path(&nested, &database).unwrap();
+        assert!(database.is_file());
+        assert!(
+            root.join(".git")
+                .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER)
+                .is_file()
+        );
+        assert!(aethyme_graph_storage::write_index_shard(&nested, "fixture", &[]).is_err());
+        assert!(!nested.join(".aethyme").exists());
+        drop(store);
+    }
+
+    #[test]
+    fn failed_enrollment_leaves_external_database_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let marker = root
+            .join(".git")
+            .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER);
+        std::fs::create_dir(marker).unwrap();
+        let database = temp.path().join("external/broker.db");
+        assert!(BrokerStore::open_repository_path(&root, &database).is_err());
+        assert!(!database.exists());
+        assert!(!database.parent().unwrap().exists());
     }
 }

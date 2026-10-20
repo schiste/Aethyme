@@ -1,13 +1,13 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
+mod common;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const RESOURCES_USAGE: &str =
     "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
 const OPERATIONS_USAGE: &str = "usage: aethyme broker advanced operations reconcile --operation <id|host-operation-id> \
-     --outcome <succeeded|failed> --reason <text> [--json]";
+     (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]";
 const INTEGRATION_USAGE: &str = "usage: aethyme broker advanced integration reconcile --upstream <ref> \
      [--resolution-file <path>] [--write-resolution-template <path>] \
      [--dry-run | --apply --confirm <sha256>] [--json]";
@@ -36,13 +36,26 @@ fn repository(repo: &Path) {
     git(repo, &["commit", "-qm", "initial"]);
 }
 
-fn run(repo: &Path, state: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .env("AETHYME_HOST_STATE_DIR", state)
-        .output()
-        .unwrap()
+fn run(fixture: &common::FixtureRepository, args: &[&str]) -> Output {
+    let broker = common::open_fixture_repository_broker(fixture).unwrap();
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(fixture.path());
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    drop(broker);
+    command.output().unwrap()
+}
+
+fn run_with_path(fixture: &common::FixtureRepository, args: &[&str], path: &str) -> Output {
+    let broker = common::open_fixture_repository_broker(fixture).unwrap();
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(fixture.path()).env("PATH", path);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    drop(broker);
+    command.output().unwrap()
 }
 
 fn assert_usage(output: Output, expected: &str) {
@@ -53,11 +66,9 @@ fn assert_usage(output: Output, expected: &str) {
 
 #[test]
 fn every_reconcile_usage_error_includes_the_complete_required_contract() {
-    let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    repository(&repo);
-    let state = temp.path().join("host-state");
+    let fixture = common::FixtureRepository::new();
+    let repo = fixture.path();
+    repository(repo);
 
     for args in [
         &["advanced", "resources", "reconcile"][..],
@@ -71,7 +82,7 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "bad",
         ][..],
     ] {
-        assert_usage(run(&repo, &state, args), RESOURCES_USAGE);
+        assert_usage(run(&fixture, args), RESOURCES_USAGE);
     }
 
     for args in [
@@ -87,6 +98,14 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
         &["advanced", "operations", "reconcile", "--operation"][..],
         &["advanced", "operations", "reconcile", "--outcome"][..],
         &["advanced", "operations", "reconcile", "--reason"][..],
+        &[
+            "advanced",
+            "operations",
+            "reconcile",
+            "--operation",
+            "1",
+            "--inspect-remote",
+        ][..],
         &["advanced", "operations", "reconcile", "--unexpected"][..],
         &[
             "advanced",
@@ -103,8 +122,11 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "reconcile",
             "--operation",
             "1",
+            "--inspect-remote",
             "--outcome",
-            "failed",
+            "succeeded",
+            "--reason",
+            "remote inspection must not combine with an assertion",
         ][..],
         &[
             "advanced",
@@ -129,7 +151,7 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "   ",
         ][..],
     ] {
-        assert_usage(run(&repo, &state, args), OPERATIONS_USAGE);
+        assert_usage(run(&fixture, args), OPERATIONS_USAGE);
     }
 
     for args in [
@@ -152,7 +174,7 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "--dry-run",
         ][..],
     ] {
-        assert_usage(run(&repo, &state, args), INTEGRATION_USAGE);
+        assert_usage(run(&fixture, args), INTEGRATION_USAGE);
     }
 }
 
@@ -161,18 +183,14 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
 fn originating_github_write_prints_the_complete_reconciliation_handoff() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    repository(&repo);
-    let state = temp.path().join("host-state");
-    let mut broker = Broker::open(&repo)
-        .unwrap()
-        .with_host_operation_database(state.join("host-operations.db"));
-    let session = broker.adopt(&repo, None).unwrap();
+    let fixture = common::FixtureRepository::new();
+    let repo = fixture.path();
+    repository(repo);
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let session = broker.adopt(repo, None).unwrap();
     drop(broker);
 
-    let bin = temp.path().join("bin");
+    let bin = fixture.owner_path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let gh = bin.join("gh");
     std::fs::write(
@@ -189,8 +207,9 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
         std::env::var("PATH").unwrap_or_default()
     );
     let session_id = session.id.to_string();
-    let output = Command::new(CLI)
-        .args([
+    let output = run_with_path(
+        &fixture,
+        &[
             "advanced",
             "gh",
             "--session",
@@ -207,12 +226,9 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
             "fixture",
             "--body",
             "fixture",
-        ])
-        .current_dir(&repo)
-        .env("AETHYME_HOST_STATE_DIR", &state)
-        .env("PATH", path)
-        .output()
-        .unwrap();
+        ],
+        &path,
+    );
 
     assert!(!output.status.success());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -236,8 +252,7 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
 
     let operation_id_arg = operation_id.to_string();
     let shown = run(
-        &repo,
-        &state,
+        &fixture,
         &[
             "advanced",
             "operations",
@@ -266,8 +281,7 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
     );
 
     let shown_text = run(
-        &repo,
-        &state,
+        &fixture,
         &["advanced", "operations", "show", &operation_id_arg],
     );
     assert!(shown_text.status.success());
@@ -276,3 +290,6 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
     assert!(shown_text.contains("Automatic retry: forbidden"));
     assert!(shown_text.contains("Blind retry is forbidden"));
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

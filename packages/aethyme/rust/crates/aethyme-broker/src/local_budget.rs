@@ -9,9 +9,12 @@ use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId,
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+use crate::collaboration_capture::OperationId;
 use crate::collaboration_state::CollaborationStore;
 use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::local_wave::{self as wave, WavePhase};
+
+mod managed_resolution;
 
 const SCHEMA_NAME: &str = "aethyme.local-budget/provisional-v0";
 static SCHEMA: RecordSchema = RecordSchema {
@@ -138,6 +141,7 @@ pub enum WorkKind {
     Verification,
     OptionalAnalysis,
     Recovery,
+    Resolution,
 }
 impl WorkKind {
     fn optional(self) -> bool {
@@ -172,6 +176,14 @@ impl Request {
         }
         Ok(())
     }
+}
+
+/// Selects whether an issuer admits work against a root allowance or
+/// subdivides an existing parent allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionRoute {
+    Direct,
+    Delegated { parent: RecordId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +302,46 @@ pub struct NonceLookupStatus {
     pub matches: Vec<ReservationStatus>,
 }
 
+/// Immutable command identity for the Local managed-resolution entrypoint.
+/// Every submitted reference is re-read and checked against the current owner
+/// and wave before a new budget attempt can be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedResolutionCommand {
+    pub wave: RecordId,
+    pub expected_version: i64,
+    pub request: crate::resolution::RecordRef,
+    pub source: crate::resolution::RecordRef,
+    pub client_key: OperationId,
+    pub envelope: Units,
+    pub limits: crate::resolution::DispatchLimits,
+    pub deadline_ms: i64,
+}
+
+/// Status returned for an existing managed key. It reports the retained
+/// ledger state only; it never carries a permit or authorizes redispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedResolutionStatus {
+    pub reservation: String,
+    pub phase: State,
+    pub reservation_attempt: u32,
+    pub reservation_version: i64,
+    pub shared_attempt: u32,
+    pub async_state: String,
+    pub outcome: Option<String>,
+}
+
+/// Result of asking the validated Local managed-resolution route to start.
+/// This build registers no production adapter, so new commands return
+/// `AdapterUnavailable` before any reservation or shared charge is written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ManagedResolutionOutcome {
+    AdapterUnavailable,
+    DispatchAcknowledged(ManagedResolutionStatus),
+    StatusOnly(ManagedResolutionStatus),
+    StaleUnknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NonceLookupOutcome {
@@ -337,6 +389,8 @@ pub enum BudgetError {
     Arithmetic,
     #[error("immutable budget authorization or idempotency key differs")]
     Immutable,
+    #[error("resolution reservations require the managed-resolution route")]
+    ResolutionRoute,
     #[error("budget unavailable in {0}")]
     Capacity(&'static str),
     #[error("reservation missing")]
@@ -357,6 +411,8 @@ pub enum BudgetError {
     Wave(#[from] wave::WaveError),
     #[error(transparent)]
     Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
+    Resolution(#[from] crate::resolution::ResolutionError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -676,6 +732,12 @@ fn reject_overrun(conn: &Connection) -> Result<(), BudgetError> {
 
     Ok(())
 }
+fn reject_generic_resolution(kind: WorkKind) -> Result<(), BudgetError> {
+    if kind == WorkKind::Resolution {
+        return Err(BudgetError::ResolutionRoute);
+    }
+    Ok(())
+}
 
 fn current(
     store: &CollaborationStore,
@@ -711,6 +773,7 @@ fn current(
                 )
         }
         WorkKind::Recovery => true,
+        WorkKind::Resolution => false,
     };
     if !phase_ok {
         return Err(BudgetError::Stale);
@@ -766,6 +829,7 @@ pub fn reserve(
     request: Request,
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
+    reject_generic_resolution(request.kind)?;
     let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
@@ -891,8 +955,10 @@ pub fn delegate(
     mut request: Request,
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
+    reject_generic_resolution(request.kind)?;
     let _authority = target::authorize(store, owner)?;
     let parent = owned(store, owner, parent)?;
+    reject_generic_resolution(parent.spec.request.kind)?;
     if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
         let existing = owned(store, owner, &key)?;
         if existing.spec.parent.as_deref() != Some(parent.id.as_str())
@@ -982,6 +1048,7 @@ pub fn begin_attempt(
 ) -> Result<Attempt, BudgetError> {
     let _authority = target::authorize(store, owner)?;
     let r = owned(store, owner, key)?;
+    reject_generic_resolution(r.spec.request.kind)?;
     let (_, state) = current(store, owner, &id(&r.spec.wave)?, r.spec.request.kind)?;
     if now_ms < 0 || now_ms >= r.spec.request.deadline_ms {
         return Err(BudgetError::Invalid("deadline".into()));
@@ -1029,6 +1096,58 @@ pub fn begin_attempt(
         epoch: owner.authority_epoch().clone(),
         project_dir: store.project_dir().to_owned(),
     })
+}
+
+/// Begin the owner-bound managed Local resolution route. Stable-key retries
+/// report retained status only; they never return a dispatch capability.
+pub fn begin_managed_resolution(
+    store: &mut CollaborationStore,
+    repo: &std::path::Path,
+    owner: &ControllerOwner,
+    command: &ManagedResolutionCommand,
+) -> Result<ManagedResolutionOutcome, BudgetError> {
+    managed_resolution::begin(store, repo, owner, command)
+}
+
+/// Admit one issuer-owned request through the selected budget lineage and
+/// begin an allowed attempt. Both routes use the same request nonce; choosing a
+/// second route for an existing nonce cannot create another root or child.
+///
+/// The clock is sampled once immediately before reservation and again after
+/// that durable write, immediately before beginning the attempt. A first-clock
+/// failure or reserve/delegate error before commit creates no new reservation.
+/// A commit or post-commit read-back error can leave the outcome ambiguous;
+/// reconcile using the same nonce before retrying, and never mint another nonce
+/// to bypass that uncertainty. Once reserve or delegate returns successfully,
+/// a later clock or attempt failure does not roll back that durable reservation
+/// or retry it here. An idempotently returned reservation may begin another
+/// attempt when the existing retry rules allow it.
+/// The clock error is preserved, while budget errors are converted into the
+/// caller's error type.
+pub fn admit<E, F>(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    wave_id: &RecordId,
+    request: Request,
+    route: AdmissionRoute,
+    mut now_ms: F,
+) -> Result<Attempt, E>
+where
+    E: From<BudgetError>,
+    F: FnMut() -> Result<i64, E>,
+{
+    let reservation = match route {
+        AdmissionRoute::Direct => reserve(store, owner, wave_id, request, now_ms()?)?,
+        AdmissionRoute::Delegated { parent } => {
+            let existing_parent = owned(store, owner, &parent)?;
+            if existing_parent.spec.wave != wave_id.as_str() {
+                return Err(BudgetError::Immutable.into());
+            }
+            delegate(store, owner, &parent, request, now_ms()?)?
+        }
+    };
+    let attempt_now = now_ms()?;
+    begin_attempt(store, owner, &reservation.id, attempt_now).map_err(E::from)
 }
 
 /// Native execution adapter: a live pending attempt must name this exact frozen
@@ -1116,7 +1235,8 @@ fn charge_usage(
     receipt: &RecordId,
     reconcile: bool,
 ) -> Result<Reservation, BudgetError> {
-    owned(store, owner, key)?;
+    let reservation = owned(store, owner, key)?;
+    reject_generic_resolution(reservation.spec.request.kind)?;
     usage.validate()?;
     let tx = store
         .connection()
@@ -1234,7 +1354,8 @@ pub fn close(
     version: i64,
 ) -> Result<Reservation, BudgetError> {
     let _authority = target::authorize(store, owner)?;
-    owned(store, owner, key)?;
+    let reservation = owned(store, owner, key)?;
+    reject_generic_resolution(reservation.spec.request.kind)?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;

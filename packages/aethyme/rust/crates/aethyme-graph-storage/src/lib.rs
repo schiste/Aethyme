@@ -63,6 +63,8 @@ pub mod overlay;
 pub mod performance;
 pub mod policy;
 pub mod store;
+pub mod write_guard;
+pub use write_guard::{ensure_isolated_graph_write, mark_broker_managed_graph};
 
 pub use binary::{
     FragmentDecodeError, FragmentEncodeError, read_fragment_bytes, write_fragment_bytes,

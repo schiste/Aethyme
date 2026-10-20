@@ -71,9 +71,9 @@ pub struct OverlayFragment<P> {
     /// Free-form producer-logic version. Bumped by the producer
     /// when its *interpretation* of inputs changes, independent
     /// of the payload struct's wire format. The storage layer
-    /// records this verbatim and never inspects it; consumers
-    /// (indexer rerun decisions, daemon staleness checks) read
-    /// it through [`producer_version`](Self::producer_version).
+    /// records this verbatim. Readers must supply the expected version
+    /// and refuse an overlay produced by different logic before exposing
+    /// its payload; callers can then rerun the producer.
     producer_version: Box<str>,
     /// The kind-specific payload.
     payload: P,
@@ -144,7 +144,9 @@ pub fn write_overlay_bytes<P: Serialize>(
 }
 
 /// Decode bincode bytes into an OverlayFragment of the requested
-/// payload type and verify the kind and schema version.
+/// payload type and verify the kind, schema, and producer logic version.
+/// The expected producer version must be nonempty; comparison is exact.
+/// A producer mismatch requires re-derivation, even if the payload parses.
 ///
 /// The caller passes the expected `kind` so the decoder can fail
 /// fast on a mismatch (e.g. a `_overlays/risks.bin` accidentally
@@ -155,7 +157,11 @@ pub fn write_overlay_bytes<P: Serialize>(
 pub fn read_overlay_bytes<P: DeserializeOwned>(
     bytes: &[u8],
     expected_kind: &str,
+    expected_producer_version: &str,
 ) -> Result<OverlayFragment<P>, OverlayDecodeError> {
+    if expected_producer_version.is_empty() {
+        return Err(OverlayDecodeError::EmptyExpectedProducerVersion);
+    }
     let overlay: OverlayFragment<P> =
         bincode::deserialize(bytes).map_err(|e| OverlayDecodeError::Bincode {
             message: e.to_string(),
@@ -170,6 +176,12 @@ pub fn read_overlay_bytes<P: DeserializeOwned>(
         return Err(OverlayDecodeError::KindMismatch {
             expected: expected_kind.into(),
             found: overlay.kind().into(),
+        });
+    }
+    if overlay.producer_version() != expected_producer_version {
+        return Err(OverlayDecodeError::ProducerVersionMismatch {
+            expected: expected_producer_version.into(),
+            found: overlay.producer_version().into(),
         });
     }
     Ok(overlay)
@@ -218,6 +230,13 @@ impl std::error::Error for OverlayEncodeError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverlayDecodeError {
+    /// No producer expectation was supplied. An unchecked read is not allowed.
+    EmptyExpectedProducerVersion,
+    /// The bytes parse, but were produced by different logic. Re-run the producer.
+    ProducerVersionMismatch {
+        expected: Box<str>,
+        found: Box<str>,
+    },
     Bincode {
         message: String,
     },
@@ -239,6 +258,13 @@ pub enum OverlayDecodeError {
 impl std::fmt::Display for OverlayDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EmptyExpectedProducerVersion => {
+                f.write_str("OverlayFragment reader requires a nonempty expected producer_version")
+            }
+            Self::ProducerVersionMismatch { expected, found } => write!(
+                f,
+                "OverlayFragment producer_version mismatch: expected {expected:?}, found {found:?}. Re-run the producer.",
+            ),
             Self::Bincode { message } => {
                 write!(f, "OverlayFragment decode failed: {message}")
             }

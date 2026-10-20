@@ -277,7 +277,7 @@ the code without parsing output. They apply with or without `--json`.
 | 0 | Success, including a verified submission that promotion did not move | Continue |
 | 1 | Unclassified failure | Read the error message |
 | 2 | Usage error | Fix the command line; see `--help` |
-| 3 | Refused: a policy, lease, confirmation or state precondition blocked the request, or a submission conflicted. Nothing changed. | Fix the precondition, then retry |
+| 3 | Refused: a policy, lease, confirmation or state precondition blocked the request, or a submission conflicted. | Inspect the report and follow its recovery guidance; fix the precondition before retrying |
 | 4 | Verification failed: a gate or graph-integrity check did not pass | Fix the code; the gate output names the failure |
 | 5 | Outcome unknown: a remote write may or may not have happened | Inspect external state, then `broker advanced operations reconcile`. Never retry blindly. |
 | 6 | Environment: a missing tool, path or remote base, or host I/O failure; also a `submit` deferred because the host stopped a gate before it judged the change | Fix the host, then retry without changing code |
@@ -285,6 +285,26 @@ the code without parsing output. They apply with or without `--json`.
 Before 2026-09-23, `submit --json` exited 0 for rejected and conflicted
 entries, and every refusal exited 1. Some subcommands keep their own
 documented codes, for example `check-contract` and the `exec` guard.
+
+#### JSON errors
+
+A broker error that has no report payload is written to stdout as one
+versioned object. Its schema is `aethyme.broker-error/v1`:
+
+    {"schema":"aethyme.broker-error/v1","error":{"code":3,"message":"the request was refused"}}
+
+The envelope code matches the process exit code. If a command has already
+written its report, that report remains the single JSON document; a blocked
+`finish --json` adds an `error` object to its existing report and exits 3.
+Commands that deliberately stream raw output, such as `report render --stdout`,
+keep that output format. `advanced exec` captures the child result and reports
+the broker's guarded-execution result; it does not forward child stdout.
+Arguments after `--` belong to the child and do not enable broker JSON mode.
+
+Exit code 3 means the requested action was refused; it does not guarantee that
+the command made no state change. Some refusal paths record safe quarantine or
+other maintenance while declining the requested action. Inspect the command's
+report and recovery guidance before retrying.
 
 `broker advanced worktree-root` is a strictly read-only placement plan. It reports the
 canonical checkout identity, the preferred private host-state root, whether
@@ -496,7 +516,7 @@ a reason.
 - `aethyme broker advanced operations [same options]` (compatibility alias during deprecation)
 - `aethyme broker advanced operations show <id|host-operation-id> [--json]`
 - `aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]`
-- `aethyme broker advanced operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker advanced operations reconcile --operation <id|host-operation-id> (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]`
 - `aethyme broker unblock [--json]` — read-only: every current blocker across `broker.db`, the host operation and resource ledgers, gate pidfiles, and conflict notices, each with a stable id (`op:<n>`, `hostop:<32-hex>`, `resource:<lease-id>`, `lease:<id>`, `gatecache:<gate>@<tree>`, `pidfile:<session>-<gate>`, `action:<session>`), its scope (`repo` or `host`), cause, owning session, `safe_to_clear_automatically`, and the exact command that clears it. `broker status --json` carries the same list as `blockers`, and `broker status doctor` prints it.
 - `aethyme broker unblock <id> [--outcome <succeeded|failed>] [--reason <text>] [--confirm <generation>] [--json]` — clear one blocker through its store's recovery path: `op:` and `hostop:` reconcile through `operations reconcile` and need `--outcome` and `--reason` from an operator who inspected the remote (the host id is accepted directly, #276); `gatecache:` marks exactly that gate's failing verdicts for that tree cleared, with the time and `--reason` (#281), so they stay in gate history but no longer satisfy the cache and the next run executes the gate (#416); `pidfile:` is removed only when its process is gone; `resource:` releases a quarantined lease once its holder is gone, without `--confirm` only when its owning session is closed; `lease:` releases a stale session's claim only when its worktree is gone; `action:` always refuses and names the resubmission. A refusal changes nothing, prints the reason and the flag it needs, and exits 3.
 - `aethyme broker advanced advisories list [--all] [--json]`
@@ -798,9 +818,19 @@ second clone remains blocked by the host-wide unknown-outcome barrier until an
 operator inspects external state and runs one explicit reconciliation command.
 
 Every `operations reconcile` usage or validation error repeats the complete
-contract—`--operation`, `--outcome`, and `--reason`—in one message. Successful
-manual reconciliation appends the operator outcome and reason without deleting
-the original push plan or remote evidence.
+contract—`--operation`, `--reason`, and exactly one of `--outcome` or
+`--inspect-remote`—in one message. The inspection mode supports only an
+outcome-unknown Git write with a recorded exact-ref push plan. It queries every
+planned destination, records the observed SHAs and a proposed outcome when all
+refs match either the planned bases or proposed commits, and leaves the write
+barrier in place. Mixed, changed, or unavailable evidence produces no proposal.
+Current refs are a snapshot, not proof of historical state. The existing
+`--outcome` mode remains an operator assertion and records
+`reconciliation.source: operator_assertion` and the supplied reason, preserving
+any earlier remote-inspection evidence. `operations show --json` exposes that
+evidence as `reconciliation.remote_inspection` separately from the original
+push evidence; a recorded final decision exposes its provenance as
+`reconciliation.source: operator_assertion`.
 
 `broker advanced operations stats` is a bounded, read-only measurement surface for the
 coordination-lock decision. It reports p50/p99 lock-hold and queue-wait
@@ -997,6 +1027,10 @@ to the checkpoint planner.
 Gate-run and submit outcomes identify the exact Git tree each result proves.
 Human-readable output abbreviates the tree hash to 12 characters; JSON retains
 the full hash in `tree_hash` for both executed and cached results.
+Cache reuse also requires the same gate definition and complete execution
+profile. Persisted JSON outcomes report `run_id`; a cache hit retains the
+source run ID, and cacheable outcomes include `cache_provenance` with the profile
+digest and declared scope. An incomplete profile disables reuse for that run.
 Pass `--no-cache` to either gate-run form or submit to require fresh gate
 execution. Bypass skips cache lookup only: the fresh result is stored normally
 and is available to a subsequent run using the default cache policy.
@@ -2102,8 +2136,10 @@ is a reconciled success. Missing, unexpected, or mixed evidence remains
 `outcome_unknown` (with mixed base/proposed refs recorded as `partial`). Pushes
 using shorthand, deletion, wildcard, `--all`, `--mirror`, `--tags`, or another
 unplannable shape remain conservatively unknown. Output text never participates
-in this classification. V1 deliberately serializes all writes for one
-repository.
+in this classification. For a later crash-ambiguous result, `operations
+reconcile --inspect-remote` records a proposal from a fresh exact-ref query;
+it never clears the barrier because a ref could have advanced and later been
+rewound. V1 deliberately serializes all writes for one repository.
 
 A labelled `gh issue`/`pr` `create` or `edit` is pre-flighted before anything is
 journaled, queued, or sent: every `--label`, `--add-label`, and `--remove-label`

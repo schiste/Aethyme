@@ -111,9 +111,9 @@ fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
     );
     assert!(!conflict.status.success());
     assert!(
-        String::from_utf8_lossy(&conflict.stderr).contains("planned lease"),
+        json_error::message(&conflict).contains("planned lease"),
         "{}",
-        String::from_utf8_lossy(&conflict.stderr)
+        json_error::message(&conflict)
     );
 }
 
@@ -1064,14 +1064,19 @@ fn subcommands_that_cannot_honor_a_claim_refuse_it() {
 
 const MAIN_CHECKOUT_REFUSED: &str = "refusing to register a session on the main checkout";
 
-fn assert_main_checkout_refused(output: &Output) {
+fn assert_main_checkout_refused(output: &Output, expect_json: bool) {
     assert!(
         !output.status.success(),
         "adopt unexpectedly succeeded: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(MAIN_CHECKOUT_REFUSED), "{stderr}");
+    if expect_json {
+        let error = json_error::message(output);
+        assert!(error.contains(MAIN_CHECKOUT_REFUSED), "{error}");
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(MAIN_CHECKOUT_REFUSED), "{error}");
+    }
 }
 
 /// #284 proposal 9: a new session on the repository's main checkout is
@@ -1081,7 +1086,10 @@ fn assert_main_checkout_refused(output: &Output) {
 fn a_new_session_on_the_main_checkout_is_refused_however_it_is_spelled() {
     let tmp = fixture();
     let root = tmp.path();
-    assert_main_checkout_refused(&run_enforced(root, &["start", "--adopt", "--task", "t"]));
+    assert_main_checkout_refused(
+        &run_enforced(root, &["start", "--adopt", "--task", "t"]),
+        false,
+    );
 
     let elsewhere = tempfile::tempdir().unwrap();
     let link = elsewhere.path().join("link-to-main");
@@ -1113,7 +1121,7 @@ fn a_new_session_on_the_main_checkout_is_refused_however_it_is_spelled() {
                 "s",
             ],
         );
-        assert_main_checkout_refused(&output);
+        assert_main_checkout_refused(&output, false);
     }
     assert!(
         common::open_fixture_broker(root, root.parent().unwrap_or(root))
@@ -1178,7 +1186,7 @@ fn the_main_checkout_environment_variable_is_not_an_operator_override() {
         .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1");
     common::isolate_host_paths(&mut command, tmp.path());
     let output = command.output().unwrap();
-    assert_main_checkout_refused(&output);
+    assert_main_checkout_refused(&output, true);
 }
 
 /// A linked worktree is not the main checkout: adopting it still works.
@@ -1205,3 +1213,6 @@ fn a_linked_worktree_is_still_adoptable() {
     let created: serde_json::Value = serde_json::from_str(&created).unwrap();
     assert_eq!(created["outcome"], "created");
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

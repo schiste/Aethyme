@@ -104,6 +104,12 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
             captured_context["worktree_root_environment_override"].is_null(),
             "the exact pinned root must be authoritative in the captured context"
         );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| { key == "AETHYME_WORKTREE_ROOT" && value.is_none() }),
+            "child must not inherit an ambient worktree container"
+        );
         let output = command.output().unwrap();
         assert!(output.status.success(), "{output:?}");
         let cli_session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

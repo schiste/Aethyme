@@ -1,5 +1,7 @@
 //! Appointed Local controller integration. Only a private, freshly rechecked
 //! acceptance grant can finish a wave. Receipts remain historical data.
+use std::path::Path;
+
 use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId, RecordSchema};
 use rusqlite::{TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -136,23 +138,21 @@ fn control_check(
 }
 
 fn completion_prior_members(
-    store: &CollaborationStore,
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &ControllerOwner,
     active: &wave::Wave,
-    current_epoch: &str,
 ) -> Result<Vec<String>, ControllerError> {
-    let Some(key) = active.spec.prior_completion.as_ref() else {
+    let revision = target::load_revision(
+        store,
+        &RecordId::parse(&active.spec.revision).map_err(|_| ControllerError::Mismatch)?,
+    )?;
+    let Some(binding) = wave::prior_completion::load(store, owner, active, &revision)? else {
         return Ok(Vec::new());
     };
-    let key = RecordId::parse(key).map_err(|_| ControllerError::Mismatch)?;
-    let (completion, prior) = wave::accepted_completion(store, &key, active.spec.sequence)?;
-    if completion.target != active.spec.target || completion.epoch != current_epoch {
-        return Err(ControllerError::Mismatch);
-    }
-    Ok(if completion.revision == active.spec.revision {
-        prior.selected
-    } else {
-        Vec::new()
-    })
+    binding.validate_retained_completion(store)?;
+    binding.validate_git_binding(store, repo)?;
+    Ok(binding.previous_members().to_vec())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -187,6 +187,7 @@ fn complete_inner(
         || state.revision.as_ref().map(RecordId::as_str) != Some(active.spec.revision.as_str())
         || active.phase != WavePhase::Verifying
         || active.spec.target != owner.target()
+        || active.spec.issuer != owner.issuer()
         || receipt.spec.decision != acceptance::ProviderDecision::Accepted
         || intent.spec.wave != wave_id.as_str()
         || receipt.spec.revision != active.spec.revision
@@ -218,8 +219,9 @@ fn complete_inner(
             .ok_or(ControllerError::Mismatch)?,
     };
     let record = spec.record()?;
+    let prior_members =
+        completion_prior_members(store, broker.repo_handle().root(), owner, &active)?;
     let object = archive::put_object(store, &record.canonical_bytes())?;
-    let prior_members = completion_prior_members(store, &active, owner.authority_epoch().as_str())?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;

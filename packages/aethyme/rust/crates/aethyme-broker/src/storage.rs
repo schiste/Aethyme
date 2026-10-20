@@ -407,6 +407,39 @@ pub struct StoragePlan {
     pub recovery_archives: Vec<StorageRecoveryArchiveGroup>,
 }
 
+/// The selected storage path's shape matters: a keyed container contains one
+/// root per repository, while a direct library override is itself the root
+/// whose children are sessions. Keeping this distinction through planning,
+/// attribution, and apply prevents direct-root sessions from being mistaken
+/// for repository roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageRootLayout {
+    KeyedContainer(PathBuf),
+    DirectRoot(PathBuf),
+}
+
+impl StorageRootLayout {
+    fn path(&self) -> &Path {
+        match self {
+            Self::KeyedContainer(path) | Self::DirectRoot(path) => path,
+        }
+    }
+
+    fn is_direct(&self) -> bool {
+        matches!(self, Self::DirectRoot(_))
+    }
+
+    fn digest_tag(&self) -> Option<&'static str> {
+        match self {
+            // Keep existing keyed-container confirmations byte-for-byte
+            // compatible. Only the previously ambiguous direct layout adds a
+            // new digest field.
+            Self::KeyedContainer(_) => None,
+            Self::DirectRoot(_) => Some("direct_root"),
+        }
+    }
+}
+
 /// One directory under `recovery-archives/` and what it holds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StorageRecoveryArchiveGroup {
@@ -499,7 +532,7 @@ pub(crate) fn storage_plan_with_context(
     let checkout = GitRepo::discover(path_inside_repo)?;
     let main_root = checkout.main_root()?;
     validate_storage_context(&main_root, context)?;
-    let storage_root = storage_container_with_context(&main_root, context)?;
+    let storage_layout = storage_layout_with_context(&main_root, context)?;
     let (policy, warnings) = host_policy(&main_root);
     let mut records = crate::measurement::load_size_records(&main_root);
     let preparation_cache_root_binding =
@@ -519,7 +552,7 @@ pub(crate) fn storage_plan_with_context(
         .and_then(|binding| binding.instance_nonce.as_deref());
     let plan = build_plan(
         &main_root,
-        &storage_root,
+        &storage_layout,
         preparation_cache_root,
         preparation_cache_root_identity,
         preparation_cache_root_nonce,
@@ -592,7 +625,7 @@ pub(crate) fn storage_apply_with_context(
     let checkout = GitRepo::discover(path_inside_repo)?;
     let main_root = checkout.main_root()?;
     validate_storage_context(&main_root, context)?;
-    let storage_root = storage_container_with_context(&main_root, context)?;
+    let storage_layout = storage_layout_with_context(&main_root, context)?;
     let (policy, warnings) = host_policy(&main_root);
     let mut records = crate::measurement::load_size_records(&main_root);
     let preparation_cache_root_binding =
@@ -606,7 +639,7 @@ pub(crate) fn storage_apply_with_context(
         .map(|binding| binding.path.clone());
     let plan = build_plan(
         &main_root,
-        &storage_root,
+        &storage_layout,
         preparation_cache_root.as_deref(),
         preparation_cache_root_binding
             .as_ref()
@@ -639,7 +672,7 @@ pub(crate) fn storage_apply_with_context(
     let mut applied = Vec::new();
     let mut failures = Vec::new();
     for candidate in &plan.candidates {
-        match apply_candidate(candidate, &storage_root) {
+        match apply_candidate(candidate, &storage_layout) {
             Ok(reclaimed_bytes) => applied.push(StorageAppliedItem {
                 kind: candidate.kind,
                 path: candidate.path.clone(),
@@ -726,7 +759,7 @@ pub(crate) fn storage_apply_with_context(
 #[allow(clippy::too_many_arguments)]
 fn build_plan(
     main_root: &Path,
-    storage_root: &Path,
+    storage_layout: &StorageRootLayout,
     preparation_cache_root: Option<&Path>,
     preparation_cache_root_identity: Option<&[u8]>,
     preparation_cache_root_nonce: Option<&str>,
@@ -735,40 +768,9 @@ fn build_plan(
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
 ) -> Result<StoragePlan, StorageError> {
-    let storage_root = normalise(&absolute_path(main_root, storage_root));
+    let storage_root = normalise(&absolute_path(main_root, storage_layout.path()));
     let evaluated_at = now_ms();
-    let mut paths = Vec::new();
-    match std::fs::symlink_metadata(&storage_root) {
-        Ok(metadata) if metadata.is_dir() => {
-            let entries = std::fs::read_dir(&storage_root).map_err(|source| StorageError::Io {
-                path: storage_root.clone(),
-                source,
-            })?;
-            for entry in entries {
-                paths.push(
-                    entry
-                        .map_err(|source| StorageError::Io {
-                            path: storage_root.clone(),
-                            source,
-                        })?
-                        .path(),
-                );
-            }
-        }
-        Ok(_) => {
-            return Err(StorageError::Unavailable {
-                reason: format!("{} is not a directory", storage_root.display()),
-            });
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(StorageError::Io {
-                path: storage_root,
-                source,
-            });
-        }
-    }
-    paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    let paths = storage_root_entries(&storage_root, storage_layout)?;
 
     let mut roots = Vec::with_capacity(paths.len());
     let mut candidates = Vec::new();
@@ -821,8 +823,11 @@ fn build_plan(
     };
     let digest = decision_digest(
         &storage_root,
-        preparation_cache_root_identity,
-        preparation_cache_root_nonce,
+        DecisionRootMetadata {
+            storage_root_layout: storage_layout.digest_tag(),
+            preparation_cache_root_identity,
+            preparation_cache_root_nonce,
+        },
         orphan_worktree_roots_days,
         &candidates,
         &primary_candidates,
@@ -4079,7 +4084,12 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
     })
 }
 
-fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<u64, String> {
+fn apply_candidate(
+    candidate: &StorageCandidate,
+    storage_layout: &StorageRootLayout,
+) -> Result<u64, String> {
+    let storage_root = normalise(storage_layout.path());
+    let candidate_root = normalise(&candidate.root_path);
     let current_marker_root = match candidate.kind {
         StorageCandidateKind::OrphanRoot | StorageCandidateKind::EmptyRoot => {
             candidate.path.as_path()
@@ -4092,8 +4102,13 @@ fn apply_candidate(candidate: &StorageCandidate, storage_root: &Path) -> Result<
             return Err("preparation cache entries use the preparation apply lane".into());
         }
     };
-    if !is_direct_child(&normalise(&candidate.root_path), storage_root) {
-        return Err("reviewed root is outside the host storage container".into());
+    let root_matches_layout = if storage_layout.is_direct() {
+        candidate_root == storage_root
+    } else {
+        is_direct_child(&candidate_root, &storage_root)
+    };
+    if !root_matches_layout {
+        return Err("reviewed root is outside the selected storage layout".into());
     }
     if candidate.kind == StorageCandidateKind::StrayDirectory
         && !is_direct_child(
@@ -4311,70 +4326,117 @@ fn remove_empty_root(root: &Path) -> Result<u64, String> {
     Ok(freed)
 }
 
-fn storage_container_with_context(
+fn storage_layout_with_context(
     main_root: &Path,
     context: &crate::broker::BrokerStorageContext,
-) -> Result<PathBuf, StorageError> {
-    let container = if let Some(root) = context.worktree_root_override.as_deref() {
-        absolute_path(main_root, root)
-    } else if let Some(container) = context.worktree_root_environment_override.as_deref() {
-        absolute_path(main_root, container)
-    } else {
-        let Some(base) = context.host_state_dir.as_deref() else {
-            return Err(StorageError::Unavailable {
-                reason: "no captured host-state directory is available; set AETHYME_WORKTREE_ROOT"
-                    .into(),
-            });
-        };
-        if !context.host_state_dir_is_explicit && crate::host_state::path_is_ephemeral(main_root) {
-            return Err(StorageError::Unavailable {
-                reason: "the repository is under the system temporary directory and the implicit host-state directory is withheld; set AETHYME_WORKTREE_ROOT or AETHYME_HOST_STATE_DIR explicitly".into(),
-            });
-        }
-        absolute_path(main_root, base).join("worktrees")
-    };
-    if path_is_inside(main_root, &container) {
-        return Err(StorageError::Unavailable {
-            reason: format!(
-                "{} resolves inside repository {}; choose an external host storage root",
-                container.display(),
-                main_root.display()
-            ),
-        });
-    }
-    Ok(container)
+) -> Result<StorageRootLayout, StorageError> {
+    let repository = GitRepo::discover(main_root)?;
+    let git_common_dir = repository.git_common_dir()?;
+    let plan = crate::broker::lifecycle::plan_worktree_root_with_context(
+        main_root,
+        Some(&git_common_dir),
+        context,
+    );
+    storage_layout_from_worktree_root_plan(&plan)
 }
 
-fn storage_container(main_root: &Path) -> Result<PathBuf, StorageError> {
-    let container = if let Some(value) =
-        std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
-    {
-        absolute_path(main_root, &PathBuf::from(value))
-    } else {
-        let Some(base) = crate::host_state::default_host_state_dir() else {
-            return Err(StorageError::Unavailable {
-                reason: "no host-state directory is available; set AETHYME_WORKTREE_ROOT".into(),
-            });
-        };
-        if !crate::host_state::host_state_dir_is_explicit()
-            && crate::host_state::path_is_ephemeral(main_root)
+fn storage_layout_from_worktree_root_plan(
+    plan: &crate::broker::WorktreeRootPlan,
+) -> Result<StorageRootLayout, StorageError> {
+    if let Some(reason) = &plan.storage_context_refusal {
+        return Err(StorageError::Unavailable {
+            reason: reason.clone(),
+        });
+    }
+
+    let layout = match plan.preferred_source {
+        Some(crate::broker::WorktreeRootSource::LibraryOverride) => plan
+            .preferred_root
+            .as_ref()
+            .map(|root| StorageRootLayout::DirectRoot(root.clone())),
+        Some(crate::broker::WorktreeRootSource::RepositoryConfig)
+            if plan.preferred_unavailable_reason.is_some() =>
         {
-            return Err(StorageError::Unavailable {
-                reason: "the repository is under the system temporary directory and the implicit host-state directory is withheld; set AETHYME_WORKTREE_ROOT or AETHYME_HOST_STATE_DIR explicitly".into(),
-            });
+            plan.host_state_fallback_root
+                .as_deref()
+                .and_then(Path::parent)
+                .map(|root| StorageRootLayout::KeyedContainer(root.to_path_buf()))
         }
-        absolute_path(main_root, &base).join("worktrees")
+        Some(
+            crate::broker::WorktreeRootSource::RepositoryConfig
+            | crate::broker::WorktreeRootSource::EnvironmentOverride
+            | crate::broker::WorktreeRootSource::HostState,
+        ) => plan
+            .root_container
+            .as_ref()
+            .map(|root| StorageRootLayout::KeyedContainer(root.clone())),
+        Some(crate::broker::WorktreeRootSource::RepositoryFallback) => plan
+            .preferred_root
+            .as_ref()
+            .map(|root| StorageRootLayout::KeyedContainer(root.clone())),
+        None => None,
     };
-    if path_is_inside(main_root, &container) {
+    let Some(layout) = layout else {
+        let reason = if let Some(unavailable) = &plan.preferred_unavailable_reason {
+            format!(
+                "the configured worktree root is unavailable and no captured host-state fallback is available: {unavailable}; set AETHYME_WORKTREE_ROOT or AETHYME_HOST_STATE_DIR explicitly"
+            )
+        } else {
+            "no eligible captured host-state directory is available; set AETHYME_WORKTREE_ROOT or AETHYME_HOST_STATE_DIR explicitly".to_string()
+        };
+        return Err(StorageError::Unavailable { reason });
+    };
+
+    if path_is_inside(&plan.repository_root, layout.path()) {
         return Err(StorageError::Unavailable {
             reason: format!(
                 "{} resolves inside repository {}; choose an external host storage root",
-                container.display(),
-                main_root.display()
+                layout.path().display(),
+                plan.repository_root.display()
             ),
         });
     }
-    Ok(container)
+    Ok(layout)
+}
+
+/// Return the roots represented by a selected storage layout. Keyed
+/// containers enumerate their repository children; a direct root is itself
+/// the one repository root and its children are sessions beneath that root.
+fn storage_root_entries(
+    storage_root: &Path,
+    layout: &StorageRootLayout,
+) -> Result<Vec<PathBuf>, StorageError> {
+    match std::fs::symlink_metadata(storage_root) {
+        Ok(metadata) if metadata.is_dir() => {
+            let entries = std::fs::read_dir(storage_root).map_err(|source| StorageError::Io {
+                path: storage_root.to_path_buf(),
+                source,
+            })?;
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|source| StorageError::Io {
+                    path: storage_root.to_path_buf(),
+                    source,
+                })?;
+                if !layout.is_direct() {
+                    paths.push(entry.path());
+                }
+            }
+            if layout.is_direct() {
+                return Ok(vec![storage_root.to_path_buf()]);
+            }
+            paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+            Ok(paths)
+        }
+        Ok(_) => Err(StorageError::Unavailable {
+            reason: format!("{} is not a directory", storage_root.display()),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(StorageError::Io {
+            path: storage_root.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn host_policy(main_root: &Path) -> (crate::RetentionPolicy, Vec<String>) {
@@ -4588,30 +4650,22 @@ pub fn storage_attribute(
     path_inside_repo: &Path,
     apply: bool,
 ) -> Result<StorageAttributionReport, StorageError> {
+    let context = capture_storage_context_for_path(path_inside_repo)?;
+    storage_attribute_with_context(path_inside_repo, apply, &context)
+}
+
+pub(crate) fn storage_attribute_with_context(
+    path_inside_repo: &Path,
+    apply: bool,
+    context: &crate::broker::BrokerStorageContext,
+) -> Result<StorageAttributionReport, StorageError> {
     let checkout = GitRepo::discover(path_inside_repo)?;
     let main_root = checkout.main_root()?;
-    let storage_root = normalise(&absolute_path(&main_root, &storage_container(&main_root)?));
+    validate_storage_context(&main_root, context)?;
+    let storage_layout = storage_layout_with_context(&main_root, context)?;
+    let storage_root = normalise(&absolute_path(&main_root, storage_layout.path()));
     let this = ThisRepository::observe(&main_root)?;
-    let mut paths = Vec::new();
-    match std::fs::read_dir(&storage_root) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|source| StorageError::Io {
-                    path: storage_root.clone(),
-                    source,
-                })?;
-                paths.push(entry.path());
-            }
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(StorageError::Io {
-                path: storage_root,
-                source,
-            });
-        }
-    }
-    paths.sort();
+    let paths = storage_root_entries(&storage_root, &storage_layout)?;
     let mut roots = Vec::new();
     for path in paths {
         // Only an unmarked root is in question. A checkout sitting where a
@@ -4735,10 +4789,16 @@ fn write_attributed_marker(root: &Path, this: &ThisRepository) -> std::io::Resul
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct DecisionRootMetadata<'a> {
+    storage_root_layout: Option<&'static str>,
+    preparation_cache_root_identity: Option<&'a [u8]>,
+    preparation_cache_root_nonce: Option<&'a str>,
+}
+
 fn decision_digest(
     storage_root: &Path,
-    preparation_cache_root_identity: Option<&[u8]>,
-    preparation_cache_root_nonce: Option<&str>,
+    root_metadata: DecisionRootMetadata<'_>,
     orphan_worktree_roots_days: u32,
     candidates: &[StorageCandidate],
     primary_candidates: &[StoragePrimaryCandidate],
@@ -4757,6 +4817,8 @@ fn decision_digest(
     #[derive(serde::Serialize)]
     struct Decision<'a> {
         storage_root: &'a Path,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        storage_root_layout: Option<&'static str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         preparation_cache_root_identity: Option<&'a [u8]>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -4781,8 +4843,9 @@ fn decision_digest(
     }
     let bytes = serde_json::to_vec(&Decision {
         storage_root,
-        preparation_cache_root_identity,
-        preparation_cache_root_nonce,
+        storage_root_layout: root_metadata.storage_root_layout,
+        preparation_cache_root_identity: root_metadata.preparation_cache_root_identity,
+        preparation_cache_root_nonce: root_metadata.preparation_cache_root_nonce,
         orphan_worktree_roots_days,
         candidates: candidates
             .iter()
@@ -4933,6 +4996,260 @@ mod tests {
         "aaaaaaaaaaaaaaaa",
         "aaaaaaaaaaaaaaaa"
     );
+
+    fn init_storage_root_test_repository(root: &Path) -> GitRepo {
+        std::fs::create_dir_all(root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Fixture"],
+            vec!["config", "user.email", "fixture@example.invalid"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        GitRepo::discover(root).unwrap()
+    }
+
+    fn bound_storage_context(
+        repository: &GitRepo,
+        host_state_dir: &Path,
+    ) -> crate::broker::BrokerStorageContext {
+        crate::broker::BrokerStorageContext {
+            repository_root: Some(repository.root().canonicalize().unwrap()),
+            git_common_dir: Some(repository.git_common_dir().unwrap().canonicalize().unwrap()),
+            host_state_dir: Some(host_state_dir.to_path_buf()),
+            host_state_dir_is_explicit: true,
+            ..crate::broker::BrokerStorageContext::default()
+        }
+    }
+
+    #[test]
+    fn storage_root_uses_shared_resolver_and_preserves_root_layouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository_root = tmp.path().join("repository");
+        let repository = init_storage_root_test_repository(&repository_root);
+        let owner = crate::test_storage::TestStorage::new();
+        let host_state = owner.host_state_dir();
+        std::fs::create_dir_all(&host_state).unwrap();
+        let configured_root = owner.root().join("configured-worktrees");
+        let environment_root = owner.root().join("environment-worktrees");
+        let direct_root = owner.root().join("direct-worktrees");
+        std::fs::create_dir_all(&configured_root).unwrap();
+        std::fs::create_dir_all(repository_root.join(".aethyme")).unwrap();
+        std::fs::write(
+            repository_root.join(".aethyme/config.toml"),
+            format!(
+                "[worktrees]\nroot = {:?}\nmin_free_bytes = 0\n",
+                configured_root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let mut context = bound_storage_context(&repository, &host_state);
+        let plan = crate::broker::lifecycle::plan_worktree_root_with_context(
+            &repository_root,
+            Some(&repository.git_common_dir().unwrap()),
+            &context,
+        );
+        assert_eq!(
+            plan.preferred_source,
+            Some(crate::broker::WorktreeRootSource::RepositoryConfig)
+        );
+        assert_eq!(
+            plan.root_container.as_deref(),
+            Some(configured_root.as_path())
+        );
+        assert_eq!(
+            storage_layout_with_context(&repository_root, &context)
+                .unwrap()
+                .path(),
+            configured_root.as_path()
+        );
+        let configured_repo_root = configured_root.join(&plan.repository_key);
+        std::fs::create_dir(&configured_repo_root).unwrap();
+        let attribution =
+            storage_attribute_with_context(&repository_root, false, &context).unwrap();
+        assert_eq!(attribution.storage_root, configured_root);
+        assert_eq!(attribution.roots.len(), 1);
+        assert_eq!(attribution.roots[0].root, configured_repo_root);
+        assert!(attribution.roots[0].attributable);
+        assert!(!attribution.roots[0].marked);
+
+        context.worktree_root_environment_override = Some(environment_root.clone());
+        let plan = crate::broker::lifecycle::plan_worktree_root_with_context(
+            &repository_root,
+            Some(&repository.git_common_dir().unwrap()),
+            &context,
+        );
+        assert_eq!(
+            plan.preferred_source,
+            Some(crate::broker::WorktreeRootSource::EnvironmentOverride)
+        );
+        assert_eq!(
+            storage_layout_with_context(&repository_root, &context)
+                .unwrap()
+                .path(),
+            environment_root.as_path()
+        );
+
+        context.worktree_root_override = Some(direct_root.clone());
+        context.worktree_root_environment_override = None;
+        let plan = crate::broker::lifecycle::plan_worktree_root_with_context(
+            &repository_root,
+            Some(&repository.git_common_dir().unwrap()),
+            &context,
+        );
+        assert_eq!(
+            plan.preferred_source,
+            Some(crate::broker::WorktreeRootSource::LibraryOverride)
+        );
+        assert!(plan.root_container.is_none());
+        assert_eq!(
+            storage_layout_with_context(&repository_root, &context).unwrap(),
+            StorageRootLayout::DirectRoot(direct_root.clone())
+        );
+
+        context.worktree_root_override = None;
+        std::fs::remove_file(repository_root.join(".aethyme/config.toml")).unwrap();
+        assert_eq!(
+            storage_layout_with_context(&repository_root, &context)
+                .unwrap()
+                .path(),
+            host_state.join("worktrees").as_path()
+        );
+
+        let unavailable_root = owner.root().join("not-mounted");
+        std::fs::write(
+            repository_root.join(".aethyme/config.toml"),
+            format!(
+                "[worktrees]\nroot = {:?}\nmin_free_bytes = 0\n",
+                unavailable_root
+            ),
+        )
+        .unwrap();
+        let plan = crate::broker::lifecycle::plan_worktree_root_with_context(
+            &repository_root,
+            Some(&repository.git_common_dir().unwrap()),
+            &context,
+        );
+        assert_eq!(
+            plan.preferred_source,
+            Some(crate::broker::WorktreeRootSource::RepositoryConfig)
+        );
+        assert!(plan.preferred_unavailable_reason.is_some());
+        assert_eq!(
+            storage_layout_with_context(&repository_root, &context)
+                .unwrap()
+                .path(),
+            host_state.join("worktrees").as_path()
+        );
+    }
+
+    #[test]
+    fn direct_library_root_is_attributed_and_inventoried_at_its_own_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository_root = tmp.path().join("repository");
+        let repository = init_storage_root_test_repository(&repository_root);
+        let owner = crate::test_storage::TestStorage::new();
+        let host_state = owner.host_state_dir();
+        std::fs::create_dir_all(&host_state).unwrap();
+        let direct_root = owner.root().join("direct-worktrees");
+        std::fs::create_dir_all(&direct_root).unwrap();
+        let registered_checkout = direct_root.join("session-one");
+        assert!(
+            std::process::Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&registered_checkout)
+                .arg("HEAD")
+                .current_dir(&repository_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            repository
+                .worktree_paths()
+                .unwrap()
+                .iter()
+                .any(|path| normalise(path) == normalise(&registered_checkout)),
+            "the direct-root child must be registered in the repository's Git metadata"
+        );
+        let mut context = bound_storage_context(&repository, &host_state);
+        context.worktree_root_override = Some(direct_root.clone());
+
+        let attribution =
+            storage_attribute_with_context(&repository_root, false, &context).unwrap();
+        assert_eq!(attribution.storage_root, direct_root);
+        assert_eq!(attribution.roots.len(), 1);
+        assert_eq!(attribution.roots[0].root, direct_root);
+        assert!(attribution.roots[0].attributable);
+        assert_eq!(attribution.roots[0].registered_worktree_count, 1);
+
+        let marked = storage_attribute_with_context(&repository_root, true, &context).unwrap();
+        assert_eq!(marked.roots.len(), 1);
+        assert!(marked.roots[0].marked);
+        assert!(direct_root.join(WORKTREE_ROOT_MARKER).is_file());
+
+        let plan = storage_plan_with_context(&repository_root, &context).unwrap();
+        assert_eq!(plan.storage_root, direct_root);
+        assert_eq!(plan.roots.len(), 1);
+        let root = &plan.roots[0];
+        assert_eq!(root.path, direct_root);
+        assert_eq!(root.marker_status, StorageMarkerStatus::Valid);
+        assert_eq!(root.worktree_count, 1);
+        assert_eq!(root.reconciliation.on_disk_count, 1);
+        assert_eq!(root.reconciliation.entries[0].path, registered_checkout);
+        assert!(root.reconciliation.entries[0].git_marker);
+        assert!(plan.candidates.is_empty());
+
+        let marker_bytes = std::fs::read(direct_root.join(WORKTREE_ROOT_MARKER)).unwrap();
+        let marker = read_marker(&direct_root);
+        let marker_sha256 = format!(
+            "{:x}",
+            Sha256::digest(marker.bytes.as_deref().expect("marker bytes are readable"))
+        );
+        let marker = marker.marker.expect("attributed marker is valid");
+        let candidate = StorageCandidate {
+            kind: StorageCandidateKind::StrayDirectory,
+            path: registered_checkout.clone(),
+            root_path: direct_root.clone(),
+            repository_key: marker.repository_key,
+            repository_root: marker.repository_root,
+            git_marker: true,
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: "fixture candidate to exercise layout revalidation".into(),
+            marker_sha256,
+        };
+        let wrong_layout = StorageRootLayout::KeyedContainer(owner.root().join("other-layout"));
+        assert_eq!(
+            apply_candidate(&candidate, &wrong_layout).unwrap_err(),
+            "reviewed root is outside the selected storage layout"
+        );
+        assert_eq!(
+            apply_candidate(
+                &candidate,
+                &StorageRootLayout::DirectRoot(direct_root.clone())
+            )
+            .unwrap_err(),
+            format!(
+                "session ledger is missing or is not a regular file at {}; no stray directory is swept",
+                repository_root.join(crate::BROKER_DB_RELPATH).display()
+            )
+        );
+        assert_eq!(
+            std::fs::read(direct_root.join(WORKTREE_ROOT_MARKER)).unwrap(),
+            marker_bytes
+        );
+        assert!(registered_checkout.is_dir());
+    }
 
     fn test_host_resource_db(root: &Path) -> PathBuf {
         let path = root.join("host-state/host-resources.db");
@@ -6345,8 +6662,22 @@ mod tests {
         changed.estimated_bytes = Some(100);
         changed.estimated_inodes = Some(99);
         assert_eq!(
-            decision_digest(Path::new("/storage"), None, None, 1, &[candidate], &[], &[]),
-            decision_digest(Path::new("/storage"), None, None, 1, &[changed], &[], &[])
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata::default(),
+                1,
+                &[candidate],
+                &[],
+                &[]
+            ),
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata::default(),
+                1,
+                &[changed],
+                &[],
+                &[]
+            )
         );
     }
 
@@ -6361,7 +6692,14 @@ mod tests {
             reason: "unused".into(),
         };
         let digest = |candidates: &[StoragePreparationCandidate]| {
-            decision_digest(Path::new("/storage"), None, None, 1, &[], &[], candidates)
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata::default(),
+                1,
+                &[],
+                &[],
+                candidates,
+            )
         };
         let approved = digest(std::slice::from_ref(&candidate));
         assert_ne!(approved, digest(&[]));
@@ -6370,8 +6708,10 @@ mod tests {
         assert_ne!(
             decision_digest(
                 Path::new("/storage"),
-                Some(&root_a),
-                None,
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_a),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6379,8 +6719,10 @@ mod tests {
             ),
             decision_digest(
                 Path::new("/storage"),
-                Some(&root_b),
-                None,
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_b),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6391,8 +6733,11 @@ mod tests {
         assert_ne!(
             decision_digest(
                 Path::new("/storage"),
-                Some(&root_a),
-                Some("a".repeat(64).as_str()),
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_a),
+                    preparation_cache_root_nonce: Some("a".repeat(64).as_str()),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6400,8 +6745,11 @@ mod tests {
             ),
             decision_digest(
                 Path::new("/storage"),
-                Some(&root_a),
-                Some("b".repeat(64).as_str()),
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_a),
+                    preparation_cache_root_nonce: Some("b".repeat(64).as_str()),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6410,9 +6758,38 @@ mod tests {
             "the confirmation must bind the cache-root instance nonce",
         );
         assert_eq!(
-            decision_digest(Path::new("/storage"), None, None, 1, &[], &[], &[]),
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata::default(),
+                1,
+                &[],
+                &[],
+                &[],
+            ),
             "0052d7a07108db59d67115eba0c2f99b6f277169e0dae7cdfbba91bc8168b415",
             "absence of an override preserves the legacy decision payload",
+        );
+        assert_ne!(
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata::default(),
+                1,
+                &[],
+                &[],
+                &[],
+            ),
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata {
+                    storage_root_layout: Some("direct_root"),
+                    ..DecisionRootMetadata::default()
+                },
+                1,
+                &[],
+                &[],
+                &[],
+            ),
+            "the confirmation must bind a direct-root layout",
         );
         let mut measured = candidate.clone();
         measured.estimated_bytes = Some(999);

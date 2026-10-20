@@ -1,0 +1,33 @@
+[
+  {
+    "broker_database": {
+      "kind": "string",
+      "path": "string",
+      "protected_repositories": [
+        "string"
+      ],
+      "retention": "string"
+    },
+    "cache_provenance": {
+      "execution_profile_digest": "string",
+      "profile_scope": "string"
+    },
+    "cached": "bool",
+    "cpu_count": "integer",
+    "definition_hash": "string",
+    "duration_ms": "integer",
+    "exit_code": "integer",
+    "failure_class": "null",
+    "first_output_ms": "null",
+    "free_disk_bytes_start": "integer",
+    "gate": "string",
+    "load_avg_1m_end": "float",
+    "load_avg_1m_start": "float",
+    "log_path": "string",
+    "output_bytes": "integer",
+    "run_id": "integer",
+    "status": "string",
+    "tree_hash": "string",
+    "wait_duration_ms": "integer"
+  }
+]

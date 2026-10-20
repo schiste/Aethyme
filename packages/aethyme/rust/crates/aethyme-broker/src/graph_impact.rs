@@ -397,8 +397,7 @@ pub fn revision_bound_impact_report(
     }
     if !coverage_missing_edge_kinds.is_empty() {
         explanations.push(format!(
-            "requested {} edges are absent from coverage: {}",
-            mode.as_str(),
+            "required relationship edge kinds are absent from coverage: {}",
             coverage_missing_edge_kinds.join(", ")
         ));
     }
@@ -572,23 +571,29 @@ fn impact_set(
             impact.manifests.push(path);
         }
     }
+    // Explicit graph evidence is authoritative even when a test file has an
+    // unusual path that the legacy filename classifier does not recognize.
+    impact.tests.extend(lookup.test_paths.iter().cloned());
     impact.tests.sort();
+    impact.tests.dedup();
     impact.configs.sort();
     impact.manifests.sort();
     impact
 }
 
 fn missing_edge_kinds(coverage: &GraphCoverage, mode: GraphImpactMode) -> Vec<String> {
-    let wanted = mode.as_str();
-    if coverage
-        .edge_counts_by_kind
-        .keys()
-        .any(|kind| kind.eq_ignore_ascii_case(wanted))
-    {
-        Vec::new()
-    } else {
-        vec![wanted.to_string()]
-    }
+    // A missing key is not evidence of a complete zero count; coverage must
+    // explicitly report each required relationship kind, including zero.
+    [mode.as_str(), "tests"]
+        .into_iter()
+        .filter(|wanted| {
+            !coverage
+                .edge_counts_by_kind
+                .keys()
+                .any(|kind| kind.eq_ignore_ascii_case(wanted))
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 fn risk_hints(changed_files: &[String], impact: &GraphImpactSet) -> GraphImpactRiskHints {
@@ -764,6 +769,11 @@ pub struct GraphImpactLookup {
     pub mode: GraphImpactMode,
     pub status: GraphImpactStatus,
     pub impacted_paths: Vec<String>,
+    /// Paths reached through explicit incoming Tests edges. This field is
+    /// internal to report projection and is omitted from the provider's
+    /// serialized compatibility view.
+    #[serde(skip_serializing)]
+    pub test_paths: Vec<String>,
     pub chains: Vec<GraphImpactChain>,
     pub visited_nodes: usize,
     pub truncated: bool,
@@ -780,6 +790,7 @@ impl GraphImpactLookup {
             mode: GraphImpactMode::Calls,
             status: GraphImpactStatus::Ready,
             impacted_paths,
+            test_paths: Vec::new(),
             chains: Vec::new(),
             visited_nodes: 0,
             truncated,
@@ -801,6 +812,7 @@ impl GraphImpactLookup {
             mode: GraphImpactMode::Calls,
             status: GraphImpactStatus::Ready,
             impacted_paths,
+            test_paths: Vec::new(),
             chains,
             visited_nodes,
             truncated,
@@ -825,6 +837,7 @@ impl GraphImpactLookup {
             mode: GraphImpactMode::Calls,
             status,
             impacted_paths: Vec::new(),
+            test_paths: Vec::new(),
             chains: Vec::new(),
             visited_nodes: 0,
             truncated: false,
@@ -846,6 +859,7 @@ impl GraphImpactLookup {
     pub(crate) fn bounded(mut self, limit: usize) -> Self {
         if self.status != GraphImpactStatus::Ready {
             self.impacted_paths.clear();
+            self.test_paths.clear();
             self.chains.clear();
             self.visited_nodes = 0;
             self.truncated = false;
@@ -860,6 +874,25 @@ impl GraphImpactLookup {
             self.impacted_paths.truncate(limit);
         }
         self.truncated |= original_len > self.impacted_paths.len();
+
+        let retained_impact_paths = self.impacted_paths.iter().cloned().collect::<HashSet<_>>();
+        let test_limit = limit.saturating_sub(self.impacted_paths.len());
+        let original_test_len = self.test_paths.len();
+        let mut seen_tests = HashSet::new();
+        self.test_paths
+            .retain(|path| is_safe_repo_relative(path) && seen_tests.insert(path.clone()));
+        let mut new_paths = 0;
+        self.test_paths.retain(|path| {
+            if retained_impact_paths.contains(path) {
+                return true;
+            }
+            if new_paths == test_limit {
+                return false;
+            }
+            new_paths += 1;
+            true
+        });
+        self.truncated |= original_test_len > self.test_paths.len();
 
         let retained_paths = self.impacted_paths.iter().cloned().collect::<HashSet<_>>();
         let original_chain_len = self.chains.len();
@@ -969,6 +1002,7 @@ fn caller_frontier(
     let mut queue = VecDeque::new();
     let mut visited = BTreeSet::new();
     let mut truncated = false;
+    let mut remaining_raw_rows = query.max_nodes;
     for changed_file in &changed_files {
         let remaining = query.max_nodes.saturating_sub(visited.len());
         let seeds = store.function_ids_for_path(changed_file, remaining)?;
@@ -988,7 +1022,12 @@ fn caller_frontier(
     let mut chains = Vec::new();
     let mut caller_files = HashSet::new();
     'walk: while let Some(current) = queue.pop_front() {
-        let callers = callable_callers(store, &current.node_id)?;
+        let callers = callable_callers(
+            store,
+            &current.node_id,
+            &mut remaining_raw_rows,
+            &mut truncated,
+        )?;
         if current.depth >= query.max_depth {
             if callers
                 .iter()
@@ -1030,16 +1069,30 @@ fn caller_frontier(
         }
     }
 
+    let test_targets = visited.iter().cloned().collect::<Vec<_>>();
+    let mut test_paths = BTreeSet::new();
+    let mut test_traversal = TestPathTraversal {
+        visited_nodes: &mut visited,
+        remaining_raw_rows: &mut remaining_raw_rows,
+        max_nodes: query.max_nodes,
+        max_results: query.max_results.saturating_sub(chains.len()),
+        test_paths: &mut test_paths,
+        truncated: &mut truncated,
+    };
+    collect_test_paths(store, &test_targets, &mut test_traversal)?;
     let explanation = format!(
-        "walked incoming Calls edges from {seed_count} changed-file callable(s); returned {} caller file(s) with depth <= {} and nodes <= {}",
+        "walked incoming Calls and Tests edges from {seed_count} changed-file callable(s); returned {} caller file(s) and {} test file(s) with depth <= {}, nodes <= {}, and raw adjacency rows <= {}",
         chains.len(),
+        test_paths.len(),
         query.max_depth,
+        query.max_nodes,
         query.max_nodes
     );
-    Ok(
+    let mut lookup =
         GraphImpactLookup::ready_with_chains(chains, visited.len(), truncated, explanation)
-            .with_mode(GraphImpactMode::Calls),
-    )
+            .with_mode(GraphImpactMode::Calls);
+    lookup.test_paths = test_paths.into_iter().collect();
+    Ok(lookup)
 }
 
 fn import_frontier(
@@ -1054,6 +1107,8 @@ fn import_frontier(
     let mut queue = VecDeque::new();
     let mut visited = BTreeSet::new();
     let mut truncated = false;
+    let mut remaining_raw_rows = query.max_nodes;
+    let mut relevant_files = changed_set.clone();
     for changed_file in &changed_files {
         if visited.len() == query.max_nodes {
             truncated = true;
@@ -1075,7 +1130,12 @@ fn import_frontier(
     let mut chains = Vec::new();
     let mut importer_files = HashSet::new();
     'walk: while let Some(current) = queue.pop_front() {
-        let importers = file_importers(store, &current.node_id)?;
+        let importers = file_importers(
+            store,
+            &current.node_id,
+            &mut remaining_raw_rows,
+            &mut truncated,
+        )?;
         if current.depth >= query.max_depth {
             if importers
                 .iter()
@@ -1106,6 +1166,7 @@ fn import_frontier(
             {
                 continue;
             }
+            relevant_files.insert(importer_file.clone());
             if chains.len() == query.max_results {
                 truncated = true;
                 break 'walk;
@@ -1118,24 +1179,64 @@ fn import_frontier(
         }
     }
 
+    let mut test_targets = BTreeSet::new();
+    for file_path in relevant_files {
+        let remaining_nodes = query.max_nodes.saturating_sub(visited.len());
+        let functions = store.function_ids_for_path(&file_path, remaining_nodes)?;
+        truncated |= functions.truncated;
+        for function_id in functions.ids {
+            if visited.contains(&function_id) {
+                test_targets.insert(function_id);
+                continue;
+            }
+            if visited.len() == query.max_nodes {
+                truncated = true;
+                break;
+            }
+            visited.insert(function_id.clone());
+            test_targets.insert(function_id);
+        }
+    }
+    let mut test_paths = BTreeSet::new();
+    let test_targets = test_targets.into_iter().collect::<Vec<_>>();
+    let mut test_traversal = TestPathTraversal {
+        visited_nodes: &mut visited,
+        remaining_raw_rows: &mut remaining_raw_rows,
+        max_nodes: query.max_nodes,
+        max_results: query.max_results.saturating_sub(chains.len()),
+        test_paths: &mut test_paths,
+        truncated: &mut truncated,
+    };
+    collect_test_paths(store, &test_targets, &mut test_traversal)?;
     let explanation = format!(
-        "walked incoming Imports edges from {seed_count} changed-file file(s); returned {} importer file(s) with depth <= {} and nodes <= {}",
+        "walked incoming Imports and Tests edges from {seed_count} changed-file file(s); returned {} importer file(s) and {} test file(s) with depth <= {}, nodes <= {}, and raw adjacency rows <= {}",
         chains.len(),
+        test_paths.len(),
         query.max_depth,
+        query.max_nodes,
         query.max_nodes
     );
-    Ok(
+    let mut lookup =
         GraphImpactLookup::ready_with_chains(chains, visited.len(), truncated, explanation)
-            .with_mode(GraphImpactMode::Imports),
-    )
+            .with_mode(GraphImpactMode::Imports);
+    lookup.test_paths = test_paths.into_iter().collect();
+    Ok(lookup)
 }
 
 fn callable_callers(
     store: &ReadOnlyGraphStore,
     node_id: &str,
+    remaining_raw_rows: &mut usize,
+    truncated: &mut bool,
 ) -> Result<Vec<(String, String)>, GraphStoreError> {
-    let mut adjacency =
-        store.neighbors(node_id, NeighborDirection::Incoming, Some(EdgeKind::Calls))?;
+    let mut adjacency = bounded_neighbors(
+        store,
+        node_id,
+        NeighborDirection::Incoming,
+        EdgeKind::Calls,
+        remaining_raw_rows,
+        truncated,
+    )?;
     adjacency.sort_by(|left, right| {
         left.other
             .as_str()
@@ -1165,11 +1266,16 @@ fn callable_callers(
 fn file_importers(
     store: &ReadOnlyGraphStore,
     node_id: &str,
+    remaining_raw_rows: &mut usize,
+    truncated: &mut bool,
 ) -> Result<Vec<(String, String)>, GraphStoreError> {
-    let mut adjacency = store.neighbors(
+    let mut adjacency = bounded_neighbors(
+        store,
         node_id,
         NeighborDirection::Incoming,
-        Some(EdgeKind::Imports),
+        EdgeKind::Imports,
+        remaining_raw_rows,
+        truncated,
     )?;
     adjacency.sort_by(|left, right| {
         left.other
@@ -1195,6 +1301,81 @@ fn file_importers(
     }
     importers.dedup();
     Ok(importers)
+}
+
+fn bounded_neighbors(
+    store: &ReadOnlyGraphStore,
+    node_id: &str,
+    direction: NeighborDirection,
+    kind: EdgeKind,
+    remaining_raw_rows: &mut usize,
+    truncated: &mut bool,
+) -> Result<Vec<aethyme_engine::store::redb::graph_store::AdjacencyRecord>, GraphStoreError> {
+    let bounded = store.neighbors_limited(node_id, direction, Some(kind), *remaining_raw_rows)?;
+    *remaining_raw_rows = remaining_raw_rows.saturating_sub(bounded.raw_rows_scanned);
+    *truncated |= bounded.truncated;
+    Ok(bounded.records)
+}
+
+struct TestPathTraversal<'a> {
+    visited_nodes: &'a mut BTreeSet<String>,
+    remaining_raw_rows: &'a mut usize,
+    max_nodes: usize,
+    max_results: usize,
+    test_paths: &'a mut BTreeSet<String>,
+    truncated: &'a mut bool,
+}
+
+fn collect_test_paths(
+    store: &ReadOnlyGraphStore,
+    target_functions: &[String],
+    traversal: &mut TestPathTraversal<'_>,
+) -> Result<(), GraphStoreError> {
+    // The current indexer only emits Tests edges for paths accepted by its
+    // `is_test_file` convention. This consumer intentionally trusts explicit
+    // graph edges instead of reapplying that path heuristic.
+    let mut seen_test_functions = BTreeSet::new();
+    for target in target_functions {
+        let edges = bounded_neighbors(
+            store,
+            target,
+            NeighborDirection::Incoming,
+            EdgeKind::Tests,
+            traversal.remaining_raw_rows,
+            traversal.truncated,
+        )?;
+        for edge in edges {
+            let test_id = edge.other.as_str().to_string();
+            if !seen_test_functions.insert(test_id.clone()) {
+                continue;
+            }
+            if !traversal.visited_nodes.contains(&test_id) {
+                if traversal.visited_nodes.len() >= traversal.max_nodes {
+                    *traversal.truncated = true;
+                    continue;
+                }
+                traversal.visited_nodes.insert(test_id.clone());
+            }
+            let Some(display) = store.node_display(&test_id)? else {
+                continue;
+            };
+            if display.kind != StoredNodeKind::Function {
+                continue;
+            }
+            let Some(path) = display.path else {
+                continue;
+            };
+            if traversal.test_paths.contains(&path) {
+                continue;
+            }
+            if traversal.test_paths.len() >= traversal.max_results {
+                *traversal.truncated = true;
+                continue;
+            }
+            traversal.test_paths.insert(path);
+        }
+    }
+    Ok(())
 }
 
 fn modified(path: &Path) -> std::io::Result<SystemTime> {
@@ -1271,11 +1452,28 @@ mod tests {
     fn degraded_results_never_carry_provider_paths() {
         let mut lookup = GraphImpactLookup::graph_stale("stale fixture");
         lookup.impacted_paths.push("src/unsafe.rs".into());
+        lookup.test_paths.push("qa/checks.py".into());
         lookup.truncated = true;
 
         let bounded = lookup.bounded(GRAPH_IMPACT_RESULT_LIMIT);
         assert!(bounded.impacted_paths.is_empty());
+        assert!(bounded.test_paths.is_empty());
         assert!(!bounded.truncated);
+    }
+
+    #[test]
+    fn bounded_results_share_the_limit_with_explicit_test_paths() {
+        let mut lookup = GraphImpactLookup::ready(vec!["src/caller.rs".into()], false, "fixture");
+        lookup.test_paths = vec![
+            "qa/contract_checks.py".into(),
+            "qa/other_checks.py".into(),
+            "../outside.py".into(),
+        ];
+
+        let bounded = lookup.bounded(2);
+        assert_eq!(bounded.impacted_paths, vec!["src/caller.rs"]);
+        assert_eq!(bounded.test_paths, vec!["qa/contract_checks.py"]);
+        assert!(bounded.truncated);
     }
 
     #[test]
@@ -1472,6 +1670,106 @@ mod tests {
     }
 
     #[test]
+    fn tests_edges_project_unusual_test_paths_for_calls_and_imports() {
+        use aethyme_engine::model::edge::Edge;
+        use aethyme_engine::model::file::{FileNode, FileRole};
+        use aethyme_engine::model::function::FunctionNode;
+        use aethyme_engine::model::intern::InternedStr;
+        use aethyme_engine::store::redb::graph_store::{
+            GraphStore, insert_edge, insert_file, insert_function,
+        };
+
+        fn file(path: &str, language: &str, role: FileRole) -> FileNode {
+            FileNode::new(
+                "Repo",
+                path,
+                Some(language.into()),
+                role,
+                10,
+                100,
+                false,
+                None,
+            )
+        }
+
+        fn function(file: &FileNode, name: &str, language: &str) -> FunctionNode {
+            FunctionNode::new(
+                "Repo",
+                InternedStr::from(file.id.clone()),
+                InternedStr::from(file.path.clone()),
+                None,
+                None,
+                InternedStr::from(language),
+                InternedStr::from(name),
+                1,
+                InternedStr::from(format!("fn {name}()")),
+            )
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(root.path()).unwrap();
+        let changed_file = file("src/core.rs", "rust", FileRole::Source);
+        let unusual_test_file = file("qa/contract_checks.py", "python", FileRole::Test);
+        let reverse_link_file = file("qa/reverse_links.py", "python", FileRole::Test);
+        let changed = function(&changed_file, "changed", "rust");
+        let test = function(&unusual_test_file, "checks_contract", "python");
+        let reverse_link = function(&reverse_link_file, "not_a_test", "python");
+        let mut session = store.begin_index().unwrap();
+        insert_file(&mut session, &changed_file).unwrap();
+        insert_file(&mut session, &unusual_test_file).unwrap();
+        insert_file(&mut session, &reverse_link_file).unwrap();
+        insert_function(&mut session, &changed).unwrap();
+        insert_function(&mut session, &test).unwrap();
+        insert_function(&mut session, &reverse_link).unwrap();
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                test.id.as_str(),
+                changed.id.as_str(),
+                EdgeKind::Tests,
+                1000,
+                "test",
+            ),
+        )
+        .unwrap();
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                changed.id.as_str(),
+                reverse_link.id.as_str(),
+                EdgeKind::Tests,
+                1000,
+                "test",
+            ),
+        )
+        .unwrap();
+        session.commit().unwrap();
+        drop(store);
+
+        let changed_files = vec![changed_file.path.clone()];
+        let provider = GraphStoreImpactProvider;
+        for mode in [GraphImpactMode::Calls, GraphImpactMode::Imports] {
+            let lookup = provider.lookup(&GraphImpactQuery {
+                repo_root: root.path(),
+                changed_files: &changed_files,
+                mode,
+                max_results: GRAPH_IMPACT_RESULT_LIMIT,
+                max_depth: GRAPH_IMPACT_MAX_DEPTH,
+                max_nodes: GRAPH_IMPACT_MAX_NODES,
+            });
+            assert_eq!(lookup.status, GraphImpactStatus::Ready);
+            assert_eq!(lookup.test_paths, vec!["qa/contract_checks.py"]);
+            assert_eq!(
+                impact_set(&lookup, &changed_files, mode).tests,
+                vec!["qa/contract_checks.py"]
+            );
+            let serialized = serde_json::to_value(&lookup).unwrap();
+            assert!(serialized.get("test_paths").is_none());
+            assert!(!lookup.truncated);
+        }
+    }
+
+    #[test]
     fn warm_graph_compares_calls_and_imports_frontiers_and_reports_mode() {
         use aethyme_engine::model::edge::Edge;
         use aethyme_engine::model::file::{FileNode, FileRole};
@@ -1581,7 +1879,11 @@ mod tests {
             imports.truncated,
             "the depth-three importer must mark truncation"
         );
-        assert!(imports.explanation.contains("incoming Imports edges"));
+        assert!(
+            imports
+                .explanation
+                .contains("incoming Imports and Tests edges")
+        );
     }
 
     #[test]
@@ -1616,20 +1918,22 @@ mod tests {
     }
 
     fn covered_root(revision: &str, edge_kind: &str) -> tempfile::TempDir {
+        covered_root_with_tests_coverage(revision, edge_kind, true)
+    }
+
+    fn covered_root_without_tests_coverage(revision: &str, edge_kind: &str) -> tempfile::TempDir {
+        covered_root_with_tests_coverage(revision, edge_kind, false)
+    }
+
+    fn covered_root_with_tests_coverage(
+        revision: &str,
+        edge_kind: &str,
+        include_tests_coverage: bool,
+    ) -> tempfile::TempDir {
         use aethyme_engine::store::redb::graph_store::{GraphStore, RepoMetadata};
         use aethyme_graph_storage::write_coverage_artifacts;
 
         let root = tempfile::tempdir().unwrap();
-        let store = GraphStore::open(root.path()).unwrap();
-        store
-            .set_repo_metadata(&RepoMetadata {
-                root_path: root.path().display().to_string(),
-                commit_hash: Some(revision.into()),
-                indexed_at_unix: 0,
-                file_count: 1,
-                languages: vec!["rust".into()],
-            })
-            .unwrap();
         let mut coverage = GraphCoverage::unavailable("fixture-engine");
         coverage.available = true;
         coverage.source_revision = Some(revision.into());
@@ -1644,14 +1948,79 @@ mod tests {
             .by_language
             .insert("rust".into(), Default::default());
         coverage.edge_counts_by_kind.insert(edge_kind.into(), 1);
+        if include_tests_coverage {
+            coverage
+                .edge_counts_by_kind
+                .entry("tests".into())
+                .or_insert(0);
+        }
+        assert_eq!(coverage.edge_counts_by_kind.get("calls"), Some(&1));
+        assert_eq!(
+            coverage.edge_counts_by_kind.get("tests").copied(),
+            include_tests_coverage.then_some(0)
+        );
+        assert!(!coverage.edge_counts_by_kind.contains_key("Calls"));
+        assert!(!coverage.edge_counts_by_kind.contains_key("Tests"));
         write_coverage_artifacts(root.path(), &coverage, &[]).unwrap();
+
+        // The production provider rejects graph fragments newer than the
+        // graph store. Finalize metadata after writing the synthetic coverage
+        // artifact so this fixture tests coverage semantics, not write order.
+        let store = GraphStore::open(root.path()).unwrap();
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.path().display().to_string(),
+                commit_hash: Some(revision.into()),
+                indexed_at_unix: 0,
+                file_count: 1,
+                languages: vec!["rust".into()],
+            })
+            .unwrap();
         drop(store);
         root
     }
 
     #[test]
+    fn revision_contract_requires_tests_relationship_coverage() {
+        let mut coverage = GraphCoverage::unavailable("fixture-engine");
+        coverage.edge_counts_by_kind.insert("calls".into(), 0);
+
+        assert_eq!(
+            missing_edge_kinds(&coverage, GraphImpactMode::Calls),
+            vec!["tests".to_string()]
+        );
+    }
+
+    #[test]
+    fn revision_contract_marks_missing_tests_coverage_partial() {
+        use aethyme_graph_storage::read_coverage;
+
+        let root = covered_root_without_tests_coverage("abc", "calls");
+        let coverage = read_coverage(root.path()).unwrap();
+        assert_eq!(coverage.edge_counts_by_kind.get("calls"), Some(&1));
+        assert!(!coverage.edge_counts_by_kind.contains_key("Calls"));
+        assert!(!coverage.edge_counts_by_kind.contains_key("tests"));
+
+        let report = revision_bound_impact_report(
+            root.path(),
+            "abc",
+            "abc",
+            &["src/leaf.rs".into()],
+            GraphImpactMode::Calls,
+            8,
+            &GraphStoreImpactProvider,
+        )
+        .unwrap();
+        assert_eq!(report.status, GraphImpactContractStatus::Partial);
+        assert_eq!(
+            report.coverage.missing_edge_kinds,
+            vec!["tests".to_string()]
+        );
+    }
+
+    #[test]
     fn revision_contract_distinguishes_complete_empty_from_unavailable() {
-        let root = covered_root("abc", "Calls");
+        let root = covered_root("abc", "calls");
         let report = revision_bound_impact_report(
             root.path(),
             "abc",
@@ -1689,7 +2058,7 @@ mod tests {
 
     #[test]
     fn revision_contract_withholds_stale_paths_and_marks_truncation() {
-        let stale_root = covered_root("old", "Calls");
+        let stale_root = covered_root("old", "calls");
         let stale = revision_bound_impact_report(
             stale_root.path(),
             "new",
@@ -1705,7 +2074,7 @@ mod tests {
         assert_eq!(stale.status, GraphImpactContractStatus::Stale);
         assert!(stale.impact.callers.is_empty());
 
-        let root = covered_root("abc", "Calls");
+        let root = covered_root("abc", "calls");
         let truncated = revision_bound_impact_report(
             root.path(),
             "abc",

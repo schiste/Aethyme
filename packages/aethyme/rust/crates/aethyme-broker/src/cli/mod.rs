@@ -59,7 +59,7 @@ pub use surface::{
 const RESOURCES_RECONCILE_USAGE: &str =
     "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
 const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker advanced operations reconcile \
-     --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]";
+     --operation <id|host-operation-id> (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]";
 const OPERATIONS_SHOW_USAGE: &str =
     "usage: aethyme broker advanced operations show <id|host-operation-id> [--json]";
 const OPERATIONS_STATS_USAGE: &str = "usage: aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
@@ -371,9 +371,9 @@ Usage:
   aethyme broker operations show <id|host-operation-id> [--json]
       Show one exact durable operation and its reconciliation state, evidence,
       write barrier, and complete recovery commands when inspection is required.
-  aethyme broker operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]
-      Resolve a crash-ambiguous operation after independently inspecting the
-      remote state. Overlapping writes remain blocked until reconciliation.
+  aethyme broker operations reconcile --operation <id|host-operation-id> (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]
+      Record a broker inspection proposal for an exact-ref Git push, or record
+      an operator-asserted outcome. Inspection never clears the write barrier.
   aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]
       Read bounded lock-hold, queue-wait, queue-depth, and known-unrelated
       contention measurements. Older operations without timing data are
@@ -928,10 +928,15 @@ fn read_only_refusal(parsed: &Parsed, refused: &str, snapshot_alternative: &str)
 }
 
 pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
+    let before = crate::cli_output::snapshot();
+    let code = run_with_mode_inner(args, mode);
+    crate::cli_output::exit_code_after_output(before, code)
+}
+
+fn run_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 {
     let resolved = resolve(args);
     if let Some(refusal) = &resolved.refusal {
-        eprintln!("Error: {refusal}");
-        return crate::exit_status::USAGE;
+        return report_dispatch_error(args, crate::exit_status::USAGE, refusal);
     }
     // Help is answered before anything opens the broker or records a metric:
     // asking what a command does must never do any of it (Phase 4, P4.3).
@@ -941,16 +946,17 @@ pub fn run_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
                 out!("{}", text.trim_end());
                 0
             }
-            None => {
-                eprintln!(
-                    "Error: unknown broker subcommand {:?} — see `aethyme broker --help`",
+            None => report_dispatch_error(
+                args,
+                crate::exit_status::USAGE,
+                &format!(
+                    "unknown broker subcommand {:?} — see aethyme broker --help",
                     args.iter()
                         .find(|arg| !arg.starts_with('-'))
                         .map(String::as_str)
                         .unwrap_or_default()
-                );
-                crate::exit_status::USAGE
-            }
+                ),
+            ),
         };
     }
     if resolved.args.is_empty() {
@@ -974,7 +980,13 @@ pub fn run_resolved(args: &[String]) -> u8 {
 /// Dispatch an internal command produced by `resolve` using a router-selected
 /// compatibility mode.
 pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
-    // Top-level `aethyme init --help` and `aethyme certify --help` use the
+    let before = crate::cli_output::snapshot();
+    let code = run_resolved_with_mode_inner(args, mode);
+    crate::cli_output::exit_code_after_output(before, code)
+}
+
+fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 {
+    // Top-level aethyme init --help and aethyme certify --help use the
     // internal spelling because those are canonical top-level commands.
     if wants_help(args) {
         return match surface::help_text_for_internal_command(args) {
@@ -982,10 +994,11 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
                 out!("{}", text.trim_end());
                 0
             }
-            None => {
-                eprintln!("Error: unknown internal broker command");
-                crate::exit_status::USAGE
-            }
+            None => report_dispatch_error(
+                args,
+                crate::exit_status::USAGE,
+                "unknown internal broker command",
+            ),
         };
     }
     if args.is_empty() {
@@ -1002,6 +1015,7 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         return crate::contract_check::run(&args[1..]);
     }
     let started = std::time::Instant::now();
+    let command_output = crate::cli_output::snapshot();
     let (code, record_outcome, error) = match run_inner(args, &mode) {
         Ok(()) => (0, true, None),
         Err(UsageError::Help) => {
@@ -1009,15 +1023,26 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
             (crate::exit_status::USAGE, false, None)
         }
         Err(UsageError::Message(message)) => {
-            eprintln!("Error: {message}");
-            (1, true, Some(message))
+            let code = report_command_error(
+                args,
+                crate::exit_status::FAILED,
+                &message,
+                crate::cli_output::output_attempted_since(command_output),
+            );
+            (code, true, Some(message))
         }
         Err(UsageError::Exit { message, code }) => {
-            eprintln!("Error: {message}");
+            let code = report_command_error(
+                args,
+                code,
+                &message,
+                crate::cli_output::output_attempted_since(command_output),
+            );
             (code, true, Some(message))
         }
         Err(UsageError::SilentExit(code)) => (code, true, None),
     };
+    let code = crate::cli_output::exit_code_after_output(command_output, code);
     let internal_hook = args.first().map(String::as_str) == Some("hooks")
         && matches!(
             args.get(1).map(String::as_str),
@@ -1030,6 +1055,92 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         record_command_metric(args, code, started.elapsed().as_millis() as i64);
     }
     code
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ErrorRendering {
+    Json(String),
+    Text(String),
+    Diagnostic(String),
+}
+
+pub fn json_requested(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        if argument == "--" {
+            break;
+        }
+        if VALUE_FLAGS.contains(&argument.as_str()) {
+            args.next();
+            continue;
+        }
+        if matches!(argument.as_str(), "--json" | "--json-output") {
+            return true;
+        }
+    }
+    false
+}
+
+fn render_cli_error(
+    args: &[String],
+    code: u8,
+    message: &str,
+    output_attempted: bool,
+) -> ErrorRendering {
+    if json_requested(args) {
+        if output_attempted {
+            // Keep an already-started report as the only stdout document,
+            // while preserving the failure reason and any recovery handoff.
+            // This also covers a partial stdout write, where appending a
+            // second JSON value could not repair the first one.
+            return ErrorRendering::Diagnostic(message.to_string());
+        }
+        ErrorRendering::Json(
+            serde_json::json!({
+                "schema": "aethyme.broker-error/v1",
+                "error": {
+                    "code": code,
+                    "message": message,
+                },
+            })
+            .to_string(),
+        )
+    } else {
+        ErrorRendering::Text(message.to_string())
+    }
+}
+
+fn emit_cli_error(rendering: ErrorRendering) {
+    match rendering {
+        ErrorRendering::Json(json) => out!("{}", json),
+        ErrorRendering::Text(message) => eprintln!("Error: {message}"),
+        ErrorRendering::Diagnostic(message) => eprintln!("Error: {message}"),
+    }
+}
+
+fn error_output_for_command(
+    args: &[String],
+    code: u8,
+    message: &str,
+    output_attempted: bool,
+) -> (u8, ErrorRendering) {
+    (
+        code,
+        render_cli_error(args, code, message, output_attempted),
+    )
+}
+
+fn report_command_error(args: &[String], code: u8, message: &str, output_attempted: bool) -> u8 {
+    let before = crate::cli_output::snapshot();
+    let (code, rendering) = error_output_for_command(args, code, message, output_attempted);
+    emit_cli_error(rendering);
+    crate::cli_output::exit_code_after_output(before, code)
+}
+
+/// Render an error raised by router preflight before broker dispatch.
+/// The JSON form is a standalone, versioned error envelope.
+pub fn report_dispatch_error(args: &[String], code: u8, message: &str) -> u8 {
+    report_command_error(args, code, message, false)
 }
 
 /// Keep the repository's primary checkout current before broker commands
@@ -1311,6 +1422,7 @@ struct Parsed {
     scope: Option<String>,
     effect: Option<String>,
     outcome: Option<String>,
+    inspect_remote: bool,
     reason: Option<String>,
     agent: Option<String>,
     repo_name: Option<String>,
@@ -1462,6 +1574,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         scope: None,
         effect: None,
         outcome: None,
+        inspect_remote: false,
         reason: None,
         agent: None,
         repo_name: None,
@@ -1584,7 +1697,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                 parsed.exec_command = iter.cloned().collect();
                 break;
             }
-            "--json" => parsed.json = true,
+            "--json" | "--json-output" => parsed.json = true,
             "--summary" => parsed.summary = true,
             "--refresh" => parsed.refresh = true,
             "--follow" => parsed.follow = true,
@@ -1635,6 +1748,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--timings" => parsed.timings = true,
             "--from-provider" => parsed.from_provider = true,
             "--no-wait" => parsed.no_wait = true,
+            "--inspect-remote" => parsed.inspect_remote = true,
             "--queue-timeout" => {
                 let value = iter.next().ok_or(UsageError::Message(
                     "--queue-timeout requires a value in seconds".into(),

@@ -148,7 +148,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
 
 #[cfg(unix)]
 #[test]
-fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
+fn finish_preserves_discovery_errors_before_closing_the_session() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = isolation::FixtureRepo::new();
@@ -157,23 +157,33 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    let mut broker = isolation::open(tmp.path());
+    let worktree_root = tmp
+        .path()
+        .parent()
+        .expect("fixture repo has an owning root")
+        .join("worktrees with spaces");
+    let mut broker = isolation::open(tmp.path()).with_worktree_root(&worktree_root);
     let session = broker.start_worktree("slow finish check", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
+    assert!(worktree.starts_with(&worktree_root));
+    assert!(worktree.to_string_lossy().contains(' '));
     let session_id = session.id;
-    drop(broker);
 
     let original_path = std::env::var_os("PATH").unwrap();
     let real_git = std::env::split_paths(&original_path)
         .map(|directory| directory.join("git"))
         .find(|candidate| candidate.is_file())
         .expect("the test host has git on PATH");
-    let bin = tmp.path().join("slow-git-bin");
+    let bin = tmp
+        .path()
+        .parent()
+        .expect("fixture repo has an owning root")
+        .join("slow-git-bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shim = bin.join("git");
     std::fs::write(
         &shim,
-        "#!/bin/sh\nif [ \"$1\" = status ] && [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ]; then exec /bin/sleep 5; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n",
+        "#!/bin/sh\nif [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ] && [ \"$1\" = rev-parse ] && [ \"$2\" = --show-toplevel ]; then exec /bin/sleep 5; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
@@ -183,22 +193,47 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     paths.extend(std::env::split_paths(&original_path));
     let path = std::env::join_paths(paths).unwrap();
     let session_arg = session_id.to_string();
-    let output = isolation::command(CLI, tmp.path(), &[])
+    let mut command = Command::new(CLI);
+    command
         .args(["finish", "--session", &session_arg, "--timeout", "1"])
         .current_dir(tmp.path())
         .env("PATH", path)
         .env("AETHYME_TEST_REAL_GIT", real_git)
         .env("AETHYME_TEST_SLOW_WORKTREE", &worktree)
-        .output()
+        .env(
+            "AETHYME_CHAU7_MCP_BRIDGE",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/no-chau7-bridge"),
+        );
+    for variable in [
+        "AETHYME_BROKER_DB",
+        "AETHYME_GATE_BROKER_DATABASES",
+        "AETHYME_HOST_STATE_DIR",
+        "AETHYME_HOST_CACHE_DIR",
+        "AETHYME_WORKTREE_ROOT",
+        "AETHYME_BROKER_STORAGE_CONTEXT_V1",
+        "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+        "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+        "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+        "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+    ] {
+        command.env_remove(variable);
+    }
+    broker
+        .configure_storage_context_for_child(&mut command)
         .unwrap();
+    drop(broker);
+    let output = command.output().unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("finish timed out after 1s"), "{stderr}");
     assert!(
-        stderr.contains("git ") && stderr.contains("did not finish within"),
+        stderr.contains("git rev-parse --show-toplevel did not finish within 1s"),
         "{stderr}"
     );
-    // The message names the session state it left and the one safe next step.
+    assert!(
+        !stderr.contains("is not inside a git repository"),
+        "a discovery timeout must not be reported as a missing repository: {stderr}"
+    );
+    // The timeout leaves the session active and points to a bounded retry.
     assert!(
         stderr.contains(&format!(
             "session {session_id} is still active and nothing was closed"
@@ -212,6 +247,33 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
         "{stderr}"
     );
     assert!(stderr.contains("broker status --json"), "{stderr}");
+
+    // An unrelated Git failure from the same discovery command is not proof
+    // that the checkout is absent either. Keep the child process and failure
+    // finite so this checks diagnostic classification without adding a second
+    // timeout path.
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nif [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ] && [ \"$1\" = rev-parse ] && [ \"$2\" = --show-toplevel ]; then printf 'fatal: repository metadata is unreadable\\n' >&2; exit 128; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fatal: repository metadata is unreadable"),
+        "the unrelated Git failure should be preserved: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is not inside a git repository"),
+        "an unrelated Git failure must not be reported as a missing repository: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "session {session_id} is still active and nothing was closed"
+        )),
+        "{stderr}"
+    );
 
     let store = aethyme_broker::BrokerStore::open_in_repo(tmp.path()).unwrap();
     assert_eq!(store.session(session_id).unwrap().status.as_str(), "active");
@@ -321,17 +383,75 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
     );
 }
 
+fn finish_guidance_text(report: &serde_json::Value) -> String {
+    let rendered = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        report["error"]["message"],
+        report["summary"],
+        report["recommended_next_action"],
+        report["warnings"],
+        report["next_commands"],
+    );
+    match report["worktree_path"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+    {
+        Some(worktree_path) => rendered.replace(worktree_path, "<worktree>"),
+        None => rendered,
+    }
+}
+
 #[test]
 fn dirty_finish_guidance_is_stash_free() {
     let (tmp, session_id, worktree, _) = promoted_fixture();
     std::fs::write(worktree.join("dirty.txt"), "keep me\n").unwrap();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(3));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let rendered = report.to_string();
-    assert!(rendered.contains("managed pre-commit lane"), "{rendered}");
-    assert!(!rendered.contains("stash"), "{rendered}");
+    assert_eq!(report["error"]["code"], 3);
+    assert_eq!(report["error"]["message"], "session is not ready to finish");
+    let guidance = finish_guidance_text(&report);
+    assert!(guidance.contains("managed pre-commit lane"), "{guidance}");
+    assert!(!guidance.contains("stash"), "{guidance}");
+
+    let path_with_token = "/tmp/dirty_finish_guidance_is_stash_free/worktrees/finish-cli-fixture";
+    let path_only_report = serde_json::json!({
+        "worktree_path": path_with_token,
+        "error": {"message": "session is not ready to finish"},
+        "summary": "session is not finished yet",
+        "recommended_next_action": "inspect the worktree",
+        "warnings": [],
+        "next_commands": [format!("git -C {path_with_token} status --short")]
+    });
+    let path_control_guidance = finish_guidance_text(&path_only_report);
+    assert!(
+        path_control_guidance.contains("<worktree>"),
+        "{path_control_guidance}"
+    );
+    assert!(
+        path_control_guidance.contains("git -C <worktree> status --short"),
+        "{path_control_guidance}"
+    );
+    assert!(
+        !path_control_guidance.contains("stash"),
+        "{path_control_guidance}"
+    );
+
+    let stash_instruction_report = serde_json::json!({
+        "worktree_path": path_with_token,
+        "error": {"message": "session is not ready to finish"},
+        "summary": "session is not finished yet",
+        "recommended_next_action": "inspect the worktree",
+        "warnings": [],
+        "next_commands": [format!("git -C {path_with_token} stash")]
+    });
+    let stash_instruction = finish_guidance_text(&stash_instruction_report);
+    assert!(
+        stash_instruction.contains("git -C <worktree> stash"),
+        "{stash_instruction}"
+    );
+    assert!(stash_instruction.contains("stash"), "{stash_instruction}");
 }
 
 #[test]
@@ -495,3 +615,6 @@ fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() 
             .success()
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

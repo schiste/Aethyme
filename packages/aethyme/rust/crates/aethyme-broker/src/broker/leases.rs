@@ -1589,6 +1589,23 @@ impl Broker {
         self.guarded_exec_with_env(session_id, command, &[])
     }
 
+    /// Keep stdout available for the completed JSON report. Child output is
+    /// inherited on stderr without buffering or changing command argv.
+    pub(crate) fn guarded_exec_for_json(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+    ) -> Result<GuardedExecReport, BrokerOpError> {
+        self.guarded_exec_with_env_heartbeat_mode_and_stdout(
+            session_id,
+            command,
+            &[],
+            || Ok(()),
+            crate::inline_exec_supervisor::generic_exec_mode,
+            std::process::Stdio::from(std::io::stderr()),
+        )
+    }
+
     pub(crate) fn guarded_exec_with_env(
         &mut self,
         session_id: i64,
@@ -1622,8 +1639,31 @@ impl Broker {
         session_id: i64,
         command: &[String],
         environment: &[(String, String)],
+        heartbeat: F,
+        select_mode: M,
+    ) -> Result<GuardedExecReport, BrokerOpError>
+    where
+        F: FnMut() -> Result<(), BrokerOpError>,
+        M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
+    {
+        self.guarded_exec_with_env_heartbeat_mode_and_stdout(
+            session_id,
+            command,
+            environment,
+            heartbeat,
+            select_mode,
+            std::process::Stdio::inherit(),
+        )
+    }
+
+    fn guarded_exec_with_env_heartbeat_mode_and_stdout<F, M>(
+        &mut self,
+        session_id: i64,
+        command: &[String],
+        environment: &[(String, String)],
         mut heartbeat: F,
         select_mode: M,
+        stdout: std::process::Stdio,
     ) -> Result<GuardedExecReport, BrokerOpError>
     where
         F: FnMut() -> Result<(), BrokerOpError>,
@@ -1659,6 +1699,7 @@ impl Broker {
                     let supervisor =
                         crate::inline_exec_supervisor::InlineExecSupervisor::start_inheriting_stdin(
                             &executable,
+                            stdout,
                         )
                         .map_err(|error| map_guarded_exec_supervisor_error(session_id, command, error))?;
                     let result = supervisor
@@ -1681,7 +1722,8 @@ impl Broker {
                     let mut child = Command::new(&command[0]);
                     child
                         .args(&command[1..])
-                        .current_dir(&session.worktree_path);
+                        .current_dir(&session.worktree_path)
+                        .stdout(stdout);
                     for (name, value) in &execution_environment {
                         child.env(name, value);
                     }
@@ -1891,6 +1933,8 @@ impl Broker {
             command: command.to_vec(),
             exit_code: status.exit_code,
             command_success,
+            ownership_ok: audit.ok,
+            conflicting_leases: audit.conflicting_leases,
             before_dirty_paths: before_dirty,
             after_dirty_paths: after_dirty,
             newly_dirty_paths,

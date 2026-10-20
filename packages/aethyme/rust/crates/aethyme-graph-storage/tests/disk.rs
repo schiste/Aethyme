@@ -177,7 +177,7 @@ fn write_then_read_overlay_round_trip() {
     let written = write_overlay(tmp.path(), "structure", &overlay).unwrap();
     assert!(written.exists());
     let back: OverlayFragment<BTreeMap<String, String>> =
-        read_overlay(tmp.path(), "structure").unwrap();
+        read_overlay(tmp.path(), "structure", "structure-producer/0.1.0").unwrap();
     assert_eq!(back, overlay);
 }
 
@@ -209,7 +209,8 @@ fn read_overlay_kind_mismatch_fails_loudly() {
     )
     .unwrap();
 
-    let err = read_overlay::<BTreeMap<String, String>>(tmp.path(), "structure").unwrap_err();
+    let err = read_overlay::<BTreeMap<String, String>>(tmp.path(), "structure", "structure/0.1.0")
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -288,4 +289,98 @@ fn fragment_bytes_on_disk_byte_identical_across_writes() {
     let bytes_b = std::fs::read(tmp.path().join(".aethyme/graph/src/cli.py.bin")).unwrap();
 
     assert_eq!(bytes_a, bytes_b);
+}
+
+#[test]
+fn overlay_byte_reader_requires_the_expected_producer_version() {
+    use aethyme_graph_storage::{OverlayDecodeError, read_overlay_bytes, write_overlay_bytes};
+
+    let overlay =
+        OverlayFragment::new("structure", "structure/1", sample_overlay_payload()).unwrap();
+    let bytes = write_overlay_bytes(&overlay).unwrap();
+    let matching: OverlayFragment<BTreeMap<String, String>> =
+        read_overlay_bytes(&bytes, "structure", "structure/1").unwrap();
+    assert_eq!(matching, overlay);
+    assert_eq!(
+        read_overlay_bytes::<BTreeMap<String, String>>(&bytes, "structure", "structure/2")
+            .unwrap_err(),
+        OverlayDecodeError::ProducerVersionMismatch {
+            expected: "structure/2".into(),
+            found: "structure/1".into(),
+        }
+    );
+    assert_eq!(bytes, write_overlay_bytes(&overlay).unwrap());
+}
+
+#[test]
+fn overlay_byte_reader_rejects_an_empty_version_expectation() {
+    use aethyme_graph_storage::{OverlayDecodeError, read_overlay_bytes, write_overlay_bytes};
+
+    let overlay =
+        OverlayFragment::new("structure", "structure/1", sample_overlay_payload()).unwrap();
+    let bytes = write_overlay_bytes(&overlay).unwrap();
+    assert_eq!(
+        read_overlay_bytes::<BTreeMap<String, String>>(&bytes, "structure", "").unwrap_err(),
+        OverlayDecodeError::EmptyExpectedProducerVersion
+    );
+}
+
+#[test]
+fn overlay_byte_reader_refuses_an_empty_persisted_producer_version() {
+    use aethyme_graph_storage::{OverlayDecodeError, read_overlay_bytes};
+
+    // Independent wire fixture: the public constructor cannot produce this invalid metadata.
+    #[derive(serde::Serialize)]
+    struct Envelope {
+        kind: &'static str,
+        schema_version: u32,
+        producer_version: &'static str,
+        payload: BTreeMap<String, String>,
+    }
+    let bytes = bincode::serialize(&Envelope {
+        kind: "structure",
+        schema_version: 1,
+        producer_version: "",
+        payload: sample_overlay_payload(),
+    })
+    .unwrap();
+    assert_eq!(
+        read_overlay_bytes::<BTreeMap<String, String>>(&bytes, "structure", "structure/1")
+            .unwrap_err(),
+        OverlayDecodeError::ProducerVersionMismatch {
+            expected: "structure/1".into(),
+            found: "".into(),
+        }
+    );
+}
+
+#[test]
+fn disk_and_store_overlay_readers_refuse_stale_versions_without_rewriting() {
+    use aethyme_graph_storage::OverlayDecodeError;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay =
+        OverlayFragment::new("structure", "structure/1", sample_overlay_payload()).unwrap();
+    let path = write_overlay(tmp.path(), "structure", &overlay).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let store = FragmentStore::open(tmp.path()).unwrap();
+    for result in [
+        read_overlay::<BTreeMap<String, String>>(tmp.path(), "structure", "structure/2"),
+        store.read_overlay::<BTreeMap<String, String>>("structure", "structure/2"),
+    ] {
+        match result.unwrap_err() {
+            OverlayReadError::Decode(error) => assert_eq!(
+                error,
+                OverlayDecodeError::ProducerVersionMismatch {
+                    expected: "structure/2".into(),
+                    found: "structure/1".into(),
+                }
+            ),
+            error => panic!("expected a producer-version decode refusal, got {error:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    let current: OverlayFragment<BTreeMap<String, String>> =
+        store.read_overlay("structure", "structure/1").unwrap();
+    assert_eq!(current, overlay);
 }

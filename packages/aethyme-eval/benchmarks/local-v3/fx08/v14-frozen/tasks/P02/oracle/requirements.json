@@ -1,0 +1,12 @@
+{
+  "task_id": "P02",
+  "task_checks": [
+    "primary and Quick Find searches produce their own results",
+    "at 375px the primary input, Search and Clear controls are visible, fit the viewport, do not overlap, and do not cause horizontal scrolling",
+    "Clear empties primary query and results and restores focus"
+  ],
+  "decision_checks": [
+    "Quick Find query and results remain unchanged after primary search and clear actions"
+  ],
+  "observation": "Rendered browser geometry and interactions at a 375px viewport; no CSS source-pattern matching."
+}
