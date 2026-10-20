@@ -318,23 +318,46 @@ fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused()
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
     assert!(broker.submit(session.id).unwrap().promoted);
-    assert!(
-        broker
-            .finish_with_options(
-                session.id,
-                FinishOptions {
-                    keep_worktree: true,
-                },
-            )
-            .unwrap()
-            .closed
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "preserve recovery fixture",
+            &worktree_text,
+        ],
     );
+    let finish = broker
+        .finish_with_options(
+            session.id,
+            FinishOptions {
+                keep_worktree: false,
+            },
+        )
+        .unwrap();
+    assert!(finish.closed);
+    assert!(
+        finish.cleanup.failure.is_some(),
+        "the fixture lock must leave a real persisted finish-cleanup intent"
+    );
+    assert!(!finish.cleanup.completed);
 
-    // Reproduce the stranded state exactly: the administrative entry is gone,
-    // the checkout is not.
+    // Reproduce a partial removal after the durable finish intent: tracked
+    // payload remains, while both Git's admin entry and the checkout pointer
+    // are gone. Recovery must be bound to the intent, not just the branch.
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
     let gitdir = std::fs::read_to_string(worktree.join(".git")).unwrap();
     let gitdir = std::path::PathBuf::from(gitdir.trim().strip_prefix("gitdir:").unwrap().trim());
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        worktree.join(gitdir)
+    };
     std::fs::remove_dir_all(&gitdir).unwrap();
+    std::fs::remove_file(worktree.join(".git")).unwrap();
+    assert!(!worktree.join("README.md").exists());
     assert!(worktree.join("done.txt").exists());
     drop(broker);
 
