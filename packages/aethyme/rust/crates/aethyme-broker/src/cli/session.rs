@@ -78,6 +78,13 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     /// Other sessions that look like the same work; omitted when none.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     duplicate_work: &'a [crate::DuplicateWork],
+    /// Scope collisions involving this session; an empty array means no match.
+    /// Omitted when the scope is unavailable; see the warning below.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_overlaps: Option<&'a [crate::ScopeOverlap]>,
+    /// Why this session's scope overlaps could not be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_overlaps_warning: Option<&'a str>,
 }
 
 /// One warning line per other session that looks like the same work.
@@ -131,6 +138,8 @@ fn session_action_json<T: serde::Serialize>(
     tab_rename: &crate::chau7_mcp::SessionTabRename,
     guidance: Option<&crate::session_guidance::SessionGuidance>,
     duplicate_work: &[crate::DuplicateWork],
+    scope_overlaps: Option<&[crate::ScopeOverlap]>,
+    scope_overlaps_warning: Option<&str>,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&SessionActionOutput {
         report,
@@ -139,6 +148,8 @@ fn session_action_json<T: serde::Serialize>(
         guidance_source: guidance.map(|guidance| guidance.source),
         guidance_warning: guidance.and_then(|guidance| guidance.warning.as_deref()),
         duplicate_work,
+        scope_overlaps,
+        scope_overlaps_warning,
     })
 }
 
@@ -678,7 +689,7 @@ pub(super) fn capture_declared_scopes(
     task: Option<&str>,
     declared: &[String],
     quiet: bool,
-) -> Result<(), UsageError> {
+) -> Result<(Option<Vec<crate::ScopeOverlap>>, Option<String>), UsageError> {
     let mut parsed = Vec::with_capacity(declared.len());
     for text in declared {
         let (kind, value, operation) =
@@ -686,42 +697,61 @@ pub(super) fn capture_declared_scopes(
         parsed.push((kind, value, operation));
     }
     let report = broker.capture_session_scopes(session_id, &parsed, task)?;
-    if quiet {
-        return Ok(());
-    }
-    if report.declared > 0 || report.derived > 0 {
-        out!(
-            "Scope: {} declared, {} derived from the task",
-            report.declared,
-            report.derived
-        );
-        let overlaps = broker.scope_overlaps_snapshot()?;
-        let mine: Vec<_> = overlaps
-            .iter()
-            .filter(|overlap| overlap.session_a == session_id || overlap.session_b == session_id)
-            .collect();
-        for overlap in &mine {
-            let other = if overlap.session_a == session_id {
-                overlap.session_b
-            } else {
-                overlap.session_a
-            };
-            out!(
-                "  {} with session {}: {}",
-                overlap.severity.as_str(),
-                other,
-                overlap.explanation
-            );
-            out!("    {}", overlap.suggestion);
-        }
-        if mine.is_empty() {
-            out!("  no other live session names these targets");
+    let (scope_overlaps, scope_overlaps_warning) = if report.declared > 0 || report.derived > 0 {
+        match broker.scope_overlaps_snapshot() {
+            Ok(overlaps) => (
+                Some(
+                    overlaps
+                        .into_iter()
+                        .filter(|overlap| {
+                            overlap.session_a == session_id || overlap.session_b == session_id
+                        })
+                        .collect(),
+                ),
+                None,
+            ),
+            Err(error) => (None, Some(error.to_string())),
         }
     } else if let Some(reason) = &report.degraded {
-        // Never let an empty scope set read as a clean bill of health.
-        out!("Scope: none recorded — {reason}");
+        (None, Some(reason.clone()))
+    } else {
+        (Some(Vec::new()), None)
+    };
+
+    if !quiet {
+        if report.declared > 0 || report.derived > 0 {
+            out!(
+                "Scope: {} declared, {} derived from the task",
+                report.declared,
+                report.derived
+            );
+            if let Some(overlaps) = &scope_overlaps {
+                for overlap in overlaps {
+                    let other = if overlap.session_a == session_id {
+                        overlap.session_b
+                    } else {
+                        overlap.session_a
+                    };
+                    out!(
+                        "  {} with session {}: {}",
+                        overlap.severity.as_str(),
+                        other,
+                        overlap.explanation
+                    );
+                    out!("    {}", overlap.suggestion);
+                }
+                if overlaps.is_empty() {
+                    out!("  no other live session names these targets");
+                }
+            } else if let Some(warning) = &scope_overlaps_warning {
+                out!("  scope overlaps unavailable: {warning}");
+            }
+        } else if let Some(reason) = &report.degraded {
+            // Never let an empty scope set read as a clean bill of health.
+            out!("Scope: none recorded — {reason}");
+        }
     }
-    Ok(())
+    Ok((scope_overlaps, scope_overlaps_warning))
 }
 
 /// Print the worktree report: what holds work that exists nowhere else, first.
@@ -1002,7 +1032,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.json {
         // Scope is recorded in both output modes: `--json` is the form
         // agents use, so skipping capture there drops it for most callers.
-        capture_declared_scopes(
+        let (scope_overlaps, scope_overlaps_warning) = capture_declared_scopes(
             &mut broker,
             session.id,
             parsed.task.as_deref(),
@@ -1012,7 +1042,14 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         let duplicates = broker.duplicate_work_for(session);
         out!(
             "{}",
-            session_action_json(&report, &tab_rename, Some(&guidance), &duplicates)?
+            session_action_json(
+                &report,
+                &tab_rename,
+                Some(&guidance),
+                &duplicates,
+                scope_overlaps.as_deref(),
+                scope_overlaps_warning.as_deref(),
+            )?
         );
     } else {
         match report.outcome {
@@ -1063,7 +1100,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         if let Some(note) = &report.default_branch_note {
             out!("note: {note}");
         }
-        capture_declared_scopes(
+        let _scope_capture = capture_declared_scopes(
             &mut broker,
             session.id,
             parsed.task.as_deref(),
@@ -1188,7 +1225,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
     if parsed.json {
-        capture_declared_scopes(
+        let (scope_overlaps, scope_overlaps_warning) = capture_declared_scopes(
             &mut broker,
             session.id,
             Some(task.as_str()),
@@ -1198,7 +1235,14 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         let duplicates = broker.duplicate_work_for(session);
         out!(
             "{}",
-            session_action_json(&report, &tab_rename, Some(&guidance), &duplicates)?
+            session_action_json(
+                &report,
+                &tab_rename,
+                Some(&guidance),
+                &duplicates,
+                scope_overlaps.as_deref(),
+                scope_overlaps_warning.as_deref(),
+            )?
         );
     } else {
         out!(
@@ -1208,7 +1252,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             session.branch
         );
         render_tab_rename(&tab_rename);
-        capture_declared_scopes(
+        let _scope_capture = capture_declared_scopes(
             &mut broker,
             session.id,
             Some(task.as_str()),
@@ -1262,7 +1306,7 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
         let duplicates = broker.duplicate_work_for(session);
         out!(
             "{}",
-            session_action_json(&report, &tab_rename, None, &duplicates)?
+            session_action_json(&report, &tab_rename, None, &duplicates, None, None)?
         );
     } else {
         out!(

@@ -250,9 +250,23 @@ impl Broker {
         report: &mut FinishReport,
         session: &Session,
     ) -> Result<(), BrokerOpError> {
+        // Acquire before persisting finish's cleanup intent and keep the claim
+        // through physical removal. Cleanup calls the already-claimed helper
+        // below so this path never tries to acquire its own lock recursively.
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+        let current_session = self.store.session(report.session_id)?;
+        super::cleanup::ensure_lifecycle_session_unchanged(
+            report.session_id,
+            session,
+            &current_session,
+        )?;
+        let session = &current_session;
         let worktree_path = PathBuf::from(&session.worktree_path);
         let item = self.cleanup_item(session)?;
         report.cleanup_safe = item.as_ref().is_none_or(|item| item.eligible());
+        let recovery_retry =
+            !report.cleanup_safe && self.interrupted_finish_cleanup_proof(session).is_some();
+        report.cleanup_safe |= recovery_retry;
         if !report.cleanup_safe {
             report.status = FinishStatus::Closed;
             report.cleanup.requested = true;
@@ -288,15 +302,40 @@ impl Broker {
             report.session_id
         ));
 
-        let start_payload =
-            crate::events::session_finish_cleanup_started_payload(worktree_present, branch_present);
-        self.store
-            .begin_finish_cleanup(report.session_id, &start_payload)?;
+        if !recovery_retry {
+            let recovery_proof =
+                if session.origin == SessionOrigin::Spawned && worktree_present && branch_present {
+                    GitRepo::discover(&worktree_path)
+                        .ok()
+                        .and_then(|checkout| {
+                            checkout.finish_cleanup_recovery_proof(&format!(
+                                "refs/heads/{}",
+                                session.branch
+                            ))
+                        })
+                        .filter(|proof| {
+                            item.as_ref().and_then(|item| item.branch_tip.as_deref())
+                                == Some(proof.branch_tip.as_str())
+                        })
+                } else {
+                    None
+                };
+            let start_payload = crate::events::session_finish_cleanup_started_payload_with_proof(
+                worktree_present,
+                branch_present,
+                recovery_proof.as_ref(),
+            );
+            self.store
+                .begin_finish_cleanup(report.session_id, &start_payload)?;
+        }
+        let cleanup_session = self.store.session(report.session_id)?;
         // `finish --timeout` bounds the checks that decide whether to close.
         // Once closed, reclaiming the worktree runs to completion: killing a
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
         // orphaned directory instead of a faster answer.
-        match crate::git::without_git_deadline(|| self.cleanup(report.session_id, false)) {
+        match crate::git::without_git_deadline(|| {
+            self.cleanup_under_lifecycle_claim(&cleanup_session, false)
+        }) {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;

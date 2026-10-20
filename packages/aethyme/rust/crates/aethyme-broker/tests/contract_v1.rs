@@ -270,6 +270,14 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &["exit_code"],
         "session.exited",
     );
+    let cleanup_started = events::session_finish_cleanup_started_payload(true, true);
+    assert_keys(
+        &cleanup_started,
+        &["branch_present", "recovery_proof", "worktree_present"],
+        "session.finish_cleanup_started",
+    );
+    let cleanup_started: serde_json::Value = serde_json::from_str(&cleanup_started).unwrap();
+    assert!(cleanup_started["recovery_proof"].is_null());
     assert_keys(
         &events::graph_integrity_checked_payload(&aethyme_broker::GraphIntegrityOutcome {
             status: aethyme_broker::GraphIntegrityStatus::Passed,

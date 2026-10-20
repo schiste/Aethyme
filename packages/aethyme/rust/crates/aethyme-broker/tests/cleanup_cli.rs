@@ -6,15 +6,7 @@ use aethyme_broker::{Broker, FinishOptions};
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .unwrap();
+    let output = git_output(repo, args);
     assert!(
         output.status.success(),
         "git {args:?}: {}",
@@ -22,12 +14,35 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
+fn git_output(repo: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new("git");
+    clear_git_environment(&mut command);
+    command
         .args(args)
         .current_dir(repo)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
         .unwrap()
+}
+
+fn run(repo: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(CLI);
+    clear_git_environment(&mut command);
+    command.args(args).current_dir(repo).output().unwrap()
+}
+
+fn clear_git_environment(command: &mut Command) {
+    let git_keys = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+        .collect::<Vec<_>>();
+    for key in git_keys {
+        command.env_remove(key);
+    }
 }
 
 #[test]
@@ -153,18 +168,17 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     assert!(apply["failures"].as_array().unwrap().is_empty());
     assert!(!worktree.exists());
     assert!(
-        !Command::new("git")
-            .args([
+        !git_output(
+            tmp.path(),
+            &[
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("refs/heads/{}", session.branch),
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
+            ],
+        )
+        .status
+        .success()
     );
 }
 
@@ -304,23 +318,46 @@ fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused()
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
     assert!(broker.submit(session.id).unwrap().promoted);
-    assert!(
-        broker
-            .finish_with_options(
-                session.id,
-                FinishOptions {
-                    keep_worktree: true,
-                },
-            )
-            .unwrap()
-            .closed
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "preserve recovery fixture",
+            &worktree_text,
+        ],
     );
+    let finish = broker
+        .finish_with_options(
+            session.id,
+            FinishOptions {
+                keep_worktree: false,
+            },
+        )
+        .unwrap();
+    assert!(finish.closed);
+    assert!(
+        finish.cleanup.failure.is_some(),
+        "the fixture lock must leave a real persisted finish-cleanup intent"
+    );
+    assert!(!finish.cleanup.completed);
 
-    // Reproduce the stranded state exactly: the administrative entry is gone,
-    // the checkout is not.
+    // Reproduce a partial removal after the durable finish intent: tracked
+    // payload remains, while both Git's admin entry and the checkout pointer
+    // are gone. Recovery must be bound to the intent, not just the branch.
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
     let gitdir = std::fs::read_to_string(worktree.join(".git")).unwrap();
     let gitdir = std::path::PathBuf::from(gitdir.trim().strip_prefix("gitdir:").unwrap().trim());
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        worktree.join(gitdir)
+    };
     std::fs::remove_dir_all(&gitdir).unwrap();
+    std::fs::remove_file(worktree.join(".git")).unwrap();
+    assert!(!worktree.join("README.md").exists());
     assert!(worktree.join("done.txt").exists());
     drop(broker);
 
@@ -403,17 +440,10 @@ fn a_squash_merged_session_is_eligible_on_its_recorded_representation() {
     std::fs::write(worktree.join("feature.txt"), "feature\n").unwrap();
     git(&worktree, &["add", "feature.txt"]);
     git(&worktree, &["commit", "-qm", "feature"]);
-    let session_head = String::from_utf8(
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&worktree)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_owned();
+    let session_head = String::from_utf8(git_output(&worktree, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
 
     // The squash merge: same content on main, a commit the session never made.
     std::fs::write(tmp.path().join("feature.txt"), "feature\n").unwrap();

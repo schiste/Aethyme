@@ -12,6 +12,7 @@
 //!   reuse, even across deletes/prune), so `--since <id>` cursors are
 //!   always safe to resume.
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 // ── kind constants ───────────────────────────────────────────────────
@@ -174,13 +175,50 @@ pub fn session_abandoned_unpushed_payload(
     .to_string()
 }
 
+/// Immutable identity captured before `finish` begins physical cleanup. A
+/// later retry may use it only when the same registered checkout is still
+/// present and its remaining dirt is exclusively unstaged tracked deletions.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinishCleanupRecoveryProof {
+    pub(crate) schema_version: u8,
+    pub(crate) worktree_path: String,
+    pub(crate) worktree_device: u64,
+    pub(crate) worktree_inode: u64,
+    pub(crate) git_pointer_device: u64,
+    pub(crate) git_pointer_inode: u64,
+    pub(crate) git_admin_path: String,
+    pub(crate) git_admin_device: u64,
+    pub(crate) git_admin_inode: u64,
+    pub(crate) git_common_path: String,
+    pub(crate) git_common_device: u64,
+    pub(crate) git_common_inode: u64,
+    pub(crate) branch_ref: String,
+    pub(crate) head: String,
+    pub(crate) branch_tip: String,
+}
+
+/// Build the stable v1 payload for the start of finish cleanup.
+///
+/// The recovery proof is an additive field produced only by the broker's
+/// internal cleanup path; this public constructor keeps its original
+/// signature for downstream callers.
 pub fn session_finish_cleanup_started_payload(
     worktree_present: bool,
     branch_present: bool,
 ) -> String {
+    session_finish_cleanup_started_payload_with_proof(worktree_present, branch_present, None)
+}
+
+pub(crate) fn session_finish_cleanup_started_payload_with_proof(
+    worktree_present: bool,
+    branch_present: bool,
+    recovery_proof: Option<&FinishCleanupRecoveryProof>,
+) -> String {
     json!({
         "worktree_present": worktree_present,
         "branch_present": branch_present,
+        "recovery_proof": recovery_proof,
     })
     .to_string()
 }

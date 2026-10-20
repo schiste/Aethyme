@@ -9,6 +9,11 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
+
+const LIFECYCLE_LOCK_WAIT: Duration = Duration::from_secs(10);
+const LIFECYCLE_LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// Open (creating if needed) a lock file without truncating it.
 pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
@@ -18,6 +23,161 @@ pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
         .write(true)
         .truncate(false)
         .open(path)
+}
+
+/// Acquire the cross-process lifecycle mutation claim for the primary repo.
+///
+/// The persistent lock lives under the primary repository's runtime state,
+/// never under a checkout that an operation may remove. All guarded checkout
+/// creation, adoption, and removal paths use the same file, so registering a
+/// nested checkout cannot race deletion of its parent. The claim is deliberately
+/// scoped to checkout creation/adoption/removal; ordinary edits, builds, and
+/// submissions do not acquire it. The lock file is never unlinked: doing so
+/// while another process holds it would allow a second inode at the same path.
+pub(crate) fn acquire_repository_lifecycle_lock(main_root: &Path) -> io::Result<ExclusiveFileLock> {
+    acquire_repository_lifecycle_lock_with_wait(main_root, LIFECYCLE_LOCK_WAIT)
+}
+
+fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::PathBuf> {
+    let root = main_root.canonicalize()?;
+    let state_dir = root.join(".aethyme");
+    ensure_real_directory(&state_dir)?;
+    let run_dir = state_dir.join("run");
+    ensure_real_directory(&run_dir)?;
+    let canonical_run = run_dir.canonicalize()?;
+    if canonical_run != run_dir || !canonical_run.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "broker runtime path is not a real directory under the primary repository: {}",
+                run_dir.display()
+            ),
+        ));
+    }
+
+    Ok(canonical_run.join("worktree-lifecycle.lock"))
+}
+
+fn acquire_repository_lifecycle_lock_with_wait(
+    main_root: &Path,
+    wait: Duration,
+) -> io::Result<ExclusiveFileLock> {
+    let path = repository_lifecycle_lock_path(main_root)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        let file = open_lock_file_nofollow(&path)?;
+        match ExclusiveFileLock::try_acquire(file)? {
+            Some(lock) => {
+                // Revalidate the primary-root-derived location after acquiring
+                // the persistent file. This catches a replaced runtime path or
+                // lock name before the claim is used for a destructive action.
+                if repository_lifecycle_lock_path(main_root)? != path {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "broker lifecycle lock path changed while it was acquired",
+                    ));
+                }
+                verify_named_lock_file(&path, &lock.file)?;
+                return Ok(lock);
+            }
+            None if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "another broker lifecycle operation holds {}; retry this command after it finishes",
+                        path.display()
+                    ),
+                ));
+            }
+            None => thread::sleep(
+                LIFECYCLE_LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            ),
+        }
+    }
+}
+
+fn ensure_real_directory(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "broker runtime path is not a real directory: {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "broker runtime path changed while it was created: {}",
+                        path.display()
+                    ),
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_lock_file_nofollow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself. `verify_named_lock_file` rejects it
+        // after open rather than following it to an unrelated lock target.
+        options.custom_flags(0x0020_0000);
+    }
+    options.open(path)
+}
+
+fn verify_named_lock_file(path: &Path, opened: &File) -> io::Result<()> {
+    let named = std::fs::symlink_metadata(path)?;
+    let opened = opened.metadata()?;
+    if !named.file_type().is_file() || !opened.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "worktree lifecycle lock is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if named.dev() != opened.dev()
+            || named.ino() != opened.ino()
+            || named.nlink() != 1
+            || opened.nlink() != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "worktree lifecycle lock path changed while it was opened: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// An exclusive lock held on an open file until the guard drops.
@@ -63,6 +223,38 @@ impl Drop for ExclusiveFileLock {
 mod tests {
     use super::*;
 
+    fn lifecycle_claim_contends_in_order(first: &str, second: &str) {
+        let repository = tempfile::tempdir().unwrap();
+        let checkout = repository.path().join("linked-worktree");
+        std::fs::create_dir(&checkout).unwrap();
+        let primary_alias = repository.path().join(".");
+        let held_by_first = acquire_repository_lifecycle_lock(repository.path())
+            .unwrap_or_else(|error| panic!("{first} claim failed: {error}"));
+        let lock_path = repository_lifecycle_lock_path(&primary_alias).unwrap();
+        assert!(
+            lock_path.starts_with(repository.path().join(".aethyme/run")),
+            "the persistent claim must be rooted in primary repository state"
+        );
+        assert!(
+            !lock_path.starts_with(&checkout),
+            "removing a linked checkout must not remove the repository claim"
+        );
+        let second_file = open_lock_file_nofollow(&lock_path).unwrap();
+        assert!(
+            matches!(
+                second_file.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "{second} must wait while {first} holds the repository lifecycle claim"
+        );
+        assert!(lock_path.exists(), "the lock file must remain persistent");
+
+        drop(held_by_first);
+        second_file.try_lock().unwrap_or_else(|error| {
+            panic!("{second} did not acquire after {first} released: {error}")
+        });
+    }
+
     #[test]
     fn a_held_lock_excludes_another_open_until_it_drops() {
         let directory = tempfile::tempdir().unwrap();
@@ -98,5 +290,57 @@ mod tests {
         std::fs::write(&path, b"holder").unwrap();
         let _lock = ExclusiveFileLock::acquire(open_lock_file(&path).unwrap()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"holder");
+    }
+
+    #[test]
+    fn adoption_claim_blocks_cleanup_claim() {
+        lifecycle_claim_contends_in_order("adoption", "cleanup");
+    }
+
+    #[test]
+    fn cleanup_claim_blocks_adoption_claim() {
+        lifecycle_claim_contends_in_order("cleanup", "adoption");
+    }
+
+    #[test]
+    fn lifecycle_claim_times_out_with_a_retry_instruction() {
+        let repository = tempfile::tempdir().unwrap();
+        let _held = acquire_repository_lifecycle_lock(repository.path()).unwrap();
+
+        let error = acquire_repository_lifecycle_lock_with_wait(
+            repository.path(),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("retry this command"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_claim_aliases_the_same_canonical_primary_repository() {
+        let holder = tempfile::tempdir().unwrap();
+        let repository = holder.path().join("repository");
+        let alias = holder.path().join("repository-alias");
+        std::fs::create_dir(&repository).unwrap();
+        std::os::unix::fs::symlink(&repository, &alias).unwrap();
+
+        assert_eq!(
+            repository_lifecycle_lock_path(&repository).unwrap(),
+            repository_lifecycle_lock_path(&alias).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_claim_refuses_a_symlink_lockfile_without_touching_its_target() {
+        let repository = tempfile::tempdir().unwrap();
+        let path = repository_lifecycle_lock_path(repository.path()).unwrap();
+        let target = repository.path().join("outside-lock-target");
+        std::fs::write(&target, b"preserve target").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(acquire_repository_lifecycle_lock(repository.path()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve target");
     }
 }

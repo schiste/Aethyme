@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::BrokerOpError;
 
@@ -30,6 +31,7 @@ pub const SIZE_RECORD_SCHEMA_VERSION: u32 = 1;
 
 /// Where measurements are written down, relative to the main checkout.
 const SIZE_RECORDS_RELPATH: &str = ".aethyme/worktree-sizes.json";
+const HEALTH_SIZE_RECORD_READ_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Whether a pass may walk the disk to find out how big something is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +268,28 @@ pub(crate) fn load_size_records(main_root: &Path) -> SizeRecords {
         .unwrap_or_default()
 }
 
+/// Read the size cache for a bounded health pass. A partial or oversized
+/// cache is unknown, not an empty inventory: callers must defer the checks
+/// that depend on these records.
+pub(crate) fn load_size_records_until(main_root: &Path, deadline: Instant) -> Option<SizeRecords> {
+    let path = size_records_path(main_root);
+    let bytes = match crate::preparation::read_bounded_regular_file_for_liveness(
+        &path,
+        HEALTH_SIZE_RECORD_READ_LIMIT_BYTES as u64,
+        deadline,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Some(SizeRecords::default()),
+        Err(_) => return None,
+    };
+    Some(
+        serde_json::from_slice::<SizeRecords>(&bytes)
+            .ok()
+            .filter(|records| records.schema_version == SIZE_RECORD_SCHEMA_VERSION)
+            .unwrap_or_default(),
+    )
+}
+
 /// Write measurements back, replacing the file in one rename.
 ///
 /// A half-written cache would be discarded on the next read anyway, but a
@@ -303,6 +327,34 @@ mod tests {
 
     fn owned(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|path| (*path).to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_size_record_read_refuses_fifo_and_expired_deadline_before_open() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        let runtime = root.join(".aethyme");
+        std::fs::create_dir(&runtime).unwrap();
+        let path = size_records_path(root);
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path inside this live TempDir.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let refused =
+            load_size_records_until(root, Instant::now() + std::time::Duration::from_secs(5));
+        assert!(refused.is_none(), "a FIFO is not a size-record file");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let expired =
+            load_size_records_until(root, Instant::now() - std::time::Duration::from_millis(1));
+        assert!(
+            expired.is_none(),
+            "expired health work refuses before opening"
+        );
     }
 
     #[test]

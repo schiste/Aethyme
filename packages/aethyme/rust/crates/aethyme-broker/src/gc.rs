@@ -48,6 +48,10 @@ fn is_sha256_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
 fn gc_journal_archive_budget_admits(count: usize, bytes: u64, incoming: u64) -> bool {
     count < GC_JOURNAL_ARCHIVE_MAX_COUNT
         && bytes
@@ -822,17 +826,172 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn retained_metric_bytes(bytes: &[u8], cutoff: i64) -> Vec<u8> {
+fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path did not open as a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn same_regular_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if !left.is_file()
+        || !right.is_file()
+        || left.len() != right.len()
+        || left
+            .modified()
+            .ok()
+            .zip(right.modified().ok())
+            .is_none_or(|(left, right)| left != right)
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+const GC_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
+const GC_METRICS_HEALTH_READ_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+fn sha256_reader_until_with_clock<R, C>(
+    reader: &mut R,
+    deadline: Option<Instant>,
+    mut now: C,
+) -> std::io::Result<Option<(String, u64)>>
+where
+    R: Read,
+    C: FnMut() -> Instant,
+{
+    let mut digest = Sha256::new();
+    let mut bytes_read = 0_u64;
+    let mut buffer = [0_u8; GC_FILE_READ_CHUNK_BYTES];
+    loop {
+        if deadline.is_some_and(|deadline| now() >= deadline) {
+            return Ok(None);
+        }
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Ok(None);
+            }
+            return Ok(Some((format!("{:x}", digest.finalize()), bytes_read)));
+        }
+        digest.update(&buffer[..count]);
+        bytes_read = bytes_read.saturating_add(count as u64);
+    }
+}
+
+fn sha256_file_until(
+    path: &Path,
+    deadline: Option<Instant>,
+) -> std::io::Result<Option<(String, u64)>> {
+    if deadline_expired(deadline) {
+        return Ok(None);
+    }
+    let mut file = open_regular_file_nonblocking(path)?;
+    let opened = file.metadata()?;
+    let before_path = std::fs::symlink_metadata(path)?;
+    if !same_regular_file_version(&opened, &before_path) || deadline_expired(deadline) {
+        return Ok(None);
+    }
+    let Some((digest, bytes)) = sha256_reader_until_with_clock(&mut file, deadline, Instant::now)?
+    else {
+        return Ok(None);
+    };
+    let after_open = file.metadata()?;
+    let after_path = std::fs::symlink_metadata(path)?;
+    if deadline_expired(deadline)
+        || !same_regular_file_version(&opened, &after_open)
+        || !same_regular_file_version(&opened, &after_path)
+        || bytes != opened.len()
+    {
+        return Ok(None);
+    }
+    Ok(Some((digest, bytes)))
+}
+
+fn read_all_until_with_clock<R, C>(
+    reader: &mut R,
+    deadline: Option<Instant>,
+    mut now: C,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: Read,
+    C: FnMut() -> Instant,
+{
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; GC_FILE_READ_CHUNK_BYTES];
+    loop {
+        if deadline.is_some_and(|deadline| now() >= deadline) {
+            return Ok(None);
+        }
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            if deadline.is_some_and(|deadline| now() >= deadline) {
+                return Ok(None);
+            }
+            return Ok(Some(bytes));
+        }
+        if deadline.is_some()
+            && bytes.len().saturating_add(count) > GC_METRICS_HEALTH_READ_LIMIT_BYTES
+        {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn retained_metric_bytes_until(
+    bytes: &[u8],
+    cutoff: i64,
+    deadline: Option<Instant>,
+) -> Option<(Vec<u8>, bool, usize)> {
     let mut after = Vec::with_capacity(bytes.len());
+    let mut removed = false;
+    let mut malformed_lines = 0_usize;
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if deadline_expired(deadline) {
+            return None;
+        }
         let timestamp = serde_json::from_slice::<serde_json::Value>(line)
             .ok()
             .and_then(|value| value.get("ts").and_then(serde_json::Value::as_i64));
-        if timestamp.is_none_or(|timestamp| timestamp >= cutoff) {
-            after.extend_from_slice(line);
+        match timestamp {
+            Some(timestamp) if timestamp < cutoff => removed = true,
+            Some(_) => after.extend_from_slice(line),
+            None => {
+                malformed_lines = malformed_lines.saturating_add(1);
+                after.extend_from_slice(line);
+            }
         }
     }
-    after
+    Some((after, removed, malformed_lines))
+}
+
+fn retained_metric_bytes(bytes: &[u8], cutoff: i64) -> Vec<u8> {
+    retained_metric_bytes_until(bytes, cutoff, None)
+        .expect("an unbounded metrics rewrite completes")
+        .0
 }
 
 fn repo_relative(root: &Path, path: &Path) -> Option<String> {
@@ -841,56 +1000,112 @@ fn repo_relative(root: &Path, path: &Path) -> Option<String> {
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
 }
 
+enum MetricsRewrite {
+    Complete(Option<GcFileCandidate>),
+    Deferred,
+}
+
 fn metrics_rewrite(
     main_root: &Path,
     cutoff: i64,
     blockers: &mut Vec<GcBlocker>,
-) -> Result<Option<GcFileCandidate>, BrokerOpError> {
+    deadline: Option<Instant>,
+) -> Result<MetricsRewrite, BrokerOpError> {
     let relative = ".aethyme/logs/command-metrics.jsonl";
     let path = main_root.join(relative);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            blockers.push(GcBlocker {
-                kind: "command_metrics".into(),
-                id: None,
-                reason: format!("cannot inspect {relative}: {error}"),
-            });
-            return Ok(None);
-        }
-    };
+    if deadline_expired(deadline) {
+        return Ok(MetricsRewrite::Deferred);
+    }
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         blockers.push(GcBlocker {
             kind: "command_metrics".into(),
             id: None,
             reason: format!("{relative} is a symlink and is never rewritten by GC"),
         });
-        return Ok(None);
+        return Ok(MetricsRewrite::Complete(None));
     }
-
-    let after = retained_metric_bytes(&bytes, cutoff);
-    let mut removed = false;
-    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        let timestamp = serde_json::from_slice::<serde_json::Value>(line)
-            .ok()
-            .and_then(|value| value.get("ts").and_then(serde_json::Value::as_i64));
-        match timestamp {
-            Some(timestamp) if timestamp < cutoff => removed = true,
-            Some(_) => {}
-            None => {
-                blockers.push(GcBlocker {
-                    kind: "command_metric_line".into(),
-                    id: None,
-                    reason: "retained one malformed or timestamp-free command metric line".into(),
-                });
-            }
+    let mut file = match open_regular_file_nonblocking(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MetricsRewrite::Complete(None));
+        }
+        Err(error) => {
+            blockers.push(GcBlocker {
+                kind: "command_metrics".into(),
+                id: None,
+                reason: format!("cannot inspect {relative}: {error}"),
+            });
+            return Ok(MetricsRewrite::Deferred);
+        }
+    };
+    let opened = file.metadata().map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let before_path =
+        std::fs::symlink_metadata(&path).map_err(|source| crate::BrokerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    if !same_regular_file_version(&opened, &before_path) || deadline_expired(deadline) {
+        return Ok(MetricsRewrite::Deferred);
+    }
+    let bytes = match read_all_until_with_clock(&mut file, deadline, Instant::now) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(MetricsRewrite::Deferred),
+        Err(error) => {
+            blockers.push(GcBlocker {
+                kind: "command_metrics".into(),
+                id: None,
+                reason: format!("cannot inspect {relative}: {error}"),
+            });
+            return Ok(MetricsRewrite::Deferred);
+        }
+    };
+    let after_open = file.metadata().map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let after_path = std::fs::symlink_metadata(&path).map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if deadline_expired(deadline)
+        || !same_regular_file_version(&opened, &after_open)
+        || !same_regular_file_version(&opened, &after_path)
+        || bytes.len() as u64 != opened.len()
+    {
+        return Ok(MetricsRewrite::Deferred);
+    }
+    let Some((after, removed, malformed_lines)) =
+        retained_metric_bytes_until(&bytes, cutoff, deadline)
+    else {
+        return Ok(MetricsRewrite::Deferred);
+    };
+    if deadline.is_some() && malformed_lines > 0 {
+        // Health only needs a conservative blocker. Keep this summary bounded
+        // instead of allocating one blocker per malformed input line.
+        blockers.push(GcBlocker {
+            kind: "command_metric_line".into(),
+            id: None,
+            reason: format!(
+                "retained {malformed_lines} malformed or timestamp-free command metric line(s)"
+            ),
+        });
+    } else {
+        // Preserve the full-GC report's historical one-blocker-per-line shape.
+        for _ in 0..malformed_lines {
+            blockers.push(GcBlocker {
+                kind: "command_metric_line".into(),
+                id: None,
+                reason: "retained one malformed or timestamp-free command metric line".into(),
+            });
         }
     }
     if !removed {
-        return Ok(None);
+        return Ok(MetricsRewrite::Complete(None));
     }
-    Ok(Some(GcFileCandidate {
+    Ok(MetricsRewrite::Complete(Some(GcFileCandidate {
         path: relative.into(),
         action: GcFileAction::Rewrite,
         before_sha256: sha256(&bytes),
@@ -898,7 +1113,7 @@ fn metrics_rewrite(
         bytes_before: bytes.len() as u64,
         bytes_after: after.len() as u64,
         source_row_ids: Vec::new(),
-    }))
+    })))
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -2538,6 +2753,21 @@ impl Broker {
             // that search costs one `git check-ignore` per directory walked.
             let artifact_scan = if size_scan.measures() {
                 collect_artifact_scan(&root, &policy.artefact_directories, &checkout)
+            } else if let Some(budget) = budget {
+                let discovery = collect_artifact_dirs_bounded(
+                    &root,
+                    &policy.artefact_directories,
+                    started + budget,
+                    ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+                );
+                if !discovery.complete {
+                    not_scanned += 1;
+                    continue;
+                }
+                ArtifactScan {
+                    classified: discovery.classified,
+                    declined: Vec::new(),
+                }
             } else {
                 let mut classified = Vec::new();
                 collect_artifact_dirs_with_extras(
@@ -3181,6 +3411,9 @@ impl Broker {
         include_active_gate_cache: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<GcPlan, BrokerOpError> {
+        // The budget is cooperative: loops and stage boundaries check it, but
+        // an in-flight SQLite query or filesystem syscall cannot be cancelled
+        // by this deadline and may finish after it.
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
         let retention_config = load_retention_policy_report(&main_root)?;
@@ -3198,22 +3431,62 @@ impl Broker {
         if cleanup.eligibility_not_inspected_count > 0 {
             deferred_checks.push("cleanup_eligibility".into());
         }
-        let sessions = self
-            .store()
-            .cleaned_sessions()?
-            .into_iter()
-            .map(|session| (session.id, session))
-            .collect::<BTreeMap<_, _>>();
-        let mut rows = self.store().gc_row_candidates(
-            cutoff(evaluated_at, policy.terminal_events_days),
-            cutoff(evaluated_at, policy.gate_results_days),
-            cutoff(evaluated_at, policy.terminal_merge_queue_days),
-        )?;
-        let checkpoint_pin_releases = self.store().gc_checkpoint_pin_candidates()?;
-        let live_sessions = self.store().live_sessions()?;
-        let advisories = self.store().advisories(false)?;
-        let exposures = self.store().outstanding_entry_path_exposures()?;
-        let operations = self.store().coordinated_operations()?;
+        let sessions = if deadline_expired(deadline) {
+            deferred_checks.push("closed_sessions".into());
+            BTreeMap::new()
+        } else {
+            self.store()
+                .cleaned_sessions()?
+                .into_iter()
+                .map(|session| (session.id, session))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut rows = if deadline_expired(deadline) {
+            deferred_checks.push("gc_rows".into());
+            Vec::new()
+        } else if deadline.is_some() {
+            self.store().gc_row_candidates_for_health(
+                cutoff(evaluated_at, policy.terminal_events_days),
+                cutoff(evaluated_at, policy.gate_results_days),
+                cutoff(evaluated_at, policy.terminal_merge_queue_days),
+            )?
+        } else {
+            self.store().gc_row_candidates(
+                cutoff(evaluated_at, policy.terminal_events_days),
+                cutoff(evaluated_at, policy.gate_results_days),
+                cutoff(evaluated_at, policy.terminal_merge_queue_days),
+            )?
+        };
+        let checkpoint_pin_releases = if deadline_expired(deadline) {
+            deferred_checks.push("checkpoint_pins".into());
+            Vec::new()
+        } else {
+            self.store().gc_checkpoint_pin_candidates()?
+        };
+        let live_sessions = if deadline_expired(deadline) {
+            deferred_checks.push("live_sessions".into());
+            Vec::new()
+        } else {
+            self.store().live_sessions()?
+        };
+        let advisories = if deadline_expired(deadline) {
+            deferred_checks.push("advisories".into());
+            Vec::new()
+        } else {
+            self.store().advisories(false)?
+        };
+        let exposures = if deadline_expired(deadline) {
+            deferred_checks.push("entry_path_exposures".into());
+            Vec::new()
+        } else {
+            self.store().outstanding_entry_path_exposures()?
+        };
+        let operations = if deadline_expired(deadline) {
+            deferred_checks.push("coordinated_operations".into());
+            Vec::new()
+        } else {
+            self.store().coordinated_operations()?
+        };
         let publication_exposure_expiries = exposures
             .iter()
             .filter(|exposure| exposure.created_at < exposure_cutoff)
@@ -3294,7 +3567,13 @@ impl Broker {
         let gate_root = main_root.join(".aethyme/logs/gates");
         let mut files = BTreeMap::<String, GcFileCandidate>::new();
         let mut retained_rows = Vec::with_capacity(rows.len());
+        let mut gate_log_inventory_deferred = false;
         for row in rows.drain(..) {
+            if deadline_expired(deadline) {
+                gate_log_inventory_deferred = true;
+                retained_rows.push(row);
+                continue;
+            }
             let Some(log) = row.gate_log_path.as_deref() else {
                 retained_rows.push(row);
                 continue;
@@ -3335,32 +3614,69 @@ impl Broker {
                 });
                 continue;
             }
-            let bytes = std::fs::read(&path).map_err(|source| crate::BrokerError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            files
-                .entry(relative.clone())
-                .and_modify(|file| file.source_row_ids.push(row.id))
-                .or_insert_with(|| GcFileCandidate {
+            if let Some(file) = files.get_mut(&relative) {
+                file.source_row_ids.push(row.id);
+                retained_rows.push(row);
+                continue;
+            }
+            let (before_sha256, bytes_before) = if deadline.is_some() {
+                match sha256_file_until(&path, deadline) {
+                    Ok(Some((digest, bytes))) => (digest, bytes),
+                    Ok(None) => {
+                        gate_log_inventory_deferred = true;
+                        retained_rows.push(row);
+                        continue;
+                    }
+                    Err(error) => {
+                        blockers.push(GcBlocker {
+                            kind: "gate_log".into(),
+                            id: Some(row.id),
+                            reason: format!(
+                                "cannot read gate log for bounded health scan: {error}"
+                            ),
+                        });
+                        gate_log_inventory_deferred = true;
+                        retained_rows.push(row);
+                        continue;
+                    }
+                }
+            } else {
+                let bytes = std::fs::read(&path).map_err(|source| crate::BrokerError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                (sha256(&bytes), bytes.len() as u64)
+            };
+            files.insert(
+                relative.clone(),
+                GcFileCandidate {
                     path: relative,
                     action: GcFileAction::Delete,
-                    before_sha256: sha256(&bytes),
+                    before_sha256,
                     after_sha256: None,
-                    bytes_before: bytes.len() as u64,
+                    bytes_before,
                     bytes_after: 0,
                     source_row_ids: vec![row.id],
-                });
+                },
+            );
             retained_rows.push(row);
         }
         rows = retained_rows;
+        if gate_log_inventory_deferred {
+            deferred_checks.push("gate_log_inventory".into());
+        }
 
-        if let Some(metrics) = metrics_rewrite(
+        match metrics_rewrite(
             &main_root,
             cutoff(evaluated_at, policy.command_metrics_days),
             &mut blockers,
+            deadline,
         )? {
-            files.insert(metrics.path.clone(), metrics);
+            MetricsRewrite::Complete(Some(metrics)) => {
+                files.insert(metrics.path.clone(), metrics);
+            }
+            MetricsRewrite::Complete(None) => {}
+            MetricsRewrite::Deferred => deferred_checks.push("command_metrics".into()),
         }
 
         let worktree_cutoff = cutoff(evaluated_at, policy.closed_worktrees_days);
@@ -3534,40 +3850,76 @@ impl Broker {
         }
         // Rooted at the per-user cache directory, not at any worktree: that
         // is why no total here ever counted it (#295).
-        let mut size_records = crate::measurement::load_size_records(&main_root);
-        // A configuration that does not load names no key, which leaves every
-        // kind to the most-recent-use fallback.
-        let configured_keys = crate::gates::load_gates(&main_root)
-            .map(|gates| {
-                gates
-                    .into_iter()
-                    .filter_map(|gate| gate.managed_cache.map(|cache| cache.key))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let gate_storage = self.storage_context().gate_storage_locations();
-        let (gate_cache, gate_caches) =
+        let (mut size_records, size_records_complete) = match deadline {
+            Some(deadline) => {
+                match crate::measurement::load_size_records_until(&main_root, deadline) {
+                    Some(records) => (records, true),
+                    None => (crate::measurement::SizeRecords::default(), false),
+                }
+            }
+            None => (crate::measurement::load_size_records(&main_root), true),
+        };
+        let (gate_cache, gate_caches) = if !size_records_complete || deadline_expired(deadline) {
+            deferred_checks.push("gate_cache_inventory".into());
+            (None, Vec::new())
+        } else {
+            // A configuration that does not load names no key, which leaves
+            // every kind to the most-recent-use fallback.
+            let configured_keys = crate::gates::load_gates(&main_root)
+                .map(|gates| {
+                    gates
+                        .into_iter()
+                        .filter_map(|gate| gate.managed_cache.map(|cache| cache.key))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let gate_storage = self.storage_context().gate_storage_locations();
             match crate::gate_cache_gc::location_in(&main_root, &gate_storage) {
                 Some(location) => {
-                    let (inventory, candidates) = crate::gate_cache_gc::inspect(
-                        &main_root,
-                        &location,
-                        crate::gate_cache_gc::KeepRule {
-                            budget_bytes: policy.gate_cache_bytes_budget,
-                            include_active: include_active_gate_cache,
-                            configured_keys: &configured_keys,
-                        },
-                        evaluated_at,
-                        scan,
-                        &mut size_records,
-                    );
-                    (Some(inventory), candidates)
+                    if let Some(deadline) = deadline {
+                        let (inventory, candidates, complete) = crate::gate_cache_gc::inspect_until(
+                            &main_root,
+                            &location,
+                            crate::gate_cache_gc::KeepRule {
+                                budget_bytes: policy.gate_cache_bytes_budget,
+                                include_active: include_active_gate_cache,
+                                configured_keys: &configured_keys,
+                            },
+                            evaluated_at,
+                            scan,
+                            &mut size_records,
+                            deadline,
+                        );
+                        if complete {
+                            (inventory, candidates)
+                        } else {
+                            deferred_checks.push("gate_cache_inventory".into());
+                            (None, Vec::new())
+                        }
+                    } else {
+                        let (inventory, candidates) = crate::gate_cache_gc::inspect(
+                            &main_root,
+                            &location,
+                            crate::gate_cache_gc::KeepRule {
+                                budget_bytes: policy.gate_cache_bytes_budget,
+                                include_active: include_active_gate_cache,
+                                configured_keys: &configured_keys,
+                            },
+                            evaluated_at,
+                            scan,
+                            &mut size_records,
+                        );
+                        (Some(inventory), candidates)
+                    }
                 }
-                None => (None, Vec::new()),
-            };
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            deferred_checks.push("gate_cache_inventory".into());
-        }
+                None => {
+                    if deadline.is_some() {
+                        deferred_checks.push("gate_cache_inventory".into());
+                    }
+                    (None, Vec::new())
+                }
+            }
+        };
         if scan.measures() {
             crate::warn_unrecorded(
                 "record gate cache sizes",
@@ -6729,6 +7081,161 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn bounded_file_hash_stops_after_a_partial_gate_log_read() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        let content = vec![b'x'; GC_FILE_READ_CHUNK_BYTES * 3];
+        let mut reader = std::io::Cursor::new(content.clone());
+        let mut clock_calls = 0;
+        let result = sha256_reader_until_with_clock(&mut reader, Some(deadline), || {
+            clock_calls += 1;
+            if clock_calls == 1 { started } else { deadline }
+        })
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "a partial digest is not a file fingerprint"
+        );
+        assert_eq!(
+            reader.position(),
+            GC_FILE_READ_CHUNK_BYTES as u64,
+            "the reader stops before consuming a second chunk"
+        );
+
+        let mut retry = std::io::Cursor::new(content.clone());
+        let result = sha256_reader_until_with_clock(
+            &mut retry,
+            Some(Instant::now() + Duration::from_secs(5)),
+            Instant::now,
+        )
+        .unwrap()
+        .expect("a fresh positive pass completes after the partial pass");
+        assert_eq!(result.0, sha256(&content));
+        assert_eq!(result.1, content.len() as u64);
+    }
+
+    #[test]
+    fn bounded_metrics_read_stops_before_returning_partial_contents() {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        let content = vec![b'x'; GC_FILE_READ_CHUNK_BYTES * 3];
+        let mut reader = std::io::Cursor::new(content.clone());
+        let mut clock_calls = 0;
+        let result = read_all_until_with_clock(&mut reader, Some(deadline), || {
+            clock_calls += 1;
+            if clock_calls == 1 { started } else { deadline }
+        })
+        .unwrap();
+
+        assert!(
+            result.is_none(),
+            "partial metrics cannot produce a rewrite plan"
+        );
+        assert_eq!(reader.position(), GC_FILE_READ_CHUNK_BYTES as u64);
+
+        let mut retry = std::io::Cursor::new(content.clone());
+        let complete = read_all_until_with_clock(
+            &mut retry,
+            Some(Instant::now() + Duration::from_secs(5)),
+            Instant::now,
+        )
+        .unwrap()
+        .expect("a fresh positive pass completes after the partial pass");
+        assert_eq!(complete, content);
+    }
+
+    #[test]
+    fn full_metrics_rewrite_preserves_per_malformed_line_blockers_and_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join(".aethyme/logs");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("command-metrics.jsonl");
+        let before = b"{\"ts\":1}\nnot-json\n{\"ts\":3}\n{}\n";
+        let after = b"not-json\n{\"ts\":3}\n{}\n";
+        std::fs::write(&path, before).unwrap();
+        let mut blockers = Vec::new();
+
+        let MetricsRewrite::Complete(Some(candidate)) =
+            metrics_rewrite(tmp.path(), 2, &mut blockers, None).unwrap()
+        else {
+            panic!("old metrics should yield a complete rewrite candidate");
+        };
+
+        let expected_after_sha256 = sha256(after);
+        assert_eq!(candidate.before_sha256, sha256(before));
+        assert_eq!(
+            candidate.after_sha256.as_deref(),
+            Some(expected_after_sha256.as_str())
+        );
+        assert_eq!(retained_metric_bytes(before, 2), after);
+        assert_eq!(
+            blockers
+                .iter()
+                .filter(|blocker| blocker.kind == "command_metric_line")
+                .count(),
+            2,
+            "full GC retains its historical per-line blocker count"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_open_refuses_a_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gate.log");
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path into this live TempDir.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let result = open_regular_file_nonblocking(&path);
+
+        assert!(result.is_err(), "a FIFO is not a regular gate log");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "nonblocking open must not wait for a FIFO writer"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_expired_retention_deadline_marks_unknown_without_partial_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let plan = broker
+            .gc_plan_scanned_until(
+                crate::SizeScan::Recorded,
+                false,
+                Some(Instant::now() - Duration::from_millis(1)),
+            )
+            .unwrap();
+
+        for expected in ["closed_sessions", "gc_rows", "gate_cache_inventory"] {
+            assert!(
+                plan.deferred_checks.iter().any(|check| check == expected),
+                "expired inventory must report {expected} as deferred: {:?}",
+                plan.deferred_checks
+            );
+        }
+        assert_eq!(plan.budget_verdict, crate::BudgetVerdict::Unknown);
+        assert!(!plan.clears_retained_bytes_budget);
+        assert!(plan.rows.is_empty());
+        assert!(plan.files.is_empty());
+        assert!(plan.gate_caches.is_empty());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

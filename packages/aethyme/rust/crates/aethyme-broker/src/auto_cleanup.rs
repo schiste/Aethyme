@@ -994,6 +994,16 @@ impl Broker {
                     reason,
                 });
             };
+            let _lifecycle_claim = match self.claim_worktree_lifecycle() {
+                Ok(claim) => claim,
+                Err(error) => {
+                    keep_it(
+                        &mut report,
+                        format!("could not claim the worktree lifecycle: {error}"),
+                    );
+                    continue;
+                }
+            };
             let Some(open_paths) = open_paths.as_ref() else {
                 keep_it(
                     &mut report,
@@ -1080,18 +1090,8 @@ impl Broker {
         // only untracked file they let through is Finder's `.DS_Store`, which
         // a plain `worktree remove` refuses.
         self.repo_handle()
-            .worktree_remove(&candidate.worktree, true)?;
-        if candidate.worktree.exists() {
-            let outcome = crate::removal::remove_tree(&candidate.worktree);
-            if !outcome.removed {
-                return Err(BrokerOpError::Git(crate::GitError::Git {
-                    args: format!("remove {}", candidate.worktree.display()),
-                    stderr: outcome
-                        .error
-                        .unwrap_or_else(|| "the directory is still present".into()),
-                }));
-            }
-        }
+            .worktree_remove_registered(&candidate.worktree, true)?;
+        ensure_auto_cleanup_path_absent(&candidate.worktree)?;
         if let Some(branch) = candidate.branch()
             && self
                 .repo_handle()
@@ -1273,5 +1273,114 @@ mod tests {
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+    }
+}
+
+fn ensure_auto_cleanup_path_absent(path: &Path) -> Result<(), BrokerOpError> {
+    let args = format!("remove {}", path.display());
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(BrokerOpError::Git(crate::GitError::Git {
+            args,
+            stderr: format!(
+                "Git reported worktree removal but {} still exists; retained it because its identity is unproven",
+                path.display()
+            ),
+        })),
+        Err(error) => Err(BrokerOpError::Git(crate::GitError::Git {
+            args,
+            stderr: format!(
+                "could not verify that {} is absent after Git worktree removal; retained it: {error}",
+                path.display()
+            ),
+        })),
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_removal_tests {
+    use super::{AutoCleanupCandidate, ContainmentProof, ensure_auto_cleanup_path_absent};
+    use crate::{SessionCleanupState, git::with_git_deadline};
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        let git_keys = std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+            .collect::<Vec<_>>();
+        for key in git_keys {
+            command.env_remove(key);
+        }
+        let output = command.args(args).current_dir(root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn auto_cleanup_preserves_candidate_after_git_removal_timeout() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.name", "Auto cleanup test"]);
+        git(
+            &repository,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
+        git(&repository, &["commit", "--allow-empty", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("auto cleanup candidate", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        broker.close(session.id).unwrap();
+        let evidence = worktree.join("keep-for-retry.txt");
+        std::fs::write(&evidence, b"preserve this candidate").unwrap();
+        let candidate = AutoCleanupCandidate {
+            worktree: worktree.clone(),
+            sessions: vec![broker.store().session(session.id).unwrap()],
+        };
+        let proof = ContainmentProof {
+            head: "fixture-head".into(),
+            containing_commit: "fixture-containing-commit".into(),
+            proof: "ancestry".into(),
+        };
+
+        let result = with_git_deadline(Duration::ZERO, || {
+            broker.remove_auto_cleanup_candidate(&candidate, &proof)
+        });
+        assert!(result.is_err(), "expired Git budget must refuse removal");
+        assert_eq!(
+            std::fs::read(&evidence).unwrap(),
+            b"preserve this candidate"
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed,
+            "failed removal must leave the candidate available for retry"
+        );
+    }
+
+    #[test]
+    fn auto_cleanup_preserves_a_path_git_left_after_removal() {
+        let owner = tempfile::tempdir().unwrap();
+        let replacement = owner.path().join("replacement-worktree");
+        std::fs::create_dir(&replacement).unwrap();
+        let evidence = replacement.join("keep.txt");
+        std::fs::write(&evidence, b"preserve replacement").unwrap();
+
+        let result = ensure_auto_cleanup_path_absent(&replacement);
+
+        assert!(result.is_err(), "a remaining path is not proof of removal");
+        assert_eq!(std::fs::read(evidence).unwrap(), b"preserve replacement");
     }
 }
