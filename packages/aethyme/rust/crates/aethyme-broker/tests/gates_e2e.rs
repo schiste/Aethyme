@@ -168,6 +168,10 @@ fn commit_all(root: &Path, message: &str) {
 }
 
 fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
+    add_worktree_at(root, name, "main")
+}
+
+fn add_worktree_at(root: &Path, name: &str, revision: &str) -> std::path::PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     sh(
@@ -179,7 +183,7 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
             "-b",
             &format!("agent/{name}"),
             path.to_str().unwrap(),
-            "main",
+            revision,
         ],
     );
     path
@@ -217,16 +221,38 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
     bootstrap_repo(tmp.path(), env!("CARGO_PKG_VERSION")).unwrap();
     commit_all(tmp.path(), "enroll authoritative graph");
     refresh_committed_graph(tmp.path());
-    commit_all(tmp.path(), "commit authoritative graph");
+    commit_all(tmp.path(), "commit initial authoritative graph");
+    let initial_graph_commit = GitRepo::discover(tmp.path())
+        .unwrap()
+        .head_commit()
+        .unwrap();
+
+    // Produce the updated graph history before Broker::open enrolls the graph
+    // directory as broker-managed. The source-only commit is the stale point;
+    // the following graph commit is the fresh point used by a second session.
+    std::fs::write(tmp.path().join("src/app.py"), "x = 2\n").unwrap();
+    commit_all(tmp.path(), "commit source edit before graph refresh");
+    let stale_graph_commit = GitRepo::discover(tmp.path())
+        .unwrap()
+        .head_commit()
+        .unwrap();
+    refresh_committed_graph(tmp.path());
+    commit_all(tmp.path(), "refresh authoritative graph after source edit");
+    let refreshed_graph_commit = GitRepo::discover(tmp.path())
+        .unwrap()
+        .head_commit()
+        .unwrap();
 
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let full_tree = broker.run_all_gates(tmp.path()).unwrap();
+    let full_tree_checkout =
+        add_worktree_at(tmp.path(), "full-tree-graph-gates", &initial_graph_commit);
+    let full_tree = broker.run_all_gates(&full_tree_checkout).unwrap();
     assert_eq!(full_tree.len(), 1, "fresh CI-equivalent tree passes");
-    std::fs::remove_file(tmp.path().join("gate-markers.txt")).unwrap();
+    std::fs::remove_file(full_tree_checkout.join("gate-markers.txt")).unwrap();
 
-    let worktree = add_worktree(tmp.path(), "stale-graph-gates");
+    let worktree = add_worktree_at(tmp.path(), "stale-graph-gates", &stale_graph_commit);
     let session = broker.adopt(&worktree, None).unwrap();
-    std::fs::write(worktree.join("src/app.py"), "x = 2\n").unwrap();
+    std::fs::write(worktree.join("src/app.py"), "x = 3\n").unwrap();
     let status_before = GitRepo::discover(&worktree).unwrap().dirty_paths().unwrap();
 
     // #280: a stale graph is recorded and reported, never a refusal. The
@@ -254,13 +280,14 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
         row.evidence
     );
 
-    commit_all(&worktree, "commit source edit before graph refresh");
-    refresh_committed_graph(&worktree);
-    // Refreshing the graph updates the authority artifacts in the worktree;
-    // gates are intentionally checked against committed graph state, so the
-    // fixture must commit the new coverage, manifest, and units together.
-    commit_all(&worktree, "refresh authoritative graph after source edit");
-    let refreshed = broker.run_gates(session.id).unwrap();
+    // The refreshed artifacts were committed in the primary checkout before
+    // Broker::open. A second session at that exact commit proves the fresh
+    // graph path without writing graph artifacts through broker-managed
+    // linked-worktree metadata.
+    let refreshed_worktree =
+        add_worktree_at(tmp.path(), "fresh-graph-gates", &refreshed_graph_commit);
+    let refreshed_session = broker.adopt(&refreshed_worktree, None).unwrap();
+    let refreshed = broker.run_gates(refreshed_session.id).unwrap();
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].status, GateStatus::Pass);
     assert!(
@@ -269,11 +296,11 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
             .unwrap()
             .advice
             .iter()
-            .any(|row| row.id.starts_with("graph.") && row.session_id == Some(session.id)),
+            .any(|row| row.id.starts_with("graph.") && row.session_id == Some(refreshed_session.id)),
         "a fresh graph raises no advice"
     );
     assert!(!refreshed[0].cached);
-    let cached = broker.run_gates(session.id).unwrap();
+    let cached = broker.run_gates(refreshed_session.id).unwrap();
     assert_eq!(cached.len(), 1);
     assert!(
         cached[0].cached,

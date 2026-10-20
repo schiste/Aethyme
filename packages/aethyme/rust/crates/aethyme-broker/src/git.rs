@@ -980,18 +980,41 @@ fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Refuse ambient routing/history overrides before graph verification can
-/// snapshot anything. Diagnostics deliberately contain no environment values.
+/// Refuse ambient repository/path/history selectors before graph verification
+/// can snapshot anything. Scoped Git commands also strip every inherited
+/// `GIT_*` variable, so harmless configuration, pager, and trace settings can
+/// be accepted here without affecting the verification boundary. Diagnostics
+/// deliberately contain no environment values.
 pub(crate) fn graph_verification_environment_refusal() -> Option<&'static str> {
     std::env::vars_os()
         .any(|(key, _)| unsafe_graph_git_environment_key(&key))
-        .then_some("graph verification refuses inherited GIT_* environment overrides")
+        .then_some("graph verification refuses inherited Git routing/history overrides")
 }
 
-fn unsafe_graph_git_environment_key(key: &std::ffi::OsStr) -> bool {
+fn is_git_environment_key(key: &std::ffi::OsStr) -> bool {
     key.to_string_lossy()
         .to_ascii_uppercase()
         .starts_with("GIT_")
+}
+
+fn unsafe_graph_git_environment_key(key: &std::ffi::OsStr) -> bool {
+    matches!(
+        key.to_string_lossy().to_ascii_uppercase().as_str(),
+        "GIT_DIR"
+            | "GIT_WORK_TREE"
+            | "GIT_COMMON_DIR"
+            | "GIT_INDEX_FILE"
+            | "GIT_OBJECT_DIRECTORY"
+            | "GIT_OBJECT_DIRECTORY_RELATIVE"
+            | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+            | "GIT_NAMESPACE"
+            | "GIT_REPLACE_REF_BASE"
+            | "GIT_GRAFT_FILE"
+            | "GIT_SHALLOW_FILE"
+            | "GIT_CEILING_DIRECTORIES"
+            | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+            | "GIT_PREFIX"
+    )
 }
 
 fn graph_snapshot_error(message: &str) -> GitError {
@@ -1022,11 +1045,7 @@ fn isolated_graph_git_command(cwd: &Path, args: &[&str]) -> Command {
 /// snapshots. This does not mutate the broker process environment.
 fn configure_isolated_graph_git_command(command: &mut Command) {
     for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
+        if is_git_environment_key(&key) {
             command.env_remove(key);
         }
     }
@@ -5045,18 +5064,29 @@ mod graph_snapshot_tests {
     use super::*;
 
     #[test]
-    fn graph_environment_preflight_covers_routing_history_and_configuration() {
+    fn graph_environment_preflight_refuses_routing_history_but_allows_scoped_settings() {
         for key in [
             "GIT_DIR",
             "GIT_WORK_TREE",
             "GIT_COMMON_DIR",
             "GIT_INDEX_FILE",
             "GIT_OBJECT_DIRECTORY",
+            "GIT_OBJECT_DIRECTORY_RELATIVE",
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_NAMESPACE",
             "GIT_REPLACE_REF_BASE",
             "GIT_GRAFT_FILE",
             "GIT_SHALLOW_FILE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_PREFIX",
+        ] {
+            assert!(
+                unsafe_graph_git_environment_key(std::ffi::OsStr::new(key)),
+                "{key}"
+            );
+        }
+        for key in [
             "GIT_CONFIG",
             "GIT_CONFIG_SYSTEM",
             "GIT_CONFIG_GLOBAL",
@@ -5071,18 +5101,22 @@ mod graph_snapshot_tests {
             "GIT_TRACE2_EVENT",
             "GIT_TRACE_SETUP",
             "GIT_CURL_VERBOSE",
+            "GIT_PAGER",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_NO_REPLACE_OBJECTS",
+            "HOME",
+            "NOT_GIT_DIR",
+            "PATH",
         ] {
-            assert!(
-                unsafe_graph_git_environment_key(std::ffi::OsStr::new(key)),
-                "{key}"
-            );
-        }
-        for key in ["HOME", "NOT_GIT_DIR", "PATH"] {
             assert!(
                 !unsafe_graph_git_environment_key(std::ffi::OsStr::new(key)),
                 "{key}"
             );
         }
+        assert!(is_git_environment_key(std::ffi::OsStr::new(
+            "GIT_CONFIG_COUNT"
+        )));
+        assert!(!is_git_environment_key(std::ffi::OsStr::new("PATH")));
     }
 
     #[test]
@@ -5143,28 +5177,65 @@ mod graph_snapshot_tests {
                 root: root.join("source"),
             };
             let commit = std::env::var("AETHYME_GRAPH_SNAPSHOT_COMMIT").unwrap();
+            let disabled_commit = std::env::var("AETHYME_GRAPH_SNAPSHOT_DISABLED_COMMIT").unwrap();
+            let global_filter_hit = root.join("global-filter-invoked");
+            let counted_filter_hit = root.join("counted-filter-invoked");
+            let trace_file = root.join("trace2.json");
             if mode == "filter" {
-                // A graph policy read is inside the same scoped Git boundary
-                // as verification. The fixture commit has no graph config, so
-                // this also proves the disabled default is returned normally.
+                // Benign configuration, clean-filter, pager, and trace
+                // variables are accepted at the graph boundary. Git commands
+                // inside that boundary must still ignore all of them.
                 assert!(!graph_verification_git_enabled());
                 assert_eq!(
-                    crate::graph_integrity::load_graph_policy_at_commit(&source, &commit).unwrap(),
+                    crate::graph_integrity::load_graph_policy_at_commit(&source, &disabled_commit)
+                        .unwrap(),
                     aethyme_graph_storage::GraphIntegrityPolicy::default()
+                );
+                assert_eq!(
+                    crate::graph_integrity::verify_disposable_checkout(
+                        &source,
+                        &aethyme_graph_storage::GraphIntegrityPolicy::default()
+                    )
+                    .status,
+                    crate::graph_integrity::GraphIntegrityStatus::Disabled,
+                    "safe Git configuration must not refuse the disabled fast path"
                 );
                 assert!(
                     !graph_verification_git_enabled(),
                     "graph-policy read leaked its scoped Git guard"
                 );
+                assert!(
+                    graph_verification_environment_refusal().is_none(),
+                    "safe Git configuration was treated as repository redirection"
+                );
+                assert!(
+                    !global_filter_hit.exists()
+                        && !counted_filter_hit.exists()
+                        && !trace_file.exists(),
+                    "graph-policy read or disabled fast path used ambient Git configuration"
+                );
 
-                // The ordinary path deliberately sees HOME's global clean
-                // filter; the graph scope must suppress it for the generated
-                // independent checkout, then restore ordinary behavior.
+                // The ordinary path sees both HOME's global clean filter and
+                // the GIT_CONFIG_COUNT filter, and emits trace output. The
+                // graph scope suppresses them for the exact snapshot, then
+                // restores ordinary behavior.
                 source.working_tree_hash().unwrap();
-                let sentinel = root.join("filter-invoked");
-                assert!(sentinel.is_file(), "global clean filter did not execute");
-                std::fs::remove_file(&sentinel).unwrap();
+                assert!(
+                    global_filter_hit.is_file(),
+                    "global clean filter did not execute"
+                );
+                assert!(
+                    counted_filter_hit.is_file(),
+                    "GIT_CONFIG_COUNT filter did not execute"
+                );
+                assert!(trace_file.is_file(), "GIT_TRACE2_EVENT did not execute");
+                std::fs::remove_file(&global_filter_hit).unwrap();
+                std::fs::remove_file(&counted_filter_hit).unwrap();
+                std::fs::remove_file(&trace_file).unwrap();
                 let expected_tree = source.commit_tree_id(&commit).unwrap();
+                if trace_file.exists() {
+                    std::fs::remove_file(&trace_file).unwrap();
+                }
                 {
                     let _graph_environment = graph_verification_git_guard();
                     let destination = root.join("isolated");
@@ -5175,15 +5246,24 @@ mod graph_snapshot_tests {
                         .unwrap();
                     isolated.working_tree_hash().unwrap();
                     assert!(
-                        !sentinel.exists(),
-                        "global clean filter executed inside graph scope"
+                        !global_filter_hit.exists() && !counted_filter_hit.exists(),
+                        "a clean filter executed inside graph scope"
+                    );
+                    assert!(
+                        !trace_file.exists(),
+                        "Git trace was written inside graph scope"
                     );
                 }
                 std::fs::write(source.root.join("payload.txt"), "after graph scope\n").unwrap();
+                std::fs::write(source.root.join("counted.bin"), "after graph scope\n").unwrap();
                 source.working_tree_hash().unwrap();
                 assert!(
-                    sentinel.is_file(),
-                    "ordinary Git configuration was not restored"
+                    global_filter_hit.is_file() && counted_filter_hit.is_file(),
+                    "ordinary Git filter configuration was not restored"
+                );
+                assert!(
+                    trace_file.is_file(),
+                    "ordinary Git tracing was not restored"
                 );
                 return;
             }
@@ -5200,7 +5280,7 @@ mod graph_snapshot_tests {
                     .expect_err("inherited Git redirection must block policy reads");
             let policy_error = policy_error.to_string();
             assert!(
-                policy_error.contains("refuses inherited GIT_* environment overrides"),
+                policy_error.contains("refuses inherited Git routing/history overrides"),
                 "unexpected policy refusal: {policy_error}"
             );
             assert!(
@@ -5255,7 +5335,7 @@ mod graph_snapshot_tests {
                 assert!(
                     outcome
                         .reason
-                        .contains("refuses inherited GIT_* environment overrides")
+                        .contains("refuses inherited Git routing/history overrides")
                 );
             }
             assert_eq!(metadata_bytes(&foreign), foreign_before);
@@ -5276,11 +5356,14 @@ mod graph_snapshot_tests {
                 "foreign content\n"
             };
             std::fs::write(path.join("payload.txt"), content).unwrap();
-            std::fs::write(
-                path.join(".gitattributes"),
-                "*.txt filter=aethyme_snapshot_fixture\n",
-            )
-            .unwrap();
+            if name == "source" {
+                std::fs::write(
+                    path.join(".gitattributes"),
+                    "*.txt filter=aethyme_snapshot_global\n*.bin filter=aethyme_snapshot_count\n",
+                )
+                .unwrap();
+                std::fs::write(path.join("counted.bin"), "counted original content\n").unwrap();
+            }
             run_isolated_graph_git(&path, &["add", "--all"]).unwrap();
             run_isolated_graph_git(
                 &path,
@@ -5297,11 +5380,37 @@ mod graph_snapshot_tests {
             )
             .unwrap();
         }
+        let disabled_commit = String::from_utf8(
+            run_isolated_graph_git(&root.join("source"), &["rev-parse", "HEAD"]).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("source/.aethyme")).unwrap();
+        std::fs::write(
+            root.join("source/.aethyme/config.toml"),
+            "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+        )
+        .unwrap();
+        run_isolated_graph_git(&root.join("source"), &["add", "--all"]).unwrap();
+        run_isolated_graph_git(
+            &root.join("source"),
+            &[
+                "-c",
+                "user.name=Snapshot Test",
+                "-c",
+                "user.email=snapshot@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "enable graph policy",
+            ],
+        )
+        .unwrap();
         let commit = String::from_utf8(
             run_isolated_graph_git(&root.join("source"), &["rev-parse", "HEAD"]).unwrap(),
         )
         .unwrap();
         std::fs::write(root.join("source/payload.txt"), "working tree content\n").unwrap();
+        std::fs::write(root.join("source/counted.bin"), "working tree content\n").unwrap();
         let config = root.join(".gitconfig");
         run_isolated_graph_git(
             &root,
@@ -5309,7 +5418,7 @@ mod graph_snapshot_tests {
                 "config",
                 "--file",
                 config.to_str().unwrap(),
-                "filter.aethyme_snapshot_fixture.clean",
+                "filter.aethyme_snapshot_global.clean",
                 "touch \"$AETHYME_GRAPH_FILTER_HIT\"; cat",
             ],
         )
@@ -5323,11 +5432,34 @@ mod graph_snapshot_tests {
                 .env(ROOT, &root)
                 .env("HOME", &root)
                 .env("AETHYME_GRAPH_SNAPSHOT_COMMIT", commit.trim())
-                .env("AETHYME_GRAPH_FILTER_HIT", root.join("filter-invoked"));
+                .env(
+                    "AETHYME_GRAPH_SNAPSHOT_DISABLED_COMMIT",
+                    disabled_commit.trim(),
+                )
+                .env(
+                    "AETHYME_GRAPH_FILTER_HIT",
+                    root.join("global-filter-invoked"),
+                )
+                .env(
+                    "AETHYME_GRAPH_COUNT_FILTER_HIT",
+                    root.join("counted-filter-invoked"),
+                );
             for (key, _) in std::env::vars_os() {
-                if unsafe_graph_git_environment_key(&key) {
+                if is_git_environment_key(&key) {
                     command.env_remove(key);
                 }
+            }
+            if !hostile_git_env {
+                command
+                    .env("GIT_CONFIG_GLOBAL", &config)
+                    .env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "filter.aethyme_snapshot_count.clean")
+                    .env(
+                        "GIT_CONFIG_VALUE_0",
+                        "touch \"$AETHYME_GRAPH_COUNT_FILTER_HIT\"; cat",
+                    )
+                    .env("GIT_TRACE2_EVENT", root.join("trace2.json"))
+                    .env("GIT_PAGER", "cat");
             }
             if hostile_git_env {
                 command
@@ -5343,7 +5475,7 @@ mod graph_snapshot_tests {
                     .env("GIT_SHALLOW_FILE", root.join("foreign/.git/shallow"))
                     .env("GIT_GRAFT_FILE", root.join("foreign/.git/info/grafts"))
                     .env("GIT_CONFIG_COUNT", "1")
-                    .env("GIT_CONFIG_KEY_0", "filter.aethyme_snapshot_fixture.clean")
+                    .env("GIT_CONFIG_KEY_0", "filter.aethyme_snapshot_global.clean")
                     .env(
                         "GIT_CONFIG_VALUE_0",
                         "touch \"$AETHYME_GRAPH_FILTER_HIT\"; cat",
