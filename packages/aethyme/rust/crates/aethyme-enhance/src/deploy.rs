@@ -281,6 +281,10 @@ fn deploy_inner(
         }
     }
 
+    if manage_root_policy {
+        actions.push(crate::readme::ensure_guidance(repo)?);
+    }
+
     for (relative_path, content) in expected_onboarding_files(repo)? {
         let dest = repo.join(&relative_path);
         if dest.exists() && !force && read_text(&dest)? == content {
@@ -862,9 +866,16 @@ mod tests {
         // AGENTS.md is inserted first; settings merge is last.
         assert_eq!(actions.first().unwrap().relative_path, "AGENTS.md");
         assert_eq!(actions.last().unwrap().relative_path, SETTINGS_FILE);
-        assert!(actions.iter().all(|a| a.action == "created"));
-        // 1 AGENTS + 6 onboarding + 20 targets + settings = 28.
-        assert_eq!(actions.len(), 28);
+        for action in &actions {
+            let expected = if action.relative_path == "README.md" {
+                "updated"
+            } else {
+                "created"
+            };
+            assert_eq!(action.action, expected, "{}", action.relative_path);
+        }
+        // 1 AGENTS + README + 6 onboarding + 20 targets + settings = 29.
+        assert_eq!(actions.len(), 29);
 
         let codex_broker_reference =
             std::fs::read_to_string(repo.join(".codex/skills/aethyme/references/broker.md"))
@@ -903,6 +914,10 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o111, 0o111, "{executable} is not executable");
         }
+
+        let readme = std::fs::read_to_string(repo.join("README.md")).unwrap();
+        assert!(readme.starts_with("# Fixture\n"));
+        assert!(readme.contains("<!-- AETHYME:BEGIN skill-learning -->"));
 
         // Content-addressed onboarding excludes its own generated outputs,
         // so an unchanged source snapshot makes the whole deploy idempotent.
@@ -965,7 +980,12 @@ mod tests {
         std::fs::write(repo.join("AGENTS.md"), "maintainer agents policy\n").unwrap();
         std::fs::write(repo.join("CLAUDE.md"), "maintainer claude policy\n").unwrap();
 
+        let readme_before = std::fs::read(repo.join("README.md")).unwrap();
         let actions = deploy_supporting_artifacts(&repo, true).unwrap();
+        assert_eq!(
+            std::fs::read(repo.join("README.md")).unwrap(),
+            readme_before
+        );
 
         assert_eq!(
             std::fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
