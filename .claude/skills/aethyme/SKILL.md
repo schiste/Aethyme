@@ -41,7 +41,7 @@ skip it when a direct read or a tiny grep already answers the task.
    only the compact projection:
 
 ```bash
-AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX.json)"
+AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX)"
 "$AETHYME_BIN" explore --repo "$REPO" --request "<user request>" --format answer-json --show-observability --depth 0 > "$AETHYME_JSON"
 "$AETHYME_BIN" explore-summary --from "$AETHYME_JSON"
 "$AETHYME_BIN" verify-targets --repo "$REPO" --from "$AETHYME_JSON" --max-targets 2 --max-lines 80
