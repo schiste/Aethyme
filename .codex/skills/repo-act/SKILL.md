@@ -26,6 +26,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and a seeded persisted marker to test fresh-process resume; assert the marker
   before invoking the resume path.
 
+- When a managed output is also an input to generated context or freshness
+  digests, update it before deriving those artifacts. Verify first deployment
+  and an unchanged repeat; a second-run rewrite can reveal incorrect ordering.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
 - Choose focused local Cargo checks by compilation target as well as test name.
@@ -131,7 +134,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
 - Give each validation attempt, including failed setup and guard-removal runs,
-  unique log and manifest paths. Preserve earlier outputs before retrying.
+  unique log and manifest paths. Check which filenames the delegated monitor
+  owns; store caller summaries under distinct names instead of overwriting or
+  exclusively creating those monitor outputs. Preserve earlier outputs before retrying.
   Freeze source for each invocation and record the exact head and dirty-state
   hashes before and after it. If relevant source changes during a run, retain
   that run as diagnostic evidence and rerun the committed source.
