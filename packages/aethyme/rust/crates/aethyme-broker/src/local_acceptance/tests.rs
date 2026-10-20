@@ -647,6 +647,17 @@ fn accepted_wave_fixture() -> (
     )
     .unwrap();
     transport::publish(&mut v.f.store, &v.owner, &carrier, &mut broker, &intent.id).unwrap();
+    let transport_observation =
+        transport::inspect(&mut v.f.store, &v.owner, &carrier, &mut broker, &intent.id).unwrap();
+    assert_eq!(
+        transport_observation.spec.observation,
+        transport::Observation::Available
+    );
+    assert!(transport_observation.spec.content_checked);
+    assert_eq!(
+        transport_observation.spec.write_outcome.as_deref(),
+        Some("succeeded")
+    );
     let receipt = observe(
         &mut v.f.store,
         &v.owner,
