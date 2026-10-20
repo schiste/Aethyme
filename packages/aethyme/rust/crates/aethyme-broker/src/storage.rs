@@ -5183,7 +5183,8 @@ mod tests {
     #[test]
     fn direct_library_root_is_attributed_and_inventoried_at_its_own_boundary() {
         let tmp = tempfile::tempdir().unwrap();
-        let repository_root = tmp.path().join("repository");
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let repository_root = tmp_root.as_path().join("repository");
         let repository = init_storage_root_test_repository(&repository_root);
         let owner = crate::test_storage::TestStorage::new();
         let host_state = owner.host_state_dir();
@@ -5918,11 +5919,12 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_sweep_revalidates_outer_binding_between_unlinks(retired: bool) {
         let tmp = tempfile::tempdir().unwrap();
-        let outer_root = tmp.path().join("preparation-cache-root");
-        let main_root = tmp.path().join("main");
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let outer_root = tmp_root.as_path().join("preparation-cache-root");
+        let main_root = tmp_root.as_path().join("main");
         std::fs::create_dir(&outer_root).unwrap();
         std::fs::create_dir(&main_root).unwrap();
-        let resource_db_path = test_host_resource_db(tmp.path());
+        let resource_db_path = test_host_resource_db(tmp_root.as_path());
         let binding = initialized_storage_cache_root_binding(&outer_root, &resource_db_path);
         let store = if retired {
             binding.path.join(format!(
@@ -5974,9 +5976,10 @@ mod tests {
     #[test]
     fn manual_apply_revalidates_outer_binding_before_each_unlink() {
         let tmp = tempfile::tempdir().unwrap();
-        let outer_root = tmp.path().join("preparation-cache-root");
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let outer_root = tmp_root.as_path().join("preparation-cache-root");
         std::fs::create_dir(&outer_root).unwrap();
-        let resource_db_path = test_host_resource_db(tmp.path());
+        let resource_db_path = test_host_resource_db(tmp_root.as_path());
         let binding = initialized_storage_cache_root_binding(&outer_root, &resource_db_path);
         let entry = binding
             .path
