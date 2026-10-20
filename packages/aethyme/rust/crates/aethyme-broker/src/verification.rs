@@ -1325,8 +1325,18 @@ mod tests {
     #[test]
     fn graph_snapshot_capacity_can_select_a_later_non_strict_root() {
         let fx = fixture();
-        let first_root = fx._root.path().join("first-worktrees");
-        let second_root = fx._root.path().join("second-worktrees");
+        let first_root = fx
+            ._root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("first-worktrees");
+        let second_root = fx
+            ._root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("second-worktrees");
         let candidates = vec![
             (
                 first_root.clone(),

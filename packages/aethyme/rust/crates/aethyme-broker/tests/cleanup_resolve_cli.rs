@@ -106,7 +106,12 @@ fn apply(repo: &Path, id: &str, digest: &str) -> Output {
 
 fn archive_root(repo: &Path, plan: &serde_json::Value) -> PathBuf {
     let root = PathBuf::from(plan["archive_root"].as_str().unwrap());
-    let owned = repo.parent().unwrap().join("host-state/recovery-archives");
+    let owned = repo
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("host-state/recovery-archives");
     assert_eq!(root.parent(), Some(owned.as_path()));
     root
 }

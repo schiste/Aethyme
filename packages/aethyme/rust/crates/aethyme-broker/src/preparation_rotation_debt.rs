@@ -5274,7 +5274,8 @@ mod tests {
     #[test]
     fn cache_root_capture_is_read_only_and_writable_init_binds_a_nonce_child() {
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("separate-cache");
+        let temporary_root = temporary.path().canonicalize().unwrap();
+        let root = temporary_root.as_path().join("separate-cache");
         fs::create_dir(&root).unwrap();
         let captured = super::capture_preparation_cache_root(&root).unwrap();
         assert!(matches!(
@@ -5322,7 +5323,8 @@ mod tests {
     #[test]
     fn cache_root_initialization_refuses_unowned_entries_and_prior_journal_rows() {
         let temporary = tempfile::tempdir().unwrap();
-        let unowned_root = temporary.path().join("unowned-cache");
+        let temporary_root = temporary.path().canonicalize().unwrap();
+        let unowned_root = temporary_root.as_path().join("unowned-cache");
         fs::create_dir(&unowned_root).unwrap();
         let capture = super::capture_preparation_cache_root(&unowned_root).unwrap();
         let identity = capture.identity.clone();
@@ -5340,7 +5342,7 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&unowned_root).unwrap().count(), 2);
 
-        let journal_root = temporary.path().join("journal-cache");
+        let journal_root = temporary_root.as_path().join("journal-cache");
         fs::create_dir(&journal_root).unwrap();
         let journal_capture = super::capture_preparation_cache_root(&journal_root).unwrap();
         let journal_identity = journal_capture.identity.clone();
@@ -5370,7 +5372,8 @@ mod tests {
     #[test]
     fn missing_nonce_child_is_completed_only_after_journal_preflight() {
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("cache-root");
+        let temporary_root = temporary.path().canonicalize().unwrap();
+        let root = temporary_root.as_path().join("cache-root");
         fs::create_dir(&root).unwrap();
         let captured = super::capture_preparation_cache_root(&root).unwrap();
         let identity = captured.identity.clone();
@@ -5412,7 +5415,8 @@ mod tests {
     #[test]
     fn cache_root_capture_rejects_partial_marker_and_root_replacement() {
         let temporary = tempfile::tempdir().unwrap();
-        let malformed_root = temporary.path().join("malformed-cache");
+        let temporary_root = temporary.path().canonicalize().unwrap();
+        let malformed_root = temporary_root.as_path().join("malformed-cache");
         fs::create_dir(&malformed_root).unwrap();
         fs::write(
             malformed_root.join(".aethyme-preparation-cache-root-v2"),
@@ -5425,11 +5429,11 @@ mod tests {
             b"{partial"
         );
 
-        let root = temporary.path().join("replaceable-cache");
+        let root = temporary_root.as_path().join("replaceable-cache");
         fs::create_dir(&root).unwrap();
         let captured = super::capture_preparation_cache_root(&root).unwrap();
         let identity = captured.identity.clone();
-        let old_root = temporary.path().join("old-cache");
+        let old_root = temporary_root.as_path().join("old-cache");
         fs::rename(&root, &old_root).unwrap();
         fs::create_dir(&root).unwrap();
         assert!(

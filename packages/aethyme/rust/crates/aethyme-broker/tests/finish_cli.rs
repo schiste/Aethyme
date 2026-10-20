@@ -236,6 +236,8 @@ fn finish_preserves_discovery_errors_before_closing_the_session() {
         .path()
         .parent()
         .expect("fixture repo has an owning root")
+        .canonicalize()
+        .unwrap()
         .join("worktrees with spaces");
     let mut broker = isolation::open(tmp.path()).with_worktree_root(&worktree_root);
     let session = broker.start_worktree("slow finish check", None).unwrap();
