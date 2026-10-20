@@ -178,6 +178,14 @@ impl Request {
     }
 }
 
+/// Selects whether an issuer admits work against a root allowance or
+/// subdivides an existing parent allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionRoute {
+    Direct,
+    Delegated { parent: RecordId },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReservationSpec {
@@ -1099,6 +1107,47 @@ pub fn begin_managed_resolution(
     command: &ManagedResolutionCommand,
 ) -> Result<ManagedResolutionOutcome, BudgetError> {
     managed_resolution::begin(store, repo, owner, command)
+}
+
+/// Admit one issuer-owned request through the selected budget lineage and
+/// begin an allowed attempt. Both routes use the same request nonce; choosing a
+/// second route for an existing nonce cannot create another root or child.
+///
+/// The clock is sampled once immediately before reservation and again after
+/// that durable write, immediately before beginning the attempt. A first-clock
+/// failure or reserve/delegate error before commit creates no new reservation.
+/// A commit or post-commit read-back error can leave the outcome ambiguous;
+/// reconcile using the same nonce before retrying, and never mint another nonce
+/// to bypass that uncertainty. Once reserve or delegate returns successfully,
+/// a later clock or attempt failure does not roll back that durable reservation
+/// or retry it here. An idempotently returned reservation may begin another
+/// attempt when the existing retry rules allow it.
+/// The clock error is preserved, while budget errors are converted into the
+/// caller's error type.
+pub fn admit<E, F>(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    wave_id: &RecordId,
+    request: Request,
+    route: AdmissionRoute,
+    mut now_ms: F,
+) -> Result<Attempt, E>
+where
+    E: From<BudgetError>,
+    F: FnMut() -> Result<i64, E>,
+{
+    let reservation = match route {
+        AdmissionRoute::Direct => reserve(store, owner, wave_id, request, now_ms()?)?,
+        AdmissionRoute::Delegated { parent } => {
+            let existing_parent = owned(store, owner, &parent)?;
+            if existing_parent.spec.wave != wave_id.as_str() {
+                return Err(BudgetError::Immutable.into());
+            }
+            delegate(store, owner, &parent, request, now_ms()?)?
+        }
+    };
+    let attempt_now = now_ms()?;
+    begin_attempt(store, owner, &reservation.id, attempt_now).map_err(E::from)
 }
 
 /// Native execution adapter: a live pending attempt must name this exact frozen
