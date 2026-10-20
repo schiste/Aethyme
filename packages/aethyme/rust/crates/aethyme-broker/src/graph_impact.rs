@@ -1948,7 +1948,7 @@ mod tests {
         coverage.edge_counts_by_kind.insert(edge_kind.into(), 1);
         coverage
             .edge_counts_by_kind
-            .entry(EdgeKind::Tests.name().into())
+            .entry("tests".into())
             .or_insert(0);
         write_coverage_artifacts(root.path(), &coverage, &[]).unwrap();
         drop(store);
@@ -1972,7 +1972,7 @@ mod tests {
 
         let root = covered_root("abc", "Calls");
         let mut coverage = read_coverage(root.path()).unwrap();
-        coverage.edge_counts_by_kind.remove(EdgeKind::Tests.name());
+        coverage.edge_counts_by_kind.remove("tests");
         write_coverage_artifacts(root.path(), &coverage, &[]).unwrap();
 
         let report = revision_bound_impact_report(
