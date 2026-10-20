@@ -2260,14 +2260,17 @@ impl Broker {
             0
         };
         phase("store", started);
+        // Inspect the selected binary before retention can consume the shared
+        // Git deadline. A partial inventory must not starve this cheap check.
+        let version_started = std::time::Instant::now();
+        let version = crate::version::inspect_version(&self.main_root);
+        phase("version", version_started);
         let retention_started = std::time::Instant::now();
         let retention = self.gc_health_until(deadline)?;
         budget_cut.extend(retention.deferred_checks.iter().cloned());
         phase("retention", retention_started);
-        let version_started = std::time::Instant::now();
-        let version = crate::version::inspect_version(&self.main_root);
+        // Keep explicit repair after read-only inventory, as before.
         let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
-        phase("version", version_started);
         let movement_started = std::time::Instant::now();
         let integration_movement = if std::time::Instant::now() < deadline {
             match self.integration_movement_notice_from_sessions(&live_sessions) {
