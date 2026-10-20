@@ -117,6 +117,31 @@ fn difference_window(stored: &str, actual: &str) -> String {
     )
 }
 
+/// The type skeleton of a JSON value: objects keep their (sorted) keys, arrays
+/// keep the shape of their first element, and leaves become their type name.
+/// Values change run to run; the shape is the contract.
+pub fn json_shape(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Null => Value::String("null".into()),
+        Value::Bool(_) => Value::String("bool".into()),
+        Value::Number(number) if number.is_f64() => Value::String("float".into()),
+        Value::Number(_) => Value::String("integer".into()),
+        Value::String(_) => Value::String("string".into()),
+        Value::Array(items) => match items.first() {
+            Some(first) => Value::Array(vec![json_shape(first)]),
+            None => Value::Array(Vec::new()),
+        },
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<_, _> = map
+                .iter()
+                .map(|(key, value)| (key.clone(), json_shape(value)))
+                .collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+    }
+}
+
 #[cfg(test)]
 mod difference_window_tests {
     use super::difference_window;
@@ -157,30 +182,5 @@ mod difference_window_tests {
         let report = difference_window(&stored, &actual);
         assert!(report.contains("[truncated]"), "{report}");
         assert!(report.len() < 2_000);
-    }
-}
-
-/// The type skeleton of a JSON value: objects keep their (sorted) keys, arrays
-/// keep the shape of their first element, and leaves become their type name.
-/// Values change run to run; the shape is the contract.
-pub fn json_shape(value: &serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::Null => Value::String("null".into()),
-        Value::Bool(_) => Value::String("bool".into()),
-        Value::Number(number) if number.is_f64() => Value::String("float".into()),
-        Value::Number(_) => Value::String("integer".into()),
-        Value::String(_) => Value::String("string".into()),
-        Value::Array(items) => match items.first() {
-            Some(first) => Value::Array(vec![json_shape(first)]),
-            None => Value::Array(Vec::new()),
-        },
-        Value::Object(map) => {
-            let sorted: std::collections::BTreeMap<_, _> = map
-                .iter()
-                .map(|(key, value)| (key.clone(), json_shape(value)))
-                .collect();
-            Value::Object(sorted.into_iter().collect())
-        }
     }
 }
