@@ -22,7 +22,6 @@
 //! "37.4 GB retained" with nobody noticing which of the two had been checked.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -274,34 +273,15 @@ pub(crate) fn load_size_records(main_root: &Path) -> SizeRecords {
 /// that depend on these records.
 pub(crate) fn load_size_records_until(main_root: &Path, deadline: Instant) -> Option<SizeRecords> {
     let path = size_records_path(main_root);
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Some(SizeRecords::default());
-        }
-        Err(_) => return Some(SizeRecords::default()),
+    let bytes = match crate::preparation::read_bounded_regular_file_for_liveness(
+        &path,
+        HEALTH_SIZE_RECORD_READ_LIMIT_BYTES as u64,
+        deadline,
+    ) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Some(SizeRecords::default()),
+        Err(_) => return None,
     };
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 64 * 1024];
-    loop {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        let count = match file.read(&mut chunk) {
-            Ok(count) => count,
-            Err(_) => return Some(SizeRecords::default()),
-        };
-        if count == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(count) > HEALTH_SIZE_RECORD_READ_LIMIT_BYTES {
-            return None;
-        }
-        bytes.extend_from_slice(&chunk[..count]);
-    }
-    if Instant::now() >= deadline {
-        return None;
-    }
     Some(
         serde_json::from_slice::<SizeRecords>(&bytes)
             .ok()
@@ -347,6 +327,34 @@ mod tests {
 
     fn owned(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|path| (*path).to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_size_record_read_refuses_fifo_and_expired_deadline_before_open() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        let runtime = root.join(".aethyme");
+        std::fs::create_dir(&runtime).unwrap();
+        let path = size_records_path(root);
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path inside this live TempDir.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let refused =
+            load_size_records_until(root, Instant::now() + std::time::Duration::from_secs(5));
+        assert!(refused.is_none(), "a FIFO is not a size-record file");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let expired =
+            load_size_records_until(root, Instant::now() - std::time::Duration::from_millis(1));
+        assert!(
+            expired.is_none(),
+            "expired health work refuses before opening"
+        );
     }
 
     #[test]

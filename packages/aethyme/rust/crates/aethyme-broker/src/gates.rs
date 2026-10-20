@@ -25,6 +25,7 @@
 //! validation rather than silently never matching.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1069,10 +1070,11 @@ pub(crate) fn running_gate_evidence_until(
             if !name.ends_with(".pid") {
                 continue;
             }
-            let Some(record) = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|content| GatePidRecord::parse(&content))
-            else {
+            let record = match read_gate_pidfile_until(&path, &mut expired) {
+                Ok(record) => record,
+                Err(()) => return None,
+            };
+            let Some(record) = record else {
                 evidence.push(format!("gate pidfile {name} is unreadable"));
                 continue;
             };
@@ -1104,7 +1106,10 @@ pub(crate) fn running_gate_evidence_until(
             if !name.ends_with(".lock") {
                 continue;
             }
-            let file = match std::fs::OpenOptions::new().read(true).open(entry.path()) {
+            if expired() {
+                return None;
+            }
+            let file = match open_gate_owner_lock_probe(&entry.path()) {
                 Ok(file) => file,
                 Err(error) => {
                     evidence.push(format!("gate owner lock {name} cannot be opened: {error}"));
@@ -1134,6 +1139,124 @@ pub(crate) fn running_gate_evidence_until(
     }
     evidence.sort();
     (!expired()).then_some(evidence)
+}
+
+const GATE_PIDFILE_READ_LIMIT_BYTES: usize = 64 * 1024;
+
+fn same_gate_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if !left.is_file()
+        || !right.is_file()
+        || left.len() != right.len()
+        || !left
+            .modified()
+            .ok()
+            .zip(right.modified().ok())
+            .is_some_and(|(left, right)| left == right)
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn open_gate_owner_lock_probe(path: &Path) -> std::io::Result<std::fs::File> {
+    let before_path = std::fs::symlink_metadata(path)?;
+    if before_path.file_type().is_symlink() || !before_path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "owner lock is not a regular file",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    let after_path = std::fs::symlink_metadata(path)?;
+    if !same_gate_file_version(&before_path, &opened)
+        || !same_gate_file_version(&opened, &after_path)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "owner lock changed while it was opened",
+        ));
+    }
+    Ok(file)
+}
+
+fn read_gate_pidfile_until(
+    path: &Path,
+    expired: &mut impl FnMut() -> bool,
+) -> Result<Option<GatePidRecord>, ()> {
+    if expired() {
+        return Err(());
+    }
+    let before_path = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+        _ => return Ok(None),
+    };
+    if before_path.len() > GATE_PIDFILE_READ_LIMIT_BYTES as u64 {
+        return Ok(None);
+    }
+    let expected_len = usize::try_from(before_path.len()).map_err(|_| ())?;
+    if expired() {
+        return Err(());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let opened = file.metadata().map_err(|_| ())?;
+    if !same_gate_file_version(&before_path, &opened) || expired() {
+        return Err(());
+    }
+    let mut bytes = Vec::with_capacity(expected_len);
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if expired() {
+            return Err(());
+        }
+        let count = file.read(&mut buffer).map_err(|_| ())?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > GATE_PIDFILE_READ_LIMIT_BYTES {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let after_open = file.metadata().map_err(|_| ())?;
+    let after_path = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if expired()
+        || !same_gate_file_version(&opened, &after_open)
+        || !same_gate_file_version(&opened, &after_path)
+        || bytes.len() as u64 != opened.len()
+    {
+        return Err(());
+    }
+    let content = std::str::from_utf8(&bytes).map_err(|_| ())?;
+    Ok(GatePidRecord::parse(content))
 }
 
 /// What a gate pidfile says about the process group it names.
@@ -5900,6 +6023,51 @@ mod tests {
             Some(record)
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_gate_evidence_refuses_a_fifo_owner_lock_without_waiting() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let owners = running_dir(root.path()).join("owners");
+        std::fs::create_dir_all(&owners).unwrap();
+        let path = owners.join("gate.lock");
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path inside this live TempDir.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let pidfile = running_dir(root.path()).join("gate.pid");
+        let encoded_pidfile = std::ffi::CString::new(pidfile.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded_pidfile` is a NUL-terminated path inside this live TempDir.
+        assert_eq!(unsafe { libc::mkfifo(encoded_pidfile.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        assert!(matches!(
+            read_gate_pidfile_until(&pidfile, &mut || false),
+            Ok(None)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            read_gate_pidfile_until(&pidfile, &mut || true),
+            Err(())
+        ));
+
+        let started = Instant::now();
+        let evidence = running_gate_evidence_until(root.path(), || false, Some(8))
+            .expect("the bounded inventory should complete");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            evidence
+                .iter()
+                .any(|item| { item.contains("gate owner lock gate.lock cannot be opened") })
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.contains("gate pidfile gate.pid is unreadable"))
+        );
     }
 
     #[test]

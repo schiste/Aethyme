@@ -826,6 +826,50 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn open_regular_file_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path did not open as a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn same_regular_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if !left.is_file()
+        || !right.is_file()
+        || left.len() != right.len()
+        || !left
+            .modified()
+            .ok()
+            .zip(right.modified().ok())
+            .is_some_and(|(left, right)| left == right)
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 const GC_FILE_READ_CHUNK_BYTES: usize = 64 * 1024;
 const GC_METRICS_HEALTH_READ_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -864,8 +908,26 @@ fn sha256_file_until(
     if deadline_expired(deadline) {
         return Ok(None);
     }
-    let mut file = std::fs::File::open(path)?;
-    sha256_reader_until_with_clock(&mut file, deadline, Instant::now)
+    let mut file = open_regular_file_nonblocking(path)?;
+    let opened = file.metadata()?;
+    let before_path = std::fs::symlink_metadata(path)?;
+    if !same_regular_file_version(&opened, &before_path) || deadline_expired(deadline) {
+        return Ok(None);
+    }
+    let Some((digest, bytes)) = sha256_reader_until_with_clock(&mut file, deadline, Instant::now)?
+    else {
+        return Ok(None);
+    };
+    let after_open = file.metadata()?;
+    let after_path = std::fs::symlink_metadata(path)?;
+    if deadline_expired(deadline)
+        || !same_regular_file_version(&opened, &after_open)
+        || !same_regular_file_version(&opened, &after_path)
+        || bytes != opened.len()
+    {
+        return Ok(None);
+    }
+    Ok(Some((digest, bytes)))
 }
 
 fn read_all_until_with_clock<R, C>(
@@ -962,7 +1024,7 @@ fn metrics_rewrite(
         });
         return Ok(MetricsRewrite::Complete(None));
     }
-    let mut file = match std::fs::File::open(&path) {
+    let mut file = match open_regular_file_nonblocking(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(MetricsRewrite::Complete(None));
@@ -973,9 +1035,21 @@ fn metrics_rewrite(
                 id: None,
                 reason: format!("cannot inspect {relative}: {error}"),
             });
-            return Ok(MetricsRewrite::Complete(None));
+            return Ok(MetricsRewrite::Deferred);
         }
     };
+    let opened = file.metadata().map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let before_path =
+        std::fs::symlink_metadata(&path).map_err(|source| crate::BrokerError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    if !same_regular_file_version(&opened, &before_path) || deadline_expired(deadline) {
+        return Ok(MetricsRewrite::Deferred);
+    }
     let bytes = match read_all_until_with_clock(&mut file, deadline, Instant::now) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(MetricsRewrite::Deferred),
@@ -985,9 +1059,24 @@ fn metrics_rewrite(
                 id: None,
                 reason: format!("cannot inspect {relative}: {error}"),
             });
-            return Ok(MetricsRewrite::Complete(None));
+            return Ok(MetricsRewrite::Deferred);
         }
     };
+    let after_open = file.metadata().map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let after_path = std::fs::symlink_metadata(&path).map_err(|source| crate::BrokerError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if deadline_expired(deadline)
+        || !same_regular_file_version(&opened, &after_open)
+        || !same_regular_file_version(&opened, &after_path)
+        || bytes.len() as u64 != opened.len()
+    {
+        return Ok(MetricsRewrite::Deferred);
+    }
     let Some((after, removed, malformed)) = retained_metric_bytes_until(&bytes, cutoff, deadline)
     else {
         return Ok(MetricsRewrite::Deferred);
@@ -3514,14 +3603,21 @@ impl Broker {
                 continue;
             }
             let (before_sha256, bytes_before) = if deadline.is_some() {
-                match sha256_file_until(&path, deadline).map_err(|source| {
-                    crate::BrokerError::Io {
-                        path: path.clone(),
-                        source,
+                match sha256_file_until(&path, deadline) {
+                    Ok(Some((digest, bytes))) => (digest, bytes),
+                    Ok(None) => {
+                        gate_log_inventory_deferred = true;
+                        retained_rows.push(row);
+                        continue;
                     }
-                })? {
-                    Some((digest, bytes)) => (digest, bytes),
-                    None => {
+                    Err(error) => {
+                        blockers.push(GcBlocker {
+                            kind: "gate_log".into(),
+                            id: Some(row.id),
+                            reason: format!(
+                                "cannot read gate log for bounded health scan: {error}"
+                            ),
+                        });
                         gate_log_inventory_deferred = true;
                         retained_rows.push(row);
                         continue;
@@ -7007,6 +7103,27 @@ mod tests {
             "partial metrics cannot produce a rewrite plan"
         );
         assert_eq!(reader.position(), GC_FILE_READ_CHUNK_BYTES as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_open_refuses_a_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gate.log");
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path into this live TempDir.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let result = open_regular_file_nonblocking(&path);
+
+        assert!(result.is_err(), "a FIFO is not a regular gate log");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "nonblocking open must not wait for a FIFO writer"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
