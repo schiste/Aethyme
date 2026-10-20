@@ -368,16 +368,15 @@ fn a_host_operation_on_another_repository_is_not_reconciled_from_here() {
         "--reason",
         "wrong repository",
     ]);
+    let unblocked_stderr = String::from_utf8_lossy(&unblocked.stderr);
     assert_eq!(
         unblocked.status.code(),
         Some(3),
-        "{}",
-        json_error::message(&unblocked)
+        "{unblocked_stderr}"
     );
     assert!(
-        json_error::message(&unblocked).contains("not a remote of this repository"),
-        "{}",
-        json_error::message(&unblocked)
+        unblocked_stderr.contains("not a remote of this repository"),
+        "{unblocked_stderr}"
     );
     assert_eq!(
         aethyme_broker::host_operation(&database, &hex)
