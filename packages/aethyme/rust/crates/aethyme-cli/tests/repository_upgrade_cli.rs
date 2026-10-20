@@ -786,7 +786,8 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
         upgrade_plan["blockers"][0]
             .as_str()
             .unwrap()
-            .contains("sessions are active")
+            .contains("sessions are active"),
+        "unexpected upgrade plan: {upgrade_plan:#}"
     );
     assert!(
         upgrade_plan["disjoint_dirty_paths"]
