@@ -1099,3 +1099,121 @@ fn release_given_a_lease_id_points_at_reconcile() {
         "the raw file error is what misled the operator: {message}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn acquire_dead_exclusive_holder_is_structured_and_immediately_nonretryable() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let first_request = temp.path().join("first.json");
+    let second_request = temp.path().join("second.json");
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    let request = |id: &str, holder_pid: u32| {
+        serde_json::json!({
+            "schema_version": 1,
+            "request_id": id,
+            "repository": "owner/repo",
+            "worktree_fingerprint": id,
+            "run_id": id,
+            "ttl_seconds": 60,
+            "holder_pid": holder_pid,
+            "resources": [{
+                "key": "worktree",
+                "kind": "exclusive_key",
+                "name": "shared-worktree"
+            }]
+        })
+    };
+    std::fs::write(
+        &first_request,
+        serde_json::to_vec_pretty(&request("first", dead_pid)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &second_request,
+        serde_json::to_vec_pretty(&request("second", std::process::id())).unwrap(),
+    )
+    .unwrap();
+
+    let acquired = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "acquire",
+            first_request.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        acquired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+    let grant: serde_json::Value = serde_json::from_slice(&acquired.stdout).unwrap();
+    let lease_id = grant["lease"]["lease_id"].as_str().unwrap();
+
+    let reaped = run(temp.path(), &state, &["gc", "reap", "--json"]);
+    assert!(
+        reaped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reaped.stderr)
+    );
+    let reap_report: serde_json::Value = serde_json::from_slice(&reaped.stdout).unwrap();
+    assert_eq!(reap_report["retained_quarantined_leases"], 1);
+    assert_eq!(reap_report["leases"][0]["lease_id"], lease_id);
+    assert_eq!(reap_report["leases"][0]["state"], "quarantined");
+
+    let blocked = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "acquire",
+            second_request.to_str().unwrap(),
+            "--wait",
+            "30s",
+            "--json",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(75));
+    let failure: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(failure["code"], "orphaned_holder");
+    assert_eq!(failure["retryable"], false);
+    assert!(failure["waited_ms"].as_u64().unwrap() < 1_000);
+    assert_eq!(failure["conflicts"][0]["code"], "orphaned_holder");
+    assert_eq!(failure["conflicts"][0]["owning_lease"], lease_id);
+
+    let explained = run(
+        temp.path(),
+        &state,
+        &[
+            "advanced",
+            "resources",
+            "explain",
+            second_request.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(
+        explained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+    let explanation: serde_json::Value = serde_json::from_slice(&explained.stdout).unwrap();
+    assert_eq!(explanation["wait"]["waitable"], false);
+    assert_eq!(explanation["wait"]["reason"], "orphaned_holder");
+    assert_eq!(
+        explanation["blockers"][0]["leases"][0]["lease_id"],
+        lease_id
+    );
+    assert_eq!(
+        explanation["blockers"][0]["leases"][0]["state"],
+        "quarantined"
+    );
+    assert!(!String::from_utf8_lossy(&blocked.stdout).contains("ownership_token"));
+}

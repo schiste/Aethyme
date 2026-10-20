@@ -44,6 +44,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+  For a CLI launched from another directory or a session checkout, derive
+  isolation paths from the owning repository fixture and set its working
+  directory separately.
 - When exercising no-follow storage paths, canonicalize the fixture-owned
   temporary root before deriving its database and cache paths. Platform aliases
   such as macOS `/var` must not turn a valid fixture into a symlink traversal;
@@ -70,6 +73,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- Carry the selected worktree-root layout through planning, attribution, and
+  apply. A `LibraryOverride` with no `root_container` is a direct repository
+  root: inventory that root itself, not its children as keyed repositories.
+  Test direct-root and keyed-container layouts, preserving existing keyed
+  confirmation digests.
 - Keep authoritative frozen plans, validation helpers, inputs and receipts on
   durable storage before execution; use temporary directories for scratch only.
   Before a long validation, choose a unique durable output directory outside
@@ -100,10 +108,15 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   summed path allocation, deduplicated physical allocation, and observed
   volume-free-space change distinct. Registration time does not establish
   worktree creation or preparation time.
-- For guard-removal controls that temporarily mutate source, restore exact bytes
-  and verify the source hash, then refresh the owned source file's mtime before
-  the restored positive Cargo run. A `cp -p` restore can otherwise let Cargo
-  reuse output from the mutation build.
+- For guard-removal controls that mutate source in place, reject sources with
+  multiple links. Before the first write, create an exclusive no-follow backup,
+  fsync and read it back to verify the exact original bytes, then create and
+  fsync an exclusive recovery-intent record. Sync the run directory and its
+  parent when newly created. After mutation, restore exact bytes, verify the
+  source hash, and refresh the owned source file's mtime before the restored
+  positive Cargo run; a `cp -p` restore can otherwise reuse mutation output. If
+  restoration cannot be proven, retain the lock and backup and report cleanup
+  as unknown. SIGKILL or power loss may require manual recovery.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only
@@ -173,6 +186,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and sentinel absence, then remove only the call-site guard in a mutation run
   and verify that the sentinel assertion fails. A helper-only test cannot prove
   that the production path invokes the guard.
+- For each deliberate guard-removal check, run the same named regression on
+  unmodified source, with the deliberate break, and after byte-for-byte
+  restoration. Require positive, intended runtime failure, positive; a compile
+  failure or a test that also fails without the break does not validate the
+  guard. A passing adjacent suite cannot replace either positive run.
+- Before reclaiming a completed worktree, inspect ignored paths for qualification
+  records; a clean Git status does not cover them. Preserve irreplaceable
+  reports outside the worktree and build target, verify copied file sizes and
+  hashes, and check symlink targets before cleanup. Keep regenerable build
+  output separate from the evidence archive.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.

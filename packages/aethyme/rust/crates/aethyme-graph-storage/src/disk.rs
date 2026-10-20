@@ -106,7 +106,9 @@ pub fn write_overlay<P: Serialize>(
 }
 
 /// Read an OverlayFragment from its canonical location, verifying
-/// that the bytes' embedded `kind` matches the filename's `kind`.
+/// that the embedded kind matches the filename and the producer logic
+/// version matches the caller's nonempty expectation. A mismatch refuses
+/// the read without modifying or deleting the stale overlay.
 ///
 /// The caller must supply the payload type `P` they expect — there
 /// is no runtime registry mapping kinds to payload types, by design
@@ -116,11 +118,12 @@ pub fn write_overlay<P: Serialize>(
 pub fn read_overlay<P: DeserializeOwned>(
     repo_root: &Path,
     kind: &str,
+    expected_producer_version: &str,
 ) -> Result<OverlayFragment<P>, OverlayReadError> {
     validate_module_name(kind).map_err(OverlayReadError::Path)?;
     let target = overlay_path(repo_root, kind);
     let bytes = read_file(&target).map_err(OverlayReadError::Io)?;
-    read_overlay_bytes(&bytes, kind).map_err(OverlayReadError::Decode)
+    read_overlay_bytes(&bytes, kind, expected_producer_version).map_err(OverlayReadError::Decode)
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────

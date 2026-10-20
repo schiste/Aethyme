@@ -183,6 +183,13 @@ pub enum BrokerOpError {
         stage: String,
         budget: String,
     },
+    /// Git-backed preparation for an explicit lease claim did not finish
+    /// within its bounded budget. The deadline is checked before the explicit
+    /// claim transaction, so this request did not record a new claim.
+    #[error(
+        "lease claim preparation timed out with a {budget_ms} ms budget; no explicit lease claim was recorded by this request"
+    )]
+    LeaseClaimPreparationTimedOut { budget_ms: u64 },
     /// A coordinated child was already running when its bounded operation
     /// budget expired. Remote writes are stored as `outcome_unknown` and use
     /// the durable recovery error below; this variant is for read-only and

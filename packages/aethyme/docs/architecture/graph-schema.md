@@ -345,9 +345,13 @@ Overlay fragments are the storage shape for that data.
   the bump must land with a coordinated re-index. It is **not**
   the producer's logic version.
 - `producer_version` is the producer's own version string
-  (e.g. `"structure-producer/0.3.2"`); it is recorded for
-  provenance and re-derivation triggers but is **not** load-bearing
-  for decode.
+  (e.g. `"structure-producer/0.3.2"`). Overlay reads at the byte, disk,
+  and `FragmentStore` layers require a nonempty expected producer version
+  and compare it exactly. A mismatch returns `ProducerVersionMismatch`
+  before exposing a payload; the caller must rerun the producer. An empty
+  expectation returns `EmptyExpectedProducerVersion`. A refused read does
+  not rewrite or delete the old overlay. This changes read validation,
+  without changing the envelope fields, serialization, or schema version.
 - `payload` is the producer-defined type `P`. Each `<kind>.bin`
   carries its own payload type; there is no global discriminant.
 

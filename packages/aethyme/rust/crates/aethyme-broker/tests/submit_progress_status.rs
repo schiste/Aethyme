@@ -4,9 +4,12 @@
 //! process blocked on a contested lock or lease is listed the same way (#494).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+
+mod common;
 
 use aethyme_broker::{Broker, SUBMIT_STALL_AFTER, SubmitProgressRecord, WaitRecord};
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -27,15 +30,24 @@ fn sh(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn repo(tmp: &Path) -> PathBuf {
-    let repo = tmp.join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    sh(&repo, &["init", "-q", "-b", "main"]);
+fn fixture() -> FixtureRepository {
+    let fixture = FixtureRepository::new();
+    let repo = fixture.path();
+    sh(repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
-    sh(&repo, &["add", "-A"]);
-    sh(&repo, &["commit", "-qm", "init"]);
-    repo
+    sh(repo, &["add", "-A"]);
+    sh(repo, &["commit", "-qm", "init"]);
+    fixture
+}
+
+fn run(broker: &Broker, repo: &Path, args: &[&str]) -> Output {
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(repo);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .expect("bind child to fixture storage context");
+    command.output().unwrap()
 }
 
 fn now_ms() -> i64 {
@@ -68,25 +80,25 @@ fn write_record(repo: &Path, session_id: i64, phase: &str, phase_started: i64, p
 
 #[test]
 fn status_lists_a_waiting_submit_with_its_position_and_the_slot_holder() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = repo(tmp.path());
+    let fixture = fixture();
+    let repo = fixture.path();
     let now = now_ms();
     write_record(
-        &repo,
+        repo,
         812,
         "verifying the merged tree",
         now - 190_000,
         now - 2_000,
     );
     write_record(
-        &repo,
+        repo,
         813,
         "waiting for a verification slot",
         now - 60_000,
         now - 1_000,
     );
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let status = broker.status(now_ms()).unwrap();
     let json = serde_json::to_value(&status).unwrap();
     let submits = json["in_flight_submits"]
@@ -114,13 +126,13 @@ fn status_lists_a_waiting_submit_with_its_position_and_the_slot_holder() {
 
 #[test]
 fn a_silent_submit_is_flagged_possibly_stalled_with_advice() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = repo(tmp.path());
+    let fixture = fixture();
+    let repo = fixture.path();
     let now = now_ms();
     let silent_since = now - SUBMIT_STALL_AFTER.as_millis() as i64 - 1_000;
-    write_record(&repo, 7, "simulating the merge", silent_since, silent_since);
+    write_record(repo, 7, "simulating the merge", silent_since, silent_since);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let status = broker.status(now_ms()).unwrap();
     let submit = &status.in_flight_submits[0];
     assert!(submit.alive && submit.possibly_stalled);
@@ -139,9 +151,8 @@ fn a_silent_submit_is_flagged_possibly_stalled_with_advice() {
 
 #[test]
 fn status_omits_the_field_when_no_submit_is_running() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = repo(tmp.path());
-    let mut broker = Broker::open(&repo).unwrap();
+    let fixture = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let json = serde_json::to_value(broker.status(now_ms()).unwrap()).unwrap();
     assert!(json.get("in_flight_submits").is_none());
 }
@@ -150,9 +161,9 @@ fn status_omits_the_field_when_no_submit_is_running() {
 /// a record behind, and that one is reported as gone, not as running.
 #[test]
 fn a_completed_submit_leaves_no_progress_record() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = repo(tmp.path());
-    let mut broker = Broker::open(&repo).unwrap();
+    let fixture = fixture();
+    let repo = fixture.path();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let session = broker.start_worktree("work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("work.txt"), "landed\n").unwrap();
@@ -194,12 +205,12 @@ fn write_wait(repo: &Path, pid: i64, session_id: i64, started_at_ms: i64) {
 
 #[test]
 fn status_and_its_summary_list_who_waits_on_which_lock() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = repo(tmp.path());
+    let fixture = fixture();
+    let repo = fixture.path();
     let now = now_ms();
-    write_wait(&repo, i64::from(std::process::id()), 812, now - 65_000);
+    write_wait(repo, i64::from(std::process::id()), 812, now - 65_000);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     for json in [
         serde_json::to_value(broker.status(now_ms()).unwrap()).unwrap(),
         serde_json::to_value(broker.status_brief(now_ms()).unwrap()).unwrap(),
@@ -212,13 +223,7 @@ fn status_and_its_summary_list_who_waits_on_which_lock() {
         assert_eq!(waiter["alive"], true);
         assert!(waiter["waited_ms"].as_i64().unwrap() >= 65_000);
     }
-    drop(broker);
-
-    let output = Command::new(CLI)
-        .args(["status", "--summary"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
+    let output = run(&broker, repo, &["status", "--summary"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
     // The wait keeps aging while the command runs; only its shape is fixed.
@@ -234,9 +239,8 @@ fn status_and_its_summary_list_who_waits_on_which_lock() {
 
 #[test]
 fn status_omits_waiters_when_nobody_waits() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = repo(tmp.path());
-    let mut broker = Broker::open(&repo).unwrap();
+    let fixture = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let json = serde_json::to_value(broker.status(now_ms()).unwrap()).unwrap();
     assert!(json.get("waiters").is_none());
     let json = serde_json::to_value(broker.status_brief(now_ms()).unwrap()).unwrap();

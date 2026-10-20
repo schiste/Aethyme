@@ -2,9 +2,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, EntryExposureResolutionKind, EntryExposureState, FinishOptions, GateStatus,
-    GcFileAction, GcRowKind, NewGateResult,
+    Broker, BrokerOpenOptions, EntryExposureResolutionKind, EntryExposureState, FinishOptions,
+    GateStatus, GcFileAction, GcRowKind, NewGateResult,
 };
+
+mod common;
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -46,10 +48,9 @@ impl Fixture {
     }
 
     fn open(&self) -> Broker {
-        Broker::open(self.path())
+        common::open_fixture_broker(self.path(), self._root.path())
             .unwrap()
-            .with_host_operation_database(self._root.path().join("host-state/host-operations.db"))
-            .with_worktree_root(self.worktree_root())
+            .into_broker()
     }
 }
 
@@ -646,7 +647,8 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
             "owned by placement test\n",
         )
         .unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "ephemeral_repositories_never_anchor_worktrees_in_durable_host_state",
@@ -656,9 +658,17 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
             .env("HOME", private_home.path())
             .env_remove("AETHYME_WORKTREE_ROOT")
             .env_remove("AETHYME_HOST_STATE_DIR")
+            .env_remove("AETHYME_HOST_CACHE_DIR")
+            .env_remove("AETHYME_BROKER_DB")
+            .env_remove("AETHYME_GATE_BROKER_DATABASES")
+            .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+            .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+            .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+            .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+            .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
             .env_remove("XDG_STATE_HOME")
-            .output()
-            .unwrap();
+            .env_remove("XDG_CACHE_HOME");
+        let output = command.output().unwrap();
         assert!(
             output.status.success(),
             "default-placement child failed: {}\n{}",
@@ -672,7 +682,16 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
     for name in [
         "AETHYME_WORKTREE_ROOT",
         "AETHYME_HOST_STATE_DIR",
+        "AETHYME_HOST_CACHE_DIR",
+        "AETHYME_BROKER_DB",
+        "AETHYME_GATE_BROKER_DATABASES",
+        "AETHYME_BROKER_STORAGE_CONTEXT_V1",
+        "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+        "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+        "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+        "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
         "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
     ] {
         assert!(
             std::env::var_os(name).is_none(),
@@ -701,9 +720,9 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "README.md"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    let mut broker = Broker::open(tmp.path())
-        .unwrap()
+    let options = BrokerOpenOptions::default()
         .with_host_operation_database(tmp._root.path().join("host-operations.db"));
+    let mut broker = Broker::open_with_options(tmp.path(), options).unwrap();
     let session = broker
         .start_worktree("default ephemeral placement", None)
         .unwrap();

@@ -9,12 +9,15 @@
 //! was merely slow.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Command;
+
+mod common;
 
 use aethyme_broker::{
-    Broker, NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance,
-    OperationProvider, OperationStatus,
+    NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance, OperationProvider,
+    OperationStatus,
 };
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -31,17 +34,9 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(output.status.success(), "git {args:?}");
 }
 
-fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
-}
-
 #[test]
 fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
@@ -61,7 +56,7 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
         ],
     );
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let session = broker.adopt(&worktree, None).unwrap();
     let repository = format!("local:{}", broker.main_root().display());
 
@@ -95,9 +90,14 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
             ..make("issues/1/comments", r#"["gh","api"]"#)
         })
         .unwrap();
+    let mut command = common::broker_cli(CLI, &["status"]);
+    command.current_dir(tmp.path());
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
     drop(broker);
 
-    let output = run(tmp.path(), &["status"]);
+    let output = command.output().unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
 
     assert!(

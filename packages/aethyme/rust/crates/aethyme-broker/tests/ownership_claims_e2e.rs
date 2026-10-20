@@ -7,10 +7,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{
     Broker, BrokerOpError, NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance,
     OperationProvider, SessionStatus,
 };
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
 
@@ -76,7 +79,7 @@ fn make_stale(broker: &mut Broker, root: &Path, session_id: i64, name: &str) {
 }
 
 struct Two {
-    _tmp: tempfile::TempDir,
+    _fixture: FixtureRepository,
     root: PathBuf,
     broker: Broker,
     first: i64,
@@ -84,10 +87,12 @@ struct Two {
 }
 
 fn two_sessions() -> Two {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
+    let fixture = FixtureRepository::new();
+    let root = fixture.path().to_path_buf();
     init_repo(&root);
-    let mut broker = Broker::open(&root).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture)
+        .unwrap()
+        .into_broker();
     let first = broker
         .adopt(&add_worktree(&root, "first"), Some("cut the release"))
         .unwrap()
@@ -97,7 +102,7 @@ fn two_sessions() -> Two {
         .unwrap()
         .id;
     Two {
-        _tmp: tmp,
+        _fixture: fixture,
         root,
         broker,
         first,

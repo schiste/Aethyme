@@ -12,6 +12,7 @@
 //! reported its floor as a total would be the original bug wearing a
 //! different number.
 
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -48,15 +49,20 @@ fn write_policy(main_root: &Path, retained_bytes_budget: u64, routine_size_budge
     .unwrap();
 }
 
-fn fixture(retained_bytes_budget: u64, routine_size_budget_ms: u64) -> (tempfile::TempDir, Broker) {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture(
+    retained_bytes_budget: u64,
+    routine_size_budget_ms: u64,
+) -> (common::FixtureRepository, Broker) {
+    let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
     write_policy(tmp.path(), retained_bytes_budget, routine_size_budget_ms);
-    let broker = Broker::open(tmp.path()).unwrap();
+    let broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     (tmp, broker)
 }
 

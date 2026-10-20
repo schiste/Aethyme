@@ -64,6 +64,164 @@ fn setup_with_cap(cap: i64) -> (Fixture, ControllerOwner, RecordId) {
     authorize_objective(&mut f.store, &owner, units(cap)).unwrap();
     (f, owner, wave.id)
 }
+
+#[test]
+fn generic_reserve_refuses_resolution_without_ledger_mutation() {
+    let (mut f, owner, wave) = setup();
+    let before: (i64, i64) = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT
+                 (SELECT count(*) FROM local_budget_reservations),
+                 (SELECT count(*) FROM resolution_attempts)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    let error = reserve(
+        &mut f.store,
+        &owner,
+        &wave,
+        request('a', 3, WorkKind::Resolution),
+        0,
+    )
+    .unwrap_err();
+    assert!(matches!(error, BudgetError::ResolutionRoute));
+
+    let after: (i64, i64) = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT
+                 (SELECT count(*) FROM local_budget_reservations),
+                 (SELECT count(*) FROM resolution_attempts)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(charged(&f.store, &owner).unwrap(), Units::default());
+}
+
+#[test]
+fn generic_resolution_mutators_refuse_without_changing_pending_reservation() {
+    let (mut f, owner, wave_id) = setup();
+    let current_wave = wave::load(&f.store, &wave_id).unwrap();
+    let (project_id, _) = project(f.store.read_connection(), owner.issuer()).unwrap();
+    let (objective_id, _) = objective(
+        f.store.read_connection(),
+        owner.issuer(),
+        &current_wave.spec.objective_authorization,
+        &project_id,
+    )
+    .unwrap();
+    let mut resolution_request = request('a', 3, WorkKind::Resolution);
+    resolution_request.max_attempts = 1;
+    let spec = ReservationSpec {
+        issuer: owner.issuer().into(),
+        target: owner.target().into(),
+        revision: current_wave.spec.revision,
+        wave: wave_id.to_string(),
+        objective: current_wave.spec.objective_authorization.clone(),
+        project_policy: project_id.to_string(),
+        objective_policy: objective_id.to_string(),
+        request: resolution_request,
+        parent: None,
+    };
+    let reservation_record = record(&spec).unwrap();
+    let reservation_id = reservation_record.id();
+    insert(
+        f.store.connection(),
+        &reservation_record,
+        &spec,
+        &reservation_id,
+    )
+    .unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_budget_reservations
+             SET phase='completion_pending',attempts=1,version=1
+             WHERE reservation=?1",
+            [reservation_id.as_str()],
+        )
+        .unwrap();
+
+    let attempt = Attempt {
+        reservation: reservation_id.clone(),
+        version: 1,
+        number: 1,
+        remaining: units(3),
+        epoch: owner.authority_epoch().clone(),
+        project_dir: f.store.project_dir().to_owned(),
+    };
+    let before: (String, i64, i64, i64) = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT phase,version,attempts,
+                    (SELECT count(*) FROM local_budget_receipts WHERE reservation=?1)
+             FROM local_budget_reservations WHERE reservation=?1",
+            [reservation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+
+    let generic_attempt = begin_attempt(&mut f.store, &owner, &reservation_id, 0);
+    assert!(
+        matches!(&generic_attempt, Err(BudgetError::ResolutionRoute)),
+        "generic resolution attempt returned an unexpected error: {generic_attempt:?}"
+    );
+    let generic_settle = settle(&mut f.store, &owner, &attempt, units(1), &receipt());
+    assert!(
+        matches!(&generic_settle, Err(BudgetError::ResolutionRoute)),
+        "generic settlement returned an unexpected error: {generic_settle:?}"
+    );
+    let generic_reconcile = reconcile(
+        &mut f.store,
+        &owner,
+        &reservation_id,
+        1,
+        units(1),
+        &receipt(),
+    );
+    assert!(
+        matches!(&generic_reconcile, Err(BudgetError::ResolutionRoute)),
+        "generic reconciliation returned an unexpected error: {generic_reconcile:?}"
+    );
+    let generic_close = close(&mut f.store, &owner, &reservation_id, 1);
+    assert!(
+        matches!(&generic_close, Err(BudgetError::ResolutionRoute)),
+        "generic close returned an unexpected error: {generic_close:?}"
+    );
+    let generic_delegate = delegate(
+        &mut f.store,
+        &owner,
+        &reservation_id,
+        request('b', 1, WorkKind::Composition),
+        0,
+    );
+    assert!(
+        matches!(&generic_delegate, Err(BudgetError::ResolutionRoute)),
+        "generic delegate returned an unexpected error: {generic_delegate:?}"
+    );
+
+    let after: (String, i64, i64, i64) = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT phase,version,attempts,
+                    (SELECT count(*) FROM local_budget_receipts WHERE reservation=?1)
+             FROM local_budget_reservations WHERE reservation=?1",
+            [reservation_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before);
+}
+
 fn receipt() -> RecordId {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x10000);
     let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

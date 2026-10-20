@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,6 +24,8 @@ use crate::composition::{
 };
 use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::resolution::{self, FailedCheck, RequirementRef};
+
+pub(crate) mod prior_completion;
 
 #[cfg(test)]
 struct SynthesizedAttachGuardCallback(Box<dyn FnMut(&CollaborationStore)>);
@@ -80,6 +82,9 @@ fn check_synthesized_attach_guards(store: &CollaborationStore) {
 const COMPOSITION_SOURCE_SCHEMA_NAME: &str = "aethyme.local-composition-source/experimental-v0";
 const COMPOSITION_SOURCE_MAX_BYTES: usize = 1 << 20;
 const ACCEPTED_BASELINE_TEXT_PROFILE: &str = "aethyme.compose.git-merge-file/accepted-baseline-v0";
+const CONFLICT_PLAN_SCHEMA_NAME: &str = "aethyme.local-conflict-plan/experimental-v0";
+const CONFLICT_SOURCE_SCHEMA_NAME: &str = "aethyme.local-conflict-source/experimental-v0";
+const CONFLICT_SOURCE_MAX_BYTES: usize = 4 << 20;
 
 const SCHEMA_NAME: &str = "aethyme.local-wave/provisional-v0";
 static SCHEMA: RecordSchema = RecordSchema {
@@ -134,6 +139,128 @@ static COMPOSITION_SOURCE_SCHEMA: RecordSchema = RecordSchema {
         },
         FieldSpec {
             name: "requirements",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+    ],
+    capabilities: &[],
+};
+
+static CONFLICT_PLAN_SCHEMA: RecordSchema = RecordSchema {
+    name: CONFLICT_PLAN_SCHEMA_NAME,
+    fields: &[
+        FieldSpec {
+            name: "version",
+            required: true,
+            kind: FieldKind::Integer,
+            capability: None,
+        },
+        FieldSpec {
+            name: "wave",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "revision",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "profile",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "engine",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "policy",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "request",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "selected",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "prior_completion",
+            required: false,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "order",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "conflicts",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "requirements",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "usage",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+    ],
+    capabilities: &[],
+};
+
+static CONFLICT_SOURCE_SCHEMA: RecordSchema = RecordSchema {
+    name: CONFLICT_SOURCE_SCHEMA_NAME,
+    fields: &[
+        FieldSpec {
+            name: "version",
+            required: true,
+            kind: FieldKind::Integer,
+            capability: None,
+        },
+        FieldSpec {
+            name: "wave",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "revision",
+            required: true,
+            kind: FieldKind::String,
+            capability: None,
+        },
+        FieldSpec {
+            name: "request",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "plan",
             required: true,
             kind: FieldKind::Opaque,
             capability: None,
@@ -244,6 +371,80 @@ pub struct Wave {
     pub drift_count: u32,
 }
 
+/// Exact immutable records that make a conflict request eligible for local
+/// synthesized resolution. `source` is the wave-linked wrapper, and `plan`
+/// is the canonical full-order composition source it binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentConflictRequestBinding {
+    pub(crate) request: resolution::RecordRef,
+    pub(crate) source: resolution::RecordRef,
+    pub(crate) plan: resolution::RecordRef,
+    pub(crate) plan_payload: ConflictPlanPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConflictPlanPayload {
+    #[serde(rename = "schema")]
+    pub(crate) schema_name: String,
+    pub(crate) version: u32,
+    pub(crate) wave: String,
+    pub(crate) revision: String,
+    pub(crate) profile: String,
+    pub(crate) engine: ConflictEnginePayload,
+    pub(crate) policy: WavePolicy,
+    pub(crate) request: CompositionRequestPayload,
+    pub(crate) selected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prior_completion: Option<String>,
+    pub(crate) order: Vec<ConflictOrderPayload>,
+    pub(crate) conflicts: Vec<ConflictPayload>,
+    pub(crate) requirements: Vec<RequirementPayload>,
+    pub(crate) usage: BudgetUsagePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConflictEnginePayload {
+    pub(crate) engine: String,
+    pub(crate) version: String,
+    pub(crate) diff: String,
+    pub(crate) move_window: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConflictOrderPayload {
+    pub(crate) id: String,
+    pub(crate) lineage: String,
+    pub(crate) base_commit: String,
+    pub(crate) result_commit: String,
+    pub(crate) base_snapshot: String,
+    pub(crate) result_snapshot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConflictPayload {
+    pub(crate) path: String,
+    pub(crate) input: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictSourcePayload {
+    #[serde(rename = "schema")]
+    schema_name: String,
+    version: u32,
+    wave: String,
+    revision: String,
+    request: RecordRefPayload,
+    plan: RecordRefPayload,
+}
+
 /// Exact lineage and candidate provenance carried into each synthesized
 /// native-gate Spec. These are source bindings only and confer no trust.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +487,273 @@ const SYNTHESIZED_GROUP_PROVENANCE_SCHEMA: &str =
 /// prove that it contains every selected lineage exactly once. Conflict
 /// requests that only contain an applied prefix remain unattached until a
 /// separate full-tail recomposition exists.
+fn recipe_json_for_wave(
+    store: &CollaborationStore,
+    wave: &Wave,
+) -> Result<Option<serde_json::Value>, WaveError> {
+    let Some(object) = wave.recipe_object else {
+        return Ok(None);
+    };
+    let bytes = archive::read_object_bounded(store, &object, COMPOSITION_SOURCE_MAX_BYTES)?;
+    let record = Record::decode(&bytes, &[&composer::COMPOSITION_RECIPE_SCHEMA])
+        .map_err(|error| WaveError::Invalid(format!("composition recipe: {error}")))?;
+    if record.canonical_bytes() != bytes {
+        return Err(WaveError::Invalid("composition recipe digest".into()));
+    }
+    let recipe = composer::read_recipe(
+        store,
+        &composer::RecipeRef {
+            id: record.id(),
+            object,
+        },
+    )?;
+    let value = serde_json::from_slice(&recipe.canonical_bytes())?;
+    Ok(Some(value))
+}
+
+fn seeded_recipe_record_ref(
+    seeded: &serde_json::Value,
+    field: &str,
+) -> Result<resolution::RecordRef, WaveError> {
+    let reference = seeded
+        .get(field)
+        .ok_or_else(|| WaveError::Invalid(format!("seeded recipe {field} reference")))?;
+    let id_text = reference["record_id"]
+        .as_str()
+        .ok_or_else(|| WaveError::Invalid(format!("seeded recipe {field} record id")))?;
+    let object_text = reference["object_sha256"]
+        .as_str()
+        .ok_or_else(|| WaveError::Invalid(format!("seeded recipe {field} object digest")))?;
+    let id = id(id_text)?;
+    let object = object(object_text)?;
+    if id.as_str() != id_text || object.hex() != object_text {
+        return Err(WaveError::Invalid(format!(
+            "seeded recipe {field} reference encoding"
+        )));
+    }
+    Ok(resolution::RecordRef { id, object })
+}
+
+fn seeded_conflict_binding_for_wave(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    wave: &Wave,
+    request_ref: &resolution::RecordRef,
+    result_ref: &resolution::RecordRef,
+    synthesis: &resolution::UnverifiedSynthesis,
+    recipe: Option<&serde_json::Value>,
+) -> Result<Option<CurrentConflictRequestBinding>, WaveError> {
+    let Some(seeded) = recipe.and_then(|recipe| recipe.get("seeded_conflict")) else {
+        return Ok(None);
+    };
+    if wave.phase != WavePhase::Verifying
+        || wave.resolution_result.as_ref() != Some(result_ref)
+        || wave.composition_source.is_none()
+    {
+        return Err(WaveError::Invalid(
+            "seeded recipe is not attached to a verifying result wave".into(),
+        ));
+    }
+    let original_request = seeded_recipe_record_ref(seeded, "resolution_request")?;
+    let original_source = seeded_recipe_record_ref(seeded, "composition_source")?;
+    if original_request != *request_ref {
+        return Err(WaveError::Invalid(
+            "seeded recipe request differs from the wave request".into(),
+        ));
+    }
+    let binding =
+        read_retained_conflict_request_binding(store, repo, &original_request, &original_source)?;
+    if binding.plan_payload.wave != wave.id.as_str()
+        || binding.plan_payload.revision != wave.spec.revision
+        || binding.plan_payload.selected != wave.spec.selected
+        || wave
+            .candidate_snapshot
+            .as_ref()
+            .map(SourceSnapshotId::as_str)
+            != recipe.and_then(|recipe| recipe["candidate"].as_str())
+        || wave.candidate_commit.as_ref().map(CommitOid::as_str)
+            != recipe.and_then(|recipe| recipe["candidate_commit"].as_str())
+        || recipe.and_then(|recipe| recipe["profile"].as_str())
+            != Some(composer::PROVISIONAL_TEXT_PROFILE)
+    {
+        return Err(WaveError::Invalid(
+            "seeded recipe candidate or frozen selection differs from the current wave".into(),
+        ));
+    }
+    let expected = composer::expected_seeded_conflict_metadata(
+        &binding,
+        result_ref,
+        &synthesis.request,
+        &synthesis.candidate,
+        &synthesis.input_manifest.sha256,
+    );
+    let expected: serde_json::Value = serde_json::from_slice(&expected.to_canonical_bytes())?;
+    if seeded != &expected {
+        return Err(WaveError::Invalid(
+            "seeded recipe does not match its exact request, result, prefix and suffix".into(),
+        ));
+    }
+    Ok(Some(binding))
+}
+
+fn conflict_group_member_matches(
+    member: &resolution::GroupMember,
+    entry: &ConflictOrderPayload,
+) -> bool {
+    member.id == entry.id
+        && member.lineage.as_str() == entry.lineage
+        && member.base.as_str() == entry.base_snapshot
+        && member.result.as_str() == entry.result_snapshot
+        && member.base_commit.as_str() == entry.base_commit
+        && member.result_commit.as_str() == entry.result_commit
+}
+
+fn validate_seeded_synthesis_prefix(
+    wave: &Wave,
+    binding: &CurrentConflictRequestBinding,
+    result_ref: &resolution::RecordRef,
+    synthesis: &resolution::UnverifiedSynthesis,
+) -> Result<(), WaveError> {
+    let order = &binding.plan_payload.order;
+    let request = &synthesis.request;
+    let prefix_len = request
+        .contents()
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| WaveError::Invalid("synthesized prefix length overflow".into()))?;
+    if prefix_len >= order.len()
+        || binding.plan_payload.prior_completion.is_some()
+        || !binding.plan_payload.request.accepted.is_empty()
+        || binding.plan_payload.selected != wave.spec.selected
+        || synthesis.request.record() != &binding.request
+        || synthesis.status.request != binding.request
+        || synthesis.group_record != *result_ref
+        || synthesis.status.result.as_ref() != Some(result_ref)
+        || synthesis.status.input_manifest_sha256 != synthesis.input_manifest.sha256
+        || synthesis.request.baseline().snapshot_id.as_str() != wave.spec.baseline
+        || synthesis.request.baseline().commit.as_str() != binding.plan_payload.request.baseline
+    {
+        return Err(WaveError::Invalid(
+            "seeded resolver result does not match the frozen middle-conflict request".into(),
+        ));
+    }
+    for (index, member) in request.contents().iter().enumerate() {
+        if !order
+            .get(index)
+            .is_some_and(|entry| conflict_group_member_matches(member, entry))
+        {
+            return Err(WaveError::Invalid(
+                "seeded resolver contents are not the exact frozen prefix".into(),
+            ));
+        }
+    }
+    let mut includes_conflict_step = false;
+    let mut request_ids = BTreeMap::new();
+    let mut candidate_inputs = request
+        .contents()
+        .iter()
+        .map(|member| CandidateInput {
+            base: member.base_commit.clone(),
+            result: member.result_commit.clone(),
+            base_snapshot: Some(member.base.clone()),
+            result_snapshot: Some(member.result.clone()),
+        })
+        .collect::<Vec<_>>();
+    let mut input_lineages = request
+        .contents()
+        .iter()
+        .map(|member| member.lineage.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    for member in request.members() {
+        let Some((index, entry)) = order
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.id == member.id)
+        else {
+            return Err(WaveError::Invalid(
+                "seeded resolver member is outside the frozen selected order".into(),
+            ));
+        };
+        if index >= prefix_len || !conflict_group_member_matches(member, entry) {
+            return Err(WaveError::Invalid(
+                "seeded resolver member differs from its frozen prefix source".into(),
+            ));
+        }
+        includes_conflict_step |= index == prefix_len - 1;
+        if !input_lineages.insert(member.lineage.as_str().to_owned()) {
+            continue;
+        }
+        candidate_inputs.push(CandidateInput {
+            base: member.base_commit.clone(),
+            result: member.result_commit.clone(),
+            base_snapshot: Some(member.base.clone()),
+            result_snapshot: Some(member.result.clone()),
+        });
+    }
+    if !includes_conflict_step {
+        return Err(WaveError::Invalid(
+            "seeded resolver members omit the conflicting prefix contribution".into(),
+        ));
+    }
+    let resolution::Trigger::Conflict(conflicts) = request.trigger() else {
+        return Err(WaveError::Invalid(
+            "seeded result is not bound to a conflict trigger".into(),
+        ));
+    };
+    if conflicts.len() != binding.plan_payload.conflicts.len()
+        || conflicts
+            .iter()
+            .zip(&binding.plan_payload.conflicts)
+            .any(|(actual, frozen)| {
+                actual.path != frozen.path
+                    || actual.input.as_str() != frozen.input
+                    || actual.reason != frozen.reason
+            })
+    {
+        return Err(WaveError::Invalid(
+            "seeded resolver conflicts differ from the frozen request".into(),
+        ));
+    }
+    if synthesis.candidate.inputs != candidate_inputs {
+        return Err(WaveError::Invalid(
+            "seed candidate inputs do not equal the exact frozen prefix".into(),
+        ));
+    }
+    let mut decision_ids = BTreeSet::new();
+    for member in request.decision_members() {
+        let Some(entry) = order.iter().find(|entry| entry.id == member.id) else {
+            return Err(WaveError::Invalid(
+                "seeded decision member is outside the frozen selected order".into(),
+            ));
+        };
+        if !conflict_group_member_matches(member, entry) || !decision_ids.insert(member.id.as_str())
+        {
+            return Err(WaveError::Invalid(
+                "seeded decision members differ from the frozen source".into(),
+            ));
+        }
+    }
+    for entry in order.iter().take(prefix_len) {
+        if request_ids
+            .insert(entry.id.clone(), entry.lineage.clone())
+            .is_some()
+        {
+            return Err(WaveError::Invalid(
+                "frozen seeded prefix repeats an id".into(),
+            ));
+        }
+    }
+    if input_lineages != request_ids.values().cloned().collect::<BTreeSet<_>>() {
+        return Err(WaveError::Invalid(
+            "seeded resolver inputs do not cover the exact frozen prefix".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Re-read an attached result through the exact settled ledger binding and
+/// prove either full selected coverage (direct attachment) or the exact
+/// frozen prefix and recipe binding (suffix continuation).
 pub(crate) fn read_synthesized_wave_result(
     store: &mut CollaborationStore,
     repo: &Path,
@@ -302,9 +770,11 @@ pub(crate) fn read_synthesized_wave_result(
             "synthesized result requires an exact request/result pair".into(),
         ));
     };
-    if wave.phase != WavePhase::Verifying || wave.spec.prior_completion.is_some() {
+    if wave.phase != WavePhase::Verifying {
         return Err(WaveError::ResolutionUnsupported);
     }
+    let pinned = target::load_revision(store, &id(&wave.spec.revision)?)?;
+    let prior = prior_completion::load_retained(store, wave, &pinned)?;
     let synthesis =
         resolution::read_synthesized_attempt_result_for_refs(store, repo, request_ref, result_ref)?;
     if synthesis.status.request != *request_ref
@@ -318,7 +788,46 @@ pub(crate) fn read_synthesized_wave_result(
         || synthesis.candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
         || synthesis.candidate.baseline != synthesis.request.baseline().commit
         || synthesis.request.baseline().snapshot_id.as_str() != wave.spec.baseline
-        || wave.candidate_snapshot.as_ref() != Some(&synthesis.candidate.subject)
+        || prior.as_ref().is_some_and(|binding| {
+            binding
+                .validate_request_baseline(&synthesis.request, wave)
+                .is_err()
+        })
+    {
+        return Err(WaveError::Invalid(
+            "synthesized group differs from the current request or candidate contract".into(),
+        ));
+    }
+    let recipe = recipe_json_for_wave(store, wave)?;
+    let seeded_binding = seeded_conflict_binding_for_wave(
+        store,
+        repo,
+        wave,
+        request_ref,
+        result_ref,
+        &synthesis,
+        recipe.as_ref(),
+    )?;
+    if let Some(binding) = &seeded_binding {
+        if synthesis.candidate.subject.as_str()
+            == wave
+                .candidate_snapshot
+                .as_ref()
+                .map(SourceSnapshotId::as_str)
+                .unwrap_or_default()
+            && synthesis.candidate.commit.as_str()
+                == wave
+                    .candidate_commit
+                    .as_ref()
+                    .map(CommitOid::as_str)
+                    .unwrap_or_default()
+        {
+            return Err(WaveError::Invalid(
+                "seed candidate was relabeled as the complete suffix candidate".into(),
+            ));
+        }
+        validate_seeded_synthesis_prefix(wave, binding, result_ref, &synthesis)?;
+    } else if wave.candidate_snapshot.as_ref() != Some(&synthesis.candidate.subject)
         || wave.candidate_commit.as_ref() != Some(&synthesis.candidate.commit)
     {
         return Err(WaveError::Invalid(
@@ -326,12 +835,12 @@ pub(crate) fn read_synthesized_wave_result(
         ));
     }
 
-    let revision = target::load_revision(store, &id(&wave.spec.revision)?)?;
+    let revision = pinned;
     if revision.target != wave.spec.target || revision.issuer != wave.spec.issuer {
         return Err(WaveError::Stale);
     }
     let mut selected = BTreeMap::new();
-    let mut selected_lineages = std::collections::BTreeSet::new();
+    let mut selected_lineages = BTreeSet::new();
     for selected_id in &wave.spec.selected {
         let contribution = revision
             .spec
@@ -369,24 +878,43 @@ pub(crate) fn read_synthesized_wave_result(
         }
         request_members.insert(lineage, member);
     }
-    if request_members
-        .keys()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>()
-        != selected_lineages
+    let expected_lineages = if let Some(binding) = &seeded_binding {
+        let prefix_len = synthesis.request.contents().len() + 1;
+        binding
+            .plan_payload
+            .order
+            .iter()
+            .take(prefix_len)
+            .map(|entry| entry.lineage.clone())
+            .collect::<BTreeSet<_>>()
+    } else {
+        selected_lineages.clone()
+    };
+    if request_members.keys().cloned().collect::<BTreeSet<_>>() != expected_lineages
+        || !expected_lineages.is_subset(&selected_lineages)
     {
         return Err(WaveError::Invalid(
-            "synthesized inputs do not cover the complete selected wave".into(),
+            "synthesized inputs do not cover the exact authorized resolver group".into(),
         ));
     }
 
-    let expected_inputs = selected
+    let selected_for_result = selected
+        .iter()
+        .filter(|(_, lineage)| expected_lineages.contains(*lineage))
+        .map(|(selected_id, lineage)| (selected_id.clone(), lineage.clone()))
+        .collect::<Vec<_>>();
+    if selected_for_result.len() != expected_lineages.len() {
+        return Err(WaveError::Invalid(
+            "synthesized input selection has duplicate or missing lineages".into(),
+        ));
+    }
+    let mut expected_inputs = selected_for_result
         .iter()
         .map(|(selected_id, lineage)| {
             let member = request_members.get(lineage).ok_or_else(|| {
-                WaveError::Invalid("selected input is absent from request".into())
+                WaveError::Invalid("selected synthesized input is absent from request".into())
             })?;
-            if member.id != *selected_id {
+            if member.id.as_str() != selected_id {
                 return Err(WaveError::Invalid(
                     "request input id does not match the selected contribution".into(),
                 ));
@@ -439,7 +967,6 @@ pub(crate) fn read_synthesized_wave_result(
             ))
         })
         .collect::<Result<Vec<_>, WaveError>>()?;
-    let mut expected_inputs = expected_inputs;
     actual_inputs.sort();
     expected_inputs.sort();
     if actual_inputs != expected_inputs {
@@ -447,8 +974,7 @@ pub(crate) fn read_synthesized_wave_result(
             "synthesized candidate inputs differ from the selected lineages".into(),
         ));
     }
-
-    let inputs = selected
+    let inputs = selected_for_result
         .iter()
         .map(|(selected_id, lineage)| {
             let member = request_members[lineage];
@@ -565,37 +1091,37 @@ struct CompositionSourcePayload {
     requirements: Vec<RequirementPayload>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CompositionRequestPayload {
-    baseline: String,
-    accepted: Vec<String>,
-    catalog: Vec<ContributionPayload>,
-    deliveries: Vec<String>,
-    budget: CompositionBudgetPayload,
+pub(crate) struct CompositionRequestPayload {
+    pub(crate) baseline: String,
+    pub(crate) accepted: Vec<String>,
+    pub(crate) catalog: Vec<ContributionPayload>,
+    pub(crate) deliveries: Vec<String>,
+    pub(crate) budget: CompositionBudgetPayload,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ContributionPayload {
-    id: String,
+pub(crate) struct ContributionPayload {
+    pub(crate) id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    lineage: Option<String>,
-    requires: Vec<String>,
+    pub(crate) lineage: Option<String>,
+    pub(crate) requires: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    atomic_group: Option<String>,
+    pub(crate) atomic_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    revision_of: Option<String>,
-    derived_from: Vec<String>,
+    pub(crate) revision_of: Option<String>,
+    pub(crate) derived_from: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CompositionBudgetPayload {
-    max_contributions: usize,
-    max_paths: usize,
-    max_bytes: String,
-    max_merges: usize,
+pub(crate) struct CompositionBudgetPayload {
+    pub(crate) max_contributions: usize,
+    pub(crate) max_paths: usize,
+    pub(crate) max_bytes: String,
+    pub(crate) max_merges: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,21 +1166,21 @@ struct RecordRefPayload {
     object: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BudgetUsagePayload {
-    contributions: usize,
-    paths: usize,
-    bytes: String,
-    merges: usize,
+pub(crate) struct BudgetUsagePayload {
+    pub(crate) contributions: usize,
+    pub(crate) paths: usize,
+    pub(crate) bytes: String,
+    pub(crate) merges: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RequirementPayload {
-    id: String,
+pub(crate) struct RequirementPayload {
+    pub(crate) id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
+    pub(crate) path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1040,6 +1566,192 @@ fn write_source_record(
     })
 }
 
+fn composition_request_payload(request: &CompositionRequest) -> CompositionRequestPayload {
+    CompositionRequestPayload {
+        baseline: request.baseline.as_str().to_owned(),
+        accepted: request
+            .accepted
+            .iter()
+            .map(|commit| commit.as_str().to_owned())
+            .collect(),
+        catalog: request
+            .catalog
+            .iter()
+            .map(|item| ContributionPayload {
+                id: item.id.clone(),
+                lineage: item.lineage.as_ref().map(ToString::to_string),
+                requires: item.requires.clone(),
+                atomic_group: item.atomic_group.clone(),
+                revision_of: item.revision_of.clone(),
+                derived_from: item.derived_from.clone(),
+            })
+            .collect(),
+        deliveries: request.deliveries.clone(),
+        budget: CompositionBudgetPayload {
+            max_contributions: request.budget.max_contributions,
+            max_paths: request.budget.max_paths,
+            max_bytes: request.budget.max_bytes.to_string(),
+            max_merges: request.budget.max_merges,
+        },
+    }
+}
+
+fn write_conflict_plan_record(
+    store: &CollaborationStore,
+    wave: &Wave,
+    request: &CompositionRequest,
+    composition: &Composition,
+    requirements: &[RequirementRef],
+    revisions: Option<&BTreeMap<String, RecordId>>,
+    pins: &composer::ProvisionalTextProfilePins,
+) -> Result<resolution::RecordRef, WaveError> {
+    let CompositionOutcome::Conflict {
+        baseline,
+        conflicts,
+    } = &composition.outcome
+    else {
+        return Err(WaveError::Invalid(
+            "conflict source requires a conflict composition".into(),
+        ));
+    };
+    if *baseline != request.baseline
+        || request.deliveries != wave.spec.selected
+        || request.deliveries.len() != composition.order.len()
+        || composition.order.len() != wave.spec.selected.len()
+        || conflicts.is_empty()
+        || pins.profile != composer::PROVISIONAL_TEXT_PROFILE
+    {
+        return Err(WaveError::Invalid(
+            "conflict source does not match the frozen wave".into(),
+        ));
+    }
+    let selected: BTreeSet<&str> = wave.spec.selected.iter().map(String::as_str).collect();
+    let ordered: BTreeSet<&str> = composition.order.iter().map(String::as_str).collect();
+    if selected.len() != wave.spec.selected.len()
+        || ordered.len() != composition.order.len()
+        || selected != ordered
+    {
+        return Err(WaveError::Invalid(
+            "conflict source order is not the complete selected set".into(),
+        ));
+    }
+    let mut catalog = BTreeMap::new();
+    for item in &request.catalog {
+        if catalog.insert(item.id.as_str(), item).is_some() {
+            return Err(WaveError::Invalid(
+                "conflict source catalog repeats a contribution".into(),
+            ));
+        }
+    }
+    let order = composition
+        .order
+        .iter()
+        .map(|contribution_id| {
+            let contribution = catalog.get(contribution_id.as_str()).ok_or_else(|| {
+                WaveError::Invalid("conflict source order has an unknown contribution".into())
+            })?;
+            let lineage = contribution
+                .lineage
+                .as_ref()
+                .ok_or_else(|| WaveError::Invalid("conflict source lineage is missing".into()))?;
+            let retained =
+                archive::retained_contribution(store, lineage)?.ok_or(TargetError::Missing)?;
+            Ok(ConflictOrderPayload {
+                id: contribution_id.clone(),
+                lineage: lineage.to_string(),
+                base_commit: retained.base.commit.as_str().to_owned(),
+                result_commit: retained.result.commit.as_str().to_owned(),
+                base_snapshot: retained.base.snapshot_id.to_string(),
+                result_snapshot: retained.result.snapshot_id.to_string(),
+                revision: revisions
+                    .and_then(|revisions| revisions.get(contribution_id))
+                    .map(ToString::to_string),
+            })
+        })
+        .collect::<Result<Vec<_>, WaveError>>()?;
+    let payload = ConflictPlanPayload {
+        schema_name: CONFLICT_PLAN_SCHEMA_NAME.into(),
+        version: 1,
+        wave: wave.id.to_string(),
+        revision: wave.spec.revision.clone(),
+        profile: pins.profile.clone(),
+        engine: ConflictEnginePayload {
+            engine: pins.engine.clone(),
+            version: pins.version.clone(),
+            diff: pins.diff.clone(),
+            move_window: pins.move_window,
+        },
+        policy: wave.spec.policy,
+        request: composition_request_payload(request),
+        selected: wave.spec.selected.clone(),
+        prior_completion: wave.spec.prior_completion.clone(),
+        order,
+        conflicts: conflicts
+            .iter()
+            .map(|conflict| ConflictPayload {
+                path: conflict.path.clone(),
+                input: conflict.input.as_str().to_owned(),
+                reason: conflict.reason.code().to_owned(),
+            })
+            .collect(),
+        requirements: requirement_payloads(requirements),
+        usage: BudgetUsagePayload {
+            contributions: composition.usage.contributions,
+            paths: composition.usage.paths,
+            bytes: composition.usage.bytes.to_string(),
+            merges: composition.usage.merges,
+        },
+    };
+    let bytes = serde_json::to_vec(&payload)?;
+    if bytes.len() > CONFLICT_SOURCE_MAX_BYTES {
+        return Err(WaveError::Invalid(
+            "conflict plan record exceeds its byte limit".into(),
+        ));
+    }
+    let record = Record::decode(&bytes, &[&CONFLICT_PLAN_SCHEMA])
+        .map_err(|error| WaveError::Invalid(format!("conflict plan record: {error}")))?;
+    let object = archive::put_object(store, &record.canonical_bytes())?;
+    Ok(resolution::RecordRef {
+        id: record.id(),
+        object,
+    })
+}
+
+fn write_conflict_source_record(
+    store: &CollaborationStore,
+    wave: &Wave,
+    request: &resolution::RecordRef,
+    plan: &resolution::RecordRef,
+) -> Result<resolution::RecordRef, WaveError> {
+    let payload = ConflictSourcePayload {
+        schema_name: CONFLICT_SOURCE_SCHEMA_NAME.into(),
+        version: 1,
+        wave: wave.id.to_string(),
+        revision: wave.spec.revision.clone(),
+        request: RecordRefPayload {
+            id: request.id.to_string(),
+            object: request.object.hex(),
+        },
+        plan: RecordRefPayload {
+            id: plan.id.to_string(),
+            object: plan.object.hex(),
+        },
+    };
+    let bytes = serde_json::to_vec(&payload)?;
+    if bytes.len() > CONFLICT_SOURCE_MAX_BYTES {
+        return Err(WaveError::Invalid(
+            "conflict source record exceeds its byte limit".into(),
+        ));
+    }
+    let record = Record::decode(&bytes, &[&CONFLICT_SOURCE_SCHEMA])
+        .map_err(|error| WaveError::Invalid(format!("conflict source record: {error}")))?;
+    let object = archive::put_object(store, &record.canonical_bytes())?;
+    Ok(resolution::RecordRef {
+        id: record.id(),
+        object,
+    })
+}
+
 fn request_from_payload(
     payload: &CompositionRequestPayload,
 ) -> Result<CompositionRequest, WaveError> {
@@ -1100,12 +1812,20 @@ fn source_from_payload(
             composer::PROVISIONAL_TEXT_PROFILE | ACCEPTED_BASELINE_TEXT_PROFILE
         )
         || payload.composition.candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
-        || payload.composition.candidate.mode != "text"
+        || !matches!(
+            payload.composition.candidate.mode.as_str(),
+            "text" | "hybrid"
+        )
     {
         return Err(WaveError::Invalid(
             "composition source record version or profile".into(),
         ));
     }
+    let mode = match payload.composition.candidate.mode.as_str() {
+        "text" => CompositionMode::Text,
+        "hybrid" => CompositionMode::Hybrid,
+        _ => unreachable!("validated composition mode"),
+    };
     let request = request_from_payload(&payload.request)?;
     let candidate = Candidate {
         subject: snapshot(&payload.composition.candidate.subject)?,
@@ -1130,7 +1850,7 @@ fn source_from_payload(
         producer: Producer::Composer {
             profile: payload.composition.candidate.producer_profile.clone(),
         },
-        mode: CompositionMode::Text,
+        mode,
     };
     let recipe = composer::RecipeRef {
         id: id(&payload.composition.recipe.id)?,
@@ -1167,36 +1887,21 @@ fn source_from_payload(
 }
 
 fn expected_composition_request(
-    store: &CollaborationStore,
-    owner: &ControllerOwner,
+    store: &mut CollaborationStore,
+    repo: &Path,
     wave: &Wave,
     pinned: &target::TargetRevision,
+    prior: Option<&prior_completion::Binding>,
 ) -> Result<CompositionRequest, WaveError> {
     let baseline =
         archive::retained(store, &snapshot(&wave.spec.baseline)?)?.ok_or(TargetError::Missing)?;
-    let (base_commit, accepted) = if let Some(key) = &wave.spec.prior_completion {
-        let (completion, previous) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
-        if completion.target != owner.target()
-            || completion.epoch != owner.authority_epoch().as_str()
-        {
-            return Err(WaveError::Stale);
-        }
-        let same_revision = completion.revision == wave.spec.revision;
-        let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
-            .ok_or(TargetError::Missing)?;
-        let accepted = if same_revision {
-            if previous
-                .selected
-                .iter()
-                .any(|member| !wave.spec.selected.contains(member))
-            {
-                return Err(WaveError::Stale);
-            }
-            vec![original.commit]
-        } else {
-            Vec::new()
-        };
-        (CommitOid::parse(&completion.accepted_commit)?, accepted)
+    let (base_commit, accepted) = if let Some(prior) = prior {
+        prior.validate_retained_completion(store)?;
+        prior.validate_git_binding(store, repo)?;
+        (
+            prior.request_baseline_commit().clone(),
+            prior.accepted_history(store, pinned)?,
+        )
     } else {
         (baseline.commit, Vec::new())
     };
@@ -1213,26 +1918,12 @@ fn expected_composition_request(
 }
 
 fn expected_source_provenance(
-    store: &CollaborationStore,
-    owner: &ControllerOwner,
-    wave: &Wave,
+    prior: Option<&prior_completion::Binding>,
 ) -> Result<(&'static str, Option<serde_json::Value>), WaveError> {
-    let Some(key) = &wave.spec.prior_completion else {
+    let Some(prior) = prior else {
         return Ok((composer::PROVISIONAL_TEXT_PROFILE, None));
     };
-    let (completion, previous) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
-    if completion.target != owner.target() || completion.epoch != owner.authority_epoch().as_str() {
-        return Err(WaveError::Stale);
-    }
-    let members = if completion.revision == wave.spec.revision {
-        previous.selected
-    } else {
-        Vec::new()
-    };
-    Ok((
-        ACCEPTED_BASELINE_TEXT_PROFILE,
-        Some(serde_json::json!({"completion": key, "members": members})),
-    ))
+    Ok((prior.producer_profile(), Some(prior.recipe_binding())))
 }
 
 fn prior_completion_recipe_matches(
@@ -1253,7 +1944,7 @@ fn requirement_payloads(requirements: &[RequirementRef]) -> Vec<RequirementPaylo
 }
 
 fn validate_source_context(
-    store: &CollaborationStore,
+    store: &mut CollaborationStore,
     repo: &Path,
     owner: &ControllerOwner,
     wave: &Wave,
@@ -1271,9 +1962,14 @@ fn validate_source_context(
     {
         return Err(WaveError::Stale);
     }
-    let expected = expected_composition_request(store, owner, wave, pinned)?;
+    let prior = prior_completion::load(store, owner, wave, pinned)?;
+    if let Some(prior) = &prior {
+        prior.validate_retained_completion(store)?;
+        prior.validate_git_binding(store, repo)?;
+    }
+    let expected = expected_composition_request(store, repo, wave, pinned, prior.as_ref())?;
     let (expected_producer_profile, expected_prior_completion) =
-        expected_source_provenance(store, owner, wave)?;
+        expected_source_provenance(prior.as_ref())?;
     if source.request.baseline != expected.baseline
         || source.request.accepted != expected.accepted
         || source.request.catalog != expected.catalog
@@ -1317,7 +2013,10 @@ fn validate_source_context(
         || source.record != *wave.composition_source.as_ref().ok_or(WaveError::Stale)?
         || candidate.baseline != source.request.baseline
         || candidate.producer.profile() != expected_producer_profile
-        || candidate.mode != CompositionMode::Text
+        || !matches!(
+            candidate.mode,
+            CompositionMode::Text | CompositionMode::Hybrid
+        )
         || candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
         || archive::raw_commit_tree(repo, &candidate.commit)? != candidate.tree
     {
@@ -1333,6 +2032,37 @@ fn validate_source_context(
     }
     let recipe_record = composer::read_recipe(store, recipe)?;
     let recipe_json: serde_json::Value = serde_json::from_slice(&recipe_record.canonical_bytes())?;
+    let seeded_recipe = recipe_json.get("seeded_conflict").is_some();
+    match (
+        wave.resolution_request.is_some(),
+        wave.resolution_result.is_some(),
+        seeded_recipe,
+        candidate.mode,
+    ) {
+        (false, false, false, CompositionMode::Text)
+            if wave.candidate_snapshot.as_ref() == Some(&candidate.subject)
+                && wave.candidate_commit.as_ref() == Some(&candidate.commit) => {}
+        (true, true, false, CompositionMode::Text) => {}
+        (true, true, true, CompositionMode::Hybrid) => {
+            let (seed, provenance) =
+                read_synthesized_wave_result(store, repo, wave)?.ok_or(WaveError::Stale)?;
+            if seed.candidate.subject == candidate.subject
+                || provenance.candidate_subject != seed.candidate.subject.as_str()
+                || provenance.candidate_commit != seed.candidate.commit.as_str()
+                || wave.candidate_snapshot.as_ref() != Some(&candidate.subject)
+                || wave.candidate_commit.as_ref() != Some(&candidate.commit)
+            {
+                return Err(WaveError::Invalid(
+                    "seeded hybrid candidate differs from the current wave".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(WaveError::Invalid(
+                "composition mode, seed provenance, and wave result do not agree".into(),
+            ));
+        }
+    }
     if !prior_completion_recipe_matches(&recipe_json, expected_prior_completion.as_ref()) {
         return Err(WaveError::Invalid(
             "composition recipe prior completion does not match the wave".into(),
@@ -1483,6 +2213,120 @@ struct RetentionGuards<'a> {
     archive: &'a crate::collaboration_gc::ArchiveUse,
     response: &'a crate::collaboration_sensitive::ResponseUse,
     authority: &'a crate::local_authority::Guard,
+}
+
+struct ConflictRequestRetention {
+    revision: RecordId,
+    snapshots: Vec<SourceSnapshotId>,
+    contributions: Vec<RecordId>,
+    objects: Vec<ObjectDigest>,
+}
+
+struct ConflictRequestRetentionInput<'a> {
+    revision: &'a RecordId,
+    request: &'a resolution::ResolutionRequest,
+    composition_request: &'a CompositionRequest,
+    plan: &'a resolution::RecordRef,
+    source: &'a resolution::RecordRef,
+}
+
+fn prepare_conflict_request_retention(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    input: ConflictRequestRetentionInput<'_>,
+    guards: RetentionGuards<'_>,
+) -> Result<ConflictRequestRetention, WaveError> {
+    let ConflictRequestRetentionInput {
+        revision,
+        request,
+        composition_request,
+        plan,
+        source,
+    } = input;
+    let pinned = target::load_revision_under_response(store, revision, guards.response)?;
+    if pinned.target != owner.target() || pinned.issuer != owner.issuer() {
+        return Err(WaveError::Stale);
+    }
+    let _permit = target::ArtifactRetentionPermit::new(
+        store,
+        owner,
+        guards.archive,
+        guards.response,
+        guards.authority,
+    )?;
+
+    let mut snapshots = BTreeMap::new();
+    let mut add_snapshot = |snapshot: &SourceSnapshotId| {
+        snapshots.insert(snapshot.to_string(), snapshot.clone());
+    };
+    add_snapshot(&request.baseline().snapshot_id);
+    add_snapshot(&request.accumulator().snapshot_id);
+    for member in request
+        .members()
+        .iter()
+        .chain(request.decision_members())
+        .chain(request.contents())
+    {
+        add_snapshot(&member.base);
+        add_snapshot(&member.result);
+    }
+
+    let selected: BTreeSet<&str> = composition_request
+        .deliveries
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if selected.len() != composition_request.deliveries.len() {
+        return Err(WaveError::Invalid(
+            "conflict request repeats a selected contribution".into(),
+        ));
+    }
+    let mut catalog = BTreeMap::new();
+    for contribution in &composition_request.catalog {
+        if catalog
+            .insert(contribution.id.as_str(), contribution)
+            .is_some()
+        {
+            return Err(WaveError::Invalid(
+                "conflict request catalog repeats a contribution".into(),
+            ));
+        }
+    }
+    let mut contributions = BTreeMap::new();
+    for contribution_id in selected {
+        let contribution = catalog.get(contribution_id).ok_or_else(|| {
+            WaveError::Invalid("conflict request selection is missing from its catalog".into())
+        })?;
+        let lineage = contribution
+            .lineage
+            .as_ref()
+            .ok_or_else(|| WaveError::Invalid("conflict request lineage is missing".into()))?;
+        let retained =
+            archive::retained_contribution(store, lineage)?.ok_or(TargetError::Missing)?;
+        add_snapshot(&retained.base.snapshot_id);
+        add_snapshot(&retained.result.snapshot_id);
+        contributions.insert(lineage.to_string(), lineage.clone());
+    }
+
+    let mut objects = BTreeMap::new();
+    for object in [request.record().object, plan.object, source.object] {
+        objects.insert(object.hex(), object);
+    }
+    for snapshot in snapshots.values() {
+        if archive::retained(store, snapshot)?.is_none() {
+            return Err(TargetError::Missing.into());
+        }
+    }
+    for object in objects.values() {
+        archive::read_object(store, object)?;
+    }
+
+    Ok(ConflictRequestRetention {
+        revision: revision.clone(),
+        snapshots: snapshots.into_values().collect(),
+        contributions: contributions.into_values().collect(),
+        objects: objects.into_values().collect(),
+    })
 }
 
 fn retain_composition_source(
@@ -1794,6 +2638,7 @@ pub(crate) fn accepted_completion(
 /// Find the newest canonical accepted completion for this target and exact
 /// epoch. The sequence and record ID ordering make repeated source snapshots
 /// resolve deterministically; the source comparison is still exact.
+#[cfg(test)]
 pub(crate) fn latest_completion_for(
     store: &CollaborationStore,
     target: &str,
@@ -2033,46 +2878,44 @@ pub(crate) fn admit_after_notices(
             }
         }
     }
-    let same_revision_completion = latest_completion_for(
-        store,
-        owner.target(),
-        owner.authority_epoch().as_str(),
-        Some(revision.as_str()),
-        None,
-    )?;
-    let prior_completion = match same_revision_completion {
-        Some(key) => Some(key),
-        None => latest_completion_for(
-            store,
-            owner.target(),
-            owner.authority_epoch().as_str(),
-            None,
-            Some(&pinned.spec.baseline),
-        )?,
-    };
+    let prior_completion = prior_completion::latest_for_admission(store, owner, &pinned)?;
     if let Some(key) = &prior_completion {
         let (completion, previous) = accepted_completion(store, key, i64::MAX)?;
         let same_revision = completion.revision == revision.as_str();
         if completion.target != owner.target()
-            || completion.epoch != owner.authority_epoch().as_str()
             || (!same_revision && completion.source != pinned.spec.baseline)
+            || previous.target != owner.target()
+            || previous.issuer != owner.issuer()
         {
             return Err(WaveError::Stale);
         }
-        let delivered: Vec<_> = dispositions
+        let delivered: BTreeSet<_> = dispositions
             .iter()
             .filter(|(_, d)| **d == target::Disposition::Delivered)
-            .map(|(c, _)| c.clone())
+            .map(|(c, _)| c.as_str())
             .collect();
         if same_revision {
-            if delivered.iter().any(|c| !previous.selected.contains(c))
-                || previous.selected.iter().any(|c| !delivered.contains(c))
+            let prior_members: BTreeSet<_> = previous.selected.iter().map(String::as_str).collect();
+            let catalog_members: BTreeSet<_> = pinned
+                .spec
+                .contributions
+                .iter()
+                .map(|contribution| contribution.id.as_str())
+                .collect();
+            if prior_members.len() != previous.selected.len()
+                || prior_members != delivered
+                || previous
+                    .selected
+                    .iter()
+                    .any(|member| !catalog_members.contains(member.as_str()))
             {
                 return Err(WaveError::Invalid(
                     "delivered members do not match prior accepted wave".into(),
                 ));
             }
-            selected.extend(delivered);
+            let current_members = std::mem::take(&mut selected);
+            selected = previous.selected;
+            selected.extend(current_members);
         } else if !delivered.is_empty() {
             return Err(WaveError::Invalid(
                 "new revision cannot inherit delivered contribution identities".into(),
@@ -2209,6 +3052,25 @@ pub fn require_current_resolution_request(
     let _archive_guard = archive_use(store)?;
     let _response_guard = crate::collaboration_sensitive::response_use(store)?;
     let _authority_guard = target::authorize(store, owner)?;
+    require_current_resolution_request_under_guards(
+        store,
+        repo,
+        owner,
+        wave_id,
+        expected_version,
+        request_ref,
+    )?;
+    Ok(())
+}
+
+fn require_current_resolution_request_under_guards(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &ControllerOwner,
+    wave_id: &RecordId,
+    expected_version: i64,
+    request_ref: &resolution::RecordRef,
+) -> Result<Wave, WaveError> {
     let wave = load(store, wave_id)?;
     let state = target::status(store, owner.target())?;
     let revision = id(&wave.spec.revision)?;
@@ -2281,7 +3143,281 @@ pub fn require_current_resolution_request(
         _ => return Err(WaveError::Stale),
     }
 
-    Ok(())
+    Ok(wave)
+}
+
+/// Read the exact frozen conflict binding while the caller still owns the
+/// current target generation. The full archive → response → authority guard
+/// lifetime covers request, wrapper, and plan decoding.
+pub(crate) fn current_conflict_request_binding(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &ControllerOwner,
+    wave_id: &RecordId,
+    expected_version: i64,
+    request_ref: &resolution::RecordRef,
+) -> Result<CurrentConflictRequestBinding, WaveError> {
+    let _archive_guard = archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let _authority_guard = target::authorize(store, owner)?;
+    let wave = require_current_resolution_request_under_guards(
+        store,
+        repo,
+        owner,
+        wave_id,
+        expected_version,
+        request_ref,
+    )?;
+    if wave.phase != WavePhase::Blocked || wave.spec.prior_completion.is_some() {
+        return Err(WaveError::ResolutionUnsupported);
+    }
+    let source_ref = wave.composition_source.as_ref().ok_or(WaveError::Stale)?;
+    validate_conflict_request_binding_records(store, repo, request_ref, source_ref, Some(&wave))
+}
+
+/// Revalidate a frozen conflict request from its exact immutable references.
+/// This historical reader deliberately does not consult current wave, target,
+/// owner epoch, policy, or reservation state; status-only retry identity is
+/// supplied by the caller's retained proof.
+pub(crate) fn read_retained_conflict_request_binding(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request_ref: &resolution::RecordRef,
+    source_ref: &resolution::RecordRef,
+) -> Result<CurrentConflictRequestBinding, WaveError> {
+    let _archive_guard = archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
+    validate_conflict_request_binding_records(store, repo, request_ref, source_ref, None)
+}
+
+fn validate_conflict_request_binding_records(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request_ref: &resolution::RecordRef,
+    source_ref: &resolution::RecordRef,
+    expected_wave: Option<&Wave>,
+) -> Result<CurrentConflictRequestBinding, WaveError> {
+    let source_bytes =
+        archive::read_object_bounded(store, &source_ref.object, CONFLICT_SOURCE_MAX_BYTES)?;
+    let source_record = Record::decode(&source_bytes, &[&CONFLICT_SOURCE_SCHEMA])
+        .map_err(|error| WaveError::Invalid(format!("conflict source record: {error}")))?;
+    if source_record.id() != source_ref.id || source_record.canonical_bytes() != source_bytes {
+        return Err(WaveError::Invalid("conflict source record digest".into()));
+    }
+    let source_payload: ConflictSourcePayload = serde_json::from_slice(&source_bytes)?;
+    if source_payload.schema_name != CONFLICT_SOURCE_SCHEMA_NAME || source_payload.version != 1 {
+        return Err(WaveError::Invalid("conflict source record version".into()));
+    }
+    let source_wave = id(&source_payload.wave)?;
+    let source_revision = id(&source_payload.revision)?;
+    if source_wave.as_str() != source_payload.wave
+        || source_revision.as_str() != source_payload.revision
+    {
+        return Err(WaveError::Invalid(
+            "conflict source identifier encoding".into(),
+        ));
+    }
+    let bound_request = conflict_record_ref(&source_payload.request)?;
+    let plan_ref = conflict_record_ref(&source_payload.plan)?;
+    if bound_request != *request_ref {
+        return Err(WaveError::Invalid(
+            "conflict source request reference mismatch".into(),
+        ));
+    }
+    if let Some(wave) = expected_wave
+        && (source_payload.wave != wave.id.as_str()
+            || source_payload.revision != wave.spec.revision
+            || wave.resolution_request.as_ref() != Some(request_ref)
+            || wave.composition_source.as_ref() != Some(source_ref)
+            || wave.spec.selected.is_empty())
+    {
+        return Err(WaveError::Stale);
+    }
+
+    let plan_bytes =
+        archive::read_object_bounded(store, &plan_ref.object, CONFLICT_SOURCE_MAX_BYTES)?;
+    let plan_record = Record::decode(&plan_bytes, &[&CONFLICT_PLAN_SCHEMA])
+        .map_err(|error| WaveError::Invalid(format!("conflict plan record: {error}")))?;
+    if plan_record.id() != plan_ref.id || plan_record.canonical_bytes() != plan_bytes {
+        return Err(WaveError::Invalid("conflict plan record digest".into()));
+    }
+    let plan_payload: ConflictPlanPayload = serde_json::from_slice(&plan_bytes)?;
+    if plan_payload.schema_name != CONFLICT_PLAN_SCHEMA_NAME || plan_payload.version != 1 {
+        return Err(WaveError::Invalid("conflict plan record version".into()));
+    }
+    if plan_payload.prior_completion.is_some() || !plan_payload.request.accepted.is_empty() {
+        return Err(WaveError::ResolutionUnsupported);
+    }
+    let _frozen_request = request_from_payload(&plan_payload.request)?;
+    plan_payload.policy.validate()?;
+    if source_payload.wave != plan_payload.wave
+        || source_payload.revision != plan_payload.revision
+        || plan_payload.profile != composer::PROVISIONAL_TEXT_PROFILE
+        || plan_payload.engine.engine != "git merge-file"
+        || plan_payload.engine.version.trim().is_empty()
+        || plan_payload.engine.version.len() > 256
+        || plan_payload.engine.diff.is_empty()
+        || plan_payload.engine.diff.len() > 256
+        || plan_payload.engine.move_window == 0
+    {
+        return Err(WaveError::Invalid("conflict plan source binding".into()));
+    }
+    let plan_wave = id(&plan_payload.wave)?;
+    let plan_revision = id(&plan_payload.revision)?;
+    if plan_wave.as_str() != plan_payload.wave
+        || plan_revision.as_str() != plan_payload.revision
+        || source_wave != plan_wave
+        || source_revision != plan_revision
+    {
+        return Err(WaveError::Invalid(
+            "conflict plan identifier binding".into(),
+        ));
+    }
+    if let Some(wave) = expected_wave
+        && (plan_payload.wave != wave.id.as_str()
+            || plan_payload.revision != wave.spec.revision
+            || plan_payload.selected != wave.spec.selected
+            || plan_payload.policy != wave.spec.policy)
+    {
+        return Err(WaveError::Stale);
+    }
+
+    let selected: BTreeSet<&str> = plan_payload.selected.iter().map(String::as_str).collect();
+    let ordered: BTreeSet<&str> = plan_payload
+        .order
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect();
+    if plan_payload.selected.is_empty()
+        || selected.len() != plan_payload.selected.len()
+        || ordered.len() != plan_payload.order.len()
+        || selected != ordered
+        || plan_payload.request.deliveries != plan_payload.selected
+    {
+        return Err(WaveError::Invalid(
+            "conflict plan is not the complete selected order".into(),
+        ));
+    }
+
+    let mut catalog = BTreeMap::new();
+    for contribution in &plan_payload.request.catalog {
+        if catalog
+            .insert(contribution.id.as_str(), contribution)
+            .is_some()
+        {
+            return Err(WaveError::Invalid(
+                "conflict plan catalog repeats a contribution".into(),
+            ));
+        }
+    }
+    let mut order = BTreeMap::new();
+    let mut lineages = BTreeSet::new();
+    for entry in &plan_payload.order {
+        let contribution = catalog
+            .get(entry.id.as_str())
+            .ok_or_else(|| WaveError::Invalid("conflict plan order has no catalog entry".into()))?;
+        if contribution.lineage.as_deref() != Some(entry.lineage.as_str())
+            || !lineages.insert(entry.lineage.as_str())
+        {
+            return Err(WaveError::Invalid("conflict plan lineage binding".into()));
+        }
+        let lineage = id(&entry.lineage)?;
+        let retained =
+            archive::retained_contribution(store, &lineage)?.ok_or(TargetError::Missing)?;
+        if retained.base.commit.as_str() != entry.base_commit
+            || retained.result.commit.as_str() != entry.result_commit
+            || retained.base.snapshot_id.as_str() != entry.base_snapshot
+            || retained.result.snapshot_id.as_str() != entry.result_snapshot
+        {
+            return Err(WaveError::Invalid(
+                "conflict plan retained lineage changed".into(),
+            ));
+        }
+        order.insert(entry.id.as_str(), entry);
+    }
+
+    let request = resolution::load_request(store, repo, request_ref)?;
+    let resolution::Trigger::Conflict(conflicts) = request.trigger() else {
+        return Err(WaveError::Invalid(
+            "frozen conflict source is not bound to a conflict request".into(),
+        ));
+    };
+    if conflicts.is_empty()
+        || request.baseline().commit.as_str() != plan_payload.request.baseline
+        || request.requirements().len() != plan_payload.requirements.len()
+        || conflicts.len() != plan_payload.conflicts.len()
+    {
+        return Err(WaveError::Invalid("conflict plan request binding".into()));
+    }
+    for (actual, frozen) in conflicts.iter().zip(&plan_payload.conflicts) {
+        if actual.path != frozen.path
+            || actual.input.as_str() != frozen.input
+            || actual.reason != frozen.reason
+            || !plan_payload
+                .order
+                .iter()
+                .any(|entry| entry.result_commit == frozen.input)
+        {
+            return Err(WaveError::Invalid(
+                "conflict plan conflict list changed".into(),
+            ));
+        }
+    }
+    for (actual, frozen) in request
+        .requirements()
+        .iter()
+        .zip(&plan_payload.requirements)
+    {
+        if actual.id != frozen.id || actual.path != frozen.path {
+            return Err(WaveError::Invalid(
+                "conflict plan requirement list changed".into(),
+            ));
+        }
+    }
+    for member in request
+        .decision_members()
+        .iter()
+        .chain(request.members())
+        .chain(request.contents())
+    {
+        let frozen = order.get(member.id.as_str()).ok_or_else(|| {
+            WaveError::Invalid("conflict request member is outside frozen order".into())
+        })?;
+        if member.lineage.as_str() != frozen.lineage
+            || member.base_commit.as_str() != frozen.base_commit
+            || member.result_commit.as_str() != frozen.result_commit
+            || member.base.as_str() != frozen.base_snapshot
+            || member.result.as_str() != frozen.result_snapshot
+        {
+            return Err(WaveError::Invalid(
+                "conflict request member source changed".into(),
+            ));
+        }
+    }
+
+    Ok(CurrentConflictRequestBinding {
+        request: request_ref.clone(),
+        source: source_ref.clone(),
+        plan: plan_ref,
+        plan_payload,
+    })
+}
+
+fn conflict_record_ref(payload: &RecordRefPayload) -> Result<resolution::RecordRef, WaveError> {
+    let id = id(&payload.id)?;
+    if id.as_str() != payload.id {
+        return Err(WaveError::Invalid(
+            "conflict source record id encoding".into(),
+        ));
+    }
+    let object = archive::parse_digest(&payload.object)
+        .ok_or_else(|| WaveError::Invalid("conflict source object digest".into()))?;
+    if object.hex() != payload.object {
+        return Err(WaveError::Invalid(
+            "conflict source object digest encoding".into(),
+        ));
+    }
+    Ok(resolution::RecordRef { id, object })
 }
 
 /// Attach the exact settled async result to its still-current wave. This only
@@ -2551,6 +3687,314 @@ pub fn attach_synthesized_attempt_result(
     load(store, wave_id)
 }
 
+/// Recompose a settled middle-conflict result with the exact frozen suffix,
+/// then atomically link the complete unverified candidate to its current wave.
+/// This does not charge or settle a resolver attempt and does not run gates.
+struct CurrentBlockedWaveProjection {
+    body: Vec<u8>,
+    phase: String,
+    request_id: Option<String>,
+    request_object: Option<String>,
+    source_id: Option<String>,
+    source_object: Option<String>,
+    result_id: Option<String>,
+    result_object: Option<String>,
+    candidate_snapshot: Option<String>,
+    candidate_commit: Option<String>,
+    recipe_object: Option<String>,
+}
+
+pub fn recompose_synthesized_conflict(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    repo: &Path,
+    wave_id: &RecordId,
+    expected_version: i64,
+    result_ref: &resolution::RecordRef,
+    cancel: &AtomicBool,
+) -> Result<Wave, WaveError> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    let observed = load(store, wave_id)?;
+    let request_ref = observed
+        .resolution_request
+        .as_ref()
+        .ok_or(WaveError::Stale)?;
+    let binding = current_conflict_request_binding(
+        store,
+        repo,
+        owner,
+        wave_id,
+        expected_version,
+        request_ref,
+    )?;
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    let composition = composer::compose_after_synthesized_conflict(
+        store,
+        repo,
+        owner,
+        wave_id,
+        expected_version,
+        &binding,
+        result_ref,
+    )?;
+    let candidate = composition.outcome.candidate().ok_or_else(|| {
+        WaveError::Invalid("synthesized conflict suffix did not produce a candidate".into())
+    })?;
+    if composition.recipe.is_none() {
+        return Err(WaveError::Invalid(
+            "synthesized conflict candidate has no recipe".into(),
+        ));
+    }
+    if candidate.mode != CompositionMode::Hybrid {
+        return Err(WaveError::Invalid(
+            "synthesized conflict continuation must preserve hybrid provenance".into(),
+        ));
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+
+    let _archive_guard = archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
+    let current_wave = load(store, wave_id)?;
+    if current_wave != observed {
+        return Err(WaveError::Stale);
+    }
+    let revision = id(&observed.spec.revision)?;
+    let pinned = target::load_revision_under_response(store, &revision, &response_guard)?;
+    let status = target::status(store, owner.target())?;
+    let latest_sequence: i64 = store.read_connection().query_row(
+        "SELECT COALESCE(MAX(sequence),0) FROM local_waves WHERE target=?1 AND revision=?2",
+        params![owner.target(), observed.spec.revision],
+        |row| row.get(0),
+    )?;
+    let released: bool = store.read_connection().query_row(
+        "SELECT released FROM local_target_revisions WHERE revision=?1",
+        [revision.as_str()],
+        |row| row.get(0),
+    )?;
+    if pinned.target != owner.target()
+        || pinned.issuer != owner.issuer()
+        || pinned.spec.baseline != observed.spec.baseline
+        || pinned.spec.selected != observed.spec.selected
+        || status.version != expected_version
+        || status.revision.as_ref() != Some(&revision)
+        || status.phase != Phase::Idle
+        || status.resume_phase.is_some()
+        || latest_sequence != observed.spec.sequence
+        || released
+        || observed.phase != WavePhase::Blocked
+        || observed.spec.target != owner.target()
+        || observed.spec.issuer != owner.issuer()
+        || observed.spec.prior_completion.is_some()
+        || observed.resolution_request.as_ref() != Some(&binding.request)
+        || observed.composition_source.as_ref() != Some(&binding.source)
+        || observed.resolution_result.is_some()
+        || observed.candidate_snapshot.is_some()
+        || observed.candidate_commit.is_some()
+        || observed.recipe_object.is_some()
+        || observed.spec.selected != binding.plan_payload.selected
+    {
+        return Err(WaveError::Stale);
+    }
+    let request = request_from_payload(&binding.plan_payload.request)?;
+    let requirements = binding
+        .plan_payload
+        .requirements
+        .iter()
+        .map(|requirement| RequirementRef {
+            id: requirement.id.clone(),
+            path: requirement.path.clone(),
+        })
+        .collect::<Vec<_>>();
+    let source_ref = write_source_record(store, &observed, &request, &composition, &requirements)?;
+    let source = CompositionSource {
+        record: source_ref.clone(),
+        request,
+        composition,
+        requirements,
+    };
+    retain_composition_source(
+        store,
+        owner,
+        &revision,
+        &source_ref,
+        &source,
+        &pinned,
+        RetentionGuards {
+            archive: &_archive_guard,
+            response: &response_guard,
+            authority: &authority_guard,
+        },
+    )?;
+
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    let source_candidate = source
+        .composition
+        .outcome
+        .candidate()
+        .ok_or_else(|| WaveError::Invalid("composition source lost its candidate".into()))?;
+    let recipe = source
+        .composition
+        .recipe
+        .as_ref()
+        .ok_or_else(|| WaveError::Invalid("composition source lost its recipe".into()))?;
+    let wave_body = Record::decode(
+        &serde_json::to_vec(&serde_json::json!({"schema": SCHEMA_NAME, "spec": observed.spec}))?,
+        &[&SCHEMA],
+    )
+    .map_err(|error| WaveError::Invalid(error.to_string()))?;
+    if wave_body.id() != *wave_id {
+        return Err(WaveError::Invalid(
+            "current wave body identity changed".into(),
+        ));
+    }
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (target_version, target_phase, resume_phase, active_revision): (
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = tx.query_row(
+        "SELECT version,phase,resume_phase,active_revision FROM local_targets WHERE target=?1 AND issuer=?2",
+        params![owner.target(), owner.issuer()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let blocked_wave: CurrentBlockedWaveProjection = tx.query_row(
+        "SELECT body,phase,resolution_request_record_id,resolution_request_object,
+                composition_source_record_id,composition_source_object,
+                resolution_result_record_id,resolution_result_object,
+                candidate_snapshot,candidate_commit,recipe_object
+         FROM local_waves WHERE wave=?1 AND target=?2 AND revision=?3 AND sequence=?4",
+        params![
+            wave_id.as_str(),
+            owner.target(),
+            observed.spec.revision,
+            observed.spec.sequence
+        ],
+        |row| {
+            Ok(CurrentBlockedWaveProjection {
+                body: row.get(0)?,
+                phase: row.get(1)?,
+                request_id: row.get(2)?,
+                request_object: row.get(3)?,
+                source_id: row.get(4)?,
+                source_object: row.get(5)?,
+                result_id: row.get(6)?,
+                result_object: row.get(7)?,
+                candidate_snapshot: row.get(8)?,
+                candidate_commit: row.get(9)?,
+                recipe_object: row.get(10)?,
+            })
+        },
+    )?;
+    let current_record = Record::decode(&blocked_wave.body, &[&SCHEMA])
+        .map_err(|error| WaveError::Invalid(format!("current wave record: {error}")))?;
+    if current_record.id() != *wave_id
+        || current_record.canonical_bytes() != blocked_wave.body
+        || blocked_wave.body != wave_body.canonical_bytes()
+        || target_version != expected_version
+        || target_phase != "idle"
+        || resume_phase.is_some()
+        || active_revision.as_deref() != Some(revision.as_str())
+        || blocked_wave.phase != "blocked"
+        || blocked_wave.request_id.as_deref() != Some(binding.request.id.as_str())
+        || blocked_wave.request_object.as_deref() != Some(binding.request.object.hex().as_str())
+        || blocked_wave.source_id.as_deref() != Some(binding.source.id.as_str())
+        || blocked_wave.source_object.as_deref() != Some(binding.source.object.hex().as_str())
+        || blocked_wave.result_id.is_some()
+        || blocked_wave.result_object.is_some()
+        || blocked_wave.candidate_snapshot.is_some()
+        || blocked_wave.candidate_commit.is_some()
+        || blocked_wave.recipe_object.is_some()
+        || cancel.load(Ordering::SeqCst)
+    {
+        return Err(WaveError::Stale);
+    }
+    let latest_sequence: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence),0) FROM local_waves WHERE target=?1 AND revision=?2",
+        params![owner.target(), observed.spec.revision],
+        |row| row.get(0),
+    )?;
+    let released: bool = tx.query_row(
+        "SELECT released FROM local_target_revisions WHERE revision=?1",
+        [revision.as_str()],
+        |row| row.get(0),
+    )?;
+    if latest_sequence != observed.spec.sequence || released {
+        return Err(WaveError::Stale);
+    }
+    if tx.execute(
+        "UPDATE local_waves SET phase='verifying',candidate_snapshot=?2,candidate_commit=?3,
+                recipe_object=?4,composition_source_record_id=?5,composition_source_object=?6,
+                resolution_result_record_id=?7,resolution_result_object=?8,
+                detail='synthesized conflict suffix awaits fresh verification'
+         WHERE wave=?1 AND target=?9 AND revision=?10 AND sequence=?11 AND phase='blocked'
+           AND resolution_request_record_id=?12 AND resolution_request_object=?13
+           AND composition_source_record_id=?14 AND composition_source_object=?15
+           AND resolution_result_record_id IS NULL AND resolution_result_object IS NULL
+           AND candidate_snapshot IS NULL AND candidate_commit IS NULL AND recipe_object IS NULL",
+        params![
+            wave_id.as_str(),
+            source_candidate.subject.as_str(),
+            source_candidate.commit.as_str(),
+            recipe.object.hex(),
+            source_ref.id.as_str(),
+            source_ref.object.hex(),
+            result_ref.id.as_str(),
+            result_ref.object.hex(),
+            owner.target(),
+            observed.spec.revision,
+            observed.spec.sequence,
+            binding.request.id.as_str(),
+            binding.request.object.hex(),
+            binding.source.id.as_str(),
+            binding.source.object.hex(),
+        ],
+    )? != 1
+    {
+        return Err(WaveError::Stale);
+    }
+    if tx.execute(
+        "UPDATE local_targets SET phase='verifying',resume_phase=NULL,version=version+1
+         WHERE target=?1 AND issuer=?2 AND active_revision=?3 AND version=?4
+           AND phase='idle' AND resume_phase IS NULL",
+        params![
+            owner.target(),
+            owner.issuer(),
+            revision.as_str(),
+            expected_version
+        ],
+    )? != 1
+    {
+        return Err(WaveError::Stale);
+    }
+    for selected in &observed.spec.selected {
+        if tx.execute(
+            "UPDATE local_target_dispositions SET status='in_wave',detail=NULL
+             WHERE revision=?1 AND contribution=?2 AND status='blocked'",
+            params![observed.spec.revision, selected],
+        )? != 1
+        {
+            return Err(WaveError::Stale);
+        }
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    tx.commit()?;
+    load(store, wave_id)
+}
+
 /// One durable dispatch. Replaying a completed composition returns its stored
 /// candidate; a crash during dispatch is explicit, never silently retried.
 pub fn compose(
@@ -2613,31 +4057,14 @@ pub(crate) fn compose_with_source(
             .transpose()?;
         let baseline = archive::retained(store, &snapshot(&wave.spec.baseline)?)?
             .ok_or(TargetError::Missing)?;
-        let (base_commit, accepted, already_delivered) = if let Some(key) =
-            &wave.spec.prior_completion
-        {
-            let (completion, prior) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
-            if completion.target != owner.target()
-                || completion.epoch != owner.authority_epoch().as_str()
-            {
-                return Err(WaveError::Stale);
-            }
-            let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
-                .ok_or(TargetError::Missing)?;
-            let members = if completion.revision == wave.spec.revision {
-                prior.selected
-            } else {
-                Vec::new()
-            };
-            let accepted = if completion.revision == wave.spec.revision {
-                vec![original.commit]
-            } else {
-                Vec::new()
-            };
+        let prior = prior_completion::load(store, owner, &wave, &pinned)?;
+        let (base_commit, accepted, already_delivered) = if let Some(prior) = prior {
+            prior.validate_retained_completion(store)?;
+            prior.validate_git_binding(store, repo)?;
             (
-                CommitOid::parse(&completion.accepted_commit)?,
-                accepted,
-                Some((id(key)?, members)),
+                prior.request_baseline_commit().clone(),
+                prior.accepted_history(store, &pinned)?,
+                Some((prior.key().clone(), prior.previous_members().to_vec())),
             )
         } else {
             (baseline.commit, vec![], None)
@@ -2721,6 +4148,7 @@ pub(crate) fn compose_with_source(
             )
             .map_err(|error| composer::ComposeError::CandidateRetention(error.to_string()))
         };
+    let text_profile_pins = composer::provisional_text_profile_pins();
     let result = if let Some(detail) = namespace_conflict {
         Ok(composer::Composition {
             outcome: crate::composition::CompositionOutcome::Refused {
@@ -2777,6 +4205,8 @@ pub(crate) fn compose_with_source(
     let authority_guard = target::authorize(store, owner)?;
     let mut source_data = None;
     let mut resolution_request = None;
+    let mut conflict_source = None;
+    let mut conflict_retention = None;
     let (mut phase, mut detail, candidate, commit, recipe) = match result {
         Ok(composition) => match &composition.outcome {
             CompositionOutcome::Candidate(candidate) => {
@@ -2801,8 +4231,24 @@ pub(crate) fn compose_with_source(
                 }
             }
             CompositionOutcome::Conflict { .. } => {
-                let raised = match ensure_resolution_supported(store, &composition) {
-                    Ok(()) => resolution::request_resolution(
+                let prepared = (|| {
+                    ensure_resolution_supported(store, &composition)?;
+                    if wave.spec.prior_completion.is_some() || !request.accepted.is_empty() {
+                        return Err(WaveError::ResolutionUnsupported);
+                    }
+                    let pins = text_profile_pins.as_ref().map_err(|error| {
+                        WaveError::Invalid(format!("conflict profile pin capture failed: {error}"))
+                    })?;
+                    let plan = write_conflict_plan_record(
+                        store,
+                        &wave,
+                        &request,
+                        &composition,
+                        &requirements,
+                        revision_bindings.as_ref(),
+                        pins,
+                    )?;
+                    let request_record = resolution::request_resolution(
                         store,
                         repo,
                         &request,
@@ -2810,44 +4256,55 @@ pub(crate) fn compose_with_source(
                         &[],
                         &requirements,
                         None,
-                    )
-                    .map_err(WaveError::from),
-                    Err(error) => Err(error),
-                };
-                match raised {
-                    Ok(request_record) => match retain_resolution_request(
+                    )?;
+                    let source =
+                        write_conflict_source_record(store, &wave, request_record.record(), &plan)?;
+                    let mut prospective = wave.clone();
+                    prospective.phase = WavePhase::Blocked;
+                    prospective.resolution_request = Some(request_record.record().clone());
+                    prospective.composition_source = Some(source.clone());
+                    validate_conflict_request_binding_records(
+                        store,
+                        repo,
+                        request_record.record(),
+                        &source,
+                        Some(&prospective),
+                    )?;
+                    let revision = id(&wave.spec.revision)?;
+                    let retention = prepare_conflict_request_retention(
                         store,
                         owner,
-                        &id(&wave.spec.revision)?,
-                        &request_record,
-                        &request,
+                        ConflictRequestRetentionInput {
+                            revision: &revision,
+                            request: &request_record,
+                            composition_request: &request,
+                            plan: &plan,
+                            source: &source,
+                        },
                         RetentionGuards {
                             archive: &_archive_guard,
                             response: &_response_guard,
                             authority: &authority_guard,
                         },
-                    ) {
-                        Ok(()) => {
-                            resolution_request = Some(request_record.record().clone());
-                            (
-                                "blocked",
-                                composition.outcome.code().into(),
-                                None,
-                                None,
-                                None,
-                            )
-                        }
-                        Err(error) => (
+                    )?;
+                    Ok((request_record, source, retention))
+                })();
+                match prepared {
+                    Ok((request_record, source, retention)) => {
+                        resolution_request = Some(request_record.record().clone());
+                        conflict_source = Some(source);
+                        conflict_retention = Some(retention);
+                        (
                             "blocked",
-                            format!("composer conflict; request retention failed: {error}"),
+                            composition.outcome.code().into(),
                             None,
                             None,
                             None,
-                        ),
-                    },
+                        )
+                    }
                     Err(error) => (
                         "blocked",
-                        format!("composer conflict; request creation failed: {error}"),
+                        format!("composer conflict; frozen request binding failed: {error}"),
                         None,
                         None,
                         None,
@@ -2868,7 +4325,7 @@ pub(crate) fn compose_with_source(
         Err(error) => ("outcome_unknown", error.to_string(), None, None, None),
     };
     let mut source = None;
-    let mut composition_source = None;
+    let mut composition_source = conflict_source;
     if let Some((request, composition, requirements)) = source_data {
         match write_source_record(store, &wave, &request, &composition, &requirements) {
             Ok(reference) => {
@@ -2956,6 +4413,37 @@ pub(crate) fn compose_with_source(
     )?;
     if state.0 != "composing" || state.1.as_deref() != Some(wave.spec.revision.as_str()) {
         return Err(WaveError::Stale);
+    }
+    if let Some(retention) = conflict_retention {
+        if retention.revision.as_str() != wave.spec.revision {
+            return Err(WaveError::Stale);
+        }
+        let released: bool = tx.query_row(
+            "SELECT released FROM local_target_revisions WHERE revision=?1",
+            [retention.revision.as_str()],
+            |row| row.get(0),
+        )?;
+        if released {
+            return Err(WaveError::Stale);
+        }
+        for snapshot in &retention.snapshots {
+            tx.execute(
+                "INSERT OR IGNORE INTO local_target_roots VALUES (?1, 'snapshot', ?2)",
+                params![retention.revision.as_str(), snapshot.as_str()],
+            )?;
+        }
+        for contribution in &retention.contributions {
+            tx.execute(
+                "INSERT OR IGNORE INTO local_target_roots VALUES (?1, 'contribution', ?2)",
+                params![retention.revision.as_str(), contribution.as_str()],
+            )?;
+        }
+        for object in &retention.objects {
+            tx.execute(
+                "INSERT OR IGNORE INTO local_target_roots VALUES (?1, 'object', ?2)",
+                params![retention.revision.as_str(), object.hex()],
+            )?;
+        }
     }
     if tx.execute("UPDATE local_waves SET phase=?2, detail=?3, candidate_snapshot=?4, candidate_commit=?5, recipe_object=?6, composition_ms=?7, resolution_request_record_id=?8, resolution_request_object=?9, composition_source_record_id=?10, composition_source_object=?11 WHERE wave=?1 AND phase='composing'", params![wave_id.as_str(),phase,detail,candidate,commit,recipe,elapsed,resolution_request.as_ref().map(|record| record.id.as_str()),resolution_request.as_ref().map(|record| record.object.hex()),composition_source.as_ref().map(|record| record.id.as_str()),composition_source.as_ref().map(|record| record.object.hex())])? != 1 {
         return Err(WaveError::Stale);

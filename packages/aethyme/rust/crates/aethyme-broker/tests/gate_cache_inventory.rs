@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime};
 
-use aethyme_broker::{Broker, FinishOptions};
+use aethyme_broker::FinishOptions;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
@@ -93,11 +93,10 @@ fn dead_pid() -> u32 {
 }
 
 struct World {
-    _tmp: tempfile::TempDir,
+    fixture: common::FixtureRepository,
     repo: PathBuf,
     cache: PathBuf,
     state: PathBuf,
-    worktree_container: PathBuf,
     finished: PathBuf,
     live: PathBuf,
     /// `<cache>/gates/<this repository's key>`.
@@ -113,13 +112,14 @@ impl World {
     }
 
     fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        common::broker_cli(CLI, args)
-            .current_dir(cwd)
-            .env("AETHYME_HOST_CACHE_DIR", &self.cache)
-            .env("AETHYME_HOST_STATE_DIR", &self.state)
-            .env("AETHYME_WORKTREE_ROOT", &self.worktree_container)
-            .output()
-            .unwrap()
+        let broker = common::open_fixture_repository_broker(&self.fixture).unwrap();
+        let mut command = common::broker_cli(CLI, args);
+        command.current_dir(cwd);
+        broker
+            .configure_storage_context_for_child(&mut command)
+            .unwrap();
+        drop(broker);
+        command.output().unwrap()
     }
 
     fn plan(&self) -> serde_json::Value {
@@ -188,9 +188,8 @@ fn entry<'a>(plan: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
 /// `target/` a nested `.gitignore` un-ignores, and an untracked file; and a
 /// live session with its own ignored `target/`.
 fn world() -> World {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
+    let fixture = common::FixtureRepository::new();
+    let repo = fixture.path().to_path_buf();
     git(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\ntarget/\n").unwrap();
@@ -207,14 +206,9 @@ fn world() -> World {
     )
     .unwrap();
 
-    let state = tmp.path().join("state");
-    let mut broker = Broker::open(&repo)
-        .unwrap()
-        .with_host_operation_database(state.join("host-operations.db"));
-    let worktree_container = tmp.path().join("host-worktrees");
-    std::fs::create_dir_all(&worktree_container).unwrap();
-    let worktree_key = broker.worktree_root_plan().unwrap().repository_key;
-    broker = broker.with_worktree_root(worktree_container.join(worktree_key));
+    let state = common::fixture_host_state_dir(fixture.owner_path());
+    let cache = common::fixture_host_cache_dir(fixture.owner_path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
     let finished = broker.start_worktree("finished work", None).unwrap();
     let finished_path = PathBuf::from(&finished.worktree_path);
     std::fs::write(finished_path.join("done.txt"), "done\n").unwrap();
@@ -244,13 +238,11 @@ fn world() -> World {
     build_dir(&live_path.join("target"), 2048);
     drop(broker);
 
-    let cache = tmp.path().join("cache");
     let mut world = World {
-        _tmp: tmp,
+        fixture,
         repo,
         cache,
         state,
-        worktree_container,
         finished: finished_path,
         live: live_path,
         gates: PathBuf::new(),

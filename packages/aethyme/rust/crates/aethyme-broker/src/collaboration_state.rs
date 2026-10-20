@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 28;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 30;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -74,7 +74,13 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 28;
 // request identity. Schema 26 writers do not preserve that state or its roots.
 // Schema 28 adds an immutable optional resolution-result link; schema 27
 // writers can advance a linked wave without preserving that provenance.
-const MIN_COMPATIBLE_SCHEMA: i64 = 28;
+// Schema 29 adds immutable Local resolution reservation proofs and their
+// one-to-one shared-attempt bindings. Older writers cannot preserve managed
+// resolution authority or its idempotency roots.
+// Schema 30 adjusts only the v27 attempt-charge trigger to admit the managed
+// resolver's existing NULL session label. It adds no columns or new encoding;
+// schema 29 remains the oldest compatible reader.
+const MIN_COMPATIBLE_SCHEMA: i64 = 29;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -958,10 +964,177 @@ const MIGRATIONS: &[(i64, &str)] = &[
          WHEN OLD.roots_released_ms IS NOT NULL AND NEW.state<>OLD.state
          BEGIN SELECT RAISE(ABORT, 'native gate roots were released'); END;"#,
     ),
+    (
+        29,
+        r#"CREATE TABLE local_resolution_reservation_proofs (
+             reservation TEXT PRIMARY KEY NOT NULL
+                 REFERENCES local_budget_reservations(reservation),
+             target TEXT NOT NULL,
+             issuer TEXT NOT NULL,
+             authority_epoch TEXT NOT NULL,
+             client_key TEXT NOT NULL CHECK(length(client_key) BETWEEN 1 AND 256),
+             wave TEXT NOT NULL REFERENCES local_waves(wave),
+             expected_version INTEGER NOT NULL CHECK(expected_version >= 0),
+             request_record_id TEXT NOT NULL,
+             request_object_sha256 TEXT NOT NULL CHECK(length(request_object_sha256)=64),
+             composition_source_record_id TEXT NOT NULL,
+             composition_source_object_sha256 TEXT NOT NULL
+                 CHECK(length(composition_source_object_sha256)=64),
+             -- ResolutionInputManifest is archived as canonical bytes and
+             -- identified by ObjectDigest; it is not a RecordRef.
+             input_manifest_object_sha256 TEXT NOT NULL
+                 CHECK(length(input_manifest_object_sha256)=64),
+             trigger_sha256 TEXT NOT NULL CHECK(length(trigger_sha256)=64),
+             project_policy TEXT NOT NULL,
+             objective_policy TEXT NOT NULL,
+             price_profile TEXT NOT NULL,
+             dispatch_limits TEXT NOT NULL CHECK(length(dispatch_limits) BETWEEN 1 AND 512),
+             reserved_envelope BLOB NOT NULL CHECK(length(reserved_envelope) BETWEEN 1 AND 4096),
+             reservation_attempt_limit INTEGER NOT NULL CHECK(reservation_attempt_limit=1),
+             deadline_ms INTEGER NOT NULL CHECK(deadline_ms >= 0),
+             created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+             UNIQUE(target,issuer,client_key)
+         ) STRICT;
+         CREATE TABLE local_resolution_reservation_roots (
+             reservation TEXT NOT NULL
+                 REFERENCES local_resolution_reservation_proofs(reservation),
+             lineage_record_id TEXT NOT NULL,
+             PRIMARY KEY(reservation,lineage_record_id)
+         ) STRICT;
+         CREATE TABLE local_managed_resolution_attempt_bindings (
+             binding_id TEXT PRIMARY KEY NOT NULL,
+             reservation TEXT NOT NULL UNIQUE
+                 REFERENCES local_resolution_reservation_proofs(reservation),
+             attempt_id INTEGER NOT NULL UNIQUE
+                 REFERENCES resolution_attempts(attempt_id),
+             authority_epoch TEXT NOT NULL,
+             reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
+             shared_attempt_number INTEGER NOT NULL CHECK(shared_attempt_number >= 1),
+             reservation_attempt_number INTEGER NOT NULL
+                 CHECK(reservation_attempt_number=1),
+             route TEXT NOT NULL
+                 CHECK(route='local_managed_resolution_v1'),
+             created_ms INTEGER NOT NULL CHECK(created_ms >= 0)
+         ) STRICT;
+         CREATE TRIGGER local_resolution_reservation_proof_scope
+         BEFORE INSERT ON local_resolution_reservation_proofs
+         WHEN NOT EXISTS (
+             SELECT 1
+             FROM local_budget_reservations r
+             JOIN local_waves w ON w.wave=NEW.wave
+             JOIN local_targets t ON t.target=r.target
+             WHERE r.reservation=NEW.reservation AND r.target=NEW.target
+               AND r.wave=NEW.wave AND r.parent IS NULL
+               AND w.wave=r.wave AND w.target=NEW.target
+               AND w.revision=r.revision
+               AND t.issuer=NEW.issuer
+               AND t.active_revision=r.revision AND t.version=NEW.expected_version
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution proof must match a root reservation');
+         END;
+         CREATE TRIGGER local_resolution_reservation_proof_immutable
+         BEFORE UPDATE ON local_resolution_reservation_proofs
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation proof is immutable');
+         END;
+         CREATE TRIGGER local_resolution_reservation_proof_no_delete
+         BEFORE DELETE ON local_resolution_reservation_proofs
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation proof is permanent');
+         END;
+         CREATE TRIGGER local_resolution_reservation_root_immutable
+         BEFORE UPDATE ON local_resolution_reservation_roots
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation roots are immutable');
+         END;
+         CREATE TRIGGER local_resolution_reservation_root_no_delete
+         BEFORE DELETE ON local_resolution_reservation_roots
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation roots are permanent');
+         END;
+         CREATE TRIGGER local_resolution_reservation_root_before_binding
+         BEFORE INSERT ON local_resolution_reservation_roots
+         WHEN EXISTS (
+             SELECT 1 FROM local_managed_resolution_attempt_bindings b
+             WHERE b.reservation=NEW.reservation
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution roots are closed by attempt binding');
+         END;
+         CREATE TRIGGER local_managed_resolution_binding_matches_attempt
+         BEFORE INSERT ON local_managed_resolution_attempt_bindings
+         WHEN NOT EXISTS (
+             SELECT 1
+             FROM local_resolution_reservation_proofs p
+             JOIN local_budget_reservations r ON r.reservation=p.reservation
+             JOIN local_waves w ON w.wave=p.wave
+             JOIN local_targets t ON t.target=p.target AND t.issuer=p.issuer
+             JOIN resolution_attempts a ON a.attempt_id=NEW.attempt_id
+             WHERE p.reservation=NEW.reservation
+               AND p.authority_epoch=NEW.authority_epoch
+               AND r.target=p.target AND r.wave=p.wave
+               AND w.target=p.target AND w.revision=r.revision
+               AND t.active_revision=r.revision AND t.version=p.expected_version
+               AND w.resolution_request_record_id=p.request_record_id
+               AND w.resolution_request_object=p.request_object_sha256
+               AND w.composition_source_record_id=p.composition_source_record_id
+               AND w.composition_source_object=p.composition_source_object_sha256
+               AND r.phase='completion_pending'
+               AND r.version=NEW.reservation_version
+               AND r.attempts=NEW.reservation_attempt_number
+               AND EXISTS (
+                   SELECT 1 FROM local_resolution_reservation_roots rr
+                   WHERE rr.reservation=p.reservation
+               )
+               AND a.request_record_id=p.request_record_id
+               AND a.request_sha256=p.request_object_sha256
+               AND a.input_manifest_sha256=p.input_manifest_object_sha256
+               AND a.client_key=p.client_key
+               AND a.resolver='local-managed-resolution'
+               AND a.session_label IS NULL
+               AND a.attempt_number=NEW.shared_attempt_number
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution binding does not match its charged attempt');
+         END;
+         CREATE TRIGGER local_managed_resolution_binding_immutable
+         BEFORE UPDATE ON local_managed_resolution_attempt_bindings
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution attempt binding is immutable');
+         END;
+         CREATE TRIGGER local_managed_resolution_binding_no_delete
+         BEFORE DELETE ON local_managed_resolution_attempt_bindings
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution attempt binding is permanent');
+         END;"#,
+    ),
+    (
+        30,
+        r#"DROP TRIGGER resolution_attempts_require_v27_charge;
+         CREATE TRIGGER resolution_attempts_require_v27_charge
+         BEFORE INSERT ON resolution_attempts
+         WHEN (NEW.attempt_number IS NULL OR NEW.attempt_number < 1
+               OR NEW.async_state = 'settled'
+               OR (NEW.async_token IS NOT NULL AND
+                   (NEW.async_state != 'exported'
+                    OR NEW.client_key IS NULL
+                    OR (NEW.resolver IS 'local-managed-resolution'
+                        AND NEW.session_label IS NOT NULL)
+                    OR (NEW.resolver IS NOT 'local-managed-resolution'
+                        AND NEW.session_label IS NULL)
+                    OR NEW.request_sha256 IS NULL OR NEW.input_sha256 IS NULL
+                    OR NEW.input_manifest_sha256 IS NULL OR NEW.dispatch_limits IS NULL)))
+          AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'), 0) >= 27
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution attempt requires a v27 pre-dispatch charge');
+         END;"#,
+    ),
 ];
 /// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
 /// while preserving all schema-25 rows. Fixtures start from a current store,
-/// so also remove schema-28 and schema-27 additions before lowering their version marker;
+/// so also remove schema-29, schema-28 and schema-27 additions before
+/// lowering their version marker;
 /// otherwise they model an impossible hybrid database and make the migration
 /// add columns that the fixture already has. This is test setup only:
 /// production migrations continue to reject malformed databases instead of
@@ -1018,6 +1191,7 @@ pub(crate) fn drop_identity_revision_schema_for_legacy_fixture(
 fn drop_resolution_schema_28_for_legacy_fixture(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<()> {
+    drop_resolution_schema_29_for_legacy_fixture(connection)?;
     if !fixture_table_exists(connection, "local_waves")? {
         return Ok(());
     }
@@ -1058,8 +1232,45 @@ fn drop_resolution_schema_28_for_legacy_fixture(
     Ok(())
 }
 
-/// Remove schema-28 and schema-27 additions from a current test store before a fixture
-/// lowers `schema_version` to exercise an older migration. Keep the original
+/// Remove only schema-29 managed-resolution authority from an empty current
+/// test store before it becomes a historical fixture. Never hide or discard a
+/// reservation proof, a selected root, or an attempt binding.
+#[cfg(test)]
+fn drop_resolution_schema_29_for_legacy_fixture(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    if !fixture_table_exists(connection, "local_resolution_reservation_proofs")? {
+        return Ok(());
+    }
+    let has_authority: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_resolution_reservation_proofs)
+             OR EXISTS(SELECT 1 FROM local_resolution_reservation_roots)
+             OR EXISTS(SELECT 1 FROM local_managed_resolution_attempt_bindings)",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        !has_authority,
+        "cannot downgrade a fixture containing schema-29 managed-resolution authority"
+    );
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS local_managed_resolution_binding_no_delete;
+         DROP TRIGGER IF EXISTS local_managed_resolution_binding_immutable;
+         DROP TRIGGER IF EXISTS local_managed_resolution_binding_matches_attempt;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_root_no_delete;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_root_immutable;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_proof_no_delete;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_proof_immutable;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_proof_scope;
+         DROP TABLE IF EXISTS local_managed_resolution_attempt_bindings;
+         DROP TABLE IF EXISTS local_resolution_reservation_roots;
+         DROP TABLE IF EXISTS local_resolution_reservation_proofs;",
+    )?;
+    Ok(())
+}
+
+/// Remove schema-29, schema-28 and schema-27 additions from a current test
+/// store before a fixture lowers `schema_version` to exercise an older migration. Keep the original
 /// resolution-attempt columns and rows: an old database has those, while it
 /// cannot contain the later async-ledger bindings or wave archive references.
 /// Refuse to discard any actual v27 or v28 data so this helper cannot make a test's
@@ -2657,11 +2868,1353 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 28);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 29);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
         // Earlier writers cannot preserve immutable revision heads, durable
         // asynchronous attempts or the archive roots those attempts name.
-        const { assert!(MIN_COMPATIBLE_SCHEMA >= 28) };
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 29) };
+    }
+
+    #[test]
+    fn schema_30_preserves_charges_and_only_allows_unlabeled_managed_attempts() {
+        struct AttemptInput<'a> {
+            decision_key: &'a str,
+            resolver: &'a str,
+            session_label: Option<&'a str>,
+            async_token: Option<&'a str>,
+            attempt_number: i64,
+            async_state: &'a str,
+            dispatch_limits: Option<&'a str>,
+        }
+
+        fn insert_attempt(
+            connection: &rusqlite::Connection,
+            input: AttemptInput<'_>,
+        ) -> rusqlite::Result<usize> {
+            connection.execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,charged_ms,
+                      async_token,client_key,session_label,attempt_number,request_sha256,
+                      input_sha256,input_manifest_sha256,dispatch_limits,async_state)
+                 VALUES (?1,'failed_checks','lineage-a','',?2,?3,456,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                rusqlite::params![
+                    input.decision_key,
+                    format!("request:{}", input.decision_key),
+                    input.resolver,
+                    input.async_token,
+                    format!("client:{}", input.decision_key),
+                    input.session_label,
+                    input.attempt_number,
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    "c".repeat(64),
+                    input.dispatch_limits,
+                    input.async_state,
+                ],
+            )
+        }
+
+        fn attempt_row(
+            connection: &rusqlite::Connection,
+            decision_key: &str,
+        ) -> Vec<rusqlite::types::Value> {
+            connection
+                .query_row(
+                    "SELECT * FROM resolution_attempts WHERE decision_key=?1",
+                    [decision_key],
+                    |row| {
+                        let mut values = Vec::with_capacity(row.as_ref().column_count());
+                        for column in 0..row.as_ref().column_count() {
+                            values.push(row.get::<_, rusqlite::types::Value>(column)?);
+                        }
+                        Ok(values)
+                    },
+                )
+                .unwrap()
+        }
+
+        fn assert_charge_refused(result: rusqlite::Result<usize>, case: &str) {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("resolution attempt requires a v27 pre-dispatch charge"),
+                "{case} must be rejected by the retained pre-dispatch guard: {error:?}"
+            );
+        }
+
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        insert_attempt(
+            store.connection(),
+            AttemptInput {
+                decision_key: "schema30-existing-charge",
+                resolver: "manual",
+                session_label: Some("operator session"),
+                async_token: Some("schema30-existing-token"),
+                attempt_number: 7,
+                async_state: "exported",
+                dispatch_limits: Some("{}"),
+            },
+        )
+        .unwrap();
+        let before = attempt_row(store.read_connection(), "schema30-existing-charge");
+
+        // Recreate the exact v27 trigger and schema-29 marker. Migration 30
+        // must replace that durable rule without rewriting prior charges.
+        store
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER resolution_attempts_require_v27_charge;
+                 UPDATE meta SET value='29' WHERE key='schema_version';
+                 UPDATE meta SET value='29' WHERE key='min_compatible_schema';
+                 CREATE TRIGGER resolution_attempts_require_v27_charge
+                 BEFORE INSERT ON resolution_attempts
+                 WHEN (NEW.attempt_number IS NULL OR NEW.attempt_number < 1
+                       OR NEW.async_state = 'settled'
+                       OR (NEW.async_token IS NOT NULL AND
+                           (NEW.async_state != 'exported'
+                            OR NEW.client_key IS NULL OR NEW.session_label IS NULL
+                            OR NEW.request_sha256 IS NULL OR NEW.input_sha256 IS NULL
+                            OR NEW.input_manifest_sha256 IS NULL OR NEW.dispatch_limits IS NULL)))
+                  AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'), 0) >= 27
+                 BEGIN
+                     SELECT RAISE(ABORT, 'resolution attempt requires a v27 pre-dispatch charge');
+                 END;",
+            )
+            .unwrap();
+        assert_charge_refused(
+            insert_attempt(
+                store.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-before-migration",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-before-migration-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "schema-29 managed attempt before the migration",
+        );
+        drop(store);
+
+        let mut migrated = open(host.path(), &[]).unwrap();
+        assert_eq!(migrated.schema_version(), 30);
+        let floor: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, 29);
+        assert_eq!(
+            attempt_row(migrated.read_connection(), "schema30-existing-charge"),
+            before,
+            "schema 30 must preserve an already charged row exactly"
+        );
+
+        insert_attempt(
+            migrated.connection(),
+            AttemptInput {
+                decision_key: "schema30-managed-valid",
+                resolver: "local-managed-resolution",
+                session_label: None,
+                async_token: Some("schema30-managed-valid-token"),
+                attempt_number: 1,
+                async_state: "exported",
+                dispatch_limits: Some("{}"),
+            },
+        )
+        .expect("managed attempt keeps its intentionally null human session label");
+        insert_attempt(
+            migrated.connection(),
+            AttemptInput {
+                decision_key: "schema30-manual-valid",
+                resolver: "manual",
+                session_label: Some("operator session"),
+                async_token: Some("schema30-manual-valid-token"),
+                attempt_number: 1,
+                async_state: "exported",
+                dispatch_limits: Some("{}"),
+            },
+        )
+        .expect("ordinary charged attempts still require and accept a session label");
+
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-manual-missing-label",
+                    resolver: "manual",
+                    session_label: None,
+                    async_token: Some("schema30-manual-missing-label-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "manual attempt with a null session label",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-with-label",
+                    resolver: "local-managed-resolution",
+                    session_label: Some("not a managed session"),
+                    async_token: Some("schema30-managed-with-label-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "managed attempt with a non-null session label",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-invalid-number",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-invalid-number-token"),
+                    attempt_number: 0,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "managed attempt with an invalid attempt number",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-settled",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-settled-token"),
+                    attempt_number: 1,
+                    async_state: "settled",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "managed attempt that bypasses dispatch",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-missing-limits",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-missing-limits-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: None,
+                },
+            ),
+            "managed attempt missing frozen dispatch limits",
+        );
+    }
+
+    #[test]
+    fn schema_29_preserves_shared_charges_and_binds_distinct_attempt_axes() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct ProofSnapshot {
+            reservation: String,
+            target: String,
+            issuer: String,
+            authority_epoch: String,
+            client_key: String,
+            wave: String,
+            expected_version: i64,
+            request_record_id: String,
+            request_object_sha256: String,
+            composition_source_record_id: String,
+            composition_source_object_sha256: String,
+            input_manifest_object_sha256: String,
+            trigger_sha256: String,
+            project_policy: String,
+            objective_policy: String,
+            price_profile: String,
+            dispatch_limits: String,
+            reserved_envelope: Vec<u8>,
+            reservation_attempt_limit: i64,
+            deadline_ms: i64,
+            created_ms: i64,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct BindingSnapshot {
+            binding_id: String,
+            reservation: String,
+            attempt_id: i64,
+            authority_epoch: String,
+            reservation_version: i64,
+            shared_attempt_number: i64,
+            reservation_attempt_number: i64,
+            route: String,
+            created_ms: i64,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct ReservationSnapshot {
+            target: String,
+            revision: String,
+            wave: String,
+            phase: String,
+            version: i64,
+            attempts: i64,
+            spent: Vec<u8>,
+            receipt: Option<String>,
+            detail: Option<String>,
+            observed_overrun: Option<Vec<u8>>,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct AttemptSnapshot {
+            attempt_id: i64,
+            decision_key: String,
+            kind: String,
+            members: String,
+            paths: String,
+            request_record_id: String,
+            resolver: String,
+            outcome: Option<String>,
+            charged_ms: i64,
+            async_token: Option<String>,
+            client_key: Option<String>,
+            session_label: Option<String>,
+            attempt_number: Option<i64>,
+            request_sha256: Option<String>,
+            input_sha256: Option<String>,
+            input_manifest_sha256: Option<String>,
+            dispatch_limits: Option<String>,
+            response_sha256: Option<String>,
+            result_record_id: Option<String>,
+            result_sha256: Option<String>,
+            detail: Option<String>,
+            async_state: String,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct BindingAuthoritySnapshot {
+            proof: ProofSnapshot,
+            wave_target_revision: (String, String),
+            roots: Vec<String>,
+            bindings: Vec<BindingSnapshot>,
+            reservation: ReservationSnapshot,
+            attempts: Vec<AttemptSnapshot>,
+        }
+
+        fn snapshot(
+            connection: &rusqlite::Connection,
+            reservation: &str,
+        ) -> rusqlite::Result<BindingAuthoritySnapshot> {
+            let proof = connection.query_row(
+                "SELECT reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
+                        request_record_id,request_object_sha256,
+                        composition_source_record_id,composition_source_object_sha256,
+                        input_manifest_object_sha256,trigger_sha256,project_policy,
+                        objective_policy,price_profile,dispatch_limits,reserved_envelope,
+                        reservation_attempt_limit,deadline_ms,created_ms
+                 FROM local_resolution_reservation_proofs WHERE reservation=?1",
+                [reservation],
+                |row| {
+                    Ok(ProofSnapshot {
+                        reservation: row.get(0)?,
+                        target: row.get(1)?,
+                        issuer: row.get(2)?,
+                        authority_epoch: row.get(3)?,
+                        client_key: row.get(4)?,
+                        wave: row.get(5)?,
+                        expected_version: row.get(6)?,
+                        request_record_id: row.get(7)?,
+                        request_object_sha256: row.get(8)?,
+                        composition_source_record_id: row.get(9)?,
+                        composition_source_object_sha256: row.get(10)?,
+                        input_manifest_object_sha256: row.get(11)?,
+                        trigger_sha256: row.get(12)?,
+                        project_policy: row.get(13)?,
+                        objective_policy: row.get(14)?,
+                        price_profile: row.get(15)?,
+                        dispatch_limits: row.get(16)?,
+                        reserved_envelope: row.get(17)?,
+                        reservation_attempt_limit: row.get(18)?,
+                        deadline_ms: row.get(19)?,
+                        created_ms: row.get(20)?,
+                    })
+                },
+            )?;
+            let mut root_statement = connection.prepare(
+                "SELECT lineage_record_id FROM local_resolution_reservation_roots
+                 WHERE reservation=?1 ORDER BY lineage_record_id",
+            )?;
+            let roots: Vec<String> = root_statement
+                .query_map([reservation], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let wave_target_revision = connection.query_row(
+                "SELECT target,revision FROM local_waves WHERE wave=?1",
+                [proof.wave.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mut binding_statement = connection.prepare(
+                "SELECT binding_id,reservation,attempt_id,authority_epoch,
+                        reservation_version,shared_attempt_number,
+                        reservation_attempt_number,route,created_ms
+                 FROM local_managed_resolution_attempt_bindings
+                 WHERE reservation=?1 ORDER BY binding_id",
+            )?;
+            let bindings = binding_statement
+                .query_map([reservation], |row| {
+                    Ok(BindingSnapshot {
+                        binding_id: row.get(0)?,
+                        reservation: row.get(1)?,
+                        attempt_id: row.get(2)?,
+                        authority_epoch: row.get(3)?,
+                        reservation_version: row.get(4)?,
+                        shared_attempt_number: row.get(5)?,
+                        reservation_attempt_number: row.get(6)?,
+                        route: row.get(7)?,
+                        created_ms: row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let reservation_state = connection.query_row(
+                "SELECT target,revision,wave,phase,version,attempts,spent,receipt,detail,
+                        observed_overrun
+                 FROM local_budget_reservations
+                 WHERE reservation=?1",
+                [reservation],
+                |row| {
+                    Ok(ReservationSnapshot {
+                        target: row.get(0)?,
+                        revision: row.get(1)?,
+                        wave: row.get(2)?,
+                        phase: row.get(3)?,
+                        version: row.get(4)?,
+                        attempts: row.get(5)?,
+                        spent: row.get(6)?,
+                        receipt: row.get(7)?,
+                        detail: row.get(8)?,
+                        observed_overrun: row.get(9)?,
+                    })
+                },
+            )?;
+            let mut attempt_statement = connection.prepare(
+                "SELECT attempt_id,decision_key,kind,members,paths,request_record_id,resolver,
+                        outcome,charged_ms,async_token,client_key,session_label,attempt_number,
+                        request_sha256,input_sha256,input_manifest_sha256,dispatch_limits,
+                        response_sha256,result_record_id,result_sha256,detail,async_state
+                 FROM resolution_attempts WHERE client_key=?1 ORDER BY attempt_id",
+            )?;
+            let attempts = attempt_statement
+                .query_map([proof.client_key.as_str()], |row| {
+                    Ok(AttemptSnapshot {
+                        attempt_id: row.get(0)?,
+                        decision_key: row.get(1)?,
+                        kind: row.get(2)?,
+                        members: row.get(3)?,
+                        paths: row.get(4)?,
+                        request_record_id: row.get(5)?,
+                        resolver: row.get(6)?,
+                        outcome: row.get(7)?,
+                        charged_ms: row.get(8)?,
+                        async_token: row.get(9)?,
+                        client_key: row.get(10)?,
+                        session_label: row.get(11)?,
+                        attempt_number: row.get(12)?,
+                        request_sha256: row.get(13)?,
+                        input_sha256: row.get(14)?,
+                        input_manifest_sha256: row.get(15)?,
+                        dispatch_limits: row.get(16)?,
+                        response_sha256: row.get(17)?,
+                        result_record_id: row.get(18)?,
+                        result_sha256: row.get(19)?,
+                        detail: row.get(20)?,
+                        async_state: row.get(21)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(BindingAuthoritySnapshot {
+                proof,
+                wave_target_revision,
+                roots,
+                bindings,
+                reservation: reservation_state,
+                attempts,
+            })
+        }
+
+        fn insert_binding(
+            connection: &rusqlite::Connection,
+            binding_id: &str,
+            reservation: &str,
+            attempt_id: i64,
+            shared_attempt_number: i64,
+            reservation_attempt_number: i64,
+        ) -> rusqlite::Result<usize> {
+            connection.execute(
+                "INSERT INTO local_managed_resolution_attempt_bindings
+                     (binding_id,reservation,attempt_id,authority_epoch,
+                      reservation_version,shared_attempt_number,
+                      reservation_attempt_number,route,created_ms)
+                 VALUES (?1,?2,?3,'epoch-1',1,?4,?5,
+                         'local_managed_resolution_v1',101)",
+                rusqlite::params![
+                    binding_id,
+                    reservation,
+                    attempt_id,
+                    shared_attempt_number,
+                    reservation_attempt_number,
+                ],
+            )
+        }
+
+        // Fixtures vary each persisted route and attempt binding independently.
+        #[allow(clippy::too_many_arguments)]
+        fn insert_attempt_with_route(
+            connection: &rusqlite::Connection,
+            request_record_id: &str,
+            request_sha: &str,
+            manifest_sha: &str,
+            client_key: &str,
+            resolver: &str,
+            session_label: Option<&str>,
+            shared_attempt_number: i64,
+        ) -> rusqlite::Result<i64> {
+            connection.execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,
+                      charged_ms,attempt_number,request_sha256,input_manifest_sha256,
+                      client_key,session_label,async_state)
+                 VALUES ('decision:shared','failed_checks','lineage-a','',?1,
+                         ?6,456,?7,?2,?3,?4,?5,'dispatching')",
+                rusqlite::params![
+                    request_record_id,
+                    request_sha,
+                    manifest_sha,
+                    client_key,
+                    session_label,
+                    resolver,
+                    shared_attempt_number
+                ],
+            )?;
+            Ok(connection.last_insert_rowid())
+        }
+
+        fn insert_attempt(
+            connection: &rusqlite::Connection,
+            request_record_id: &str,
+            request_sha: &str,
+            manifest_sha: &str,
+            client_key: &str,
+            shared_attempt_number: i64,
+        ) -> rusqlite::Result<i64> {
+            insert_attempt_with_route(
+                connection,
+                request_record_id,
+                request_sha,
+                manifest_sha,
+                client_key,
+                "local-managed-resolution",
+                None,
+                shared_attempt_number,
+            )
+        }
+
+        fn assert_rejected_without_mutation(
+            connection: &rusqlite::Connection,
+            reservation: &str,
+            description: &str,
+            insert: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<usize>,
+        ) {
+            let before = snapshot(connection, reservation).unwrap();
+            assert!(
+                insert(connection).is_err(),
+                "{description} must be rejected"
+            );
+            let after = snapshot(connection, reservation).unwrap();
+            assert_eq!(
+                after, before,
+                "{description} must not mutate proof, roots, bindings, or reservation state"
+            );
+        }
+
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,
+                      charged_ms,attempt_number,async_state)
+                 VALUES ('decision:shared','failed_checks','lineage-a','',
+                         'request:legacy','manual',123,1,'dispatching')",
+                [],
+            )
+            .unwrap();
+        drop_resolution_schema_29_for_legacy_fixture(store.connection()).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "UPDATE meta SET value='28'
+                     WHERE key IN ('schema_version','min_compatible_schema');",
+            )
+            .unwrap();
+        drop(store);
+
+        let mut migrated = open(host.path(), &[]).unwrap();
+        let legacy: (String, String, i64, Option<String>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT request_record_id,async_state,attempt_number,async_token
+                 FROM resolution_attempts WHERE decision_key='decision:shared'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy,
+            ("request:legacy".into(), "dispatching".into(), 1, None)
+        );
+
+        let request_sha = "a".repeat(64);
+        let source_sha = "f".repeat(64);
+        let manifest_sha = "b".repeat(64);
+        let trigger_sha = "c".repeat(64);
+        migrated
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_targets (target,issuer) VALUES ('target','issuer');
+                 INSERT INTO local_target_revisions (revision,target,body)
+                     VALUES ('revision','target',X'01');
+                 INSERT INTO local_target_revisions (revision,target,body)
+                     VALUES ('revision:other','target',X'11');
+                 INSERT INTO local_targets (target,issuer)
+                     VALUES ('target:other','issuer');
+                 UPDATE local_targets SET active_revision='revision'
+                     WHERE target='target';",
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_waves
+                     (wave,target,revision,sequence,body,phase,
+                      resolution_request_record_id,resolution_request_object,
+                      composition_source_record_id,composition_source_object)
+                 VALUES ('wave','target','revision',1,X'02','verifying',?1,?2,?3,?4)",
+                rusqlite::params!["request:managed", request_sha, "source:managed", source_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_waves
+                     (wave,target,revision,sequence,body,phase)
+                 VALUES ('wave:wrong-target','target:other','revision',4,X'12','completed');
+                 INSERT INTO local_waves
+                     (wave,target,revision,sequence,body,phase)
+                 VALUES ('wave:wrong-revision','target','revision:other',2,X'13','completed');",
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-wave-target','nonce:wrong-wave-target',
+                         'target','revision','wave:wrong-target',
+                         'reservation:wrong-wave-target',NULL,X'14',
+                         'completion_pending',X'00',1,1);
+                 INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-wave-revision','nonce:wrong-wave-revision',
+                         'target','revision','wave:wrong-revision',
+                         'reservation:wrong-wave-revision',NULL,X'15',
+                         'completion_pending',X'00',1,1);",
+            )
+            .unwrap();
+        let wrong_wave_target_proof = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
+                  request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:wrong-wave-target','target','issuer','epoch-1',
+                     'client-key:wrong-wave-target','wave:wrong-target',0,
+                     'request:managed',?1,'source:managed',?2,?3,?4,
+                     'project-policy','objective-policy','price-profile',
+                     'v1:1024:10:1024:4096:1024',X'16',1,999,100)",
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            wrong_wave_target_proof.is_err(),
+            "a proof cannot bind a reservation to a wave for another target"
+        );
+        let wrong_wave_target_proof_count: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_resolution_reservation_proofs
+                 WHERE reservation='reservation:wrong-wave-target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_wave_target_proof_count, 0);
+        let wrong_wave_revision_proof = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
+                  request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:wrong-wave-revision','target','issuer','epoch-1',
+                     'client-key:wrong-wave-revision','wave:wrong-revision',0,
+                     'request:managed',?1,'source:managed',?2,?3,?4,
+                     'project-policy','objective-policy','price-profile',
+                     'v1:1024:10:1024:4096:1024',X'17',1,999,100)",
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            wrong_wave_revision_proof.is_err(),
+            "a proof cannot bind a reservation to a different wave revision"
+        );
+        let wrong_wave_revision_proof_count: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_resolution_reservation_proofs
+                 WHERE reservation='reservation:wrong-wave-revision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_wave_revision_proof_count, 0);
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation','nonce','target','revision','wave',
+                         'reservation',NULL,X'03','completion_pending',X'00',1,1)",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:stale-version','nonce:stale-version','target',
+                         'revision','wave','reservation:stale-version',NULL,X'0d',
+                         'reserved',X'00',0,0)",
+                [],
+            )
+            .unwrap();
+        let stale_version_proof = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
+                  request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:stale-version','target','issuer','epoch-1',
+                     'client-key:stale-version','wave',1,'request:managed',?1,
+                     'source:managed',?2,?3,?4,'project-policy','objective-policy',
+                     'price-profile','v1:1024:10:1024:4096:1024',X'0e',1,999,100)",
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            stale_version_proof.is_err(),
+            "proof creation must bind the expected current target version"
+        );
+        let stale_version_proof_count: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_resolution_reservation_proofs
+                 WHERE reservation='reservation:stale-version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_version_proof_count, 0);
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,
+                      charged_ms,attempt_number,request_sha256,input_manifest_sha256,
+                      client_key,async_state)
+                 VALUES ('decision:shared','failed_checks','lineage-a','',
+                         'request:managed','local-managed-resolution',456,2,?1,?2,
+                         'client-key','dispatching')",
+                rusqlite::params![request_sha, manifest_sha],
+            )
+            .unwrap();
+        let attempt_id = migrated.connection().last_insert_rowid();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation','target','issuer','epoch-1','client-key','wave',0,
+                         'request:managed',?1,'source:managed',?2,?3,?4,
+                         'project-policy','objective-policy',
+                         'price-profile','v1:1024:10:1024:4096:1024',X'04',1,999,100)",
+                rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_roots
+                     (reservation,lineage_record_id) VALUES ('reservation','lineage-a')",
+                [],
+            )
+            .unwrap();
+
+        // Each invalid insert reaches the binding predicate for the intended
+        // proof axis before the valid row is created below.
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong shared comparable attempt number",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-shared-attempt",
+                    "reservation",
+                    attempt_id,
+                    1,
+                    1,
+                )
+            },
+        );
+
+        // Keep NEW.reservation_attempt_number valid and vary the persisted
+        // reservation count, so the r.attempts equality guard is what rejects
+        // the insert (rather than the binding column CHECK).
+        migrated
+            .connection()
+            .execute(
+                "UPDATE local_budget_reservations SET attempts=2
+                 WHERE reservation='reservation'",
+                [],
+            )
+            .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong Local reservation attempt count",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-reservation-attempt",
+                    "reservation",
+                    attempt_id,
+                    2,
+                    1,
+                )
+            },
+        );
+        let attempts_after_rejection: i64 = migrated
+            .connection()
+            .query_row(
+                "SELECT attempts FROM local_budget_reservations
+                 WHERE reservation='reservation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts_after_rejection, 2,
+            "the failed binding must not change the persisted Local attempt count"
+        );
+        migrated
+            .connection()
+            .execute(
+                "UPDATE local_budget_reservations SET attempts=1
+                 WHERE reservation='reservation'",
+                [],
+            )
+            .unwrap();
+
+        // The wrapper source pair is current-wave authority too. A matching
+        // charged attempt cannot be bound to a different frozen source.
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-source','nonce:wrong-source','target',
+                         'revision','wave','reservation:wrong-source',NULL,X'09',
+                         'completion_pending',X'00',1,1)",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation:wrong-source','target','issuer','epoch-1',
+                         'client-key:wrong-source','wave',0,'request:managed',?1,
+                         'source:wrong',?2,?3,?4,'project-policy','objective-policy',
+                         'price-profile','v1:1024:10:1024:4096:1024',X'0a',1,999,100)",
+                rusqlite::params![request_sha, &"0".repeat(64), manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_roots
+                     (reservation,lineage_record_id)
+                 VALUES ('reservation:wrong-source','lineage-a')",
+                [],
+            )
+            .unwrap();
+        let wrong_source_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key:wrong-source",
+            3,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation:wrong-source",
+            "wrong composition source wrapper identity",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-source",
+                    "reservation:wrong-source",
+                    wrong_source_attempt,
+                    3,
+                    1,
+                )
+            },
+        );
+
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-source-object','nonce:wrong-source-object',
+                         'target','revision','wave','reservation:wrong-source-object',
+                         NULL,X'0b','completion_pending',X'00',1,1)",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation:wrong-source-object','target','issuer','epoch-1',
+                         'client-key:wrong-source-object','wave',0,'request:managed',?1,
+                         'source:managed',?2,?3,?4,'project-policy','objective-policy',
+                         'price-profile','v1:1024:10:1024:4096:1024',X'0c',1,999,100)",
+                rusqlite::params![request_sha, &"0".repeat(64), manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_roots
+                     (reservation,lineage_record_id)
+                 VALUES ('reservation:wrong-source-object','lineage-a')",
+                [],
+            )
+            .unwrap();
+        let wrong_source_object_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key:wrong-source-object",
+            3,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation:wrong-source-object",
+            "wrong composition source object digest",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-source-object",
+                    "reservation:wrong-source-object",
+                    wrong_source_object_attempt,
+                    3,
+                    1,
+                )
+            },
+        );
+
+        let wrong_request_record_attempt = insert_attempt(
+            migrated.connection(),
+            "request:other",
+            &request_sha,
+            &manifest_sha,
+            "client-key",
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong request record ID",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-request-record",
+                    "reservation",
+                    wrong_request_record_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
+        let wrong_request_object_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &"d".repeat(64),
+            &manifest_sha,
+            "client-key",
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong request object digest",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-request-object",
+                    "reservation",
+                    wrong_request_object_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
+        let wrong_manifest_object_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &"e".repeat(64),
+            "client-key",
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong manifest object digest",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-manifest-object",
+                    "reservation",
+                    wrong_manifest_object_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
+        let manual_attempt = insert_attempt_with_route(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key",
+            "manual",
+            None,
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "manual attempt cannot receive a managed binding",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:manual-attempt",
+                    "reservation",
+                    manual_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
+        let labeled_managed_attempt = insert_attempt_with_route(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key",
+            "local-managed-resolution",
+            Some("manual-session"),
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "session-labeled attempt cannot receive a managed binding",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:labeled-attempt",
+                    "reservation",
+                    labeled_managed_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:no-roots','nonce:no-roots','target','revision',
+                         'wave','reservation:no-roots',NULL,X'07',
+                         'completion_pending',X'00',1,1)",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation:no-roots','target','issuer','epoch-1',
+                         'client-key:no-roots','wave',0,'request:managed',?1,
+                         'source:managed',?2,?3,?4,
+                         'project-policy','objective-policy','price-profile',
+                         'v1:1024:10:1024:4096:1024',X'08',1,999,100)",
+                rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        let no_roots_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key:no-roots",
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation:no-roots",
+            "binding without selected lineage roots",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:no-roots",
+                    "reservation:no-roots",
+                    no_roots_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
+        // Recheck reservation and wave identity at binding time too. The
+        // proof was valid when inserted; these direct fixture mutations model
+        // stale or corrupted state reaching the durable trigger boundary.
+        migrated
+            .connection()
+            .execute_batch(
+                "UPDATE local_targets SET active_revision='revision:other'
+                 WHERE target='target';
+                 UPDATE local_budget_reservations SET revision='revision:other'
+                 WHERE reservation='reservation';",
+            )
+            .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wave revision must still match the reservation revision",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:stale-reservation-revision",
+                    "reservation",
+                    attempt_id,
+                    2,
+                    1,
+                )
+            },
+        );
+        migrated
+            .connection()
+            .execute_batch(
+                "UPDATE local_targets SET active_revision='revision'
+                 WHERE target='target';
+                 UPDATE local_budget_reservations SET revision='revision'
+                 WHERE reservation='reservation';
+                 UPDATE local_waves SET target='target:other' WHERE wave='wave';",
+            )
+            .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wave target must still match the proof target",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:stale-wave-target",
+                    "reservation",
+                    attempt_id,
+                    2,
+                    1,
+                )
+            },
+        );
+        migrated
+            .connection()
+            .execute(
+                "UPDATE local_waves SET target='target' WHERE wave='wave'",
+                [],
+            )
+            .unwrap();
+
+        insert_binding(
+            migrated.connection(),
+            "binding",
+            "reservation",
+            attempt_id,
+            2,
+            1,
+        )
+        .unwrap();
+        let counters: (i64, i64) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT shared_attempt_number,reservation_attempt_number
+                 FROM local_managed_resolution_attempt_bindings WHERE binding_id='binding'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counters, (2, 1));
+
+        let duplicate_binding = migrated.connection().execute(
+            "INSERT INTO local_managed_resolution_attempt_bindings
+                 (binding_id,reservation,attempt_id,authority_epoch,
+                  reservation_version,shared_attempt_number,
+                  reservation_attempt_number,route,created_ms)
+             VALUES ('binding:duplicate','reservation',?1,'epoch-1',1,2,1,
+                     'local_managed_resolution_v1',102)",
+            [attempt_id],
+        );
+        assert!(
+            duplicate_binding.is_err(),
+            "a managed reservation binds once"
+        );
+        let changed_proof = migrated.connection().execute(
+            "UPDATE local_resolution_reservation_proofs
+             SET composition_source_record_id='source:changed'
+             WHERE reservation='reservation'",
+            [],
+        );
+        assert!(
+            changed_proof.is_err(),
+            "the exact request/source proof is immutable"
+        );
+        let changed_request_proof = migrated.connection().execute(
+            "UPDATE local_resolution_reservation_proofs
+             SET request_record_id='request:changed' WHERE reservation='reservation'",
+            [],
+        );
+        assert!(
+            changed_request_proof.is_err(),
+            "the exact request proof is immutable"
+        );
+        let appended_root = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_roots
+                 (reservation,lineage_record_id) VALUES ('reservation','lineage-b')",
+            [],
+        );
+        assert!(
+            appended_root.is_err(),
+            "the selected root set closes at binding"
+        );
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:retry','nonce:retry','target','revision','wave',
+                         'reservation:retry',NULL,X'05','reserved',X'00',0,0)",
+                [],
+            )
+            .unwrap();
+        let cross_epoch_key = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,
+                  expected_version,request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:retry','target','issuer','epoch-2','client-key','wave',0,
+                     'request:other',?1,'source:other',?2,?3,?4,
+                     'project-policy','objective-policy',
+                     'price-profile','v1:1024:10:1024:4096:1024',X'06',1,999,102)",
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            cross_epoch_key.is_err(),
+            "idempotency scope remains stable across authority epochs"
+        );
     }
 
     #[test]
