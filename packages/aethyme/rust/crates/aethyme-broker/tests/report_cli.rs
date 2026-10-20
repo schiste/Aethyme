@@ -1343,10 +1343,10 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
     drop(broker);
     let after_successful_reconciliation = run_with_env(tmp.path(), &args, &environment);
     assert!(!after_successful_reconciliation.status.success());
-    let reconciliation_stderr = String::from_utf8_lossy(&after_successful_reconciliation.stderr);
+    let reconciliation_message = json_error::message(&after_successful_reconciliation);
     assert!(
-        reconciliation_stderr.contains("already has completed filing operation"),
-        "{reconciliation_stderr}"
+        reconciliation_message.contains("already has completed filing operation"),
+        "{reconciliation_message}"
     );
     assert_eq!(issue_creates(&calls_path), 1);
 
