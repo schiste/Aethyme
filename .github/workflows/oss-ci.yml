@@ -97,6 +97,10 @@ jobs:
           printf '# Demo\n' > README.md
           git add -A && git commit -qm init
 
+          # Standalone graph generation precedes broker enrollment. Once the
+          # repository is managed, canonical graph writes use graph refresh.
+          aethyme-graph-index --repo-root "$TARGET" --repo-name demo --engine-version ci
+
           # Canonical repository enrollment must work from only the installed
           # binary pair. The read-only verification command is the CI policy
           # gate repositories should retain after committing deployment files.
@@ -137,8 +141,8 @@ jobs:
             exit 1
           fi
 
-          # Index + the Explore chain and both readers over one saved file.
-          aethyme-graph-index --repo-root "$TARGET" --repo-name demo --engine-version ci
+          # Materialize the generated graph and exercise Explore plus both
+          # readers after enrollment, without bypassing canonical write guards.
           aethyme-engine-cli index --repo .
           aethyme explore --repo . --request "where is main defined" --format answer-json > explore.json
           grep -q '"schema_version": "aethyme-explore-v1"' explore.json

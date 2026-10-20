@@ -56,15 +56,22 @@ pub fn bootstrap_repo(
         return Err(BootstrapError::EmptyEngineVersion);
     }
 
+    crate::ensure_isolated_graph_write(repo_root).map_err(BootstrapError::Io)?;
     let graph_dir = graph_dir(repo_root);
     let index_dir = index_dir(repo_root);
     fs::create_dir_all(&index_dir).map_err(BootstrapError::Io)?;
 
     let gitattributes = graph_dir.join(".gitattributes");
-    fs::write(&gitattributes, GITATTRIBUTES_CONTENT).map_err(BootstrapError::Io)?;
+    crate::disk::atomic_write(repo_root, &gitattributes, GITATTRIBUTES_CONTENT.as_bytes())
+        .map_err(BootstrapError::Io)?;
 
     let version_file = engine_version_path(repo_root);
-    fs::write(&version_file, format!("{engine_version}\n")).map_err(BootstrapError::Io)?;
+    crate::disk::atomic_write(
+        repo_root,
+        &version_file,
+        format!("{engine_version}\n").as_bytes(),
+    )
+    .map_err(BootstrapError::Io)?;
 
     Ok(BootstrapPaths {
         graph_dir,

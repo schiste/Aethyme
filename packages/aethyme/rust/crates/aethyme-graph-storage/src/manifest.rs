@@ -64,15 +64,13 @@ pub fn write_graph_authority_manifest(
     repository: &str,
     engine_version: &str,
 ) -> Result<GraphAuthorityManifest, GraphManifestError> {
+    crate::ensure_isolated_graph_write(repo_root).map_err(|source| GraphManifestError::Io {
+        path: repo_root.to_path_buf(),
+        source,
+    })?;
     let manifest = GraphAuthorityManifest::build(repo_root, revision, repository, engine_version)?;
     let path = repo_root.join(GRAPH_MANIFEST_RELPATH);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| GraphManifestError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::write(&path, manifest.encode()?)
+    crate::disk::atomic_write(repo_root, &path, &manifest.encode()?)
         .map_err(|source| GraphManifestError::Io { path, source })?;
     Ok(manifest)
 }
