@@ -278,15 +278,37 @@ exec /bin/sleep 20
     )
     .unwrap();
     std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+
+    // The CLI needs Git on PATH before it reaches the provider. Keep that
+    // dependency available without adding system directories that could also
+    // expose a live `gh` executable.
+    let trusted_git =
+        std::env::split_paths(&std::env::var_os("PATH").expect("test runner provides a PATH"))
+            .filter_map(|directory| directory.join("git").canonicalize().ok())
+            .find(|candidate| {
+                let Ok(metadata) = std::fs::metadata(candidate) else {
+                    return false;
+                };
+                let mode = metadata.permissions().mode();
+                metadata.is_file()
+                    && mode & 0o111 != 0
+                    && (metadata.uid() == 0 || metadata.uid() == uid)
+                    && mode & 0o022 == 0
+            })
+            .expect("test runner PATH contains a trusted Git executable");
+    let fixture_git = fake_bin.join("git");
+    std::os::unix::fs::symlink(&trusted_git, &fixture_git).unwrap();
+    assert_eq!(fixture_git.canonicalize().unwrap(), trusted_git);
 
     // This mirrors the production debug-test resolver's acceptance checks.
-    // Prove the fixture executable will be selected before launching the CLI;
-    // the test must never fall through to an installed, live gh.
+    // Prove the fixture executable will be selected before launching the CLI.
+    // PATH contains only this fake provider and Git, so it cannot fall through
+    // to an installed, live gh.
     let canonical_fake_gh = fake_gh.canonicalize().unwrap();
     let metadata = std::fs::metadata(&canonical_fake_gh).unwrap();
     let mode = metadata.permissions().mode();
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
     assert!(metadata.is_file());
     assert!(metadata.uid() == 0 || metadata.uid() == uid);
     assert_ne!(mode & 0o111, 0, "fake gh must be executable");
@@ -301,7 +323,7 @@ exec /bin/sleep 20
         .unwrap();
     assert_eq!(
         first_candidate, canonical_fake_gh,
-        "debug gh resolution must choose the prevalidated fixture before trusted system directories"
+        "debug gh resolution must choose the prevalidated fixture executable"
     );
     let search_path = search_path.to_str().expect("fixture PATH is UTF-8");
 
