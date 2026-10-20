@@ -546,13 +546,12 @@ fn auto_promotion_releases_the_verification_slot_before_requeue() {
     )
     .unwrap();
     let child_session = a.id.to_string();
-    let mut child_command = common::broker_cli(
+    let mut child_command = fixture_cli(
         env!("CARGO_BIN_EXE_broker-cli-shim"),
         &["submit", "--session", &child_session],
+        tmp.path(),
+        tmp.owner_path(),
     );
-    broker
-        .configure_storage_context_for_child(&mut child_command)
-        .unwrap();
     drop(broker);
 
     let mut child = child_command.current_dir(tmp.path()).spawn().unwrap();
@@ -811,15 +810,41 @@ fn contract_tracked_repo(root: &Path, name: &str) -> (Broker, i64, std::path::Pa
     (broker, session.id, worktree)
 }
 
-fn cli_submit_command(broker: &Broker, root: &Path, session: i64) -> Command {
+fn fixture_cli(binary: &str, args: &[&str], repository: &Path, fixture_owner: &Path) -> Command {
+    let owner = fixture_owner
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let repository = repository
+        .canonicalize()
+        .expect("canonicalize fixture repository");
+    let host_state = common::fixture_host_state_dir(&owner);
+    let mut command = common::broker_cli_for_fixture(binary, args, &owner);
+    command
+        .env("AETHYME_BROKER_DB", repository.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", owner.join("worktrees"))
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        );
+    command
+}
+
+fn cli_submit_command(root: &Path, session: i64) -> Command {
     let session = session.to_string();
-    let mut command = common::broker_cli(
+    let owner = root
+        .parent()
+        .expect("fixture repository has an owning temporary directory");
+    let mut command = fixture_cli(
         env!("CARGO_BIN_EXE_broker-cli-shim"),
         &["submit", "--session", &session],
+        root,
+        owner,
     );
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
     command.current_dir(root);
     command
 }
@@ -831,7 +856,7 @@ fn submit_refuses_an_undeclared_tracked_removal_before_any_gate_runs() {
     let tmp = common::FixtureRepository::new();
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "undeclared");
     commit_edit(&worktree, "src/a.py", "a = 2\n");
-    let mut command = cli_submit_command(&broker, tmp.path(), session);
+    let mut command = cli_submit_command(tmp.path(), session);
     drop(broker);
 
     let output = command.output().unwrap();
@@ -863,7 +888,7 @@ fn submit_preflight_ignores_uncommitted_tracked_removals() {
     let (broker, session, worktree) = contract_tracked_repo(tmp.path(), "uncommitted");
     commit_edit(&worktree, "src/b.py", "b = 2\n");
     std::fs::write(worktree.join("src/a.py"), "a = 2\n").unwrap();
-    let mut command = cli_submit_command(&broker, tmp.path(), session);
+    let mut command = cli_submit_command(tmp.path(), session);
     drop(broker);
 
     let output = command.output().unwrap();
@@ -1146,7 +1171,7 @@ fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_foll
     assert_eq!(plan.pending_commits, vec![followup_head.clone()]);
     assert_eq!(plan.digest.len(), 64);
     let session_id = session.id.to_string();
-    let mut cli_command = common::broker_cli(
+    let mut cli_command = fixture_cli(
         env!("CARGO_BIN_EXE_broker-cli-shim"),
         &[
             "advanced",
@@ -1156,10 +1181,9 @@ fn reviewed_checkpoint_recovery_preserves_head_and_reanchors_without_hiding_foll
             &session_id,
             "--json",
         ],
+        tmp.path(),
+        tmp.owner_path(),
     );
-    broker
-        .configure_storage_context_for_child(&mut cli_command)
-        .unwrap();
     let cli = cli_command.current_dir(&worktree).output().unwrap();
     assert!(
         cli.status.success(),
