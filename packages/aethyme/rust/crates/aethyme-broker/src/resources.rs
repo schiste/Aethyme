@@ -3353,6 +3353,50 @@ impl HostResourceCoordinator {
         }
         Ok(leases)
     }
+
+    /// Read active leases with a caller-owned time and count bound. `None`
+    /// means the inventory is incomplete and must not be interpreted as an
+    /// empty or complete lease set.
+    pub(crate) fn list_until(
+        &self,
+        include_released: bool,
+        entry_budget: usize,
+        mut expired: impl FnMut() -> bool,
+    ) -> Result<Option<Vec<HostResourceLease>>, HostResourceError> {
+        let sql = if include_released {
+            "SELECT lease_id FROM resource_leases ORDER BY generation"
+        } else {
+            "SELECT lease_id FROM resource_leases WHERE state!='released' ORDER BY generation"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let mut leases = Vec::new();
+        let mut rows_seen = 0_usize;
+        loop {
+            if expired() {
+                return Ok(None);
+            }
+            let Some(row) = rows.next()? else {
+                break;
+            };
+            if rows_seen >= entry_budget {
+                return Ok(None);
+            }
+            rows_seen = rows_seen.saturating_add(1);
+            let id = row.get::<_, String>(0)?;
+            if let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? {
+                if lease.state == HostLeaseState::Active && lease.expires_at <= now_ms() {
+                    lease.state = HostLeaseState::Quarantined;
+                }
+                leases.push(lease);
+            }
+        }
+        if expired() {
+            Ok(None)
+        } else {
+            Ok(Some(leases))
+        }
+    }
 }
 
 struct ResourceChild {
