@@ -118,6 +118,13 @@ blocked.
    Read the pull-request body back and compare it with the approved file before
    handing the draft off for review.
 
+   For notes and other free-form broker text passed through a shell, prefer
+   literal argv via Python `subprocess.run([...])` or a quoted here-doc; do
+   not inline text containing shell substitutions or quote characters. For
+   PR descriptions, write the reviewed body to a file and pass
+   `--body-file`, then read it back. If shell parsing or expansion reports
+   an error, confirm whether the broker operation ran before retrying.
+
    `--pr` opens a draft PR, or reports the one already open. The policy is
    the authorization for exactly these two things -- pushing your own session
    branch and opening a draft PR -- and nothing more: it does not authorize

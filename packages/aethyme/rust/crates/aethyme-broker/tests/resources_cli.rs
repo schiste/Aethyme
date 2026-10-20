@@ -9,6 +9,11 @@ use std::process::{Command, Output};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+use aethyme_broker::{
+    HostLeaseState, HostResourceCoordinator, HostResourceKind, HostResourceRequest,
+    HostResourceRequirement,
+};
+
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
 fn run(cwd: &Path, state: &Path, args: &[&str]) -> Output {
@@ -18,6 +23,102 @@ fn run(cwd: &Path, state: &Path, args: &[&str]) -> Output {
         .env("AETHYME_HOST_STATE_DIR", state)
         .output()
         .unwrap()
+}
+
+#[test]
+fn reap_reports_unproven_live_and_unverifiable_holders_without_releasing_allocations() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let database = state.join("host-resources.db");
+    let mut coordinator = HostResourceCoordinator::open(&database).unwrap();
+    let request = |request_id: &str, holder_pid| HostResourceRequest {
+        schema_version: 1,
+        request_id: request_id.into(),
+        repository: "owner/repo".into(),
+        worktree_fingerprint: request_id.into(),
+        run_id: format!("run-{request_id}"),
+        ttl_seconds: 60,
+        holder_pid: Some(holder_pid),
+        resources: vec![
+            HostResourceRequirement {
+                key: "workers".into(),
+                resource: HostResourceKind::Capacity {
+                    pool: "diagnostics".into(),
+                    units: 1,
+                    limit: 4,
+                },
+            },
+            HostResourceRequirement {
+                key: "database".into(),
+                resource: HostResourceKind::ExclusiveKey {
+                    name: format!("db-{request_id}"),
+                },
+            },
+        ],
+    };
+
+    let live = coordinator
+        .acquire(&request("live", std::process::id()))
+        .unwrap();
+    let unverifiable = coordinator
+        .acquire(&request("unverifiable", u32::MAX))
+        .unwrap();
+    for grant in [&live, &unverifiable] {
+        coordinator
+            .quarantine(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+    }
+    let before = coordinator.list(false).unwrap();
+    let live_lease_id = live.lease.lease_id.clone();
+    let unverifiable_lease_id = unverifiable.lease.lease_id.clone();
+    drop(coordinator);
+
+    let reaped = run(temp.path(), &state, &["gc", "reap", "--json"]);
+    assert!(
+        reaped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reaped.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&reaped.stdout).unwrap();
+    assert_eq!(report["dead_holders_seen"], 0);
+    assert_eq!(report["reclaimed_capacity_units"], 0);
+    let not_reaped = report["not_reaped"].as_array().unwrap();
+    assert_eq!(not_reaped.len(), 2);
+    for lease_id in [&live_lease_id, &unverifiable_lease_id] {
+        assert!(not_reaped.iter().any(|entry| {
+            entry["lease_id"].as_str() == Some(lease_id.as_str())
+                && entry["reason"] == "not_proven_gone"
+        }));
+    }
+
+    let after = HostResourceCoordinator::open(&database)
+        .unwrap()
+        .list(false)
+        .unwrap();
+    assert_eq!(after.len(), before.len());
+    for prior in before {
+        let retained = after
+            .iter()
+            .find(|lease| lease.lease_id == prior.lease_id)
+            .unwrap();
+        assert_eq!(retained.state, HostLeaseState::Quarantined);
+        assert_eq!(retained.allocations, prior.allocations);
+    }
+
+    let human = run(temp.path(), &state, &["gc", "reap"]);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains(&live_lease_id));
+    assert!(human.contains(&unverifiable_lease_id));
+    assert!(human.contains("not_proven_gone"));
 }
 
 #[cfg(unix)]
