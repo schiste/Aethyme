@@ -124,6 +124,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   positive Cargo run; a `cp -p` restore can otherwise reuse mutation output. If
   restoration cannot be proven, retain the lock and backup and report cleanup
   as unknown. SIGKILL or power loss may require manual recovery.
+  Bound mutation readback and restoration by the larger of the exact original
+  and mutant byte lengths plus one byte. Before touching source, exercise the
+  actual mutation and restoration on scratch files seeded with pinned source bytes;
+  equal-sized toy replacements cannot validate a size-changing mutation.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only
