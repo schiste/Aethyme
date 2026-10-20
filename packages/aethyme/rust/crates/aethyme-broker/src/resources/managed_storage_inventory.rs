@@ -1819,7 +1819,7 @@ mod tests {
 
     #[test]
     fn incremental_inventory_poll_budgets_preserve_the_complete_receipt() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         std::fs::create_dir_all(fixture.materialization_root.join("nested")).unwrap();
         std::fs::write(fixture.materialization_root.join("z-file"), b"z").unwrap();
         std::fs::write(
