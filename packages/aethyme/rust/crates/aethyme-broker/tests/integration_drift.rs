@@ -11,6 +11,9 @@ use std::process::Command;
 
 use aethyme_broker::{AutomaticIntegrationCleanupState, Broker, StatusAdviceSeverity};
 
+#[path = "common/isolation.rs"]
+mod isolation;
+
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -32,8 +35,8 @@ fn git(repo: &Path, args: &[&str]) -> String {
 /// A repository whose `main` tracks `origin/main`, with integration pinned at
 /// the commit `main` started from, then `origin/main` advanced by `ahead`
 /// commits. Integration is therefore a strict ancestor of upstream.
-fn fixture(ahead: usize) -> (tempfile::TempDir, Broker) {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture(ahead: usize) -> (isolation::FixtureRepo, Broker) {
+    let tmp = isolation::FixtureRepo::new();
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
     std::fs::write(root.join("README.md"), "fixture\n").unwrap();
@@ -73,7 +76,7 @@ fn fixture(ahead: usize) -> (tempfile::TempDir, Broker) {
     git(root, &["config", "branch.main.remote", "origin"]);
     git(root, &["config", "branch.main.merge", "refs/heads/main"]);
 
-    let broker = Broker::open(root).unwrap();
+    let broker = isolation::open(root);
     (tmp, broker)
 }
 
@@ -211,7 +214,7 @@ fn verify_only_status_reports_leftover_integration_work_without_refresh() {
     let root = tmp.path();
     add_leftover_integration_work(root, 2);
     set_promote_mode(root, "verify-only");
-    let mut broker = Broker::open(root).unwrap();
+    let mut broker = isolation::open(root);
 
     let status = broker.status_current(0).unwrap();
     let advice = status
@@ -238,7 +241,7 @@ fn verify_only_status_reports_leftover_integration_work_without_refresh() {
 fn verify_only_status_is_silent_when_integration_holds_nothing_of_its_own() {
     let (tmp, _broker) = fixture(2);
     set_promote_mode(tmp.path(), "verify-only");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
 
     let status = broker.status_current(0).unwrap();
     assert!(
@@ -257,7 +260,7 @@ fn verify_only_status_is_silent_when_integration_holds_nothing_of_its_own() {
 fn promoting_status_does_not_report_pending_layer_as_leftover() {
     let (tmp, _broker) = fixture(1);
     add_leftover_integration_work(tmp.path(), 1);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
 
     let status = broker.status_current(0).unwrap();
     assert!(
@@ -271,14 +274,9 @@ fn promoting_status_does_not_report_pending_layer_as_leftover() {
 }
 
 fn doctor_cli(root: &Path, args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
-        .args(["status", "doctor"])
-        .args(args)
-        .current_dir(root)
-        .env(
-            "AETHYME_HOST_STATE_DIR",
-            root.join(".aethyme/test-host-state"),
-        )
+    let mut arguments = vec!["status", "doctor"];
+    arguments.extend_from_slice(args);
+    let output = isolation::command(env!("CARGO_BIN_EXE_broker-cli-shim"), root, &arguments)
         .output()
         .unwrap();
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -288,12 +286,64 @@ fn doctor_cli(root: &Path, args: &[&str]) -> String {
 /// with the same dry-run next action, and leave every ref where it was.
 #[test]
 fn verify_only_doctor_reports_leftover_integration_work() {
-    let (tmp, _broker) = fixture(1);
+    let (tmp, mut setup_broker) = fixture(1);
     let root = tmp.path();
+    // A fresh isolated host has no worktree-history registry. Establish it
+    // through the real lifecycle so doctor can complete its orphan inventory;
+    // missing history must continue to report incomplete health in production.
+    let fixture_upstream = git(root, &["rev-parse", "refs/remotes/origin/main"]);
+    let fixture_integration = git(root, &["rev-parse", "refs/heads/aethyme/integration"]);
+    git(
+        root,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let seed = setup_broker
+        .start_worktree(
+            "initialize fixture worktree history",
+            Some("Fixture <fixture@example.invalid>"),
+        )
+        .unwrap();
+    let finished = setup_broker.finish(seed.id).unwrap();
+    assert!(finished.closed && finished.cleanup_safe, "{finished:?}");
+    assert!(finished.dirty_paths.is_empty(), "{finished:?}");
+    assert_eq!(finished.unsubmitted_commits, 0, "{finished:?}");
+    assert!(!finished.pending_work.present, "{finished:?}");
+    assert!(finished.cleanup.completed, "{finished:?}");
+    assert!(finished.cleanup.worktree_removed, "{finished:?}");
+    assert!(finished.cleanup.branch_removed, "{finished:?}");
+    assert!(!std::path::Path::new(&seed.worktree_path).exists());
+    // The offline remote is this repository itself: lifecycle refresh may
+    // replace the manually staged tracking ref. Restore scenario inputs before
+    // constructing the leftover commits and taking the read-only snapshots.
+    git(
+        root,
+        &["update-ref", "refs/remotes/origin/main", &fixture_upstream],
+    );
+    git(
+        root,
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &fixture_integration,
+        ],
+    );
+    assert_eq!(
+        git(root, &["rev-parse", "refs/remotes/origin/main"]),
+        fixture_upstream
+    );
+    assert_eq!(
+        git(root, &["rev-parse", "refs/heads/aethyme/integration"]),
+        fixture_integration
+    );
+    drop(setup_broker);
     let leftover = add_leftover_integration_work(root, 2);
     set_promote_mode(root, "verify-only");
     let upstream = git(root, &["rev-parse", "refs/remotes/origin/main"]);
-    let mut broker = Broker::open(root).unwrap();
+    let mut broker = isolation::open(root);
 
     let report = broker.doctor().unwrap();
     let advice = report
@@ -309,7 +359,10 @@ fn verify_only_doctor_reports_leftover_integration_work() {
     );
     let command = "aethyme broker advanced integration reconcile --upstream origin/main --dry-run";
     assert_eq!(advice.commands, vec![command]);
-    assert!(report.healthy(), "leftover work is reported, not unhealthy");
+    assert!(
+        report.healthy(),
+        "leftover work is reported, not unhealthy: {report:?}"
+    );
     drop(broker);
 
     let json: serde_json::Value =
@@ -343,7 +396,7 @@ fn verify_only_doctor_reports_leftover_integration_work() {
 fn verify_only_doctor_is_silent_when_integration_holds_nothing_of_its_own() {
     let (tmp, _broker) = fixture(2);
     set_promote_mode(tmp.path(), "verify-only");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
 
     assert!(broker.doctor().unwrap().leftover_integration_work.is_none());
     drop(broker);
@@ -358,7 +411,7 @@ fn verify_only_doctor_is_silent_when_integration_holds_nothing_of_its_own() {
 fn promoting_doctor_does_not_report_pending_layer_as_leftover() {
     let (tmp, _broker) = fixture(1);
     add_leftover_integration_work(tmp.path(), 1);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
 
     assert!(broker.doctor().unwrap().leftover_integration_work.is_none());
 }
