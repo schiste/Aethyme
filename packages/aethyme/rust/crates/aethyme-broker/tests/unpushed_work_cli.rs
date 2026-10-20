@@ -282,7 +282,18 @@ fn finish_refuses_unpushed_work_under_the_push_lane() {
         "{}",
         String::from_utf8_lossy(&text_finish.stderr)
     );
-    assert!(String::from_utf8_lossy(&text_finish.stdout).contains("finish: blocked"));
+    assert!(
+        String::from_utf8_lossy(&text_finish.stdout)
+            .contains(&format!("Finish session {session}: blocked")),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&text_finish.stdout),
+        String::from_utf8_lossy(&text_finish.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&text_finish.stderr).contains("session is not ready to finish"),
+        "stderr: {}",
+        String::from_utf8_lossy(&text_finish.stderr)
+    );
 
     let close = run(&fixture.repo, &["finish", "close", "--session", &id]);
     assert!(!close.status.success());
