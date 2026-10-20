@@ -1749,7 +1749,7 @@ impl Broker {
             return self.resume_interrupted_finish_cleanup(session, &proof);
         }
         if session.origin == SessionOrigin::Adopted {
-            if worktree_path.exists() {
+            if worktree_path_is_real_directory(&worktree_path, session_id)? {
                 if !force {
                     let (disposition, reason, _) =
                         self.cleanup_eligibility(session_id, &worktree_path)?;
@@ -1764,6 +1764,7 @@ impl Broker {
                 self.repo
                     .worktree_remove_registered(&worktree_path, force)?;
             }
+            require_worktree_path_absent(&worktree_path, session_id)?;
             self.store
                 .set_session_status(session_id, SessionStatus::Cleaned, None)?;
             return Ok(());
@@ -1794,11 +1795,12 @@ impl Broker {
             });
         }
 
-        if worktree_path.exists() {
+        if worktree_path_is_real_directory(&worktree_path, session_id)? {
             self.refuse_live_checkout(session_id, &worktree_path)?;
             self.repo
                 .worktree_remove_registered(&worktree_path, force)?;
         }
+        require_worktree_path_absent(&worktree_path, session_id)?;
         if let Some(branch_tip) = item.and_then(|item| item.branch_tip)
             && session.origin == SessionOrigin::Spawned
         {
@@ -1838,6 +1840,45 @@ impl Broker {
             }
         }
         Ok(())
+    }
+}
+
+fn worktree_path_is_real_directory(path: &Path, session_id: i64) -> Result<bool, BrokerOpError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(BrokerOpError::DirtyWorktree {
+                id: session_id,
+                reason: format!(
+                    "worktree path {} is not a real directory; preserved the path and session, and did not delete the branch",
+                    path.display()
+                ),
+            })
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(BrokerError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+        .into()),
+    }
+}
+
+fn require_worktree_path_absent(path: &Path, session_id: i64) -> Result<(), BrokerOpError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(BrokerOpError::DirtyWorktree {
+            id: session_id,
+            reason: format!(
+                "Git reported worktree removal but {} still exists; preserved the path, branch, and session for inspection",
+                path.display()
+            ),
+        }),
+        Err(source) => Err(BrokerError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+        .into()),
     }
 }
 
@@ -2097,6 +2138,19 @@ mod registered_removal_failure_tests {
     use std::process::Command;
     use std::time::Duration;
 
+    fn initialized_repository(root: &Path) -> std::path::PathBuf {
+        let repository = root.join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.name", "Cleanup test"]);
+        git(
+            &repository,
+            &["config", "user.email", "cleanup@example.invalid"],
+        );
+        git(&repository, &["commit", "--allow-empty", "-qm", "initial"]);
+        repository
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let mut command = Command::new("git");
         let git_keys = std::env::vars_os()
@@ -2118,15 +2172,7 @@ mod registered_removal_failure_tests {
     #[test]
     fn registered_cleanup_preserves_checkout_after_git_removal_timeout() {
         let owner = tempfile::tempdir().unwrap();
-        let repository = owner.path().join("repository");
-        std::fs::create_dir_all(&repository).unwrap();
-        git(&repository, &["init", "-q", "-b", "main"]);
-        git(&repository, &["config", "user.name", "Cleanup test"]);
-        git(
-            &repository,
-            &["config", "user.email", "cleanup@example.invalid"],
-        );
-        git(&repository, &["commit", "--allow-empty", "-qm", "initial"]);
+        let repository = initialized_repository(owner.path());
 
         let worktree = owner.path().join("registered-worktree");
         let worktree_text = worktree.to_string_lossy().into_owned();
@@ -2165,6 +2211,182 @@ mod registered_removal_failure_tests {
                 .resolve_ref("refs/heads/fixture-adopted")
                 .is_some(),
             "failed removal must retain its branch"
+        );
+    }
+
+    #[test]
+    fn adopted_cleanup_preserves_non_directory_replacement_and_branch() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = initialized_repository(owner.path());
+        let parent = owner.path().join("adopted-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let worktree = parent.join("checkout");
+        let worktree_text = worktree.to_string_lossy().into_owned();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fixture-adopted-replacement",
+                &worktree_text,
+                "HEAD",
+            ],
+        );
+        let evidence = worktree.join("keep-for-retry.txt");
+        std::fs::write(&evidence, b"preserve adopted checkout").unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let adopted = broker
+            .adopt(&worktree, Some("replacement cleanup"))
+            .unwrap();
+        broker.close(adopted.id).unwrap();
+
+        let preserved = parent.join("preserved-checkout");
+        std::fs::rename(&worktree, &preserved).unwrap();
+        std::fs::write(&worktree, b"replacement data").unwrap();
+
+        let result = broker.cleanup(adopted.id, true);
+
+        assert!(
+            result.is_err(),
+            "a non-directory replacement must be retained"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a real directory")
+        );
+        assert_eq!(
+            broker.store().session(adopted.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert_eq!(std::fs::read(&worktree).unwrap(), b"replacement data");
+        assert_eq!(
+            std::fs::read(preserved.join("keep-for-retry.txt")).unwrap(),
+            b"preserve adopted checkout"
+        );
+        assert!(
+            crate::git::GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref("refs/heads/fixture-adopted-replacement")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_cleanup_preserves_session_and_branch_when_path_metadata_fails() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = initialized_repository(owner.path());
+        let parent = owner.path().join("adopted-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let worktree = parent.join("checkout");
+        let worktree_text = worktree.to_string_lossy().into_owned();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fixture-adopted",
+                &worktree_text,
+                "HEAD",
+            ],
+        );
+        let evidence = worktree.join("keep-for-retry.txt");
+        std::fs::write(&evidence, b"preserve adopted checkout").unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let adopted = broker
+            .adopt(&worktree, Some("metadata-error cleanup"))
+            .unwrap();
+        broker.close(adopted.id).unwrap();
+
+        let preserved_parent = owner.path().join("preserved-parent");
+        std::fs::rename(&parent, &preserved_parent).unwrap();
+        std::fs::write(&parent, b"not a directory").unwrap();
+
+        let result = broker.cleanup(adopted.id, true);
+
+        assert!(
+            result.is_err(),
+            "metadata uncertainty must retain the session"
+        );
+        assert_eq!(
+            broker.store().session(adopted.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert_eq!(
+            std::fs::read(preserved_parent.join("checkout/keep-for-retry.txt")).unwrap(),
+            b"preserve adopted checkout"
+        );
+        assert!(
+            crate::git::GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref("refs/heads/fixture-adopted")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_cleanup_preserves_dangling_replacement_and_branch() {
+        use std::os::unix::fs::symlink;
+
+        let owner = tempfile::tempdir().unwrap();
+        let repository = initialized_repository(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("dangling cleanup replacement", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        broker.close(session.id).unwrap();
+        let evidence = worktree.join("keep-for-retry.txt");
+        std::fs::write(&evidence, b"preserve spawned checkout").unwrap();
+
+        let preserved = owner.path().join("preserved-spawned-checkout");
+        std::fs::rename(&worktree, &preserved).unwrap();
+        let missing_target = owner.path().join("missing-target");
+        symlink(&missing_target, &worktree).unwrap();
+
+        let result = broker.cleanup(session.id, true);
+
+        assert!(
+            result.is_err(),
+            "a dangling symlink is not an absent worktree"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a real directory")
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(
+            std::fs::symlink_metadata(&worktree)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(preserved.join("keep-for-retry.txt")).unwrap(),
+            b"preserve spawned checkout"
+        );
+        assert!(
+            crate::git::GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&format!("refs/heads/{}", session.branch))
+                .is_some()
         );
     }
 }

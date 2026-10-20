@@ -3062,7 +3062,14 @@ impl Broker {
                         ),
                     }));
                 }
-                let _ = self.repo.delete_branch_ref_checked(&branch, &base);
+                if let Err(branch_error) = self.repo.delete_branch_ref_checked(&branch, &base) {
+                    return Err(BrokerOpError::Git(crate::GitError::Git {
+                        args: format!("delete refs/heads/{branch}"),
+                        stderr: format!(
+                            "session registration failed: {error}; worktree was removed, but branch rollback could not be confirmed: {branch_error}"
+                        ),
+                    }));
+                }
                 return Err(error.into());
             }
         };
