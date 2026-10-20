@@ -5395,7 +5395,13 @@ mod batched_commit_tests {
     use super::*;
 
     fn run(root: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        let out = command
             .args(args)
             .current_dir(root)
             .env("GIT_AUTHOR_NAME", "t")
