@@ -11,7 +11,13 @@ use aethyme_broker::init::{self, CheckStatus};
 use aethyme_broker::{Gate, ReadinessDimensionId, ReadinessState, RepositoryOperatingMode};
 
 fn sh(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    let status = command
         .args(args)
         .current_dir(cwd)
         .env("GIT_AUTHOR_NAME", "t")
@@ -43,7 +49,12 @@ fn write_agent_protocol(root: &Path) {
 /// excluding the runtime db (its WAL bytes legitimately change).
 fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
-    for rel in [".aethyme/gates.toml", ".aethyme/config.toml", ".gitignore"] {
+    for rel in [
+        ".aethyme/gates.toml",
+        ".aethyme/config.toml",
+        ".gitignore",
+        "README.md",
+    ] {
         if let Ok(bytes) = std::fs::read(root.join(rel)) {
             out.insert(rel.to_string(), bytes);
         }
@@ -113,16 +124,30 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
         "certify must never create the database"
     );
 
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "hi\n"
+    );
+
     // Scaffold: only the invariant broker artifacts — config skeleton,
     // gitignore block, database. Gate drafting is NOT scaffolding.
     let report = init::scaffold(tmp.path()).unwrap();
     assert!(report.certified());
+    let readme = std::fs::read_to_string(tmp.path().join("README.md")).unwrap();
+    assert!(readme.starts_with("hi\n"));
+    assert_eq!(
+        readme
+            .matches("<!-- AETHYME:BEGIN skill-learning -->")
+            .count(),
+        1
+    );
     assert!(
         report.checks.iter().all(|c| !c.id.contains("gates")),
         "scaffold never touches gates"
     );
     for id in [
         "scaffold.config-toml",
+        "scaffold.readme-skills",
         "scaffold.shared-activation",
         "scaffold.gitignore",
         "scaffold.broker-db",
@@ -141,6 +166,7 @@ fn certify_is_always_read_only_and_scaffold_rerun_is_byte_identical() {
     assert!(report.certified());
     for id in [
         "scaffold.config-toml",
+        "scaffold.readme-skills",
         "scaffold.shared-activation",
         "scaffold.gitignore",
         "scaffold.broker-db",
@@ -485,6 +511,10 @@ fn local_scaffold_uses_runtime_state_without_touching_gitignore() {
     init_repo(tmp.path());
 
     let report = init::scaffold_local(tmp.path()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "hi\n"
+    );
     assert!(report.certified());
     assert!(tmp.path().join(".aethyme/config.toml").is_file());
     assert!(tmp.path().join(".aethyme/broker.db").is_file());
@@ -691,6 +721,7 @@ fn guided_init_sets_up_a_fresh_repo_and_second_run_is_a_no_op() {
     let scaffold = report.scaffold.as_ref().expect("certification passed");
     for id in [
         "scaffold.config-toml",
+        "scaffold.readme-skills",
         "scaffold.gitignore",
         "scaffold.broker-db",
     ] {
@@ -714,6 +745,7 @@ fn guided_init_sets_up_a_fresh_repo_and_second_run_is_a_no_op() {
     let scaffold = report.scaffold.as_ref().unwrap();
     for id in [
         "scaffold.config-toml",
+        "scaffold.readme-skills",
         "scaffold.gitignore",
         "scaffold.broker-db",
     ] {

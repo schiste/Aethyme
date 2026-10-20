@@ -12,7 +12,8 @@
 //! **`scaffold()`** — deterministic writes only: the artifacts the
 //! broker itself needs, whose bytes are ALWAYS identical regardless of
 //! the repo (config.toml skeleton, .gitignore block, broker database
-//! with its fixed schema). Never overwrites; a second run changes
+//! with its fixed schema), plus a managed README guidance section. Existing
+//! user content is preserved; a second run changes
 //! nothing. Certify and scaffold are the "always exactly the same"
 //! pair — one reads, one writes.
 //!
@@ -343,6 +344,27 @@ pub fn scaffold(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         || ACTIVATION_MARKER_CONTENT.to_string(),
     ));
     checks.push(ensure_gitignore_block(&checkout_root));
+    checks.push(
+        match aethyme_enhance::readme::ensure_guidance(&checkout_root) {
+            Ok(action) => Check {
+                id: "scaffold.readme-skills",
+                status: if action.action == "unchanged" {
+                    CheckStatus::Pass
+                } else {
+                    CheckStatus::Created
+                },
+                detail: format!(
+                    "{}: {} skill-learning guidance; existing prose preserved",
+                    action.relative_path, action.action
+                ),
+            },
+            Err(detail) => Check {
+                id: "scaffold.readme-skills",
+                status: CheckStatus::Fail,
+                detail,
+            },
+        },
+    );
 
     let db_existed = main_root.join(crate::BROKER_DB_RELPATH).exists();
     let store = crate::BrokerStore::open_in_repo(&main_root)?;

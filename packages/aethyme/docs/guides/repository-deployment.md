@@ -252,3 +252,25 @@ Re-running local deployment refreshes Aethyme-owned ignored files. Removing
 `.aethyme/local/enabled` immediately makes the committed bridge inert; the
 remaining ignored files perform no work and may be removed later. A fresh
 clone receives the bridge but none of the activation artifacts.
+
+## Skill learning in the README
+
+Canonical `aethyme deploy --repo .`, `aethyme init`, and `aethyme broker scaffold`
+add one managed skill-learning section to the repository README. Existing prose
+outside the section is preserved byte-for-byte. Repeating the operation refreshes
+that section without duplicating it. Existing repositories use the same commands
+to receive or refresh the guidance; review the resulting diff before committing.
+
+The updater recognizes a single root README with no extension, or a `.md`,
+`.markdown`, `.rst`, or `.txt` extension, regardless of letter case. It uses reST
+comments for `.rst` files and Markdown comments otherwise; a repository without a
+README receives `README.md`. Multiple matching READMEs, incomplete or duplicate
+ownership markers, symbolic links, nonregular files, non-UTF-8 content, and files
+larger than 4 MiB are refused without replacing README content. Resolve the
+reported ambiguity before retrying; `--force` does not discard README prose.
+
+Local-only deployment and checkout-local scaffolding leave the shared README
+untouched. Supporting-artifact-only upgrades also leave it untouched; run a
+canonical deployment explicitly to update this shared documentation. The guidance
+asks agents to maintain relevant skills; it does not launch a review agent or
+export session records.
