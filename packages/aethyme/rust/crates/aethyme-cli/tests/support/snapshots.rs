@@ -41,10 +41,9 @@ pub fn assert_snapshots(group: &str, entries: &[(String, String)]) {
         match std::fs::read_to_string(&path) {
             Ok(stored) if stored == *body => {}
             Ok(stored) => problems.push(format!(
-                "{name}: differs from {}\n--- stored\n{}\n--- actual\n{}",
+                "{name}: differs from {}\n{}",
                 path.display(),
-                first_lines(&stored),
-                first_lines(body)
+                difference_window(&stored, body)
             )),
             Err(_) => problems.push(format!("{name}: no snapshot at {}", path.display())),
         }
@@ -80,8 +79,85 @@ fn orphaned_snapshots(dir: &std::path::Path, entries: &[(String, String)]) -> Ve
     orphans
 }
 
-fn first_lines(text: &str) -> String {
-    text.lines().take(15).collect::<Vec<_>>().join("\n")
+fn difference_window(stored: &str, actual: &str) -> String {
+    let stored: Vec<_> = stored.split_inclusive('\n').collect();
+    let actual: Vec<_> = actual.split_inclusive('\n').collect();
+    let first = stored
+        .iter()
+        .zip(&actual)
+        .position(|(left, right)| left != right)
+        .unwrap_or(stored.len().min(actual.len()));
+    let start = first.saturating_sub(2);
+    let end = first.saturating_add(4);
+    let render = |lines: &[&str]| {
+        lines
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(start)
+            .map(|(index, line)| {
+                let excerpt: String = line.chars().take(200).collect();
+                let suffix = if excerpt.len() < line.len() {
+                    " [truncated]"
+                } else {
+                    ""
+                };
+                format!("{}: {excerpt:?}{suffix}", index + 1)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "first differing line: {} (stored {} lines; actual {} lines)\n--- stored\n{}\n--- actual\n{}",
+        first + 1,
+        stored.len(),
+        actual.len(),
+        render(&stored),
+        render(&actual)
+    )
+}
+
+#[cfg(test)]
+mod difference_window_tests {
+    use super::difference_window;
+
+    #[test]
+    fn reports_a_difference_after_the_shared_prefix() {
+        let prefix = "same\n".repeat(30);
+        let report = difference_window(&format!("{prefix}old\n"), &format!("{prefix}new\n"));
+        assert!(report.contains("first differing line: 31"), "{report}");
+        assert!(report.contains("old"), "{report}");
+        assert!(report.contains("new"), "{report}");
+        assert!(
+            !report.lines().any(|line| line.starts_with("1: ")),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn reports_missing_and_empty_suffixes() {
+        for (stored, actual) in [("same\n", "same\nextra\n"), ("extra\n", "")] {
+            let report = difference_window(stored, actual);
+            assert!(report.contains("extra"), "{report}");
+            assert!(report.contains("actual"), "{report}");
+        }
+    }
+
+    #[test]
+    fn reports_a_trailing_newline_difference() {
+        let report = difference_window("same\n", "same");
+        assert!(report.contains("first differing line: 1"), "{report}");
+        assert!(report.contains(r"same\n"), "{report}");
+    }
+
+    #[test]
+    fn bounds_unicode_lines_and_context() {
+        let stored = format!("{}old", "é".repeat(10_000));
+        let actual = format!("{}new", "é".repeat(10_000));
+        let report = difference_window(&stored, &actual);
+        assert!(report.contains("[truncated]"), "{report}");
+        assert!(report.len() < 2_000);
+    }
 }
 
 /// The type skeleton of a JSON value: objects keep their (sorted) keys, arrays
