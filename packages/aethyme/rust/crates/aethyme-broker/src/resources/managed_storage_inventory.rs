@@ -5,13 +5,17 @@
 //! accounting input, not a filesystem quota, exact physical-extent measure,
 //! or constraint on non-broker writers.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[path = "managed_storage_inventory_core.rs"]
 pub(super) mod core;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(super) use core::TreeInventory;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(super) use core::{InventoryScan, InventoryScanPoll, ScanLimits, TreeInventory};
+pub(super) use core::{InventoryScan, InventoryScanPoll, ScanLimits};
 
 use super::{
     HostLeaseState, HostResourceCoordinator, HostResourceError, HostResourceGrant,
