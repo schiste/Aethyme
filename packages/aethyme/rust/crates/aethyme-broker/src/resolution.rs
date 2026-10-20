@@ -3955,6 +3955,18 @@ pub(crate) fn read_synthesized_attempt_result_for_refs(
     Ok(synthesis)
 }
 
+fn historical_synthesis_trigger_is_valid(
+    trigger: &Trigger,
+    accumulator: &SourceSnapshotId,
+) -> bool {
+    match trigger {
+        Trigger::Conflict(conflicts) => !conflicts.is_empty(),
+        Trigger::FailedChecks { candidate, checks } => {
+            !checks.is_empty() && candidate == accumulator
+        }
+    }
+}
+
 /// Revalidate the immutable synthesis ledger and its complete archived input
 /// closure for historical baseline provenance. This deliberately omits Git
 /// tree inspection and does not return a candidate accepted for execution;
@@ -4024,7 +4036,10 @@ pub(crate) fn read_retained_synthesized_result_for_refs(
     let request = load_request_from_bytes(store, None, request_ref, &request_bytes)?;
     verify_attempt_inputs(&status, &request)?;
     if request.record() != request_ref
-        || !matches!(request.trigger(), Trigger::Conflict(conflicts) if !conflicts.is_empty())
+        || !historical_synthesis_trigger_is_valid(
+            request.trigger(),
+            &request.accumulator().snapshot_id,
+        )
     {
         return Err(invalid("historical synthesis request identity or trigger"));
     }
@@ -4752,6 +4767,52 @@ pub fn read_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_synthesis_trigger_requires_nonempty_checks_and_matching_candidate() {
+        let accumulator = SourceSnapshotId::parse(&format!("sha256:{}", "0".repeat(64))).unwrap();
+        let other_candidate =
+            SourceSnapshotId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+        let input = CommitOid::parse(&"a".repeat(40)).unwrap();
+        let conflict = ConflictPath {
+            path: "src/lib.rs".into(),
+            input,
+            reason: "content".into(),
+        };
+        assert!(historical_synthesis_trigger_is_valid(
+            &Trigger::Conflict(vec![conflict]),
+            &accumulator,
+        ));
+        assert!(!historical_synthesis_trigger_is_valid(
+            &Trigger::Conflict(Vec::new()),
+            &accumulator,
+        ));
+        assert!(historical_synthesis_trigger_is_valid(
+            &Trigger::FailedChecks {
+                candidate: accumulator.clone(),
+                checks: vec![FailedCheck {
+                    check: "native-gate:unit".into(),
+                }],
+            },
+            &accumulator,
+        ));
+        assert!(!historical_synthesis_trigger_is_valid(
+            &Trigger::FailedChecks {
+                candidate: accumulator.clone(),
+                checks: Vec::new(),
+            },
+            &accumulator,
+        ));
+        assert!(!historical_synthesis_trigger_is_valid(
+            &Trigger::FailedChecks {
+                candidate: other_candidate,
+                checks: vec![FailedCheck {
+                    check: "native-gate:unit".into(),
+                }],
+            },
+            &accumulator,
+        ));
+    }
 
     #[test]
     fn dispatch_limits_stay_within_existing_local_io_caps() {

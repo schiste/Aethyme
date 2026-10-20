@@ -898,6 +898,26 @@ fn classify_revision_relation(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistoricalCandidateIdentity<'a> {
+    subject: &'a str,
+    commit: &'a str,
+    tree: &'a str,
+}
+
+fn historical_synthesis_candidate_bindings_match(
+    final_candidate: HistoricalCandidateIdentity<'_>,
+    resolver_candidate: HistoricalCandidateIdentity<'_>,
+    completion: HistoricalCandidateIdentity<'_>,
+    seeded_candidate: Option<HistoricalCandidateIdentity<'_>>,
+) -> bool {
+    final_candidate == completion
+        && match seeded_candidate {
+            Some(seed) => resolver_candidate == seed,
+            None => resolver_candidate == completion,
+        }
+}
+
 fn verify_historical_seed_binding_git(
     store: &mut CollaborationStore,
     repo: &Path,
@@ -959,21 +979,65 @@ fn verify_historical_seed_binding_git(
             "historical retained synthesis proof differs from its Git-bound result".into(),
         ));
     }
+    let seeded = recipe.get("seeded_conflict");
     let result_tree = archive::raw_commit_tree(repo, &proof.candidate_commit)?;
     if archive::snapshot_of_commit(repo, &proof.candidate_commit)?.id() != proof.candidate_subject
         || synthesis.candidate.tree != result_tree
         || proof.request.baseline().snapshot_id.as_str() != wave.spec.baseline
-        || proof.candidate_subject.as_str() != completion.source
-        || proof.candidate_commit.as_str() != completion.candidate_commit
-        || synthesis.candidate.subject.as_str() != completion.source
-        || synthesis.candidate.commit.as_str() != completion.candidate_commit
-        || result_tree != completion.candidate_tree
     {
+        return Err(WaveError::Invalid(
+            "historical synthesized candidate differs from its retained Git result".into(),
+        ));
+    }
+
+    let completion_commit = CommitOid::parse(&completion.candidate_commit)?;
+    let final_snapshot = archive::snapshot_of_commit(repo, &completion_commit)?.id();
+    let final_tree = archive::raw_commit_tree(repo, &completion_commit)?;
+    let final_candidate = HistoricalCandidateIdentity {
+        subject: final_snapshot.as_str(),
+        commit: completion_commit.as_str(),
+        tree: final_tree.as_str(),
+    };
+    let completion_candidate = HistoricalCandidateIdentity {
+        subject: &completion.source,
+        commit: &completion.candidate_commit,
+        tree: &completion.candidate_tree,
+    };
+    let resolver_candidate = HistoricalCandidateIdentity {
+        subject: proof.candidate_subject.as_str(),
+        commit: proof.candidate_commit.as_str(),
+        tree: result_tree.as_str(),
+    };
+    let seeded_candidate = seeded
+        .map(
+            |seeded| -> Result<HistoricalCandidateIdentity<'_>, WaveError> {
+                let seed = &seeded["seed_candidate"];
+                Ok(HistoricalCandidateIdentity {
+                    subject: seed["subject"].as_str().ok_or_else(|| {
+                        WaveError::Invalid("historical seeded candidate subject".into())
+                    })?,
+                    commit: seed["commit"].as_str().ok_or_else(|| {
+                        WaveError::Invalid("historical seeded candidate commit".into())
+                    })?,
+                    tree: seed["tree"].as_str().ok_or_else(|| {
+                        WaveError::Invalid("historical seeded candidate tree".into())
+                    })?,
+                })
+            },
+        )
+        .transpose()?;
+    if !historical_synthesis_candidate_bindings_match(
+        final_candidate,
+        resolver_candidate,
+        completion_candidate,
+        seeded_candidate,
+    ) {
         return Err(WaveError::Invalid(
             "historical synthesized candidate differs from its accepted Git result".into(),
         ));
     }
-    let Some(seeded) = recipe.get("seeded_conflict") else {
+
+    let Some(seeded) = seeded else {
         // Direct attachment preserves the original Text composition source;
         // the accepted completion is instead bound to the settled resolver
         // result checked above.
@@ -1185,6 +1249,63 @@ mod tests {
                 .map(|s| (*s).to_owned())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn historical_synthesis_binds_seed_result_and_final_candidate_separately() {
+        let final_candidate = HistoricalCandidateIdentity {
+            subject: "sha256:final-source",
+            commit: "final-commit",
+            tree: "final-tree",
+        };
+        let resolver_candidate = HistoricalCandidateIdentity {
+            subject: "sha256:seed-source",
+            commit: "seed-commit",
+            tree: "seed-tree",
+        };
+        let completion = final_candidate;
+        let seed = resolver_candidate;
+        assert!(historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            resolver_candidate,
+            completion,
+            Some(seed),
+        ));
+
+        let tampered_seed = HistoricalCandidateIdentity {
+            tree: "tampered-seed-tree",
+            ..seed
+        };
+        assert!(!historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            resolver_candidate,
+            completion,
+            Some(tampered_seed),
+        ));
+
+        let tampered_final = HistoricalCandidateIdentity {
+            tree: "tampered-final-tree",
+            ..final_candidate
+        };
+        assert!(!historical_synthesis_candidate_bindings_match(
+            tampered_final,
+            resolver_candidate,
+            completion,
+            Some(seed),
+        ));
+
+        assert!(historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            final_candidate,
+            completion,
+            None,
+        ));
+        assert!(!historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            resolver_candidate,
+            completion,
+            None,
+        ));
     }
 
     #[test]
