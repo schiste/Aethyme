@@ -1050,92 +1050,147 @@ pub(crate) fn running_gate_evidence_until(
     mut expired: impl FnMut() -> bool,
     entry_budget: Option<usize>,
 ) -> Option<Vec<String>> {
+    fn confirmed_absent_until(path: &Path, expired: &mut impl FnMut() -> bool) -> Option<bool> {
+        if expired() {
+            return None;
+        }
+        let absent = matches!(
+            std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        (!expired()).then_some(absent)
+    }
+
     let run_dir = running_dir(main_root);
     let mut evidence = Vec::new();
     let mut entries_seen = 0_usize;
-    if let Ok(entries) = std::fs::read_dir(&run_dir) {
-        for entry in entries {
-            if expired() || entry_budget.is_some_and(|budget| entries_seen >= budget) {
-                return None;
-            }
-            let Ok(entry) = entry else {
-                if entry_budget.is_some() {
-                    return None;
-                }
-                continue;
-            };
-            entries_seen = entries_seen.saturating_add(1);
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".pid") {
-                continue;
-            }
-            let record = match read_gate_pidfile_until(&path, &mut expired) {
-                Ok(record) => record,
-                Err(()) => return None,
-            };
-            let Some(record) = record else {
-                evidence.push(format!("gate pidfile {name} is unreadable"));
-                continue;
-            };
-            let pid = record.pid.unwrap_or(record.pgid);
-            if record.names_running_process() {
-                evidence.push(format!("gate pidfile {name} names running process {pid}"));
-            }
-            if expired() {
-                return None;
-            }
-        }
-    } else if entry_budget.is_some() && run_dir.exists() {
+    if expired() {
         return None;
     }
-    let owners_dir = run_dir.join("owners");
-    if let Ok(entries) = std::fs::read_dir(&owners_dir) {
-        for entry in entries {
-            if expired() || entry_budget.is_some_and(|budget| entries_seen >= budget) {
-                return None;
-            }
-            let Ok(entry) = entry else {
-                if entry_budget.is_some() {
+    let run_entries = std::fs::read_dir(&run_dir);
+    if expired() {
+        return None;
+    }
+    match run_entries {
+        Ok(entries) => {
+            for entry in entries {
+                if expired() || entry_budget.is_some_and(|budget| entries_seen >= budget) {
                     return None;
                 }
-                continue;
-            };
-            entries_seen = entries_seen.saturating_add(1);
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".lock") {
-                continue;
-            }
-            if expired() {
-                return None;
-            }
-            let file = match open_gate_owner_lock_probe(&entry.path()) {
-                Ok(file) => file,
-                Err(error) => {
-                    evidence.push(format!("gate owner lock {name} cannot be opened: {error}"));
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) if entry_budget.is_some() => return None,
+                    Err(error) => {
+                        evidence.push(format!("gate run directory entry cannot be read: {error}"));
+                        continue;
+                    }
+                };
+                entries_seen = entries_seen.saturating_add(1);
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".pid") {
                     continue;
                 }
-            };
-            match file.try_lock() {
-                // Released at once: a probe, not a claim.
-                Ok(()) => {
-                    // Dropping the file also releases it; report a failed unlock
-                    // rather than discard it.
-                    crate::warn_unrecorded("release a gate owner lock probe", file.unlock());
+                let record = match read_gate_pidfile_until(&path, &mut expired) {
+                    Ok(record) => record,
+                    Err(()) => return None,
+                };
+                let Some(record) = record else {
+                    evidence.push(format!("gate pidfile {name} is unreadable"));
+                    continue;
+                };
+                let pid = record.pid.unwrap_or(record.pgid);
+                if record.names_running_process() {
+                    evidence.push(format!("gate pidfile {name} names running process {pid}"));
                 }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    evidence.push(format!("gate owner lock {name} is held by a running gate"));
+                if expired() {
+                    return None;
                 }
-                Err(std::fs::TryLockError::Error(error)) => {
-                    evidence.push(format!("gate owner lock {name} cannot be probed: {error}"));
-                }
-            }
-            if expired() {
-                return None;
             }
         }
-    } else if entry_budget.is_some() && owners_dir.exists() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match confirmed_absent_until(&run_dir, &mut expired) {
+                Some(true) => {}
+                Some(false) if entry_budget.is_some() => return None,
+                Some(false) => {
+                    evidence.push(format!("gate run directory cannot be read: {error}"));
+                }
+                None => return None,
+            }
+        }
+        Err(_) if entry_budget.is_some() => return None,
+        Err(error) => evidence.push(format!("gate run directory cannot be read: {error}")),
+    }
+    let owners_dir = run_dir.join("owners");
+    if expired() {
         return None;
+    }
+    let owner_entries = std::fs::read_dir(&owners_dir);
+    if expired() {
+        return None;
+    }
+    match owner_entries {
+        Ok(entries) => {
+            for entry in entries {
+                if expired() || entry_budget.is_some_and(|budget| entries_seen >= budget) {
+                    return None;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) if entry_budget.is_some() => return None,
+                    Err(error) => {
+                        evidence.push(format!(
+                            "gate owner directory entry cannot be read: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                entries_seen = entries_seen.saturating_add(1);
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".lock") {
+                    continue;
+                }
+                if expired() {
+                    return None;
+                }
+                let file = match open_gate_owner_lock_probe(&entry.path()) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        evidence.push(format!("gate owner lock {name} cannot be opened: {error}"));
+                        continue;
+                    }
+                };
+                match file.try_lock() {
+                    // Released at once: a probe, not a claim.
+                    Ok(()) => {
+                        // Dropping the file also releases it; report a failed unlock
+                        // rather than discard it.
+                        crate::warn_unrecorded("release a gate owner lock probe", file.unlock());
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        evidence.push(format!("gate owner lock {name} is held by a running gate"));
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        evidence.push(format!("gate owner lock {name} cannot be probed: {error}"));
+                    }
+                }
+                if expired() {
+                    return None;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match confirmed_absent_until(&owners_dir, &mut expired) {
+                Some(true) => {}
+                Some(false) if entry_budget.is_some() => return None,
+                Some(false) => {
+                    evidence.push(format!("gate owner directory cannot be read: {error}"));
+                }
+                None => return None,
+            }
+        }
+        Err(_) if entry_budget.is_some() => return None,
+        Err(error) => evidence.push(format!("gate owner directory cannot be read: {error}")),
     }
     evidence.sort();
     (!expired()).then_some(evidence)
@@ -6067,6 +6122,59 @@ mod tests {
             evidence
                 .iter()
                 .any(|item| item.contains("gate pidfile gate.pid is unreadable"))
+        );
+    }
+
+    #[test]
+    fn bounded_gate_evidence_treats_only_missing_directories_as_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = running_dir(root.path());
+
+        assert_eq!(
+            running_gate_evidence_until(root.path(), || false, Some(8)),
+            Some(Vec::new()),
+            "a positively absent run directory is empty"
+        );
+
+        std::fs::create_dir_all(run_dir.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            symlink("missing", &run_dir).unwrap();
+            assert_eq!(
+                running_gate_evidence_until(root.path(), || false, Some(8)),
+                None,
+                "a dangling run-directory symlink is not an absent directory"
+            );
+            std::fs::remove_file(&run_dir).unwrap();
+        }
+        std::fs::write(&run_dir, b"not a directory").unwrap();
+        assert_eq!(
+            running_gate_evidence_until(root.path(), || false, Some(8)),
+            None,
+            "an unreadable run directory makes the bounded inventory unknown"
+        );
+
+        std::fs::remove_file(&run_dir).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            symlink("missing", run_dir.join("owners")).unwrap();
+            assert_eq!(
+                running_gate_evidence_until(root.path(), || false, Some(8)),
+                None,
+                "a dangling owner-directory symlink is not an absent directory"
+            );
+            std::fs::remove_file(run_dir.join("owners")).unwrap();
+        }
+        std::fs::write(run_dir.join("owners"), b"not a directory").unwrap();
+        assert_eq!(
+            running_gate_evidence_until(root.path(), || false, Some(8)),
+            None,
+            "an unreadable owner directory makes the bounded inventory unknown"
         );
     }
 

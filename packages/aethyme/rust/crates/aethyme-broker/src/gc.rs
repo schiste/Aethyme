@@ -3912,7 +3912,12 @@ impl Broker {
                         (Some(inventory), candidates)
                     }
                 }
-                None => (None, Vec::new()),
+                None => {
+                    if deadline.is_some() {
+                        deferred_checks.push("gate_cache_inventory".into());
+                    }
+                    (None, Vec::new())
+                }
             }
         };
         if scan.measures() {

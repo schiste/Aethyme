@@ -100,14 +100,37 @@ fn last_used_at_ms_until(
     path: &Path,
     expired: &mut impl FnMut() -> bool,
 ) -> Result<Option<i64>, ()> {
-    fn modified_ms(path: &Path) -> Option<i64> {
-        let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
-        i64::try_from(modified.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
+    fn modified_ms_until(
+        path: &Path,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Result<Option<(i64, std::fs::Metadata)>, ()> {
+        if expired() {
+            return Err(());
+        }
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return if expired() { Err(()) } else { Ok(None) };
+            }
+            Err(_) => return Err(()),
+        };
+        if expired() {
+            return Err(());
+        }
+        let modified = metadata.modified().map_err(|_| ())?;
+        let millis = i64::try_from(
+            modified
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ())?
+                .as_millis(),
+        )
+        .map_err(|_| ())?;
+        if expired() {
+            return Err(());
+        }
+        Ok(Some((millis, metadata)))
     }
-    if expired() {
-        return Err(());
-    }
-    let Some(mut latest) = modified_ms(path) else {
+    let Some((mut latest, _)) = modified_ms_until(path, expired)? else {
         return Ok(None);
     };
     let mut frontier = vec![(path.to_path_buf(), 0_usize)];
@@ -115,9 +138,13 @@ fn last_used_at_ms_until(
         if expired() {
             return Err(());
         }
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => return Err(()),
         };
+        if expired() {
+            return Err(());
+        }
         let mut entries = entries;
         loop {
             if expired() {
@@ -126,18 +153,16 @@ fn last_used_at_ms_until(
             let Some(entry) = entries.next() else {
                 break;
             };
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let child = entry.path();
-            if let Some(modified) = modified_ms(&child) {
-                latest = latest.max(modified);
-            }
+            let entry = entry.map_err(|_| ())?;
             if expired() {
                 return Err(());
             }
-            if depth < 1 && is_real_directory(&child) {
-                frontier.push((child, depth + 1));
+            let child = entry.path();
+            if let Some((modified, metadata)) = modified_ms_until(&child, expired)? {
+                latest = latest.max(modified);
+                if depth < 1 && metadata.is_dir() {
+                    frontier.push((child, depth + 1));
+                }
             }
         }
     }
@@ -435,7 +460,8 @@ fn inspect_with_expiration(
                 };
                 let last_used_at_ms = match last_used_at_ms_until(&path, &mut expired) {
                     Ok(value) => value,
-                    Err(()) => return (None, Vec::new(), false),
+                    Err(()) if entry_budget.is_some() => return (None, Vec::new(), false),
+                    Err(()) => None,
                 };
                 let mut hold = Vec::new();
                 if let Some((_, pid)) = &retired
@@ -970,6 +996,24 @@ mod tests {
 
         assert_eq!(result, Err(()));
         assert_eq!(checks, 4, "the scan checks its bound between entries");
+    }
+
+    #[test]
+    fn last_used_scan_fails_closed_on_enumeration_errors_but_accepts_absence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_directory = tmp.path().join("cache-entry");
+        std::fs::write(&not_a_directory, b"not a directory").unwrap();
+        assert_eq!(
+            last_used_at_ms_until(&not_a_directory, &mut || false),
+            Err(()),
+            "a partial mtime inventory must not rank a cache as stale"
+        );
+
+        assert_eq!(
+            last_used_at_ms_until(&tmp.path().join("absent"), &mut || false),
+            Ok(None),
+            "a positively absent cache path has no inventory"
+        );
     }
 
     /// Finding 1: an absent registry is a registry this process cannot see,
