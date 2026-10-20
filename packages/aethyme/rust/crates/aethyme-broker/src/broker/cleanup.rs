@@ -690,7 +690,7 @@ impl Broker {
     }
 
     /// Eligibility judged from the session branch rather than the worktree.
-    pub(super) fn branch_provenance_disposition(
+    fn branch_provenance_disposition(
         &self,
         session: &Session,
         session_head: &str,
@@ -763,7 +763,7 @@ impl Broker {
     /// (see [`GitRepo::local_branch_tips`]). A plan visits every session ever
     /// recorded, most of whose branch and worktree are long gone; looking the
     /// branch up in one listing lets those return without forking `git`.
-    pub(super) fn cleanup_item_scanned_with_tips(
+    fn cleanup_item_scanned_with_tips(
         &self,
         session: &Session,
         scan: crate::SizeScan,
@@ -3086,48 +3086,137 @@ mod cleanup_target_snapshot_tests {
         repository
     }
 
-    fn count_upstream_lookups(trace: &Path) -> usize {
-        std::fs::read_to_string(trace)
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|event| event["event"] == "start")
-            .filter(|event| {
-                event["argv"]
-                    .as_array()
-                    .is_some_and(|argv| argv.iter().any(|argument| argument == "@{upstream}"))
-            })
-            .count()
+    struct UpstreamLookupTrace {
+        starts: Vec<String>,
+    }
+
+    impl UpstreamLookupTrace {
+        fn count(&self) -> usize {
+            self.starts.len()
+        }
+
+        fn diagnostic(&self) -> String {
+            self.starts.join("\n")
+        }
+    }
+
+    fn upstream_lookup_trace(trace: &Path) -> UpstreamLookupTrace {
+        let contents = std::fs::read_to_string(trace)
+            .unwrap_or_else(|error| panic!("read Git Trace2 file {}: {error}", trace.display()));
+        let mut starts = Vec::new();
+        for (index, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!(
+                    "invalid Git Trace2 JSON at {}:{}: {error}; record={line:?}",
+                    trace.display(),
+                    index + 1
+                )
+            });
+            if event["event"] != "start" {
+                continue;
+            }
+            let argv = event["argv"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "Git Trace2 start event at {}:{} has no argv array: {line}",
+                    trace.display(),
+                    index + 1
+                )
+            });
+            if argv.iter().any(|argument| argument == "@{upstream}") {
+                assert!(
+                    event["cwd"].as_str().is_some(),
+                    "Git Trace2 upstream start event at {}:{} has no cwd: {line}",
+                    trace.display(),
+                    index + 1
+                );
+                starts.push(line.to_owned());
+            }
+        }
+        UpstreamLookupTrace { starts }
     }
 
     #[test]
     fn cleanup_plan_reuses_one_delivery_target_snapshot() {
+        // `cleanup_plan_scanned_within` captures targets once, then passes
+        // that snapshot through `cleanup_item_scanned_with_tips`. Trace2
+        // catches a regression that resolves `@{upstream}` per worktree.
         if let Some(parent) = std::env::var_os(ROOT_ENV) {
             let parent = PathBuf::from(parent);
             let repository = initialized_repository(&parent);
             let storage = TestStorage::new();
             let mut broker = storage.open(&repository).unwrap();
             let represented_one = broker.start_worktree("represented one", None).unwrap();
-            let represented_two = broker.start_worktree("represented two", None).unwrap();
-            let pending = broker.start_worktree("pending", None).unwrap();
-            let pending_worktree = PathBuf::from(&pending.worktree_path);
-
+            let represented_one_worktree = PathBuf::from(&represented_one.worktree_path);
+            std::fs::write(
+                represented_one_worktree.join("represented-one.txt"),
+                "delivered\n",
+            )
+            .unwrap();
+            git(&represented_one_worktree, &["add", "represented-one.txt"]);
+            git(
+                &represented_one_worktree,
+                &["commit", "-qm", "first delivered commit"],
+            );
             git(
                 &repository,
-                &["commit", "--allow-empty", "-qm", "advance main"],
+                &["merge", "--ff-only", represented_one.branch.as_str()],
+            );
+            let one_worktree_main_head = git_text(&repository, &["rev-parse", "HEAD"]);
+            broker.close(represented_one.id).unwrap();
+
+            let trace = std::env::var_os("GIT_TRACE2_EVENT")
+                .map(PathBuf::from)
+                .expect("parent supplies a private Git trace path");
+            std::fs::write(&trace, "").unwrap();
+            let one_worktree_plan = broker.cleanup_plan_recorded().unwrap();
+            assert!(
+                one_worktree_plan
+                    .target_snapshot
+                    .contains(&format!("HEAD={one_worktree_main_head}"))
+            );
+            assert_eq!(one_worktree_plan.worktrees.len(), 1);
+            assert_eq!(
+                one_worktree_plan.worktrees[0].disposition,
+                CleanupDisposition::Eligible,
+                "the worktree represented on the captured primary target remains eligible"
+            );
+            let one_worktree_trace = upstream_lookup_trace(&trace);
+            assert!(
+                one_worktree_trace.count() > 0,
+                "the trace observes the target-capture lookup; Trace2 starts:\n{}",
+                one_worktree_trace.diagnostic()
+            );
+
+            let represented_two = broker.start_worktree("represented two", None).unwrap();
+            let pending = broker.start_worktree("pending", None).unwrap();
+            let represented_two_worktree = PathBuf::from(&represented_two.worktree_path);
+            let pending_worktree = PathBuf::from(&pending.worktree_path);
+            std::fs::write(
+                represented_two_worktree.join("represented-two.txt"),
+                "delivered\n",
+            )
+            .unwrap();
+            git(&represented_two_worktree, &["add", "represented-two.txt"]);
+            git(
+                &represented_two_worktree,
+                &["commit", "-qm", "second delivered commit"],
+            );
+            git(
+                &repository,
+                &["merge", "--ff-only", represented_two.branch.as_str()],
             );
             let main_head = git_text(&repository, &["rev-parse", "HEAD"]);
             std::fs::write(pending_worktree.join("pending.txt"), "not delivered\n").unwrap();
             git(&pending_worktree, &["add", "pending.txt"]);
             git(&pending_worktree, &["commit", "-qm", "session-only commit"]);
             let pending_head = git_text(&pending_worktree, &["rev-parse", "HEAD"]);
-            for session in [&represented_one, &represented_two, &pending] {
+            for session in [&represented_two, &pending] {
                 broker.close(session.id).unwrap();
             }
 
-            let trace = std::env::var_os("GIT_TRACE2_EVENT")
-                .map(PathBuf::from)
-                .expect("parent supplies a private Git trace path");
             std::fs::write(&trace, "").unwrap();
             let plan = broker.cleanup_plan_recorded().unwrap();
 
@@ -3158,6 +3247,14 @@ mod cleanup_target_snapshot_tests {
                 Some(CleanupDisposition::PendingCommits),
                 "the unique session commit stays pending against the primary targets"
             );
+            let three_worktree_trace = upstream_lookup_trace(&trace);
+            assert_eq!(
+                three_worktree_trace.count(),
+                one_worktree_trace.count(),
+                "a cleanup plan's upstream lookup count must not grow when worktrees grow from one to three; one-worktree Trace2 starts:\n{}\nthree-worktree Trace2 starts:\n{}",
+                one_worktree_trace.diagnostic(),
+                three_worktree_trace.diagnostic()
+            );
             return;
         }
 
@@ -3177,11 +3274,6 @@ mod cleanup_target_snapshot_tests {
             "child test failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            count_upstream_lookups(&trace),
-            1,
-            "a cleanup plan resolves shared upstream targets once, regardless of its three worktrees"
         );
     }
 
