@@ -2659,4 +2659,6 @@ mod coordination;
 mod open;
 mod pull_requests;
 mod queue;
+#[path = "store/repository_binding.rs"]
+mod repository_binding;
 mod review;

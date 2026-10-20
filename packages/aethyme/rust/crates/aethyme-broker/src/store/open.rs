@@ -1,5 +1,17 @@
 use super::*;
 
+/// Capability proving that a database belongs to the private fresh-stage
+/// bootstrap path. Only this module can construct it, after it has established
+/// exclusive stage ownership and before publishing the final database name.
+pub(super) struct FreshDatabaseStagePermit {
+    _private: (),
+}
+
+#[cfg(test)]
+pub(super) fn test_fresh_database_stage_permit() -> FreshDatabaseStagePermit {
+    FreshDatabaseStagePermit { _private: () }
+}
+
 impl BrokerStore {
     /// Open (creating and migrating if needed) the broker database for a
     /// repository root: `<repo>/.aethyme/broker.db`, or wherever

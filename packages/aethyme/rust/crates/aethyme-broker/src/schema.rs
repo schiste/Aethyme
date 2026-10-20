@@ -11,8 +11,9 @@
 //!   added `agent_provenance_json`, so #611's v48 tables were skipped and
 //!   #613's v49 then failed with "duplicate column name"). Migrations from
 //!   v48 on are therefore applied idempotently, and every open runs a repair
-//!   pass that re-creates their objects when a database claims the version
-//!   but lacks them. Never point a dev build at a real broker database.
+//!   pass that re-creates listed objects when a database claims the version
+//!   but lacks them. Identity-bearing v53 binding state is intentionally not
+//!   repairable. Never point a dev build at a real broker database.
 //! - `meta.min_compatible_schema` records the oldest schema version whose
 //!   binaries may still read and write the database. A binary older than the
 //!   database opens it without migrating when its own [`SCHEMA_VERSION`] is at
@@ -33,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 52;
+pub const SCHEMA_VERSION: i64 = 53;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -75,6 +76,12 @@ pub const SCHEMA_VERSION: i64 = 52;
 ///   query only gate, tree and definition, so they could reuse a result
 ///   without checking its execution profile. The global floor therefore
 ///   rises to v52.
+/// - v53: adds a repository worktree-root binding record. Migration writes
+///   only `legacy_unbound`; existing databases retain floor 52 until an
+///   explicit reviewed binding raises it. A fresh staged database raises its
+///   own floor to 53 before the final database path is published. The binding
+///   table is deliberately excluded from the repair list: recreating a missing
+///   row could erase evidence of an existing root and misclassify it as legacy.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 52;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -1757,6 +1764,44 @@ const MIGRATION_V52: &str = "
 ALTER TABLE gate_results ADD COLUMN execution_profile_hash TEXT;
 ";
 
+/// v53: durable repository worktree-root binding. Existing databases remain
+/// explicitly unbound until a reviewed adoption transition records exact
+/// placement evidence. The migration itself never consults the filesystem or
+/// silently adopts the current configuration.
+const MIGRATION_V53: &str = "
+CREATE TABLE IF NOT EXISTS repository_worktree_binding (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    record_schema_version INTEGER NOT NULL CHECK (record_schema_version = 1),
+    state TEXT NOT NULL CHECK (state IN (
+        'legacy_unbound', 'fresh_unbound', 'fresh_reserved', 'bound',
+        'recovery_required'
+    )),
+    origin TEXT CHECK (origin IN ('legacy', 'fresh')),
+    path_encoding TEXT CHECK (path_encoding IN (
+        'unix_bytes', 'windows_utf16le', 'utf8'
+    )),
+    repository_root BLOB,
+    git_common_dir BLOB,
+    repository_key TEXT,
+    broker_db_path BLOB,
+    bootstrap_nonce TEXT,
+    worktree_root BLOB,
+    root_layout TEXT CHECK (root_layout IN ('keyed_container', 'direct_root')),
+    root_source TEXT CHECK (root_source IN (
+        'host_state', 'repository_config', 'environment_override',
+        'library_override', 'repository_fallback'
+    )),
+    reservation_digest TEXT,
+    parent_identity_json TEXT,
+    worktree_identity_json TEXT,
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
+);
+INSERT INTO repository_worktree_binding (
+    singleton, record_schema_version, state, origin, updated_at_ms
+) VALUES (1, 1, 'legacy_unbound', 'legacy', 0)
+ON CONFLICT (singleton) DO NOTHING;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1810,6 +1855,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V50,
     MIGRATION_V51,
     MIGRATION_V52,
+    MIGRATION_V53,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2034,7 +2080,10 @@ fn compatibility_floor_for_migration(version: i64) -> Option<i64> {
     }
 }
 
-fn record_min_compatible_schema_floor(conn: &Connection, minimum: i64) -> Result<(), BrokerError> {
+pub(crate) fn record_min_compatible_schema_floor(
+    conn: &Connection,
+    minimum: i64,
+) -> Result<(), BrokerError> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value
@@ -2461,13 +2510,32 @@ mod tests {
     }
 
     #[test]
-    fn v52_requires_a_profile_aware_reader_for_gate_cache_reuse() {
+    fn v53_additive_binding_schema_keeps_v52_reader_compatibility() {
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
         let conn = migrated();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 51).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 42).unwrap());
+    }
+
+    #[test]
+    fn v53_adds_an_explicit_legacy_unbound_state_without_raising_the_floor() {
+        let conn = migrated_through(52);
+        set_meta(&conn, "min_compatible_schema", 52);
+        migrate(&conn).unwrap();
+        let (state, floor): (String, String) = conn
+            .query_row(
+                "SELECT b.state, m.value
+                 FROM repository_worktree_binding b
+                 JOIN meta m ON m.key = 'min_compatible_schema'
+                 WHERE b.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "legacy_unbound");
+        assert_eq!(floor, "52");
     }
 
     #[test]
@@ -2581,7 +2649,7 @@ mod tests {
         .unwrap();
 
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 52);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
         assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
         assert!(!schema_is_compatible_with(&conn, 52, 51).unwrap());
@@ -2619,7 +2687,7 @@ mod tests {
 
             migrate(&conn).unwrap();
 
-            assert_eq!(current_version(&conn).unwrap(), 52);
+            assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
             assert_eq!(
                 conn.query_row(
                     "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
@@ -2699,7 +2767,7 @@ mod tests {
         set_meta(&conn, "min_compatible_schema", 47);
 
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 52);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
         let columns = conn
             .prepare("PRAGMA table_info(gate_results)")
