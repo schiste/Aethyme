@@ -204,6 +204,23 @@ missing, unplugged, inside the repository or below its free-space floor, and
 drive are locked, so nothing prunes or cleans them up while it is away. See the
 CLI reference for the rules.
 
+When continuing the same task, reuse its broker session/worktree instead of
+creating another checkout. For a follow-up task, use `broker start --reuse`
+and inspect its reported baseline before editing. For a new task, prepare
+declared dependencies once and let the broker's preparation digest skip the
+install when the lockfiles and runtime are unchanged:
+
+```bash
+aethyme broker submit prepare status --session <id> --json
+aethyme broker submit prepare --session <id>
+```
+
+Use a repository-shared package-manager store or managed gate cache only where
+the tool supports safe sharing. Reuse and cache reduce repeated setup; they do
+not make one session's mutable checkout or installed `node_modules/` safe for
+another concurrent session. See [host resource coordination](host-resource-coordination.md)
+for explicit preparation and Git status tuning guidance.
+
 ## The Working Agreement
 
 `broker start`, `start --reuse` and `start --adopt` print a short "Working
