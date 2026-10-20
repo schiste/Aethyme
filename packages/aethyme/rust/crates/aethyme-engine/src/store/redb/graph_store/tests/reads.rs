@@ -643,14 +643,31 @@ fn read_api_neighbors_filters_direction_and_kind() {
 
 #[test]
 fn bounded_adjacency_caps_raw_rows_before_kind_filtering() {
-    let fixture = read_api_fixture(function_name!());
-    let store = GraphStore::open(&fixture.root).expect("open writer");
+    // Keep exactly one Calls and one Tests row targeting this function. The
+    // larger read_api_fixture also adds an incoming Contains row, so a two-row
+    // budget can be consumed before either edge under test is reached.
+    let fixture_root = tempfile::tempdir().expect("temporary graph root");
+    let root = fixture_root.path();
+    let store = GraphStore::open(root).expect("open minimal store");
+    let call_file = sample_file("Repo", "src/caller.rs", None);
+    let test_file = sample_file("Repo", "tests/target.rs", None);
+    let target_file = sample_file("Repo", "src/target.rs", None);
+    let call_function = sample_function(&call_file, "caller", None);
+    let test_function = sample_function(&test_file, "exercises_target", None);
+    let target_function = sample_function(&target_file, "target", None);
+
     let mut session = store.begin_index().expect("index session");
+    for file in [&call_file, &test_file, &target_file] {
+        insert_file(&mut session, file).expect("insert file");
+    }
+    for function in [&call_function, &test_function, &target_function] {
+        insert_function(&mut session, function).expect("insert function");
+    }
     insert_edge(
         &mut session,
         &Edge::new(
-            "call-source",
-            fixture.function.id.as_str(),
+            call_function.id.as_str(),
+            target_function.id.as_str(),
             EdgeKind::Calls,
             900,
             "test",
@@ -660,8 +677,8 @@ fn bounded_adjacency_caps_raw_rows_before_kind_filtering() {
     insert_edge(
         &mut session,
         &Edge::new(
-            "test-source",
-            fixture.function.id.as_str(),
+            test_function.id.as_str(),
+            target_function.id.as_str(),
             EdgeKind::Tests,
             900,
             "test",
@@ -669,12 +686,29 @@ fn bounded_adjacency_caps_raw_rows_before_kind_filtering() {
     )
     .expect("insert tests edge");
     session.commit().expect("commit");
+
+    // Assert the exact persisted incoming value order that makes the bounded
+    // raw-row expectation meaningful, rather than relying on insertion order.
+    let persisted_rows = collect_multimap(store.db(), EDGES_IN, target_function.id.as_str());
+    let persisted_kinds = persisted_rows
+        .iter()
+        .map(|row| {
+            bincode::deserialize::<AdjacencyRecord>(row)
+                .expect("decode persisted adjacency")
+                .kind
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted_kinds,
+        vec![EdgeKind::Calls, EdgeKind::Tests],
+        "persisted Calls row must precede Tests before filtering"
+    );
     drop(store);
 
-    let readonly = fixture.read_only();
+    let readonly = GraphStore::open_read_only(root).expect("read-only");
     let limited = readonly
         .neighbors_limited(
-            fixture.function.id.as_str(),
+            target_function.id.as_str(),
             NeighborDirection::Incoming,
             Some(EdgeKind::Tests),
             1,
@@ -689,7 +723,7 @@ fn bounded_adjacency_caps_raw_rows_before_kind_filtering() {
 
     let exact_budget = readonly
         .neighbors_limited(
-            fixture.function.id.as_str(),
+            target_function.id.as_str(),
             NeighborDirection::Incoming,
             Some(EdgeKind::Tests),
             2,
