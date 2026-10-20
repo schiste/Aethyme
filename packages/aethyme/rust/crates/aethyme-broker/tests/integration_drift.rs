@@ -286,8 +286,60 @@ fn doctor_cli(root: &Path, args: &[&str]) -> String {
 /// with the same dry-run next action, and leave every ref where it was.
 #[test]
 fn verify_only_doctor_reports_leftover_integration_work() {
-    let (tmp, _broker) = fixture(1);
+    let (tmp, mut setup_broker) = fixture(1);
     let root = tmp.path();
+    // A fresh isolated host has no worktree-history registry. Establish it
+    // through the real lifecycle so doctor can complete its orphan inventory;
+    // missing history must continue to report incomplete health in production.
+    let fixture_upstream = git(root, &["rev-parse", "refs/remotes/origin/main"]);
+    let fixture_integration = git(root, &["rev-parse", "refs/heads/aethyme/integration"]);
+    git(
+        root,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let seed = setup_broker
+        .start_worktree(
+            "initialize fixture worktree history",
+            Some("Fixture <fixture@example.invalid>"),
+        )
+        .unwrap();
+    let finished = setup_broker.finish(seed.id).unwrap();
+    assert!(finished.closed && finished.cleanup_safe, "{finished:?}");
+    assert!(finished.dirty_paths.is_empty(), "{finished:?}");
+    assert_eq!(finished.unsubmitted_commits, 0, "{finished:?}");
+    assert!(!finished.pending_work.present, "{finished:?}");
+    assert!(finished.cleanup.completed, "{finished:?}");
+    assert!(finished.cleanup.worktree_removed, "{finished:?}");
+    assert!(finished.cleanup.branch_removed, "{finished:?}");
+    assert!(!std::path::Path::new(&seed.worktree_path).exists());
+    // The offline remote is this repository itself: lifecycle refresh may
+    // replace the manually staged tracking ref. Restore scenario inputs before
+    // constructing the leftover commits and taking the read-only snapshots.
+    git(
+        root,
+        &["update-ref", "refs/remotes/origin/main", &fixture_upstream],
+    );
+    git(
+        root,
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &fixture_integration,
+        ],
+    );
+    assert_eq!(
+        git(root, &["rev-parse", "refs/remotes/origin/main"]),
+        fixture_upstream
+    );
+    assert_eq!(
+        git(root, &["rev-parse", "refs/heads/aethyme/integration"]),
+        fixture_integration
+    );
+    drop(setup_broker);
     let leftover = add_leftover_integration_work(root, 2);
     set_promote_mode(root, "verify-only");
     let upstream = git(root, &["rev-parse", "refs/remotes/origin/main"]);
