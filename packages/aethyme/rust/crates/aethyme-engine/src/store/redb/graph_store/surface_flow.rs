@@ -148,6 +148,8 @@ pub(super) fn is_surface_or_file_kind(kind: StoredNodeKind) -> bool {
 }
 
 pub(super) fn surface_flow_edge_kinds() -> Vec<EdgeKind> {
+    // Tests is intentionally absent: it is test-to-subject evidence, not a
+    // runtime flow edge.
     vec![
         EdgeKind::Authorizes,
         EdgeKind::Exposes,

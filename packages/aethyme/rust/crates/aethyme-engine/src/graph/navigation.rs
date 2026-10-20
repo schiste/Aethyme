@@ -1286,6 +1286,7 @@ fn edge_kind_label(kind: &EdgeKind) -> &'static str {
         EdgeKind::ValidatesCredential => "validates_credential",
         EdgeKind::RewritesHeader => "rewrites_header",
         EdgeKind::TestedBy => "tested_by",
+        EdgeKind::Tests => "tests",
     }
 }
 

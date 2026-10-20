@@ -51,6 +51,7 @@ fn edge_kind_index(kind: &EdgeKind) -> usize {
         | EdgeKind::RewritesHeader
         | EdgeKind::StoresCredential
         | EdgeKind::TestedBy
+        | EdgeKind::Tests
         | EdgeKind::UsesCredential
         | EdgeKind::ValidatesCredential => 5,
         EdgeKind::Exposes | EdgeKind::InstallsMiddleware => 8,

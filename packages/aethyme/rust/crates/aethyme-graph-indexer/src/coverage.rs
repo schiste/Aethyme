@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use aethyme_graph_schema::{Node, NodeKind, NodeKindCategory, SourceRange};
+use aethyme_graph_schema::{EdgeKind, Node, NodeKind, NodeKindCategory, SourceRange};
 use aethyme_graph_storage::{
     CoverageBytes, CoverageFileStatus, CoverageFiles, ExclusionReason, GraphCoverage, GraphUnit,
     UnitCoverageStatus, UnitPosition, sort_units,
@@ -164,6 +164,11 @@ pub(crate) fn assemble(
         edge_counts_by_category: BTreeMap::new(),
         unit_count: 0,
     };
+    // The current indexer emits Tests relationships when present. A complete
+    // index with none is still evidence that this edge kind was checked.
+    report
+        .edge_counts_by_kind
+        .insert(EdgeKind::Tests.name().into(), 0);
     let mut units = Vec::new();
     let mut unlocated_units = 0;
 
