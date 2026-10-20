@@ -35,17 +35,18 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
 
     let (repo, _) = super::landing_fixture();
     let capsule = tempfile::tempdir().expect("private fixture capsule");
-    let private_state = capsule.path().join("private-host-state");
-    let private_cache = capsule.path().join("private-host-cache");
-    let private_preparation_root = capsule.path().join("private-preparation-cache");
+    let capsule_root = capsule.path().canonicalize().unwrap();
+    let private_state = capsule_root.as_path().join("private-host-state");
+    let private_cache = capsule_root.as_path().join("private-host-cache");
+    let private_preparation_root = capsule_root.as_path().join("private-preparation-cache");
     std::fs::create_dir(&private_preparation_root).expect("private preparation-cache root");
-    let private_worktrees = capsule.path().join("private-worktrees");
-    let poisoned_state = capsule.path().join("poisoned-host-state");
-    let poisoned_cache = capsule.path().join("poisoned-host-cache");
-    let poisoned_worktrees = capsule.path().join("poisoned-worktrees");
-    let poisoned_xdg_state = capsule.path().join("poisoned-xdg-state");
-    let poisoned_xdg_cache = capsule.path().join("poisoned-xdg-cache");
-    let poisoned_home = capsule.path().join("poisoned-home");
+    let private_worktrees = capsule_root.as_path().join("private-worktrees");
+    let poisoned_state = capsule_root.as_path().join("poisoned-host-state");
+    let poisoned_cache = capsule_root.as_path().join("poisoned-host-cache");
+    let poisoned_worktrees = capsule_root.as_path().join("poisoned-worktrees");
+    let poisoned_xdg_state = capsule_root.as_path().join("poisoned-xdg-state");
+    let poisoned_xdg_cache = capsule_root.as_path().join("poisoned-xdg-cache");
+    let poisoned_home = capsule_root.as_path().join("poisoned-home");
 
     // First writable open initializes the opt-in root while it is empty. The
     // test payload is placed only inside the resulting nonce-scoped namespace.
@@ -212,8 +213,9 @@ fn separate_cache_root_modes_survive_a_restrictive_process_umask() {
     }
 
     let capsule = tempfile::tempdir().expect("fixture capsule");
-    let root = capsule.path().join("preparation-cache");
-    let host_state = capsule.path().join("host-state");
+    let capsule_root = capsule.path().canonicalize().unwrap();
+    let root = capsule_root.as_path().join("preparation-cache");
+    let host_state = capsule_root.as_path().join("host-state");
     std::fs::create_dir(&root).unwrap();
     std::fs::create_dir(&host_state).unwrap();
     let resource_db = host_state.join("host-resources.db");

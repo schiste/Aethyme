@@ -4809,9 +4809,10 @@ mod artifact_sweep_namespace_tests {
         use std::os::unix::fs::MetadataExt as _;
 
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("separate-cache");
+        let temporary_root = temporary.path().canonicalize().unwrap();
+        let root = temporary_root.as_path().join("separate-cache");
         std::fs::create_dir(&root).unwrap();
-        let host_state_dir = temporary.path().join("host-state");
+        let host_state_dir = temporary_root.as_path().join("host-state");
         std::fs::create_dir(&host_state_dir).unwrap();
         let host_resource_db_path = host_state_dir.join("host-resources.db");
         std::fs::File::create(&host_resource_db_path).unwrap();
@@ -4819,8 +4820,8 @@ mod artifact_sweep_namespace_tests {
         let (canonical, root_identity, state, handle) =
             capture_preparation_cache_root(&root).unwrap();
         let uninitialized = BrokerStorageContext {
-            repository_root: Some(temporary.path().join("repo")),
-            git_common_dir: Some(temporary.path().join("repo/.git")),
+            repository_root: Some(temporary_root.as_path().join("repo")),
+            git_common_dir: Some(temporary_root.as_path().join("repo/.git")),
             host_state_dir: Some(host_state_dir.clone()),
             host_resource_db_path: Some(host_resource_db_path.clone()),
             preparation_cache_root_override: Some(canonical.clone()),
@@ -4896,7 +4897,7 @@ mod artifact_sweep_namespace_tests {
             marked.artifact_sweep_namespace().unwrap()
         );
 
-        let other_state = temporary.path().join("other-host-state");
+        let other_state = temporary_root.as_path().join("other-host-state");
         std::fs::create_dir(&other_state).unwrap();
         let other_db = other_state.join("host-resources.db");
         std::fs::File::create(&other_db).unwrap();
@@ -4935,7 +4936,7 @@ mod artifact_sweep_namespace_tests {
             "a V4 payload cannot rebind a cache root to another coordinator"
         );
 
-        let host_state_alias = temporary.path().join("host-state-alias");
+        let host_state_alias = temporary_root.as_path().join("host-state-alias");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&host_state_dir, &host_state_alias).unwrap();
         let mut alias_context = marked.clone();
@@ -4962,8 +4963,8 @@ mod artifact_sweep_namespace_tests {
         std::fs::write(&marker_path, serde_json::to_vec(&changed_marker).unwrap()).unwrap();
         assert!(binding.validate().is_err());
         let sweep = crate::storage::sweep_preparation_cache_for_roots_with_binding(
-            &temporary.path().join("repo"),
-            &[temporary.path().join("worktrees")],
+            &temporary_root.as_path().join("repo"),
+            &[temporary_root.as_path().join("worktrees")],
             &binding,
             &host_resource_db_path,
             std::time::Instant::now() + Duration::from_secs(1),
@@ -4988,7 +4989,7 @@ mod artifact_sweep_namespace_tests {
             legacy.artifact_sweep_namespace().unwrap()
         );
 
-        let old_root = temporary.path().join("moved-cache");
+        let old_root = temporary_root.as_path().join("moved-cache");
         std::fs::rename(&canonical, &old_root).unwrap();
         std::fs::create_dir(&canonical).unwrap();
         assert!(marked.preparation_cache_root_binding().is_err());

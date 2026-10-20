@@ -3241,8 +3241,9 @@ mod tests {
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().unwrap();
-        let outer_root = tmp.path().join("preparation-cache-root");
-        let host_state = tmp.path().join("host-state");
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let outer_root = tmp_root.as_path().join("preparation-cache-root");
+        let host_state = tmp_root.as_path().join("host-state");
         std::fs::create_dir(&outer_root).unwrap();
         std::fs::create_dir(&host_state).unwrap();
         let resource_db = host_state.join("host-resources.db");
@@ -3294,7 +3295,8 @@ mod tests {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, error)
                         })?;
                     marker["coordinator_db_path"] = serde_json::Value::from(
-                        tmp.path()
+                        tmp_root
+                            .as_path()
                             .join("replacement-host-state/host-resources.db")
                             .to_string_lossy()
                             .into_owned(),
@@ -3344,8 +3346,9 @@ mod tests {
     #[test]
     fn preparation_writer_refuses_a_changed_cache_root_marker_before_measuring() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache_root = tmp.path().join("preparation-cache");
-        let host_state = tmp.path().join("host-state");
+        let tmp_root = tmp.path().canonicalize().unwrap();
+        let cache_root = tmp_root.as_path().join("preparation-cache");
+        let host_state = tmp_root.as_path().join("host-state");
         std::fs::create_dir(&cache_root).unwrap();
         std::fs::create_dir(&host_state).unwrap();
         let resource_db = host_state.join("host-resources.db");
@@ -3363,7 +3366,8 @@ mod tests {
         let mut marker: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
         marker["coordinator_db_path"] = serde_json::Value::from(
-            tmp.path()
+            tmp_root
+                .as_path()
                 .join("different-host-state/host-resources.db")
                 .to_string_lossy()
                 .into_owned(),

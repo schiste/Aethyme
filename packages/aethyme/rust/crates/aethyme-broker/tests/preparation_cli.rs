@@ -40,7 +40,7 @@ fn success_json(output: Output) -> serde_json::Value {
 }
 
 fn fixture() -> tempfile::TempDir {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     git(temp.path(), &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(temp.path().join(".aethyme")).unwrap();
     std::fs::write(
