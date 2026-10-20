@@ -1,5 +1,55 @@
 use super::*;
 
+const DEFAULT_LEASE_CLAIM_PREPARATION_BUDGET_MS: u64 = 30_000;
+const LEASE_CLAIM_PREPARATION_BUDGET_ENV: &str = "AETHYME_BROKER_LEASE_CLAIM_PREPARATION_BUDGET_MS";
+
+fn lease_claim_preparation_budget_ms_from(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|budget| *budget > 0)
+        .map_or(DEFAULT_LEASE_CLAIM_PREPARATION_BUDGET_MS, |budget| {
+            budget.min(DEFAULT_LEASE_CLAIM_PREPARATION_BUDGET_MS)
+        })
+}
+
+fn lease_claim_preparation_budget_ms() -> u64 {
+    lease_claim_preparation_budget_ms_from(
+        std::env::var(LEASE_CLAIM_PREPARATION_BUDGET_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The deadline for the read-only and Git-backed preparation before an
+/// explicit lease claim is committed. The SQLite claim transaction itself is
+/// not interrupted: the deadline is checked immediately before that write.
+struct LeaseClaimPreparation {
+    deadline: std::time::Instant,
+    budget_ms: u64,
+    git_timeout_generation: u64,
+}
+
+impl LeaseClaimPreparation {
+    fn start(budget_ms: u64) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + std::time::Duration::from_millis(budget_ms),
+            budget_ms,
+            git_timeout_generation: crate::git::git_timeout_generation(),
+        }
+    }
+
+    fn check(&self) -> Result<(), BrokerOpError> {
+        if std::time::Instant::now() >= self.deadline
+            || crate::git::git_timeout_generation() != self.git_timeout_generation
+        {
+            return Err(BrokerOpError::LeaseClaimPreparationTimedOut {
+                budget_ms: self.budget_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Broker {
     // ── agents (liveness) ─────────────────────────────────────────────
 
@@ -552,16 +602,37 @@ impl Broker {
         &mut self,
         acting: Option<i64>,
     ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
+        self.refresh_leases_including_with_claim_preparation(acting, None)
+    }
+
+    fn refresh_leases_including_with_claim_preparation(
+        &mut self,
+        acting: Option<i64>,
+        preparation: Option<&LeaseClaimPreparation>,
+    ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, detect_overlaps};
 
         let rules = LeaseIgnoreRules::load(&self.main_root);
         // The integration tip is the same for every session; resolving it
         // inside the loop cost one git subprocess per live session.
         let integration = self.integration_tip();
+        if let Some(preparation) = preparation {
+            preparation.check()?;
+        }
         let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
+        if let Some(preparation) = preparation {
+            preparation.check()?;
+        }
         let mut coordinating = self.coordinating_session_ids()?;
+        if let Some(preparation) = preparation {
+            preparation.check()?;
+        }
         coordinating.extend(acting);
+        let mut pending_implicit_leases = Vec::new();
         for session in self.store.live_sessions()? {
+            if let Some(preparation) = preparation {
+                preparation.check()?;
+            }
             if !coordinating.contains(&session.id) {
                 continue;
             }
@@ -571,15 +642,44 @@ impl Broker {
                 integration.as_deref(),
                 upstream.as_deref(),
             ) else {
+                if let Some(preparation) = preparation {
+                    // `integration_tip`, `upstream_default`, baseline and
+                    // changed-file helpers deliberately hide ordinary Git
+                    // failures behind `Option`. A timeout is different: a
+                    // lease claim must stop rather than treating that
+                    // incomplete scan as an empty or absent worktree.
+                    preparation.check()?;
+                }
                 continue;
             };
-            self.store.set_implicit_leases(session.id, &paths)?;
+            if let Some(preparation) = preparation {
+                preparation.check()?;
+                pending_implicit_leases.push((session.id, paths));
+            } else {
+                self.store.set_implicit_leases(session.id, &paths)?;
+            }
+        }
+        if let Some(preparation) = preparation {
+            preparation.check()?;
+            for (session_id, paths) in pending_implicit_leases {
+                preparation.check()?;
+                self.store.set_implicit_leases(session_id, &paths)?;
+            }
         }
 
         let after = detect_overlaps(&self.coordinating_leases(&coordinating)?);
+        if let Some(preparation) = preparation {
+            preparation.check()?;
+        }
         self.classify_and_announce_overlaps(&after)?;
+        if let Some(preparation) = preparation {
+            preparation.check()?;
+        }
         self.store
             .meta_set("leases.refreshed_at_ms", &now_ms().to_string())?;
+        if let Some(preparation) = preparation {
+            preparation.check()?;
+        }
         Ok(after)
     }
 
@@ -629,7 +729,10 @@ impl Broker {
         path: &str,
         ttl_ms: Option<i64>,
     ) -> Result<LeaseClaimReport, BrokerOpError> {
+        let preparation = LeaseClaimPreparation::start(lease_claim_preparation_budget_ms());
+        preparation.check()?;
         let session = self.store.session(session_id)?;
+        preparation.check()?;
         if session.status.is_closed() {
             return Err(BrokerOpError::ClosedSessionOperation {
                 session_id,
@@ -637,8 +740,12 @@ impl Broker {
             });
         }
         let path = normalize_lease_path(path)?;
-        self.refresh_leases_including(Some(session_id))?;
+        preparation.check()?;
+        let _git_deadline = crate::git::limit_git_until(preparation.deadline);
+        self.refresh_leases_including_with_claim_preparation(Some(session_id), Some(&preparation))?;
+        preparation.check()?;
         let policy = self.lease_refusal_policy()?;
+        preparation.check()?;
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
         for mut lease in self.lease_blockers(session_id, &path)? {
@@ -657,6 +764,7 @@ impl Broker {
                 warnings.push(lease);
             }
         }
+        preparation.check()?;
         if !blockers.is_empty() {
             return Err(BrokerOpError::LeaseClaimConflict {
                 session_id,
@@ -665,6 +773,10 @@ impl Broker {
                 blockers,
             });
         }
+        // Keep the deadline immediately adjacent to the only explicit-claim
+        // write. A timeout in preparation never inserts a claim row or emits
+        // `lease.claimed`; the storage transaction itself is not interrupted.
+        preparation.check()?;
         self.store.claim_lease(session_id, &path, ttl_ms)?;
         Ok(LeaseClaimReport {
             session_id,
@@ -2042,6 +2154,107 @@ mod generic_guarded_exec_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(repository.path()).unwrap();
         (repository, storage, broker)
+    }
+
+    #[test]
+    fn lease_claim_preparation_budget_is_positive_and_capped() {
+        assert_eq!(
+            lease_claim_preparation_budget_ms_from(None),
+            DEFAULT_LEASE_CLAIM_PREPARATION_BUDGET_MS
+        );
+        assert_eq!(
+            lease_claim_preparation_budget_ms_from(Some(" 1250 ")),
+            1_250
+        );
+        assert_eq!(
+            lease_claim_preparation_budget_ms_from(Some("90000")),
+            DEFAULT_LEASE_CLAIM_PREPARATION_BUDGET_MS
+        );
+        assert_eq!(
+            lease_claim_preparation_budget_ms_from(Some("0")),
+            DEFAULT_LEASE_CLAIM_PREPARATION_BUDGET_MS
+        );
+        assert_eq!(
+            lease_claim_preparation_budget_ms_from(Some("invalid")),
+            DEFAULT_LEASE_CLAIM_PREPARATION_BUDGET_MS
+        );
+    }
+
+    #[test]
+    fn timed_out_git_during_claim_preparation_records_no_explicit_claim() {
+        use std::time::{Duration, Instant};
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("bounded lease claim", None).unwrap();
+        let explicit_before: i64 = broker
+            .store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM leases
+                 WHERE session_id = ?1 AND path = ?2 AND kind = 'explicit'",
+                rusqlite::params![session.id, "claim-target.txt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claimed_events_before: i64 = broker
+            .store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE session_id = ?1 AND kind = ?2",
+                rusqlite::params![session.id, crate::events::LEASE_CLAIMED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let git_timeout_generation_before = crate::git::git_timeout_generation();
+
+        let error = {
+            // Simulate a Git command whose ordinary timeout is shorter than
+            // the claim's overall budget. The ref helper returns `None`, but
+            // the timeout generation must make the claim refuse instead of
+            // treating it as a missing integration ref.
+            let _expired_git_deadline =
+                crate::git::limit_git_until(Instant::now() - Duration::from_millis(1));
+            broker
+                .claim_lease(session.id, "claim-target.txt", None)
+                .unwrap_err()
+        };
+
+        assert!(
+            matches!(error, BrokerOpError::LeaseClaimPreparationTimedOut { .. }),
+            "unexpected error: {error}"
+        );
+        assert_ne!(
+            crate::git::git_timeout_generation(),
+            git_timeout_generation_before,
+            "the test must exercise a timed-out Git read, not only an elapsed claim budget"
+        );
+        assert_eq!(
+            crate::exit_status::for_broker_error(&error),
+            crate::exit_status::ENVIRONMENT
+        );
+        let explicit_after: i64 = broker
+            .store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM leases
+                 WHERE session_id = ?1 AND path = ?2 AND kind = 'explicit'",
+                rusqlite::params![session.id, "claim-target.txt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claimed_events_after: i64 = broker
+            .store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE session_id = ?1 AND kind = ?2",
+                rusqlite::params![session.id, crate::events::LEASE_CLAIMED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(explicit_after, explicit_before);
+        assert_eq!(claimed_events_after, claimed_events_before);
     }
 
     #[test]
