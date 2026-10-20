@@ -4364,8 +4364,11 @@ mod tests {
     #[test]
     fn generated_outputs_and_commit_identity_do_not_invalidate_onboarding() {
         let repo = committed_git_repo("stable-after-commit");
-        let expected = expected_onboarding_files(&repo).unwrap();
         crate::deploy::deploy(&repo, true).unwrap();
+        // Deployment intentionally adds README guidance, which is source input.
+        // Committing that updated source and the generated outputs must not
+        // change the onboarding derived from those same bytes.
+        let expected = expected_onboarding_files(&repo).unwrap();
         git(&repo, &["add", "--all"]);
         git(&repo, &["commit", "-m", "docs: generate onboarding"]);
 

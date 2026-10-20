@@ -1028,7 +1028,10 @@ fn broker_runtime_files_do_not_change_the_gate_tree_hash() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     init::scaffold(tmp.path()).unwrap();
-    sh(tmp.path(), &["add", ".gitignore", ".aethyme/config.toml"]);
+    sh(
+        tmp.path(),
+        &["add", ".gitignore", ".aethyme/config.toml", "README.md"],
+    );
     sh(tmp.path(), &["commit", "-qm", "scaffold"]);
 
     let repo = aethyme_broker::GitRepo::discover(tmp.path()).unwrap();

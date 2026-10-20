@@ -255,7 +255,7 @@ clone receives the bridge but none of the activation artifacts.
 
 ## Skill learning in the README
 
-Canonical `aethyme deploy --repo .`, `aethyme init`, and `aethyme broker scaffold`
+Canonical `aethyme deploy --repo .`, `aethyme init`, and `aethyme broker advanced scaffold`
 add one managed skill-learning section to the repository README. Existing prose
 outside the section is preserved byte-for-byte. Repeating the operation refreshes
 that section without duplicating it. Existing repositories use the same commands
