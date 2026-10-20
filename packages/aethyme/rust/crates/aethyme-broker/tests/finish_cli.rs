@@ -8,10 +8,29 @@ use aethyme_broker::{GateStatus, NewGateResult, events};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
+fn git_command(repo: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    let git_keys = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+        .collect::<Vec<_>>();
+    for key in git_keys {
+        command.env_remove(key);
+    }
+    command.args(args).current_dir(repo)
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    let reference = format!("refs/heads/{branch}");
+    git_command(repo, &["show-ref", "--verify", "--quiet", &reference])
+        .status()
+        .unwrap()
+        .success()
+}
+
 fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
+    let output = git_command(repo, args)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
@@ -217,20 +236,7 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert_eq!(report["cleanup"]["worktree_removed"], true);
     assert_eq!(report["cleanup"]["branch_removed"], true);
     assert!(!worktree.exists());
-    assert!(
-        !Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(!branch_exists(tmp.path(), &branch));
     assert!(
         report["recommended_next_action"]
             .as_str()
@@ -646,20 +652,7 @@ fn finish_cli_keep_worktree_closes_state_without_reclaiming_artifacts() {
     assert_eq!(report["cleanup"]["kept"], true);
     assert_eq!(report["cleanup"]["attempted"], false);
     assert!(worktree.exists());
-    assert!(
-        Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -701,20 +694,7 @@ fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
     let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(resumed["cleaned"], session_id);
     assert!(!worktree.exists());
-    assert!(
-        !Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(!branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -739,15 +719,7 @@ fn finish_cleanup_refuses_partial_deletions_without_a_proof_bearing_intent() {
     assert!(!output.status.success());
     assert!(worktree.exists());
     assert!(!worktree.join("README.md").exists());
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -778,15 +750,7 @@ fn finish_cleanup_proof_does_not_authorize_untracked_files() {
         std::fs::read_to_string(worktree.join("untracked.txt")).unwrap(),
         "keep me\n"
     );
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -833,15 +797,7 @@ fn finish_cleanup_proof_does_not_authorize_a_replacement_checkout_at_the_same_pa
         git(tmp.path(), &["worktree", "list", "--porcelain"]).contains(worktree.to_str().unwrap()),
         "Git must still list the replacement checkout after recovery refuses it"
     );
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -884,15 +840,7 @@ fn finish_cleanup_resumes_with_managed_runtime_and_witnessed_build_artifacts() {
     assert!(!managed_status.exists());
     assert!(!broker_log.exists());
     assert!(!target.exists());
-    assert!(
-        !Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(!branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -918,15 +866,7 @@ fn finish_cleanup_proof_does_not_authorize_a_same_named_ignored_runtime_file() {
         std::fs::read_to_string(&log_file).unwrap(),
         "preserve this file\n"
     );
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -945,15 +885,7 @@ fn finish_cleanup_proof_does_not_authorize_arbitrary_ignored_files() {
     assert!(worktree.exists());
     assert!(!worktree.join("README.md").exists());
     assert_eq!(std::fs::read_to_string(secret).unwrap(), "KEEP=me\n");
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -974,15 +906,7 @@ fn finish_cleanup_proof_does_not_authorize_a_staged_deletion() {
         git(&worktree, &["diff", "--cached", "--name-status"]),
         "D\tREADME.md"
     );
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -1003,15 +927,7 @@ fn finish_cleanup_proof_does_not_authorize_a_mixed_modification() {
         std::fs::read_to_string(worktree.join("done.txt")).unwrap(),
         "local edit\n"
     );
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -1033,15 +949,7 @@ fn finish_cleanup_proof_does_not_authorize_a_moved_unrepresented_head() {
     assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), moved_head);
     assert!(worktree.join("late.txt").exists());
     assert!(!worktree.join("README.md").exists());
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -1071,15 +979,7 @@ fn finish_cleanup_proof_does_not_authorize_a_live_replacement_session() {
     assert!(!worktree.join("README.md").exists());
     let broker = isolation::open(tmp.path());
     assert!(!broker.store().session(live.id).unwrap().status.is_closed());
-    assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
@@ -1140,20 +1040,7 @@ fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() 
     let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(resumed["status"], "cleaned");
     assert_eq!(resumed["cleanup"]["completed"], true);
-    assert!(
-        !Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    assert!(!branch_exists(tmp.path(), &branch));
 }
 
 #[path = "common/json_error.rs"]
@@ -1216,13 +1103,7 @@ fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
     assert!(worktree.join("README.md").is_file());
     assert!(worktree.exists());
     assert!(
-        Command::new("git")
-            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap()
-            .status
-            .success(),
+        branch_exists(tmp.path(), &branch),
         "a failed cleanup must preserve the branch"
     );
 }
