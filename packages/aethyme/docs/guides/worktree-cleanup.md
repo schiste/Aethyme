@@ -142,6 +142,16 @@ keep = ["*-investigation"]     # worktrees never removed automatically
 Build caches of inactive sessions are still reclaimed separately, even when a
 checkout must be kept.
 
+## Maintenance during broker open
+
+Opening a broker handle may resume an already-authorized durable GC journal
+and run the bounded autonomous sweep before the requested command proceeds.
+The sweep may reclaim rebuildable artifacts and remove a closed checkout only
+when the configured policy and the existing ownership, liveness, cleanliness,
+and delivery proofs pass. It does not create a cleanup plan or adopt an
+unmarked root; candidates it cannot prove safe remain retained and are
+reported by the GC and broker status views.
+
 ## 2. Dry-run the supported sweep
 
 ```sh

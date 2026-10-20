@@ -1324,7 +1324,7 @@ fn refused_worktree_root_plan(
     }
 }
 
-fn plan_worktree_root_with_context(
+pub(crate) fn plan_worktree_root_with_context(
     main_root: &Path,
     git_common_dir: Option<&Path>,
     context: &BrokerStorageContext,
