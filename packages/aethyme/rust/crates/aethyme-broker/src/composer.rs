@@ -182,7 +182,7 @@ pub fn compose_structural(
 pub const COMPOSER_BASELINE_SOURCE: &str = "retained";
 
 pub const COMPOSITION_RECIPE_SCHEMA_NAME: &str = "aethyme.composition-recipe/experimental-v0";
-const SEEDED_CONFLICT_RECIPE_SCHEMA_NAME: &str =
+pub(crate) const SEEDED_CONFLICT_RECIPE_SCHEMA_NAME: &str =
     "aethyme.seeded-conflict-composition/experimental-v1";
 
 /// Consecutive non-blank lines (whitespace-insensitive) that must leave one
@@ -636,22 +636,42 @@ pub(crate) fn compose_after_synthesized_conflict(
         )
         .map_err(|error| ComposeError::CandidateRetention(error.to_string()))?;
         retain_seeded_conflict_artifacts(
-            store, &revision, binding, result, &synthesis, candidate, recipe, &retention,
+            store,
+            &revision,
+            SeededConflictArtifacts {
+                binding,
+                result,
+                synthesis: &synthesis,
+                candidate,
+                recipe,
+            },
+            &retention,
         )?;
     }
     Ok(composition)
 }
 
+struct SeededConflictArtifacts<'a> {
+    binding: &'a crate::local_wave::CurrentConflictRequestBinding,
+    result: &'a crate::resolution::RecordRef,
+    synthesis: &'a crate::resolution::UnverifiedSynthesis,
+    candidate: &'a Candidate,
+    recipe: &'a RecipeRef,
+}
+
 fn retain_seeded_conflict_artifacts(
     store: &mut CollaborationStore,
     revision: &RecordId,
-    binding: &crate::local_wave::CurrentConflictRequestBinding,
-    result: &crate::resolution::RecordRef,
-    synthesis: &crate::resolution::UnverifiedSynthesis,
-    candidate: &Candidate,
-    recipe: &RecipeRef,
+    artifacts: SeededConflictArtifacts<'_>,
     retention: &crate::local_target::ArtifactRetentionPermit<'_>,
 ) -> Result<(), ComposeError> {
+    let SeededConflictArtifacts {
+        binding,
+        result,
+        synthesis,
+        candidate,
+        recipe,
+    } = artifacts;
     let mut snapshots = BTreeMap::new();
     let mut add_snapshot = |snapshot: &SourceSnapshotId| {
         snapshots.insert(snapshot.to_string(), snapshot.clone());
@@ -1292,18 +1312,21 @@ fn compose_inner_under_archive_guard(
             }
         }
     }
+    let build_baseline = Baseline {
+        retained: baseline,
+        accepted,
+    };
     let (candidate, plan) = match build(
-        store,
-        repo,
-        request,
-        &Baseline {
-            retained: baseline,
-            accepted,
+        BuildInputs {
+            store,
+            repo,
+            request,
+            baseline: &build_baseline,
+            deliveries: inputs.deliveries,
+            seeded_conflict: inputs.seeded_conflict,
         },
-        inputs.deliveries,
         (&mut usage, &mut order),
         profile,
-        inputs.seeded_conflict,
     )? {
         Ok(Built::Candidate(candidate, plan)) => (candidate, plan),
         Ok(Built::Other(outcome)) => {
@@ -1644,26 +1667,38 @@ pub(crate) fn validate_retained_selection(
     )
 }
 
+struct BuildInputs<'a> {
+    store: &'a CollaborationStore,
+    repo: &'a Path,
+    request: &'a CompositionRequest,
+    baseline: &'a Baseline,
+    deliveries: &'a [String],
+    seeded_conflict: Option<&'a SeededConflict<'a>>,
+}
+
 fn build(
-    store: &CollaborationStore,
-    repo: &Path,
-    request: &CompositionRequest,
-    baseline: &Baseline,
-    deliveries: &[String],
+    inputs: BuildInputs<'_>,
     progress: (&mut BudgetUsage, &mut Vec<String>),
     profile: &mut MergeProfile<'_>,
-    seeded_conflict: Option<&SeededConflict<'_>>,
 ) -> Result<Result<Built, Refused>, ComposeError> {
+    let BuildInputs {
+        store,
+        repo,
+        request,
+        baseline,
+        deliveries,
+        seeded_conflict,
+    } = inputs;
     let (usage, order) = progress;
     let plan = match plan(store, request, baseline, deliveries, usage)? {
         Ok(plan) => plan,
         Err(refusal) => return Ok(Err(refusal)),
     };
     order.extend(plan.steps.iter().map(|step| step.spec.id.clone()));
-    if let Some(seed) = seeded_conflict {
-        if let Err(refusal) = validate_seeded_plan(request, &plan, seed) {
-            return Ok(Err(refusal));
-        }
+    if let Some(seed) = seeded_conflict
+        && let Err(refusal) = validate_seeded_plan(request, &plan, seed)
+    {
+        return Ok(Err(refusal));
     }
 
     let mut reader = Reader {

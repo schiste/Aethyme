@@ -1,5 +1,7 @@
 //! Appointed Local controller integration. Only a private, freshly rechecked
 //! acceptance grant can finish a wave. Receipts remain historical data.
+use std::path::Path;
+
 use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId, RecordSchema};
 use rusqlite::{TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -136,7 +138,8 @@ fn control_check(
 }
 
 fn completion_prior_members(
-    store: &CollaborationStore,
+    store: &mut CollaborationStore,
+    repo: &Path,
     owner: &ControllerOwner,
     active: &wave::Wave,
 ) -> Result<Vec<String>, ControllerError> {
@@ -148,6 +151,7 @@ fn completion_prior_members(
         return Ok(Vec::new());
     };
     binding.validate_retained_completion(store)?;
+    binding.validate_git_binding(store, repo)?;
     Ok(binding.previous_members().to_vec())
 }
 
@@ -215,7 +219,8 @@ fn complete_inner(
             .ok_or(ControllerError::Mismatch)?,
     };
     let record = spec.record()?;
-    let prior_members = completion_prior_members(store, owner, &active)?;
+    let prior_members =
+        completion_prior_members(store, broker.repo_handle().root(), owner, &active)?;
     let object = archive::put_object(store, &record.canonical_bytes())?;
     let tx = store
         .connection()

@@ -1351,6 +1351,19 @@ fn admit_new(
             validated.now_ms,
         ],
     )?;
+    // Schema 27 requires a managed charge to be inserted in exported state
+    // before dispatch. After writing the reservation and proof bindings, this
+    // admission transaction advances it to dispatching before commit.
+    if transaction.execute(
+        "UPDATE resolution_attempts SET async_state='dispatching'
+         WHERE attempt_id=?1 AND async_token=?2
+           AND resolver='local-managed-resolution' AND session_label IS NULL
+           AND async_state='exported'",
+        params![attempt_id, async_token.as_str()],
+    )? != 1
+    {
+        return Err(BudgetError::Stale);
+    }
     transaction.commit()?;
 
     Ok(ResolutionDispatchPermit {

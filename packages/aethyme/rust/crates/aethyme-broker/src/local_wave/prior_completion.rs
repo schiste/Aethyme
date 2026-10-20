@@ -231,6 +231,24 @@ pub(super) fn latest_for_admission(
 
 const MAX_HISTORICAL_COMPLETION_DEPTH: usize = 32;
 
+struct HistoricalWaveRow {
+    body: Vec<u8>,
+    phase: String,
+    detail: Option<String>,
+    sequence: i64,
+    target: String,
+    revision: String,
+    candidate_snapshot: Option<String>,
+    candidate_commit: Option<String>,
+    recipe_object: Option<String>,
+    composition_source_record_id: Option<String>,
+    composition_source_object: Option<String>,
+    resolution_request_record_id: Option<String>,
+    resolution_request_object: Option<String>,
+    resolution_result_record_id: Option<String>,
+    resolution_result_object: Option<String>,
+}
+
 /// Validate the immutable composition source for an accepted completion.
 /// This is provenance only: it never authorizes a current controller action.
 fn verify_historical_source(
@@ -244,6 +262,16 @@ fn verify_historical_source(
     let response = crate::collaboration_sensitive::response_use(store)?;
     let mut seen = BTreeSet::new();
     verify_historical_source_inner(store, &response, key, completion, wave_spec, &mut seen, 0)
+}
+
+#[cfg(test)]
+pub(crate) fn verify_historical_source_for_test(
+    store: &CollaborationStore,
+    key: &RecordId,
+    completion: &CompletionSpec,
+    wave_spec: &WaveSpec,
+) -> Result<(), WaveError> {
+    verify_historical_source(store, key, completion, wave_spec)
 }
 
 fn verify_historical_source_inner(
@@ -261,23 +289,7 @@ fn verify_historical_source_inner(
         ));
     }
     let result = (|| {
-        let row: (
-            Vec<u8>,
-            String,
-            Option<String>,
-            i64,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = store.read_connection().query_row(
+        let row = store.read_connection().query_row(
             "SELECT body,phase,detail,sequence,target,revision,candidate_snapshot,
                     candidate_commit,recipe_object,composition_source_record_id,
                     composition_source_object,resolution_request_record_id,
@@ -286,73 +298,101 @@ fn verify_historical_source_inner(
              FROM local_waves WHERE wave=?1",
             [&completion.wave],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                    row.get(14)?,
-                ))
+                Ok(HistoricalWaveRow {
+                    body: row.get(0)?,
+                    phase: row.get(1)?,
+                    detail: row.get(2)?,
+                    sequence: row.get(3)?,
+                    target: row.get(4)?,
+                    revision: row.get(5)?,
+                    candidate_snapshot: row.get(6)?,
+                    candidate_commit: row.get(7)?,
+                    recipe_object: row.get(8)?,
+                    composition_source_record_id: row.get(9)?,
+                    composition_source_object: row.get(10)?,
+                    resolution_request_record_id: row.get(11)?,
+                    resolution_request_object: row.get(12)?,
+                    resolution_result_record_id: row.get(13)?,
+                    resolution_result_object: row.get(14)?,
+                })
             },
         )?;
-        let record = Record::decode(&row.0, &[&super::SCHEMA])
+        let record = Record::decode(&row.body, &[&super::SCHEMA])
             .map_err(|error| WaveError::Invalid(format!("historical wave record: {error}")))?;
-        let body: Value = serde_json::from_slice(&row.0)?;
+        let body: Value = serde_json::from_slice(&row.body)?;
         let stored_spec: WaveSpec = serde_json::from_value(body["spec"].clone())?;
         if record.id().as_str() != completion.wave
-            || record.canonical_bytes() != row.0
-            || row.1 != "accepted"
-            || row.2.as_deref() != Some(key.as_str())
-            || row.3 != wave_spec.sequence
-            || row.4 != completion.target
-            || row.5 != completion.revision
+            || record.canonical_bytes() != row.body
+            || row.phase != "accepted"
+            || row.detail.as_deref() != Some(key.as_str())
+            || row.sequence != wave_spec.sequence
+            || row.target != completion.target
+            || row.revision != completion.revision
             || stored_spec != *wave_spec
-            || row.6.as_deref() != Some(completion.source.as_str())
-            || row.7.as_deref() != Some(completion.candidate_commit.as_str())
+            || row.candidate_snapshot.as_deref() != Some(completion.source.as_str())
+            || row.candidate_commit.as_deref() != Some(completion.candidate_commit.as_str())
         {
             return Err(WaveError::Invalid(
                 "historical accepted wave source projection".into(),
             ));
         }
-        let source_ref = super::record_ref(row.9.as_deref(), row.10.as_deref())?
-            .ok_or_else(|| WaveError::Invalid("accepted wave has no composition source".into()))?;
-        let request_ref = super::record_ref(row.11.as_deref(), row.12.as_deref())?;
-        let result_ref = super::record_ref(row.13.as_deref(), row.14.as_deref())?;
-        match (request_ref.as_ref(), result_ref.as_ref()) {
-            (None, None) => {}
+        let source_ref = super::record_ref(
+            row.composition_source_record_id.as_deref(),
+            row.composition_source_object.as_deref(),
+        )?
+        .ok_or_else(|| WaveError::Invalid("accepted wave has no composition source".into()))?;
+        let request_ref = super::record_ref(
+            row.resolution_request_record_id.as_deref(),
+            row.resolution_request_object.as_deref(),
+        )?;
+        let result_ref = super::record_ref(
+            row.resolution_result_record_id.as_deref(),
+            row.resolution_result_object.as_deref(),
+        )?;
+        let historical_synthesis = match (request_ref.as_ref(), result_ref.as_ref()) {
+            (None, None) => None,
             (Some(request), Some(result)) => {
-                let synthesis = crate::resolution::read_retained_synthesized_result_for_refs(
+                let proof = crate::resolution::read_retained_synthesized_result_for_refs(
                     store, request, result,
                 )?;
-                if synthesis.request.baseline().snapshot_id.as_str() != wave_spec.baseline {
+                if proof.status.state != crate::resolution::ResolutionAttemptState::Settled
+                    || proof.status.outcome.as_deref() != Some("synthesized")
+                    || proof.status.response_sha256.is_none()
+                    || proof.status.request != *request
+                    || proof.status.request_sha256 != request.object.hex()
+                    || proof.status.result.as_ref() != Some(result)
+                    || proof.status.input_manifest_sha256 != proof.input_manifest.sha256
+                    || proof.request.baseline().snapshot_id.as_str() != wave_spec.baseline
+                    || proof.group_record != *result
+                {
                     return Err(WaveError::Invalid(
-                        "historical synthesized baseline differs from its wave".into(),
+                        "historical synthesized baseline or result differs from its wave".into(),
                     ));
                 }
-                // The archive proof is available, but prior-completion reuse
-                // remains failclosed until the seed tree is checked against
-                // its Git commit at the repository materialization boundary.
-                return Err(WaveError::ResolutionUnsupported);
+                for reference in [request.object.hex(), result.object.hex()] {
+                    require_completion_root(store, key, "object", &reference)?;
+                }
+                require_completion_root(store, key, "object", &proof.input_manifest.sha256)?;
+                require_completion_root(store, key, "snapshot", proof.candidate_subject.as_str())?;
+                for digest in proof
+                    .input_manifest
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.sha256.as_deref())
+                {
+                    require_completion_root(store, key, "object", digest)?;
+                }
+                Some(proof)
             }
             _ => {
                 return Err(WaveError::Invalid(
                     "historical wave has an incomplete synthesized request/result pair".into(),
                 ));
             }
-        }
+        };
 
         let recipe_object = row
-            .8
+            .recipe_object
             .as_deref()
             .map(super::object)
             .transpose()?
@@ -388,12 +428,8 @@ fn verify_historical_source_inner(
             || payload.profile != composer::PROVISIONAL_TEXT_PROFILE
             || source.record != source_ref
             || recipe.object != recipe_object
-            || candidate.subject.as_str() != completion.source
-            || candidate.commit.as_str() != completion.candidate_commit
-            || candidate.tree != completion.candidate_tree
             || candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
             || candidate.baseline != source.request.baseline
-            || candidate.mode != CompositionMode::Text
         {
             return Err(WaveError::Invalid(
                 "historical composition source candidate binding".into(),
@@ -566,16 +602,124 @@ fn verify_historical_source_inner(
             ));
         }
         let recipe_json: Value = serde_json::from_slice(&recipe_bytes)?;
+        let seeded_recipe = recipe_json.get("seeded_conflict").is_some();
+        match (historical_synthesis.as_ref(), seeded_recipe) {
+            (None, false) => {
+                if candidate.mode != CompositionMode::Text
+                    || candidate.subject.as_str() != completion.source
+                    || candidate.commit.as_str() != completion.candidate_commit
+                    || candidate.tree != completion.candidate_tree
+                {
+                    return Err(WaveError::Invalid(
+                        "historical direct composition candidate binding".into(),
+                    ));
+                }
+            }
+            (Some(proof), false) => {
+                // Direct synthesis leaves the original Text source and recipe
+                // intact. The accepted candidate is the settled resolver
+                // output, not the candidate in that original composition.
+                if candidate.mode != CompositionMode::Text
+                    || proof.candidate_subject.as_str() != completion.source
+                    || proof.candidate_commit.as_str() != completion.candidate_commit
+                {
+                    return Err(WaveError::Invalid(
+                        "historical direct synthesized candidate binding".into(),
+                    ));
+                }
+            }
+            (Some(_), true) => {
+                if candidate.mode != CompositionMode::Hybrid
+                    || candidate.subject.as_str() != completion.source
+                    || candidate.commit.as_str() != completion.candidate_commit
+                    || candidate.tree != completion.candidate_tree
+                {
+                    return Err(WaveError::Invalid(
+                        "historical seeded hybrid candidate binding".into(),
+                    ));
+                }
+            }
+            (None, true) => {
+                return Err(WaveError::Invalid(
+                    "historical seeded recipe has no synthesized result".into(),
+                ));
+            }
+        }
         if recipe_json["candidate"].as_str() != Some(candidate.subject.as_str())
             || recipe_json["candidate_commit"].as_str() != Some(candidate.commit.as_str())
             || recipe_json["baseline"].as_str() != Some(wave_spec.baseline.as_str())
             || recipe_json["baseline_commit"].as_str() != Some(expected_commit.as_str())
             || recipe_json["profile"].as_str() != Some(expected_profile)
-            || recipe_json.get("seeded_conflict").is_some()
+            || (seeded_recipe && historical_synthesis.is_none())
         {
             return Err(WaveError::Invalid(
                 "historical composition recipe binding".into(),
             ));
+        }
+        if let (Some(seeded), Some(proof), Some(request), Some(result)) = (
+            recipe_json.get("seeded_conflict"),
+            historical_synthesis.as_ref(),
+            request_ref.as_ref(),
+            result_ref.as_ref(),
+        ) {
+            let seeded_request = super::seeded_recipe_record_ref(seeded, "resolution_request")?;
+            let seeded_source = super::seeded_recipe_record_ref(seeded, "composition_source")?;
+            let seeded_plan = super::seeded_recipe_record_ref(seeded, "composition_plan")?;
+            let seeded_result = super::seeded_recipe_record_ref(seeded, "resolution_result")?;
+            let prefix_len = proof
+                .request
+                .contents()
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    WaveError::Invalid("historical seed prefix length overflow".into())
+                })?;
+            let order = seeded["order"]
+                .as_array()
+                .ok_or_else(|| WaveError::Invalid("historical seeded order".into()))?;
+            let suffix = seeded["suffix"]
+                .as_array()
+                .ok_or_else(|| WaveError::Invalid("historical seeded suffix".into()))?;
+            let expected_suffix = order
+                .iter()
+                .skip(prefix_len)
+                .map(|entry| {
+                    entry["id"]
+                        .as_str()
+                        .map(Value::from)
+                        .ok_or_else(|| WaveError::Invalid("historical seeded order id".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let seed_candidate = &seeded["seed_candidate"];
+            let seed_tree = seed_candidate["tree"]
+                .as_str()
+                .ok_or_else(|| WaveError::Invalid("historical seed tree".into()))?;
+            if seeded_request != *request
+                || seeded_result != *result
+                || seeded["schema"].as_str() != Some(composer::SEEDED_CONFLICT_RECIPE_SCHEMA_NAME)
+                || seeded["version"].as_u64() != Some(1)
+                || seeded["trust"].as_str() != Some("unverified")
+                || seeded["input_manifest_sha256"].as_str()
+                    != Some(proof.input_manifest.sha256.as_str())
+                || seed_candidate["subject"].as_str() != Some(proof.candidate_subject.as_str())
+                || seed_candidate["commit"].as_str() != Some(proof.candidate_commit.as_str())
+                || seed_tree.is_empty()
+                || seeded["prefix_len"].as_u64() != Some(prefix_len as u64)
+                || seeded["selected"] != serde_json::to_value(&wave_spec.selected)?
+                || suffix != &expected_suffix
+                || order.len() != wave_spec.selected.len()
+                || order
+                    .iter()
+                    .zip(&wave_spec.selected)
+                    .any(|(entry, selected)| entry["id"].as_str() != Some(selected.as_str()))
+            {
+                return Err(WaveError::Invalid(
+                    "historical seeded recipe does not match its settled prefix and suffix".into(),
+                ));
+            }
+            for reference in [seeded_source.object.hex(), seeded_plan.object.hex()] {
+                require_completion_root(store, key, "object", &reference)?;
+            }
         }
         let usage = source.composition.usage;
         let budget = source.request.budget;
@@ -754,13 +898,215 @@ fn classify_revision_relation(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HistoricalCandidateIdentity<'a> {
+    subject: &'a str,
+    commit: &'a str,
+    tree: &'a str,
+}
+
+fn historical_synthesis_candidate_bindings_match(
+    final_candidate: HistoricalCandidateIdentity<'_>,
+    resolver_candidate: HistoricalCandidateIdentity<'_>,
+    completion: HistoricalCandidateIdentity<'_>,
+    seeded_candidate: Option<HistoricalCandidateIdentity<'_>>,
+) -> bool {
+    final_candidate == completion
+        && match seeded_candidate {
+            Some(seed) => resolver_candidate == seed,
+            None => resolver_candidate == completion,
+        }
+}
+
+fn verify_historical_seed_binding_git(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    key: &RecordId,
+    completion: &CompletionSpec,
+    wave_spec: &WaveSpec,
+) -> Result<(), WaveError> {
+    let wave_id = id(&completion.wave)?;
+    let wave = super::load(store, &wave_id)?;
+    if wave.phase != super::WavePhase::Accepted
+        || wave.spec != *wave_spec
+        || wave
+            .candidate_snapshot
+            .as_ref()
+            .map(SourceSnapshotId::as_str)
+            != Some(completion.source.as_str())
+        || wave.candidate_commit.as_ref().map(CommitOid::as_str)
+            != Some(completion.candidate_commit.as_str())
+    {
+        return Err(WaveError::Invalid(
+            "historical seeded wave no longer matches its accepted completion".into(),
+        ));
+    }
+    let Some(request_ref) = wave.resolution_request.as_ref() else {
+        if wave.resolution_result.is_none() {
+            return Ok(());
+        }
+        return Err(WaveError::Invalid(
+            "historical synthesized request/result pair is incomplete".into(),
+        ));
+    };
+    let result_ref = wave
+        .resolution_result
+        .as_ref()
+        .ok_or_else(|| WaveError::Invalid("historical synthesized result is missing".into()))?;
+    let Some(recipe) = super::recipe_json_for_wave(store, &wave)? else {
+        return Err(WaveError::Invalid(
+            "historical seeded recipe is missing".into(),
+        ));
+    };
+    let proof = crate::resolution::read_retained_synthesized_result_for_refs(
+        store,
+        request_ref,
+        result_ref,
+    )?;
+    let synthesis = crate::resolution::read_synthesized_attempt_result_for_refs(
+        store,
+        repo,
+        request_ref,
+        result_ref,
+    )?;
+    if proof.request.record() != synthesis.request.record()
+        || proof.group_record != synthesis.group_record
+        || proof.candidate_subject != synthesis.candidate.subject
+        || proof.candidate_commit != synthesis.candidate.commit
+        || proof.input_manifest.sha256 != synthesis.input_manifest.sha256
+    {
+        return Err(WaveError::Invalid(
+            "historical retained synthesis proof differs from its Git-bound result".into(),
+        ));
+    }
+    let seeded = recipe.get("seeded_conflict");
+    let result_tree = archive::raw_commit_tree(repo, &proof.candidate_commit)?;
+    if archive::snapshot_of_commit(repo, &proof.candidate_commit)?.id() != proof.candidate_subject
+        || synthesis.candidate.tree != result_tree
+        || proof.request.baseline().snapshot_id.as_str() != wave.spec.baseline
+    {
+        return Err(WaveError::Invalid(
+            "historical synthesized candidate differs from its retained Git result".into(),
+        ));
+    }
+
+    let completion_commit = CommitOid::parse(&completion.candidate_commit)?;
+    let final_snapshot = archive::snapshot_of_commit(repo, &completion_commit)?.id();
+    let final_tree = archive::raw_commit_tree(repo, &completion_commit)?;
+    let final_candidate = HistoricalCandidateIdentity {
+        subject: final_snapshot.as_str(),
+        commit: completion_commit.as_str(),
+        tree: final_tree.as_str(),
+    };
+    let completion_candidate = HistoricalCandidateIdentity {
+        subject: &completion.source,
+        commit: &completion.candidate_commit,
+        tree: &completion.candidate_tree,
+    };
+    let resolver_candidate = HistoricalCandidateIdentity {
+        subject: proof.candidate_subject.as_str(),
+        commit: proof.candidate_commit.as_str(),
+        tree: result_tree.as_str(),
+    };
+    let seeded_candidate = seeded
+        .map(
+            |seeded| -> Result<HistoricalCandidateIdentity<'_>, WaveError> {
+                let seed = &seeded["seed_candidate"];
+                Ok(HistoricalCandidateIdentity {
+                    subject: seed["subject"].as_str().ok_or_else(|| {
+                        WaveError::Invalid("historical seeded candidate subject".into())
+                    })?,
+                    commit: seed["commit"].as_str().ok_or_else(|| {
+                        WaveError::Invalid("historical seeded candidate commit".into())
+                    })?,
+                    tree: seed["tree"].as_str().ok_or_else(|| {
+                        WaveError::Invalid("historical seeded candidate tree".into())
+                    })?,
+                })
+            },
+        )
+        .transpose()?;
+    if !historical_synthesis_candidate_bindings_match(
+        final_candidate,
+        resolver_candidate,
+        completion_candidate,
+        seeded_candidate,
+    ) {
+        return Err(WaveError::Invalid(
+            "historical synthesized candidate differs from its accepted Git result".into(),
+        ));
+    }
+
+    let Some(seeded) = seeded else {
+        // Direct attachment preserves the original Text composition source;
+        // the accepted completion is instead bound to the settled resolver
+        // result checked above.
+        return Ok(());
+    };
+    let conflict_request = super::seeded_recipe_record_ref(seeded, "resolution_request")?;
+    let conflict_source = super::seeded_recipe_record_ref(seeded, "composition_source")?;
+    if &conflict_request != request_ref {
+        return Err(WaveError::Invalid(
+            "historical seeded request differs from its accepted wave".into(),
+        ));
+    }
+    let binding = super::read_retained_conflict_request_binding(
+        store,
+        repo,
+        &conflict_request,
+        &conflict_source,
+    )?;
+    if binding.plan_payload.wave != wave.id.as_str()
+        || binding.plan_payload.revision != wave.spec.revision
+        || binding.plan_payload.selected != wave.spec.selected
+    {
+        return Err(WaveError::Invalid(
+            "historical conflict plan differs from its accepted wave".into(),
+        ));
+    }
+    if seeded["seed_candidate"]["tree"].as_str() != Some(result_tree.as_str()) {
+        return Err(WaveError::Invalid(
+            "historical seeded candidate tree differs from its retained commit".into(),
+        ));
+    }
+    let expected = composer::expected_seeded_conflict_metadata(
+        &binding,
+        result_ref,
+        &synthesis.request,
+        &synthesis.candidate,
+        &synthesis.input_manifest.sha256,
+    );
+    let expected: Value = serde_json::from_slice(&expected.to_canonical_bytes())?;
+    if seeded != &expected {
+        return Err(WaveError::Invalid(
+            "historical seeded recipe differs from its exact conflict, result, or suffix".into(),
+        ));
+    }
+    for reference in [
+        request_ref.object.hex(),
+        result_ref.object.hex(),
+        proof.input_manifest.sha256,
+        binding.request.object.hex(),
+        binding.source.object.hex(),
+        binding.plan.object.hex(),
+    ] {
+        require_completion_root(store, key, "object", &reference)?;
+    }
+    require_completion_root(store, key, "snapshot", proof.candidate_subject.as_str())?;
+    for digest in proof
+        .input_manifest
+        .entries
+        .iter()
+        .filter_map(|entry| entry.sha256.as_deref())
+    {
+        require_completion_root(store, key, "object", digest)?;
+    }
+    Ok(())
+}
+
 impl Binding {
     pub(crate) fn key(&self) -> &RecordId {
         &self.key
-    }
-
-    pub(crate) fn source(&self) -> &SourceSnapshotId {
-        &self.source
     }
 
     /// The actual request baseline is the accepted commit. WaveSpec::baseline
@@ -829,7 +1175,11 @@ impl Binding {
 
     /// Verify that the accepted commit still materializes the exact source
     /// snapshot and tree stated by the private completion.
-    pub(crate) fn validate_git_binding(&self, repo: &Path) -> Result<(), WaveError> {
+    pub(crate) fn validate_git_binding(
+        &self,
+        store: &mut CollaborationStore,
+        repo: &Path,
+    ) -> Result<(), WaveError> {
         if archive::raw_commit_tree(repo, &self.accepted_commit)? != self.completion.accepted_tree
             || archive::snapshot_of_commit(repo, &self.accepted_commit)?.id() != self.source
         {
@@ -837,7 +1187,7 @@ impl Binding {
                 "prior completion accepted commit no longer matches its source".into(),
             ));
         }
-        Ok(())
+        verify_historical_seed_binding_git(store, repo, &self.key, &self.completion, &self.previous)
     }
 
     /// Completion artifacts are rooted independently of a later revision.
@@ -899,6 +1249,63 @@ mod tests {
                 .map(|s| (*s).to_owned())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn historical_synthesis_binds_seed_result_and_final_candidate_separately() {
+        let final_candidate = HistoricalCandidateIdentity {
+            subject: "sha256:final-source",
+            commit: "final-commit",
+            tree: "final-tree",
+        };
+        let resolver_candidate = HistoricalCandidateIdentity {
+            subject: "sha256:seed-source",
+            commit: "seed-commit",
+            tree: "seed-tree",
+        };
+        let completion = final_candidate;
+        let seed = resolver_candidate;
+        assert!(historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            resolver_candidate,
+            completion,
+            Some(seed),
+        ));
+
+        let tampered_seed = HistoricalCandidateIdentity {
+            tree: "tampered-seed-tree",
+            ..seed
+        };
+        assert!(!historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            resolver_candidate,
+            completion,
+            Some(tampered_seed),
+        ));
+
+        let tampered_final = HistoricalCandidateIdentity {
+            tree: "tampered-final-tree",
+            ..final_candidate
+        };
+        assert!(!historical_synthesis_candidate_bindings_match(
+            tampered_final,
+            resolver_candidate,
+            completion,
+            Some(seed),
+        ));
+
+        assert!(historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            final_candidate,
+            completion,
+            None,
+        ));
+        assert!(!historical_synthesis_candidate_bindings_match(
+            final_candidate,
+            resolver_candidate,
+            completion,
+            None,
+        ));
     }
 
     #[test]

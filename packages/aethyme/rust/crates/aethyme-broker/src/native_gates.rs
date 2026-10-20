@@ -502,23 +502,9 @@ pub(crate) fn validate_source(
     if let Some(expected_provenance) = &spec.synthesized_group {
         let (synthesis, provenance) = wave::read_synthesized_wave_result(store, repo, &w)?
             .ok_or(NativeGateError::Mismatch)?;
-        if &provenance != expected_provenance
-            || w.spec.baseline != spec.baseline
-            || synthesis.candidate.subject.as_str() != spec.subject
-            || synthesis.candidate.tree != spec.tree
-            || synthesis.candidate.commit.as_str() != spec.commit
-            || synthesis.candidate.baseline.as_str() != spec.base_commit
-            || synthesis
-                .candidate
-                .inputs
-                .iter()
-                .map(|input| input.result.as_str().to_owned())
-                .collect::<Vec<_>>()
-                != spec.inputs
-            || w.recipe_object.map(|object| object.hex()) != spec.recipe
-        {
+        if &provenance != expected_provenance || w.spec.baseline != spec.baseline {
             return Err(NativeGateError::Binding(
-                "synthesized candidate or provenance differs from its exact settled result",
+                "synthesized result or provenance differs from the current wave",
             ));
         }
         wave::validate_synthesized_group_roots(store, &w, &synthesis, &provenance)?;
@@ -535,10 +521,73 @@ pub(crate) fn validate_source(
                     .as_ref()
                     .is_some_and(|reference| reference.object.hex() == *recipe) =>
             {
-                // The source loader verifies the original composer candidate
-                // and recipe independently from this synthesized candidate.
+                let recipe_ref = source
+                    .composition
+                    .recipe
+                    .as_ref()
+                    .ok_or(NativeGateError::Mismatch)?;
+                let recipe_bytes = archive::read_object(store, &recipe_ref.object)?;
+                let recipe_body: Value = serde_json::from_slice(&recipe_bytes)?;
+                if recipe_body.get("seeded_conflict").is_some() {
+                    let candidate = source
+                        .composition
+                        .outcome
+                        .candidate()
+                        .ok_or(NativeGateError::Mismatch)?;
+                    let inputs = candidate
+                        .inputs
+                        .iter()
+                        .map(|input| input.result.as_str().to_owned())
+                        .collect::<Vec<_>>();
+                    if candidate.mode != crate::composition::CompositionMode::Hybrid
+                        || candidate.subject.as_str() != spec.subject
+                        || candidate.tree != spec.tree
+                        || candidate.commit.as_str() != spec.commit
+                        || candidate.baseline.as_str() != spec.base_commit
+                        || inputs != spec.inputs
+                        || Some(&candidate.subject) != w.candidate_snapshot.as_ref()
+                        || Some(&candidate.commit) != w.candidate_commit.as_ref()
+                        || synthesis.candidate.baseline.as_str() != spec.base_commit
+                    {
+                        return Err(NativeGateError::Binding(
+                            "native gate spec does not use the complete seeded suffix candidate",
+                        ));
+                    }
+                } else if synthesis.candidate.subject.as_str() != spec.subject
+                    || synthesis.candidate.tree != spec.tree
+                    || synthesis.candidate.commit.as_str() != spec.commit
+                    || synthesis.candidate.baseline.as_str() != spec.base_commit
+                    || synthesis
+                        .candidate
+                        .inputs
+                        .iter()
+                        .map(|input| input.result.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                        != spec.inputs
+                {
+                    return Err(NativeGateError::Binding(
+                        "native gate spec differs from its exact settled synthesized candidate",
+                    ));
+                }
             }
-            (None, None) if w.recipe_object.is_none() && w.composition_source.is_none() => (),
+            (None, None) if w.recipe_object.is_none() && w.composition_source.is_none() => {
+                if synthesis.candidate.subject.as_str() != spec.subject
+                    || synthesis.candidate.tree != spec.tree
+                    || synthesis.candidate.commit.as_str() != spec.commit
+                    || synthesis.candidate.baseline.as_str() != spec.base_commit
+                    || synthesis
+                        .candidate
+                        .inputs
+                        .iter()
+                        .map(|input| input.result.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                        != spec.inputs
+                {
+                    return Err(NativeGateError::Binding(
+                        "legacy synthesized spec differs from its exact result",
+                    ));
+                }
+            }
             _ => return Err(NativeGateError::Binding("original composition source")),
         }
         return Ok(crate::types::VerificationCandidate {
@@ -577,7 +626,7 @@ pub(crate) fn validate_source(
             let prior = wave::prior_completion::load(store, owner, &w, &revision)?
                 .ok_or(NativeGateError::Mismatch)?;
             prior.validate_retained_completion(store)?;
-            prior.validate_git_binding(repo)?;
+            prior.validate_git_binding(store, repo)?;
             if body["accepted_baseline"] != prior.recipe_binding()
                 || prior.request_baseline_commit().as_str() != spec.base_commit
                 || body["profile"] != prior.producer_profile()
@@ -653,26 +702,66 @@ pub fn prepare(
 ) -> Result<Job, NativeGateError> {
     let _archive_guard = crate::collaboration_gc::archive_use(store)?;
     let _response_guard = crate::collaboration_sensitive::response_use(store)?;
-    let (w, _source) =
+    let (w, source) =
         wave::load_composition_source(store, owner, broker.repo_handle().root(), wave_id)?;
     let synthesized = wave::read_synthesized_wave_result(store, broker.repo_handle().root(), &w)?;
     let (base, subject, tree, candidate_commit, inputs, recipe, synthesized_group, synthesis) =
         if let Some((synthesis, provenance)) = synthesized {
-            (
-                synthesis.candidate.baseline.as_str().to_owned(),
-                synthesis.candidate.subject.to_string(),
-                synthesis.candidate.tree.clone(),
-                synthesis.candidate.commit.as_str().to_owned(),
-                synthesis
-                    .candidate
-                    .inputs
-                    .iter()
-                    .map(|input| input.result.as_str().to_owned())
-                    .collect(),
-                w.recipe_object.map(|object| object.hex()),
-                Some(provenance),
-                Some(synthesis),
-            )
+            let seeded = if let Some(source) = source.as_ref() {
+                if let Some(recipe) = source.composition.recipe.as_ref() {
+                    let bytes = archive::read_object(store, &recipe.object)?;
+                    let body: Value = serde_json::from_slice(&bytes)?;
+                    body.get("seeded_conflict").is_some()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if seeded {
+                let candidate = source
+                    .as_ref()
+                    .and_then(|source| source.composition.outcome.candidate())
+                    .ok_or(NativeGateError::Mismatch)?;
+                if candidate.mode != crate::composition::CompositionMode::Hybrid
+                    || Some(&candidate.subject) != w.candidate_snapshot.as_ref()
+                    || Some(&candidate.commit) != w.candidate_commit.as_ref()
+                {
+                    return Err(NativeGateError::Binding(
+                        "seeded suffix source is not the current hybrid wave candidate",
+                    ));
+                }
+                (
+                    candidate.baseline.as_str().to_owned(),
+                    candidate.subject.to_string(),
+                    candidate.tree.clone(),
+                    candidate.commit.as_str().to_owned(),
+                    candidate
+                        .inputs
+                        .iter()
+                        .map(|input| input.result.as_str().to_owned())
+                        .collect(),
+                    w.recipe_object.map(|object| object.hex()),
+                    Some(provenance),
+                    Some(synthesis),
+                )
+            } else {
+                (
+                    synthesis.candidate.baseline.as_str().to_owned(),
+                    synthesis.candidate.subject.to_string(),
+                    synthesis.candidate.tree.clone(),
+                    synthesis.candidate.commit.as_str().to_owned(),
+                    synthesis
+                        .candidate
+                        .inputs
+                        .iter()
+                        .map(|input| input.result.as_str().to_owned())
+                        .collect(),
+                    w.recipe_object.map(|object| object.hex()),
+                    Some(provenance),
+                    Some(synthesis),
+                )
+            }
         } else {
             let recipe = w.recipe_object.ok_or(NativeGateError::Mismatch)?;
             let bytes = archive::read_object(store, &recipe)?;
@@ -760,9 +849,9 @@ pub fn prepare(
     validate_source(store, owner, broker.repo_handle().root(), &spec)?;
     let rec = record(&spec)?;
     let object = archive::put_object(store, &rec.canonical_bytes())?;
-    let recipe_bytes = if synthesis.is_none() {
-        let recipe = spec.recipe.as_deref().ok_or(NativeGateError::Mismatch)?;
-        Some(archive::read_object(store, &digest(recipe)?)?)
+    let recipe_bytes = if let Some(recipe) = spec.recipe.as_deref() {
+        let recipe_digest = digest(recipe)?;
+        Some(archive::read_object(store, &recipe_digest)?)
     } else {
         None
     };
