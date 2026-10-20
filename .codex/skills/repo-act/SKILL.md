@@ -59,8 +59,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   TempDir); pass it explicitly to CLI children too. An inherited
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
   leave stale Git pointers after teardown. Assert paths and cleanup; avoid
-  process-wide environment mutation in parallel tests. For tests scoped to
-  artifact caches or reclaim, set `[cleanup] auto_remove = false` explicitly and
+  process-wide environment mutation in parallel tests. Filtering
+  `std::env::vars_os()` and passing the result to `Command::envs` does not
+  clear inherited `GIT_*` variables; it only adds or overrides values. For
+  isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
+  preserve unrelated variables such as `PATH`, then set the fixture's intended
+  author/committer values. For tests scoped to artifact caches or reclaim, set
+  `[cleanup] auto_remove = false` explicitly and
   keep it enabled in whole-checkout cleanup tests. A real offline `origin` can
   make a clean branch legitimately eligible for whole-checkout cleanup; do not
   rely on a missing remote ref to preserve the fixture. Reproduce the exact CLI
