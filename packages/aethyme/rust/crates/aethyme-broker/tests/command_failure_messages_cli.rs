@@ -55,7 +55,7 @@ fn run(repo: &Path, args: &[&str]) -> Output {
     run_with_env(repo, args, &[])
 }
 
-fn run_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
+fn command_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Command {
     let broker = test_broker(repo);
     let mut command = common::broker_cli(CLI, args);
     command.current_dir(repo);
@@ -67,7 +67,11 @@ fn run_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Out
         .configure_storage_context_for_child(&mut command)
         .unwrap();
     drop(broker);
-    command.output().unwrap()
+    command
+}
+
+fn run_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
+    command_with_env(repo, args, environment).output().unwrap()
 }
 
 /// Payloads of every `broker.command.failed` event, oldest first.
@@ -288,11 +292,17 @@ exec /bin/sleep 20
     assert_ne!(mode & 0o111, 0, "fake gh must be executable");
     assert_eq!(mode & 0o022, 0, "fake gh must not be group/world writable");
 
-    let mut search_path = vec![fake_bin];
-    if let Some(path) = std::env::var_os("PATH") {
-        search_path.extend(std::env::split_paths(&path));
-    }
-    let search_path = std::env::join_paths(search_path).unwrap();
+    let search_path = std::env::join_paths([&fake_bin]).unwrap();
+    let first_candidate = std::env::split_paths(&search_path)
+        .next()
+        .expect("fixture PATH has one directory")
+        .join("gh")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        first_candidate, canonical_fake_gh,
+        "debug gh resolution must choose the prevalidated fixture before trusted system directories"
+    );
     let search_path = search_path.to_str().expect("fixture PATH is UTF-8");
 
     let mut broker = test_broker(tmp.path());
@@ -316,8 +326,7 @@ exec /bin/sleep 20
     drop(broker);
 
     let session_id = session.id.to_string();
-    let started = Instant::now();
-    let output = run_with_env(
+    let mut command = command_with_env(
         tmp.path(),
         &[
             "advanced",
@@ -345,6 +354,8 @@ exec /bin/sleep 20
             ),
         ],
     );
+    let started = Instant::now();
+    let output = command.output().unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "the bounded provider call returned too late: {:?}",
@@ -404,7 +415,7 @@ exec /bin/sleep 20
     );
     let message = error["error"]["message"].as_str().unwrap();
     assert!(message.contains("read-only operation"), "{message}");
-    assert!(message.contains("Owner/Repo"), "{message}");
+    assert!(message.contains("github.com/owner/repo"), "{message}");
     assert!(
         message.contains("waiting for \x60gh\x60 to respond"),
         "{message}"
