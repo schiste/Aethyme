@@ -12,12 +12,13 @@ use std::path::Path;
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, EVENTS_SCHEMA_VERSION, Event, FinishCleanupReport, FinishDelivery,
-    FinishGateCacheSource, FinishGateRun, FinishGraphIntegrity, FinishHandoff, FinishLease,
-    FinishLeaseState, FinishPendingWork, FinishReport, FinishStatus, GateStatus, LeaseKind,
-    MergeStatus, OperationEffect, OperationProvider, OperationStatus, Overlap, SessionStatus,
-    events,
+    EVENTS_SCHEMA_VERSION, Event, FinishCleanupReport, FinishDelivery, FinishGateCacheSource,
+    FinishGateRun, FinishGraphIntegrity, FinishHandoff, FinishLease, FinishLeaseState,
+    FinishPendingWork, FinishReport, FinishStatus, GateStatus, LeaseKind, MergeStatus,
+    OperationEffect, OperationProvider, OperationStatus, Overlap, SessionStatus, events,
 };
+
+mod common;
 
 /// The complete v1 kind catalog. Additions append here (additive change);
 /// any rename or removal is a break that requires a schema_version bump.
@@ -615,7 +616,7 @@ fn commit_edit(worktree: &Path, file: &str, content: &str) {
 
 #[test]
 fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     init_repo(tmp.path());
     // Gate policy is read from the base, so the gate that rejects session C
     // is committed there up front, scoped to the file only C touches.
@@ -629,7 +630,7 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
         tmp.path(),
         &["commit", "-qm", "base: gate that rejects b.py"],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
 
     // Verified + promoted: session A lands a clean change through a
     // passing gate.

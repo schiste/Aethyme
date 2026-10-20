@@ -4,6 +4,7 @@
 //! submit would change, then runs the real submit on the same state and
 //! compares: the tree, the baseline and the outcome class must agree.
 
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,8 +32,8 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn fixture(promote_mode: Option<&str>) -> (tempfile::TempDir, Broker) {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture(promote_mode: Option<&str>) -> (common::FixtureRepository, Broker) {
+    let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Aethyme Test"]);
@@ -53,7 +54,9 @@ fn fixture(promote_mode: Option<&str>) -> (tempfile::TempDir, Broker) {
     }
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
-    let broker = Broker::open(root).unwrap();
+    let broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
     (tmp, broker)
 }
 

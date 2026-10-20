@@ -44,6 +44,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+  For a CLI launched from another directory or a session checkout, derive
+  isolation paths from the owning repository fixture and set its working
+  directory separately.
 - When exercising no-follow storage paths, canonicalize the fixture-owned
   temporary root before deriving its database and cache paths. Platform aliases
   such as macOS `/var` must not turn a valid fixture into a symlink traversal;
@@ -173,6 +176,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and sentinel absence, then remove only the call-site guard in a mutation run
   and verify that the sentinel assertion fails. A helper-only test cannot prove
   that the production path invokes the guard.
+- For each deliberate guard-removal check, run the same named regression on
+  unmodified source, with the deliberate break, and after byte-for-byte
+  restoration. Require positive, intended runtime failure, positive; a compile
+  failure or a test that also fails without the break does not validate the
+  guard. A passing adjacent suite cannot replace either positive run.
+- Before reclaiming a completed worktree, inspect ignored paths for qualification
+  records; a clean Git status does not cover them. Preserve irreplaceable
+  reports outside the worktree and build target, verify copied file sizes and
+  hashes, and check symlink targets before cleanup. Keep regenerable build
+  output separate from the evidence archive.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.

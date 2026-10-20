@@ -5,7 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, ScopeKind, ScopeOperation};
+use aethyme_broker::{ScopeKind, ScopeOperation};
+
+mod common;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const PUSH_LANE: &str = "schema = 1\n[delivery]\npush_session_branches = true\n";
@@ -38,16 +40,8 @@ fn git(repo: &Path, args: &[&str]) -> String {
     git_at(repo, args, None)
 }
 
-fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
-}
-
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    _storage: common::FixtureRepository,
     repo: PathBuf,
 }
 
@@ -55,11 +49,10 @@ struct Fixture {
 /// default branch, and (when `config` is non-empty) that config committed as
 /// `.aethyme/config.toml` -- the only copy the push policy trusts.
 fn fixture(config: &str) -> Fixture {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
+    let storage = common::FixtureRepository::new();
+    let repo = storage.path().to_path_buf();
     git(
-        tmp.path(),
+        storage.owner_path(),
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&repo, &["init", "-q", "-b", "main"]);
@@ -74,7 +67,7 @@ fn fixture(config: &str) -> Fixture {
         git(&repo, &["add", "-f", ".aethyme/config.toml"]);
         git(&repo, &["commit", "-qm", "policy"]);
     }
-    let origin = tmp.path().join("origin.git");
+    let origin = storage.owner_path().join("origin.git");
     git(
         &repo,
         &["remote", "add", "origin", origin.to_str().unwrap()],
@@ -82,13 +75,27 @@ fn fixture(config: &str) -> Fixture {
     git(&repo, &["push", "-q", "-u", "origin", "main"]);
     git(&repo, &["fetch", "-q", "origin"]);
     git(&repo, &["remote", "set-head", "origin", "main"]);
-    Fixture { _tmp: tmp, repo }
+    Fixture {
+        _storage: storage,
+        repo,
+    }
 }
 
-fn start(repo: &Path, task: &str) -> (i64, PathBuf) {
-    let mut broker = Broker::open(repo).unwrap();
+fn start(fixture: &Fixture, task: &str) -> (i64, PathBuf) {
+    let mut broker = common::open_fixture_repository_broker(&fixture._storage).unwrap();
     let session = broker.start_worktree(task, None).unwrap();
     (session.id, PathBuf::from(session.worktree_path))
+}
+
+fn run(fixture: &Fixture, args: &[&str]) -> Output {
+    let broker = common::open_fixture_repository_broker(&fixture._storage).unwrap();
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(&fixture.repo);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    drop(broker);
+    command.output().unwrap()
 }
 
 /// Rewrite the given 1-based lines of `lines.txt` and commit at `date`.
@@ -111,8 +118,8 @@ fn edit_lines(worktree: &Path, lines: &[usize], tag: &str, date: &str) {
     git_at(worktree, &["commit", "-qm", tag], Some(date));
 }
 
-fn advice(repo: &Path) -> Vec<serde_json::Value> {
-    let output = run(repo, &["status", "--refresh", "--json"]);
+fn advice(fixture: &Fixture) -> Vec<serde_json::Value> {
+    let output = run(fixture, &["status", "--refresh", "--json"]);
     assert!(
         output.status.success(),
         "{}",
@@ -142,12 +149,12 @@ fn commands(row: &serde_json::Value) -> Vec<String> {
 #[test]
 fn overlapping_committed_hunks_name_the_earlier_committer_and_the_commands() {
     let fixture = fixture(PUSH_LANE);
-    let (_, first_worktree) = start(&fixture.repo, "first");
-    let (second, second_worktree) = start(&fixture.repo, "second");
+    let (_, first_worktree) = start(&fixture, "first");
+    let (second, second_worktree) = start(&fixture, "second");
     edit_lines(&second_worktree, &[5], "second", "2026-01-01T10:00:00Z");
     edit_lines(&first_worktree, &[5, 6], "first", "2026-01-01T11:00:00Z");
 
-    let rows = advice(&fixture.repo);
+    let rows = advice(&fixture);
     assert_eq!(rows.len(), 1, "{rows:#?}");
     let row = &rows[0];
     assert_eq!(row["session_id"], second, "{row:#}");
@@ -189,28 +196,28 @@ fn overlapping_committed_hunks_name_the_earlier_committer_and_the_commands() {
 #[test]
 fn disjoint_hunks_in_one_file_get_no_advice() {
     let fixture = fixture(PUSH_LANE);
-    let (_, first_worktree) = start(&fixture.repo, "first");
-    let (_, second_worktree) = start(&fixture.repo, "second");
+    let (_, first_worktree) = start(&fixture, "first");
+    let (_, second_worktree) = start(&fixture, "second");
     edit_lines(&first_worktree, &[2], "first", "2026-01-01T10:00:00Z");
     edit_lines(&second_worktree, &[10], "second", "2026-01-01T11:00:00Z");
 
-    assert!(advice(&fixture.repo).is_empty());
+    assert!(advice(&fixture).is_empty());
 }
 
 /// Without the push lane, landing a PR first is not how work arrives.
 #[test]
 fn without_the_push_policy_there_is_no_advice() {
     let fixture = fixture("");
-    let (_, first_worktree) = start(&fixture.repo, "first");
-    let (_, second_worktree) = start(&fixture.repo, "second");
+    let (_, first_worktree) = start(&fixture, "first");
+    let (_, second_worktree) = start(&fixture, "second");
     edit_lines(&first_worktree, &[5], "first", "2026-01-01T10:00:00Z");
     edit_lines(&second_worktree, &[5], "second", "2026-01-01T11:00:00Z");
 
-    assert!(advice(&fixture.repo).is_empty());
+    assert!(advice(&fixture).is_empty());
 }
 
-fn declare(repo: &Path, session: i64, symbol: &str, operation: ScopeOperation) {
-    let mut broker = Broker::open(repo).unwrap();
+fn declare(fixture: &Fixture, session: i64, symbol: &str, operation: ScopeOperation) {
+    let mut broker = common::open_fixture_repository_broker(&fixture._storage).unwrap();
     broker
         .capture_session_scopes(
             session,
@@ -225,22 +232,12 @@ fn declare(repo: &Path, session: i64, symbol: &str, operation: ScopeOperation) {
 #[test]
 fn a_high_scope_collision_advises_the_rewriting_session_to_land_first() {
     let fixture = fixture(PUSH_LANE);
-    let (first, _) = start(&fixture.repo, "first");
-    let (second, _) = start(&fixture.repo, "second");
-    declare(
-        &fixture.repo,
-        first,
-        "PaymentService",
-        ScopeOperation::Extend,
-    );
-    declare(
-        &fixture.repo,
-        second,
-        "PaymentService",
-        ScopeOperation::Replace,
-    );
+    let (first, _) = start(&fixture, "first");
+    let (second, _) = start(&fixture, "second");
+    declare(&fixture, first, "PaymentService", ScopeOperation::Extend);
+    declare(&fixture, second, "PaymentService", ScopeOperation::Replace);
 
-    let rows = advice(&fixture.repo);
+    let rows = advice(&fixture);
     assert_eq!(rows.len(), 1, "{rows:#?}");
     assert_eq!(rows[0]["session_id"], second, "{:#}", rows[0]);
     assert!(
@@ -257,20 +254,10 @@ fn a_high_scope_collision_advises_the_rewriting_session_to_land_first() {
 #[test]
 fn a_low_scope_collision_gets_no_advice() {
     let fixture = fixture(PUSH_LANE);
-    let (first, _) = start(&fixture.repo, "first");
-    let (second, _) = start(&fixture.repo, "second");
-    declare(
-        &fixture.repo,
-        first,
-        "PaymentService",
-        ScopeOperation::Extend,
-    );
-    declare(
-        &fixture.repo,
-        second,
-        "PaymentService",
-        ScopeOperation::Extend,
-    );
+    let (first, _) = start(&fixture, "first");
+    let (second, _) = start(&fixture, "second");
+    declare(&fixture, first, "PaymentService", ScopeOperation::Extend);
+    declare(&fixture, second, "PaymentService", ScopeOperation::Extend);
 
-    assert!(advice(&fixture.repo).is_empty());
+    assert!(advice(&fixture).is_empty());
 }

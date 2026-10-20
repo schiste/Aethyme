@@ -1,7 +1,10 @@
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
 use aethyme_broker::Broker;
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -23,26 +26,28 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
+fn child_command(broker: &Broker, repo: &Path, args: &[&str]) -> Command {
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(repo);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    command
 }
 
-fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    git(tmp.path(), &["add", "-A"]);
-    git(tmp.path(), &["commit", "-qm", "init"]);
-    let sender = tmp.path().join(".aethyme/worktrees/sender");
-    let recipient = tmp.path().join(".aethyme/worktrees/recipient");
+fn fixture() -> (FixtureRepository, PathBuf, PathBuf) {
+    let fixture = FixtureRepository::new();
+    let repo = fixture.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", "init"]);
+    let sender = repo.join(".aethyme/worktrees/sender");
+    let recipient = repo.join(".aethyme/worktrees/recipient");
     std::fs::create_dir_all(sender.parent().unwrap()).unwrap();
     git(
-        tmp.path(),
+        repo,
         &[
             "worktree",
             "add",
@@ -54,7 +59,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         ],
     );
     git(
-        tmp.path(),
+        repo,
         &[
             "worktree",
             "add",
@@ -65,36 +70,38 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
             "main",
         ],
     );
-    (tmp, sender, recipient)
+    (fixture, sender, recipient)
 }
 
 #[test]
 fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
-    let (tmp, sender_worktree, recipient_worktree) = fixture();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let (fixture, sender_worktree, recipient_worktree) = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let sender = broker.adopt(&sender_worktree, Some("sender")).unwrap();
     let recipient = broker
         .adopt(&recipient_worktree, Some("recipient"))
         .unwrap();
-    drop(broker);
-
-    let sender_id = sender.id.to_string();
-    let recipient_id = recipient.id.to_string();
-    let sent = run(
+    let mut send_command = child_command(
+        &broker,
         &sender_worktree,
         &[
             "advanced",
             "note",
             "send",
             "--session",
-            &sender_id,
+            &sender.id.to_string(),
             "--to-session",
-            &recipient_id,
+            &recipient.id.to_string(),
             "--message",
             "coordinate src/router.rs before editing",
             "--json",
         ],
     );
+    drop(broker);
+
+    let sender_id = sender.id.to_string();
+    let recipient_id = recipient.id.to_string();
+    let sent = send_command.output().unwrap();
     assert!(
         sent.status.success(),
         "{}",
@@ -106,7 +113,7 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     assert_eq!(sent["recipient_session_id"], recipient.id);
     assert_eq!(sent["acknowledged_at"], serde_json::Value::Null);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let event = broker
         .store()
         .events_after_filtered(0, 10, Some("session.note.sent"))
@@ -116,16 +123,23 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
     let payload = event.payload_json.unwrap();
     assert!(payload.contains(&format!("\"note_id\":{note_id}")));
     assert!(!payload.contains("coordinate"), "{payload}");
+    let mut agents_command = child_command(
+        &broker,
+        &recipient_worktree,
+        &["advanced", "agents", "--json"],
+    );
     drop(broker);
 
-    let surfaced = run(&recipient_worktree, &["advanced", "agents", "--json"]);
+    let surfaced = agents_command.output().unwrap();
     let surfaced_stderr = String::from_utf8_lossy(&surfaced.stderr);
     assert!(surfaced.status.success(), "{surfaced_stderr}");
     assert!(surfaced_stderr.contains(&format!("Unread broker note {note_id}")));
     assert!(surfaced_stderr.contains("coordinate src/router.rs before editing"));
     assert!(surfaced_stderr.contains(&format!("--session {} --id {note_id}", recipient.id)));
 
-    let listed = run(
+    let broker = open_fixture_repository_broker(&fixture).unwrap();
+    let mut listed_command = child_command(
+        &broker,
         &recipient_worktree,
         &[
             "advanced",
@@ -136,11 +150,8 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
             "--json",
         ],
     );
-    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
-    assert_eq!(listed["unread_count"], 1);
-    assert_eq!(listed["notes"][0]["id"], note_id);
-
-    let wrong_recipient = run(
+    let mut wrong_recipient_command = child_command(
+        &broker,
         &sender_worktree,
         &[
             "advanced",
@@ -152,10 +163,8 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
             &note_id.to_string(),
         ],
     );
-    assert!(!wrong_recipient.status.success());
-    assert!(String::from_utf8_lossy(&wrong_recipient.stderr).contains("belongs to session"));
-
-    let acknowledged = run(
+    let mut acknowledged_command = child_command(
+        &broker,
         &recipient_worktree,
         &[
             "advanced",
@@ -168,14 +177,13 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
             "--json",
         ],
     );
-    assert!(acknowledged.status.success());
-    let acknowledged: serde_json::Value = serde_json::from_slice(&acknowledged.stdout).unwrap();
-    assert!(acknowledged["acknowledged_at"].as_i64().is_some());
-
-    let quiet = run(&recipient_worktree, &["advanced", "agents", "--json"]);
-    assert!(!String::from_utf8_lossy(&quiet.stderr).contains("Unread broker note"));
-
-    let multiline = run(
+    let mut quiet_command = child_command(
+        &broker,
+        &recipient_worktree,
+        &["advanced", "agents", "--json"],
+    );
+    let mut multiline_command = child_command(
+        &broker,
         &sender_worktree,
         &[
             "advanced",
@@ -189,10 +197,29 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
             "forged\noutput",
         ],
     );
+    drop(broker);
+    let listed = listed_command.output().unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["unread_count"], 1);
+    assert_eq!(listed["notes"][0]["id"], note_id);
+
+    let wrong_recipient = wrong_recipient_command.output().unwrap();
+    assert!(!wrong_recipient.status.success());
+    assert!(String::from_utf8_lossy(&wrong_recipient.stderr).contains("belongs to session"));
+
+    let acknowledged = acknowledged_command.output().unwrap();
+    assert!(acknowledged.status.success());
+    let acknowledged: serde_json::Value = serde_json::from_slice(&acknowledged.stdout).unwrap();
+    assert!(acknowledged["acknowledged_at"].as_i64().is_some());
+
+    let quiet = quiet_command.output().unwrap();
+    assert!(!String::from_utf8_lossy(&quiet.stderr).contains("Unread broker note"));
+
+    let multiline = multiline_command.output().unwrap();
     assert!(!multiline.status.success());
     assert!(String::from_utf8_lossy(&multiline.stderr).contains("one line of plain text"));
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     broker.close(recipient.id).unwrap();
     let closed = broker
         .send_session_note(sender.id, recipient.id, "too late")
