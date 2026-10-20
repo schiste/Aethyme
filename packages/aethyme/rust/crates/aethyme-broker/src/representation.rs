@@ -1130,6 +1130,27 @@ mod tests {
 
     #[test]
     fn rebased_then_merged_work_is_found_by_patch_equivalence() {
+        const ROOT_ENV: &str = "AETHYME_REPRESENTATION_TRACE_ROOT";
+        const HEAD_ENV: &str = "AETHYME_REPRESENTATION_TRACE_HEAD";
+        const TIP_ENV: &str = "AETHYME_REPRESENTATION_TRACE_TIP";
+        const COPY_ENV: &str = "AETHYME_REPRESENTATION_TRACE_COPY";
+        const TEST: &str =
+            "representation::tests::rebased_then_merged_work_is_found_by_patch_equivalence";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let repo = GitRepo::discover(Path::new(&root)).unwrap();
+            let head = std::env::var(HEAD_ENV).unwrap();
+            let tip = std::env::var(TIP_ENV).unwrap();
+            let copy = std::env::var(COPY_ENV).unwrap();
+            assert_eq!(
+                work_landed(&repo, &head, &tip).unwrap(),
+                LandingVerdict::Landed {
+                    evidence: LandingEvidence::PatchEquivalent,
+                    landed_by: Some(copy),
+                }
+            );
+            return;
+        }
+
         let (_tmp, repo, base, head, refs) = rebased_then_merged();
         let (copy, tip) = refs.split_once(' ').unwrap();
         assert_ne!(
@@ -1150,6 +1171,53 @@ mod tests {
                 evidence: LandingEvidence::PatchEquivalent,
                 landed_by: Some(copy.to_string()),
             }
+        );
+
+        let trace_dir = tempfile::tempdir().unwrap();
+        let trace = trace_dir.path().join("patch-landing-trace.json");
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", TEST, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                child.env_remove(key);
+            }
+        }
+        let output = child
+            .env(ROOT_ENV, _tmp.path())
+            .env(HEAD_ENV, &head)
+            .env(TIP_ENV, tip)
+            .env(COPY_ENV, copy)
+            .env("GIT_TRACE2_EVENT", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let events = std::fs::read_to_string(trace).unwrap();
+        let (mut logs, mut patch_ids) = (0, 0);
+        for line in events.lines() {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            if event["event"] != "start" {
+                continue;
+            }
+            let Some(argv) = event["argv"].as_array() else {
+                continue;
+            };
+            if argv.iter().any(|arg| arg == "log") {
+                logs += 1;
+            }
+            if argv.iter().any(|arg| arg == "patch-id") {
+                patch_ids += 1;
+            }
+        }
+        assert_eq!(logs, 1, "patch_landing lists both sides in one git log");
+        assert_eq!(
+            patch_ids, 1,
+            "work_landed's real patch_landing call shares one patch-id stream"
         );
     }
 

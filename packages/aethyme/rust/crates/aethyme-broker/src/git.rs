@@ -5952,6 +5952,45 @@ mod batched_commit_tests {
     }
 
     #[test]
+    fn paired_cherry_comparison_matches_one_sided_for_unrelated_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("left.txt"), "left root\n").unwrap();
+        run(root, &["add", "left.txt"]);
+        run(root, &["commit", "-qm", "left root"]);
+        run(root, &["checkout", "--orphan", "unrelated"]);
+        std::fs::write(root.join("right.txt"), "right root\n").unwrap();
+        run(root, &["add", "right.txt"]);
+        run(root, &["commit", "-qm", "unrelated root"]);
+
+        let repo = GitRepo {
+            root: root.to_path_buf(),
+        };
+        let paired = repo.cherry_marked_both("main", "unrelated").unwrap();
+        assert_eq!(paired.left_only.len(), 1);
+        assert!(
+            !paired.left_only[0].1,
+            "a parentless commit has no patch id"
+        );
+        assert_eq!(paired.right_only.len(), 1);
+        assert!(
+            !paired.right_only[0].1,
+            "a parentless commit has no patch id"
+        );
+        assert_eq!(
+            paired.left_only,
+            repo.cherry_marked("main", "unrelated", CherrySide::Left)
+                .unwrap()
+        );
+        assert_eq!(
+            paired.right_only,
+            repo.cherry_marked("main", "unrelated", CherrySide::Right)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn batched_shapes_and_patch_ids_match_the_per_commit_answers() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
