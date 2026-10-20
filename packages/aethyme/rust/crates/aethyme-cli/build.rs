@@ -487,6 +487,21 @@ fn add_tracked_files(repo_root: &Path, watches: &mut BTreeSet<PathBuf>) -> Optio
     Some(())
 }
 
+fn manifest_relative_repo_watch(
+    repo_root: &Path,
+    manifest_dir: &Path,
+    watched_path: &Path,
+) -> Option<PathBuf> {
+    let manifest_relative = manifest_dir.strip_prefix(repo_root).ok()?;
+    let watched_relative = watched_path.strip_prefix(repo_root).ok()?;
+    let mut relative = PathBuf::new();
+    for _ in manifest_relative.components() {
+        relative.push("..");
+    }
+    relative.push(watched_relative);
+    Some(relative)
+}
+
 fn source_identity_watch_paths(manifest_dir: &Path, commit: &str) -> Option<Vec<PathBuf>> {
     let repo_root = canonical_git_directory(manifest_dir, &["rev-parse", "--show-toplevel"])?;
     let git_dir = canonical_git_directory(manifest_dir, &["rev-parse", "--absolute-git-dir"])?;
@@ -502,16 +517,24 @@ fn source_identity_watch_paths(manifest_dir: &Path, commit: &str) -> Option<Vec<
 
     let mut watches = BTreeSet::new();
     let git_marker = repo_root.join(".git");
-    match fs::symlink_metadata(&git_marker) {
+    let worktree_anchor = match fs::symlink_metadata(&git_marker) {
         Ok(metadata) if metadata.file_type().is_file() => {
             // A linked-worktree marker distinguishes checkouts sharing one
             // Cargo target directory. Its contents are not followed as a path.
-            watches.insert(git_marker);
+            watches.insert(git_marker.clone());
+            git_marker.clone()
         }
-        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(metadata) if metadata.file_type().is_dir() => git_marker.join("HEAD"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Ok(_) | Err(_) => return None,
-    }
+    };
+    // Keep one narrow anchor relative to the active package root. Cargo may
+    // share build-script fingerprints across worktrees, so cached absolute
+    // Git paths alone cannot detect entering another checkout. `.git/HEAD`
+    // distinguishes a main worktree without recursively watching its shared
+    // Git directory; a linked worktree instead watches its `.git` pointer file.
+    let relative_anchor = manifest_relative_repo_watch(&repo_root, manifest_dir, &worktree_anchor)?;
+    watches.insert(relative_anchor);
 
     if git_dir != common_dir {
         add_file_watch(&git_dir.join("commondir"), false, &mut watches)?;
