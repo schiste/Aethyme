@@ -96,6 +96,58 @@ fn verify_only_repositories_verify_and_promote_nothing() {
     );
 }
 
+/// A misspelled critical mode stays visible and can never re-enable auto-promotion.
+#[test]
+fn unknown_mode_warns_in_status_and_submit_and_falls_back_to_verify_only() {
+    let (tmp, mut broker) = fixture(Some("verify-onyl"));
+    let before = git(tmp.path(), &["rev-parse", "HEAD"]);
+    let session = commit_work(&mut broker, "unknown-mode");
+
+    let status = broker.status_brief(0).unwrap();
+    let warning = status
+        .advice
+        .iter()
+        .find(|advice| advice.id == "promote.mode-invalid")
+        .expect("status surfaces an invalid promotion mode");
+    assert_eq!(warning.severity.as_str(), "warning");
+    assert!(
+        warning.summary.contains("verify-onyl"),
+        "{}",
+        warning.summary
+    );
+    assert!(
+        warning.summary.contains("verify-only"),
+        "{}",
+        warning.summary
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_broker-cli-shim"))
+        .args(["submit", "--session", &session.to_string(), "--json"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "submit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["promoted"], false);
+    assert!(
+        outcome["promotion_suppressed"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("verify-onyl"))
+    );
+    let integration = git(
+        tmp.path(),
+        &["rev-parse", "--verify", "-q", "aethyme/integration"],
+    );
+    assert!(
+        integration.is_empty() || integration == before,
+        "unknown mode promoted work to {integration}"
+    );
+}
+
 /// The reason and the next action must agree. The first cut of `verify-only`
 /// printed "promotion is off for this repository" and then, on the very next
 /// line, "verified but not promoted (manual mode). Promote with `aethyme

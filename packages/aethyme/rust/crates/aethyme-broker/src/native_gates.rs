@@ -876,6 +876,16 @@ struct Checkout {
     _root: tempfile::TempDir,
     repo: GitRepo,
 }
+
+fn reconstruct_checkout_source(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    dest: &Path,
+    limits: archive::ReconstructionLimits,
+) -> Result<SourceSnapshot, NativeGateError> {
+    archive::reconstruct_bounded(store, id, dest, limits).map_err(Into::into)
+}
+
 impl Checkout {
     fn new(store: &CollaborationStore, repo: &Path, spec: &Spec) -> Result<Self, NativeGateError> {
         refuse_git_redirects()?;
@@ -887,7 +897,12 @@ impl Checkout {
         if retained.entry_count > 8192 || retained.content_bytes > 256 * 1024 * 1024 {
             return Err(NativeGateError::Unsupported("retained source bound".into()));
         }
-        let manifest = archive::reconstruct(store, &snapshot(&spec.subject)?, &source)?;
+        let manifest = reconstruct_checkout_source(
+            store,
+            &snapshot(&spec.subject)?,
+            &source,
+            crate::execution_snapshot::RECONSTRUCTION_LIMITS,
+        )?;
         if manifest.entries().len() > 8192 {
             return Err(NativeGateError::Unsupported("source path bound".into()));
         }
@@ -955,64 +970,122 @@ impl Checkout {
 }
 #[cfg(unix)]
 fn physical_snapshot(root: &Path) -> Result<SourceSnapshot, NativeGateError> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
-    fn walk(
-        root: &Path,
-        path: &Path,
-        entries: &mut Vec<SourceEntry>,
-        total: &mut u64,
-    ) -> Result<(), NativeGateError> {
-        for leaf in std::fs::read_dir(path)? {
-            let leaf = leaf?;
-            let path = leaf.path();
-            if path == root.join(".git") {
-                continue;
-            }
-            let meta = std::fs::symlink_metadata(&path)?;
-            if meta.is_dir() {
-                walk(root, &path, entries, total)?;
-                continue;
-            }
-            if entries.len() >= 8192 {
-                return Err(NativeGateError::Unsupported("source path bound".into()));
-            }
-            let (kind, bytes) = if meta.file_type().is_symlink() {
-                (
-                    EntryKind::Symlink,
-                    std::fs::read_link(&path)?.as_os_str().as_bytes().to_vec(),
-                )
-            } else if meta.is_file() {
-                if meta.len() > 64 * 1024 * 1024 {
-                    return Err(NativeGateError::Unsupported("source file bound".into()));
-                }
-                let kind = if meta.permissions().mode() & 0o111 != 0 {
-                    EntryKind::Executable
-                } else {
-                    EntryKind::Regular
-                };
-                (kind, std::fs::read(&path)?)
-            } else {
-                return Err(NativeGateError::Mismatch);
-            };
-            *total += bytes.len() as u64;
-            if *total > 256 * 1024 * 1024 {
-                return Err(NativeGateError::Unsupported("source byte bound".into()));
-            }
-            entries.push(SourceEntry::from_content(
-                path.strip_prefix(root)
-                    .map_err(|_| NativeGateError::Mismatch)?
-                    .as_os_str()
-                    .as_bytes(),
-                kind,
-                &bytes,
-            ));
-        }
-        Ok(())
+    physical_snapshot_with_limits(root, crate::execution_snapshot::RECONSTRUCTION_LIMITS)
+}
+
+#[cfg(unix)]
+fn read_source_bytes(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>, NativeGateError> {
+    use std::io::Read;
+    let read_limit = limit
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| NativeGateError::Unsupported("source byte bound".into()))?;
+    let mut bytes = Vec::new();
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(NativeGateError::Unsupported("source byte bound".into()));
     }
-    let mut entries = vec![];
-    walk(root, root, &mut entries, &mut 0)?;
-    SourceSnapshot::new(entries).map_err(|_| NativeGateError::Mismatch)
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_source_file(path: &Path, limit: usize) -> Result<(EntryKind, Vec<u8>), NativeGateError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(NativeGateError::Mismatch);
+    }
+    if opened.len() > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return Err(NativeGateError::Unsupported("source byte bound".into()));
+    }
+    let kind = if opened.permissions().mode() & 0o111 != 0 {
+        EntryKind::Executable
+    } else {
+        EntryKind::Regular
+    };
+    Ok((kind, read_source_bytes(file, limit)?))
+}
+
+#[cfg(unix)]
+fn physical_snapshot_with_limits(
+    root: &Path,
+    limits: archive::ReconstructionLimits,
+) -> Result<SourceSnapshot, NativeGateError> {
+    use std::os::unix::ffi::OsStrExt;
+    struct Walk<'a> {
+        root: &'a Path,
+        limits: archive::ReconstructionLimits,
+        entries: Vec<SourceEntry>,
+        nodes: usize,
+        total: usize,
+    }
+    impl Walk<'_> {
+        fn visit(&mut self, path: &Path, depth: usize) -> Result<(), NativeGateError> {
+            for leaf in std::fs::read_dir(path)? {
+                let leaf = leaf?;
+                let path = leaf.path();
+                if path == self.root.join(".git") {
+                    continue;
+                }
+                if depth >= self.limits.max_path_depth {
+                    return Err(NativeGateError::Unsupported("source depth bound".into()));
+                }
+                if self.nodes >= self.limits.max_nodes {
+                    return Err(NativeGateError::Unsupported("source node bound".into()));
+                }
+                self.nodes += 1;
+                if leaf.file_name().as_bytes().len() > self.limits.max_component_bytes {
+                    return Err(NativeGateError::Unsupported(
+                        "source component bound".into(),
+                    ));
+                }
+                let meta = std::fs::symlink_metadata(&path)?;
+                if meta.is_dir() {
+                    self.visit(&path, depth + 1)?;
+                    continue;
+                }
+                if self.entries.len() >= self.limits.max_entries {
+                    return Err(NativeGateError::Unsupported("source path bound".into()));
+                }
+                let remaining = self.limits.max_output_bytes - self.total;
+                let limit = self.limits.max_file_bytes.min(remaining);
+                let (kind, bytes) = if meta.file_type().is_symlink() {
+                    let bytes = std::fs::read_link(&path)?.as_os_str().as_bytes().to_vec();
+                    if bytes.len() > limit {
+                        return Err(NativeGateError::Unsupported("source byte bound".into()));
+                    }
+                    (EntryKind::Symlink, bytes)
+                } else if meta.is_file() {
+                    read_source_file(&path, limit)?
+                } else {
+                    return Err(NativeGateError::Mismatch);
+                };
+                self.total += bytes.len();
+                self.entries.push(SourceEntry::from_content(
+                    path.strip_prefix(self.root)
+                        .map_err(|_| NativeGateError::Mismatch)?
+                        .as_os_str()
+                        .as_bytes(),
+                    kind,
+                    &bytes,
+                ));
+            }
+            Ok(())
+        }
+    }
+    let mut walk = Walk {
+        root,
+        limits,
+        entries: vec![],
+        nodes: 0,
+        total: 0,
+    };
+    walk.visit(root, 0)?;
+    SourceSnapshot::new(walk.entries).map_err(|_| NativeGateError::Mismatch)
 }
 #[cfg(not(unix))]
 fn physical_snapshot(_root: &Path) -> Result<SourceSnapshot, NativeGateError> {
