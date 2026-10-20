@@ -650,3 +650,32 @@ Under `capture = "advisory"`, `broker submit --json`'s `collaboration_capture`
 gains `ignored_settings` (sorted) when the config carries `[collaboration]`
 keys this binary does not implement; text output adds one warning line.
 Under `required` such a key is refused as `unknown_setting`.
+
+
+### Guarded execution outcomes
+
+`broker advanced exec --json` reports a command that has already run. Its
+post-execution ownership audit does not undo filesystem changes. The existing
+`exit_code` and `command_success` describe the child; the CLI exits 1 when either
+the command or audit fails and retains the completed report on stdout.
+
+Additive fields:
+
+- `ownership_ok`: the actual ownership audit result, independent of the child.
+- `conflicting_leases`: blocking leases retained from that audit, including the
+  holder session and path. An edited file being dirty before execution does not
+  itself imply an ownership violation.
+- `outcome`: `passed`, `command_failed`, `ownership_failed`, or
+  `command_and_ownership_failed`, derived from those two independent results.
+- `next_actions`: explicit lease claim commands for missing owned paths, or
+  coordination guidance for conflicting leases and adoption-time foreign edits.
+  Claim commands shell-quote the path. Leading-dash paths receive coordination
+  guidance rather than a command that the lease CLI cannot parse. Commands are
+  suggestions; their normal broker authorization and conflict checks still apply.
+  Foreign changes are preserved. Human output shows at most eight next actions;
+  JSON retains the full list.
+
+The existing `command_ran`, `edits_remain`, and `changed_paths_remaining` fields
+remain available. Human output likewise states that the audit happens after the
+command and prints recovery guidance. Arbitrary argv does not declare a write
+set, so the guard cannot infer every generated path before running it.

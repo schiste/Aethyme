@@ -1779,6 +1779,8 @@ impl Broker {
             command: command.to_vec(),
             exit_code: status.exit_code,
             command_success,
+            ownership_ok: audit.ok,
+            conflicting_leases: audit.conflicting_leases,
             before_dirty_paths: before_dirty,
             after_dirty_paths: after_dirty,
             newly_dirty_paths,
