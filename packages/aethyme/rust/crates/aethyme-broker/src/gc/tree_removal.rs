@@ -62,6 +62,30 @@ impl PinnedTreeRemoval {
         }
     }
 
+    /// Remove this pinned tree and report logical regular-file lengths observed
+    /// during successful unlinks. Symlinks and directories contribute zero;
+    /// hard links count per removed name. This is not physical space recovered.
+    /// The existing witness, identity, filesystem and deadline guards apply.
+    pub(crate) fn remove_with_observed_file_bytes(
+        self,
+        _keep_until_last: Option<&str>,
+        _deadline: Option<Instant>,
+    ) -> Result<(TreeRemoval, u64), TreeRemovalError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.0
+                .remove_with_observed_file_bytes(_keep_until_last, _deadline)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _self = self;
+            Err(TreeRemovalError {
+                source: unsupported_platform(),
+                entries_reclaimed: 0,
+            })
+        }
+    }
+
     /// Identity of the directory opened by [`Self::open`].
     pub(crate) fn object_identity(&self) -> io::Result<TreeObjectIdentity> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -377,6 +401,23 @@ mod unix {
                 before_mutation,
                 |_| Ok(()),
             )
+            .map(|(outcome, entries, _bytes)| (outcome, entries))
+        }
+
+        pub(super) fn remove_with_observed_file_bytes(
+            self,
+            keep_until_last: Option<&str>,
+            deadline: Option<Instant>,
+        ) -> Result<(TreeRemoval, u64), super::TreeRemovalError> {
+            self.remove_with_hooks_and_progress(
+                keep_until_last,
+                deadline,
+                &mut || Ok(()),
+                &mut || Ok(()),
+                &mut || Ok(()),
+                |_| Ok(()),
+            )
+            .map(|(outcome, _entries, bytes)| (outcome, bytes))
         }
 
         pub(super) fn remove_verified_witness_with_progress_and_guard<F, M>(
@@ -398,6 +439,7 @@ mod unix {
                 before_mutation,
                 validate,
             )
+            .map(|(outcome, entries, _bytes)| (outcome, entries))
         }
 
         #[cfg(test)]
@@ -420,7 +462,7 @@ mod unix {
                 &mut || Ok(()),
                 |_| Ok(()),
             )
-            .map(|(outcome, _entries_reclaimed)| outcome)
+            .map(|(outcome, _entries_reclaimed, _bytes)| outcome)
             .map_err(|error| error.source)
         }
 
@@ -432,7 +474,7 @@ mod unix {
             after_witness_unlink: &mut G,
             before_mutation: &mut M,
             validate_witness: V,
-        ) -> Result<(TreeRemoval, usize), super::TreeRemovalError>
+        ) -> Result<(TreeRemoval, usize, u64), super::TreeRemovalError>
         where
             F: FnMut() -> io::Result<()>,
             G: FnMut() -> io::Result<()>,
@@ -440,6 +482,7 @@ mod unix {
             V: FnOnce(&[u8]) -> io::Result<()>,
         {
             let mut entries_reclaimed = 0;
+            let mut observed_regular_bytes = 0u64;
             let result = (|| -> io::Result<TreeRemoval> {
                 let keep = keep_until_last.map(CString::new).transpose().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "witness name contains NUL")
@@ -475,6 +518,7 @@ mod unix {
                         before_directory_open,
                         before_mutation,
                         &mut entries_reclaimed,
+                        &mut observed_regular_bytes,
                     ) {
                         Ok(TreeRemoval::Complete) => {}
                         Ok(TreeRemoval::Interrupted) => {
@@ -543,6 +587,12 @@ mod unix {
                     match final_unlink {
                         Ok(()) => {
                             entries_reclaimed = entries_reclaimed.saturating_add(1);
+                            // A witness may be restored and unlinked again on
+                            // retries. Count it only once after final success.
+                            if let Some(backup) = witness_backup.as_ref() {
+                                observed_regular_bytes = observed_regular_bytes
+                                    .saturating_add(backup.bytes.len() as u64);
+                            }
                             return Ok(TreeRemoval::Complete);
                         }
                         Err(error)
@@ -575,7 +625,7 @@ mod unix {
                 }
             })();
             result
-                .map(|outcome| (outcome, entries_reclaimed))
+                .map(|outcome| (outcome, entries_reclaimed, observed_regular_bytes))
                 .map_err(|source| super::TreeRemovalError {
                     source,
                     entries_reclaimed,
@@ -610,6 +660,7 @@ mod unix {
         before_directory_open: &mut F,
         before_mutation: &mut M,
         entries_reclaimed: &mut usize,
+        observed_regular_bytes: &mut u64,
     ) -> io::Result<TreeRemoval>
     where
         F: FnMut() -> io::Result<()>,
@@ -726,6 +777,10 @@ mod unix {
                 match unlink_at(directory_fd, &c_name, false) {
                     Ok(()) => {
                         *entries_reclaimed = entries_reclaimed.saturating_add(1);
+                        if observed.is_regular {
+                            *observed_regular_bytes =
+                                observed_regular_bytes.saturating_add(observed.logical_bytes);
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
@@ -924,6 +979,7 @@ mod unix {
         identity: TreeObjectIdentity,
         is_directory: bool,
         is_regular: bool,
+        logical_bytes: u64,
     }
 
     fn stat_at(parent_fd: RawFd, name: &CString) -> io::Result<Option<EntryMetadata>> {
@@ -964,6 +1020,7 @@ mod unix {
             },
             is_directory: mode & libc::S_IFMT == libc::S_IFDIR,
             is_regular: mode & libc::S_IFMT == libc::S_IFREG,
+            logical_bytes: u64::try_from(stat.st_size).unwrap_or(0),
         }))
     }
 
@@ -1838,5 +1895,52 @@ mod unix {
             );
             assert!(!root.exists());
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod observed_file_byte_tests {
+    use super::{PinnedTreeRemoval, TreeRemoval};
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn removal_counts_regular_file_names_without_following_symlinks() {
+        let owner = tempfile::tempdir().unwrap();
+        let parent = owner.path().canonicalize().unwrap();
+        let root = parent.join("tree");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("file"), b"abc").unwrap();
+        std::fs::hard_link(root.join("file"), root.join("second-name")).unwrap();
+        std::fs::write(root.join("nested/file"), b"defg").unwrap();
+        std::fs::write(root.join("witness"), b"ok").unwrap();
+        let outside = parent.join("outside");
+        std::fs::write(&outside, b"must remain").unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        let (outcome, bytes) = PinnedTreeRemoval::open(&root)
+            .unwrap()
+            .remove_with_observed_file_bytes(Some("witness"), None)
+            .unwrap();
+        assert_eq!(outcome, TreeRemoval::Complete);
+        assert_eq!(
+            bytes, 12,
+            "3 + 3 + 4 + 2 logical bytes, not physical allocation"
+        );
+        assert!(!root.exists());
+        assert_eq!(std::fs::read(outside).unwrap(), b"must remain");
+    }
+
+    #[test]
+    fn interrupted_count_preserves_existing_deadline_behavior() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().canonicalize().unwrap().join("tree");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file"), b"12345").unwrap();
+        let (outcome, bytes) = PinnedTreeRemoval::open(&root)
+            .unwrap()
+            .remove_with_observed_file_bytes(None, Some(std::time::Instant::now()))
+            .unwrap();
+        assert_eq!(outcome, TreeRemoval::Interrupted);
+        assert_eq!(bytes, 5);
+        assert!(root.is_dir());
     }
 }
