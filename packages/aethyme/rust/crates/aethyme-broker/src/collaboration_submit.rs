@@ -954,7 +954,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut broker = crate::Broker::open(repo.path())
             .unwrap()
-            .with_worktree_root(worktrees.path())
+            .with_worktree_root(worktrees.path().canonicalize().unwrap().join("worktrees"))
             .with_collaboration_state(state.path());
         let session = broker.start_worktree("work", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);

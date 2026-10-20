@@ -61,7 +61,7 @@ impl Fixture {
         let worktrees = tempfile::tempdir().unwrap();
         let mut broker = Broker::open(repo.path())
             .unwrap()
-            .with_worktree_root(worktrees.path())
+            .with_worktree_root(worktrees.path().canonicalize().unwrap().join("worktrees"))
             .with_collaboration_state(host.path());
         let session = broker
             .start_worktree("compatibility", Some("disposable Playground compatibility"))
