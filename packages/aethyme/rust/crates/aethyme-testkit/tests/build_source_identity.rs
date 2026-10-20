@@ -3,7 +3,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, UNIX_EPOCH};
 
+const SOURCE_ROOT_ENV: &str = "AETHYME_BUILD_SOURCE_ROOT";
+const FIXTURE_CARGO_CONFIG: &str =
+    "[env]\nAETHYME_BUILD_SOURCE_ROOT = { value = \".\", relative = true, force = true }\n";
 fn checked(command: &mut Command) -> String {
     let output: Output = command.output().expect("spawn fixture command");
     assert!(
@@ -16,15 +20,23 @@ fn checked(command: &mut Command) -> String {
 }
 
 fn clear_git_environment(command: &mut Command) {
-    let inherited_git_variables = std::env::vars_os()
+    const BUILD_IDENTITY_VARIABLES: [&str; 6] = [
+        "AETHYME_GIT_COMMIT",
+        "AETHYME_GIT_DESCRIBE",
+        "AETHYME_GIT_REVISION",
+        "AETHYME_BROKER_GIT_COMMIT",
+        "AETHYME_BROKER_GIT_DESCRIBE",
+        "AETHYME_BROKER_GIT_REVISION",
+    ];
+    let inherited_fixture_variables = std::env::vars_os()
         .filter_map(|(name, _)| {
-            name.to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("GIT_")
-                .then_some(name)
+            let normalized = name.to_string_lossy().to_ascii_uppercase();
+            (normalized.starts_with("GIT_")
+                || BUILD_IDENTITY_VARIABLES.contains(&normalized.as_str()))
+            .then_some(name)
         })
         .collect::<Vec<_>>();
-    for name in inherited_git_variables {
+    for name in inherited_fixture_variables {
         command.env_remove(name);
     }
     // Match the build-script's isolated Git identity profile.
@@ -136,6 +148,18 @@ struct ProbeRun {
     diagnostics: String,
 }
 
+fn repository_root_for_manifest(manifest: &Path) -> PathBuf {
+    let mut directory = manifest.parent().expect("fixture manifest parent");
+    loop {
+        if directory.join(".git").exists() {
+            return directory.to_path_buf();
+        }
+        directory = directory
+            .parent()
+            .expect("fixture manifest must be inside a Git worktree");
+    }
+}
+
 fn run_probe(manifest: &Path, target: &Path, common_cwd: &Path) -> ProbeRun {
     run_probe_with_environment(manifest, target, common_cwd, &[])
 }
@@ -146,14 +170,59 @@ fn run_probe_with_environment(
     common_cwd: &Path,
     environment: &[(&str, &str)],
 ) -> ProbeRun {
+    let source_root = repository_root_for_manifest(manifest);
+    let config = source_root.join(".cargo/config.toml");
+    run_probe_using(
+        manifest,
+        target,
+        common_cwd,
+        common_cwd,
+        Some(&config),
+        environment,
+    )
+}
+
+fn run_probe_discovered_config(
+    manifest: &Path,
+    target: &Path,
+    source_root: &Path,
+    fixed_pwd: &Path,
+) -> ProbeRun {
+    run_probe_using(manifest, target, source_root, fixed_pwd, None, &[])
+}
+
+fn run_probe_without_config(manifest: &Path, target: &Path, common_cwd: &Path) -> ProbeRun {
+    run_probe_using(manifest, target, common_cwd, common_cwd, None, &[])
+}
+
+fn run_probe_using(
+    manifest: &Path,
+    target: &Path,
+    current_dir: &Path,
+    fixed_pwd: &Path,
+    config: Option<&Path>,
+    environment: &[(&str, &str)],
+) -> ProbeRun {
+    let cargo_home = target
+        .parent()
+        .expect("probe target parent")
+        .join("isolated-cargo-home");
+    fs::create_dir_all(&cargo_home).expect("create isolated Cargo home");
     let mut command = Command::new(env!("CARGO"));
     clear_git_environment(&mut command);
     command
-        .current_dir(common_cwd)
+        .current_dir(current_dir)
+        .env("PWD", fixed_pwd)
+        .env_remove(SOURCE_ROOT_ENV)
+        .env("CARGO_HOME", cargo_home)
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_PROFILE_DEV_DEBUG", "0")
-        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WRAPPER", "");
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    command
         .args([
             "run",
             "--offline",
@@ -220,6 +289,55 @@ fn assert_script_fresh(run: &ProbeRun, context: &str) {
         !run.build_script_ran,
         "build script reran for unchanged inputs ({context}); Cargo diagnostics:\n{}",
         run.diagnostics
+    );
+}
+
+fn assert_source_root_fallback(run: &ProbeRun, context: &str) {
+    assert!(
+        run.diagnostics
+            .contains(&format!("cargo:rerun-if-env-changed={SOURCE_ROOT_ENV}")),
+        "source-root environment input was not tracked ({context}); Cargo diagnostics:\n{}",
+        run.diagnostics
+    );
+    assert!(
+        run.diagnostics
+            .contains("cargo:rerun-if-changed=.aethyme-source-identity-always-recheck"),
+        "missing or mismatched source-root config did not use conservative fallback ({context}); Cargo diagnostics:\n{}",
+        run.diagnostics
+    );
+}
+
+fn make_git_pointer_older_than_any_probe_output(path: &Path) {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open linked-worktree pointer without truncating it");
+    file.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+        .expect("make linked-worktree pointer older than probe outputs");
+}
+
+fn assert_git_pointer_older_than_probe_output(
+    pointer: &Path,
+    target: &Path,
+    commit_variable: &str,
+    context: &str,
+) {
+    let build_dir = target.join("debug/build");
+    let needle = format!("cargo:rustc-env={commit_variable}=");
+    let output_time = fs::read_dir(&build_dir)
+        .expect("read probe build outputs")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("output"))
+        .find(|output| fs::read_to_string(output).is_ok_and(|contents| contents.contains(&needle)))
+        .and_then(|output| fs::metadata(output).ok()?.modified().ok())
+        .expect("find source-identity build-script output time");
+    let pointer_time = fs::metadata(pointer)
+        .expect("stat linked-worktree pointer")
+        .modified()
+        .expect("read linked-worktree pointer time");
+    assert!(
+        pointer_time < output_time,
+        "linked-worktree pointer must predate the build output ({context}): pointer={pointer_time:?}, output={output_time:?}"
     );
 }
 
@@ -366,6 +484,8 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
         let package_root = repo.join(package);
         let target = temp.path().join("shared-target");
         fs::create_dir_all(package_root.join("src")).unwrap();
+        fs::create_dir_all(repo.join(".cargo")).unwrap();
+        fs::write(repo.join(".cargo/config.toml"), FIXTURE_CARGO_CONFIG).unwrap();
         fs::write(
             package_root.join("Cargo.toml"),
             "[package]\nname = \"source-identity-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n",
@@ -396,6 +516,7 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
                 "add",
                 "packages/probe/Cargo.toml",
                 "packages/probe/Cargo.lock",
+                ".cargo/config.toml",
                 "packages/probe/build.rs",
                 "packages/probe/src/main.rs",
             ],
@@ -417,33 +538,6 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
         git(&repo, &["commit", "-m", "advance newer source"]);
         let second = git(&repo, &["rev-parse", "HEAD"]);
         assert_ne!(first, second);
-        for (tree, expected) in [(&repo, &second), (&older, &first), (&repo, &second)] {
-            let run = run_probe(&tree.join(package).join("Cargo.toml"), &target, temp.path());
-            let revision = git_revision(tree);
-            assert_identity(&run, expected, &revision, name);
-            assert_script_ran(&run, "switching source worktree");
-            if tree == &older {
-                let linked_git_dir = git(tree, &["rev-parse", "--absolute-git-dir"]);
-                let commondir_watch = format!(
-                    "cargo:rerun-if-changed={}",
-                    Path::new(&linked_git_dir).join("commondir").display()
-                );
-                let cargo_prefixed_commondir_watch =
-                    format!("[source-identity-probe 0.1.0] {commondir_watch}");
-                assert!(
-                    run.diagnostics.lines().any(|line| {
-                        line == commondir_watch || line == cargo_prefixed_commondir_watch
-                    }),
-                    "linked worktree source identity omitted its commondir input: {}",
-                    run.diagnostics
-                );
-            }
-        }
-        let warm = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
-        let stable_revision = git_revision(&repo);
-        assert_identity(&warm, &second, &stable_revision, name);
-        assert_script_fresh(&warm, "same linked worktree and source state");
-
         let sibling = temp.path().join("sibling-only");
         git(
             &repo,
@@ -455,19 +549,246 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
                 &second,
             ],
         );
+        make_git_pointer_older_than_any_probe_output(&older.join(".git"));
+        make_git_pointer_older_than_any_probe_output(&sibling.join(".git"));
+
+        // Explicit `--config` keeps the actual CWD and PWD fixed while the
+        // config file path supplies the active worktree root fingerprint.
+        let first_main = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(&first_main, &second, &second, "initial main worktree");
+        assert_script_ran(&first_main, "initial main worktree");
+        assert_git_pointer_older_than_probe_output(
+            &older.join(".git"),
+            &target,
+            commit_variable,
+            "primary-to-linked pointer precondition",
+        );
+        assert_git_pointer_older_than_probe_output(
+            &sibling.join(".git"),
+            &target,
+            commit_variable,
+            "linked-to-linked pointer precondition",
+        );
+
+        let linked_old = run_probe(
+            &older.join(package).join("Cargo.toml"),
+            &target,
+            temp.path(),
+        );
+        assert_identity(&linked_old, &first, &first, "main to older linked worktree");
+        assert_script_ran(&linked_old, "main to older linked worktree");
+        let linked_git_dir = git(&older, &["rev-parse", "--absolute-git-dir"]);
+        let commondir_watch = format!(
+            "cargo:rerun-if-changed={}",
+            Path::new(&linked_git_dir).join("commondir").display()
+        );
+        let cargo_prefixed_commondir_watch =
+            format!("[source-identity-probe 0.1.0] {commondir_watch}");
+        assert!(
+            linked_old
+                .diagnostics
+                .lines()
+                .any(|line| { line == commondir_watch || line == cargo_prefixed_commondir_watch }),
+            "linked worktree source identity omitted its commondir input: {}",
+            linked_old.diagnostics
+        );
+
+        let main_again = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &main_again,
+            &second,
+            &second,
+            "older linked worktree to main",
+        );
+        assert_script_ran(&main_again, "older linked worktree to main");
+        let main_warm = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(&main_warm, &second, &git_revision(&repo), "main warm build");
+        assert_script_fresh(&main_warm, "same main worktree and source state");
+
+        let linked_old_again = run_probe(
+            &older.join(package).join("Cargo.toml"),
+            &target,
+            temp.path(),
+        );
+        assert_identity(
+            &linked_old_again,
+            &first,
+            &first,
+            "main to linked worktree before linked switch",
+        );
+        assert_script_ran(
+            &linked_old_again,
+            "main to linked worktree before linked switch",
+        );
+        assert_git_pointer_older_than_probe_output(
+            &sibling.join(".git"),
+            &target,
+            commit_variable,
+            "linked-to-linked older-pointer precondition",
+        );
+        let linked_latest = run_probe(
+            &sibling.join(package).join("Cargo.toml"),
+            &target,
+            temp.path(),
+        );
+        assert_identity(
+            &linked_latest,
+            &second,
+            &second,
+            "linked to linked worktree",
+        );
+        assert_script_ran(
+            &linked_latest,
+            "linked to linked worktree with older pointer",
+        );
+        let linked_warm = run_probe(
+            &sibling.join(package).join("Cargo.toml"),
+            &target,
+            temp.path(),
+        );
+        assert_identity(
+            &linked_warm,
+            &second,
+            &second,
+            "same linked worktree warm build",
+        );
+        assert_script_fresh(&linked_warm, "same linked worktree warm build");
+
+        // Cargo's normal config discovery follows the active CWD. PWD remains
+        // fixed, so these root changes exercise the config env value directly.
+        let discovered_target = temp.path().join("discovered-target");
+        let discovered_main = run_probe_discovered_config(
+            &repo.join(package).join("Cargo.toml"),
+            &discovered_target,
+            &repo,
+            temp.path(),
+        );
+        assert_identity(
+            &discovered_main,
+            &second,
+            &second,
+            "discovered config main worktree",
+        );
+        assert_script_ran(&discovered_main, "discovered config main worktree");
+        assert_git_pointer_older_than_probe_output(
+            &older.join(".git"),
+            &discovered_target,
+            commit_variable,
+            "discovered primary-to-linked pointer precondition",
+        );
+        let discovered_old = run_probe_discovered_config(
+            &older.join(package).join("Cargo.toml"),
+            &discovered_target,
+            &older,
+            temp.path(),
+        );
+        assert_identity(&discovered_old, &first, &first, "discovered main to linked");
+        assert_script_ran(&discovered_old, "discovered main to linked");
+        assert_git_pointer_older_than_probe_output(
+            &sibling.join(".git"),
+            &discovered_target,
+            commit_variable,
+            "discovered linked-to-linked older-pointer precondition",
+        );
+        let discovered_sibling = run_probe_discovered_config(
+            &sibling.join(package).join("Cargo.toml"),
+            &discovered_target,
+            &sibling,
+            temp.path(),
+        );
+        assert_identity(
+            &discovered_sibling,
+            &second,
+            &second,
+            "discovered linked to linked",
+        );
+        assert_script_ran(
+            &discovered_sibling,
+            "discovered linked to linked with older pointer",
+        );
+        let discovered_sibling_warm = run_probe_discovered_config(
+            &sibling.join(package).join("Cargo.toml"),
+            &discovered_target,
+            &sibling,
+            temp.path(),
+        );
+        assert_identity(
+            &discovered_sibling_warm,
+            &second,
+            &second,
+            "discovered sibling warm build",
+        );
+        assert_script_fresh(&discovered_sibling_warm, "discovered sibling warm build");
+        let discovered_main_again = run_probe_discovered_config(
+            &repo.join(package).join("Cargo.toml"),
+            &discovered_target,
+            &repo,
+            temp.path(),
+        );
+        assert_identity(
+            &discovered_main_again,
+            &second,
+            &second,
+            "discovered linked to main",
+        );
+        assert_script_ran(&discovered_main_again, "discovered linked to main");
+        let discovered_main_warm = run_probe_discovered_config(
+            &repo.join(package).join("Cargo.toml"),
+            &discovered_target,
+            &repo,
+            temp.path(),
+        );
+        assert_identity(
+            &discovered_main_warm,
+            &second,
+            &second,
+            "discovered main warm build",
+        );
+        assert_script_fresh(&discovered_main_warm, "discovered main warm build");
+
+        // A sibling's creation and later commit do not invalidate the active
+        // root's stable source identity.
+        let main_before_sibling_change =
+            run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
+        assert_identity(
+            &main_before_sibling_change,
+            &second,
+            &second,
+            "return from sibling to main before sibling change",
+        );
+        assert_script_ran(
+            &main_before_sibling_change,
+            "return from sibling to main before sibling change",
+        );
+        let late_sibling = temp.path().join("late-sibling");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                late_sibling.to_str().unwrap(),
+                &second,
+            ],
+        );
         let sibling_added = run_probe(&repo.join(package).join("Cargo.toml"), &target, temp.path());
         assert_identity(&sibling_added, &second, &second, "sibling worktree added");
         assert_script_fresh(&sibling_added, "sibling worktree added");
-        fs::write(sibling.join("sibling-only.txt"), "sibling-only\n").unwrap();
+        fs::write(late_sibling.join("sibling-only.txt"), "sibling-only\n").unwrap();
         git(
             &repo,
-            &["-C", sibling.to_str().unwrap(), "add", "sibling-only.txt"],
+            &[
+                "-C",
+                late_sibling.to_str().unwrap(),
+                "add",
+                "sibling-only.txt",
+            ],
         );
         git(
             &repo,
             &[
                 "-C",
-                sibling.to_str().unwrap(),
+                late_sibling.to_str().unwrap(),
                 "commit",
                 "-m",
                 "sibling-only commit",
@@ -479,7 +800,139 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
         assert_script_fresh(&sibling_committed, "sibling-only commit");
         git(
             &repo,
-            &["worktree", "remove", "--force", sibling.to_str().unwrap()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                late_sibling.to_str().unwrap(),
+            ],
+        );
+
+        // Without the project config, each invocation remains correct by
+        // taking the conservative always-recheck path.
+        let no_config_target = temp.path().join("external-no-config-target");
+        let no_config_main = run_probe_without_config(
+            &repo.join(package).join("Cargo.toml"),
+            &no_config_target,
+            temp.path(),
+        );
+        assert_identity(
+            &no_config_main,
+            &second,
+            &second,
+            "external cwd without config",
+        );
+        assert_source_root_fallback(&no_config_main, "external cwd without config");
+        assert_script_ran(&no_config_main, "first external cwd without config");
+        let no_config_warm = run_probe_without_config(
+            &repo.join(package).join("Cargo.toml"),
+            &no_config_target,
+            temp.path(),
+        );
+        assert_identity(
+            &no_config_warm,
+            &second,
+            &second,
+            "repeated external cwd without config",
+        );
+        assert_source_root_fallback(&no_config_warm, "repeated external cwd without config");
+        assert_script_ran(&no_config_warm, "missing config always-recheck fallback");
+        let no_config_linked = run_probe_without_config(
+            &older.join(package).join("Cargo.toml"),
+            &no_config_target,
+            temp.path(),
+        );
+        assert_identity(
+            &no_config_linked,
+            &first,
+            &first,
+            "external cwd without config linked",
+        );
+        assert_source_root_fallback(&no_config_linked, "external cwd without config linked");
+        assert_script_ran(&no_config_linked, "missing config linked-worktree fallback");
+
+        let mismatch_root = temp.path().join("not-source-root");
+        fs::create_dir_all(&mismatch_root).unwrap();
+        let forced_config_target = temp.path().join("forced-config-target");
+        let poisoned_environment = [(SOURCE_ROOT_ENV, mismatch_root.to_str().unwrap())];
+        let forced_config = run_probe_with_environment(
+            &repo.join(package).join("Cargo.toml"),
+            &forced_config_target,
+            temp.path(),
+            &poisoned_environment,
+        );
+        assert_identity(
+            &forced_config,
+            &second,
+            &second,
+            "forced source-root config",
+        );
+        assert_script_ran(&forced_config, "forced source-root config");
+        assert!(
+            !forced_config
+                .diagnostics
+                .contains("cargo:rerun-if-changed=.aethyme-source-identity-always-recheck"),
+            "project config did not override ambient source-root spoof: {}",
+            forced_config.diagnostics
+        );
+        let forced_config_warm = run_probe_with_environment(
+            &repo.join(package).join("Cargo.toml"),
+            &forced_config_target,
+            temp.path(),
+            &poisoned_environment,
+        );
+        assert_identity(
+            &forced_config_warm,
+            &second,
+            &second,
+            "repeated forced source-root config",
+        );
+        assert_script_fresh(&forced_config_warm, "repeated forced source-root config");
+
+        let mismatch_config = temp.path().join("mismatched-source-root.toml");
+        fs::write(
+            &mismatch_config,
+            format!(
+                "[env]\n{SOURCE_ROOT_ENV} = {{ value = {:?}, force = true }}\n",
+                mismatch_root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mismatch_target = temp.path().join("mismatched-config-target");
+        let mismatched = run_probe_using(
+            &repo.join(package).join("Cargo.toml"),
+            &mismatch_target,
+            temp.path(),
+            temp.path(),
+            Some(&mismatch_config),
+            &[],
+        );
+        assert_identity(
+            &mismatched,
+            &second,
+            &second,
+            "mismatched source-root config",
+        );
+        assert_source_root_fallback(&mismatched, "mismatched source-root config");
+        assert_script_ran(&mismatched, "mismatched source-root config");
+        let mismatched_again = run_probe_using(
+            &repo.join(package).join("Cargo.toml"),
+            &mismatch_target,
+            temp.path(),
+            temp.path(),
+            Some(&mismatch_config),
+            &[],
+        );
+        assert_identity(
+            &mismatched_again,
+            &second,
+            &second,
+            "repeated mismatched source-root config",
+        );
+        assert_source_root_fallback(&mismatched_again, "repeated mismatched source-root config");
+        assert_script_ran(
+            &mismatched_again,
+            "mismatched source-root always-recheck fallback",
         );
 
         // `--dirty` changes for tracked worktree edits even without an index or
@@ -651,8 +1104,8 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
         );
         assert_script_fresh(&detached_warm, "detached HEAD stable");
 
-        // Replacement refs and inherited Git environment cannot rewrite this
-        // profile's exact commit + tracked-dirty identity.
+        // Replacement refs and inherited Git/build identity variables cannot
+        // rewrite this profile's exact commit + tracked-dirty identity.
         git(&repo, &["checkout", "--detach", &second]);
         git(
             &repo,
@@ -884,6 +1337,8 @@ fn shallow_metadata_does_not_change_the_stable_source_identity() {
         let package_root = repo.join("packages/probe");
         let target = temp.path().join("shared-target");
         fs::create_dir_all(package_root.join("src")).unwrap();
+        fs::create_dir_all(repo.join(".cargo")).unwrap();
+        fs::write(repo.join(".cargo/config.toml"), FIXTURE_CARGO_CONFIG).unwrap();
         fs::write(
             package_root.join("Cargo.toml"),
             "[package]\nname = \"source-identity-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n",
@@ -1002,6 +1457,8 @@ fn symlinked_tracked_ancestor_uses_fallback_without_watching_its_target() {
         let package_root = repo.join("packages/probe");
         let target = temp.path().join("shared-target");
         fs::create_dir_all(package_root.join("src")).unwrap();
+        fs::create_dir_all(repo.join(".cargo")).unwrap();
+        fs::write(repo.join(".cargo/config.toml"), FIXTURE_CARGO_CONFIG).unwrap();
         fs::create_dir_all(repo.join("tracked-parent")).unwrap();
         fs::write(
             package_root.join("Cargo.toml"),

@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const ALWAYS_RECHECK: &str = ".aethyme-source-identity-always-recheck";
+const SOURCE_ROOT_ENV: &str = "AETHYME_BUILD_SOURCE_ROOT";
 const MAX_TRACKED_LIST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRACKED_PATHS: usize = 32_768;
 const MAX_WATCH_DIRECTIVE_BYTES: usize = 8 * 1024 * 1024;
@@ -487,21 +488,6 @@ fn add_tracked_files(repo_root: &Path, watches: &mut BTreeSet<PathBuf>) -> Optio
     Some(())
 }
 
-fn manifest_relative_repo_watch(
-    repo_root: &Path,
-    manifest_dir: &Path,
-    watched_path: &Path,
-) -> Option<PathBuf> {
-    let manifest_relative = manifest_dir.strip_prefix(repo_root).ok()?;
-    let watched_relative = watched_path.strip_prefix(repo_root).ok()?;
-    let mut relative = PathBuf::new();
-    for _ in manifest_relative.components() {
-        relative.push("..");
-    }
-    relative.push(watched_relative);
-    Some(relative)
-}
-
 fn source_identity_watch_paths(manifest_dir: &Path, commit: &str) -> Option<Vec<PathBuf>> {
     let repo_root = canonical_git_directory(manifest_dir, &["rev-parse", "--show-toplevel"])?;
     let git_dir = canonical_git_directory(manifest_dir, &["rev-parse", "--absolute-git-dir"])?;
@@ -515,27 +501,19 @@ fn source_identity_watch_paths(manifest_dir: &Path, commit: &str) -> Option<Vec<
         return None;
     }
 
-    let mut watches = BTreeSet::new();
-    let git_marker = repo_root.join(".git");
-    let worktree_anchor = match fs::symlink_metadata(&git_marker) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            // A linked-worktree marker distinguishes checkouts sharing one
-            // Cargo target directory. Its contents are not followed as a path.
-            watches.insert(git_marker.clone());
-            git_marker.clone()
-        }
-        Ok(metadata) if metadata.file_type().is_dir() => git_marker.join("HEAD"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Ok(_) | Err(_) => return None,
-    };
-    // Keep one narrow anchor relative to the active package root. Cargo may
-    // share build-script fingerprints across worktrees, so cached absolute
-    // Git paths alone cannot detect entering another checkout. `.git/HEAD`
-    // distinguishes a main worktree without recursively watching its shared
-    // Git directory; a linked worktree instead watches its `.git` pointer file.
-    let relative_anchor = manifest_relative_repo_watch(&repo_root, manifest_dir, &worktree_anchor)?;
-    watches.insert(relative_anchor);
+    // Cargo compares rerun-if-changed inputs by modification time. That is
+    // insufficient for switching between linked worktrees whose `.git` pointer
+    // files are older than the shared target's cached build output. The project
+    // Cargo config supplies an exact root value that Cargo fingerprints as an
+    // environment input; missing or mismatched config takes the conservative
+    // always-recheck path in the caller.
+    let configured_root = std::env::var_os(SOURCE_ROOT_ENV)?;
+    let configured_root = fs::canonicalize(configured_root).ok()?;
+    if configured_root != repo_root {
+        return None;
+    }
 
+    let mut watches = BTreeSet::new();
     if git_dir != common_dir {
         add_file_watch(&git_dir.join("commondir"), false, &mut watches)?;
     }
@@ -576,7 +554,8 @@ fn source_identity_watch_paths(manifest_dir: &Path, commit: &str) -> Option<Vec<
         return None;
     }
 
-    let mut output_bytes = "cargo:rerun-if-changed=build.rs\n".len();
+    let mut output_bytes = "cargo:rerun-if-changed=build.rs\n".len()
+        + format!("cargo:rerun-if-env-changed={SOURCE_ROOT_ENV}\n").len();
     for path in &watches {
         let text = path.to_str()?;
         if text.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
@@ -601,6 +580,7 @@ fn emit_source_identity_reruns(
     identity_uncertain: bool,
 ) {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed={SOURCE_ROOT_ENV}");
     if identity_uncertain {
         println!("cargo:rerun-if-changed={ALWAYS_RECHECK}");
         return;
