@@ -7190,22 +7190,17 @@ mod tests {
         assert!(
             report.closed,
             "finish should close the represented current session: status={:?}, unsubmitted_commits={}, warnings={:?}, next_commands={:?}",
-            report.status,
-            report.unsubmitted_commits,
-            report.warnings,
-            report.next_commands
+            report.status, report.unsubmitted_commits, report.warnings, report.next_commands
         );
         assert!(
             report.cleanup.kept,
             "finish should keep the current checkout: status={:?}, warnings={:?}",
-            report.status,
-            report.warnings
+            report.status, report.warnings
         );
         assert!(
             !report.cleanup.worktree_removed,
             "finish removed the current checkout: status={:?}, warnings={:?}",
-            report.status,
-            report.warnings
+            report.status, report.warnings
         );
         assert!(current_worktree.join("README.md").is_file());
         assert!(
