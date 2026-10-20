@@ -877,3 +877,24 @@ the schema lock:
 - BSL constraint: [Phase 3 redb plan](phase3-redb-graph-store-plan.md)
   explains why the cache layer must stay BSL-free; the same constraint
   applies to any library used to write/read fragments.
+
+## 11. Derived redb schema 10 and test relationships
+
+This section describes the local derived redb materialization, not a change
+to the committed-fragment source of truth. The redb schema is version 10.
+Its engine `EdgeKind::Tests` variant is appended after the existing variants
+so their bincode discriminants stay stable. A schema-9 redb file is rejected
+with `SchemaMismatch`; it is not decoded as schema 10 or migrated in place.
+Rebuild the derived store from the committed graph fragments.
+
+The canonical edge name is lowercase `tests`, with direction
+`test_function → tested_symbol`. Coverage records include `tests: 0` when the
+current indexer checked this relationship kind and found none. A missing
+`tests` key means that coverage is unavailable, not that there are no test
+edges; graph-impact reports that case as partial.
+
+Bounded graph-impact lookup follows indexed `Tests` edges from impacted
+targets to test source paths. It does not infer test relationships from
+filenames. Incoming-adjacency limits count raw rows before filtering by edge
+kind and share the lookup's traversal limits. If a limit truncates the walk,
+the report is partial and cannot authorize the complete-result fast path.
