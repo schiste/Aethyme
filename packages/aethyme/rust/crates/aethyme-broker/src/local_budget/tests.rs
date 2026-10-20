@@ -124,7 +124,7 @@ fn generic_resolution_mutators_refuse_without_changing_pending_reservation() {
         target: owner.target().into(),
         revision: current_wave.spec.revision,
         wave: wave_id.to_string(),
-        objective: objective_id.to_string(),
+        objective: current_wave.spec.objective_authorization.clone(),
         project_policy: project_id.to_string(),
         objective_policy: objective_id.to_string(),
         request: resolution_request,
