@@ -757,14 +757,7 @@ impl Broker {
         intent: PromotionIntent,
         expected_head: Option<&str>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.require_bound_repository_worktree_root("session submission")?;
-        // Recorded from the first step: lease auditing and planning can take
-        // minutes on a busy repository, and a silent submit looks hung.
-        let progress = crate::submit_progress::SubmitProgress::start(
-            &self.main_root_path(),
-            session_id,
-            crate::gates::heartbeat_interval(),
-        );
+        self.check_submission_root_before_planning()?;
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = require_session_checkout_identity(&session, &checkout, None)?;
@@ -780,6 +773,13 @@ impl Broker {
                 actual: head.into_boxed_str(),
             });
         }
+        // Recorded only after the session and checkout are known to be valid:
+        // lease auditing and planning can take minutes on a busy repository.
+        let progress = crate::submit_progress::SubmitProgress::start(
+            &self.main_root_path(),
+            session_id,
+            crate::gates::heartbeat_interval(),
+        );
         // Planning uses the same policy-aware base as submit: fetched upstream
         // in verify-only mode, integration otherwise. This prevents upstream-only
         // commits from being counted as session work when integration is stale (#352).
@@ -823,6 +823,10 @@ impl Broker {
         // queued submission away from the session snapshot.
         require_session_checkout_identity(&session, &checkout, Some(&head))?;
 
+        // Only an otherwise-valid submission may create and bind the fresh
+        // root. This leaves root state untouched for identity, policy,
+        // ownership, and planning refusals.
+        self.prepare_worktree_root_for_submission()?;
         let entry = self.store().submit(session_id, &head, &base)?;
         // A new head supersedes this session's older in-flight entries:
         // without this, a stale conflicted entry would be re-simulated

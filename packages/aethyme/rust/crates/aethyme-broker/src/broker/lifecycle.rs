@@ -4032,6 +4032,37 @@ impl Broker {
         Ok(())
     }
 
+    /// Submission may create a root only after its non-root checks have
+    /// passed. A fresh-unbound database can continue through preflight;
+    /// legacy and incomplete bindings keep the existing refusal, and a bound
+    /// root is validated immediately.
+    pub(crate) fn check_submission_root_before_planning(&self) -> Result<(), BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        if self.store.repository_worktree_binding()?.state
+            == RepositoryWorktreeBindingState::FreshUnbound
+        {
+            return Ok(());
+        }
+        self.require_bound_repository_worktree_root("session submission")?;
+        Ok(())
+    }
+
+    /// Submission is an explicit root-creating operation. Keep open, status,
+    /// and adoption observational for an unbound repository; prepare a fresh
+    /// root only after session, checkout, policy, and plan validation.
+    pub(crate) fn prepare_worktree_root_for_submission(&mut self) -> Result<(), BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        if self.store.repository_worktree_binding()?.state
+            == RepositoryWorktreeBindingState::FreshUnbound
+        {
+            self.prepare_broker_worktree_root()?;
+        }
+        self.require_bound_repository_worktree_root("session submission")?;
+        Ok(())
+    }
+
     pub(super) fn prepare_broker_worktree_root(
         &mut self,
     ) -> Result<WorktreePlacement, BrokerOpError> {
