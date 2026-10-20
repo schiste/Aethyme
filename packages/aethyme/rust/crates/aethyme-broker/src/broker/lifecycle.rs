@@ -2522,7 +2522,19 @@ impl Broker {
         if options.sync_integration && options.mode != AdoptMode::Reuse {
             return Err(BrokerOpError::ReuseSyncRequiresReuse);
         }
+        // All ownership changes in this repository share one cross-process
+        // claim. Rediscover after acquiring it because cleanup may have
+        // removed or replaced this checkout while this caller was waiting.
+        let observed_checkout = GitRepo::discover(worktree)?;
+        let observed_root = observed_checkout.root().to_path_buf();
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
         let checkout = GitRepo::discover(worktree)?;
+        if checkout.root() != observed_root.as_path() {
+            return Err(GitError::UntrustedOutput {
+                detail: "worktree path changed while waiting for its lifecycle claim".into(),
+            }
+            .into());
+        }
         let branch = checkout.current_branch()?;
         let worktree_path = checkout.root().to_string_lossy().into_owned();
         let existing = self.store.session_for_worktree(&worktree_path)?;
@@ -3006,9 +3018,8 @@ impl Broker {
     ) -> Result<StartReport, BrokerOpError> {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
-        self.ensure_planned_paths_available(&planned_paths, None)?;
-        let (_slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task, explicit_base)?;
+        let (_slug, branch, start_base, worktree, worktree_placement, _lifecycle_claim) =
+            self.create_session_worktree(task, explicit_base, &planned_paths)?;
         let base = start_base.commit.clone();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
@@ -3099,8 +3110,8 @@ impl Broker {
                 source,
             })?;
         let context = self.session_context(context);
-        let (slug, branch, start_base, worktree, worktree_placement) =
-            self.create_session_worktree(task, explicit_base)?;
+        let (slug, branch, start_base, worktree, worktree_placement, _lifecycle_claim) =
+            self.create_session_worktree(task, explicit_base, &[])?;
         let base = start_base.commit.clone();
         let worktree_path = worktree.root().to_path_buf();
         let repository_contract = match self.capture_repository_contract(&worktree_path, false) {
@@ -3296,12 +3307,19 @@ impl Broker {
         &mut self,
         task: &str,
         explicit_base: Option<&str>,
-    ) -> Result<(String, String, SessionStartBase, GitRepo, WorktreePlacement), BrokerOpError> {
+        planned_paths: &[String],
+    ) -> Result<
+        (
+            String,
+            String,
+            SessionStartBase,
+            GitRepo,
+            WorktreePlacement,
+            crate::file_lock::ExclusiveFileLock,
+        ),
+        BrokerOpError,
+    > {
         let placement = self.prepare_broker_worktree_root()?;
-        let slug = self.next_worktree_slug(task, &placement.root);
-        let worktree_path = placement.root.join(&slug);
-        self.refuse_nested_worktree_path(&worktree_path)?;
-        let branch = format!("agent/{slug}");
         let refresh = self.refresh_default_branch_before_start();
         // Verify-only sessions start from the fetched default branch either
         // way; advancing a disposable integration here keeps it from feeding
@@ -3309,8 +3327,17 @@ impl Broker {
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Start);
         let mut start_base = self.select_session_start_base(explicit_base)?;
         refresh.record(&mut start_base);
-        // Refresh may wait on another process or a remote. Sample the actual
-        // destination again immediately before allocating a Git checkout.
+        // Refresh may wait on another process or a remote. Acquire the
+        // repository lifecycle claim only after that work, then choose the
+        // unique branch and recheck the destination immediately before the
+        // checkout is allocated. The returned guard stays held until the
+        // caller registers the session or rolls the checkout back.
+        let lifecycle_claim = self.claim_worktree_lifecycle()?;
+        self.ensure_planned_paths_available(planned_paths, None)?;
+        let slug = self.next_worktree_slug(task, &placement.root);
+        let worktree_path = placement.root.join(&slug);
+        self.refuse_nested_worktree_path(&worktree_path)?;
+        let branch = format!("agent/{slug}");
         self.preflight_session_checkout_storage(&placement)?;
         let worktree = match self
             .repo
@@ -3338,7 +3365,14 @@ impl Broker {
                 self.repo.worktree_lock(&worktree_path),
             );
         }
-        Ok((slug, branch, start_base, worktree, placement))
+        Ok((
+            slug,
+            branch,
+            start_base,
+            worktree,
+            placement,
+            lifecycle_claim,
+        ))
     }
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {

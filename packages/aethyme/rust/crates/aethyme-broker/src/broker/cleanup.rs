@@ -86,6 +86,55 @@ fn worktree_size_estimate(
 }
 
 impl Broker {
+    /// Claim repository-wide checkout lifecycle mutations.
+    ///
+    /// `Broker::open` resolves both fields from the repository's primary
+    /// checkout, even when the command started inside a linked worktree. Check
+    /// that invariant again before deriving the lock location so the claim is
+    /// always stored in the same repository state directory, outside linked
+    /// checkouts that a lifecycle operation may remove.
+    pub(crate) fn claim_worktree_lifecycle(
+        &self,
+    ) -> Result<crate::file_lock::ExclusiveFileLock, BrokerOpError> {
+        let main_root = self
+            .main_root
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: self.main_root.clone(),
+                source,
+            })?;
+        let broker_root = self
+            .repo
+            .root()
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: self.repo.root().to_path_buf(),
+                source,
+            })?;
+        let common_dir = self
+            .main_git_common_dir()?
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: self.main_root.join(".git"),
+                source,
+            })?;
+        if broker_root != main_root || common_dir.parent() != Some(main_root.as_path()) {
+            return Err(GitError::UntrustedOutput {
+                detail:
+                    "worktree lifecycle claim could not confirm the primary repository identity"
+                        .into(),
+            }
+            .into());
+        }
+        crate::file_lock::acquire_repository_lifecycle_lock(&main_root).map_err(|source| {
+            BrokerError::Io {
+                path: main_root.join(".aethyme/run"),
+                source,
+            }
+            .into()
+        })
+    }
+
     /// Whether a directory is the remains of a worktree of *this* repository
     /// whose registration is already gone.
     ///
@@ -1615,8 +1664,10 @@ impl Broker {
 
         // `--force` is confined to this validated interrupted finish. The
         // exact registered checkout, represented head, and unstaged-deletion
-        // only status were rechecked immediately above.
-        self.repo.worktree_remove(&worktree_path, true)?;
+        // only status were rechecked immediately above. Preserve Git's
+        // refusal if its registration or the directory changed after the
+        // proof; the generic orphan fallback is not authorized here.
+        self.repo.worktree_remove_registered(&worktree_path, true)?;
         match std::fs::symlink_metadata(&worktree_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
@@ -1674,10 +1725,28 @@ impl Broker {
     }
 
     pub fn cleanup(&mut self, session_id: i64, force: bool) -> Result<(), BrokerOpError> {
+        let initial_session = self.store.session(session_id)?;
+        // Adoption and checkout creation take the same repository-wide claim
+        // before changing ownership. Hold it from the final proof/live-session
+        // checks through Git removal and the terminal database update.
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
         let session = self.store.session(session_id)?;
+        ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
+        self.cleanup_under_lifecycle_claim(&session, force)
+    }
+
+    /// Perform cleanup while the caller holds the repository lifecycle claim.
+    /// Finish uses this after recording its durable cleanup intent under the
+    /// same claim; reacquiring here would deadlock on the persistent lock.
+    pub(super) fn cleanup_under_lifecycle_claim(
+        &mut self,
+        session: &Session,
+        force: bool,
+    ) -> Result<(), BrokerOpError> {
+        let session_id = session.id;
         let worktree_path = PathBuf::from(&session.worktree_path);
-        if !force && let Some(proof) = self.interrupted_finish_cleanup_proof(&session) {
-            return self.resume_interrupted_finish_cleanup(&session, &proof);
+        if !force && let Some(proof) = self.interrupted_finish_cleanup_proof(session) {
+            return self.resume_interrupted_finish_cleanup(session, &proof);
         }
         if session.origin == SessionOrigin::Adopted {
             if worktree_path.exists() {
@@ -1702,7 +1771,7 @@ impl Broker {
         // not the byte count, and a walk here only widens the window between
         // the live-checkout check below and the removal.
         let mut records = crate::measurement::SizeRecords::default();
-        let item = self.cleanup_item_scanned(&session, crate::SizeScan::Recorded, &mut records)?;
+        let item = self.cleanup_item_scanned(session, crate::SizeScan::Recorded, &mut records)?;
         if !force
             && let Some(item) = item.as_ref()
             && !item.eligible()
@@ -1768,6 +1837,36 @@ impl Broker {
         }
         Ok(())
     }
+}
+
+pub(super) fn ensure_lifecycle_session_unchanged(
+    session_id: i64,
+    before: &Session,
+    after: &Session,
+) -> Result<(), BrokerOpError> {
+    if before.worktree_path != after.worktree_path
+        || before.branch != after.branch
+        || before.origin != after.origin
+        || before.status != after.status
+        || before.cleanup_state != after.cleanup_state
+        || before.closed_at != after.closed_at
+        || before.task != after.task
+        || before.diff_base != after.diff_base
+        || before.adoption_base != after.adoption_base
+        || before.adopted_head != after.adopted_head
+        || before.pid != after.pid
+        || before.command != after.command
+        || before.log_path != after.log_path
+        || before.agent_identity != after.agent_identity
+        || before.updated_at != after.updated_at
+        || before.last_activity_at != after.last_activity_at
+    {
+        return Err(BrokerOpError::DirtyWorktree {
+            id: session_id,
+            reason: "the session owner, activity, or cleanup state changed while waiting for the worktree lifecycle claim".into(),
+        });
+    }
+    Ok(())
 }
 
 fn size_warm_candidates(plan: &CleanupPlan) -> Vec<String> {

@@ -994,6 +994,16 @@ impl Broker {
                     reason,
                 });
             };
+            let _lifecycle_claim = match self.claim_worktree_lifecycle() {
+                Ok(claim) => claim,
+                Err(error) => {
+                    keep_it(
+                        &mut report,
+                        format!("could not claim the worktree lifecycle: {error}"),
+                    );
+                    continue;
+                }
+            };
             let Some(open_paths) = open_paths.as_ref() else {
                 keep_it(
                     &mut report,

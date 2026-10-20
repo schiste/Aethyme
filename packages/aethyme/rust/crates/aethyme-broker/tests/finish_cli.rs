@@ -754,6 +754,8 @@ fn finish_cleanup_proof_does_not_authorize_a_replacement_checkout_at_the_same_pa
         tmp.path(),
         &["worktree", "add", "--", worktree.to_str().unwrap(), &branch],
     );
+    let replacement_sentinel = worktree.join("replacement-owned.txt");
+    std::fs::write(&replacement_sentinel, "preserve replacement checkout\n").unwrap();
     std::fs::remove_file(worktree.join("README.md")).unwrap();
 
     let output = run(
@@ -762,7 +764,15 @@ fn finish_cleanup_proof_does_not_authorize_a_replacement_checkout_at_the_same_pa
     );
     assert!(!output.status.success());
     assert!(worktree.exists());
+    assert_eq!(
+        std::fs::read_to_string(&replacement_sentinel).unwrap(),
+        "preserve replacement checkout\n"
+    );
     assert!(!worktree.join("README.md").exists());
+    assert!(
+        git(tmp.path(), &["worktree", "list", "--porcelain"]).contains(worktree.to_str().unwrap()),
+        "Git must still list the replacement checkout after recovery refuses it"
+    );
     assert!(
         Command::new("git")
             .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
