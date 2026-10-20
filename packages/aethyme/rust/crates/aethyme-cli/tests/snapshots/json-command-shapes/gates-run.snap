@@ -8,6 +8,10 @@
       ],
       "retention": "string"
     },
+    "cache_provenance": {
+      "execution_profile_digest": "string",
+      "profile_scope": "string"
+    },
     "cached": "bool",
     "cpu_count": "integer",
     "definition_hash": "string",
