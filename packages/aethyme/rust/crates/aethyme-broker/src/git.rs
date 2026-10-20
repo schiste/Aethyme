@@ -1948,15 +1948,14 @@ impl GitRepo {
     /// cleanup recovery.
     pub(crate) fn finish_cleanup_recovery_proof(
         &self,
-        branch_ref: &str,
+        _branch_ref: &str,
     ) -> Option<crate::events::FinishCleanupRecoveryProof> {
         #[cfg(unix)]
         {
-            self.finish_cleanup_recovery_proof_unix(branch_ref)
+            self.finish_cleanup_recovery_proof_unix(_branch_ref)
         }
         #[cfg(not(unix))]
         {
-            let _ = branch_ref;
             None
         }
     }
@@ -1995,7 +1994,7 @@ impl GitRepo {
         pointer_options.read(true);
         use std::os::unix::fs::OpenOptionsExt;
         pointer_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        let mut pointer = pointer_options.open(&pointer_path).ok()?;
+        let pointer = pointer_options.open(&pointer_path).ok()?;
         let pointer_metadata = pointer.metadata().ok()?;
         if !pointer_metadata.is_file() {
             return None;
