@@ -59,7 +59,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   TempDir); pass it explicitly to CLI children too. An inherited
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
   leave stale Git pointers after teardown. Assert paths and cleanup; avoid
-  process-wide environment mutation in parallel tests.
+  process-wide environment mutation in parallel tests. For tests scoped to
+  artifact caches or reclaim, set `[cleanup] auto_remove = false` explicitly and
+  keep it enabled in whole-checkout cleanup tests. A real offline `origin` can
+  make a clean branch legitimately eligible for whole-checkout cleanup; do not
+  rely on a missing remote ref to preserve the fixture. Reproduce the exact CLI
+  sequence and assert the checkout's provenance/policy preconditions before
+  changing tracked fixtures.
   Supply fixture-owned host state, cache, and coordination database when opening
   the broker, before startup maintenance. Post-open setters cannot isolate work
   the constructor has already performed.
@@ -209,11 +215,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
   target is a setup failure; stop before Cargo instead of treating it as a
   product failure or zero-test result.
-- Bound compilation and test execution separately: Cargo `-j1` limits build
-  jobs, not test workers. Select nextest’s `local` profile and an explicit
-  `--test-threads 2` cap (or `NEXTEST_TEST_THREADS=2`); for the Cargo test
-  harness use `-- --test-threads=2`. Verify the profile selected by the actual
-  gate command; a configured local profile has no effect when it is not selected.
+- Bound compilation and test execution separately. With `cargo nextest run`,
+  use `--build-jobs 1` for Cargo and `--test-threads 1` or `2` for nextest;
+  nextest's `-j` aliases test parallelism, so never use it as the Cargo worker
+  cap or combine `-j1` with `--test-threads`. Select nextest’s `local` profile.
+  For the Cargo test harness use `-- --test-threads=2`. Verify the profile and
+  actual argv used by the gate; a configured local profile has no effect when it
+  is not selected.
 - Run the fastest relevant test command first.
   Check the complete selected test names and a nonzero executed count before
   treating a focused run as evidence. Rust filters match substrings, including
