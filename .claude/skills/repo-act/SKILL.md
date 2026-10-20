@@ -155,10 +155,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   target. Expand to verbose or workspace-wide runs only when explicitly needed
   or after a focused failure.
 - Before a long or frozen Rust inventory, verify each selected
-  `--package`/`--test` pair against declared Cargo targets in the package's
-  `Cargo.toml`, including explicit `[[test]]` entries, and bind the exact
-  lib/bin/test binary identity. A missing target is a setup failure; stop
-  before Cargo instead of treating it as a product failure or zero-test result.
+  `--package`/`--test` pair against the owning package's effective Cargo
+  targets: the `tests/` defaults and any `[[test]]` or `autotests` settings
+  in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
+  target is a setup failure; stop before Cargo instead of treating it as a
+  product failure or zero-test result.
 - Run the fastest relevant test command first.
   Check the complete selected test names and a nonzero executed count before
   treating a focused run as evidence. Rust filters match substrings, including
