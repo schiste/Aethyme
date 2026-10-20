@@ -527,6 +527,7 @@ fn stopped_historical_observation_never_delivers_or_restarts_a_target() {
 
 fn accepted_wave_fixture() -> (
     verifier::tests::Subject,
+    tempfile::TempDir,
     Broker,
     GitCarrier,
     RecordId,
@@ -574,10 +575,34 @@ fn accepted_wave_fixture() -> (
             remote.path().to_str().unwrap(),
         ],
     );
-    let mut broker = Broker::open(v.f._repo.path())
-        .unwrap()
-        .with_host_operation_database(v.f._host.path().join("host-operations.db"))
-        .with_worktree_root(v.f._host.path().join("worktrees"));
+    let fixture_owner = v.f._host.path().canonicalize().unwrap();
+    let host_cache = fixture_owner.join("broker-host-cache");
+    let preparation_cache = fixture_owner.join("preparation-cache");
+    let worktree_root = fixture_owner.join("worktrees");
+    let host_operation_db = fixture_owner.join("host-operations.db");
+    let collaboration_root =
+        crate::collaboration_state::CollaborationRoot::under_host_state(&fixture_owner)
+            .path()
+            .to_path_buf();
+    for path in [
+        &host_cache,
+        &preparation_cache,
+        &worktree_root,
+        &collaboration_root,
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let mut broker = Broker::open_with_options(
+        v.f._repo.path(),
+        crate::BrokerOpenOptions::default()
+            .with_host_state_dir(&fixture_owner)
+            .with_host_cache_dir(&host_cache)
+            .with_preparation_cache_root(&preparation_cache)
+            .with_host_operation_database(host_operation_db)
+            .with_worktree_root(worktree_root)
+            .with_collaboration_state(collaboration_root),
+    )
+    .unwrap();
     let session = broker
         .adopt(v.f._repo.path(), Some("trusted acceptance fixture"))
         .unwrap();
@@ -647,7 +672,9 @@ fn accepted_wave_fixture() -> (
     let revision_id = v.execution.target_revision().clone();
     target::retain_artifacts(&mut v.f.store, &v.owner, &revision_id, &[], &output_objects).unwrap();
     let evidence = v.evidence();
-    (v, broker, carrier, w.id, intent, binding, receipt, evidence)
+    (
+        v, remote, broker, carrier, w.id, intent, binding, receipt, evidence,
+    )
 }
 
 fn settle_test_synthesis(
@@ -1412,7 +1439,7 @@ fn accepted_seeded_synthesis_is_reused_by_the_next_wave() {
 
 #[test]
 fn private_current_qualification_requires_verifier_and_refuses_revocation() {
-    let (mut v, mut broker, carrier, _wave, intent, binding, receipt, evidence) =
+    let (mut v, _remote, mut broker, carrier, _wave, intent, binding, receipt, evidence) =
         accepted_wave_fixture();
     let grant = qualify_receipt(
         &mut v.f.store,
@@ -1456,7 +1483,10 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
         Some(expected_artifact_object.as_str())
     );
 
-    let current = current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant).unwrap();
+    let current = current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant)
+        .unwrap_or_else(|error| {
+            panic!("freshly qualified accepted ref should be current: {error:?}")
+        });
     current.check_clock().unwrap();
     drop(current);
     let newest_receipt = last_receipt(&v.f.store, binding.id()).unwrap().unwrap();
@@ -1472,10 +1502,11 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
             &format!("{wrong}:refs/heads/accepted"),
         ],
     );
-    assert!(matches!(
-        current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant),
-        Err(AcceptanceError::NotAccepted)
-    ));
+    match current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant) {
+        Err(AcceptanceError::NotAccepted) => {}
+        Err(error) => panic!("revoked accepted ref returned the wrong refusal: {error:?}"),
+        Ok(_) => panic!("revoked accepted ref unexpectedly remained current"),
+    }
     drop(grant);
     // Restore the exact accepted provider representation and obtain its fresh
     // receipt, so stale source history cannot mask the producer revocation gate.
@@ -1538,7 +1569,7 @@ fn age_archive_objects(store: &CollaborationStore) {
 
 #[test]
 fn historical_completion_roots_survive_revision_release_and_gc() {
-    let (mut v, mut broker, carrier, wave_id, _intent, binding, receipt, evidence) =
+    let (mut v, _remote, mut broker, carrier, wave_id, _intent, binding, receipt, evidence) =
         accepted_wave_fixture();
     let grant = qualify_receipt(
         &mut v.f.store,

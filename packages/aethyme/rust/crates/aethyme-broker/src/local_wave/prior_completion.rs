@@ -231,6 +231,24 @@ pub(super) fn latest_for_admission(
 
 const MAX_HISTORICAL_COMPLETION_DEPTH: usize = 32;
 
+struct HistoricalWaveRow {
+    body: Vec<u8>,
+    phase: String,
+    detail: Option<String>,
+    sequence: i64,
+    target: String,
+    revision: String,
+    candidate_snapshot: Option<String>,
+    candidate_commit: Option<String>,
+    recipe_object: Option<String>,
+    composition_source_record_id: Option<String>,
+    composition_source_object: Option<String>,
+    resolution_request_record_id: Option<String>,
+    resolution_request_object: Option<String>,
+    resolution_result_record_id: Option<String>,
+    resolution_result_object: Option<String>,
+}
+
 /// Validate the immutable composition source for an accepted completion.
 /// This is provenance only: it never authorizes a current controller action.
 fn verify_historical_source(
@@ -271,23 +289,7 @@ fn verify_historical_source_inner(
         ));
     }
     let result = (|| {
-        let row: (
-            Vec<u8>,
-            String,
-            Option<String>,
-            i64,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = store.read_connection().query_row(
+        let row = store.read_connection().query_row(
             "SELECT body,phase,detail,sequence,target,revision,candidate_snapshot,
                     candidate_commit,recipe_object,composition_source_record_id,
                     composition_source_object,resolution_request_record_id,
@@ -296,48 +298,57 @@ fn verify_historical_source_inner(
              FROM local_waves WHERE wave=?1",
             [&completion.wave],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                    row.get(12)?,
-                    row.get(13)?,
-                    row.get(14)?,
-                ))
+                Ok(HistoricalWaveRow {
+                    body: row.get(0)?,
+                    phase: row.get(1)?,
+                    detail: row.get(2)?,
+                    sequence: row.get(3)?,
+                    target: row.get(4)?,
+                    revision: row.get(5)?,
+                    candidate_snapshot: row.get(6)?,
+                    candidate_commit: row.get(7)?,
+                    recipe_object: row.get(8)?,
+                    composition_source_record_id: row.get(9)?,
+                    composition_source_object: row.get(10)?,
+                    resolution_request_record_id: row.get(11)?,
+                    resolution_request_object: row.get(12)?,
+                    resolution_result_record_id: row.get(13)?,
+                    resolution_result_object: row.get(14)?,
+                })
             },
         )?;
-        let record = Record::decode(&row.0, &[&super::SCHEMA])
+        let record = Record::decode(&row.body, &[&super::SCHEMA])
             .map_err(|error| WaveError::Invalid(format!("historical wave record: {error}")))?;
-        let body: Value = serde_json::from_slice(&row.0)?;
+        let body: Value = serde_json::from_slice(&row.body)?;
         let stored_spec: WaveSpec = serde_json::from_value(body["spec"].clone())?;
         if record.id().as_str() != completion.wave
-            || record.canonical_bytes() != row.0
-            || row.1 != "accepted"
-            || row.2.as_deref() != Some(key.as_str())
-            || row.3 != wave_spec.sequence
-            || row.4 != completion.target
-            || row.5 != completion.revision
+            || record.canonical_bytes() != row.body
+            || row.phase != "accepted"
+            || row.detail.as_deref() != Some(key.as_str())
+            || row.sequence != wave_spec.sequence
+            || row.target != completion.target
+            || row.revision != completion.revision
             || stored_spec != *wave_spec
-            || row.6.as_deref() != Some(completion.source.as_str())
-            || row.7.as_deref() != Some(completion.candidate_commit.as_str())
+            || row.candidate_snapshot.as_deref() != Some(completion.source.as_str())
+            || row.candidate_commit.as_deref() != Some(completion.candidate_commit.as_str())
         {
             return Err(WaveError::Invalid(
                 "historical accepted wave source projection".into(),
             ));
         }
-        let source_ref = super::record_ref(row.9.as_deref(), row.10.as_deref())?
-            .ok_or_else(|| WaveError::Invalid("accepted wave has no composition source".into()))?;
-        let request_ref = super::record_ref(row.11.as_deref(), row.12.as_deref())?;
-        let result_ref = super::record_ref(row.13.as_deref(), row.14.as_deref())?;
+        let source_ref = super::record_ref(
+            row.composition_source_record_id.as_deref(),
+            row.composition_source_object.as_deref(),
+        )?
+        .ok_or_else(|| WaveError::Invalid("accepted wave has no composition source".into()))?;
+        let request_ref = super::record_ref(
+            row.resolution_request_record_id.as_deref(),
+            row.resolution_request_object.as_deref(),
+        )?;
+        let result_ref = super::record_ref(
+            row.resolution_result_record_id.as_deref(),
+            row.resolution_result_object.as_deref(),
+        )?;
         let historical_synthesis = match (request_ref.as_ref(), result_ref.as_ref()) {
             (None, None) => None,
             (Some(request), Some(result)) => {
@@ -381,7 +392,7 @@ fn verify_historical_source_inner(
         };
 
         let recipe_object = row
-            .8
+            .recipe_object
             .as_deref()
             .map(super::object)
             .transpose()?

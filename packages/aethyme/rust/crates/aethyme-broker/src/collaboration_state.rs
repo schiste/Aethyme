@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 29;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 30;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -77,6 +77,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 29;
 // Schema 29 adds immutable Local resolution reservation proofs and their
 // one-to-one shared-attempt bindings. Older writers cannot preserve managed
 // resolution authority or its idempotency roots.
+// Schema 30 adjusts only the v27 attempt-charge trigger to admit the managed
+// resolver's existing NULL session label. It adds no columns or new encoding;
+// schema 29 remains the oldest compatible reader.
 const MIN_COMPATIBLE_SCHEMA: i64 = 29;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
@@ -1104,6 +1107,27 @@ const MIGRATIONS: &[(i64, &str)] = &[
          BEFORE DELETE ON local_managed_resolution_attempt_bindings
          BEGIN
              SELECT RAISE(ABORT, 'managed resolution attempt binding is permanent');
+         END;"#,
+    ),
+    (
+        30,
+        r#"DROP TRIGGER resolution_attempts_require_v27_charge;
+         CREATE TRIGGER resolution_attempts_require_v27_charge
+         BEFORE INSERT ON resolution_attempts
+         WHEN (NEW.attempt_number IS NULL OR NEW.attempt_number < 1
+               OR NEW.async_state = 'settled'
+               OR (NEW.async_token IS NOT NULL AND
+                   (NEW.async_state != 'exported'
+                    OR NEW.client_key IS NULL
+                    OR (NEW.resolver IS 'local-managed-resolution'
+                        AND NEW.session_label IS NOT NULL)
+                    OR (NEW.resolver IS NOT 'local-managed-resolution'
+                        AND NEW.session_label IS NULL)
+                    OR NEW.request_sha256 IS NULL OR NEW.input_sha256 IS NULL
+                    OR NEW.input_manifest_sha256 IS NULL OR NEW.dispatch_limits IS NULL)))
+          AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'), 0) >= 27
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution attempt requires a v27 pre-dispatch charge');
          END;"#,
     ),
 ];
@@ -2849,6 +2873,252 @@ mod tests {
         // Earlier writers cannot preserve immutable revision heads, durable
         // asynchronous attempts or the archive roots those attempts name.
         const { assert!(MIN_COMPATIBLE_SCHEMA >= 29) };
+    }
+
+    #[test]
+    fn schema_30_preserves_charges_and_only_allows_unlabeled_managed_attempts() {
+        struct AttemptInput<'a> {
+            decision_key: &'a str,
+            resolver: &'a str,
+            session_label: Option<&'a str>,
+            async_token: Option<&'a str>,
+            attempt_number: i64,
+            async_state: &'a str,
+            dispatch_limits: Option<&'a str>,
+        }
+
+        fn insert_attempt(
+            connection: &rusqlite::Connection,
+            input: AttemptInput<'_>,
+        ) -> rusqlite::Result<usize> {
+            connection.execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,charged_ms,
+                      async_token,client_key,session_label,attempt_number,request_sha256,
+                      input_sha256,input_manifest_sha256,dispatch_limits,async_state)
+                 VALUES (?1,'failed_checks','lineage-a','',?2,?3,456,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                rusqlite::params![
+                    input.decision_key,
+                    format!("request:{}", input.decision_key),
+                    input.resolver,
+                    input.async_token,
+                    format!("client:{}", input.decision_key),
+                    input.session_label,
+                    input.attempt_number,
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    "c".repeat(64),
+                    input.dispatch_limits,
+                    input.async_state,
+                ],
+            )
+        }
+
+        fn attempt_row(
+            connection: &rusqlite::Connection,
+            decision_key: &str,
+        ) -> Vec<rusqlite::types::Value> {
+            connection
+                .query_row(
+                    "SELECT * FROM resolution_attempts WHERE decision_key=?1",
+                    [decision_key],
+                    |row| {
+                        let mut values = Vec::with_capacity(row.as_ref().column_count());
+                        for column in 0..row.as_ref().column_count() {
+                            values.push(row.get::<_, rusqlite::types::Value>(column)?);
+                        }
+                        Ok(values)
+                    },
+                )
+                .unwrap()
+        }
+
+        fn assert_charge_refused(result: rusqlite::Result<usize>, case: &str) {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("resolution attempt requires a v27 pre-dispatch charge"),
+                "{case} must be rejected by the retained pre-dispatch guard: {error:?}"
+            );
+        }
+
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        insert_attempt(
+            store.connection(),
+            AttemptInput {
+                decision_key: "schema30-existing-charge",
+                resolver: "manual",
+                session_label: Some("operator session"),
+                async_token: Some("schema30-existing-token"),
+                attempt_number: 7,
+                async_state: "exported",
+                dispatch_limits: Some("{}"),
+            },
+        )
+        .unwrap();
+        let before = attempt_row(store.read_connection(), "schema30-existing-charge");
+
+        // Recreate the exact v27 trigger and schema-29 marker. Migration 30
+        // must replace that durable rule without rewriting prior charges.
+        store
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER resolution_attempts_require_v27_charge;
+                 UPDATE meta SET value='29' WHERE key='schema_version';
+                 UPDATE meta SET value='29' WHERE key='min_compatible_schema';
+                 CREATE TRIGGER resolution_attempts_require_v27_charge
+                 BEFORE INSERT ON resolution_attempts
+                 WHEN (NEW.attempt_number IS NULL OR NEW.attempt_number < 1
+                       OR NEW.async_state = 'settled'
+                       OR (NEW.async_token IS NOT NULL AND
+                           (NEW.async_state != 'exported'
+                            OR NEW.client_key IS NULL OR NEW.session_label IS NULL
+                            OR NEW.request_sha256 IS NULL OR NEW.input_sha256 IS NULL
+                            OR NEW.input_manifest_sha256 IS NULL OR NEW.dispatch_limits IS NULL)))
+                  AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'), 0) >= 27
+                 BEGIN
+                     SELECT RAISE(ABORT, 'resolution attempt requires a v27 pre-dispatch charge');
+                 END;",
+            )
+            .unwrap();
+        assert_charge_refused(
+            insert_attempt(
+                store.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-before-migration",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-before-migration-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "schema-29 managed attempt before the migration",
+        );
+        drop(store);
+
+        let migrated = open(host.path(), &[]).unwrap();
+        assert_eq!(migrated.schema_version(), 30);
+        let floor: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, 29);
+        assert_eq!(
+            attempt_row(migrated.read_connection(), "schema30-existing-charge"),
+            before,
+            "schema 30 must preserve an already charged row exactly"
+        );
+
+        insert_attempt(
+            migrated.connection(),
+            AttemptInput {
+                decision_key: "schema30-managed-valid",
+                resolver: "local-managed-resolution",
+                session_label: None,
+                async_token: Some("schema30-managed-valid-token"),
+                attempt_number: 1,
+                async_state: "exported",
+                dispatch_limits: Some("{}"),
+            },
+        )
+        .expect("managed attempt keeps its intentionally null human session label");
+        insert_attempt(
+            migrated.connection(),
+            AttemptInput {
+                decision_key: "schema30-manual-valid",
+                resolver: "manual",
+                session_label: Some("operator session"),
+                async_token: Some("schema30-manual-valid-token"),
+                attempt_number: 1,
+                async_state: "exported",
+                dispatch_limits: Some("{}"),
+            },
+        )
+        .expect("ordinary charged attempts still require and accept a session label");
+
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-manual-missing-label",
+                    resolver: "manual",
+                    session_label: None,
+                    async_token: Some("schema30-manual-missing-label-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "manual attempt with a null session label",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-with-label",
+                    resolver: "local-managed-resolution",
+                    session_label: Some("not a managed session"),
+                    async_token: Some("schema30-managed-with-label-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "managed attempt with a non-null session label",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-invalid-number",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-invalid-number-token"),
+                    attempt_number: 0,
+                    async_state: "exported",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "managed attempt with an invalid attempt number",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-settled",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-settled-token"),
+                    attempt_number: 1,
+                    async_state: "settled",
+                    dispatch_limits: Some("{}"),
+                },
+            ),
+            "managed attempt that bypasses dispatch",
+        );
+        assert_charge_refused(
+            insert_attempt(
+                migrated.connection(),
+                AttemptInput {
+                    decision_key: "schema30-managed-missing-limits",
+                    resolver: "local-managed-resolution",
+                    session_label: None,
+                    async_token: Some("schema30-managed-missing-limits-token"),
+                    attempt_number: 1,
+                    async_state: "exported",
+                    dispatch_limits: None,
+                },
+            ),
+            "managed attempt missing frozen dispatch limits",
+        );
     }
 
     #[test]

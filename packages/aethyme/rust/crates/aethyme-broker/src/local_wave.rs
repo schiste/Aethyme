@@ -2222,16 +2222,27 @@ struct ConflictRequestRetention {
     objects: Vec<ObjectDigest>,
 }
 
+struct ConflictRequestRetentionInput<'a> {
+    revision: &'a RecordId,
+    request: &'a resolution::ResolutionRequest,
+    composition_request: &'a CompositionRequest,
+    plan: &'a resolution::RecordRef,
+    source: &'a resolution::RecordRef,
+}
+
 fn prepare_conflict_request_retention(
     store: &CollaborationStore,
     owner: &ControllerOwner,
-    revision: &RecordId,
-    request: &resolution::ResolutionRequest,
-    composition_request: &CompositionRequest,
-    plan: &resolution::RecordRef,
-    source: &resolution::RecordRef,
+    input: ConflictRequestRetentionInput<'_>,
     guards: RetentionGuards<'_>,
 ) -> Result<ConflictRequestRetention, WaveError> {
+    let ConflictRequestRetentionInput {
+        revision,
+        request,
+        composition_request,
+        plan,
+        source,
+    } = input;
     let pinned = target::load_revision_under_response(store, revision, guards.response)?;
     if pinned.target != owner.target() || pinned.issuer != owner.issuer() {
         return Err(WaveError::Stale);
@@ -3213,15 +3224,14 @@ fn validate_conflict_request_binding_records(
             "conflict source request reference mismatch".into(),
         ));
     }
-    if let Some(wave) = expected_wave {
-        if source_payload.wave != wave.id.as_str()
+    if let Some(wave) = expected_wave
+        && (source_payload.wave != wave.id.as_str()
             || source_payload.revision != wave.spec.revision
             || wave.resolution_request.as_ref() != Some(request_ref)
             || wave.composition_source.as_ref() != Some(source_ref)
-            || wave.spec.selected.is_empty()
-        {
-            return Err(WaveError::Stale);
-        }
+            || wave.spec.selected.is_empty())
+    {
+        return Err(WaveError::Stale);
     }
 
     let plan_bytes =
@@ -3263,14 +3273,13 @@ fn validate_conflict_request_binding_records(
             "conflict plan identifier binding".into(),
         ));
     }
-    if let Some(wave) = expected_wave {
-        if plan_payload.wave != wave.id.as_str()
+    if let Some(wave) = expected_wave
+        && (plan_payload.wave != wave.id.as_str()
             || plan_payload.revision != wave.spec.revision
             || plan_payload.selected != wave.spec.selected
-            || plan_payload.policy != wave.spec.policy
-        {
-            return Err(WaveError::Stale);
-        }
+            || plan_payload.policy != wave.spec.policy)
+    {
+        return Err(WaveError::Stale);
     }
 
     let selected: BTreeSet<&str> = plan_payload.selected.iter().map(String::as_str).collect();
@@ -3681,6 +3690,20 @@ pub fn attach_synthesized_attempt_result(
 /// Recompose a settled middle-conflict result with the exact frozen suffix,
 /// then atomically link the complete unverified candidate to its current wave.
 /// This does not charge or settle a resolver attempt and does not run gates.
+struct CurrentBlockedWaveProjection {
+    body: Vec<u8>,
+    phase: String,
+    request_id: Option<String>,
+    request_object: Option<String>,
+    source_id: Option<String>,
+    source_object: Option<String>,
+    result_id: Option<String>,
+    result_object: Option<String>,
+    candidate_snapshot: Option<String>,
+    candidate_commit: Option<String>,
+    recipe_object: Option<String>,
+}
+
 pub fn recompose_synthesized_conflict(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
@@ -3846,31 +3869,7 @@ pub fn recompose_synthesized_conflict(
         params![owner.target(), owner.issuer()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
-    let (
-        body,
-        phase,
-        request_id,
-        request_object,
-        source_id,
-        source_object,
-        result_id,
-        result_object,
-        current_candidate,
-        current_commit,
-        current_recipe,
-    ): (
-        Vec<u8>,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = tx.query_row(
+    let blocked_wave: CurrentBlockedWaveProjection = tx.query_row(
         "SELECT body,phase,resolution_request_record_id,resolution_request_object,
                 composition_source_record_id,composition_source_object,
                 resolution_result_record_id,resolution_result_object,
@@ -3883,40 +3882,40 @@ pub fn recompose_synthesized_conflict(
             observed.spec.sequence
         ],
         |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-                row.get(10)?,
-            ))
+            Ok(CurrentBlockedWaveProjection {
+                body: row.get(0)?,
+                phase: row.get(1)?,
+                request_id: row.get(2)?,
+                request_object: row.get(3)?,
+                source_id: row.get(4)?,
+                source_object: row.get(5)?,
+                result_id: row.get(6)?,
+                result_object: row.get(7)?,
+                candidate_snapshot: row.get(8)?,
+                candidate_commit: row.get(9)?,
+                recipe_object: row.get(10)?,
+            })
         },
     )?;
-    let current_record = Record::decode(&body, &[&SCHEMA])
+    let current_record = Record::decode(&blocked_wave.body, &[&SCHEMA])
         .map_err(|error| WaveError::Invalid(format!("current wave record: {error}")))?;
     if current_record.id() != *wave_id
-        || current_record.canonical_bytes() != body
-        || body != wave_body.canonical_bytes()
+        || current_record.canonical_bytes() != blocked_wave.body
+        || blocked_wave.body != wave_body.canonical_bytes()
         || target_version != expected_version
         || target_phase != "idle"
         || resume_phase.is_some()
         || active_revision.as_deref() != Some(revision.as_str())
-        || phase != "blocked"
-        || request_id.as_deref() != Some(binding.request.id.as_str())
-        || request_object.as_deref() != Some(binding.request.object.hex().as_str())
-        || source_id.as_deref() != Some(binding.source.id.as_str())
-        || source_object.as_deref() != Some(binding.source.object.hex().as_str())
-        || result_id.is_some()
-        || result_object.is_some()
-        || current_candidate.is_some()
-        || current_commit.is_some()
-        || current_recipe.is_some()
+        || blocked_wave.phase != "blocked"
+        || blocked_wave.request_id.as_deref() != Some(binding.request.id.as_str())
+        || blocked_wave.request_object.as_deref() != Some(binding.request.object.hex().as_str())
+        || blocked_wave.source_id.as_deref() != Some(binding.source.id.as_str())
+        || blocked_wave.source_object.as_deref() != Some(binding.source.object.hex().as_str())
+        || blocked_wave.result_id.is_some()
+        || blocked_wave.result_object.is_some()
+        || blocked_wave.candidate_snapshot.is_some()
+        || blocked_wave.candidate_commit.is_some()
+        || blocked_wave.recipe_object.is_some()
         || cancel.load(Ordering::SeqCst)
     {
         return Err(WaveError::Stale);
@@ -4271,14 +4270,17 @@ pub(crate) fn compose_with_source(
                         &source,
                         Some(&prospective),
                     )?;
+                    let revision = id(&wave.spec.revision)?;
                     let retention = prepare_conflict_request_retention(
                         store,
                         owner,
-                        &id(&wave.spec.revision)?,
-                        &request_record,
-                        &request,
-                        &plan,
-                        &source,
+                        ConflictRequestRetentionInput {
+                            revision: &revision,
+                            request: &request_record,
+                            composition_request: &request,
+                            plan: &plan,
+                            source: &source,
+                        },
                         RetentionGuards {
                             archive: &_archive_guard,
                             response: &_response_guard,
