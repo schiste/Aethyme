@@ -33,6 +33,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For read-only GitHub status/check inspection, use `gh --repo` directly without
   opening a broker session. Isolate source research in its task worktree and
   independent reviews in their own read-only snapshot; sessions are for edits.
+- For changed-path tree comparisons, pass each path as a separate argument; use
+  NUL-delimited transport when paths need to cross a file boundary. A newline-
+  joined list passed as one quoted pathspec can silently match no files. Retain
+  the executed argv, exit status, stdout and stderr, and require a positive
+  control that detects a known changed path before treating empty diff output
+  as equality.
 - For routine broker status checks, prefer `aethyme broker status --summary
   --json`; capture full `status --json` only when its additional detail is needed.
   Retain complete stdout and stderr before parsing exact session IDs and
