@@ -151,6 +151,12 @@ blocked.
    external state should suffix it with that value instead of sharing one
    fixed name.
 
+   Tests that run `git` against fixture repositories must clear inherited and
+   explicitly configured `GIT_*` variables from every subprocess, including
+   read-only probes. Preserve `PATH` and other test environment values. A
+   shared command builder keeps selectors from redirecting fixture operations
+   into a caller's repository.
+
    If this repository declares committed graph fragments authoritative in
    `.aethyme/config.toml`, graph freshness is an enforced deployment-integrity
    check, not a semantic gate suggestion. Session gates, full-tree CI,

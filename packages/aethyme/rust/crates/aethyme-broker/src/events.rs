@@ -198,7 +198,19 @@ pub(crate) struct FinishCleanupRecoveryProof {
     pub(crate) branch_tip: String,
 }
 
-pub(crate) fn session_finish_cleanup_started_payload(
+/// Build the stable v1 payload for the start of finish cleanup.
+///
+/// The recovery proof is an additive field produced only by the broker's
+/// internal cleanup path; this public constructor keeps its original
+/// signature for downstream callers.
+pub fn session_finish_cleanup_started_payload(
+    worktree_present: bool,
+    branch_present: bool,
+) -> String {
+    session_finish_cleanup_started_payload_with_proof(worktree_present, branch_present, None)
+}
+
+pub(crate) fn session_finish_cleanup_started_payload_with_proof(
     worktree_present: bool,
     branch_present: bool,
     recovery_proof: Option<&FinishCleanupRecoveryProof>,

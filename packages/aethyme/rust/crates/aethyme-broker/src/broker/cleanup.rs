@@ -1724,6 +1724,136 @@ impl Broker {
         Ok(())
     }
 
+    fn remove_proven_orphan_worktree(
+        &self,
+        session: &Session,
+        item: Option<&CleanupWorktreePlan>,
+        worktree_path: &Path,
+    ) -> Result<(String, String), BrokerOpError> {
+        let current = self.store.session(session.id)?;
+        let Some(item) = item else {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason:
+                    "the orphaned worktree has no current cleanup plan; preserved it for inspection"
+                        .into(),
+            });
+        };
+        let expected_branch_ref = format!("refs/heads/{}", session.branch);
+        if current.cleanup_state != crate::SessionCleanupState::Closed
+            || current.origin != SessionOrigin::Spawned
+            || current.worktree_path != session.worktree_path
+            || current.branch != session.branch
+            || item.session_id != session.id
+            || item.origin != SessionOrigin::Spawned
+            || item.worktree_path != session.worktree_path
+            || !item.worktree_present
+            || !item.eligible()
+            || item.branch_ref != expected_branch_ref
+            || item.provenance.as_ref().is_none_or(|provenance| {
+                provenance.representation != CleanupRepresentation::Represented
+            })
+        {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the orphaned checkout lacks a current represented cleanup proof; preserved it for inspection".into(),
+            });
+        }
+        let branch_tip =
+            item.branch_tip
+                .as_deref()
+                .ok_or_else(|| {
+                    BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason:
+                    "the orphaned checkout has no branch tip to preserve; left it for inspection"
+                        .into(),
+            }
+                })?;
+        if self.repo.resolve_ref(&expected_branch_ref).as_deref() != Some(branch_tip) {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the orphaned checkout branch moved after its cleanup plan; preserved it for inspection".into(),
+            });
+        }
+        if !self.is_broker_owned_worktree_checked(&current, worktree_path)?
+            || !self.is_orphaned_worktree_of_this_repository_checked(worktree_path)?
+        {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the worktree is not a positively identified orphan of this repository; preserved it for inspection".into(),
+            });
+        }
+        let canonical_path = worktree_path
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: worktree_path.to_path_buf(),
+                source,
+            })?;
+        self.ensure_orphan_branch_not_checked_out(
+            session.id,
+            &expected_branch_ref,
+            branch_tip,
+            Some(&canonical_path),
+        )?;
+        self.refuse_live_checkout(session.id, worktree_path)?;
+
+        // This path is no longer registered, so Git cannot remove it. Reach
+        // this filesystem removal only with the current represented branch,
+        // a same-repository `.git` pointer whose admin entry is explicitly
+        // absent, and the session/path ownership checks above. In particular,
+        // a Git discovery error alone never authorizes recursive removal.
+        if !self.is_orphaned_worktree_of_this_repository_checked(worktree_path)? {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the orphan identity changed before removal; preserved the checkout".into(),
+            });
+        }
+        let outcome = crate::removal::remove_tree(worktree_path);
+        if !outcome.removed {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: format!(
+                    "orphan removal stopped after {} attempt(s); preserved the branch and session for retry: {}",
+                    outcome.attempts,
+                    outcome.error.as_deref().unwrap_or("the path remains")
+                ),
+            });
+        }
+        Ok((expected_branch_ref, branch_tip.to_owned()))
+    }
+
+    fn ensure_orphan_branch_not_checked_out(
+        &self,
+        session_id: i64,
+        branch_ref: &str,
+        expected_tip: &str,
+        worktree_path: Option<&Path>,
+    ) -> Result<(), BrokerOpError> {
+        if self.repo.resolve_ref(branch_ref).as_deref() != Some(expected_tip) {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session_id,
+                reason: "the orphan cleanup branch tip changed; preserved the branch and session for inspection".into(),
+            });
+        }
+        let canonical_path =
+            worktree_path.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        let inventory = self.repo.worktree_inventory()?;
+        if inventory.iter().any(|entry| {
+            entry.branch.as_deref() == Some(branch_ref)
+                || canonical_path.as_ref().is_some_and(|canonical| {
+                    entry.path == *canonical
+                        || entry.path.canonicalize().ok().as_ref() == Some(canonical)
+                })
+        }) {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session_id,
+                reason: "the orphan cleanup branch or path is registered by another worktree; preserved it for inspection".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn cleanup(&mut self, session_id: i64, force: bool) -> Result<(), BrokerOpError> {
         let initial_session = self.store.session(session_id)?;
         // Adoption and checkout creation take the same repository-wide claim
@@ -1795,12 +1925,25 @@ impl Broker {
             });
         }
 
+        let mut removed_orphan_branch = None;
         if worktree_path_is_real_directory(&worktree_path, session_id)? {
             self.refuse_live_checkout(session_id, &worktree_path)?;
-            self.repo
-                .worktree_remove_registered(&worktree_path, force)?;
+            if self.is_orphaned_worktree_of_this_repository_checked(&worktree_path)? {
+                removed_orphan_branch = Some(self.remove_proven_orphan_worktree(
+                    session,
+                    item.as_ref(),
+                    &worktree_path,
+                )?);
+            } else {
+                self.repo
+                    .worktree_remove_registered(&worktree_path, force)?;
+            }
         }
         require_worktree_path_absent(&worktree_path, session_id)?;
+        if let Some((branch_ref, branch_tip)) = removed_orphan_branch.as_ref() {
+            self.refuse_live_checkout(session_id, &worktree_path)?;
+            self.ensure_orphan_branch_not_checked_out(session_id, branch_ref, branch_tip, None)?;
+        }
         if let Some(branch_tip) = item.and_then(|item| item.branch_tip)
             && session.origin == SessionOrigin::Spawned
         {
@@ -2169,6 +2312,22 @@ mod registered_removal_failure_tests {
         );
     }
 
+    fn remove_worktree_admin_directory(worktree: &Path) {
+        let pointer = std::fs::read_to_string(worktree.join(".git")).unwrap();
+        let gitdir = pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .expect("linked worktree has a gitdir pointer")
+            .trim();
+        let gitdir = Path::new(gitdir);
+        let gitdir = if gitdir.is_absolute() {
+            gitdir.to_path_buf()
+        } else {
+            worktree.join(gitdir)
+        };
+        std::fs::remove_dir_all(gitdir).unwrap();
+    }
+
     #[test]
     fn registered_cleanup_preserves_checkout_after_git_removal_timeout() {
         let owner = tempfile::tempdir().unwrap();
@@ -2388,5 +2547,79 @@ mod registered_removal_failure_tests {
                 .resolve_ref(&format!("refs/heads/{}", session.branch))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn spawned_cleanup_refuses_orphan_paths_without_a_valid_same_repository_pointer() {
+        for invalid_pointer in ["missing", "malformed", "wrong-repository", "metadata-error"] {
+            let owner = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let repository = initialized_repository(owner.path());
+            let foreign_repository = if invalid_pointer == "wrong-repository" {
+                Some(initialized_repository(&owner.path().join("foreign")))
+            } else {
+                None
+            };
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let session = broker
+                .start_worktree("invalid orphan pointer", None)
+                .unwrap();
+            let worktree = Path::new(&session.worktree_path).to_path_buf();
+            broker.close(session.id).unwrap();
+            let evidence = worktree.join("keep-for-retry.txt");
+            std::fs::write(&evidence, b"preserve this checkout").unwrap();
+            remove_worktree_admin_directory(&worktree);
+
+            match invalid_pointer {
+                "missing" => std::fs::remove_file(worktree.join(".git")).unwrap(),
+                "malformed" => {
+                    std::fs::write(worktree.join(".git"), b"not a gitdir pointer\n").unwrap()
+                }
+                "wrong-repository" => {
+                    let foreign = foreign_repository.as_ref().unwrap();
+                    let gitdir = foreign.join(".git/worktrees/foreign-checkout");
+                    std::fs::write(
+                        worktree.join(".git"),
+                        format!("gitdir: {}\n", gitdir.display()),
+                    )
+                    .unwrap();
+                }
+                "metadata-error" => {
+                    let non_directory = repository.join(".git/not-a-directory");
+                    std::fs::write(&non_directory, b"file where a directory is required").unwrap();
+                    let gitdir = non_directory.join("worktrees/missing-admin");
+                    std::fs::write(
+                        worktree.join(".git"),
+                        format!("gitdir: {}\n", gitdir.display()),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let result = broker.cleanup(session.id, true);
+
+            assert!(
+                result.is_err(),
+                "{invalid_pointer} orphan evidence must not authorize removal"
+            );
+            assert_eq!(
+                std::fs::read(&evidence).unwrap(),
+                b"preserve this checkout",
+                "{invalid_pointer} pointer must leave the checkout contents intact"
+            );
+            assert_eq!(
+                broker.store().session(session.id).unwrap().cleanup_state,
+                SessionCleanupState::Closed,
+                "{invalid_pointer} pointer must leave the session retryable"
+            );
+            assert!(
+                crate::git::GitRepo::discover(&repository)
+                    .unwrap()
+                    .resolve_ref(&format!("refs/heads/{}", session.branch))
+                    .is_some(),
+                "{invalid_pointer} pointer must retain the branch"
+            );
+        }
     }
 }

@@ -320,7 +320,7 @@ impl Broker {
                 } else {
                     None
                 };
-            let start_payload = crate::events::session_finish_cleanup_started_payload(
+            let start_payload = crate::events::session_finish_cleanup_started_payload_with_proof(
                 worktree_present,
                 branch_present,
                 recovery_proof.as_ref(),
