@@ -145,6 +145,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
+- Before sealing a validation packet, require every input referenced by its
+  plan, argv, or README to exist and match its pinned hash; hashing only the
+  files that happen to be present can silently bless an incomplete packet.
+  Recheck every required path after copying the packet to durable storage.
   Before freezing execution argv, check it against the actual helper parser
   and environment allowlist; do not pass defaults already fixed by the runner as
   caller overrides. Successful plan or intent generation alone does not prove
