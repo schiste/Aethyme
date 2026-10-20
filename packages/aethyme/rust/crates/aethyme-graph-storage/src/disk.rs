@@ -46,7 +46,7 @@ pub fn write_fragment(
     validate_source_path(source_path).map_err(FragmentWriteError::Path)?;
     let bytes = write_fragment_bytes(fragment).map_err(FragmentWriteError::Encode)?;
     let target = fragment_path(repo_root, source_path);
-    atomic_write(&target, &bytes).map_err(FragmentWriteError::Io)?;
+    atomic_write(repo_root, &target, &bytes).map_err(FragmentWriteError::Io)?;
     Ok(target)
 }
 
@@ -69,7 +69,7 @@ pub fn write_index_shard(
     validate_module_name(module).map_err(IndexShardWriteError::Path)?;
     let bytes = write_index_shard_bytes(records).map_err(IndexShardWriteError::Encode)?;
     let target = index_shard_path(repo_root, module);
-    atomic_write(&target, &bytes).map_err(IndexShardWriteError::Io)?;
+    atomic_write(repo_root, &target, &bytes).map_err(IndexShardWriteError::Io)?;
     Ok(target)
 }
 
@@ -101,7 +101,7 @@ pub fn write_overlay<P: Serialize>(
     validate_module_name(kind).map_err(OverlayWriteError::Path)?;
     let bytes = write_overlay_bytes(overlay).map_err(OverlayWriteError::Encode)?;
     let target = overlay_path(repo_root, kind);
-    atomic_write(&target, &bytes).map_err(OverlayWriteError::Io)?;
+    atomic_write(repo_root, &target, &bytes).map_err(OverlayWriteError::Io)?;
     Ok(target)
 }
 
@@ -132,10 +132,13 @@ pub fn read_overlay<P: DeserializeOwned>(
 /// dir) so the rename is guaranteed to be within the same
 /// filesystem — `fs::rename` is only atomic across same-filesystem
 /// renames on POSIX.
-pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(repo_root: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::ensure_isolated_graph_write(repo_root)?;
+    crate::write_guard::ensure_output_path(repo_root, target)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
+    crate::write_guard::ensure_output_path(repo_root, target)?;
     let pid = std::process::id();
     // Use a deterministic-but-collision-resistant tmp name. The
     // file path + PID is sufficient: two indexers writing the
@@ -144,10 +147,16 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp.push(format!(".tmp.{pid}"));
     let tmp = PathBuf::from(tmp);
     {
-        let mut f = fs::File::create(&tmp)?;
+        crate::write_guard::ensure_output_path(repo_root, &tmp)?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
+    crate::ensure_isolated_graph_write(repo_root)?;
+    crate::write_guard::ensure_output_path(repo_root, target)?;
     fs::rename(&tmp, target)
 }
 
