@@ -256,6 +256,24 @@ fn landing_fixture() -> (tempfile::TempDir, impl Fn(&[&str]) -> String) {
     (repo, git)
 }
 
+fn git_in_worktree(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 #[test]
 fn a_merged_head_is_proved_by_ancestry_before_any_candidate_walk() {
     let (repo, git) = landing_fixture();
@@ -416,6 +434,263 @@ fn fresh_unbound_status_defers_worktree_inventory_without_provisioning_storage()
             .get("deferred_reason")
             .is_none()
     );
+}
+
+#[test]
+fn fresh_unbound_adopt_remains_read_only_until_submit_prepares_root() {
+    let (repo, git) = landing_fixture();
+    let base = git(&["rev-parse", "HEAD"]);
+    let policy = crate::broker::gate_trust::policy_at_commit(
+        &crate::git::GitRepo::discover(repo.path()).unwrap(),
+        &base,
+    )
+    .unwrap();
+    assert!(
+        !policy.runs_commands(),
+        "the fixture deliberately has a valid no-command gate policy"
+    );
+    let checkout_owner = tempfile::tempdir().unwrap();
+    let checkout = checkout_owner.path().join("adopted");
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "agent/adopted-submit",
+        checkout.to_str().unwrap(),
+        "main",
+    ]);
+
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let root = storage.worktree_root();
+    let registry = crate::worktree_registry::registry_path(
+        &storage.host_state_dir().join("host-operations.db"),
+    )
+    .unwrap();
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+    );
+    assert!(!root.exists(), "open does not create the managed root");
+
+    let session = broker
+        .adopt(&checkout, Some("submit adopted work"))
+        .unwrap();
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+    );
+    assert!(!root.exists(), "adopt does not create the managed root");
+    assert!(
+        !registry.exists(),
+        "adopt does not create the root registry"
+    );
+
+    std::fs::write(checkout.join("submitted.txt"), "owned after adoption\n").unwrap();
+    git_in_worktree(&checkout, &["add", "submitted.txt"]);
+    git_in_worktree(&checkout, &["commit", "-qm", "owned adopted change"]);
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted, "{outcome:#?}");
+    assert!(root.is_dir(), "explicit submit prepares the managed root");
+    assert!(registry.is_file(), "submit records the root registry entry");
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::Bound
+    );
+}
+
+#[test]
+fn invalid_fresh_unbound_submissions_do_not_prepare_root() {
+    let (repo, git) = landing_fixture();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let root = storage.worktree_root();
+    let registry = crate::worktree_registry::registry_path(
+        &storage.host_state_dir().join("host-operations.db"),
+    )
+    .unwrap();
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+    );
+
+    let events_before = broker.store().events_after(0, i64::MAX).unwrap().len();
+    let error = broker.submit(i64::MAX).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::BrokerOpError::Store(crate::BrokerError::SessionNotFound(i64::MAX))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        broker.store().events_after(0, i64::MAX).unwrap().len(),
+        events_before
+    );
+    assert!(broker.store().merge_queue().unwrap().is_empty());
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+    );
+    assert!(
+        !root.exists(),
+        "a missing session cannot create the managed root"
+    );
+    assert!(
+        !registry.exists(),
+        "a missing session cannot create the root registry"
+    );
+
+    let checkout_owner = tempfile::tempdir().unwrap();
+    let checkout = checkout_owner.path().join("adopted");
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "agent/invalid-submit",
+        checkout.to_str().unwrap(),
+        "main",
+    ]);
+    let session = broker
+        .adopt(&checkout, Some("invalid fresh submit"))
+        .unwrap();
+    let events_before = broker.store().events_after(0, i64::MAX).unwrap().len();
+    assert!(broker.store().merge_queue().unwrap().is_empty());
+    let expected = "0000000000000000000000000000000000000000";
+    let error = broker
+        .submit_expecting_head(
+            session.id,
+            crate::gates::CachePolicy::Use,
+            crate::PromotionIntent::Configured,
+            expected,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::BrokerOpError::CapturedHeadMoved { .. }
+    ));
+    assert_eq!(
+        broker.store().events_after(0, i64::MAX).unwrap().len(),
+        events_before
+    );
+    assert!(broker.store().merge_queue().unwrap().is_empty());
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+    );
+    assert!(
+        !root.exists(),
+        "a moved expected head cannot create the managed root"
+    );
+    assert!(
+        !registry.exists(),
+        "a moved expected head cannot create the root registry"
+    );
+
+    git_in_worktree(&checkout, &["checkout", "-q", "-b", "foreign/branch"]);
+    let events_before = broker.store().events_after(0, i64::MAX).unwrap().len();
+    assert!(broker.store().merge_queue().unwrap().is_empty());
+    let error = broker.submit(session.id).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::BrokerOpError::SessionCheckoutDrift { .. }
+    ));
+    assert_eq!(
+        broker.store().events_after(0, i64::MAX).unwrap().len(),
+        events_before
+    );
+    assert!(broker.store().merge_queue().unwrap().is_empty());
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+    );
+    assert!(
+        !root.exists(),
+        "a checkout identity mismatch cannot create the managed root"
+    );
+    assert!(
+        !registry.exists(),
+        "a checkout identity mismatch cannot create the root registry"
+    );
+}
+
+#[test]
+fn legacy_unbound_adopted_submit_refuses_without_provisioning_root() {
+    let (repo, git) = landing_fixture();
+    let database = repo.path().join(".aethyme/broker.db");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    drop(crate::BrokerStore::open(&database).unwrap());
+    let checkout_owner = tempfile::tempdir().unwrap();
+    let checkout = checkout_owner.path().join("adopted");
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "agent/legacy-adopted-submit",
+        checkout.to_str().unwrap(),
+        "main",
+    ]);
+
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let root = storage.worktree_root();
+    let registry = crate::worktree_registry::registry_path(
+        &storage.host_state_dir().join("host-operations.db"),
+    )
+    .unwrap();
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound
+    );
+    let session = broker
+        .adopt(&checkout, Some("legacy adopted submit"))
+        .unwrap();
+    assert!(!root.exists(), "adopt does not create the managed root");
+    assert!(
+        !registry.exists(),
+        "adopt does not create the root registry"
+    );
+    let cache_entries_before = std::fs::read_dir(storage.root().join("preparation-cache"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let events_before = broker.store().events_after(0, i64::MAX).unwrap().len();
+    assert!(broker.store().merge_queue().unwrap().is_empty());
+
+    let error = broker.submit(session.id).unwrap_err();
+    assert!(
+        matches!(error, crate::BrokerOpError::WorktreeRootUnavailable { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound
+    );
+    assert!(
+        !root.exists(),
+        "refused submit does not create the managed root"
+    );
+    assert!(
+        !registry.exists(),
+        "refused submit does not create the registry"
+    );
+    assert_eq!(
+        std::fs::read_dir(storage.root().join("preparation-cache"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        cache_entries_before,
+        "refused submit does not modify the preparation cache"
+    );
+    assert_eq!(
+        broker.store().events_after(0, i64::MAX).unwrap().len(),
+        events_before
+    );
+    assert!(broker.store().merge_queue().unwrap().is_empty());
 }
 
 #[test]
