@@ -1093,7 +1093,11 @@ pub(crate) fn running_gate_evidence_until(
                 }
                 let record = match read_gate_pidfile_until(&path, &mut expired) {
                     Ok(record) => record,
-                    Err(()) => return None,
+                    Err(()) if entry_budget.is_some() => return None,
+                    Err(()) => {
+                        evidence.push(format!("gate pidfile {name} is unreadable"));
+                        continue;
+                    }
                 };
                 let Some(record) = record else {
                     evidence.push(format!("gate pidfile {name} is unreadable"));
@@ -6175,6 +6179,28 @@ mod tests {
             running_gate_evidence_until(root.path(), || false, Some(8)),
             None,
             "an unreadable owner directory makes the bounded inventory unknown"
+        );
+    }
+
+    #[test]
+    fn unbounded_gate_evidence_holds_cache_on_pidfile_read_error() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = running_dir(root.path());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let pidfile = run_dir.join("gate.pid");
+        std::fs::write(&pidfile, [0xff]).unwrap();
+
+        let evidence = running_gate_evidence(root.path());
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item == "gate pidfile gate.pid is unreadable"),
+            "an unbounded read error must be evidence, not a panic: {evidence:?}"
+        );
+        assert_eq!(
+            running_gate_evidence_until(root.path(), || false, Some(8)),
+            None,
+            "a bounded read error leaves the inventory incomplete"
         );
     }
 
