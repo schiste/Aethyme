@@ -667,23 +667,7 @@ fn both_push_paths_surface_hook_streams_and_missing_path_guidance() {
 
     let broker_push = fixture.push(session, &[]);
     assert!(!broker_push.status.success());
-    let broker_report: serde_json::Value = serde_json::from_slice(&broker_push.stdout).unwrap();
-    assert_eq!(broker_report["command_success"], false);
-    assert!(
-        broker_report["stdout"]
-            .as_str()
-            .unwrap()
-            .contains("hook stdout: checks could not start"),
-        "{broker_report}"
-    );
-    assert!(
-        broker_report["stderr"]
-            .as_str()
-            .unwrap()
-            .contains("env: node: No such file or directory"),
-        "{broker_report}"
-    );
-    let push_error = stderr(&broker_push);
+    let push_error = json_error::message(&broker_push);
     assert!(
         push_error.contains("hook stdout: checks could not start"),
         "{push_error}"
@@ -735,16 +719,7 @@ fn opted_in_pre_push_refusals_show_hook_stderr_and_path_guidance_on_both_pushes(
 
     let broker_push = fixture.push(session, &[]);
     assert!(!broker_push.status.success());
-    let broker_report: serde_json::Value = serde_json::from_slice(&broker_push.stdout).unwrap();
-    assert_eq!(broker_report["command_success"], false);
-    assert!(
-        broker_report["stderr"]
-            .as_str()
-            .unwrap()
-            .contains("env: node: No such file or directory"),
-        "{broker_report}"
-    );
-    let push_error = stderr(&broker_push);
+    let push_error = json_error::message(&broker_push);
     assert!(
         push_error.contains("env: node: No such file or directory"),
         "{push_error}"

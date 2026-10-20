@@ -369,11 +369,7 @@ fn a_host_operation_on_another_repository_is_not_reconciled_from_here() {
         "wrong repository",
     ]);
     let unblocked_stderr = String::from_utf8_lossy(&unblocked.stderr);
-    assert_eq!(
-        unblocked.status.code(),
-        Some(3),
-        "{unblocked_stderr}"
-    );
+    assert_eq!(unblocked.status.code(), Some(3), "{unblocked_stderr}");
     assert!(
         unblocked_stderr.contains("not a remote of this repository"),
         "{unblocked_stderr}"

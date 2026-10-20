@@ -1328,7 +1328,7 @@ fn ambiguous_file_outcome_requires_reconciliation_and_is_never_retried() {
 
     let second = run_with_env(tmp.path(), &args, &environment);
     assert!(!second.status.success());
-    let stderr = String::from_utf8_lossy(&second.stderr);
+    let stderr = json_error::message(&second);
     assert!(stderr.contains("is now write-blocked"));
     assert!(stderr.contains(&format!("Operation ID: {operation_id}")));
     assert!(stderr.contains(&format!("--operation {operation_id} --outcome succeeded")));

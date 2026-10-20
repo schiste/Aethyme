@@ -200,7 +200,7 @@ fn a_new_clone_refuses_gates_and_submit_until_trusted() {
     let (worktree, session) = fixture.session("first");
     let session_gates = fixture.run(
         &worktree,
-        &["advanced", "gates", "run", "--session", &session],
+        &["advanced", "gates", "run", "--session", &session, "--json"],
     );
     assert_refused_with_hint(&session_gates, &root);
     let submit = fixture.run(&worktree, &["submit", "--session", &session, "--json"]);
@@ -294,7 +294,7 @@ fn trust_refuses_without_a_terminal() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("interactive terminal"));
     assert_eq!(fixture.trust_status()["trusted"], false);
     assert_refused_with_hint(
-        &fixture.run(&root, &["advanced", "gates", "run", "--all"]),
+        &fixture.run(&root, &["advanced", "gates", "run", "--all", "--json"]),
         &root,
     );
 }
@@ -308,7 +308,7 @@ fn the_pre_commit_hook_refuses_an_untrusted_policy() {
     fixture.git(&root, &["add", "tracked.txt"]);
     let head = fixture.git(&root, &["rev-parse", "HEAD"]).stdout;
 
-    let direct = fixture.run(&root, &["broker", "hooks", "pre-commit"]);
+    let direct = fixture.run(&root, &["broker", "hooks", "pre-commit", "--json"]);
     assert_refused_with_hint(&direct, &root);
     let commit = fixture
         .command("git", &root)
