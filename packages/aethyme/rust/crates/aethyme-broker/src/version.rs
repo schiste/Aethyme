@@ -347,8 +347,13 @@ mod tests {
     use std::time::Duration;
 
     fn sh(cwd: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .envs(std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().starts_with("GIT_")))
+        let mut git = Command::new("git");
+        for (key, _) in
+            std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+        {
+            git.env_remove(key);
+        }
+        let status = git
             .args(args)
             .current_dir(cwd)
             .env("GIT_AUTHOR_NAME", "t")
@@ -470,14 +475,15 @@ mod tests {
     #[test]
     fn expired_git_deadline_does_not_masquerade_as_missing_repository() {
         let tmp = tempfile::tempdir().unwrap();
-        sh(tmp.path(), &["init", "-q", "-b", "main"]);
-        marker_source_checkout(tmp.path());
-        sh(tmp.path(), &["add", "-A"]);
-        sh(tmp.path(), &["commit", "-qm", "source checkout"]);
-        assert!(GitRepo::discover(tmp.path()).is_ok());
+        let root = tmp.path().canonicalize().unwrap();
+        sh(&root, &["init", "-q", "-b", "main"]);
+        marker_source_checkout(&root);
+        sh(&root, &["add", "-A"]);
+        sh(&root, &["commit", "-qm", "source checkout"]);
+        assert!(GitRepo::discover(&root).is_ok());
 
         let report = crate::git::with_git_deadline(Duration::ZERO, || {
-            inspect_version_with_binary(tmp.path(), binary("deadbeef", "v0.1.1"))
+            inspect_version_with_binary(&root, binary("deadbeef", "v0.1.1"))
         });
 
         assert_eq!(report.status, VersionDriftStatus::Unknown);
