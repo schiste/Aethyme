@@ -1722,6 +1722,26 @@ mod tests {
         }
     }
 
+    fn resolution_attempt_snapshot(
+        store: &CollaborationStore,
+        client_key: &str,
+    ) -> Vec<rusqlite::types::Value> {
+        let connection = store.read_connection();
+        let mut statement = connection
+            .prepare("SELECT * FROM resolution_attempts WHERE client_key=?1")
+            .unwrap();
+        let column_count = statement.column_count();
+        statement
+            .query_row([client_key], |row| {
+                let mut values = Vec::with_capacity(column_count);
+                for index in 0..column_count {
+                    values.push(row.get::<_, rusqlite::types::Value>(index)?);
+                }
+                Ok(values)
+            })
+            .unwrap()
+    }
+
     type WriteSnapshot = (i64, i64, i64, i64, i64, i64, i64, i64);
 
     fn write_snapshot(store: &CollaborationStore, target: &str) -> WriteSnapshot {
@@ -1887,64 +1907,171 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_managed_superset_blocks_new_admission_without_writes() {
-        use sha2::{Digest, Sha256};
+    fn unresolved_managed_superset_blocks_new_admission_without_managed_ledger_writes() {
+        let (mut fixture, subset_owner, subset_wave) = conflict_fixture();
+        let base = fixture.a.base.commit.clone();
+        local_target::tests::git(
+            fixture._repo.path(),
+            &["switch", "-qc", "managed-superset", base.as_str()],
+        );
+        std::fs::write(
+            fixture._repo.path().join("one.txt"),
+            "another incompatible edit\n",
+        )
+        .unwrap();
+        local_target::tests::git(
+            fixture._repo.path(),
+            &["commit", "-qam", "another conflict"],
+        );
+        let tip = CommitOid::parse(&local_target::tests::git(
+            fixture._repo.path(),
+            &["rev-parse", "HEAD"],
+        ))
+        .unwrap();
+        let additional: RetainedContribution =
+            archive::retain_contribution(&mut fixture.store, fixture._repo.path(), &base, &tip)
+                .unwrap();
 
-        let (mut fixture, owner, wave) = conflict_fixture();
-        let command = command(&fixture.store, &wave);
+        let subset_revision = local_target::status(&fixture.store, subset_owner.target())
+            .unwrap()
+            .revision
+            .unwrap();
+        let mut superset_spec = local_target::load_revision(&fixture.store, &subset_revision)
+            .unwrap()
+            .spec;
+        superset_spec.contributions.push(RequestedContribution {
+            id: "D".into(),
+            lineage: additional.lineage_record_id.to_string(),
+            requires: Vec::new(),
+            atomic_group: None,
+            revision_of: None,
+            derived_from: Vec::new(),
+        });
+        superset_spec.selected = vec!["A".into(), "C".into(), "D".into()];
+
+        let superset_owner = local_target::acquire_controller(
+            &mut fixture.store,
+            "managed-superset-target",
+            subset_owner.issuer(),
+        )
+        .unwrap();
+        let revision =
+            local_target::propose_revision(&mut fixture.store, &superset_owner, superset_spec)
+                .unwrap();
+        local_target::select_revision(&mut fixture.store, &superset_owner, &revision.id).unwrap();
+        local_wave::available(&mut fixture.store, &superset_owner, "A", 0).unwrap();
+        local_wave::available(&mut fixture.store, &superset_owner, "C", 1).unwrap();
+        local_wave::available(&mut fixture.store, &superset_owner, "D", 2).unwrap();
+        let admission = local_wave::admit(
+            &mut fixture.store,
+            &superset_owner,
+            local_wave::WavePolicy {
+                debounce_ms: 0,
+                ..local_wave::WavePolicy::default()
+            },
+            2,
+        )
+        .unwrap();
+        let local_wave::Admission::Frozen(wave) = admission else {
+            panic!("expected frozen superset conflict wave, got {admission:?}");
+        };
+        let superset_wave = local_wave::compose_with_source(
+            &mut fixture.store,
+            &superset_owner,
+            fixture._repo.path(),
+            &wave.id,
+        )
+        .unwrap()
+        .wave;
+        assert_eq!(superset_wave.phase, WavePhase::Blocked);
+        assert!(superset_wave.resolution_request.is_some());
+
+        let superset_command = command(&fixture.store, &superset_wave);
+        let subset_command = command(&fixture.store, &subset_wave);
+        let superset_request = resolution::load_request(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &superset_command.request,
+        )
+        .unwrap();
+        let subset_request = resolution::load_request(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &subset_command.request,
+        )
+        .unwrap();
+        let (_, superset_kind, superset_members, superset_paths) =
+            superset_request.managed_decision_fields();
+        let (_, subset_kind, subset_members, subset_paths) =
+            subset_request.managed_decision_fields();
+        assert_eq!(subset_kind, superset_kind);
+        let decision_set = |raw: &str| {
+            raw.split('\n')
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let subset_members = decision_set(&subset_members);
+        let superset_members = decision_set(&superset_members);
+        assert!(subset_members.is_subset(&superset_members));
+        assert!(subset_members.len() < superset_members.len());
+        assert_eq!(decision_set(&subset_paths), decision_set(&superset_paths));
+
         reset_acknowledgements();
         let _adapter = register_test_adapter(acknowledge);
-        let first = begin(&mut fixture.store, fixture._repo.path(), &owner, &command).unwrap();
+        let first = begin(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &superset_owner,
+            &superset_command,
+        )
+        .unwrap();
         let ManagedResolutionOutcome::DispatchAcknowledged(status) = first else {
-            panic!("expected first acknowledgement, got {first:?}");
+            panic!("expected first superset acknowledgement, got {first:?}");
         };
-        let request =
-            resolution::load_request(&mut fixture.store, fixture._repo.path(), &command.request)
-                .unwrap();
-        let (original_key, kind, members, paths) = request.managed_decision_fields();
-        let mut members: BTreeSet<String> = members.split('\n').map(str::to_owned).collect();
-        members.insert("additional-contribution".into());
-        let mut paths: BTreeSet<String> = paths.split('\n').map(str::to_owned).collect();
-        paths.insert("src/additional.rs".into());
-        // Independent encoding of the persisted decision identity. This row
-        // represents another unresolved decision that contains the new one.
-        let mut hash = Sha256::new();
-        hash.update(b"aethyme resolution decision v0\0");
-        hash.update(kind.as_bytes());
-        for member in &members {
-            hash.update(b"\0m");
-            hash.update(member.as_bytes());
-        }
-        for path in &paths {
-            hash.update(b"\0p");
-            hash.update(path.as_bytes());
-        }
-        let key = format!("{:x}", hash.finalize());
-        assert_ne!(key, original_key);
+        assert_eq!(status.async_state, "dispatching");
+        assert_eq!(acknowledgements(), 1);
+        let attempt_before =
+            resolution_attempt_snapshot(&fixture.store, superset_command.client_key.as_str());
+
+        // `begin` durably stores the input manifest before checking the pending
+        // decision. Prime the exact object so the oracle below measures managed
+        // ledger writes; also verify the manifest bytes survive the pending refusal.
+        let (subset_manifest_bytes, subset_manifest) = resolution::build_input_manifest(
+            &fixture.store,
+            &subset_request,
+            subset_command.limits,
+        )
+        .unwrap();
+        let subset_manifest_object =
+            archive::put_object(&fixture.store, &subset_manifest_bytes).unwrap();
+        assert_eq!(subset_manifest_object.hex(), subset_manifest.sha256);
         assert_eq!(
-            fixture
-                .store
-                .connection()
-                .execute(
-                    "UPDATE resolution_attempts SET decision_key=?1,members=?2,paths=?3
-             WHERE client_key=?4",
-                    params![
-                        key,
-                        members.into_iter().collect::<Vec<_>>().join("\n"),
-                        paths.into_iter().collect::<Vec<_>>().join("\n"),
-                        command.client_key.as_str()
-                    ],
-                )
-                .unwrap(),
-            1
+            archive::read_object(&fixture.store, &subset_manifest_object).unwrap(),
+            subset_manifest_bytes
         );
-        let before = write_snapshot(&fixture.store, owner.target());
-        let mut distinct = command.clone();
+        let before = write_snapshot(&fixture.store, subset_owner.target());
+        let mut distinct = subset_command;
         distinct.client_key = OperationId::mint().unwrap();
-        let outcome = begin(&mut fixture.store, fixture._repo.path(), &owner, &distinct);
+        let outcome = begin(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &subset_owner,
+            &distinct,
+        );
         assert!(matches!(outcome, Err(BudgetError::Pending)), "{outcome:?}");
         assert_eq!(acknowledgements(), 1);
-        assert_eq!(write_snapshot(&fixture.store, owner.target()), before);
+        assert_eq!(
+            write_snapshot(&fixture.store, subset_owner.target()),
+            before
+        );
+        assert_eq!(
+            resolution_attempt_snapshot(&fixture.store, superset_command.client_key.as_str()),
+            attempt_before
+        );
+        assert_eq!(
+            archive::read_object(&fixture.store, &subset_manifest_object).unwrap(),
+            subset_manifest_bytes
+        );
     }
 
     #[test]
