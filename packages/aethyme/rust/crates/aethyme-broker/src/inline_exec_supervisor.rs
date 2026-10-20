@@ -2,7 +2,8 @@
 //!
 //! This is a lifecycle guard, not a sandbox: a command that deliberately leaves
 //! its process group is outside the guarantee. The caller preserves the
-//! repository command's argv and inherited stdio. Preparation starts the helper
+//! repository command's argv and inherited stdio, except that JSON-mode guarded
+//! exec routes child stdout to stderr. Preparation starts the helper
 //! with null stdin; generic guarded execution preserves inherited stdin. A normal
 //! in-group descendant is stopped when the helper exits.
 
@@ -340,12 +341,27 @@ pub(crate) struct InlineExecSupervisor;
 impl InlineExecSupervisor {
     #[cfg(unix)]
     pub(crate) fn start(executable: &Path) -> Result<Self, InlineExecError> {
-        Self::start_with_stdin(executable, std::process::Stdio::null(), false, false)
+        Self::start_with_stdin(
+            executable,
+            std::process::Stdio::null(),
+            std::process::Stdio::inherit(),
+            false,
+            false,
+        )
     }
 
     #[cfg(unix)]
-    pub(crate) fn start_inheriting_stdin(executable: &Path) -> Result<Self, InlineExecError> {
-        Self::start_with_stdin(executable, std::process::Stdio::inherit(), false, false)
+    pub(crate) fn start_inheriting_stdin(
+        executable: &Path,
+        stdout: std::process::Stdio,
+    ) -> Result<Self, InlineExecError> {
+        Self::start_with_stdin(
+            executable,
+            std::process::Stdio::inherit(),
+            stdout,
+            false,
+            false,
+        )
     }
 
     #[cfg(all(unix, test))]
@@ -357,6 +373,7 @@ impl InlineExecSupervisor {
         Self::start_with_stdin(
             executable,
             std::process::Stdio::null(),
+            std::process::Stdio::inherit(),
             fail_cleanup_watcher,
             fail_after_launch,
         )
@@ -366,6 +383,7 @@ impl InlineExecSupervisor {
     fn start_with_stdin(
         executable: &Path,
         stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
         fail_cleanup_watcher: bool,
         _fail_after_launch: bool,
     ) -> Result<Self, InlineExecError> {
@@ -436,7 +454,7 @@ impl InlineExecSupervisor {
         }
         command
             .stdin(stdin)
-            .stdout(Stdio::inherit())
+            .stdout(stdout)
             .stderr(Stdio::inherit())
             .process_group(0);
         // SAFETY: the child-side stream is created before spawn. The hook uses
@@ -517,7 +535,10 @@ impl InlineExecSupervisor {
     }
 
     #[cfg(not(unix))]
-    pub(crate) fn start_inheriting_stdin(executable: &Path) -> Result<Self, InlineExecError> {
+    pub(crate) fn start_inheriting_stdin(
+        executable: &Path,
+        _: std::process::Stdio,
+    ) -> Result<Self, InlineExecError> {
         Self::start(executable)
     }
 
@@ -1737,6 +1758,7 @@ mod tests {
         let supervisor = InlineExecSupervisor::start_with_stdin(
             &std::env::current_exe().unwrap(),
             Stdio::from(reader),
+            Stdio::inherit(),
             false,
             false,
         )

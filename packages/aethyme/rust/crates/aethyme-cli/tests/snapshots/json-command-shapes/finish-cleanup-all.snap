@@ -1,0 +1,21 @@
+{
+  "applied": "bool",
+  "failures": [],
+  "plan": {
+    "digest": "string",
+    "eligible_branch_count": "integer",
+    "eligible_worktree_count": "integer",
+    "estimated_reclaimable_bytes": "integer",
+    "estimated_retained_bytes": "integer",
+    "retained_branch_count": "integer",
+    "retained_worktree_count": "integer",
+    "schema_version": "integer",
+    "sizes_measured_at_ms": "null",
+    "target_snapshot": [
+      "string"
+    ],
+    "unmeasured_worktree_count": "integer",
+    "worktrees": []
+  },
+  "removed_session_ids": []
+}

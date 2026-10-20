@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -5,6 +7,7 @@ use aethyme_broker::{
     Broker, ExternalEventEnvelope, ExternalEventProvider, ExternalVerificationMethod,
     NewPrWatchState, VerifiedExternalSource, external_event_digest,
 };
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -22,12 +25,24 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
-fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
+fn run(broker: &Broker, repo: &Path, args: &[&str]) -> Output {
+    let mut command = common::broker_cli(CLI, args);
+    command.current_dir(repo);
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .expect("bind child to fixture storage context");
+    command.output().unwrap()
+}
+
+fn fixture() -> FixtureRepository {
+    let fixture = FixtureRepository::new();
+    let repo = fixture.path();
+    git(repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", "initial"]);
+    fixture
 }
 
 fn envelope(id: &str, commit: &str) -> ExternalEventEnvelope {
@@ -57,14 +72,10 @@ fn envelope(id: &str, commit: &str) -> ExternalEventEnvelope {
 
 #[test]
 fn external_event_cli_ingests_inspects_and_reconciles_without_background_state() {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    git(tmp.path(), &["add", "-A"]);
-    git(tmp.path(), &["commit", "-qm", "initial"]);
+    let fixture = fixture();
+    let repo = fixture.path();
     git(
-        tmp.path(),
+        repo,
         &[
             "remote",
             "add",
@@ -72,8 +83,8 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
             "https://github.com/acme/product.git",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let session = broker.adopt(tmp.path(), Some("SECRET task")).unwrap();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let session = broker.adopt(repo, Some("SECRET task")).unwrap();
     broker
         .store()
         .upsert_pr_watch_state(&NewPrWatchState {
@@ -85,8 +96,8 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
             last_agent_session_id: Some(session.id),
         })
         .unwrap();
-    let head = git(tmp.path(), &["rev-parse", "HEAD"]);
-    let event_path = tmp.path().join("event.json");
+    let head = git(repo, &["rev-parse", "HEAD"]);
+    let event_path = repo.join("event.json");
     std::fs::write(
         &event_path,
         serde_json::to_vec_pretty(&envelope("cli-delivery", &head)).unwrap(),
@@ -94,7 +105,8 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
     .unwrap();
 
     let ingest = run(
-        tmp.path(),
+        &broker,
+        repo,
         &[
             "advanced",
             "external-events",
@@ -112,10 +124,11 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
     assert_eq!(report["event"]["status"], "advisory_created");
     let event_id = report["event"]["id"].as_i64().unwrap();
 
-    let metric_path = tmp.path().join(".aethyme/logs/command-metrics.jsonl");
+    let metric_path = repo.join(".aethyme/logs/command-metrics.jsonl");
     let metrics_before = std::fs::read(&metric_path).unwrap();
     let list = run(
-        tmp.path(),
+        &broker,
+        repo,
         &["advanced", "external-events", "list", "--all", "--json"],
     );
     assert!(list.status.success());
@@ -123,7 +136,8 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
     assert_eq!(inventory["schema_version"], 1);
     assert_eq!(inventory["events"].as_array().unwrap().len(), 1);
     let show = run(
-        tmp.path(),
+        &broker,
+        repo,
         &[
             "advanced",
             "external-events",
@@ -138,17 +152,18 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
         event_id
     );
     assert_eq!(std::fs::read(&metric_path).unwrap(), metrics_before);
-    assert!(!tmp.path().join(".aethyme/external-events.sock").exists());
-    assert!(!tmp.path().join(".aethyme/external-events.pid").exists());
+    assert!(!repo.join(".aethyme/external-events.sock").exists());
+    assert!(!repo.join(".aethyme/external-events.pid").exists());
 
-    let unknown_path = tmp.path().join("unknown.json");
+    let unknown_path = repo.join("unknown.json");
     std::fs::write(
         &unknown_path,
         serde_json::to_vec_pretty(&envelope("unknown-owner", &"a".repeat(40))).unwrap(),
     )
     .unwrap();
     let unknown = run(
-        tmp.path(),
+        &broker,
+        repo,
         &[
             "advanced",
             "external-events",
@@ -163,7 +178,8 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
     let unknown_id = unknown["event"]["id"].as_i64().unwrap().to_string();
     let session_id = session.id.to_string();
     let reconciled = run(
-        tmp.path(),
+        &broker,
+        repo,
         &[
             "advanced",
             "external-events",
@@ -190,15 +206,13 @@ fn external_event_cli_ingests_inspects_and_reconciles_without_background_state()
 
 #[test]
 fn external_event_cli_requires_the_complete_reconciliation_contract() {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    git(tmp.path(), &["add", "README.md"]);
-    git(tmp.path(), &["commit", "-qm", "initial"]);
-    Broker::open(tmp.path()).unwrap();
+    let fixture = fixture();
+    let repo = fixture.path();
+    let broker = open_fixture_repository_broker(&fixture).unwrap();
 
     let missing = run(
-        tmp.path(),
+        &broker,
+        repo,
         &["advanced", "external-events", "reconcile", "1"],
     );
     assert!(!missing.status.success());

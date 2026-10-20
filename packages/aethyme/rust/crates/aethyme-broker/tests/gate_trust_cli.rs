@@ -171,22 +171,22 @@ fn succeeded(output: &Output) {
 }
 
 fn assert_refused_with_hint(output: &Output, root: &Path) {
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error = json_error::message(output);
     assert_eq!(
         output.status.code(),
         Some(REFUSED),
-        "stdout={}\nstderr={stderr}",
+        "stdout={}\nerror={error}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        stderr.contains(&format!(
+        error.contains(&format!(
             "aethyme broker advanced trust --repo {}",
             root.display()
-        )) || stderr.contains(&format!(
+        )) || error.contains(&format!(
             "aethyme broker advanced trust --repo '{}'",
             root.display()
         )),
-        "refusal does not name the trust command: {stderr}"
+        "refusal does not name the trust command: {error}"
     );
 }
 
@@ -200,7 +200,7 @@ fn a_new_clone_refuses_gates_and_submit_until_trusted() {
     let (worktree, session) = fixture.session("first");
     let session_gates = fixture.run(
         &worktree,
-        &["advanced", "gates", "run", "--session", &session],
+        &["advanced", "gates", "run", "--session", &session, "--json"],
     );
     assert_refused_with_hint(&session_gates, &root);
     let submit = fixture.run(&worktree, &["submit", "--session", &session, "--json"]);
@@ -240,9 +240,9 @@ fn a_landed_gate_change_refuses_the_next_submit_until_trusted_again() {
     let refused = fixture.run(&worktree, &verify);
     assert_refused_with_hint(&refused, &root);
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("changed since it was last trusted"),
+        json_error::message(&refused).contains("changed since it was last trusted"),
         "{}",
-        String::from_utf8_lossy(&refused.stderr)
+        json_error::message(&refused)
     );
     assert!(
         !fixture.marker("after.marker"),
@@ -294,7 +294,7 @@ fn trust_refuses_without_a_terminal() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("interactive terminal"));
     assert_eq!(fixture.trust_status()["trusted"], false);
     assert_refused_with_hint(
-        &fixture.run(&root, &["advanced", "gates", "run", "--all"]),
+        &fixture.run(&root, &["advanced", "gates", "run", "--all", "--json"]),
         &root,
     );
 }
@@ -308,7 +308,7 @@ fn the_pre_commit_hook_refuses_an_untrusted_policy() {
     fixture.git(&root, &["add", "tracked.txt"]);
     let head = fixture.git(&root, &["rev-parse", "HEAD"]).stdout;
 
-    let direct = fixture.run(&root, &["broker", "hooks", "pre-commit"]);
+    let direct = fixture.run(&root, &["broker", "hooks", "pre-commit", "--json"]);
     assert_refused_with_hint(&direct, &root);
     let commit = fixture
         .command("git", &root)
@@ -397,3 +397,6 @@ fn trust_status_next_action_approves_the_exact_linked_checkout_policy() {
     assert!(!fixture.marker("main.marker"));
     assert!(!checkout.join("changed.marker").exists());
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

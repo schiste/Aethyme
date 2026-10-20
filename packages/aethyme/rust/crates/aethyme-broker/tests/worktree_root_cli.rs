@@ -165,9 +165,9 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("refusing nested broker worktree path"),
+        json_error::message(&output).contains("refusing nested broker worktree path"),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        json_error::message(&output)
     );
 }
 
@@ -255,7 +255,7 @@ fn unavailable_history_refuses_before_fallback_root_checkout_or_agent_creation()
             .output()
             .unwrap();
         assert!(!output.status.success());
-        let error = String::from_utf8_lossy(&output.stderr);
+        let error = json_error::message(&output);
         assert!(
             error.contains("cannot retain worktree storage discovery"),
             "{error}"
@@ -706,3 +706,6 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
         }
     }
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

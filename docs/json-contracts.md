@@ -35,6 +35,30 @@ break announced in this file. Enum-valued fields (`status`, `origin`,
 Object key order and `null`-vs-present for nullable fields are **not**
 part of the contract.
 
+## Error output (`aethyme.broker-error/v1`, introduced 2026-10-20)
+
+When a broker command requested JSON with `--json` or the compatibility alias
+`--json-output` fails before producing a report, it writes one JSON object to
+stdout with the versioned shape below. The `code` is the command's numeric exit
+code; `message` is human-readable and may vary between releases.
+
+```json
+{"schema":"aethyme.broker-error/v1","error":{"code":3,"message":"the request was refused"}}
+```
+
+When a command has already emitted a JSON report and then fails, the report
+remains the only JSON document on stdout. The broker writes the failure
+diagnostic to stderr; it includes any required recovery handoff, and the
+process exits with the command's nonzero code. A blocked `finish --json` keeps
+its existing report fields, adds an `error` object with `code` and `message`,
+and exits with the matching nonzero code. If writing to stdout fails after
+output begins, the broker does not append a second error document; it writes
+the diagnostic to stderr and preserves the command's nonzero exit code (or
+returns the environment-failure code for an otherwise successful command).
+The stdout bytes may be incomplete if that write failed. Arguments after `--`
+belong to a child and do not enable broker JSON mode. Commands that
+deliberately stream raw output retain their documented output format.
+
 ## Field inventory (v1)
 
 ### `status --json`
@@ -656,3 +680,57 @@ Under `capture = "advisory"`, `broker submit --json`'s `collaboration_capture`
 gains `ignored_settings` (sorted) when the config carries `[collaboration]`
 keys this binary does not implement; text output adds one warning line.
 Under `required` such a key is refused as `unknown_setting`.
+
+
+### Guarded execution outcomes
+
+`broker advanced exec --json` reports a command that has already run. Its
+post-execution ownership audit does not undo filesystem changes. The existing
+`exit_code` and `command_success` describe the child. In JSON mode, child stdout
+is inherited on stderr alongside child stderr, leaving stdout for exactly one
+completed report; output is neither buffered nor discarded. Text mode retains
+inherited child stdout. The CLI exits 1 when either
+the command or audit fails and retains the completed report on stdout.
+
+Additive fields:
+
+- `ownership_ok`: the actual ownership audit result, independent of the child.
+- `conflicting_leases`: blocking leases retained from that audit, including the
+  holder session and path. An edited file being dirty before execution does not
+  itself imply an ownership violation.
+- `outcome`: `passed`, `command_failed`, `ownership_failed`, or
+  `command_and_ownership_failed`, derived from those two independent results.
+- `next_actions`: explicit lease claim commands for missing owned paths, or
+  coordination guidance for conflicting leases and adoption-time foreign edits.
+  Paths covered by a blocking or foreign directory receive coordination only.
+  Claim commands shell-quote the path. Leading-dash paths receive coordination
+  guidance rather than a command that the lease CLI cannot parse. Commands are
+  suggestions; their normal broker authorization and conflict checks still apply.
+  Foreign changes are preserved. Human output shows at most eight next actions;
+  JSON retains the full list.
+
+The existing `command_ran`, `edits_remain`, and `changed_paths_remaining` fields
+remain available. Human output likewise states that the audit happens after the
+command and prints recovery guidance. Arbitrary argv does not declare a write
+set, so the guard cannot infer every generated path before running it.
+
+### `broker advanced resources acquire --json` (stable conflict codes)
+
+The acquire failure object keeps its existing fields: `code`, `request_id`,
+`retryable`, `waited_ms`, and `conflicts`. Each conflict keeps `code`,
+`resource_key`, `kind`, `requested`, `reason`, and optional `owning_lease`.
+The following codes are stable automation values:
+
+| Code | `retryable` | Meaning |
+|---|---:|---|
+| `resource_contention` | `true` | An active owner or occupied TCP range may release enough resources for the request. This includes capacity and TCP conflicts even when one recorded holder is known to be gone. |
+| `capacity_policy_mismatch` | `false` | Existing leases use a different limit for the same capacity pool; waiting cannot change that policy. |
+| `orphaned_holder` (introduced 2026-10-20, #876) | `false` | A requested exclusive key is still reserved by a lease whose recorded holder process is confirmed gone. The lease and key remain quarantined; the conflict identifies its lease and gives the generation-bound reconciliation command. Waiting does not release it. |
+
+`orphaned_holder` is emitted for an exact exclusive-key conflict only. It does
+not mean that every dead resource holder is unrecoverable: capacity and TCP
+range conflicts remain `resource_contention` because other owners can still
+make the request feasible. `resources explain --json` reports the matching
+`wait` as `{"waitable": false, "reason": "orphaned_holder"}`. Reconciliation
+is an explicit operator action and is required before the quarantined key can
+be reused.

@@ -299,9 +299,9 @@ fn work_preserved_on_an_open_pull_request_matches_by_patch() {
     let closed = fixture.reconcile(&resolution, &["--dry-run"]);
     assert!(!closed.status.success());
     assert!(
-        String::from_utf8_lossy(&closed.stderr).contains("pull request #41 is not open"),
+        json_error::message(&closed).contains("pull request #41 is not open"),
         "{}",
-        String::from_utf8_lossy(&closed.stderr)
+        json_error::message(&closed)
     );
 }
 
@@ -337,12 +337,12 @@ fn a_commit_preserved_nowhere_refuses_tracked_elsewhere() {
 
     let refused = fixture.reconcile(&resolution, &["--dry-run"]);
     assert!(!refused.status.success());
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let error = json_error::message(&refused);
     assert!(
-        stderr.contains(&format!(
+        error.contains(&format!(
             "unrecorded integration commit {lost} cannot use tracked_elsewhere"
-        )) && stderr.contains("neither it nor an identical patch is on origin/agent/keep"),
-        "{stderr}"
+        )) && error.contains("neither it nor an identical patch is on origin/agent/keep"),
+        "{error}"
     );
     assert_eq!(
         git(&fixture.repo, &["rev-parse", "aethyme/integration"]),
@@ -360,8 +360,11 @@ fn a_commit_preserved_nowhere_refuses_tracked_elsewhere() {
     let refused = fixture.reconcile(&unpushed, &["--dry-run"]);
     assert!(!refused.status.success());
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("it is not proven pushed"),
+        json_error::message(&refused).contains("it is not proven pushed"),
         "{}",
-        String::from_utf8_lossy(&refused.stderr)
+        json_error::message(&refused)
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

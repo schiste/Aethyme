@@ -44,6 +44,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+  For a CLI launched from another directory or a session checkout, derive
+  isolation paths from the owning repository fixture and set its working
+  directory separately.
 - When exercising no-follow storage paths, canonicalize the fixture-owned
   temporary root before deriving its database and cache paths. Platform aliases
   such as macOS `/var` must not turn a valid fixture into a symlink traversal;
@@ -84,6 +87,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   to make it writable. After a reboot, mark missing evidence interrupted or
   unavailable. Recorded hashes do not recover missing bytes or recreate a trust
   record.
+- Before an expensive run, invoke the exact frozen helper entrypoint in its
+  plan and offline-control modes. Require nonempty parsed output with the
+  expected identity, schedule and zero-Cargo result; exit zero alone can hide a
+  missing entrypoint. Bind redundant manifest fields to the same final bytes.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Preserve earlier outputs before retrying.
   Freeze source for each invocation and record the exact head and dirty-state
@@ -164,6 +171,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `incremental=0` from the outset; avoid changing profile settings on a warm
   target. Expand to verbose or workspace-wide runs only when explicitly needed
   or after a focused failure.
+- Before a long or frozen Rust inventory, verify each selected
+  `--package`/`--test` pair against the owning package's effective Cargo
+  targets: the `tests/` defaults and any `[[test]]` or `autotests` settings
+  in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
+  target is a setup failure; stop before Cargo instead of treating it as a
+  product failure or zero-test result.
 - Run the fastest relevant test command first.
   Check the complete selected test names and a nonzero executed count before
   treating a focused run as evidence. Rust filters match substrings, including
@@ -178,11 +191,25 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   matching tests does not validate the change. Automated focused-test runners
   should refuse a successful zero-test result; preserve the process exit
   separately from that validation refusal.
+- For CLI JSON stream tests, parse complete stdout as one JSON value and
+  check child output on the intended stream separately. A report may retain
+  the original command arguments, so searching its serialized text for a child
+  marker cannot establish output isolation. Assert command metadata separately.
 - For a production guard that must prevent side effects, test the real entrypoint
   with a fixture command that writes a unique sentinel. Assert the typed refusal
   and sentinel absence, then remove only the call-site guard in a mutation run
   and verify that the sentinel assertion fails. A helper-only test cannot prove
   that the production path invokes the guard.
+- For each deliberate guard-removal check, run the same named regression on
+  unmodified source, with the deliberate break, and after byte-for-byte
+  restoration. Require positive, intended runtime failure, positive; a compile
+  failure or a test that also fails without the break does not validate the
+  guard. A passing adjacent suite cannot replace either positive run.
+- Before reclaiming a completed worktree, inspect ignored paths for qualification
+  records; a clean Git status does not cover them. Preserve irreplaceable
+  reports outside the worktree and build target, verify copied file sizes and
+  hashes, and check symlink targets before cleanup. Keep regenerable build
+  output separate from the evidence archive.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.

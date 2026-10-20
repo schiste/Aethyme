@@ -5,10 +5,18 @@
 //! accounting input, not a filesystem quota, exact physical-extent measure,
 //! or constraint on non-broker writers.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-
 use sha2::{Digest, Sha256};
+use std::path::Path;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[path = "managed_storage_inventory_core.rs"]
+pub(super) mod core;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(super) use core::TreeInventory;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) use core::{InventoryScan, InventoryScanPoll, ScanLimits};
 
 use super::{
     HostLeaseState, HostResourceCoordinator, HostResourceError, HostResourceGrant,
@@ -22,6 +30,8 @@ const OWNER_TTL_MAX_SECONDS: u64 = 86_400;
 const SCAN_MAX_ENTRIES: usize = 100_000;
 const SCAN_MAX_DEPTH: usize = 64;
 const SCAN_MAX_DURATION: Duration = Duration::from_secs(3);
+const ROOT_SET_MAX_ROOTS: usize = 32;
+const ROOT_SET_MAX_POLL_WORK: usize = 512;
 
 /// A new reservation grants one materialization attempt. Existing rows are
 /// returned as status and never grant another attempt.
@@ -54,6 +64,98 @@ pub(crate) struct ManagedStorageOwner<'a> {
     repository: String,
     root: RootBinding,
     ttl_seconds: u64,
+}
+
+/// A bounded collection of existing materialization roots under one
+/// repository's preparation-cache directory. It preserves the single-root
+/// path domain and does not resolve profile selectors or arbitrary worktree
+/// paths. Roots are ordered by their path-derived identity, and duplicate
+/// identities are refused rather than silently collapsed.
+///
+/// Capturing these bindings does not make later scans an atomic filesystem
+/// snapshot or fence writers outside the cooperative broker lease.
+#[allow(
+    dead_code,
+    reason = "root-set inventory is the staged foundation for managed profile adoption"
+)]
+#[derive(Debug)]
+pub(crate) struct ManagedStorageRootSetBinding {
+    repository: String,
+    roots: Vec<RootBinding>,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+pub(crate) struct ManagedStorageRootInventoryReceipt {
+    materialization: String,
+    filesystem_id: String,
+    root_identity: String,
+    root_instance_id: String,
+    allocated_bytes: u64,
+    entry_count: usize,
+    inventory_digest: String,
+}
+
+/// Aggregate receipt for sequential observations of a bounded root set.
+///
+/// The scanner completes one root before starting the next while retaining one
+/// preparation-cache lease. This is not an atomic filesystem snapshot: the
+/// lease coordinates broker writers for that cache, but does not exclude
+/// non-broker writers or changes between per-root observations. A caller must
+/// revalidate identities at a later mutation boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+pub(crate) struct CompleteManagedStorageRootSetInventory {
+    repository: String,
+    root_set_digest: String,
+    lease_id: String,
+    generation: u64,
+    roots: Vec<ManagedStorageRootInventoryReceipt>,
+    allocated_bytes: u64,
+    entry_count: usize,
+    inventory_digest: String,
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+pub(crate) enum ManagedStorageRootSetInventoryPoll {
+    Pending,
+    Complete(CompleteManagedStorageRootSetInventory),
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+pub(crate) struct ManagedStorageRootSetInventoryScan<'a> {
+    binding: &'a ManagedStorageRootSetBinding,
+    lease_id: String,
+    generation: u64,
+    next_root: usize,
+    current: Option<InventoryScan<'a>>,
+    receipts: Vec<ManagedStorageRootInventoryReceipt>,
+    failed: bool,
+    finished: bool,
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+pub(crate) struct ManagedStorageRootSetInventoryScan<'a> {
+    _binding: std::marker::PhantomData<&'a ManagedStorageRootSetBinding>,
 }
 
 #[allow(
@@ -117,13 +219,13 @@ impl<'a> ManagedStorageOwner<'a> {
     }
 
     pub(crate) fn filesystem_id(&self) -> &str {
-        &self.root.filesystem_id
+        self.root.filesystem_id()
     }
 
     /// A path-derived opaque identity suitable for a ManagedStorageClaimRequest.
     /// The absolute path itself is never written to the host-resource ledger.
     pub(crate) fn root_identity(&self) -> &str {
-        &self.root.identity
+        self.root.root_identity()
     }
 
     /// Exact retries return status only. A new permit is returned only after a
@@ -157,7 +259,7 @@ impl<'a> ManagedStorageOwner<'a> {
             ));
         }
 
-        let free_space_root = self.root.parent.clone();
+        let free_space_root = self.root.parent().to_path_buf();
         match self
             .coordinator
             .reserve_managed_storage_with_probe(request, || {
@@ -195,7 +297,7 @@ impl<'a> ManagedStorageOwner<'a> {
         self.renew()?;
         let claim = self
             .coordinator
-            .managed_storage_claim(&self.repository, &self.root.filesystem_id, claim_id)?
+            .managed_storage_claim(&self.repository, self.root.filesystem_id(), claim_id)?
             .ok_or_else(|| {
                 managed_storage_refusal(
                     "managed_storage_claim_missing",
@@ -333,7 +435,7 @@ impl<'a> ManagedStorageOwner<'a> {
                 "the exact charged root no longer matches its measured baseline and instance",
             ));
         }
-        let free_space_root = self.root.parent.clone();
+        let free_space_root = self.root.parent().to_path_buf();
         let root_instance_id = lineage.root_instance_id.ok_or_else(|| {
             managed_storage_refusal(
                 "managed_storage_predecessor_unmeasured",
@@ -449,9 +551,9 @@ impl<'a> ManagedStorageOwner<'a> {
     ) -> Result<(), HostResourceError> {
         validate_managed_storage_claim_request(request)?;
         if request.repository != self.repository
-            || request.materialization != self.root.materialization
-            || request.filesystem_id != self.root.filesystem_id
-            || request.root_identity != self.root.identity
+            || request.materialization != self.root.materialization()
+            || request.filesystem_id != self.root.filesystem_id()
+            || request.root_identity != self.root.root_identity()
         {
             return Err(managed_storage_refusal(
                 "managed_storage_owner_mismatch",
@@ -487,6 +589,119 @@ impl<'a> ManagedStorageOwner<'a> {
         Ok(())
     }
 
+    /// Start a bounded scan of sibling materializations under this exact
+    /// repository preparation-cache lease. Roots are observed sequentially;
+    /// the lease coordinates broker writers for this cache, not unrelated
+    /// filesystem writers. The set binding must come from the same cache root
+    /// and repository as this owner.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn begin_root_set_inventory_scan<'b>(
+        &mut self,
+        binding: &'b ManagedStorageRootSetBinding,
+    ) -> Result<ManagedStorageRootSetInventoryScan<'b>, HostResourceError> {
+        self.validate_root_set_binding(binding)?;
+        self.renew()?;
+        Ok(ManagedStorageRootSetInventoryScan {
+            binding,
+            lease_id: self.grant.lease.lease_id.clone(),
+            generation: self.grant.lease.generation,
+            next_root: 0,
+            current: None,
+            receipts: Vec::with_capacity(binding.roots.len()),
+            failed: false,
+            finished: false,
+        })
+    }
+
+    /// Advance at most one scanner poll, renewing this same lease before and
+    /// after the bounded work. Roots are scanned one at a time, so completion
+    /// does not imply an atomic snapshot across the set. A failed or completed
+    /// scan is terminal.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn poll_root_set_inventory_scan(
+        &mut self,
+        scan: &mut ManagedStorageRootSetInventoryScan<'_>,
+        work_budget: usize,
+    ) -> Result<ManagedStorageRootSetInventoryPoll, HostResourceError> {
+        let result = (|| {
+            if scan.failed || scan.finished {
+                return Err(scan_refusal(
+                    "managed root-set inventory scan was polled after completion or refusal",
+                ));
+            }
+            if !(1..=ROOT_SET_MAX_POLL_WORK).contains(&work_budget) {
+                return Err(managed_storage_refusal(
+                    "managed_storage_inventory_incomplete",
+                    "root-set poll work budget must be 1..=512",
+                ));
+            }
+            if scan.lease_id != self.grant.lease.lease_id
+                || scan.generation != self.grant.lease.generation
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_owner_mismatch",
+                    "root-set scan belongs to another host lease generation",
+                ));
+            }
+            self.validate_root_set_binding(scan.binding)?;
+            self.renew()?;
+            let polled = scan.poll_next(work_budget)?;
+            self.renew()?;
+            Ok(polled)
+        })();
+        if result.is_err() {
+            scan.failed = true;
+        }
+        result
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn validate_root_set_binding(
+        &self,
+        binding: &ManagedStorageRootSetBinding,
+    ) -> Result<(), HostResourceError> {
+        if binding.repository != self.repository
+            || binding.roots.is_empty()
+            || binding.roots.len() > ROOT_SET_MAX_ROOTS
+            || binding.digest != root_set_binding_digest(&binding.repository, &binding.roots)
+            || binding.roots[0].root_identity() != self.root.root_identity()
+            || binding.roots.iter().any(|root| {
+                root.parent() != self.root.parent()
+                    || root.parent_identity() != self.root.parent_identity()
+                    || root.filesystem_id() != self.root.filesystem_id()
+            })
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_owner_mismatch",
+                "root set must match this owner's repository cache, filesystem, and anchor root",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn begin_root_set_inventory_scan<'b>(
+        &mut self,
+        _binding: &'b ManagedStorageRootSetBinding,
+    ) -> Result<ManagedStorageRootSetInventoryScan<'b>, HostResourceError> {
+        Err(managed_storage_refusal(
+            "managed_storage_inventory_unsupported",
+            "bounded managed-storage inventory is currently supported only on macOS and Linux",
+        ))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn poll_root_set_inventory_scan(
+        &mut self,
+        _scan: &mut ManagedStorageRootSetInventoryScan<'_>,
+        _work_budget: usize,
+    ) -> Result<ManagedStorageRootSetInventoryPoll, HostResourceError> {
+        Err(managed_storage_refusal(
+            "managed_storage_inventory_unsupported",
+            "bounded managed-storage inventory is currently supported only on macOS and Linux",
+        ))
+    }
+
     fn consume_inventory(
         &mut self,
         request: &ManagedStorageClaimRequest,
@@ -503,15 +718,333 @@ impl<'a> ManagedStorageOwner<'a> {
     }
 }
 
-#[derive(Debug)]
-struct RootBinding {
-    parent: PathBuf,
-    leaf: std::ffi::OsString,
-    materialization: String,
-    parent_device: u64,
-    parent_inode: u64,
-    identity: String,
-    filesystem_id: String,
+pub(super) use core::PinnedManagedStorageRoot as RootBinding;
+
+#[allow(
+    dead_code,
+    reason = "root-set inventory bindings are consumed by the staged managed profile path"
+)]
+impl ManagedStorageRootSetBinding {
+    /// Capture a finite set of existing-root bindings in the same path domain
+    /// as `ManagedStorageOwner`. The scanner later refuses any absent root.
+    /// This records bindings only; it does not fence writers or create an atomic
+    /// observation across the selected roots.
+    pub(crate) fn capture(
+        preparation_cache_root: &Path,
+        repository: &str,
+        materializations: &[String],
+    ) -> Result<Self, HostResourceError> {
+        validate_lower_hex_identifier("repository", repository, 64)?;
+        if materializations.is_empty() || materializations.len() > ROOT_SET_MAX_ROOTS {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_invalid",
+                "managed root set must contain 1..=32 materializations",
+            ));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut roots = Vec::with_capacity(materializations.len());
+        for materialization in materializations {
+            validate_lower_hex_identifier("materialization", materialization, 12)?;
+            if !seen.insert(materialization.as_str()) {
+                return Err(managed_storage_refusal(
+                    "managed_storage_root_set_overlap",
+                    "duplicate materializations would bind the same managed root more than once",
+                ));
+            }
+            roots.push(RootBinding::new(
+                preparation_cache_root,
+                repository,
+                materialization,
+            )?);
+        }
+
+        let first = roots.first().ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_root_set_invalid",
+                "managed root set cannot be empty",
+            )
+        })?;
+        if roots.iter().any(|root| {
+            root.parent() != first.parent()
+                || root.parent_identity() != first.parent_identity()
+                || root.filesystem_id() != first.filesystem_id()
+        }) {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_overlap",
+                "all roots must be sibling materializations under the same pinned repository cache directory",
+            ));
+        }
+
+        roots.sort_by(|left, right| left.root_identity().cmp(right.root_identity()));
+        if roots
+            .windows(2)
+            .any(|pair| pair[0].root_identity() == pair[1].root_identity())
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_overlap",
+                "distinct materializations resolved to the same path identity",
+            ));
+        }
+
+        let digest = root_set_binding_digest(repository, &roots);
+        Ok(Self {
+            repository: repository.to_owned(),
+            roots,
+            digest,
+        })
+    }
+
+    pub(crate) fn root_set_digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(crate) fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub(super) fn first_materialization(&self) -> Result<&str, HostResourceError> {
+        self.roots
+            .first()
+            .map(|root| root.materialization())
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_root_set_invalid",
+                    "managed root set cannot be empty",
+                )
+            })
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+impl ManagedStorageRootInventoryReceipt {
+    pub(crate) fn materialization(&self) -> &str {
+        &self.materialization
+    }
+
+    pub(crate) fn filesystem_id(&self) -> &str {
+        &self.filesystem_id
+    }
+
+    pub(crate) fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
+
+    pub(crate) fn root_instance_id(&self) -> &str {
+        &self.root_instance_id
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) fn inventory_digest(&self) -> &str {
+        &self.inventory_digest
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+impl CompleteManagedStorageRootSetInventory {
+    pub(crate) fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    pub(crate) fn root_set_digest(&self) -> &str {
+        &self.root_set_digest
+    }
+
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn roots(&self) -> &[ManagedStorageRootInventoryReceipt] {
+        &self.roots
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) fn inventory_digest(&self) -> &str {
+        &self.inventory_digest
+    }
+}
+
+fn root_set_binding_digest(repository: &str, roots: &[RootBinding]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"aethyme-managed-storage-root-set-binding-v1\0");
+    update_root_set_hash_component(&mut digest, repository.as_bytes());
+    digest.update((roots.len() as u64).to_le_bytes());
+    for root in roots {
+        update_root_set_hash_component(&mut digest, root.materialization().as_bytes());
+        update_root_set_hash_component(&mut digest, root.filesystem_id().as_bytes());
+        update_root_set_hash_component(&mut digest, root.root_identity().as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn update_root_set_hash_component(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+fn validate_unique_root_instance(
+    receipts: &[ManagedStorageRootInventoryReceipt],
+    root_instance_id: &str,
+) -> Result<(), HostResourceError> {
+    if receipts
+        .iter()
+        .any(|receipt| receipt.root_instance_id == root_instance_id)
+    {
+        return Err(managed_storage_refusal(
+            "managed_storage_root_set_overlap",
+            "selected materialization roots resolve to the same directory instance",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+impl ManagedStorageRootSetInventoryScan<'_> {
+    fn poll_next(
+        &mut self,
+        work_budget: usize,
+    ) -> Result<ManagedStorageRootSetInventoryPoll, HostResourceError> {
+        let root = self
+            .binding
+            .roots
+            .get(self.next_root)
+            .ok_or_else(|| scan_refusal("managed root-set scan has no remaining root"))?;
+        if self.current.is_none() {
+            self.current = Some(InventoryScan::begin(root, ScanLimits::existing_owner())?);
+        }
+
+        let tree = match self
+            .current
+            .as_mut()
+            .ok_or_else(|| scan_refusal("managed root-set scan lost its active root"))?
+            .poll(work_budget)?
+        {
+            InventoryScanPoll::Pending => return Ok(ManagedStorageRootSetInventoryPoll::Pending),
+            InventoryScanPoll::Complete(tree) => tree,
+        };
+        if !tree.root_present() {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_incomplete",
+                "every selected managed root must exist before a complete root-set inventory is issued",
+            ));
+        }
+        let root_instance_id = tree.root_instance_id().ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_root_instance_missing",
+                "a present managed root must have a pinned instance identity",
+            )
+        })?;
+        validate_unique_root_instance(&self.receipts, root_instance_id)?;
+        self.receipts.push(ManagedStorageRootInventoryReceipt {
+            materialization: root.materialization().to_owned(),
+            filesystem_id: root.filesystem_id().to_owned(),
+            root_identity: root.root_identity().to_owned(),
+            root_instance_id: root_instance_id.to_owned(),
+            allocated_bytes: tree.allocated_bytes(),
+            entry_count: tree.entry_count(),
+            inventory_digest: tree.inventory_digest().to_owned(),
+        });
+        self.current = None;
+        self.next_root += 1;
+        if self.next_root < self.binding.roots.len() {
+            return Ok(ManagedStorageRootSetInventoryPoll::Pending);
+        }
+
+        self.finished = true;
+        self.build_complete_receipt()
+            .map(ManagedStorageRootSetInventoryPoll::Complete)
+    }
+
+    fn build_complete_receipt(
+        &self,
+    ) -> Result<CompleteManagedStorageRootSetInventory, HostResourceError> {
+        if self.receipts.len() != self.binding.roots.len() {
+            return Err(scan_refusal(
+                "managed root-set scan completed with an incomplete receipt",
+            ));
+        }
+        let mut allocated_bytes = 0_u64;
+        let mut entry_count = 0_usize;
+        let mut inventory_digest = Sha256::new();
+        inventory_digest.update(b"aethyme-managed-storage-root-set-inventory-v1\0");
+        update_root_set_hash_component(&mut inventory_digest, self.binding.repository.as_bytes());
+        update_root_set_hash_component(&mut inventory_digest, self.binding.digest.as_bytes());
+        update_root_set_hash_component(&mut inventory_digest, self.lease_id.as_bytes());
+        inventory_digest.update(self.generation.to_le_bytes());
+        inventory_digest.update((self.receipts.len() as u64).to_le_bytes());
+        for receipt in &self.receipts {
+            allocated_bytes = allocated_bytes
+                .checked_add(receipt.allocated_bytes)
+                .ok_or_else(|| {
+                    managed_storage_refusal(
+                        "managed_storage_inventory_overflow",
+                        "aggregate root-set allocated bytes exceeded the supported range",
+                    )
+                })?;
+            entry_count = entry_count
+                .checked_add(receipt.entry_count)
+                .ok_or_else(|| {
+                    managed_storage_refusal(
+                        "managed_storage_inventory_overflow",
+                        "aggregate root-set entry count exceeded the supported range",
+                    )
+                })?;
+            update_root_set_hash_component(
+                &mut inventory_digest,
+                receipt.materialization.as_bytes(),
+            );
+            update_root_set_hash_component(&mut inventory_digest, receipt.filesystem_id.as_bytes());
+            update_root_set_hash_component(&mut inventory_digest, receipt.root_identity.as_bytes());
+            update_root_set_hash_component(
+                &mut inventory_digest,
+                receipt.root_instance_id.as_bytes(),
+            );
+            inventory_digest.update(receipt.allocated_bytes.to_le_bytes());
+            inventory_digest.update((receipt.entry_count as u64).to_le_bytes());
+            update_root_set_hash_component(
+                &mut inventory_digest,
+                receipt.inventory_digest.as_bytes(),
+            );
+        }
+        Ok(CompleteManagedStorageRootSetInventory {
+            repository: self.binding.repository.clone(),
+            root_set_digest: self.binding.digest.clone(),
+            lease_id: self.lease_id.clone(),
+            generation: self.generation,
+            roots: self.receipts.clone(),
+            allocated_bytes,
+            entry_count,
+            inventory_digest: format!("{:x}", inventory_digest.finalize()),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -558,266 +1091,31 @@ impl CompleteManagedStorageInventory {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-impl RootBinding {
-    fn new(
-        preparation_cache_root: &Path,
-        repository: &str,
-        materialization: &str,
-    ) -> Result<Self, HostResourceError> {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let path = preparation_cache_root
-            .join(repository)
-            .join(materialization);
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|source| HostResourceError::Io {
-                    path: PathBuf::from("."),
-                    source,
-                })?
-                .join(path)
-        };
-        let leaf = absolute.file_name().ok_or_else(|| {
-            managed_storage_refusal(
-                "managed_storage_root_invalid",
-                "managed root must name a directory below a parent",
-            )
-        })?;
-        if leaf == "." || leaf == ".." {
-            return Err(managed_storage_refusal(
-                "managed_storage_root_invalid",
-                "managed root leaf cannot be dot or dot-dot",
-            ));
-        }
-        let canonical_store = std::fs::canonicalize(preparation_cache_root).map_err(|source| {
-            HostResourceError::Io {
-                path: preparation_cache_root.to_path_buf(),
-                source,
-            }
-        })?;
-        let store_fd = open_absolute_directory_nofollow(&canonical_store)?;
-        let store_stat = fstat(store_fd.as_raw_fd(), &canonical_store)?;
-        if file_type(&store_stat) != libc::S_IFDIR {
-            return Err(managed_storage_refusal(
-                "managed_storage_root_invalid",
-                "preparation cache root must resolve to a directory",
-            ));
-        }
-        let repository_name = std::ffi::CString::new(repository)
-            .map_err(|_| scan_refusal("repository identity contained an invalid NUL"))?;
-        let repository_stat = match stat_at(
-            store_fd.as_raw_fd(),
-            &repository_name,
-            libc::AT_SYMLINK_NOFOLLOW,
-        ) {
-            Ok(stat) if file_type(&stat) == libc::S_IFDIR && stat.st_dev == store_stat.st_dev => {
-                stat
-            }
-            Ok(_) => {
-                return Err(managed_storage_refusal(
-                    "managed_storage_repository_root_invalid",
-                    "repository cache root must be a non-symlink directory on the preparation-cache filesystem",
-                ));
-            }
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
-                return Err(managed_storage_refusal(
-                    "managed_storage_repository_root_missing",
-                    "repository cache root must be created under its exact exclusive lease before reserving a materialization",
-                ));
-            }
-            Err(source) => {
-                return Err(HostResourceError::Io {
-                    path: canonical_store.join(repository),
-                    source,
-                });
-            }
-        };
-        let repository_fd = openat_directory(
-            store_fd.as_raw_fd(),
-            &repository_name,
-            &canonical_store.join(repository),
-        )?;
-        let opened_repository_stat =
-            fstat(repository_fd.as_raw_fd(), &canonical_store.join(repository))?;
-        if !same_identity(&repository_stat, &opened_repository_stat) {
-            return Err(scan_refusal(
-                "repository cache root changed while it was being opened",
-            ));
-        }
-        let canonical_parent = canonical_store.join(repository);
-        let parent_fd = open_absolute_directory_nofollow(&canonical_parent)?;
-        let parent_stat = fstat(parent_fd.as_raw_fd(), &canonical_parent)?;
-        if !same_identity(&opened_repository_stat, &parent_stat) {
-            return Err(scan_refusal(
-                "repository cache root changed while its parent binding was established",
-            ));
-        }
-        let leaf_string = leaf.to_os_string();
-        let leaf_c = cstring_from_os(&leaf_string)?;
-        match stat_at(parent_fd.as_raw_fd(), &leaf_c, libc::AT_SYMLINK_NOFOLLOW) {
-            Ok(stat) if file_type(&stat) == libc::S_IFDIR && stat.st_dev == parent_stat.st_dev => {}
-            Ok(_) => {
-                return Err(managed_storage_refusal(
-                    "managed_storage_root_invalid",
-                    "existing managed root must be a non-symlink directory on its parent filesystem",
-                ));
-            }
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
-            Err(source) => {
-                return Err(HostResourceError::Io {
-                    path: canonical_parent.join(&leaf_string),
-                    source,
-                });
-            }
-        }
-
-        let mut path_bytes = canonical_parent.as_os_str().as_bytes().to_vec();
-        path_bytes.push(b'/');
-        path_bytes.extend_from_slice(leaf_string.as_bytes());
-        let mut hash = Sha256::new();
-        hash.update(b"aethyme-managed-storage-root-v1\0");
-        hash.update(&path_bytes);
-        let identity = format!("path-v1:{:x}", hash.finalize());
-        let filesystem_id = filesystem_identity(device_id(&parent_stat));
-        Ok(Self {
-            parent: canonical_parent,
-            leaf: leaf_string,
-            materialization: materialization.to_owned(),
-            parent_device: device_id(&parent_stat),
-            parent_inode: parent_stat.st_ino as u64,
-            identity,
-            filesystem_id,
-        })
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-impl RootBinding {
-    fn new(
-        _preparation_cache_root: &Path,
-        _repository: &str,
-        _materialization: &str,
-    ) -> Result<Self, HostResourceError> {
-        Err(managed_storage_refusal(
-            "managed_storage_inventory_unsupported",
-            "bounded managed-storage inventory is currently supported only on macOS and Linux",
-        ))
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn scan_complete(
     root: &RootBinding,
     grant: &HostResourceGrant,
     request: &ManagedStorageClaimRequest,
 ) -> Result<CompleteManagedStorageInventory, HostResourceError> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let parent_fd = open_absolute_directory_nofollow(&root.parent)?;
-    let leaf_c = cstring_from_os(&root.leaf)?;
-    let parent_before = fstat(parent_fd.as_raw_fd(), &root.parent)?;
-    let leaf_path = root.parent.join(&root.leaf);
-    let root_stat = match stat_at(parent_fd.as_raw_fd(), &leaf_c, libc::AT_SYMLINK_NOFOLLOW) {
-        Ok(stat) => Some(stat),
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => None,
-        Err(source) => {
-            return Err(HostResourceError::Io {
-                path: leaf_path.clone(),
-                source,
-            });
+    let mut scan = InventoryScan::begin(root, ScanLimits::existing_owner())?;
+    let tree = loop {
+        match scan.poll(512)? {
+            InventoryScanPoll::Pending => {}
+            InventoryScanPoll::Complete(tree) => break tree,
         }
     };
-    let expected_device = parse_filesystem_identity(&root.filesystem_id)?;
-    if device_id(&parent_before) != expected_device
-        || device_id(&parent_before) != root.parent_device
-        || parent_before.st_ino != root.parent_inode
-    {
-        return Err(managed_storage_refusal(
-            "managed_storage_filesystem_changed",
-            "managed root parent identity or filesystem changed after owner creation",
-        ));
-    }
-
-    let mut scanner = Scanner::new(expected_device, Instant::now() + SCAN_MAX_DURATION);
-    let mut root_instance_id = None;
-    let root_present = if let Some(root_stat) = root_stat {
-        if file_type(&root_stat) != libc::S_IFDIR || device_id(&root_stat) != expected_device {
-            return Err(managed_storage_refusal(
-                "managed_storage_root_invalid",
-                "managed root must remain a directory on the owner's filesystem",
-            ));
-        }
-        let root_fd = openat_directory(parent_fd.as_raw_fd(), &leaf_c, &leaf_path)?;
-        let opened_stat = fstat(root_fd.as_raw_fd(), &leaf_path)?;
-        ensure_same_identity(
-            &root_stat,
-            &opened_stat,
-            "managed root changed while it was being opened",
-        )?;
-        root_instance_id = Some(format!(
-            "unix-inode-v1:{}:{}",
-            opened_stat.st_dev, opened_stat.st_ino
-        ));
-        scanner.visit_directory(root_fd.as_raw_fd(), &leaf_path, 0, Some(&opened_stat))?;
-        let named_after = stat_at(parent_fd.as_raw_fd(), &leaf_c, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(|source| HostResourceError::Io {
-                path: leaf_path.clone(),
-                source,
-            })?;
-        ensure_same_identity(
-            &opened_stat,
-            &named_after,
-            "managed root name changed during inventory",
-        )?;
-        true
-    } else {
-        false
-    };
-
-    let parent_after = fstat(parent_fd.as_raw_fd(), &root.parent)?;
-    let named_parent_fd = open_absolute_directory_nofollow(&root.parent)?;
-    let named_parent_after = fstat(named_parent_fd.as_raw_fd(), &root.parent)?;
-    if !same_identity(&parent_before, &parent_after)
-        || !same_identity(&parent_before, &named_parent_after)
-    {
-        return Err(scan_refusal("managed root parent changed during inventory"));
-    }
-    if !root_present {
-        match stat_at(parent_fd.as_raw_fd(), &leaf_c, libc::AT_SYMLINK_NOFOLLOW) {
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
-            _ => {
-                return Err(scan_refusal(
-                    "managed root appeared during absent-root inventory",
-                ));
-            }
-        }
-    }
-
-    let mut receipt_hash = scanner.digest;
-    receipt_hash.update(root.parent.as_os_str().as_bytes());
-    receipt_hash.update(root.leaf.as_bytes());
-    receipt_hash.update(scanner.allocated_bytes.to_le_bytes());
-    receipt_hash.update((scanner.entry_count as u64).to_le_bytes());
-    if let Some(root_instance_id) = &root_instance_id {
-        receipt_hash.update(root_instance_id.as_bytes());
-    }
     Ok(CompleteManagedStorageInventory {
         repository: request.repository.clone(),
-        filesystem_id: root.filesystem_id.clone(),
+        filesystem_id: root.filesystem_id().to_owned(),
         claim_id: request.claim_id.clone(),
         request_digest: super::managed_storage_claim_digest(request)?,
-        root_identity: root.identity.clone(),
+        root_identity: root.root_identity().to_owned(),
         lease_id: grant.lease.lease_id.clone(),
         generation: grant.lease.generation,
-        allocated_bytes: scanner.allocated_bytes,
-        root_instance_id,
-        entry_count: scanner.entry_count.max(1),
-        inventory_digest: format!("{:x}", receipt_hash.finalize()),
-        root_present,
+        allocated_bytes: tree.allocated_bytes(),
+        root_instance_id: tree.root_instance_id().map(str::to_owned),
+        entry_count: tree.entry_count(),
+        inventory_digest: tree.inventory_digest().to_owned(),
+        root_present: tree.root_present(),
     })
 }
 
@@ -831,198 +1129,6 @@ fn scan_complete(
         "managed_storage_inventory_unsupported",
         "bounded managed-storage inventory is currently supported only on macOS and Linux",
     ))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-struct Scanner {
-    device: u64,
-    deadline: Instant,
-    entry_count: usize,
-    allocated_bytes: u64,
-    seen_inodes: std::collections::HashSet<(u64, u64)>,
-    digest: Sha256,
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-impl Scanner {
-    fn new(device: u64, deadline: Instant) -> Self {
-        Self {
-            device,
-            deadline,
-            entry_count: 0,
-            allocated_bytes: 0,
-            seen_inodes: std::collections::HashSet::new(),
-            digest: Sha256::new(),
-        }
-    }
-
-    fn visit_directory(
-        &mut self,
-        fd: libc::c_int,
-        path: &Path,
-        depth: usize,
-        expected: Option<&libc::stat>,
-    ) -> Result<(), HostResourceError> {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::ffi::OsStrExt as _;
-
-        if depth > SCAN_MAX_DEPTH {
-            return Err(scan_refusal("directory depth limit exceeded"));
-        }
-        self.check_deadline(path)?;
-        let dir_stat = fstat(fd, path)?;
-        if device_id(&dir_stat) != self.device || file_type(&dir_stat) != libc::S_IFDIR {
-            return Err(scan_refusal("directory crossed filesystem or changed type"));
-        }
-        if expected.is_some_and(|expected| !same_identity(expected, &dir_stat)) {
-            return Err(scan_refusal(
-                "directory identity changed before enumeration",
-            ));
-        }
-        self.count_stat(&dir_stat, b".")?;
-
-        // SAFETY: `fd` is the live directory descriptor checked above; `fcntl`
-        // duplicates it and returns either a new owned descriptor or -1.
-        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if duplicate < 0 {
-            return Err(io_failure(path));
-        }
-        // SAFETY: `duplicate` is a fresh descriptor owned by this function;
-        // on success `fdopendir` takes ownership, and on failure we close it.
-        let stream = unsafe { libc::fdopendir(duplicate) };
-        if stream.is_null() {
-            // SAFETY: `fdopendir` failed and therefore did not take ownership
-            // of this freshly duplicated descriptor.
-            unsafe { libc::close(duplicate) };
-            return Err(io_failure(path));
-        }
-        let stream = DirectoryStream(stream);
-        let mut names = Vec::<Vec<u8>>::new();
-        loop {
-            set_errno(0);
-            // SAFETY: `stream` uniquely owns this DIR pointer and is used only
-            // by this scan; `readdir` returns a borrowed entry for that stream.
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                if get_errno() != 0 {
-                    return Err(io_failure(path));
-                }
-                break;
-            }
-            // SAFETY: `readdir` returned a live entry whose `d_name` is
-            // NUL-terminated and remains valid until the next `readdir` call.
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name == b"." || name == b".." {
-                continue;
-            }
-            if names.len().is_multiple_of(256) {
-                self.check_deadline(path)?;
-            }
-            if self.entry_count.saturating_add(names.len()) >= SCAN_MAX_ENTRIES {
-                return Err(scan_refusal("entry limit exceeded"));
-            }
-            names.push(name.to_vec());
-        }
-        names.sort();
-
-        for name_bytes in names {
-            self.check_deadline(path)?;
-            let name = std::ffi::CString::new(name_bytes)
-                .map_err(|_| scan_refusal("directory entry contained an invalid NUL"))?;
-            let child_stat = stat_at(fd, &name, libc::AT_SYMLINK_NOFOLLOW).map_err(|_| {
-                scan_refusal("entry metadata could not be read without following links")
-            })?;
-            if device_id(&child_stat) != self.device {
-                return Err(scan_refusal("entry crossed onto another filesystem"));
-            }
-            let child_path = path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
-            if file_type(&child_stat) == libc::S_IFDIR {
-                let child = openat_directory(fd, &name, &child_path)?;
-                let opened_stat = fstat(child.as_raw_fd(), &child_path)?;
-                ensure_same_identity(
-                    &child_stat,
-                    &opened_stat,
-                    "directory entry changed while opening",
-                )?;
-                self.visit_directory(
-                    child.as_raw_fd(),
-                    &child_path,
-                    depth + 1,
-                    Some(&opened_stat),
-                )?;
-            } else {
-                self.count_stat(&child_stat, name.as_bytes())?;
-                if file_type(&child_stat) == libc::S_IFREG {
-                    let child = openat_regular(fd, &name, &child_path)?;
-                    let opened_stat = fstat(child.as_raw_fd(), &child_path)?;
-                    ensure_same_identity(
-                        &child_stat,
-                        &opened_stat,
-                        "regular file changed while opening",
-                    )?;
-                }
-            }
-        }
-
-        let after = fstat(fd, path)?;
-        if !same_identity(&dir_stat, &after) {
-            return Err(scan_refusal("directory changed during inventory"));
-        }
-        Ok(())
-    }
-
-    fn count_stat(&mut self, stat: &libc::stat, name: &[u8]) -> Result<(), HostResourceError> {
-        if self.seen_inodes.insert((device_id(stat), stat.st_ino)) {
-            let blocks = u64::try_from(stat.st_blocks)
-                .map_err(|_| scan_refusal("negative allocated block count"))?;
-            let bytes = blocks
-                .checked_mul(512)
-                .ok_or_else(|| scan_refusal("allocated byte count overflowed"))?;
-            self.allocated_bytes = self
-                .allocated_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| scan_refusal("total allocated byte count overflowed"))?;
-        }
-        self.entry_count = self
-            .entry_count
-            .checked_add(1)
-            .ok_or_else(|| scan_refusal("entry count overflowed"))?;
-        self.digest.update((name.len() as u64).to_le_bytes());
-        self.digest.update(name);
-        self.digest.update(device_id(stat).to_le_bytes());
-        self.digest.update(stat.st_ino.to_le_bytes());
-        self.digest.update((stat.st_mode as u64).to_le_bytes());
-        self.digest.update(stat.st_size.to_le_bytes());
-        self.digest.update(stat.st_blocks.to_le_bytes());
-        if self.entry_count > SCAN_MAX_ENTRIES {
-            return Err(scan_refusal("entry limit exceeded"));
-        }
-        Ok(())
-    }
-
-    fn check_deadline(&self, path: &Path) -> Result<(), HostResourceError> {
-        if Instant::now() >= self.deadline {
-            return Err(scan_refusal(&format!(
-                "inventory exceeded its bounded deadline at {}",
-                path.display()
-            )));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-struct DirectoryStream(*mut libc::DIR);
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        // SAFETY: this wrapper uniquely owns the non-null DIR pointer returned
-        // by `fdopendir`; `closedir` closes its descriptor and frees the stream.
-        unsafe {
-            libc::closedir(self.0);
-        }
-    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1292,8 +1398,11 @@ mod tests {
         VerifiedManagedStorageRemoval, load_managed_storage_lineage, managed_storage_i64,
     };
     use rusqlite::params;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
     const REPOSITORY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1327,8 +1436,8 @@ mod tests {
 
             let binding =
                 RootBinding::new(&preparation_cache_root, REPOSITORY, MATERIALIZATION).unwrap();
-            let filesystem_id = binding.filesystem_id.clone();
-            let root_identity = binding.identity.clone();
+            let filesystem_id = binding.filesystem_id().to_owned();
+            let root_identity = binding.root_identity().to_owned();
             let database = temp.path().join("host-resources.db");
             let mut coordinator = HostResourceCoordinator::open(&database).unwrap();
             coordinator
@@ -1380,6 +1489,22 @@ mod tests {
             )
         }
 
+        fn root_set_owner(
+            &mut self,
+            binding: &ManagedStorageRootSetBinding,
+        ) -> Result<ManagedStorageOwner<'_>, HostResourceError> {
+            let grant = self.coordinator.acquire(&self.lease_request)?;
+            let repository = self.repository.clone();
+            let cache_root = self.preparation_cache_root.clone();
+            self.coordinator.begin_managed_storage_root_set_owner(
+                grant,
+                &repository,
+                &cache_root,
+                binding,
+                60,
+            )
+        }
+
         fn claim(&self, claim_id: &str, reserved_bytes: u64) -> ManagedStorageClaimRequest {
             ManagedStorageClaimRequest {
                 repository: self.repository.clone(),
@@ -1424,6 +1549,118 @@ mod tests {
                 panic!("expected a new materialization permit, got {claim:?}")
             }
         }
+    }
+
+    fn run_inventory_scan(
+        root: &RootBinding,
+        limits: ScanLimits,
+        work_budget: usize,
+    ) -> Result<TreeInventory, HostResourceError> {
+        let mut scan = InventoryScan::begin(root, limits)?;
+        loop {
+            match scan.poll(work_budget)? {
+                InventoryScanPoll::Pending => {}
+                InventoryScanPoll::Complete(inventory) => return Ok(inventory),
+            }
+        }
+    }
+
+    fn capture_root_set(
+        fixture: &Fixture,
+        materializations: &[&str],
+    ) -> ManagedStorageRootSetBinding {
+        let materializations = materializations
+            .iter()
+            .map(|materialization| (*materialization).to_owned())
+            .collect::<Vec<_>>();
+        ManagedStorageRootSetBinding::capture(
+            &fixture.preparation_cache_root,
+            &fixture.repository,
+            &materializations,
+        )
+        .unwrap()
+    }
+
+    fn scan_root_set(
+        owner: &mut ManagedStorageOwner<'_>,
+        binding: &ManagedStorageRootSetBinding,
+        work_budget: usize,
+    ) -> Result<CompleteManagedStorageRootSetInventory, HostResourceError> {
+        let mut scan = owner.begin_root_set_inventory_scan(binding)?;
+        loop {
+            match owner.poll_root_set_inventory_scan(&mut scan, work_budget)? {
+                ManagedStorageRootSetInventoryPoll::Pending => {}
+                ManagedStorageRootSetInventoryPoll::Complete(receipt) => return Ok(receipt),
+            }
+        }
+    }
+
+    fn expected_fixed_tree_inventory(
+        root: &RootBinding,
+    ) -> (u64, Option<String>, usize, String, bool) {
+        let parent_fd = open_absolute_directory_nofollow(root.parent()).unwrap();
+        let root_name = cstring_from_os(root.leaf()).unwrap();
+        let root_path = root.parent().join(root.leaf());
+        let root_fd = openat_directory(parent_fd.as_raw_fd(), &root_name, &root_path).unwrap();
+        let root_stat = fstat(root_fd.as_raw_fd(), &root_path).unwrap();
+
+        let nested_name = CString::new("nested").unwrap();
+        let nested_path = root_path.join("nested");
+        let nested_fd = openat_directory(root_fd.as_raw_fd(), &nested_name, &nested_path).unwrap();
+        let nested_stat = fstat(nested_fd.as_raw_fd(), &nested_path).unwrap();
+        let a_file_name = CString::new("a-file").unwrap();
+        let a_file_stat = stat_at(
+            nested_fd.as_raw_fd(),
+            &a_file_name,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        let z_file_name = CString::new("z-file").unwrap();
+        let z_file_stat =
+            stat_at(root_fd.as_raw_fd(), &z_file_name, libc::AT_SYMLINK_NOFOLLOW).unwrap();
+
+        // This is the fixed bytewise depth-first receipt order for the tiny
+        // fixture: root directory, nested directory, nested file, root file.
+        let mut entry_hash = Sha256::new();
+        let mut seen_inodes = HashSet::new();
+        let mut allocated_bytes = 0_u64;
+        let mut entry_count = 0_usize;
+        for (stat, name) in [
+            (&root_stat, &b"."[..]),
+            (&nested_stat, &b"."[..]),
+            (&a_file_stat, &b"a-file"[..]),
+            (&z_file_stat, &b"z-file"[..]),
+        ] {
+            if seen_inodes.insert((device_id(stat), stat.st_ino)) {
+                let blocks = u64::try_from(stat.st_blocks).unwrap();
+                allocated_bytes += blocks * 512;
+            }
+            entry_count += 1;
+            entry_hash.update((name.len() as u64).to_le_bytes());
+            entry_hash.update(name);
+            entry_hash.update(device_id(stat).to_le_bytes());
+            entry_hash.update(stat.st_ino.to_le_bytes());
+            entry_hash.update((stat.st_mode as u64).to_le_bytes());
+            entry_hash.update(stat.st_size.to_le_bytes());
+            entry_hash.update(stat.st_blocks.to_le_bytes());
+        }
+        let root_instance_id = Some(format!(
+            "unix-inode-v1:{}:{}",
+            root_stat.st_dev, root_stat.st_ino
+        ));
+        let mut receipt_hash = entry_hash;
+        receipt_hash.update(root.parent().as_os_str().as_bytes());
+        receipt_hash.update(root.leaf().as_bytes());
+        receipt_hash.update(allocated_bytes.to_le_bytes());
+        receipt_hash.update((entry_count as u64).to_le_bytes());
+        receipt_hash.update(root_instance_id.as_ref().unwrap().as_bytes());
+        (
+            allocated_bytes,
+            root_instance_id,
+            entry_count,
+            format!("{:x}", receipt_hash.finalize()),
+            true,
+        )
     }
 
     #[test]
@@ -2120,36 +2357,331 @@ mod tests {
     #[test]
     fn scanner_refuses_entry_depth_and_deadline_limits() {
         let temp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temp.path()).unwrap();
-        let fd = open_absolute_directory_nofollow(&root).unwrap();
-        let stat = fstat(fd.as_raw_fd(), &root).unwrap();
+        let cache_root = temp.path().join("preparation-cache");
+        let repository_root = cache_root.join(REPOSITORY);
+        std::fs::create_dir_all(&repository_root).unwrap();
+        let binding = RootBinding::new(&cache_root, REPOSITORY, MATERIALIZATION).unwrap();
+        let materialization_root = repository_root.join(MATERIALIZATION);
+        std::fs::create_dir_all(materialization_root.join("nested")).unwrap();
+        std::fs::write(materialization_root.join("payload"), b"bounded").unwrap();
 
-        let mut entry_limited = Scanner::new(device_id(&stat), Instant::now() + SCAN_MAX_DURATION);
-        entry_limited.entry_count = SCAN_MAX_ENTRIES;
-        let error = entry_limited
-            .count_stat(&stat, b"one-too-many")
+        let entry_limits = ScanLimits::new(1, SCAN_MAX_DEPTH, SCAN_MAX_DURATION).unwrap();
+        let error = run_inventory_scan(&binding, entry_limits, 2).unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_incomplete")
+        );
+
+        let depth_limits = ScanLimits::new(SCAN_MAX_ENTRIES, 0, SCAN_MAX_DURATION).unwrap();
+        let mut depth_scan = InventoryScan::begin(&binding, depth_limits).unwrap();
+        let depth_error = loop {
+            match depth_scan.poll(1) {
+                Ok(InventoryScanPoll::Pending) => {}
+                Ok(InventoryScanPoll::Complete(_)) => {
+                    panic!("a nested directory exceeded the configured depth")
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            conflict_code(&depth_error),
+            Some("managed_storage_inventory_incomplete")
+        );
+        let retry_error = depth_scan.poll(8).unwrap_err();
+        assert_eq!(
+            conflict_code(&retry_error),
+            Some("managed_storage_inventory_incomplete")
+        );
+
+        let deadline_limits =
+            ScanLimits::new(SCAN_MAX_ENTRIES, SCAN_MAX_DEPTH, Duration::from_nanos(1)).unwrap();
+        let error = run_inventory_scan(&binding, deadline_limits, 1).unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_incomplete")
+        );
+    }
+
+    #[test]
+    fn incremental_inventory_poll_budgets_preserve_the_complete_receipt() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.materialization_root.join("nested")).unwrap();
+        std::fs::write(fixture.materialization_root.join("z-file"), b"z").unwrap();
+        std::fs::write(
+            fixture.materialization_root.join("nested").join("a-file"),
+            b"nested",
+        )
+        .unwrap();
+        let binding =
+            RootBinding::new(&fixture.preparation_cache_root, REPOSITORY, MATERIALIZATION).unwrap();
+        let limits = ScanLimits::existing_owner();
+        let mut zero_budget_scan = InventoryScan::begin(&binding, limits).unwrap();
+        let zero_budget_error = zero_budget_scan.poll(0).unwrap_err();
+        assert_eq!(
+            conflict_code(&zero_budget_error),
+            Some("managed_storage_inventory_incomplete")
+        );
+
+        let one_entry_at_a_time = run_inventory_scan(&binding, limits, 1).unwrap();
+        let larger_polls = run_inventory_scan(&binding, limits, 32).unwrap();
+        let expected = expected_fixed_tree_inventory(&binding);
+
+        for actual in [&one_entry_at_a_time, &larger_polls] {
+            assert_eq!(actual.allocated_bytes(), expected.0);
+            assert_eq!(actual.root_instance_id(), expected.1.as_deref());
+            assert_eq!(actual.entry_count(), expected.2);
+            assert_eq!(actual.inventory_digest(), expected.3.as_str());
+            assert_eq!(actual.root_present(), expected.4);
+        }
+    }
+
+    #[test]
+    fn managed_storage_root_set_one_root_matches_independent_inventory_oracle() {
+        let mut fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.materialization_root.join("nested")).unwrap();
+        std::fs::write(fixture.materialization_root.join("z-file"), b"z").unwrap();
+        std::fs::write(
+            fixture.materialization_root.join("nested").join("a-file"),
+            b"nested",
+        )
+        .unwrap();
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let single_root =
+            RootBinding::new(&fixture.preparation_cache_root, REPOSITORY, MATERIALIZATION).unwrap();
+        let expected = expected_fixed_tree_inventory(&single_root);
+        let mut owner = fixture.root_set_owner(&binding).unwrap();
+        let lease_id = owner.grant.lease.lease_id.clone();
+        let generation = owner.grant.lease.generation;
+
+        let receipt = scan_root_set(&mut owner, &binding, 1).unwrap();
+
+        assert_eq!(receipt.repository(), REPOSITORY);
+        assert_eq!(receipt.root_set_digest(), binding.root_set_digest());
+        assert_eq!(receipt.lease_id(), lease_id);
+        assert_eq!(receipt.generation(), generation);
+        assert_eq!(receipt.roots().len(), 1);
+        let root = &receipt.roots()[0];
+        assert_eq!(root.materialization(), MATERIALIZATION);
+        assert_eq!(root.filesystem_id(), single_root.filesystem_id());
+        assert_eq!(root.root_identity(), single_root.root_identity());
+        assert_eq!(root.root_instance_id(), expected.1.as_deref().unwrap());
+        assert_eq!(root.allocated_bytes(), expected.0);
+        assert_eq!(root.entry_count(), expected.2);
+        assert_eq!(root.inventory_digest(), expected.3);
+        assert_eq!(receipt.allocated_bytes(), expected.0);
+        assert_eq!(receipt.entry_count(), expected.2);
+        assert_eq!(receipt.inventory_digest().len(), 64);
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn managed_storage_root_set_is_sorted_finite_and_refuses_duplicates() {
+        let mut fixture = Fixture::new();
+        let second_materialization = "cccccccccccc";
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
+        std::fs::create_dir_all(fixture.repository_root.join(second_materialization)).unwrap();
+        let first_order = capture_root_set(&fixture, &[MATERIALIZATION, second_materialization]);
+        let reverse_order = capture_root_set(&fixture, &[second_materialization, MATERIALIZATION]);
+
+        assert_eq!(first_order.root_count(), 2);
+        assert_eq!(
+            first_order.root_set_digest(),
+            reverse_order.root_set_digest()
+        );
+        assert!(
+            first_order
+                .roots
+                .windows(2)
+                .all(|pair| pair[0].root_identity() < pair[1].root_identity())
+        );
+
+        let mut owner = fixture.root_set_owner(&first_order).unwrap();
+        let receipt = scan_root_set(&mut owner, &first_order, 1).unwrap();
+        assert_eq!(receipt.roots().len(), 2);
+        for (actual, expected) in receipt.roots().iter().zip(&first_order.roots) {
+            assert_eq!(actual.materialization(), expected.materialization());
+            assert_eq!(actual.root_identity(), expected.root_identity());
+        }
+        assert_eq!(
+            receipt.allocated_bytes(),
+            receipt
+                .roots()
+                .iter()
+                .map(ManagedStorageRootInventoryReceipt::allocated_bytes)
+                .sum::<u64>()
+        );
+        assert_eq!(
+            receipt.entry_count(),
+            receipt
+                .roots()
+                .iter()
+                .map(ManagedStorageRootInventoryReceipt::entry_count)
+                .sum::<usize>()
+        );
+        assert_eq!(receipt.inventory_digest().len(), 64);
+        owner.finish().unwrap();
+
+        let duplicate = vec![MATERIALIZATION.to_owned(), MATERIALIZATION.to_owned()];
+        let error = ManagedStorageRootSetBinding::capture(
+            &fixture.preparation_cache_root,
+            REPOSITORY,
+            &duplicate,
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_root_set_overlap")
+        );
+
+        let too_many = vec![second_materialization.to_owned(); ROOT_SET_MAX_ROOTS + 1];
+        let error = ManagedStorageRootSetBinding::capture(
+            &fixture.preparation_cache_root,
+            REPOSITORY,
+            &too_many,
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_root_set_invalid")
+        );
+    }
+
+    #[test]
+    fn managed_storage_root_set_refuses_duplicate_directory_instances() {
+        let receipt = ManagedStorageRootInventoryReceipt {
+            materialization: MATERIALIZATION.into(),
+            filesystem_id: "unix-device-v1:1".into(),
+            root_identity: "path-v1:first".into(),
+            root_instance_id: "unix-inode-v1:1:2".into(),
+            allocated_bytes: 0,
+            entry_count: 1,
+            inventory_digest: "first".into(),
+        };
+
+        let error = validate_unique_root_instance(&[receipt], "unix-inode-v1:1:2").unwrap_err();
+
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_root_set_overlap")
+        );
+    }
+
+    #[test]
+    fn managed_storage_root_set_scan_refuses_root_replacement_and_cannot_resume() {
+        let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
+        for index in 0..8 {
+            std::fs::write(
+                fixture.materialization_root.join(format!("entry-{index}")),
+                [index as u8; 8],
+            )
+            .unwrap();
+        }
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let repository_root = fixture.repository_root.clone();
+        let materialization_root = fixture.materialization_root.clone();
+        let mut owner = fixture.root_set_owner(&binding).unwrap();
+        let mut scan = owner.begin_root_set_inventory_scan(&binding).unwrap();
+        assert!(matches!(
+            owner.poll_root_set_inventory_scan(&mut scan, 1).unwrap(),
+            ManagedStorageRootSetInventoryPoll::Pending
+        ));
+
+        let moved = repository_root.join("bbbbbbbbbbbb-moved");
+        std::fs::rename(&materialization_root, &moved).unwrap();
+        std::fs::create_dir(&materialization_root).unwrap();
+        std::fs::write(materialization_root.join("replacement"), b"new").unwrap();
+
+        let error = loop {
+            match owner.poll_root_set_inventory_scan(&mut scan, 1) {
+                Ok(ManagedStorageRootSetInventoryPoll::Pending) => {}
+                Ok(ManagedStorageRootSetInventoryPoll::Complete(_)) => {
+                    panic!("a replaced root name must not produce a complete receipt")
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_incomplete")
+        );
+        let retry_error = owner
+            .poll_root_set_inventory_scan(&mut scan, 1)
             .unwrap_err();
         assert_eq!(
-            conflict_code(&error),
+            conflict_code(&retry_error),
             Some("managed_storage_inventory_incomplete")
         );
+    }
 
-        let mut depth_limited = Scanner::new(device_id(&stat), Instant::now() + SCAN_MAX_DURATION);
-        let error = depth_limited
-            .visit_directory(-1, Path::new("unopened"), SCAN_MAX_DEPTH + 1, None)
-            .unwrap_err();
-        assert_eq!(
-            conflict_code(&error),
-            Some("managed_storage_inventory_incomplete")
-        );
+    #[test]
+    fn managed_storage_root_set_polls_renew_the_exact_owner_lease() {
+        let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
+        for index in 0..16 {
+            std::fs::write(
+                fixture.materialization_root.join(format!("entry-{index}")),
+                [index as u8; 16],
+            )
+            .unwrap();
+        }
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let mut owner = fixture.root_set_owner(&binding).unwrap();
+        let mut scan = owner.begin_root_set_inventory_scan(&binding).unwrap();
+        let initial_expiry = owner.grant.lease.expires_at;
+        std::thread::sleep(Duration::from_millis(3));
 
-        let deadline = Instant::now() - Duration::from_secs(1);
-        let expired = Scanner::new(device_id(&stat), deadline);
-        let error = expired.check_deadline(Path::new("expired")).unwrap_err();
-        assert_eq!(
-            conflict_code(&error),
-            Some("managed_storage_inventory_incomplete")
+        assert!(matches!(
+            owner.poll_root_set_inventory_scan(&mut scan, 1).unwrap(),
+            ManagedStorageRootSetInventoryPoll::Pending
+        ));
+        assert!(owner.grant.lease.expires_at > initial_expiry);
+
+        loop {
+            match owner.poll_root_set_inventory_scan(&mut scan, 32).unwrap() {
+                ManagedStorageRootSetInventoryPoll::Pending => {}
+                ManagedStorageRootSetInventoryPoll::Complete(receipt) => {
+                    assert_eq!(receipt.lease_id(), owner.grant.lease.lease_id);
+                    assert_eq!(receipt.generation(), owner.grant.lease.generation);
+                    break;
+                }
+            }
+        }
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn managed_storage_root_set_refuses_a_stale_owner_grant() {
+        let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.materialization_root).unwrap();
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let grant = fixture.coordinator.acquire(&fixture.lease_request).unwrap();
+        let stale_grant = grant.clone();
+        let database = fixture.database.clone();
+        let mut second_coordinator = HostResourceCoordinator::open(&database).unwrap();
+        second_coordinator
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+
+        let result = fixture.coordinator.begin_managed_storage_root_set_owner(
+            stale_grant,
+            REPOSITORY,
+            &fixture.preparation_cache_root,
+            &binding,
+            60,
         );
+        let error = match result {
+            Ok(_) => panic!("a released grant must not start a root-set owner"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            HostResourceError::RequestNotActive { state, .. } if state == "released"
+        ));
     }
 
     #[test]

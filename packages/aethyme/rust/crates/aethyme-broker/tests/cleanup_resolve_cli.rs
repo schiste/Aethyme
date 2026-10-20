@@ -286,7 +286,7 @@ fn a_stale_digest_is_refused_and_nothing_moves() {
 
     let refused = apply(tmp.path(), &id, reviewed["digest"].as_str().unwrap());
     assert!(!refused.status.success());
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let stderr = json_error::message(&refused);
     assert!(stderr.contains("no longer matches"), "{stderr}");
     assert!(worktree.join("notes/todo.txt").is_file());
     assert!(
@@ -382,3 +382,6 @@ fn live_eligible_and_unmarked_requests_are_refused() {
         String::from_utf8_lossy(&refused.stderr)
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

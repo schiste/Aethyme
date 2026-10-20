@@ -192,7 +192,7 @@ fn all_roots_reported_nearly_full_refuse_instead_of_bypassing_the_default_floor(
         .output()
         .unwrap();
     assert!(!output.status.success(), "{output:?}");
-    let error = String::from_utf8_lossy(&output.stderr);
+    let error = json_error::message(&output);
     assert!(error.contains("broker recovery reserve"), "{error}");
     assert!(
         !fx.repo.join(".aethyme/worktrees").exists(),
@@ -321,3 +321,6 @@ fn cleanup_releases_the_brokers_own_lock_on_the_configured_root() {
     fx.ok(&["finish", "cleanup", &id, "--force"]);
     assert!(!worktree.exists(), "the locked worktree was removed");
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

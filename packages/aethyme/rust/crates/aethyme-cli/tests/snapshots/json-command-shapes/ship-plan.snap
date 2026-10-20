@@ -1,0 +1,142 @@
+{
+  "delivery": {
+    "configured_mode": "null",
+    "divergence_reasons": [],
+    "mode": "string",
+    "reason": "string",
+    "recommended_mode": "null",
+    "requires_explicit_selection": "bool",
+    "source": "string",
+    "trusted_config_commit": "string",
+    "trusted_config_digest": "string",
+    "trusted_config_ref": "string"
+  },
+  "excluded_entries": [],
+  "freshness": {
+    "fast_forward": "bool",
+    "integration_is_ancestor_of_remote": "bool",
+    "remote_is_ancestor_of_integration": "bool",
+    "remote_matches_planned_base": "bool",
+    "result": "string"
+  },
+  "included_entries": [
+    {
+      "newly_published": "bool",
+      "promotion_sha": "string",
+      "queue_entry_id": "integer",
+      "session_id": "integer"
+    }
+  ],
+  "integration_ref": "string",
+  "integration_sha": "string",
+  "local_default_branch_ref": "string",
+  "local_default_branch_sha": "string",
+  "local_main_sync_assessment": {
+    "conflicting_untracked_paths": [],
+    "current_branch_matches": "bool",
+    "fast_forward": "bool",
+    "local_commits_not_in_integration": [],
+    "local_head_unchanged": "bool",
+    "safe": "bool",
+    "tracked_dirty_paths": [],
+    "untracked_paths": []
+  },
+  "local_main_sync_safe": "bool",
+  "only": "bool",
+  "originating_session": {
+    "accepted_at": "integer",
+    "accepted_integration_commit": "string",
+    "accepted_integration_tree": "string",
+    "accepted_queue_entry_id": "integer",
+    "accepted_session_head": "string",
+    "adopted_head": "string",
+    "adoption_base": "string",
+    "agent_identity": "null",
+    "ai_provider": "null",
+    "branch": "string",
+    "cleanup_completed_at": "null",
+    "cleanup_state": "string",
+    "closed_at": "null",
+    "command": "null",
+    "created_at": "integer",
+    "diff_base": "string",
+    "exit_code": "null",
+    "id": "integer",
+    "last_activity_at": "integer",
+    "log_path": "null",
+    "origin": "string",
+    "pid": "null",
+    "repository_contract": {
+      "aethyme_version": "string",
+      "backfilled": "bool",
+      "deployment_state_digest": "string",
+      "gate_definition_digest": "string",
+      "repository_schema": "null"
+    },
+    "repository_name": "null",
+    "short_name": "string",
+    "status": "string",
+    "tab_name": "null",
+    "task": "string",
+    "updated_at": "integer",
+    "worktree_path": "string"
+  },
+  "plan_digest": "string",
+  "planned_remote_base_sha": "string",
+  "proposed_push": {
+    "command": [
+      "string"
+    ],
+    "destination_ref": "string",
+    "refspec": "string",
+    "remote": "string",
+    "source_sha": "string"
+  },
+  "publication_policy": {
+    "evidence": [],
+    "policy": {
+      "allow_break_glass": "bool",
+      "mode": "string",
+      "schema_version": "integer"
+    },
+    "remediation": "null",
+    "satisfied": "bool",
+    "source_commit": "string"
+  },
+  "publication_sha": "string",
+  "queue_entry": {
+    "base_commit": "string",
+    "created_at": "integer",
+    "details_json": "string",
+    "head_commit": "string",
+    "id": "integer",
+    "merged_tree": "string",
+    "session_id": "integer",
+    "status": "string",
+    "updated_at": "integer"
+  },
+  "remote_default_branch_ref": "string",
+  "remote_default_branch_sha": "string",
+  "target": {
+    "coordination_key": "string",
+    "display_slug": "string",
+    "evidence": {
+      "caller_assertion": "string",
+      "command_selection": "string",
+      "fetch": {
+        "source": "string",
+        "syntax": "string"
+      },
+      "identity": "string",
+      "push": {
+        "source": "string",
+        "syntax": "string"
+      }
+    },
+    "fetch_url": "string",
+    "normalized_host": "string",
+    "push_url": "string",
+    "remote_name": "string",
+    "repository_path": "string"
+  }
+}

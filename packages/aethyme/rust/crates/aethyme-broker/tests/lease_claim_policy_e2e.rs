@@ -7,7 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{Broker, BrokerOpError, LeaseKind};
+use common::{FixtureRepository, open_fixture_repository_broker};
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
 
@@ -87,9 +90,9 @@ fn make_stale(broker: &mut Broker, root: &Path, session_id: i64, name: &str) {
 
 #[test]
 fn a_verify_only_claim_over_a_working_sessions_explicit_lease_succeeds_with_a_warning() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), Some(VERIFY_ONLY));
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let owner = broker
         .adopt(&add_worktree(tmp.path(), "owner"), Some("rewrite auth"))
         .unwrap();
@@ -124,9 +127,9 @@ fn a_verify_only_claim_over_a_working_sessions_explicit_lease_succeeds_with_a_wa
 
 #[test]
 fn outside_verify_only_a_working_sessions_explicit_lease_still_refuses() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let owner = broker
         .adopt(&add_worktree(tmp.path(), "owner"), None)
         .unwrap();
@@ -154,9 +157,9 @@ fn outside_verify_only_a_working_sessions_explicit_lease_still_refuses() {
 
 #[test]
 fn a_stale_sessions_explicit_lease_never_refuses_a_claim() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let quiet = broker
         .adopt(&add_worktree(tmp.path(), "quiet"), None)
         .unwrap();
@@ -185,9 +188,9 @@ fn a_stale_sessions_explicit_lease_never_refuses_a_claim() {
 
 #[test]
 fn an_implicit_lease_never_refuses_an_explicit_claim() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let wt_editor = add_worktree(tmp.path(), "editor");
     let editor = broker.adopt(&wt_editor, None).unwrap();
     let claimer = broker
@@ -214,9 +217,9 @@ fn an_implicit_lease_never_refuses_an_explicit_claim() {
 
 #[test]
 fn leases_implied_by_a_stale_sessions_old_edits_are_not_reported() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let wt_quiet = add_worktree(tmp.path(), "quiet");
     let quiet = broker.adopt(&wt_quiet, None).unwrap();
     let claimer = broker
@@ -235,9 +238,9 @@ fn leases_implied_by_a_stale_sessions_old_edits_are_not_reported() {
 #[test]
 fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
     // auto: a stale holder's explicit lease does not refuse a planned start.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let quiet_owner = tempfile::tempdir().unwrap();
     let quiet_path = quiet_owner.path().join("quiet");
     let quiet = broker
@@ -250,9 +253,9 @@ fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
         .expect("a stale holder must not refuse a planned lease");
 
     // verify-only: even a working holder's explicit lease only informs.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), Some(VERIFY_ONLY));
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     broker
         .start_worktree_with_planned_paths("first rewrite", &["generated/".into()], None)
         .unwrap();
@@ -263,12 +266,9 @@ fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
 
 #[test]
 fn guarded_exec_is_not_failed_by_a_stale_sessions_explicit_lease() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
-    let mut broker = Broker::open(tmp.path())
-        .unwrap()
-        .with_agent_supervisor_executable(env!("CARGO_BIN_EXE_broker-cli-shim"))
-        .unwrap();
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
     let quiet = broker
         .adopt(&add_worktree(tmp.path(), "quiet"), None)
         .unwrap();

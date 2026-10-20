@@ -356,9 +356,9 @@ fn a_host_operation_on_another_repository_is_not_reconciled_from_here() {
         "a foreign host operation was reconciled"
     );
     assert!(
-        stderr(&reconciled).contains("not a remote of this repository"),
+        json_error::message(&reconciled).contains("not a remote of this repository"),
         "{}",
-        stderr(&reconciled)
+        json_error::message(&reconciled)
     );
     let unblocked = fixture.run(&[
         "unblock",
@@ -368,11 +368,11 @@ fn a_host_operation_on_another_repository_is_not_reconciled_from_here() {
         "--reason",
         "wrong repository",
     ]);
-    assert_eq!(unblocked.status.code(), Some(3), "{}", stderr(&unblocked));
+    let unblocked_stderr = String::from_utf8_lossy(&unblocked.stderr);
+    assert_eq!(unblocked.status.code(), Some(3), "{unblocked_stderr}");
     assert!(
-        stderr(&unblocked).contains("not a remote of this repository"),
-        "{}",
-        stderr(&unblocked)
+        unblocked_stderr.contains("not a remote of this repository"),
+        "{unblocked_stderr}"
     );
     assert_eq!(
         aethyme_broker::host_operation(&database, &hex)
@@ -1049,3 +1049,6 @@ fn a_live_quarantined_lease_reports_its_holder_pid_as_running() {
     );
     assert_eq!(blocker["safe_to_clear_automatically"], false);
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

@@ -183,6 +183,13 @@ pub enum BrokerOpError {
         stage: String,
         budget: String,
     },
+    /// Git-backed preparation for an explicit lease claim did not finish
+    /// within its bounded budget. The deadline is checked before the explicit
+    /// claim transaction, so this request did not record a new claim.
+    #[error(
+        "lease claim preparation timed out with a {budget_ms} ms budget; no explicit lease claim was recorded by this request"
+    )]
+    LeaseClaimPreparationTimedOut { budget_ms: u64 },
     /// A coordinated child was already running when its bounded operation
     /// budget expired. Remote writes are stored as `outcome_unknown` and use
     /// the durable recovery error below; this variant is for read-only and
@@ -2316,6 +2323,9 @@ pub struct GuardedExecReport {
     pub command: Vec<String>,
     pub exit_code: Option<i32>,
     pub command_success: bool,
+    /// The post-execution ownership audit, independent of the child exit status.
+    pub ownership_ok: bool,
+    pub conflicting_leases: Vec<LeaseBlocker>,
     pub before_dirty_paths: Vec<String>,
     pub after_dirty_paths: Vec<String>,
     pub newly_dirty_paths: Vec<String>,

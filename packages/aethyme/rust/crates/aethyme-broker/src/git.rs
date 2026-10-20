@@ -21,6 +21,23 @@ thread_local! {
     /// the general git timeout. Thread-local so one finish cannot shorten a
     /// concurrent operation running in another broker thread.
     static GIT_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// Counts timed-out Git subprocesses on this thread. Some read helpers
+    /// intentionally turn ordinary Git failures into `None`; a caller with a
+    /// stronger deadline can use this generation to distinguish a timeout
+    /// from an absent ref without changing those best-effort APIs.
+    static GIT_TIMEOUT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A snapshot for callers that must detect Git timeouts hidden by a
+/// best-effort `Option`-returning read helper.
+pub(crate) fn git_timeout_generation() -> u64 {
+    GIT_TIMEOUT_GENERATION.with(std::cell::Cell::get)
+}
+
+fn note_git_timeout() {
+    GIT_TIMEOUT_GENERATION.with(|generation| {
+        generation.set(generation.get().wrapping_add(1));
+    });
 }
 
 struct RestoreGitDeadline(Option<Instant>);
@@ -174,42 +191,44 @@ fn git_timeout() -> Duration {
     })
 }
 
-/// Extract paths from `git status --porcelain` output, validating each
-/// line against the porcelain XY grammar before trusting it (#43).
-///
-/// PATH shims can decorate git output — the Chau7 CTO shim was observed
-/// printing `ok ✓` where porcelain output belongs, which a naive
-/// `line[3..]` parse reports as a dirty file named `✓` (three of four
-/// agents in the 2026-07-17 batch hit this independently). A status
-/// line is only believed when it matches `XY<space><path>` with X and Y
-/// drawn from git's status-code alphabet. Rename lines keep the target
-/// path (`old -> new` ⇒ `new`).
-fn parse_porcelain_paths(out: &str) -> Vec<String> {
-    parse_porcelain_entries(out)
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect()
-}
-
-fn parse_porcelain_entries(out: &str) -> Vec<([u8; 2], String)> {
+/// Parse `git status --porcelain=v1 -z` without interpreting quoted paths.
+/// Git emits rename/copy destinations first and their source as the next NUL
+/// field. Preserve the established destination-path contract and consume both
+/// fields. Malformed output and non-UTF-8 paths refuse an ownership decision.
+fn parse_porcelain_entries_z(out: &[u8]) -> Result<Vec<([u8; 2], String)>, GitError> {
     const CODES: &[u8] = b" MTADRCU?!";
-    out.lines()
-        .filter_map(|line| {
-            let bytes = line.as_bytes();
-            if bytes.len() < 4
-                || bytes[2] != b' '
-                || !CODES.contains(&bytes[0])
-                || !CODES.contains(&bytes[1])
-            {
-                return None;
-            }
-            let path = &line[3..];
-            Some((
-                [bytes[0], bytes[1]],
-                path.rsplit(" -> ").next().unwrap_or(path).to_string(),
-            ))
-        })
-        .collect()
+    let invalid = || GitError::UntrustedOutput {
+        detail: "malformed or non-UTF-8 NUL-separated porcelain status".into(),
+    };
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    if out.last() != Some(&0) {
+        return Err(invalid());
+    }
+    let mut fields = out[..out.len() - 1].split(|byte| *byte == 0);
+    let mut entries = Vec::new();
+    while let Some(record) = fields.next() {
+        if record.len() < 4
+            || record[2] != b' '
+            || !CODES.contains(&record[0])
+            || !CODES.contains(&record[1])
+            || record[..2] == *b"  "
+        {
+            return Err(invalid());
+        }
+        let path = std::str::from_utf8(&record[3..]).map_err(|_| invalid())?;
+        let xy = [record[0], record[1]];
+        if xy.iter().any(|code| matches!(code, b'R' | b'C')) {
+            let source = fields
+                .next()
+                .filter(|source| !source.is_empty())
+                .ok_or_else(invalid)?;
+            std::str::from_utf8(source).map_err(|_| invalid())?;
+        }
+        entries.push((xy, path.to_owned()));
+    }
+    Ok(entries)
 }
 
 /// Extract paths from newline-separated path listings (`git diff
@@ -1018,6 +1037,7 @@ fn run_git_process_output(
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                note_git_timeout();
                 return Err(GitError::TimedOut {
                     args: args.join(" "),
                     seconds: 1,
@@ -1027,15 +1047,19 @@ fn run_git_process_output(
         }
         None => budget,
     };
-    let output = crate::bounded_output::output_within(&mut command, budget)
-        .map_err(|source| GitError::Spawn {
+    let output = crate::bounded_output::output_within(&mut command, budget).map_err(|source| {
+        GitError::Spawn {
             args: args.join(" "),
             source,
-        })?
-        .ok_or_else(|| GitError::TimedOut {
+        }
+    })?;
+    let Some(output) = output else {
+        note_git_timeout();
+        return Err(GitError::TimedOut {
             args: args.join(" "),
             seconds: budget.as_secs().max(1),
-        })?;
+        });
+    };
     Ok(output)
 }
 /// A commit's tree and parents, in Git's stored parent order.
@@ -2922,10 +2946,13 @@ impl GitRepo {
     /// wrong answer that costs work rather than disk.
     pub fn dirty_paths(&self) -> Result<Vec<String>, GitError> {
         require_trustworthy_porcelain()?;
-        Ok(parse_porcelain_paths(&run_git(
+        Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain", "--untracked-files=all"],
-        )?))
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect())
     }
 
     /// Untracked paths from porcelain status. Used for the adoption-time
@@ -3036,10 +3063,10 @@ impl GitRepo {
     pub fn uncommitted_summary(&self) -> Result<UncommittedSummary, GitError> {
         require_trustworthy_porcelain()?;
         let mut summary = UncommittedSummary::default();
-        for (xy, path) in parse_porcelain_entries(&run_git(
+        for (xy, path) in parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain", "--untracked-files=normal"],
-        )?) {
+            &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+        )?)? {
             match xy {
                 [b'?', b'?'] => summary.untracked.push(path),
                 [b'!', b'!'] => {}
@@ -3050,10 +3077,10 @@ impl GitRepo {
     }
 
     pub fn untracked_paths(&self) -> Result<Vec<String>, GitError> {
-        Ok(parse_porcelain_entries(&run_git(
+        Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain", "--untracked-files=all"],
-        )?)
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?)?
         .into_iter()
         .filter(|(xy, _path)| *xy == [b'?', b'?'])
         .map(|(_xy, path)| path)
@@ -3162,10 +3189,10 @@ impl GitRepo {
     /// untracked paths for operations that can safely tolerate unrelated
     /// local files while still refusing modifications to committed state.
     pub fn tracked_dirty_paths(&self) -> Result<Vec<String>, GitError> {
-        Ok(parse_porcelain_entries(&run_git(
+        Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain", "--untracked-files=all"],
-        )?)
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?)?
         .into_iter()
         .filter(|(xy, _path)| *xy != [b'?', b'?'])
         .map(|(_xy, path)| path)
@@ -3763,29 +3790,45 @@ mod path_line_tests {
 
 #[cfg(test)]
 mod porcelain_tests {
-    use super::parse_porcelain_paths;
+    use super::parse_porcelain_entries_z;
 
     #[test]
-    fn valid_lines_yield_paths() {
-        let out = " M src/a.rs\n?? new.txt\nA  staged.rs\n";
+    fn nul_status_preserves_literal_whitespace_quotes_and_arrows() {
+        let out = b" M leading space \0?? quote\"name\0A  tab\tand\nnewline -> name\0";
+        let entries = parse_porcelain_entries_z(out).unwrap();
         assert_eq!(
-            parse_porcelain_paths(out),
-            vec!["src/a.rs", "new.txt", "staged.rs"]
+            entries,
+            vec![
+                (*b" M", "leading space ".into()),
+                (*b"??", "quote\"name".into()),
+                (*b"A ", "tab\tand\nnewline -> name".into()),
+            ]
         );
+        assert!(parse_porcelain_entries_z(b"").unwrap().is_empty());
     }
 
     #[test]
-    fn shim_decorations_are_discarded() {
-        // The Chau7 CTO shim prints decorations like these where
-        // porcelain output belongs — none may survive as a "path".
-        let out = "ok \u{2713}\n\u{2713}\nok\n";
-        assert!(parse_porcelain_paths(out).is_empty());
+    fn nul_status_rejects_malformed_decorated_and_non_utf8_output() {
+        for out in [
+            b"ok \xe2\x9c\x93\n".as_slice(),
+            b"?? no terminator",
+            b"?? \0",
+            b"?? bad-\xff\0",
+            b"  fake\0",
+            b"?? good\0trailing\0",
+        ] {
+            assert!(parse_porcelain_entries_z(out).is_err(), "{out:?}");
+        }
     }
 
     #[test]
-    fn rename_lines_keep_the_target() {
-        let out = "R  old.rs -> new.rs\n";
-        assert_eq!(parse_porcelain_paths(out), vec!["new.rs"]);
+    fn nul_renames_keep_destination_and_consume_exactly_one_source() {
+        assert_eq!(
+            parse_porcelain_entries_z(b"R  new -> name\0old\nname\0?? later\0").unwrap(),
+            vec![(*b"R ", "new -> name".into()), (*b"??", "later".into())]
+        );
+        assert!(parse_porcelain_entries_z(b"R  new\0").is_err());
+        assert!(parse_porcelain_entries_z(b"R  new\0\0").is_err());
     }
 }
 
@@ -4332,11 +4375,17 @@ mod timeout_tests {
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 30"]);
         let started = std::time::Instant::now();
+        let timeout_generation_before = git_timeout_generation();
         let error = run_git_command(command, &["fetch", "origin"], Duration::from_millis(300))
             .expect_err("a sleeping git must time out");
         assert!(
             matches!(&error, GitError::TimedOut { args, .. } if args == "fetch origin"),
             "{error:?}"
+        );
+        assert_ne!(
+            git_timeout_generation(),
+            timeout_generation_before,
+            "a real subprocess timeout must be observable by bounded callers"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");

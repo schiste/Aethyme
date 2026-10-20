@@ -733,16 +733,17 @@ impl Broker {
                     ),
                 });
             }
+            // The promoted candidate is the durable record of the patch that
+            // passed gates. Session adoption/reuse baselines can move after a
+            // queue entry is created, while its submitted head stays fixed.
+            // Reconstruct the selected patch from the exact first parent to
+            // this promotion instead of consulting mutable session metadata.
+            let source_base = self.repo_handle().first_parent(&promotion)?;
             let (independent_sha, changed_files) = build_ship_only_publication(
                 self,
                 &queue,
                 &entry,
-                session
-                    .adopted_head
-                    .as_deref()
-                    .or(session.adoption_base.as_deref())
-                    .or(session.diff_base.as_deref())
-                    .unwrap_or(&entry.base_commit),
+                &source_base,
                 &promotion,
                 &remote_default.sha,
             )?;
@@ -785,13 +786,7 @@ impl Broker {
                 entry.session_id,
             )?;
             only_verification = Some(ShipOnlyVerification {
-                source_base_sha: session
-                    .adopted_head
-                    .as_deref()
-                    .or(session.adoption_base.as_deref())
-                    .or(session.diff_base.as_deref())
-                    .unwrap_or(&entry.base_commit)
-                    .into(),
+                source_base_sha: source_base,
                 base_sha: remote_default.sha.clone(),
                 publication_tree_sha: self.repo_handle().commit_tree_id(&publication_sha)?,
                 changed_files,
@@ -1725,16 +1720,16 @@ fn build_ship_only_publication(
     remote_base: &str,
 ) -> Result<(String, Vec<String>), BrokerOpError> {
     let repo = broker.repo_handle();
-    if !repo.is_ancestor(source_base, &entry.head_commit) {
+    if !repo.is_ancestor(source_base, promotion) {
         return Err(BrokerOpError::ShipPlanUnavailable {
             what: "independent publication source",
             reason: format!(
-                "the recorded source base {source_base} is not an ancestor of entry {} head {}",
-                entry.id, entry.head_commit
+                "the promoted patch base {source_base} is not an ancestor of entry {} promotion {promotion}",
+                entry.id
             ),
         });
     }
-    let selected_paths = repo.gate_scope_changed_between(source_base, &entry.head_commit)?;
+    let selected_paths = repo.gate_scope_changed_between(source_base, promotion)?;
     if selected_paths.is_empty() {
         return Err(BrokerOpError::ShipPlanUnavailable {
             what: "independent publication",
@@ -1789,7 +1784,7 @@ fn build_ship_only_publication(
         let ancestry_dependency = is_unshipped_ancestry_dependency(
             repo,
             &earlier_promotion,
-            source_base,
+            &entry.base_commit,
             &entry.head_commit,
         );
         // NUL-separated, like `selected_paths`: `diff-tree --name-status`
@@ -1848,7 +1843,7 @@ fn build_ship_only_publication(
         }
     }
 
-    let simulation = repo.merge_tree_with_base(source_base, remote_base, &entry.head_commit)?;
+    let simulation = repo.merge_tree_with_base(source_base, remote_base, promotion)?;
     if !simulation.conflicts.is_empty() {
         return Err(BrokerOpError::ShipPlanUnavailable {
             what: "independent publication tree",

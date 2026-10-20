@@ -1284,16 +1284,20 @@ fn schema_edge_kind_to_model(kind: SchemaEdgeKind) -> EdgeKind {
         SchemaEdgeKind::ValidatesCredential => EdgeKind::ValidatesCredential,
         SchemaEdgeKind::RewritesHeader => EdgeKind::RewritesHeader,
         SchemaEdgeKind::TestedBy => EdgeKind::TestedBy,
+        // Keep this producer-to-subject relationship distinct so impact
+        // consumers need not infer tests from path names.
+        SchemaEdgeKind::Tests => EdgeKind::Tests,
+        // These schema facts remain generic references in the runtime model;
+        // no current consumer needs their individual semantics.
         SchemaEdgeKind::References
         | SchemaEdgeKind::Decides
         | SchemaEdgeKind::Deprecates
         | SchemaEdgeKind::Implements
         | SchemaEdgeKind::Inherits
+        | SchemaEdgeKind::Mocks
         | SchemaEdgeKind::Reads
         | SchemaEdgeKind::Uses
-        | SchemaEdgeKind::Writes
-        | SchemaEdgeKind::Mocks
-        | SchemaEdgeKind::Tests => EdgeKind::References,
+        | SchemaEdgeKind::Writes => EdgeKind::References,
     }
 }
 
@@ -1754,9 +1758,23 @@ fn graph_node_kind_from_surface(kind: SurfaceKind) -> GraphNodeKind {
 mod tests {
     use std::fs;
 
-    use super::RepositoryMap;
+    use super::{RepositoryMap, schema_edge_kind_to_model};
     use crate::model::class::ClassNode;
+    use crate::model::edge::EdgeKind;
     use crate::model::function::FunctionNode;
+    use aethyme_graph_schema::EdgeKind as SchemaEdgeKind;
+
+    #[test]
+    fn schema_tests_relationships_remain_distinct_in_the_runtime_model() {
+        assert_eq!(
+            schema_edge_kind_to_model(SchemaEdgeKind::Tests),
+            EdgeKind::Tests
+        );
+        assert_eq!(
+            schema_edge_kind_to_model(SchemaEdgeKind::Mocks),
+            EdgeKind::References
+        );
+    }
 
     #[test]
     fn build_map_creates_graph_layers() {
