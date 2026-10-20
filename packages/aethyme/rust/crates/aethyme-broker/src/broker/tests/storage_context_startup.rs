@@ -148,6 +148,11 @@ fn run_fresh_external_db_parent_child() {
         .with_collaboration_state(collaboration);
     let mut broker = Broker::open_with_options(&repository, options)
         .expect("open fresh broker database outside the checkout");
+    assert_eq!(
+        broker.store().db_path(),
+        external_db.as_path(),
+        "the configured external database path remains authoritative"
+    );
     assert!(
         !repository.join(".aethyme").exists(),
         "opening the fresh external database must not create a repository root parent"

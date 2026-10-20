@@ -15,7 +15,8 @@ const MAX_IDENTITY_JSON_BYTES: usize = 4096;
 const MAX_REPOSITORY_KEY_BYTES: usize = 1024;
 const BOOTSTRAP_NONCE_HEX_BYTES: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RepositoryWorktreeBindingState {
     LegacyUnbound,
     FreshUnbound,
@@ -47,7 +48,8 @@ impl RepositoryWorktreeBindingState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RepositoryWorktreeRootLayout {
     KeyedContainer,
     DirectRoot,
@@ -70,7 +72,7 @@ impl RepositoryWorktreeRootLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct RepositoryWorktreeBinding {
     pub state: RepositoryWorktreeBindingState,
     pub origin: Option<RepositoryWorktreeBindingOrigin>,
@@ -88,7 +90,8 @@ pub(crate) struct RepositoryWorktreeBinding {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RepositoryWorktreeBindingOrigin {
     Legacy,
     Fresh,
@@ -143,8 +146,8 @@ pub(crate) struct LegacyRepositoryRootConfirmation {
 /// last committed transaction after power loss. Raise synchronous before the
 /// immediate transaction, commit while FULL is active, then restore the
 /// connection's prior mode after a successful commit or a rolled-back body.
-/// If commit itself reports an error, leave FULL active because its outcome is
-/// uncertain and weakening subsequent writes would be unsafe.
+/// If transaction start or commit reports an error, leave FULL active because
+/// its outcome is uncertain and weakening subsequent writes would be unsafe.
 fn with_durable_binding_transaction<T>(
     conn: &mut Connection,
     operation: impl FnOnce(&Transaction<'_>) -> Result<T, BrokerError>,
@@ -155,18 +158,9 @@ fn with_durable_binding_transaction<T>(
         conn.pragma_update(None, "synchronous", "FULL")?;
     }
 
-    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
-        Ok(tx) => tx,
-        Err(error) => {
-            if raised_synchronous {
-                crate::warn_unrecorded(
-                    "restore SQLite synchronous mode after failed binding transaction start",
-                    conn.pragma_update(None, "synchronous", previous_synchronous),
-                );
-            }
-            return Err(error.into());
-        }
-    };
+    // Keep FULL active if BEGIN fails; do not assume its setup left the
+    // connection in a state where lowering durability is safe.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
     match operation(&tx) {
         Ok(value) => {
@@ -966,6 +960,101 @@ fn invalid_binding(message: String) -> BrokerError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn binding_json_uses_documented_snake_case_enum_values() {
+        let state_values = [
+            (
+                RepositoryWorktreeBindingState::LegacyUnbound,
+                "legacy_unbound",
+            ),
+            (
+                RepositoryWorktreeBindingState::FreshUnbound,
+                "fresh_unbound",
+            ),
+            (
+                RepositoryWorktreeBindingState::FreshReserved,
+                "fresh_reserved",
+            ),
+            (RepositoryWorktreeBindingState::Bound, "bound"),
+            (
+                RepositoryWorktreeBindingState::RecoveryRequired,
+                "recovery_required",
+            ),
+        ];
+        for (state, expected) in state_values {
+            assert_eq!(serde_json::to_value(state).unwrap(), expected);
+        }
+
+        assert_eq!(
+            serde_json::to_value(RepositoryWorktreeBindingOrigin::Legacy).unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            serde_json::to_value(RepositoryWorktreeBindingOrigin::Fresh).unwrap(),
+            "fresh"
+        );
+        assert_eq!(
+            serde_json::to_value(RepositoryWorktreeRootLayout::KeyedContainer).unwrap(),
+            "keyed_container"
+        );
+        assert_eq!(
+            serde_json::to_value(RepositoryWorktreeRootLayout::DirectRoot).unwrap(),
+            "direct_root"
+        );
+        assert_eq!(
+            serde_json::to_value(WorktreeRootSource::RepositoryFallback).unwrap(),
+            "repository_fallback"
+        );
+
+        let binding = RepositoryWorktreeBinding {
+            state: RepositoryWorktreeBindingState::Bound,
+            origin: Some(RepositoryWorktreeBindingOrigin::Legacy),
+            repository_root: Some(PathBuf::from("/repo")),
+            git_common_dir: Some(PathBuf::from("/repo/.git")),
+            repository_key: Some("repo-key".to_owned()),
+            broker_db_path: Some(PathBuf::from("/repo/.aethyme/broker.db")),
+            bootstrap_nonce: None,
+            worktree_root: Some(PathBuf::from("/worktrees")),
+            root_layout: Some(RepositoryWorktreeRootLayout::KeyedContainer),
+            root_source: Some(WorktreeRootSource::RepositoryFallback),
+            reservation_digest: Some("ab".repeat(32)),
+            parent_identity_json: Some(r#"{"device":1,"inode":2}"#.to_owned()),
+            worktree_identity_json: None,
+            updated_at_ms: 7,
+        };
+        let value = serde_json::to_value(binding).unwrap();
+        let object = value.as_object().unwrap();
+        let actual_keys = object
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_keys = [
+            "state",
+            "origin",
+            "repository_root",
+            "git_common_dir",
+            "repository_key",
+            "broker_db_path",
+            "bootstrap_nonce",
+            "worktree_root",
+            "root_layout",
+            "root_source",
+            "reservation_digest",
+            "parent_identity_json",
+            "worktree_identity_json",
+            "updated_at_ms",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual_keys, expected_keys);
+        assert_eq!(value["state"], "bound");
+        assert_eq!(value["origin"], "legacy");
+        assert_eq!(value["root_layout"], "keyed_container");
+        assert_eq!(value["root_source"], "repository_fallback");
+        assert!(value["bootstrap_nonce"].is_null());
+        assert!(value["worktree_identity_json"].is_null());
+    }
+
     fn identity(directory: &tempfile::TempDir) -> RepositoryRootIdentity {
         RepositoryRootIdentity {
             repository_root: directory.path().join("repo"),
@@ -1072,7 +1161,7 @@ mod tests {
                 "INSERT INTO binding_test_rows(value) VALUES('rolled-back')",
                 [],
             )?;
-            Err(invalid_binding("test rollback".to_owned()))
+            Err::<(), BrokerError>(invalid_binding("test rollback".to_owned()))
         })
         .unwrap_err();
         assert!(matches!(

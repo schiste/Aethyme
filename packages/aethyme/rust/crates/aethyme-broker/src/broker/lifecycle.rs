@@ -1776,23 +1776,87 @@ fn fresh_root_reservation_digest(
     source: WorktreeRootSource,
     parent_identity_json: &str,
 ) -> Result<String, BrokerOpError> {
-    let payload = serde_json::json!({
-        "repository_root": identity.repository_root,
-        "git_common_dir": identity.git_common_dir,
-        "repository_key": identity.repository_key,
-        "broker_db_path": identity.broker_db_path,
-        "bootstrap_nonce": identity.bootstrap_nonce,
-        "worktree_root": root,
-        "layout": format!("{layout:?}"),
-        "source": source,
-        "parent_identity": parent_identity_json,
-    });
-    let bytes =
-        serde_json::to_vec(&payload).map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+    #[derive(serde::Serialize)]
+    struct FreshRootReservationDigestInput<'a> {
+        repository_root: &'a Path,
+        git_common_dir: &'a Path,
+        repository_key: &'a str,
+        broker_db_path: &'a Path,
+        bootstrap_nonce: &'a str,
+        worktree_root: &'a Path,
+        layout: String,
+        source: WorktreeRootSource,
+        parent_identity: &'a str,
+    }
+
+    let payload = FreshRootReservationDigestInput {
+        repository_root: &identity.repository_root,
+        git_common_dir: &identity.git_common_dir,
+        repository_key: &identity.repository_key,
+        broker_db_path: &identity.broker_db_path,
+        bootstrap_nonce: &identity.bootstrap_nonce,
+        worktree_root: root,
+        layout: format!("{layout:?}"),
+        source,
+        parent_identity: parent_identity_json,
+    };
+    let bytes = canonical_json_value_bytes(payload).map_err(|error| {
+        BrokerOpError::WorktreeRootUnavailable {
             path: root.to_path_buf(),
             reason: format!("cannot encode root reservation identity: {error}"),
-        })?;
+        }
+    })?;
     Ok(hex_digest(&bytes))
+}
+
+/// Serialize a typed digest payload through a JSON value so object keys keep
+/// serde_json's canonical map ordering. Unlike `json!`, this reports invalid
+/// path encodings instead of panicking while converting a `PathBuf`.
+fn canonical_json_value_bytes<T: serde::Serialize>(
+    payload: T,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let value = serde_json::to_value(payload)?;
+    serde_json::to_vec(&value)
+}
+
+fn legacy_worktree_root_binding_digest(
+    repository_root: &Path,
+    git_common_dir: &Path,
+    repository_key: &str,
+    broker_db_path: &Path,
+    worktree_root: &Path,
+    layout: &str,
+    source: WorktreeRootSource,
+    parent_identity: &str,
+    worktree_identity: &str,
+) -> Result<String, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct LegacyBindingDigestInput<'a> {
+        schema_version: u32,
+        repository_root: &'a Path,
+        git_common_dir: &'a Path,
+        repository_key: &'a str,
+        broker_db_path: &'a Path,
+        worktree_root: &'a Path,
+        layout: &'a str,
+        source: WorktreeRootSource,
+        parent_identity: &'a str,
+        worktree_identity: &'a str,
+    }
+
+    let payload = LegacyBindingDigestInput {
+        schema_version: 1,
+        repository_root,
+        git_common_dir,
+        repository_key,
+        broker_db_path,
+        worktree_root,
+        layout,
+        source,
+        parent_identity,
+        worktree_identity,
+    };
+    canonical_json_value_bytes(payload).map(|bytes| hex_digest(&bytes))
 }
 
 fn bound_directory_identity(path: &Path) -> Result<BoundDirectoryIdentity, String> {
@@ -3874,21 +3938,18 @@ impl Broker {
                 "direct_root"
             }
         };
-        let digest_input = serde_json::json!({
-            "schema_version": 1,
-            "repository_root": &repository_root,
-            "git_common_dir": &git_common_dir,
-            "repository_key": &repository_key,
-            "broker_db_path": &broker_db_path,
-            "worktree_root": &root,
-            "layout": layout_name,
-            "source": source,
-            "parent_identity": &parent_json,
-            "worktree_identity": &worktree_json,
-        });
-        let digest_bytes = serde_json::to_vec(&digest_input).map_err(|error| {
-            refusal(&root, format!("cannot encode legacy binding plan: {error}"))
-        })?;
+        let digest = legacy_worktree_root_binding_digest(
+            &repository_root,
+            &git_common_dir,
+            &repository_key,
+            &broker_db_path,
+            &root,
+            layout_name,
+            source,
+            &parent_json,
+            &worktree_json,
+        )
+        .map_err(|error| refusal(&root, format!("cannot encode legacy binding plan: {error}")))?;
         Ok(LegacyWorktreeRootBindingPlan {
             schema_version: 1,
             repository_root,
@@ -3900,7 +3961,7 @@ impl Broker {
             source,
             parent_identity,
             worktree_identity: root_identity,
-            digest: hex_digest(&digest_bytes),
+            digest,
         })
     }
 
@@ -5657,6 +5718,114 @@ fn same_path(left: &Path, right: &Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
     left == right
+}
+
+#[cfg(all(test, unix))]
+mod worktree_root_digest_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn non_utf8_paths_are_refused_by_both_binding_digest_encoders() {
+        let non_utf8_root = PathBuf::from(OsString::from_vec(vec![
+            b'/', b'r', b'e', b'p', b'o', b'/', 0xff,
+        ]));
+        let identity = crate::store::repository_binding::RepositoryRootIdentity {
+            repository_root: non_utf8_root.clone(),
+            git_common_dir: non_utf8_root.join(".git"),
+            repository_key: "repo-key".to_owned(),
+            broker_db_path: non_utf8_root.join(".aethyme/broker.db"),
+            bootstrap_nonce: "a1".repeat(32),
+        };
+
+        let fresh_error = fresh_root_reservation_digest(
+            &identity,
+            &non_utf8_root.join(".aethyme/worktrees"),
+            crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer,
+            WorktreeRootSource::RepositoryFallback,
+            r#"{"device":1,"inode":2}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            fresh_error,
+            BrokerOpError::WorktreeRootUnavailable { reason, .. }
+                if reason.contains("cannot encode root reservation identity")
+        ));
+
+        let legacy_result = legacy_worktree_root_binding_digest(
+            &non_utf8_root,
+            &non_utf8_root.join(".git"),
+            "repo-key",
+            &non_utf8_root.join(".aethyme/broker.db"),
+            &non_utf8_root.join(".aethyme/worktrees"),
+            "keyed_container",
+            WorktreeRootSource::RepositoryFallback,
+            r#"{"device":1,"inode":2}"#,
+            r#"{"device":1,"inode":3}"#,
+        );
+        assert!(legacy_result.is_err());
+    }
+
+    #[test]
+    fn utf8_digest_encoders_preserve_legacy_canonical_bytes() {
+        let identity = crate::store::repository_binding::RepositoryRootIdentity {
+            repository_root: PathBuf::from("/repo"),
+            git_common_dir: PathBuf::from("/repo/.git"),
+            repository_key: "repo-key".to_owned(),
+            broker_db_path: PathBuf::from("/repo/.aethyme/broker.db"),
+            bootstrap_nonce: "a1".repeat(32),
+        };
+        let root = PathBuf::from("/repo/.aethyme/worktrees");
+        let layout = crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer;
+        let source = WorktreeRootSource::RepositoryFallback;
+        let parent_identity = r#"{"device":1,"inode":2}"#;
+        let worktree_identity = r#"{"device":1,"inode":3}"#;
+
+        let expected_fresh_bytes = serde_json::to_vec(&serde_json::json!({
+            "repository_root": identity.repository_root,
+            "git_common_dir": identity.git_common_dir,
+            "repository_key": identity.repository_key,
+            "broker_db_path": identity.broker_db_path,
+            "bootstrap_nonce": identity.bootstrap_nonce,
+            "worktree_root": root,
+            "layout": format!("{layout:?}"),
+            "source": source,
+            "parent_identity": parent_identity,
+        }))
+        .unwrap();
+        let fresh_digest =
+            fresh_root_reservation_digest(&identity, &root, layout, source, parent_identity)
+                .unwrap();
+        assert_eq!(fresh_digest, hex_digest(&expected_fresh_bytes));
+
+        let expected_legacy_bytes = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "repository_root": identity.repository_root,
+            "git_common_dir": identity.git_common_dir,
+            "repository_key": identity.repository_key,
+            "broker_db_path": identity.broker_db_path,
+            "worktree_root": root,
+            "layout": "keyed_container",
+            "source": source,
+            "parent_identity": parent_identity,
+            "worktree_identity": worktree_identity,
+        }))
+        .unwrap();
+        let legacy_digest = legacy_worktree_root_binding_digest(
+            &identity.repository_root,
+            &identity.git_common_dir,
+            &identity.repository_key,
+            &identity.broker_db_path,
+            &root,
+            "keyed_container",
+            source,
+            parent_identity,
+            worktree_identity,
+        )
+        .unwrap();
+        assert_eq!(legacy_digest, hex_digest(&expected_legacy_bytes));
+    }
 }
 
 #[cfg(test)]

@@ -249,7 +249,7 @@ mod unix {
                     &base,
                     DatabaseProof::UnpublishedStage,
                 )?;
-                publish_verified_stage(repo_root, &paths, &base, &verified)
+                publish_verified_stage(&paths, &base, &verified)
             }
             (false, false) => {
                 let base = capture_identity_base(repo_root, &paths.final_path)?;
@@ -272,7 +272,7 @@ mod unix {
                 }
                 // The stage remains as inspectable evidence on every uncertain
                 // path, including collisions with a readable legacy database.
-                publish_verified_stage(repo_root, &paths, &base, &verified)
+                publish_verified_stage(&paths, &base, &verified)
             }
         }
     }
@@ -417,7 +417,7 @@ mod unix {
     }
 
     fn verify_parent(paths: &DbPaths) -> Result<(), BrokerError> {
-        let (file, identity) =
+        let (file, _identity) =
             open_verified_parent(&paths.parent_path, Some(paths.parent_identity))?;
         drop(file);
         Ok(())
@@ -1222,7 +1222,6 @@ mod unix {
     }
 
     fn publish_verified_stage(
-        repo_root: &Path,
         paths: &DbPaths,
         base: &IdentityBase,
         verified: &VerifiedDatabase,
@@ -1316,7 +1315,7 @@ mod unix {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         schema::migrate(&connection)?;
-        let mut store = BrokerStore {
+        let store = BrokerStore {
             conn: connection,
             path: logical_path.to_path_buf(),
             _snapshot_dir: None,
@@ -1491,10 +1490,7 @@ mod unix {
                 "verified replay clears its stage link"
             );
             let binding = store.repository_worktree_binding().unwrap();
-            assert_eq!(
-                binding.bootstrap_nonce,
-                Some(verified.identity.bootstrap_nonce)
-            );
+            assert_eq!(binding.bootstrap_nonce, verified.identity.bootstrap_nonce);
             assert_eq!(binding.state, RepositoryWorktreeBindingState::FreshUnbound);
             let final_meta = fs::symlink_metadata(&paths.final_path).unwrap();
             assert_eq!(final_meta.nlink(), 1);
@@ -1509,10 +1505,7 @@ mod unix {
 
             let store = open_in_repo(repo.path(), &paths.logical_path).unwrap();
             let binding = store.repository_worktree_binding().unwrap();
-            assert_eq!(
-                binding.bootstrap_nonce,
-                Some(verified.identity.bootstrap_nonce)
-            );
+            assert_eq!(binding.bootstrap_nonce, verified.identity.bootstrap_nonce);
             assert_eq!(binding.state, RepositoryWorktreeBindingState::FreshUnbound);
             assert!(!paths.stage_path.exists());
             assert_eq!(fs::symlink_metadata(&paths.final_path).unwrap().nlink(), 1);
@@ -1732,8 +1725,7 @@ mod unix {
                 binding.state == RepositoryWorktreeBindingState::LegacyUnbound
             }));
 
-            let publish_error = match publish_verified_stage(repo.path(), &paths, &base, &verified)
-            {
+            let publish_error = match publish_verified_stage(&paths, &base, &verified) {
                 Ok(_) => panic!("a legacy final-name collision must be refused"),
                 Err(error) => error,
             };

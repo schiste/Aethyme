@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-09-14
+Last Updated: 2026-10-20
 
 ## Install
 
@@ -317,6 +317,28 @@ to choose another external base. The broker appends the clone key, writes a
 private ownership marker, and refuses a root inside this repository or any
 linked worktree.
 
+`broker worktree-root binding plan <exact-root> <keyed_container|direct_root>
+[--json]` and `apply ... --confirm <sha256> [--json]` explicitly bind an
+existing legacy database to the exact worktree root already present on disk.
+Planning is read-only and prints a `schema_version: 1` object with repository
+and Git identity, broker database path, requested root/layout/source, parent
+and root identities, and a confirmation digest. Apply rechecks that plan and
+requires its exact digest; it does not move or create the root. Startup
+recovery uses the bound identity on the next broker open.
+
+Apply JSON prints the binding record directly. Its keys are `state`, `origin`,
+`repository_root`, `git_common_dir`, `repository_key`, `broker_db_path`,
+`bootstrap_nonce`, `worktree_root`, `root_layout`, `root_source`,
+`reservation_digest`, `parent_identity_json`, `worktree_identity_json`, and
+`updated_at_ms`. Inapplicable optional fields are JSON `null`. Enum strings use
+lower snake case: states `legacy_unbound`, `fresh_unbound`, `fresh_reserved`,
+`bound`, `recovery_required`; origins `legacy`, `fresh`; layouts
+`keyed_container`, `direct_root`; and sources `host_state`,
+`repository_config`, `environment_override`, `library_override`,
+`repository_fallback`. The plan/apply workflow only adopts `legacy_unbound`
+records. Fresh interrupted or `recovery_required` bindings have no operator
+repair command in this release and remain fail-closed.
+
 If the platform host-state root cannot be prepared, `broker start` uses the
 legacy `.aethyme/worktrees/` location and reports the exact fallback reason in
 text and JSON. Explicit environment overrides fail closed instead of silently
@@ -491,6 +513,8 @@ stashing multi-worktree changes.
 - `aethyme broker status readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
 - `aethyme broker status [--json]`
 - `aethyme broker advanced worktree-root [--json]`
+- `aethyme broker worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]`
+- `aethyme broker worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]`
 - `aethyme broker start --task "..." --short-name <name> [--pull-request <number>] [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
 - `aethyme broker start --task "..." --cmd <command> --short-name <name> [--pull-request <number>] [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
 - Supplying `--pull-request` explicitly refuses the integration-tip lane:
