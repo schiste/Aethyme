@@ -2380,7 +2380,13 @@ fn a_closed_session_with_a_persisted_interrupted_cache_is_resumed_by_the_next_pa
     let (worktree, id) = closed_session_with_target(repo.path(), container.path(), "interrupted");
     let worktree = worktree.canonicalize().unwrap();
     let session_id = id.parse().unwrap();
-    assert_eq!(session_status(repo.path(), session_id), "closed");
+    let initial_status = session_status(repo.path(), session_id);
+    assert!(
+        aethyme_broker::SessionStatus::parse(&initial_status)
+            .unwrap()
+            .is_closed(),
+        "the cache belongs to a closed session, got {initial_status:?}"
+    );
     assert!(worktree.is_dir(), "the closed checkout is retained");
 
     let target = worktree.join("rust/target").canonicalize().unwrap();
@@ -2451,7 +2457,9 @@ fn a_closed_session_with_a_persisted_interrupted_cache_is_resumed_by_the_next_pa
     );
     let final_status = session_status(repo.path(), session_id);
     assert!(
-        matches!(final_status.as_str(), "closed" | "cleaned"),
+        aethyme_broker::SessionStatus::parse(&final_status)
+            .unwrap()
+            .is_closed(),
         "cache cleanup leaves the session closed, got {final_status:?}: {report}"
     );
     assert_eq!(
