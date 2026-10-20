@@ -3045,8 +3045,14 @@ impl Broker {
             Ok(session) => session,
             Err(error) => {
                 let worktree_path = worktree.root().to_path_buf();
-                let _ = self.repo.worktree_remove_registered(&worktree_path, true);
-                let _ = self.repo.delete_branch_ref_checked(&branch, &base);
+                let removed = self
+                    .repo
+                    .worktree_remove_registered(&worktree_path, true)
+                    .is_ok()
+                    && !worktree_path.exists();
+                if removed {
+                    let _ = self.repo.delete_branch_ref_checked(&branch, &base);
+                }
                 return Err(error.into());
             }
         };
