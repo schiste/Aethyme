@@ -35,6 +35,27 @@ break announced in this file. Enum-valued fields (`status`, `origin`,
 Object key order and `null`-vs-present for nullable fields are **not**
 part of the contract.
 
+## Error output (`aethyme.broker-error/v1`, introduced 2026-10-20)
+
+When a broker command requested JSON with `--json` or the compatibility alias
+`--json-output` fails before producing a report, it writes one JSON object to
+stdout with the versioned shape below. The `code` is the command's numeric exit
+code; `message` is human-readable and may vary between releases.
+
+```json
+{"schema":"aethyme.broker-error/v1","error":{"code":3,"message":"the request was refused"}}
+```
+
+When a command has already produced a JSON report, that report remains the
+single JSON document. A blocked `finish --json` keeps its existing report
+fields, adds an `error` object with `code` and `message`, and exits with the
+matching nonzero code. If writing to stdout fails after output begins, the
+broker does not append a second error document; it preserves the command's
+nonzero exit code (or returns the environment-failure code for an otherwise
+successful command). Arguments after `--` belong to a child and do not enable
+broker JSON mode. Commands that deliberately stream raw output retain their
+documented output format.
+
 ## Field inventory (v1)
 
 ### `status --json`

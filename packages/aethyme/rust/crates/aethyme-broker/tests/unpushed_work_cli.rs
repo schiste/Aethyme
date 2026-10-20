@@ -247,8 +247,23 @@ fn finish_refuses_unpushed_work_under_the_push_lane() {
     let (session, worktree, _) = promoted_unpushed_session(&fixture);
     let id = session.to_string();
 
-    let report = json(&run(&fixture.repo, &["finish", "--session", &id, "--json"]));
+    let output = run(&fixture.repo, &["finish", "--session", &id, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)));
     assert_eq!(report["status"], "blocked", "{report:#}");
+    assert_eq!(report["error"]["code"], 3, "{report:#}");
+    assert_eq!(report["error"]["message"], "session is not ready to finish");
     assert_eq!(report["closed"], false);
     assert_eq!(report["unpushed_commits"], 1);
     let commands = report["next_commands"].as_array().unwrap();
@@ -259,6 +274,15 @@ fn finish_refuses_unpushed_work_under_the_push_lane() {
         "{commands:?}"
     );
     assert!(worktree.exists());
+
+    let text_finish = run(&fixture.repo, &["finish", "--session", &id]);
+    assert_eq!(
+        text_finish.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&text_finish.stderr)
+    );
+    assert!(String::from_utf8_lossy(&text_finish.stdout).contains("finish: blocked"));
 
     let close = run(&fixture.repo, &["finish", "close", "--session", &id]);
     assert!(!close.status.success());
