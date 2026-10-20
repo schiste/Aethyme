@@ -652,6 +652,39 @@ mod gate_result_clear_metadata_tests {
         assert_eq!(permits, 0);
     }
 
+    #[test]
+    fn health_row_inventory_keeps_candidates_without_reading_content_fingerprints() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO gate_results (
+                     gate_name, tree_hash, definition_hash, status, created_at, log_path
+                 ) VALUES ('unit', 'tree', 'definition', 'fail', 1, 'old.log')",
+                [],
+            )
+            .unwrap();
+
+        let planned = store.gc_row_candidates(2, 2, 2).unwrap();
+        let health = store.gc_row_candidates_for_health(2, 2, 2).unwrap();
+        assert_eq!(health.len(), planned.len());
+        assert!(!health.is_empty());
+        for health in &health {
+            let planned = planned
+                .iter()
+                .find(|planned| planned.kind == health.kind && planned.id == health.id)
+                .expect("health inventory preserves each planned candidate");
+            assert_eq!(health.kind, planned.kind);
+            assert_eq!(health.id, planned.id);
+            assert_eq!(health.recorded_at, planned.recorded_at);
+            assert_eq!(health.estimated_bytes, planned.estimated_bytes);
+            assert_eq!(health.gate_log_path, planned.gate_log_path);
+            assert!(health.content_fingerprint.is_none());
+            assert!(planned.content_fingerprint.is_some());
+        }
+    }
+
     fn git(repo: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .args(["-c", "commit.gpgsign=false"])

@@ -1089,7 +1089,33 @@ impl BrokerStore {
         gate_cutoff: i64,
         queue_cutoff: i64,
     ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
-        Self::gc_row_candidates_on(&self.conn, event_cutoff, gate_cutoff, queue_cutoff, None)
+        Self::gc_row_candidates_on(
+            &self.conn,
+            event_cutoff,
+            gate_cutoff,
+            queue_cutoff,
+            None,
+            true,
+        )
+    }
+
+    /// The row inventory used by health summaries. Health reports counts and
+    /// estimates but cannot authorize deletion, so it does not read every
+    /// candidate row back in full merely to compute apply-time fingerprints.
+    pub fn gc_row_candidates_for_health(
+        &self,
+        event_cutoff: i64,
+        gate_cutoff: i64,
+        queue_cutoff: i64,
+    ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
+        Self::gc_row_candidates_on(
+            &self.conn,
+            event_cutoff,
+            gate_cutoff,
+            queue_cutoff,
+            None,
+            false,
+        )
     }
 
     fn gc_row_candidates_on(
@@ -1098,6 +1124,7 @@ impl BrokerStore {
         gate_cutoff: i64,
         queue_cutoff: i64,
         only: Option<&[crate::GcRowCandidate]>,
+        attach_fingerprints: bool,
     ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
         use crate::{GcRowCandidate, GcRowKind};
 
@@ -1468,7 +1495,9 @@ impl BrokerStore {
             })
         })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
-        attach_gc_row_content_fingerprints(conn, &mut candidates)?;
+        if attach_fingerprints {
+            attach_gc_row_content_fingerprints(conn, &mut candidates)?;
+        }
         Ok(candidates)
     }
 
@@ -1599,8 +1628,14 @@ impl BrokerStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let eligible =
-            Self::gc_row_candidates_on(&tx, event_cutoff, gate_cutoff, queue_cutoff, Some(&rows))?;
+        let eligible = Self::gc_row_candidates_on(
+            &tx,
+            event_cutoff,
+            gate_cutoff,
+            queue_cutoff,
+            Some(&rows),
+            true,
+        )?;
         let eligible_by_id = eligible
             .into_iter()
             .map(|candidate| ((candidate.kind, candidate.id), candidate))

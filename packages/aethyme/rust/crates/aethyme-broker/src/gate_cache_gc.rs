@@ -29,6 +29,8 @@ use crate::{
     GcGateCacheCandidate, GcGateCacheDisposition, GcGateCacheEntry, GcGateCacheInventory, GitRepo,
 };
 
+const HEALTH_GATE_CACHE_ENTRY_BUDGET: usize = 16_384;
+
 /// Where this repository's gate cache lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GateCacheLocation {
@@ -91,27 +93,55 @@ pub(crate) fn retired_rotation(name: &str) -> Option<(&str, i64)> {
 /// every build. Deeper than that is a full walk, which sizing already pays for
 /// but routine ranking must not.
 fn last_used_at_ms(path: &Path) -> Option<i64> {
+    last_used_at_ms_until(path, || false).ok().flatten()
+}
+
+fn last_used_at_ms_until(
+    path: &Path,
+    expired: &mut impl FnMut() -> bool,
+) -> Result<Option<i64>, ()> {
     fn modified_ms(path: &Path) -> Option<i64> {
         let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
         i64::try_from(modified.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
     }
-    let mut latest = modified_ms(path)?;
+    if expired() {
+        return Err(());
+    }
+    let Some(mut latest) = modified_ms(path) else {
+        return Ok(None);
+    };
     let mut frontier = vec![(path.to_path_buf(), 0_usize)];
     while let Some((directory, depth)) = frontier.pop() {
+        if expired() {
+            return Err(());
+        }
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
-        for entry in entries.flatten() {
+        let mut entries = entries;
+        loop {
+            if expired() {
+                return Err(());
+            }
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            let Ok(entry) = entry else {
+                continue;
+            };
             let child = entry.path();
             if let Some(modified) = modified_ms(&child) {
                 latest = latest.max(modified);
+            }
+            if expired() {
+                return Err(());
             }
             if depth < 1 && is_real_directory(&child) {
                 frontier.push((child, depth + 1));
             }
         }
     }
-    Some(latest)
+    Ok(Some(latest))
 }
 
 /// What a cache entry is a generation of: its name without a trailing
@@ -197,6 +227,52 @@ fn cache_leases(
     Ok(held)
 }
 
+fn cache_leases_until(
+    location: &GateCacheLocation,
+    mut expired: impl FnMut() -> bool,
+) -> Result<Option<std::collections::BTreeMap<String, Vec<String>>>, String> {
+    let prefix = crate::gates::managed_cache_lease_name(&location.repository_key, "");
+    let registry = location
+        .registry
+        .as_deref()
+        .ok_or_else(|| "the host state directory cannot be resolved".to_string())?;
+    require_registry(registry)?;
+    let coordinator = crate::HostResourceCoordinator::open_read_only(registry)
+        .map_err(|error| error.to_string())?;
+    let Some(leases) = coordinator
+        .list_until(false, HEALTH_GATE_CACHE_ENTRY_BUDGET, &mut expired)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let mut held = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for lease in leases {
+        if expired() {
+            return Ok(None);
+        }
+        for allocation in &lease.allocations {
+            if expired() {
+                return Ok(None);
+            }
+            if allocation.kind != "exclusive_key" {
+                continue;
+            }
+            let Some(cache_key) = allocation.value.strip_prefix(&prefix) else {
+                continue;
+            };
+            held.entry(cache_key.to_string()).or_default().push(format!(
+                "gate cache lease {} is {} (holder pid {})",
+                lease.lease_id,
+                lease.state.as_str(),
+                lease
+                    .holder_pid
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+            ));
+        }
+    }
+    Ok((!expired()).then_some(held))
+}
+
 /// Inventory this repository's gate cache and choose what to propose.
 ///
 /// `scan` decides whether entries are walked for their size or read from the
@@ -221,96 +297,196 @@ pub(crate) fn inspect(
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
 ) -> (GcGateCacheInventory, Vec<GcGateCacheCandidate>) {
+    let (inventory, candidates, complete) = inspect_with_expiration(
+        main_root,
+        location,
+        rule,
+        evaluated_at,
+        scan,
+        records,
+        || false,
+        None,
+    );
+    debug_assert!(complete);
+    (
+        inventory.expect("unbounded gate-cache inspection returns an inventory"),
+        candidates,
+    )
+}
+
+pub(crate) fn inspect_until(
+    main_root: &Path,
+    location: &GateCacheLocation,
+    rule: KeepRule<'_>,
+    evaluated_at: i64,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+    deadline: Instant,
+) -> (
+    Option<GcGateCacheInventory>,
+    Vec<GcGateCacheCandidate>,
+    bool,
+) {
+    inspect_with_expiration(
+        main_root,
+        location,
+        rule,
+        evaluated_at,
+        scan,
+        records,
+        || Instant::now() >= deadline,
+        Some(HEALTH_GATE_CACHE_ENTRY_BUDGET),
+    )
+}
+
+fn inspect_with_expiration(
+    main_root: &Path,
+    location: &GateCacheLocation,
+    rule: KeepRule<'_>,
+    evaluated_at: i64,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+    mut expired: impl FnMut() -> bool,
+    entry_budget: Option<usize>,
+) -> (
+    Option<GcGateCacheInventory>,
+    Vec<GcGateCacheCandidate>,
+    bool,
+) {
     let KeepRule {
         budget_bytes,
         include_active,
         configured_keys,
     } = rule;
-    let mut holders = crate::gates::running_gate_evidence(main_root);
-    let leases = match cache_leases(location) {
-        Ok(leases) => leases,
-        Err(error) => {
-            holders.push(format!(
-                "the host resource registry cannot be read, so no lease can be ruled out: {error}"
-            ));
-            Default::default()
+    if expired() {
+        return (None, Vec::new(), false);
+    }
+    let Some(mut holders) =
+        crate::gates::running_gate_evidence_until(main_root, &mut expired, entry_budget)
+    else {
+        return (None, Vec::new(), false);
+    };
+    let leases = if entry_budget.is_some() {
+        match cache_leases_until(location, &mut expired) {
+            Ok(Some(leases)) => leases,
+            Ok(None) => return (None, Vec::new(), false),
+            Err(error) => {
+                holders.push(format!(
+                    "the host resource registry cannot be read, so no lease can be ruled out: {error}"
+                ));
+                Default::default()
+            }
+        }
+    } else {
+        match cache_leases(location) {
+            Ok(leases) => leases,
+            Err(error) => {
+                holders.push(format!(
+                    "the host resource registry cannot be read, so no lease can be ruled out: {error}"
+                ));
+                Default::default()
+            }
         }
     };
+    if expired() {
+        return (None, Vec::new(), false);
+    }
 
     let mut entries = Vec::new();
-    if let Ok(children) = std::fs::read_dir(&location.root) {
-        for child in children.flatten() {
-            let path = child.path();
-            // Never follow a link out of the cache root, and ignore files.
-            if !is_real_directory(&path) {
-                continue;
-            }
-            let entry = child.file_name().to_string_lossy().into_owned();
-            let retired = retired_rotation(&entry).map(|(key, pid)| (key.to_string(), pid));
-            let cache_key = retired
-                .as_ref()
-                .map_or_else(|| entry.clone(), |(key, _)| key.clone());
-            let key = path.to_string_lossy().into_owned();
-            let (estimated_bytes, estimated_inodes) = if scan.measures() {
-                let measured =
-                    crate::disk_headroom::directory_usage_without_following_links(&path).ok();
-                if let Some(usage) = measured {
-                    records.record_usage(&key, usage.bytes, Some(usage.inodes), evaluated_at);
+    let mut entries_examined = 0_usize;
+    match std::fs::read_dir(&location.root) {
+        Ok(children) => {
+            for child in children {
+                if expired() || entry_budget.is_some_and(|budget| entries_examined >= budget) {
+                    return (None, Vec::new(), false);
                 }
-                measured
-                    .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
-                    .unwrap_or((None, None))
-            } else {
-                records
-                    .get(&key)
-                    .map(|record| (Some(record.bytes), record.inodes))
-                    .unwrap_or((None, None))
-            };
-            let last_used_at_ms = last_used_at_ms(&path);
-            let mut hold = Vec::new();
-            if let Some((_, pid)) = &retired
-                && crate::broker::pid_alive(*pid)
-            {
-                hold.push(format!(
-                    "process {pid} is still rotating or removing this entry"
-                ));
-            }
-            if let Some(lease) = leases.get(&cache_key) {
-                hold.extend(lease.iter().cloned());
-            }
-            hold.extend(holders.iter().cloned());
-            let (disposition, reason) = if !hold.is_empty() {
-                (GcGateCacheDisposition::Held, hold.join("; "))
-            } else if estimated_bytes.is_none() || last_used_at_ms.is_none() {
-                (
-                    GcGateCacheDisposition::Unmeasured,
-                    "not sized on this pass; run `aethyme broker gc plan` to measure it".into(),
-                )
-            } else if let Some((_, pid)) = &retired {
-                (
-                    GcGateCacheDisposition::Reclaimable,
-                    format!(
-                        "a cache rotation by process {pid} was interrupted before it removed \
+                let Ok(child) = child else {
+                    if entry_budget.is_some() {
+                        return (None, Vec::new(), false);
+                    }
+                    continue;
+                };
+                entries_examined = entries_examined.saturating_add(1);
+                let path = child.path();
+                // Never follow a link out of the cache root, and ignore files.
+                if !is_real_directory(&path) {
+                    continue;
+                }
+                let entry = child.file_name().to_string_lossy().into_owned();
+                let retired = retired_rotation(&entry).map(|(key, pid)| (key.to_string(), pid));
+                let cache_key = retired
+                    .as_ref()
+                    .map_or_else(|| entry.clone(), |(key, _)| key.clone());
+                let key = path.to_string_lossy().into_owned();
+                let (estimated_bytes, estimated_inodes) = if scan.measures() {
+                    let measured =
+                        crate::disk_headroom::directory_usage_without_following_links(&path).ok();
+                    if let Some(usage) = measured {
+                        records.record_usage(&key, usage.bytes, Some(usage.inodes), evaluated_at);
+                    }
+                    measured
+                        .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
+                        .unwrap_or((None, None))
+                } else {
+                    records
+                        .get(&key)
+                        .map(|record| (Some(record.bytes), record.inodes))
+                        .unwrap_or((None, None))
+                };
+                let last_used_at_ms = match last_used_at_ms_until(&path, &mut expired) {
+                    Ok(value) => value,
+                    Err(()) => return (None, Vec::new(), false),
+                };
+                let mut hold = Vec::new();
+                if let Some((_, pid)) = &retired
+                    && crate::broker::pid_alive(*pid)
+                {
+                    hold.push(format!(
+                        "process {pid} is still rotating or removing this entry"
+                    ));
+                }
+                if let Some(lease) = leases.get(&cache_key) {
+                    hold.extend(lease.iter().cloned());
+                }
+                hold.extend(holders.iter().cloned());
+                let (disposition, reason) = if !hold.is_empty() {
+                    (GcGateCacheDisposition::Held, hold.join("; "))
+                } else if estimated_bytes.is_none() || last_used_at_ms.is_none() {
+                    (
+                        GcGateCacheDisposition::Unmeasured,
+                        "not sized on this pass; run `aethyme broker gc plan` to measure it".into(),
+                    )
+                } else if let Some((_, pid)) = &retired {
+                    (
+                        GcGateCacheDisposition::Reclaimable,
+                        format!(
+                            "a cache rotation by process {pid} was interrupted before it removed \
                          this directory; the process is gone and the rotation had already \
                          discarded it"
-                    ),
-                )
-            } else {
-                // Ranked against the budget below.
-                (GcGateCacheDisposition::WithinBudget, String::new())
-            };
-            entries.push(GcGateCacheEntry {
-                entry,
-                cache_key,
-                path: key,
-                estimated_bytes,
-                estimated_inodes,
-                last_used_at_ms,
-                age_days: last_used_at_ms.map(|at| days_between(evaluated_at, at)),
-                disposition,
-                reason,
-            });
+                        ),
+                    )
+                } else {
+                    // Ranked against the budget below.
+                    (GcGateCacheDisposition::WithinBudget, String::new())
+                };
+                entries.push(GcGateCacheEntry {
+                    entry,
+                    cache_key,
+                    path: key,
+                    estimated_bytes,
+                    estimated_inodes,
+                    last_used_at_ms,
+                    age_days: last_used_at_ms.map(|at| days_between(evaluated_at, at)),
+                    disposition,
+                    reason,
+                });
+            }
         }
+        Err(_) if entry_budget.is_some() => return (None, Vec::new(), false),
+        Err(_) => {}
+    }
+    if expired() {
+        return (None, Vec::new(), false);
     }
 
     // The most recently used entry of each kind is the one the next gate of
@@ -329,6 +505,9 @@ pub(crate) fn inspect(
         .map(|key| cache_kind(key).to_string())
         .collect::<std::collections::BTreeSet<_>>();
     for key in configured_keys {
+        if expired() {
+            return (None, Vec::new(), false);
+        }
         if entries
             .iter()
             .any(|entry| entry.entry == *key && entry.last_used_at_ms.is_some())
@@ -337,6 +516,9 @@ pub(crate) fn inspect(
         }
     }
     for entry in &entries {
+        if expired() {
+            return (None, Vec::new(), false);
+        }
         if configured_kinds.contains(cache_kind(&entry.entry)) {
             continue;
         }
@@ -357,6 +539,9 @@ pub(crate) fn inspect(
             .or_insert(candidate);
     }
     for entry in &mut entries {
+        if expired() {
+            return (None, Vec::new(), false);
+        }
         let is_newest = newest
             .get(cache_kind(&entry.entry))
             .is_some_and(|(_, name)| *name == entry.entry);
@@ -384,6 +569,9 @@ pub(crate) fn inspect(
     // of the budget by occupying it: what is kept for later is decided among
     // the entries nothing is using, by recency alone.
     let mut kept_bytes = 0_u64;
+    if expired() {
+        return (None, Vec::new(), false);
+    }
     let mut ranked = entries
         .iter_mut()
         .filter(|entry| {
@@ -391,6 +579,9 @@ pub(crate) fn inspect(
                 && retired_rotation(&entry.entry).is_none()
         })
         .collect::<Vec<_>>();
+    if expired() {
+        return (None, Vec::new(), false);
+    }
     ranked.sort_by(|left, right| {
         right
             .last_used_at_ms
@@ -401,6 +592,9 @@ pub(crate) fn inspect(
     // recently are proposed, even an older entry small enough to squeeze in.
     let mut overflowed = false;
     for entry in ranked {
+        if expired() {
+            return (None, Vec::new(), false);
+        }
         let bytes = entry.estimated_bytes.unwrap_or(0);
         if !overflowed && kept_bytes.saturating_add(bytes) <= budget_bytes {
             kept_bytes = kept_bytes.saturating_add(bytes);
@@ -422,6 +616,9 @@ pub(crate) fn inspect(
         }
     }
 
+    if expired() {
+        return (None, Vec::new(), false);
+    }
     entries.sort_by(|left, right| left.entry.cmp(&right.entry));
     let mut candidates = entries
         .iter()
@@ -437,6 +634,9 @@ pub(crate) fn inspect(
             reason: entry.reason.clone(),
         })
         .collect::<Vec<_>>();
+    if expired() {
+        return (None, Vec::new(), false);
+    }
     // Interrupted rotations first -- they are already discarded, not a cache
     // anyone could reuse -- then least recently used, so a bounded apply
     // reaches the coldest bytes before the warmer ones.
@@ -489,7 +689,7 @@ pub(crate) fn inspect(
         holders,
         entries,
     };
-    (inventory, candidates)
+    (Some(inventory), candidates, true)
 }
 
 /// What removing one candidate achieved.
@@ -733,6 +933,43 @@ mod tests {
             crate::SizeScan::Measure,
             &mut records,
         )
+    }
+
+    #[test]
+    fn gate_cache_health_inventory_discards_results_after_deadline() {
+        let fixture = fixture("rust-workspace-v3", 10);
+        let mut records = crate::measurement::SizeRecords::default();
+        let (inventory, candidates, complete) = inspect_until(
+            &fixture.main_root,
+            &fixture.location,
+            KeepRule {
+                budget_bytes: 0,
+                include_active: false,
+                configured_keys: &std::collections::BTreeSet::new(),
+            },
+            crate::clock::epoch_ms(),
+            crate::SizeScan::Recorded,
+            &mut records,
+            Instant::now() - std::time::Duration::from_millis(1),
+        );
+
+        assert!(!complete);
+        assert!(inventory.is_none());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn last_used_scan_stops_when_deadline_expires_mid_directory() {
+        let fixture = fixture("rust-workspace-v3", 10);
+        let path = fixture.location.root.join("rust-workspace-v3");
+        let mut checks = 0;
+        let result = last_used_at_ms_until(&path, &mut || {
+            checks += 1;
+            checks >= 4
+        });
+
+        assert_eq!(result, Err(()));
+        assert_eq!(checks, 4, "the scan checks its bound between entries");
     }
 
     /// Finding 1: an absent registry is a registry this process cannot see,

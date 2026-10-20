@@ -1037,10 +1037,33 @@ pub(crate) fn running_session_gates(main_root: &Path, session_id: i64) -> Vec<St
 /// into?", and on 2026-09-26 a blanket delete that guessed wrong broke a live
 /// gate (#295).
 pub(crate) fn running_gate_evidence(main_root: &Path) -> Vec<String> {
+    running_gate_evidence_until(main_root, || false, None)
+        .expect("unbounded gate evidence scan completes")
+}
+
+/// Read the gate witnesses without allowing a health inventory to spend its
+/// whole deadline walking an unexpectedly large run directory. An incomplete
+/// result is unknown: callers must not use it to authorize cache removal.
+pub(crate) fn running_gate_evidence_until(
+    main_root: &Path,
+    mut expired: impl FnMut() -> bool,
+    entry_budget: Option<usize>,
+) -> Option<Vec<String>> {
     let run_dir = running_dir(main_root);
     let mut evidence = Vec::new();
+    let mut entries_seen = 0_usize;
     if let Ok(entries) = std::fs::read_dir(&run_dir) {
-        for entry in entries.flatten() {
+        for entry in entries {
+            if expired() || entry_budget.is_some_and(|budget| entries_seen >= budget) {
+                return None;
+            }
+            let Ok(entry) = entry else {
+                if entry_budget.is_some() {
+                    return None;
+                }
+                continue;
+            };
+            entries_seen = entries_seen.saturating_add(1);
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.ends_with(".pid") {
@@ -1057,10 +1080,26 @@ pub(crate) fn running_gate_evidence(main_root: &Path) -> Vec<String> {
             if record.names_running_process() {
                 evidence.push(format!("gate pidfile {name} names running process {pid}"));
             }
+            if expired() {
+                return None;
+            }
         }
+    } else if entry_budget.is_some() && run_dir.exists() {
+        return None;
     }
-    if let Ok(entries) = std::fs::read_dir(run_dir.join("owners")) {
-        for entry in entries.flatten() {
+    let owners_dir = run_dir.join("owners");
+    if let Ok(entries) = std::fs::read_dir(&owners_dir) {
+        for entry in entries {
+            if expired() || entry_budget.is_some_and(|budget| entries_seen >= budget) {
+                return None;
+            }
+            let Ok(entry) = entry else {
+                if entry_budget.is_some() {
+                    return None;
+                }
+                continue;
+            };
+            entries_seen = entries_seen.saturating_add(1);
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.ends_with(".lock") {
                 continue;
@@ -1086,10 +1125,15 @@ pub(crate) fn running_gate_evidence(main_root: &Path) -> Vec<String> {
                     evidence.push(format!("gate owner lock {name} cannot be probed: {error}"));
                 }
             }
+            if expired() {
+                return None;
+            }
         }
+    } else if entry_budget.is_some() && owners_dir.exists() {
+        return None;
     }
     evidence.sort();
-    evidence
+    (!expired()).then_some(evidence)
 }
 
 /// What a gate pidfile says about the process group it names.

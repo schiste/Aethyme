@@ -22,7 +22,9 @@
 //! "37.4 GB retained" with nobody noticing which of the two had been checked.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::BrokerOpError;
 
@@ -30,6 +32,7 @@ pub const SIZE_RECORD_SCHEMA_VERSION: u32 = 1;
 
 /// Where measurements are written down, relative to the main checkout.
 const SIZE_RECORDS_RELPATH: &str = ".aethyme/worktree-sizes.json";
+const HEALTH_SIZE_RECORD_READ_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Whether a pass may walk the disk to find out how big something is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +267,47 @@ pub(crate) fn load_size_records(main_root: &Path) -> SizeRecords {
         .and_then(|bytes| serde_json::from_slice::<SizeRecords>(&bytes).ok())
         .filter(|records| records.schema_version == SIZE_RECORD_SCHEMA_VERSION)
         .unwrap_or_default()
+}
+
+/// Read the size cache for a bounded health pass. A partial or oversized
+/// cache is unknown, not an empty inventory: callers must defer the checks
+/// that depend on these records.
+pub(crate) fn load_size_records_until(main_root: &Path, deadline: Instant) -> Option<SizeRecords> {
+    let path = size_records_path(main_root);
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(SizeRecords::default());
+        }
+        Err(_) => return Some(SizeRecords::default()),
+    };
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let count = match file.read(&mut chunk) {
+            Ok(count) => count,
+            Err(_) => return Some(SizeRecords::default()),
+        };
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > HEALTH_SIZE_RECORD_READ_LIMIT_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    if Instant::now() >= deadline {
+        return None;
+    }
+    Some(
+        serde_json::from_slice::<SizeRecords>(&bytes)
+            .ok()
+            .filter(|records| records.schema_version == SIZE_RECORD_SCHEMA_VERSION)
+            .unwrap_or_default(),
+    )
 }
 
 /// Write measurements back, replacing the file in one rename.
