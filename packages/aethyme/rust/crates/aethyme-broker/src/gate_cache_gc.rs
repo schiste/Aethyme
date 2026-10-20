@@ -74,6 +74,18 @@ fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
+fn cache_directory_status(
+    metadata: std::io::Result<std::fs::Metadata>,
+    fail_closed: bool,
+) -> Result<bool, ()> {
+    match metadata {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) if fail_closed => Err(()),
+        Err(_) => Ok(false),
+    }
+}
+
 /// `(cache key, pid)` for `.<key>.retired-<ms>-<pid>`, the name a gate gives
 /// an oversized entry between renaming it aside and removing it. The
 /// directory survives only when that process died in between -- or, for a
@@ -434,8 +446,20 @@ fn inspect_with_expiration(
                 entries_examined = entries_examined.saturating_add(1);
                 let path = child.path();
                 // Never follow a link out of the cache root, and ignore files.
-                if !is_real_directory(&path) {
-                    continue;
+                if expired() {
+                    return (None, Vec::new(), false);
+                }
+                let is_directory = cache_directory_status(
+                    std::fs::symlink_metadata(&path),
+                    entry_budget.is_some(),
+                );
+                if expired() {
+                    return (None, Vec::new(), false);
+                }
+                match is_directory {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(()) => return (None, Vec::new(), false),
                 }
                 let entry = child.file_name().to_string_lossy().into_owned();
                 let retired = retired_rotation(&entry).map(|(key, pid)| (key.to_string(), pid));
@@ -1013,6 +1037,46 @@ mod tests {
             last_used_at_ms_until(&tmp.path().join("absent"), &mut || false),
             Ok(None),
             "a positively absent cache path has no inventory"
+        );
+    }
+
+    #[test]
+    fn bounded_cache_directory_probe_defers_on_metadata_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("cache");
+        let file = tmp.path().join("not-a-cache");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"file").unwrap();
+
+        assert_eq!(
+            cache_directory_status(std::fs::symlink_metadata(&directory), true),
+            Ok(true)
+        );
+        assert_eq!(
+            cache_directory_status(std::fs::symlink_metadata(&file), true),
+            Ok(false)
+        );
+        assert_eq!(
+            cache_directory_status(
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                true
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            cache_directory_status(
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                true
+            ),
+            Err(())
+        );
+        assert_eq!(
+            cache_directory_status(
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                false
+            ),
+            Ok(false),
+            "the unbounded planner keeps its prior best-effort behavior"
         );
     }
 
