@@ -5726,14 +5726,20 @@ mod tests {
             tcp_callbacks > 0,
             "the live listener may release another port in the requested range"
         );
+        let retained_dead_port = c
+            .list(false)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == dead_port_lease.lease.lease_id)
+            .unwrap();
         assert_eq!(
-            c.list(false)
-                .unwrap()
-                .into_iter()
-                .find(|lease| lease.lease_id == dead_port_lease.lease.lease_id)
-                .unwrap()
-                .state,
-            HostLeaseState::Quarantined
+            retained_dead_port.state,
+            HostLeaseState::Active,
+            "a retryable TCP contention refusal rolls back the opportunistic quarantine sweep"
+        );
+        assert_eq!(
+            retained_dead_port.allocations, dead_port_lease.lease.allocations,
+            "the refused request must not quietly release the dead holder's named TCP allocation"
         );
         drop(live_listener);
     }
