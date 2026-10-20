@@ -26,6 +26,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and a seeded persisted marker to test fresh-process resume; assert the marker
   before invoking the resume path.
 
+- When a managed output is also an input to generated context or freshness
+  digests, update it before deriving those artifacts. Verify first deployment
+  and an unchanged repeat; a second-run rewrite can reveal incorrect ordering.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
 - Choose focused local Cargo checks by compilation target as well as test name.
@@ -64,7 +67,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   clear inherited `GIT_*` variables; it only adds or overrides values. For
   isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
   preserve unrelated variables such as `PATH`, then set the fixture's intended
-  author/committer values. For tests scoped to artifact caches or reclaim, set
+  author/committer values. If a fixture PATH excludes real provider binaries,
+  retain required CLI dependencies: install a prevalidated Git executable beside
+  the fake provider instead of removing Git and failing before provider startup.
+  For tests scoped to artifact caches or reclaim, set
   `[cleanup] auto_remove = false` explicitly and
   keep it enabled in whole-checkout cleanup tests. A real offline `origin` can
   make a clean branch legitimately eligible for whole-checkout cleanup; do not
@@ -131,7 +137,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
 - Give each validation attempt, including failed setup and guard-removal runs,
-  unique log and manifest paths. Preserve earlier outputs before retrying.
+  unique log and manifest paths. Check which filenames the delegated monitor
+  owns; store caller summaries under distinct names instead of overwriting or
+  exclusively creating those monitor outputs. Preserve earlier outputs before retrying.
   Freeze source for each invocation and record the exact head and dirty-state
   hashes before and after it. If relevant source changes during a run, retain
   that run as diagnostic evidence and rerun the committed source.
