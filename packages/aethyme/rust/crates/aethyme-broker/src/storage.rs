@@ -20,9 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
-use crate::gc::{
-    TreeRemoval, remove_condemned_tree, remove_condemned_tree_with_progress_and_guard,
-};
+use crate::gc::{PinnedTreeRemoval, TreeRemoval, remove_condemned_tree_with_progress_and_guard};
 use crate::reclaim::is_artefact_directory_with_extras;
 use crate::{BrokerStore, GitRepo};
 
@@ -460,6 +458,9 @@ pub struct StorageRecoveryArchiveGroup {
 pub struct StorageAppliedItem {
     pub kind: StorageCandidateKind,
     pub path: PathBuf,
+    /// Logical byte accounting for removed content, not an observed increase
+    /// in filesystem free space. Shared extents, hard links and concurrent
+    /// writers can make physical reclamation differ.
     pub reclaimed_bytes: u64,
 }
 
@@ -477,6 +478,9 @@ pub struct StorageApplyReport {
     pub complete: bool,
     pub applied: Vec<StorageAppliedItem>,
     pub failures: Vec<StorageApplyFailure>,
+    /// Logical byte accounting for removed content, not an observed increase
+    /// in filesystem free space. Shared extents, hard links and concurrent
+    /// writers can make physical reclamation differ.
     pub reclaimed_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_action: Option<String>,
@@ -4255,11 +4259,13 @@ fn remove_candidate_tree(path: &Path, witness: Option<&str>) -> Result<u64, Stri
     if !is_real_directory(path) {
         return Err("candidate is no longer a real directory".into());
     }
-    let before = crate::removal::tree_size(path);
-    match remove_condemned_tree(path, witness, None) {
-        Ok(TreeRemoval::Complete) => Ok(before),
-        Ok(TreeRemoval::Interrupted) => Err("directory removal was interrupted".into()),
-        Err(error) => Err(error.to_string()),
+    let tree = PinnedTreeRemoval::open(path).map_err(|error| error.to_string())?;
+    // Reporting-only logical lengths observed by the guarded unlink walk;
+    // this does not claim physical disk space recovered or require a prewalk.
+    match tree.remove_with_observed_file_bytes(witness, None) {
+        Ok((TreeRemoval::Complete, bytes)) => Ok(bytes),
+        Ok((TreeRemoval::Interrupted, _)) => Err("directory removal was interrupted".into()),
+        Err(error) => Err(error.source.to_string()),
     }
 }
 
