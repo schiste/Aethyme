@@ -1770,13 +1770,15 @@ fn historical_completion_roots_survive_revision_release_and_gc() {
     }];
     next_spec.selected = vec!["next".into()];
     let next_revision = target::propose_revision(&mut v.f.store, &v.owner, next_spec).unwrap();
-    v.f.store
-        .connection()
-        .execute(
-            "UPDATE local_targets SET phase='idle',resume_phase=NULL WHERE target=?1",
-            [v.owner.target()],
-        )
-        .unwrap();
+    let status = target::status(&v.f.store, v.owner.target()).unwrap();
+    assert_eq!(status.phase, target::Phase::PublicationConfirmed);
+    target::transition(
+        &mut v.f.store,
+        &v.owner,
+        status.version,
+        target::Phase::Idle,
+    )
+    .unwrap();
     target::select_revision(&mut v.f.store, &v.owner, &next_revision.id).unwrap();
     target::release_revision(&mut v.f.store, &v.owner, &old_revision).unwrap();
 
@@ -1802,6 +1804,19 @@ fn historical_completion_roots_survive_revision_release_and_gc() {
     let new_owner = target::acquire_controller(&mut v.f.store, &target_name, &issuer).unwrap();
     assert_ne!(new_owner.authority_epoch(), &prior_epoch);
     verify_historical_completion(&v.f.store, &historical).unwrap();
+
+    // Authority resume reopens ingress but leaves each target stopped. The
+    // newly acquired owner explicitly reselects the unreleased revision before
+    // asking the normal wave path to admit its next contribution.
+    assert_eq!(
+        target::status(&v.f.store, &target_name).unwrap().phase,
+        target::Phase::Stopped
+    );
+    target::select_revision(&mut v.f.store, &new_owner, &next_revision.id).unwrap();
+    assert_eq!(
+        target::status(&v.f.store, &target_name).unwrap().phase,
+        target::Phase::Idle
+    );
 
     // The normal admission path selects the historical completion after the
     // owner epoch changes, then composition binds the actual accepted commit
