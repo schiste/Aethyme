@@ -656,7 +656,10 @@ Under `required` such a key is refused as `unknown_setting`.
 
 `broker advanced exec --json` reports a command that has already run. Its
 post-execution ownership audit does not undo filesystem changes. The existing
-`exit_code` and `command_success` describe the child; the CLI exits 1 when either
+`exit_code` and `command_success` describe the child. In JSON mode, child stdout
+is inherited on stderr alongside child stderr, leaving stdout for exactly one
+completed report; output is neither buffered nor discarded. Text mode retains
+inherited child stdout. The CLI exits 1 when either
 the command or audit fails and retains the completed report on stdout.
 
 Additive fields:
@@ -669,6 +672,7 @@ Additive fields:
   `command_and_ownership_failed`, derived from those two independent results.
 - `next_actions`: explicit lease claim commands for missing owned paths, or
   coordination guidance for conflicting leases and adoption-time foreign edits.
+  Paths covered by a blocking or foreign directory receive coordination only.
   Claim commands shell-quote the path. Leading-dash paths receive coordination
   guidance rather than a command that the lease CLI cannot parse. Commands are
   suggestions; their normal broker authorization and conflict checks still apply.

@@ -177,3 +177,51 @@ fn human_output_says_command_already_ran_and_prints_quoted_claim_action() {
     );
     assert!(fixture.worktree.join("generated file.txt").exists());
 }
+
+#[test]
+fn json_success_routes_child_output_to_stderr_and_keeps_one_report() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run("printf CHILD_STDOUT; printf CHILD_STDERR >&2", true);
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON report without child output");
+    assert_eq!(value["outcome"], "passed");
+    assert_eq!(value["exit_code"], 0);
+    assert_eq!(value["ownership_ok"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("CHILD_STDOUT"), "{stderr}");
+    assert!(stderr.contains("CHILD_STDERR"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("CHILD_STDOUT"));
+}
+
+#[test]
+fn json_failure_preserves_both_child_streams_without_contaminating_report() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run(
+        "printf FAILED_STDOUT; printf FAILED_STDERR >&2; exit 7",
+        true,
+    );
+    let value = report(&output);
+    assert_eq!(value["outcome"], "command_failed");
+    assert_eq!(value["exit_code"], 7);
+    assert_eq!(value["ownership_ok"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("FAILED_STDOUT"), "{stderr}");
+    assert!(stderr.contains("FAILED_STDERR"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("FAILED_STDOUT"));
+}
+
+#[test]
+fn text_mode_preserves_inherited_child_stdout() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run(
+        "printf TEXT_CHILD_STDOUT; printf TEXT_CHILD_STDERR >&2",
+        false,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("TEXT_CHILD_STDOUT"), "{stdout}");
+    assert!(stderr.contains("TEXT_CHILD_STDERR"), "{stderr}");
+    assert!(!stderr.contains("TEXT_CHILD_STDOUT"), "{stderr}");
+}
