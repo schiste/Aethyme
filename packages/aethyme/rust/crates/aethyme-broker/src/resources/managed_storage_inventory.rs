@@ -5,6 +5,7 @@
 //! accounting input, not a filesystem quota, exact physical-extent measure,
 //! or constraint on non-broker writers.
 
+use sha2::{Digest, Sha256};
 use std::path::Path;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 use std::path::PathBuf;
@@ -29,6 +30,8 @@ const OWNER_TTL_MAX_SECONDS: u64 = 86_400;
 const SCAN_MAX_ENTRIES: usize = 100_000;
 const SCAN_MAX_DEPTH: usize = 64;
 const SCAN_MAX_DURATION: Duration = Duration::from_secs(3);
+const ROOT_SET_MAX_ROOTS: usize = 32;
+const ROOT_SET_MAX_POLL_WORK: usize = 512;
 
 /// A new reservation grants one materialization attempt. Existing rows are
 /// returned as status and never grant another attempt.
@@ -61,6 +64,98 @@ pub(crate) struct ManagedStorageOwner<'a> {
     repository: String,
     root: RootBinding,
     ttl_seconds: u64,
+}
+
+/// A bounded collection of existing materialization roots under one
+/// repository's preparation-cache directory. It preserves the single-root
+/// path domain and does not resolve profile selectors or arbitrary worktree
+/// paths. Roots are ordered by their path-derived identity, and duplicate
+/// identities are refused rather than silently collapsed.
+///
+/// Capturing these bindings does not make later scans an atomic filesystem
+/// snapshot or fence writers outside the cooperative broker lease.
+#[allow(
+    dead_code,
+    reason = "root-set inventory is the staged foundation for managed profile adoption"
+)]
+#[derive(Debug)]
+pub(crate) struct ManagedStorageRootSetBinding {
+    repository: String,
+    roots: Vec<RootBinding>,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+pub(crate) struct ManagedStorageRootInventoryReceipt {
+    materialization: String,
+    filesystem_id: String,
+    root_identity: String,
+    root_instance_id: String,
+    allocated_bytes: u64,
+    entry_count: usize,
+    inventory_digest: String,
+}
+
+/// Aggregate receipt for sequential observations of a bounded root set.
+///
+/// The scanner completes one root before starting the next while retaining one
+/// preparation-cache lease. This is not an atomic filesystem snapshot: the
+/// lease coordinates broker writers for that cache, but does not exclude
+/// non-broker writers or changes between per-root observations. A caller must
+/// revalidate identities at a later mutation boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+pub(crate) struct CompleteManagedStorageRootSetInventory {
+    repository: String,
+    root_set_digest: String,
+    lease_id: String,
+    generation: u64,
+    roots: Vec<ManagedStorageRootInventoryReceipt>,
+    allocated_bytes: u64,
+    entry_count: usize,
+    inventory_digest: String,
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+pub(crate) enum ManagedStorageRootSetInventoryPoll {
+    Pending,
+    Complete(CompleteManagedStorageRootSetInventory),
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+pub(crate) struct ManagedStorageRootSetInventoryScan<'a> {
+    binding: &'a ManagedStorageRootSetBinding,
+    lease_id: String,
+    generation: u64,
+    next_root: usize,
+    current: Option<InventoryScan<'a>>,
+    receipts: Vec<ManagedStorageRootInventoryReceipt>,
+    failed: bool,
+    finished: bool,
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+pub(crate) struct ManagedStorageRootSetInventoryScan<'a> {
+    _binding: std::marker::PhantomData<&'a ManagedStorageRootSetBinding>,
 }
 
 #[allow(
@@ -494,6 +589,119 @@ impl<'a> ManagedStorageOwner<'a> {
         Ok(())
     }
 
+    /// Start a bounded scan of sibling materializations under this exact
+    /// repository preparation-cache lease. Roots are observed sequentially;
+    /// the lease coordinates broker writers for this cache, not unrelated
+    /// filesystem writers. The set binding must come from the same cache root
+    /// and repository as this owner.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn begin_root_set_inventory_scan<'b>(
+        &mut self,
+        binding: &'b ManagedStorageRootSetBinding,
+    ) -> Result<ManagedStorageRootSetInventoryScan<'b>, HostResourceError> {
+        self.validate_root_set_binding(binding)?;
+        self.renew()?;
+        Ok(ManagedStorageRootSetInventoryScan {
+            binding,
+            lease_id: self.grant.lease.lease_id.clone(),
+            generation: self.grant.lease.generation,
+            next_root: 0,
+            current: None,
+            receipts: Vec::with_capacity(binding.roots.len()),
+            failed: false,
+            finished: false,
+        })
+    }
+
+    /// Advance at most one scanner poll, renewing this same lease before and
+    /// after the bounded work. Roots are scanned one at a time, so completion
+    /// does not imply an atomic snapshot across the set. A failed or completed
+    /// scan is terminal.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn poll_root_set_inventory_scan(
+        &mut self,
+        scan: &mut ManagedStorageRootSetInventoryScan<'_>,
+        work_budget: usize,
+    ) -> Result<ManagedStorageRootSetInventoryPoll, HostResourceError> {
+        let result = (|| {
+            if scan.failed || scan.finished {
+                return Err(scan_refusal(
+                    "managed root-set inventory scan was polled after completion or refusal",
+                ));
+            }
+            if !(1..=ROOT_SET_MAX_POLL_WORK).contains(&work_budget) {
+                return Err(managed_storage_refusal(
+                    "managed_storage_inventory_incomplete",
+                    "root-set poll work budget must be 1..=512",
+                ));
+            }
+            if scan.lease_id != self.grant.lease.lease_id
+                || scan.generation != self.grant.lease.generation
+            {
+                return Err(managed_storage_refusal(
+                    "managed_storage_owner_mismatch",
+                    "root-set scan belongs to another host lease generation",
+                ));
+            }
+            self.validate_root_set_binding(scan.binding)?;
+            self.renew()?;
+            let polled = scan.poll_next(work_budget)?;
+            self.renew()?;
+            Ok(polled)
+        })();
+        if result.is_err() {
+            scan.failed = true;
+        }
+        result
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn validate_root_set_binding(
+        &self,
+        binding: &ManagedStorageRootSetBinding,
+    ) -> Result<(), HostResourceError> {
+        if binding.repository != self.repository
+            || binding.roots.is_empty()
+            || binding.roots.len() > ROOT_SET_MAX_ROOTS
+            || binding.digest != root_set_binding_digest(&binding.repository, &binding.roots)
+            || binding.roots[0].root_identity() != self.root.root_identity()
+            || binding.roots.iter().any(|root| {
+                root.parent() != self.root.parent()
+                    || root.parent_identity() != self.root.parent_identity()
+                    || root.filesystem_id() != self.root.filesystem_id()
+            })
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_owner_mismatch",
+                "root set must match this owner's repository cache, filesystem, and anchor root",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn begin_root_set_inventory_scan<'b>(
+        &mut self,
+        _binding: &'b ManagedStorageRootSetBinding,
+    ) -> Result<ManagedStorageRootSetInventoryScan<'b>, HostResourceError> {
+        Err(managed_storage_refusal(
+            "managed_storage_inventory_unsupported",
+            "bounded managed-storage inventory is currently supported only on macOS and Linux",
+        ))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn poll_root_set_inventory_scan(
+        &mut self,
+        _scan: &mut ManagedStorageRootSetInventoryScan<'_>,
+        _work_budget: usize,
+    ) -> Result<ManagedStorageRootSetInventoryPoll, HostResourceError> {
+        Err(managed_storage_refusal(
+            "managed_storage_inventory_unsupported",
+            "bounded managed-storage inventory is currently supported only on macOS and Linux",
+        ))
+    }
+
     fn consume_inventory(
         &mut self,
         request: &ManagedStorageClaimRequest,
@@ -511,6 +719,333 @@ impl<'a> ManagedStorageOwner<'a> {
 }
 
 pub(super) use core::PinnedManagedStorageRoot as RootBinding;
+
+#[allow(
+    dead_code,
+    reason = "root-set inventory bindings are consumed by the staged managed profile path"
+)]
+impl ManagedStorageRootSetBinding {
+    /// Capture a finite set of existing-root bindings in the same path domain
+    /// as `ManagedStorageOwner`. The scanner later refuses any absent root.
+    /// This records bindings only; it does not fence writers or create an atomic
+    /// observation across the selected roots.
+    pub(crate) fn capture(
+        preparation_cache_root: &Path,
+        repository: &str,
+        materializations: &[String],
+    ) -> Result<Self, HostResourceError> {
+        validate_lower_hex_identifier("repository", repository, 64)?;
+        if materializations.is_empty() || materializations.len() > ROOT_SET_MAX_ROOTS {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_invalid",
+                "managed root set must contain 1..=32 materializations",
+            ));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut roots = Vec::with_capacity(materializations.len());
+        for materialization in materializations {
+            validate_lower_hex_identifier("materialization", materialization, 12)?;
+            if !seen.insert(materialization.as_str()) {
+                return Err(managed_storage_refusal(
+                    "managed_storage_root_set_overlap",
+                    "duplicate materializations would bind the same managed root more than once",
+                ));
+            }
+            roots.push(RootBinding::new(
+                preparation_cache_root,
+                repository,
+                materialization,
+            )?);
+        }
+
+        let first = roots.first().ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_root_set_invalid",
+                "managed root set cannot be empty",
+            )
+        })?;
+        if roots.iter().any(|root| {
+            root.parent() != first.parent()
+                || root.parent_identity() != first.parent_identity()
+                || root.filesystem_id() != first.filesystem_id()
+        }) {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_overlap",
+                "all roots must be sibling materializations under the same pinned repository cache directory",
+            ));
+        }
+
+        roots.sort_by(|left, right| left.root_identity().cmp(right.root_identity()));
+        if roots
+            .windows(2)
+            .any(|pair| pair[0].root_identity() == pair[1].root_identity())
+        {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_overlap",
+                "distinct materializations resolved to the same path identity",
+            ));
+        }
+
+        let digest = root_set_binding_digest(repository, &roots);
+        Ok(Self {
+            repository: repository.to_owned(),
+            roots,
+            digest,
+        })
+    }
+
+    pub(crate) fn root_set_digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(crate) fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub(super) fn first_materialization(&self) -> Result<&str, HostResourceError> {
+        self.roots
+            .first()
+            .map(|root| root.materialization())
+            .ok_or_else(|| {
+                managed_storage_refusal(
+                    "managed_storage_root_set_invalid",
+                    "managed root set cannot be empty",
+                )
+            })
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+impl ManagedStorageRootInventoryReceipt {
+    pub(crate) fn materialization(&self) -> &str {
+        &self.materialization
+    }
+
+    pub(crate) fn filesystem_id(&self) -> &str {
+        &self.filesystem_id
+    }
+
+    pub(crate) fn root_identity(&self) -> &str {
+        &self.root_identity
+    }
+
+    pub(crate) fn root_instance_id(&self) -> &str {
+        &self.root_instance_id
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) fn inventory_digest(&self) -> &str {
+        &self.inventory_digest
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "root-set inventory receipts are consumed by the staged managed profile path"
+)]
+impl CompleteManagedStorageRootSetInventory {
+    pub(crate) fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    pub(crate) fn root_set_digest(&self) -> &str {
+        &self.root_set_digest
+    }
+
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn roots(&self) -> &[ManagedStorageRootInventoryReceipt] {
+        &self.roots
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) fn inventory_digest(&self) -> &str {
+        &self.inventory_digest
+    }
+}
+
+fn root_set_binding_digest(repository: &str, roots: &[RootBinding]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"aethyme-managed-storage-root-set-binding-v1\0");
+    update_root_set_hash_component(&mut digest, repository.as_bytes());
+    digest.update((roots.len() as u64).to_le_bytes());
+    for root in roots {
+        update_root_set_hash_component(&mut digest, root.materialization().as_bytes());
+        update_root_set_hash_component(&mut digest, root.filesystem_id().as_bytes());
+        update_root_set_hash_component(&mut digest, root.root_identity().as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn update_root_set_hash_component(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value);
+}
+
+fn validate_unique_root_instance(
+    receipts: &[ManagedStorageRootInventoryReceipt],
+    root_instance_id: &str,
+) -> Result<(), HostResourceError> {
+    if receipts
+        .iter()
+        .any(|receipt| receipt.root_instance_id == root_instance_id)
+    {
+        return Err(managed_storage_refusal(
+            "managed_storage_root_set_overlap",
+            "selected materialization roots resolve to the same directory instance",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "root-set inventory polling is consumed by the staged managed profile path"
+)]
+impl ManagedStorageRootSetInventoryScan<'_> {
+    fn poll_next(
+        &mut self,
+        work_budget: usize,
+    ) -> Result<ManagedStorageRootSetInventoryPoll, HostResourceError> {
+        let root = self
+            .binding
+            .roots
+            .get(self.next_root)
+            .ok_or_else(|| scan_refusal("managed root-set scan has no remaining root"))?;
+        if self.current.is_none() {
+            self.current = Some(InventoryScan::begin(root, ScanLimits::existing_owner())?);
+        }
+
+        let tree = match self
+            .current
+            .as_mut()
+            .ok_or_else(|| scan_refusal("managed root-set scan lost its active root"))?
+            .poll(work_budget)?
+        {
+            InventoryScanPoll::Pending => return Ok(ManagedStorageRootSetInventoryPoll::Pending),
+            InventoryScanPoll::Complete(tree) => tree,
+        };
+        if !tree.root_present() {
+            return Err(managed_storage_refusal(
+                "managed_storage_root_set_incomplete",
+                "every selected managed root must exist before a complete root-set inventory is issued",
+            ));
+        }
+        let root_instance_id = tree.root_instance_id().ok_or_else(|| {
+            managed_storage_refusal(
+                "managed_storage_root_instance_missing",
+                "a present managed root must have a pinned instance identity",
+            )
+        })?;
+        validate_unique_root_instance(&self.receipts, root_instance_id)?;
+        self.receipts.push(ManagedStorageRootInventoryReceipt {
+            materialization: root.materialization().to_owned(),
+            filesystem_id: root.filesystem_id().to_owned(),
+            root_identity: root.root_identity().to_owned(),
+            root_instance_id: root_instance_id.to_owned(),
+            allocated_bytes: tree.allocated_bytes(),
+            entry_count: tree.entry_count(),
+            inventory_digest: tree.inventory_digest().to_owned(),
+        });
+        self.current = None;
+        self.next_root += 1;
+        if self.next_root < self.binding.roots.len() {
+            return Ok(ManagedStorageRootSetInventoryPoll::Pending);
+        }
+
+        self.finished = true;
+        self.build_complete_receipt()
+            .map(ManagedStorageRootSetInventoryPoll::Complete)
+    }
+
+    fn build_complete_receipt(
+        &self,
+    ) -> Result<CompleteManagedStorageRootSetInventory, HostResourceError> {
+        if self.receipts.len() != self.binding.roots.len() {
+            return Err(scan_refusal(
+                "managed root-set scan completed with an incomplete receipt",
+            ));
+        }
+        let mut allocated_bytes = 0_u64;
+        let mut entry_count = 0_usize;
+        let mut inventory_digest = Sha256::new();
+        inventory_digest.update(b"aethyme-managed-storage-root-set-inventory-v1\0");
+        update_root_set_hash_component(&mut inventory_digest, self.binding.repository.as_bytes());
+        update_root_set_hash_component(&mut inventory_digest, self.binding.digest.as_bytes());
+        update_root_set_hash_component(&mut inventory_digest, self.lease_id.as_bytes());
+        inventory_digest.update(self.generation.to_le_bytes());
+        inventory_digest.update((self.receipts.len() as u64).to_le_bytes());
+        for receipt in &self.receipts {
+            allocated_bytes = allocated_bytes
+                .checked_add(receipt.allocated_bytes)
+                .ok_or_else(|| {
+                    managed_storage_refusal(
+                        "managed_storage_inventory_overflow",
+                        "aggregate root-set allocated bytes exceeded the supported range",
+                    )
+                })?;
+            entry_count = entry_count
+                .checked_add(receipt.entry_count)
+                .ok_or_else(|| {
+                    managed_storage_refusal(
+                        "managed_storage_inventory_overflow",
+                        "aggregate root-set entry count exceeded the supported range",
+                    )
+                })?;
+            update_root_set_hash_component(
+                &mut inventory_digest,
+                receipt.materialization.as_bytes(),
+            );
+            update_root_set_hash_component(&mut inventory_digest, receipt.filesystem_id.as_bytes());
+            update_root_set_hash_component(&mut inventory_digest, receipt.root_identity.as_bytes());
+            update_root_set_hash_component(
+                &mut inventory_digest,
+                receipt.root_instance_id.as_bytes(),
+            );
+            inventory_digest.update(receipt.allocated_bytes.to_le_bytes());
+            inventory_digest.update((receipt.entry_count as u64).to_le_bytes());
+            update_root_set_hash_component(
+                &mut inventory_digest,
+                receipt.inventory_digest.as_bytes(),
+            );
+        }
+        Ok(CompleteManagedStorageRootSetInventory {
+            repository: self.binding.repository.clone(),
+            root_set_digest: self.binding.digest.clone(),
+            lease_id: self.lease_id.clone(),
+            generation: self.generation,
+            roots: self.receipts.clone(),
+            allocated_bytes,
+            entry_count,
+            inventory_digest: format!("{:x}", inventory_digest.finalize()),
+        })
+    }
+}
 
 #[derive(Debug)]
 struct CompleteManagedStorageInventory {
@@ -954,6 +1489,22 @@ mod tests {
             )
         }
 
+        fn root_set_owner(
+            &mut self,
+            binding: &ManagedStorageRootSetBinding,
+        ) -> Result<ManagedStorageOwner<'_>, HostResourceError> {
+            let grant = self.coordinator.acquire(&self.lease_request)?;
+            let repository = self.repository.clone();
+            let cache_root = self.preparation_cache_root.clone();
+            self.coordinator.begin_managed_storage_root_set_owner(
+                grant,
+                &repository,
+                &cache_root,
+                binding,
+                60,
+            )
+        }
+
         fn claim(&self, claim_id: &str, reserved_bytes: u64) -> ManagedStorageClaimRequest {
             ManagedStorageClaimRequest {
                 repository: self.repository.clone(),
@@ -1010,6 +1561,36 @@ mod tests {
             match scan.poll(work_budget)? {
                 InventoryScanPoll::Pending => {}
                 InventoryScanPoll::Complete(inventory) => return Ok(inventory),
+            }
+        }
+    }
+
+    fn capture_root_set(
+        fixture: &Fixture,
+        materializations: &[&str],
+    ) -> ManagedStorageRootSetBinding {
+        let materializations = materializations
+            .iter()
+            .map(|materialization| (*materialization).to_owned())
+            .collect::<Vec<_>>();
+        ManagedStorageRootSetBinding::capture(
+            &fixture.preparation_cache_root,
+            &fixture.repository,
+            &materializations,
+        )
+        .unwrap()
+    }
+
+    fn scan_root_set(
+        owner: &mut ManagedStorageOwner<'_>,
+        binding: &ManagedStorageRootSetBinding,
+        work_budget: usize,
+    ) -> Result<CompleteManagedStorageRootSetInventory, HostResourceError> {
+        let mut scan = owner.begin_root_set_inventory_scan(binding)?;
+        loop {
+            match owner.poll_root_set_inventory_scan(&mut scan, work_budget)? {
+                ManagedStorageRootSetInventoryPoll::Pending => {}
+                ManagedStorageRootSetInventoryPoll::Complete(receipt) => return Ok(receipt),
             }
         }
     }
@@ -1852,6 +2433,249 @@ mod tests {
             assert_eq!(actual.inventory_digest(), expected.3.as_str());
             assert_eq!(actual.root_present(), expected.4);
         }
+    }
+
+    #[test]
+    fn managed_storage_root_set_one_root_matches_independent_inventory_oracle() {
+        let mut fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.materialization_root.join("nested")).unwrap();
+        std::fs::write(fixture.materialization_root.join("z-file"), b"z").unwrap();
+        std::fs::write(
+            fixture.materialization_root.join("nested").join("a-file"),
+            b"nested",
+        )
+        .unwrap();
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let single_root =
+            RootBinding::new(&fixture.preparation_cache_root, REPOSITORY, MATERIALIZATION).unwrap();
+        let expected = expected_fixed_tree_inventory(&single_root);
+        let mut owner = fixture.root_set_owner(&binding).unwrap();
+        let lease_id = owner.grant.lease.lease_id.clone();
+        let generation = owner.grant.lease.generation;
+
+        let receipt = scan_root_set(&mut owner, &binding, 1).unwrap();
+
+        assert_eq!(receipt.repository(), REPOSITORY);
+        assert_eq!(receipt.root_set_digest(), binding.root_set_digest());
+        assert_eq!(receipt.lease_id(), lease_id);
+        assert_eq!(receipt.generation(), generation);
+        assert_eq!(receipt.roots().len(), 1);
+        let root = &receipt.roots()[0];
+        assert_eq!(root.materialization(), MATERIALIZATION);
+        assert_eq!(root.filesystem_id(), single_root.filesystem_id());
+        assert_eq!(root.root_identity(), single_root.root_identity());
+        assert_eq!(root.root_instance_id(), expected.1.as_deref().unwrap());
+        assert_eq!(root.allocated_bytes(), expected.0);
+        assert_eq!(root.entry_count(), expected.2);
+        assert_eq!(root.inventory_digest(), expected.3);
+        assert_eq!(receipt.allocated_bytes(), expected.0);
+        assert_eq!(receipt.entry_count(), expected.2);
+        assert_eq!(receipt.inventory_digest().len(), 64);
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn managed_storage_root_set_is_sorted_finite_and_refuses_duplicates() {
+        let fixture = Fixture::new();
+        let second_materialization = "cccccccccccc";
+        std::fs::create_dir_all(fixture.repository_root.join(second_materialization)).unwrap();
+        let first_order = capture_root_set(&fixture, &[MATERIALIZATION, second_materialization]);
+        let reverse_order = capture_root_set(&fixture, &[second_materialization, MATERIALIZATION]);
+
+        assert_eq!(first_order.root_count(), 2);
+        assert_eq!(
+            first_order.root_set_digest(),
+            reverse_order.root_set_digest()
+        );
+        assert!(
+            first_order
+                .roots
+                .windows(2)
+                .all(|pair| pair[0].root_identity() < pair[1].root_identity())
+        );
+
+        let mut owner = fixture.root_set_owner(&first_order).unwrap();
+        let receipt = scan_root_set(&mut owner, &first_order, 1).unwrap();
+        assert_eq!(receipt.roots().len(), 2);
+        for (actual, expected) in receipt.roots().iter().zip(&first_order.roots) {
+            assert_eq!(actual.materialization(), expected.materialization());
+            assert_eq!(actual.root_identity(), expected.root_identity());
+        }
+        assert_eq!(
+            receipt.allocated_bytes(),
+            receipt
+                .roots()
+                .iter()
+                .map(ManagedStorageRootInventoryReceipt::allocated_bytes)
+                .sum()
+        );
+        assert_eq!(
+            receipt.entry_count(),
+            receipt
+                .roots()
+                .iter()
+                .map(ManagedStorageRootInventoryReceipt::entry_count)
+                .sum()
+        );
+        assert_eq!(receipt.inventory_digest().len(), 64);
+        owner.finish().unwrap();
+
+        let duplicate = vec![MATERIALIZATION.to_owned(), MATERIALIZATION.to_owned()];
+        let error = ManagedStorageRootSetBinding::capture(
+            &fixture.preparation_cache_root,
+            REPOSITORY,
+            &duplicate,
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_root_set_overlap")
+        );
+
+        let too_many = vec![second_materialization.to_owned(); ROOT_SET_MAX_ROOTS + 1];
+        let error = ManagedStorageRootSetBinding::capture(
+            &fixture.preparation_cache_root,
+            REPOSITORY,
+            &too_many,
+        )
+        .unwrap_err();
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_root_set_invalid")
+        );
+    }
+
+    #[test]
+    fn managed_storage_root_set_refuses_duplicate_directory_instances() {
+        let receipt = ManagedStorageRootInventoryReceipt {
+            materialization: MATERIALIZATION.into(),
+            filesystem_id: "unix-device-v1:1".into(),
+            root_identity: "path-v1:first".into(),
+            root_instance_id: "unix-inode-v1:1:2".into(),
+            allocated_bytes: 0,
+            entry_count: 1,
+            inventory_digest: "first".into(),
+        };
+
+        let error = validate_unique_root_instance(&[receipt], "unix-inode-v1:1:2").unwrap_err();
+
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_root_set_overlap")
+        );
+    }
+
+    #[test]
+    fn managed_storage_root_set_scan_refuses_root_replacement_and_cannot_resume() {
+        let mut fixture = Fixture::new();
+        for index in 0..8 {
+            std::fs::write(
+                fixture.materialization_root.join(format!("entry-{index}")),
+                [index as u8; 8],
+            )
+            .unwrap();
+        }
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let mut owner = fixture.root_set_owner(&binding).unwrap();
+        let mut scan = owner.begin_root_set_inventory_scan(&binding).unwrap();
+        assert!(matches!(
+            owner.poll_root_set_inventory_scan(&mut scan, 1).unwrap(),
+            ManagedStorageRootSetInventoryPoll::Pending
+        ));
+
+        let moved = fixture.repository_root.join("bbbbbbbbbbbb-moved");
+        std::fs::rename(&fixture.materialization_root, &moved).unwrap();
+        std::fs::create_dir(&fixture.materialization_root).unwrap();
+        std::fs::write(fixture.materialization_root.join("replacement"), b"new").unwrap();
+
+        let error = loop {
+            match owner.poll_root_set_inventory_scan(&mut scan, 1) {
+                Ok(ManagedStorageRootSetInventoryPoll::Pending) => {}
+                Ok(ManagedStorageRootSetInventoryPoll::Complete(_)) => {
+                    panic!("a replaced root name must not produce a complete receipt")
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            conflict_code(&error),
+            Some("managed_storage_inventory_incomplete")
+        );
+        let retry_error = owner
+            .poll_root_set_inventory_scan(&mut scan, 1)
+            .unwrap_err();
+        assert_eq!(
+            conflict_code(&retry_error),
+            Some("managed_storage_inventory_incomplete")
+        );
+    }
+
+    #[test]
+    fn managed_storage_root_set_polls_renew_the_exact_owner_lease() {
+        let mut fixture = Fixture::new();
+        for index in 0..16 {
+            std::fs::write(
+                fixture.materialization_root.join(format!("entry-{index}")),
+                [index as u8; 16],
+            )
+            .unwrap();
+        }
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let mut owner = fixture.root_set_owner(&binding).unwrap();
+        let mut scan = owner.begin_root_set_inventory_scan(&binding).unwrap();
+        let initial_expiry = owner.grant.lease.expires_at;
+        std::thread::sleep(Duration::from_millis(3));
+
+        assert!(matches!(
+            owner.poll_root_set_inventory_scan(&mut scan, 1).unwrap(),
+            ManagedStorageRootSetInventoryPoll::Pending
+        ));
+        assert!(owner.grant.lease.expires_at > initial_expiry);
+
+        loop {
+            match owner.poll_root_set_inventory_scan(&mut scan, 32).unwrap() {
+                ManagedStorageRootSetInventoryPoll::Pending => {}
+                ManagedStorageRootSetInventoryPoll::Complete(receipt) => {
+                    assert_eq!(receipt.lease_id(), owner.grant.lease.lease_id);
+                    assert_eq!(receipt.generation(), owner.grant.lease.generation);
+                    break;
+                }
+            }
+        }
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn managed_storage_root_set_refuses_a_stale_owner_grant() {
+        let mut fixture = Fixture::new();
+        let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let grant = fixture.coordinator.acquire(&fixture.lease_request).unwrap();
+        let stale_grant = grant.clone();
+        let database = fixture.database.clone();
+        let mut second_coordinator = HostResourceCoordinator::open(&database).unwrap();
+        second_coordinator
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+
+        let result = fixture.coordinator.begin_managed_storage_root_set_owner(
+            stale_grant,
+            REPOSITORY,
+            &fixture.preparation_cache_root,
+            &binding,
+            60,
+        );
+        let error = match result {
+            Ok(_) => panic!("a released grant must not start a root-set owner"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            HostResourceError::RequestNotActive { state, .. } if state == "released"
+        ));
     }
 
     #[test]

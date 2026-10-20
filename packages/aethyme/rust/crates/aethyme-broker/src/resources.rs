@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod managed_storage_inventory;
-pub(crate) use managed_storage_inventory::ManagedStorageOwner;
+pub(crate) use managed_storage_inventory::{
+    CompleteManagedStorageRootSetInventory, ManagedStorageOwner,
+    ManagedStorageRootInventoryReceipt, ManagedStorageRootSetBinding,
+    ManagedStorageRootSetInventoryPoll, ManagedStorageRootSetInventoryScan,
+};
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
 /// Additive ledger version, independent of the host-resource store version.
@@ -773,6 +777,37 @@ impl HostResourceCoordinator {
             materialization,
             ttl_seconds,
         )
+    }
+
+    /// Begin root-set inventory using the same exact preparation-cache lease
+    /// and per-root scanner as the existing single-root owner. This does not
+    /// resolve profile selectors or authorize materialization growth.
+    #[allow(
+        dead_code,
+        reason = "managed profile callers are staged separately from root-set inventory"
+    )]
+    pub(crate) fn begin_managed_storage_root_set_owner<'a>(
+        &'a mut self,
+        grant: HostResourceGrant,
+        repository: &str,
+        preparation_cache_root: &Path,
+        binding: &ManagedStorageRootSetBinding,
+        ttl_seconds: u64,
+    ) -> Result<ManagedStorageOwner<'a>, HostResourceError> {
+        let materialization = binding.first_materialization()?;
+        let mut owner = ManagedStorageOwner::new(
+            self,
+            grant,
+            repository,
+            preparation_cache_root,
+            materialization,
+            ttl_seconds,
+        )?;
+        // Validate the complete binding against the same owner grant before
+        // handing the owner to a caller. The returned scan is intentionally
+        // discarded; scanning begins only when the caller explicitly polls.
+        drop(owner.begin_root_set_inventory_scan(binding)?);
+        Ok(owner)
     }
 
     /// Read one exact durable claim so a restarted owner can distinguish an
