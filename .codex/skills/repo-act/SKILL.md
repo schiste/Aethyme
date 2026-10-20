@@ -66,6 +66,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   exceptions, and finite deadlines for every synthetic process. Original group
   absence proves only that group's absence; it says nothing about escaped or
   detached descendants.
+- When verifying mutable file inputs, open with no-follow and nonblocking flags
+  before checking the descriptor is a regular file. A path replaced with a FIFO
+  can block an ordinary read-only open before the type check. Verify bounded,
+  stable bytes through that same descriptor; include a finite FIFO refusal
+  control that cannot start the expensive work.
 - Before adding strict validation or recovery for persisted data, inspect every
   production writer and test its exact serialized bytes. Accept only known
   producer encodings, and bind the exact observed bytes across plan/apply when
