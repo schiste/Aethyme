@@ -1380,3 +1380,143 @@ fn identity_recovery_usage_names_the_dispatched_command() {
     );
     assert!(message.contains("--confirm <old-sha256:new-sha256:owner-marker-sha256>"));
 }
+
+#[test]
+fn json_errors_use_one_versioned_envelope_and_respect_child_argument_boundary() {
+    use super::{ErrorRendering, error_output_for_command, json_requested};
+
+    let args = ["leases", "claim", "--json"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(json_requested(&args));
+    let (code, rendering) =
+        error_output_for_command(&args, crate::exit_status::REFUSED, "not available", false);
+    assert_eq!(code, crate::exit_status::REFUSED);
+    let ErrorRendering::Json(rendered) = rendering else {
+        panic!("JSON mode renders a JSON error envelope");
+    };
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(value["schema"], "aethyme.broker-error/v1");
+    assert_eq!(value["error"]["code"], crate::exit_status::REFUSED);
+    assert_eq!(value["error"]["message"], "not available");
+
+    let alias_args = ["leases", "claim", "--json-output"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(json_requested(&alias_args));
+
+    let value_named_like_json = ["start", "--task", "--json", "--bogus"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(!json_requested(&value_named_like_json));
+
+    for value_flag in super::VALUE_FLAGS {
+        let value_named_like_json = [(*value_flag).to_string(), "--json".to_string()];
+        assert!(
+            !json_requested(&value_named_like_json),
+            "{value_flag} consumes its following value, even when it looks like a JSON switch"
+        );
+    }
+
+    let explicit_json_after_value = ["start", "--task", "fixture", "--json-output"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(json_requested(&explicit_json_after_value));
+    let parsed = match super::parse(&explicit_json_after_value) {
+        Ok(parsed) => parsed,
+        Err(_) => panic!("--json-output is accepted as the JSON alias"),
+    };
+    assert!(parsed.json);
+
+    let child_args = ["advanced", "exec", "--", "echo", "--json"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(!json_requested(&child_args));
+    assert_eq!(
+        error_output_for_command(&child_args, 7, "child failed", false),
+        (7, ErrorRendering::Text("child failed".into()))
+    );
+}
+
+#[test]
+fn an_error_after_a_report_keeps_its_exit_code_without_a_second_json_document() {
+    use super::{ErrorRendering, error_output_for_command};
+
+    let args = ["finish", "--json"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let recovery = "blocked; recover with broker reconcile --plan reviewed-digest";
+    let (code, rendering) =
+        error_output_for_command(&args, crate::exit_status::REFUSED, recovery, true);
+    assert_eq!(code, crate::exit_status::REFUSED);
+    assert_eq!(rendering, ErrorRendering::Diagnostic(recovery.into()));
+
+    let report = serde_json::json!({
+        "status": "blocked",
+        "closed": false,
+    });
+    let mut stdout = serde_json::to_vec(&report).unwrap();
+    stdout.push(b'\n');
+    if let ErrorRendering::Json(error) = rendering {
+        stdout.extend_from_slice(error.as_bytes());
+        stdout.push(b'\n');
+    }
+    let only_report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(only_report["status"], "blocked");
+    assert_eq!(only_report["closed"], false);
+}
+
+#[test]
+fn a_partial_report_write_suppresses_fallback_json_and_keeps_its_exit_code() {
+    use std::io::{self, Write};
+
+    use super::{ErrorRendering, error_output_for_command};
+
+    struct PrefixThenBrokenPipe {
+        bytes: Vec<u8>,
+        first_write: bool,
+    }
+
+    impl Write for PrefixThenBrokenPipe {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.first_write {
+                self.first_write = false;
+                let count = bytes.len().min(4);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let before = crate::cli_output::snapshot();
+    let mut writer = PrefixThenBrokenPipe {
+        bytes: Vec::new(),
+        first_write: true,
+    };
+    crate::cli_output::write_line_and_record(&mut writer, "report");
+    assert_eq!(writer.bytes, b"repo");
+
+    let attempted = crate::cli_output::output_attempted_since(before);
+    assert!(attempted);
+    let args = ["finish", "--json"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let recovery = "blocked; recover with broker reconcile --plan reviewed-digest";
+    let (code, rendering) =
+        error_output_for_command(&args, crate::exit_status::REFUSED, recovery, attempted);
+    assert_eq!(code, crate::exit_status::REFUSED);
+    assert_eq!(rendering, ErrorRendering::Diagnostic(recovery.into()));
+}
