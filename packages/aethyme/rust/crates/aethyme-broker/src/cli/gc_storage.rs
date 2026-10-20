@@ -296,9 +296,9 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         human_bytes(plan.estimated_retained_bytes),
         human_bytes(plan.estimated_blocked_bytes),
     );
-    // The ordering line is not decoration: `gc apply --budget-ms` drains these
-    // lists in the order printed and stops at its deadline, so this says which
-    // end of the backlog a bounded sweep actually reaches (#176).
+    // The ordering line is not decoration: `Broker::gc_apply_bounded` drains
+    // these lists in the order printed and stops at its deadline, so this says
+    // which end of the backlog a bounded apply actually reaches (#176).
     let ordered = plan.reclaim_order.as_str().replace('_', " ");
     match plan.budget_verdict {
         crate::BudgetVerdict::Over => out!(
