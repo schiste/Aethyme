@@ -2476,7 +2476,7 @@ mod tests {
 
     #[test]
     fn managed_storage_root_set_is_sorted_finite_and_refuses_duplicates() {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
         let second_materialization = "cccccccccccc";
         std::fs::create_dir_all(fixture.repository_root.join(second_materialization)).unwrap();
         let first_order = capture_root_set(&fixture, &[MATERIALIZATION, second_materialization]);
