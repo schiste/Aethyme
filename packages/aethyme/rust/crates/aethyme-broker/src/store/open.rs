@@ -1363,6 +1363,7 @@ mod graph_fence_tests {
         let root = temp.path().canonicalize().unwrap().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let database = temp.path().join("external/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&root, &database).unwrap();
         assert!(database.is_file());
         assert!(!root.join(crate::BROKER_DB_RELPATH).exists());
@@ -1383,6 +1384,7 @@ mod graph_fence_tests {
         let nested = root.join("nested/output");
         std::fs::create_dir_all(&nested).unwrap();
         let database = temp.path().join("external/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&nested, &database).unwrap();
         assert!(database.is_file());
         assert!(
