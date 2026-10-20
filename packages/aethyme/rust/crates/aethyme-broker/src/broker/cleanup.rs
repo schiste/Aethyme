@@ -3249,14 +3249,11 @@ mod cleanup_target_snapshot_tests {
             return;
         }
 
-        let Some(real_git) = (match crate::git::git_output_trust() {
-            crate::git::GitOutputTrust::Undecorated { resolved, .. } => {
-                resolved.canonicalize().ok()
-            }
-            _ => None,
-        }) else {
-            eprintln!("no trusted Git binary is available for the transient-failure shim");
-            return;
+        let real_git = match crate::git::git_output_trust() {
+            crate::git::GitOutputTrust::Undecorated { resolved, .. } => resolved
+                .canonicalize()
+                .expect("trusted Git executable should have a canonical path"),
+            other => panic!("transient-failure fixture requires trusted Git: {other:?}"),
         };
         let parent = tempfile::tempdir().unwrap();
         let parent_path = parent.path().canonicalize().unwrap();
