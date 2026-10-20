@@ -165,6 +165,8 @@ pub(crate) enum ArtifactSweepScope {
     /// An explicit reclaim command: the policy budget scaled by disk
     /// pressure, ignoring cadence and spacing.
     Drain,
+    /// Finish: drain the artifact backlog without whole-checkout cleanup.
+    FinishDrain,
     /// Detached recovery: the policy budget scaled by disk pressure, ignoring
     /// cadence and spacing, and without whole-checkout cleanup.
     AutomaticContinuation,
@@ -486,6 +488,7 @@ fn artifact_sweep_budget_ms(
     match scope {
         ArtifactSweepScope::Inline => policy_budget_ms.min(INLINE_ARTIFACT_SWEEP_BUDGET_MS),
         ArtifactSweepScope::Drain
+        | ArtifactSweepScope::FinishDrain
         | ArtifactSweepScope::AutomaticContinuation
         | ArtifactSweepScope::ClosedSession(_) => {
             policy_budget_ms.saturating_mul(urgency.budget_scale())
@@ -494,8 +497,12 @@ fn artifact_sweep_budget_ms(
 }
 
 fn scope_runs_checkout_cleanup(scope: ArtifactSweepScope) -> bool {
-    scope != ArtifactSweepScope::AutomaticContinuation
-        && !matches!(scope, ArtifactSweepScope::ClosedSession(_))
+    !matches!(
+        scope,
+        ArtifactSweepScope::FinishDrain
+            | ArtifactSweepScope::AutomaticContinuation
+            | ArtifactSweepScope::ClosedSession(_)
+    )
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -4114,9 +4121,9 @@ impl Broker {
         })
     }
 
-    /// Continue an unfinished sweep with the full budget, if one is pending.
-    /// `finish` calls this: an agent finishing is about to leave anyway, so
-    /// the drain the inline path no longer does is paid there instead.
+    /// Continue an unfinished artifact sweep with the full budget, if one is pending.
+    /// `finish` pays the deferred artifact work while leaving the separate
+    /// whole-checkout cleanup lane to the general sweep scopes.
     pub(crate) fn continue_artifact_sweep_backlog(
         &mut self,
     ) -> Result<Option<ArtifactSweepOutcome>, BrokerOpError> {
@@ -4124,7 +4131,7 @@ impl Broker {
             return Ok(None);
         }
         let policy = load_retention_policy(self.main_root())?;
-        self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)
+        self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::FinishDrain)
             .map(Some)
     }
 
@@ -4610,6 +4617,7 @@ impl Broker {
             ArtifactSweepScope::ClosedSession(session_id) => Some(session_id),
             ArtifactSweepScope::Inline
             | ArtifactSweepScope::Drain
+            | ArtifactSweepScope::FinishDrain
             | ArtifactSweepScope::AutomaticContinuation => None,
         };
         let main_root = self.main_root().to_path_buf();
@@ -7054,10 +7062,142 @@ mod tests {
         assert!(!scope_runs_checkout_cleanup(
             ArtifactSweepScope::AutomaticContinuation
         ));
+        assert!(!scope_runs_checkout_cleanup(
+            ArtifactSweepScope::FinishDrain
+        ));
         assert!(scope_runs_checkout_cleanup(ArtifactSweepScope::Drain));
         assert!(!scope_runs_checkout_cleanup(
             ArtifactSweepScope::ClosedSession(1)
         ));
+    }
+
+    #[test]
+    fn finish_drains_artifacts_without_running_whole_checkout_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".gitignore", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        git(&root, &["remote", "add", "origin", "."]);
+        git(
+            &root,
+            &["fetch", "-q", "origin", "main:refs/remotes/origin/main"],
+        );
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        git(&root, &["rev-parse", "refs/remotes/origin/HEAD"]);
+
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 0\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let abandoned = broker
+            .start_worktree("unrepresented artifact fixture", None)
+            .unwrap();
+        let abandoned_worktree = PathBuf::from(&abandoned.worktree_path);
+        std::fs::write(abandoned_worktree.join("unrepresented.txt"), "local\n").unwrap();
+        git(&abandoned_worktree, &["add", "unrepresented.txt"]);
+        git(&abandoned_worktree, &["commit", "-qm", "unrepresented"]);
+        let abandoned_report = broker
+            .finish_abandoning_unpushed(
+                abandoned.id,
+                crate::FinishOptions {
+                    keep_worktree: true,
+                },
+                "fixture backlog owner",
+            )
+            .unwrap();
+        assert!(abandoned_report.closed);
+        assert!(abandoned_report.cleanup.kept);
+
+        let cache = abandoned_worktree.join("target");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(&cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("payload"), b"interrupted artifact backlog").unwrap();
+        let cache_key = cache.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let current = broker
+            .start_worktree("retained finish fixture", None)
+            .unwrap();
+        let current_worktree = PathBuf::from(&current.worktree_path);
+        git(
+            &current_worktree,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                "HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &cache_key)
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "1")
+            .unwrap();
+        let queued_paths = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+            .unwrap();
+        assert_eq!(
+            decode_interrupted_paths(queued_paths.as_deref()).unwrap(),
+            vec![cache_key.clone()]
+        );
+        assert!(cache.join("CACHEDIR.TAG").is_file());
+        std::fs::remove_file(cache.join("CACHEDIR.TAG")).unwrap();
+        assert!(!cache.join("CACHEDIR.TAG").exists());
+        assert!(cache.join("payload").is_file());
+        assert!(broker.artifact_sweep_backlog_pending().unwrap());
+
+        let report = broker
+            .finish_with_options(
+                current.id,
+                crate::FinishOptions {
+                    keep_worktree: true,
+                },
+            )
+            .unwrap();
+        assert!(report.closed);
+        assert!(report.cleanup.kept);
+        assert!(!report.cleanup.worktree_removed);
+        assert!(current_worktree.join("README.md").is_file());
+        assert!(
+            !cache.exists(),
+            "finish should drain the pending cache backlog"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("continued the build-artifact sweep"))
+        );
+        assert!(
+            decode_interrupted_paths(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+        let selected = plan.selected_worktrees();
+        assert!(
+            selected.contains(&current_worktree.to_string_lossy().into_owned()),
+            "the retained checkout must remain eligible under explicit auto_remove=true"
+        );
     }
 
     #[test]
@@ -8056,6 +8196,7 @@ mod tests {
     fn explicit_and_closed_session_sweeps_keep_the_pressure_scaled_budget() {
         for scope in [
             ArtifactSweepScope::Drain,
+            ArtifactSweepScope::FinishDrain,
             ArtifactSweepScope::AutomaticContinuation,
             ArtifactSweepScope::ClosedSession(7),
         ] {
