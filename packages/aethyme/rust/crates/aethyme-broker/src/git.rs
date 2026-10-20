@@ -171,6 +171,15 @@ pub enum CherrySide {
     Right,
 }
 
+/// Both side-specific patch-equivalence results for one symmetric range.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PairedCherryMarks {
+    /// Commits unique to the left side, newest first.
+    pub(crate) left_only: Vec<(String, bool)>,
+    /// Commits unique to the right side, newest first.
+    pub(crate) right_only: Vec<(String, bool)>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error("failed to run git {args}: {source}")]
@@ -3143,7 +3152,7 @@ impl GitRepo {
         &self,
         left: &str,
         right: &str,
-    ) -> Result<(Vec<(String, bool)>, Vec<(String, bool)>), GitError> {
+    ) -> Result<PairedCherryMarks, GitError> {
         let range = format!("{left}...{right}");
         let left = self.cherry_side_commits(&range, "--left-only")?;
         let right = self.cherry_side_commits(&range, "--right-only")?;
@@ -3156,7 +3165,10 @@ impl GitRepo {
                 .into_iter()
                 .map(|(commit, _)| (commit, false))
                 .collect();
-            return Ok((left, right));
+            return Ok(PairedCherryMarks {
+                left_only: left,
+                right_only: right,
+            });
         }
 
         let with_parent = left
@@ -3192,7 +3204,10 @@ impl GitRepo {
                 (commit, equivalent)
             })
             .collect();
-        Ok((left, right))
+        Ok(PairedCherryMarks {
+            left_only: left,
+            right_only: right,
+        })
     }
 
     /// Commits reachable from `to` that descend from `from`, excluding
@@ -5773,9 +5788,9 @@ mod batched_commit_tests {
                         .unwrap()
                         .is_empty()
                 );
-                let (left, right) = repo.cherry_marked_both("base", "main").unwrap();
-                assert!(left.is_empty());
-                assert_eq!(right, expected);
+                let paired = repo.cherry_marked_both("base", "main").unwrap();
+                assert!(paired.left_only.is_empty());
+                assert_eq!(paired.right_only, expected);
             } else {
                 let copied = run(&root, &["rev-parse", "copied"]);
                 assert_eq!(
@@ -5853,11 +5868,15 @@ mod batched_commit_tests {
             let repo = GitRepo {
                 root: PathBuf::from(root),
             };
-            let (left, right) = repo.cherry_marked_both("left", "main").unwrap();
-            assert_eq!(left.len(), 1);
-            assert!(left[0].1, "the cherry-picked patch is present on the right");
+            let paired = repo.cherry_marked_both("left", "main").unwrap();
+            assert_eq!(paired.left_only.len(), 1);
+            assert!(
+                paired.left_only[0].1,
+                "the cherry-picked patch is present on the right"
+            );
             assert_eq!(
-                right
+                paired
+                    .right_only
                     .iter()
                     .map(|(_, equivalent)| *equivalent)
                     .collect::<Vec<_>>(),
@@ -6081,24 +6100,24 @@ mod batched_commit_tests {
         assert_eq!(marked("tabbed"), vec![(tabbed, false)], "not landed");
         assert_eq!(marked("exact"), vec![(exact, true)], "landed");
 
-        let (tabbed_left, tabbed_right) = repo
+        let tabbed_paired = repo
             .cherry_marked_both("main", "tabbed")
             .expect("paired whitespace comparison");
         assert_eq!(
-            tabbed_left,
+            tabbed_paired.left_only,
             repo.cherry_marked("main", "tabbed", CherrySide::Left)
                 .expect("left-side whitespace comparison")
         );
-        assert_eq!(tabbed_right, marked("tabbed"));
-        let (exact_left, exact_right) = repo
+        assert_eq!(tabbed_paired.right_only, marked("tabbed"));
+        let exact_paired = repo
             .cherry_marked_both("main", "exact")
             .expect("paired exact comparison");
         assert_eq!(
-            exact_left,
+            exact_paired.left_only,
             repo.cherry_marked("main", "exact", CherrySide::Left)
                 .expect("left-side exact comparison")
         );
-        assert_eq!(exact_right, marked("exact"));
+        assert_eq!(exact_paired.right_only, marked("exact"));
     }
 }
 
