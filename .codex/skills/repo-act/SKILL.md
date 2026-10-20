@@ -216,6 +216,7 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   protect its split-index backing files.
   Use the same isolated-index probes for operator status checks during pinned
   validation; an ordinary Git status command can refresh the watched index.
+- When testing configurable duration or deadline selection, put selection behind a pure seam and assert defaults, provider classes and explicit overrides without sleeping. Test real timeout cleanup separately with a short test-only budget; never reduce a production budget just to speed up a test.
 - For routine Rust validation, reuse a matching warm target and run one Cargo
   process at a time with `--locked -j1`. Prefer a selected package/binary or
   focused test filter. On a resource-constrained target, use `debug=0` and
