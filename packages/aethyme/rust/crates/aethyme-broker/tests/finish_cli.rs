@@ -53,6 +53,7 @@ fn run(repo: &Path, args: &[&str]) -> Output {
 #[cfg(unix)]
 fn run_with_transient_git_removal_failure(
     repo: &Path,
+    worktree: &Path,
     args: &[&str],
     artifacts: &Path,
 ) -> (Output, PathBuf, PathBuf) {
@@ -79,9 +80,11 @@ esac
 if [ -e "$AETHYME_TEST_GIT_REMOVE_MARKER" ]; then
   case "$*" in
     *"rev-parse --show-toplevel"*)
-      : > "$AETHYME_TEST_GIT_DISCOVERY_MARKER"
-      echo 'injected transient repository discovery failure' >&2
-      exit 74
+      if [ "$(pwd -P)" = "$AETHYME_TEST_GIT_WORKTREE_ROOT" ]; then
+        : > "$AETHYME_TEST_GIT_DISCOVERY_MARKER"
+        echo 'injected transient worktree discovery failure' >&2
+        exit 74
+      fi
       ;;
   esac
 fi
@@ -105,6 +108,10 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
         .env("AETHYME_TEST_REAL_GIT", real_git)
         .env("AETHYME_TEST_GIT_REMOVE_MARKER", &removal_marker)
         .env("AETHYME_TEST_GIT_DISCOVERY_MARKER", &discovery_marker)
+        .env(
+            "AETHYME_TEST_GIT_WORKTREE_ROOT",
+            worktree.canonicalize().expect("fixture worktree exists"),
+        )
         .output()
         .unwrap();
     (output, removal_marker, discovery_marker)
@@ -1086,6 +1093,7 @@ fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
     let artifacts = tmp.path().join("transient-git-failure");
     let (output, removal_marker, discovery_marker) = run_with_transient_git_removal_failure(
         tmp.path(),
+        &worktree,
         &["finish", "cleanup", &session, "--json"],
         &artifacts,
     );
