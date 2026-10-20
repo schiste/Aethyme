@@ -2201,7 +2201,8 @@ impl Broker {
         let mut phase_timings_ms = std::collections::BTreeMap::new();
         let mut budget_cut = Vec::new();
         let mut phase = |name: &str, since: std::time::Instant| {
-            phase_timings_ms.insert(name.to_string(), since.elapsed().as_millis() as u64);
+            let elapsed = phase_timings_ms.entry(name.to_string()).or_insert(0u64);
+            *elapsed = elapsed.saturating_add(since.elapsed().as_millis() as u64);
         };
         let integrity = self.store.integrity_check()?;
 
@@ -2263,14 +2264,23 @@ impl Broker {
         // Inspect the selected binary before retention can consume the shared
         // Git deadline. A partial inventory must not starve this cheap check.
         let version_started = std::time::Instant::now();
-        let version = crate::version::inspect_version(&self.main_root);
+        let mut version = crate::version::inspect_version(&self.main_root);
         phase("version", version_started);
         let retention_started = std::time::Instant::now();
         let retention = self.gc_health_until(deadline)?;
         budget_cut.extend(retention.deferred_checks.iter().cloned());
         phase("retention", retention_started);
-        // Keep explicit repair after read-only inventory, as before.
-        let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
+        // Keep explicit repair after read-only inventory, as before. Refresh
+        // its source after inventory and include repair in the version timing.
+        let version_repair = if fix_version {
+            let repair_started = std::time::Instant::now();
+            version = crate::version::inspect_version(&self.main_root);
+            let repair = self.repair_local_cli_version(&version);
+            phase("version", repair_started);
+            Some(repair)
+        } else {
+            None
+        };
         let movement_started = std::time::Instant::now();
         let integration_movement = if std::time::Instant::now() < deadline {
             match self.integration_movement_notice_from_sessions(&live_sessions) {
