@@ -651,6 +651,14 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+fn remove_git_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if is_git_environment_key(&key) {
+            command.env_remove(key);
+        }
+    }
+}
+
 /// What one candidate did when asked for porcelain it could not embellish.
 #[derive(Debug, PartialEq, Eq)]
 enum PorcelainProbe {
@@ -700,19 +708,15 @@ fn porcelain_probe(program: &Path) -> PorcelainProbe {
 
     let isolated = |program: &Path| {
         let mut command = Command::new(program);
+        command.current_dir(&repo);
+        remove_git_environment(&mut command);
         command
-            .current_dir(&repo)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", &config)
             .env("GIT_AUTHOR_NAME", "aethyme probe")
             .env("GIT_AUTHOR_EMAIL", "probe@aethyme.invalid")
             .env("GIT_COMMITTER_NAME", "aethyme probe")
-            .env("GIT_COMMITTER_EMAIL", "probe@aethyme.invalid")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE");
+            .env("GIT_COMMITTER_EMAIL", "probe@aethyme.invalid");
         command
     };
 
@@ -5258,10 +5262,16 @@ mod graph_snapshot_tests {
                     "safe Git configuration was treated as repository redirection"
                 );
                 assert!(
-                    !global_filter_hit.exists()
-                        && !counted_filter_hit.exists()
-                        && !trace_file.exists(),
-                    "graph-policy read or disabled fast path used ambient Git configuration"
+                    !global_filter_hit.exists(),
+                    "graph-policy read or disabled fast path ran the HOME clean filter"
+                );
+                assert!(
+                    !counted_filter_hit.exists(),
+                    "graph-policy read or disabled fast path ran the GIT_CONFIG_COUNT clean filter"
+                );
+                assert!(
+                    !trace_file.exists(),
+                    "initial Git program resolution honored inherited GIT_TRACE2_EVENT"
                 );
 
                 // The ordinary path sees both HOME's global clean filter and
@@ -5546,6 +5556,9 @@ mod graph_snapshot_tests {
                 other => panic!("isolated graph child did not complete: {other:?}"),
             }
         };
+        // Each child starts with an unused Git-program OnceLock, so the
+        // injected trace variable reaches the candidate probe itself before
+        // graph-command isolation is configured.
         run_child("filter", false);
         run_child("hostile", true);
     }

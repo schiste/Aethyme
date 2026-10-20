@@ -281,14 +281,13 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
     );
 
     // The refreshed artifacts were committed in the primary checkout before
-    // Broker::open. A second session at that exact commit proves the fresh
-    // graph path without writing graph artifacts through broker-managed
-    // linked-worktree metadata.
+    // Broker::open. Run that exact committed tree through the CI full-tree
+    // path; a session adopted at the same commit would have no diff for
+    // trigger-based gate selection.
     let refreshed_worktree =
         add_worktree_at(tmp.path(), "fresh-graph-gates", &refreshed_graph_commit);
-    let refreshed_session = broker.adopt(&refreshed_worktree, None).unwrap();
-    let refreshed = broker.run_gates(refreshed_session.id).unwrap();
-    assert_eq!(refreshed.len(), 1);
+    let refreshed = broker.run_all_gates(&refreshed_worktree).unwrap();
+    assert_eq!(refreshed.len(), 1, "full-tree mode runs configured gates");
     assert_eq!(refreshed[0].status, GateStatus::Pass);
     assert!(
         !broker
@@ -296,11 +295,11 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
             .unwrap()
             .advice
             .iter()
-            .any(|row| row.id.starts_with("graph.") && row.session_id == Some(refreshed_session.id)),
-        "a fresh graph raises no advice"
+            .any(|row| row.id.starts_with("graph.") && row.session_id.is_none()),
+        "a fresh full-tree graph raises no global advice"
     );
     assert!(!refreshed[0].cached);
-    let cached = broker.run_gates(refreshed_session.id).unwrap();
+    let cached = broker.run_all_gates(&refreshed_worktree).unwrap();
     assert_eq!(cached.len(), 1);
     assert!(
         cached[0].cached,
