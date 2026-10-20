@@ -536,9 +536,10 @@ pub use resources::{
     HostResourceAllocation, HostResourceBlocker, HostResourceConflict, HostResourceCoordinator,
     HostResourceError, HostResourceExplanation, HostResourceGrant, HostResourceHolder,
     HostResourceKind, HostResourceLease, HostResourcePlan, HostResourceReapLease,
-    HostResourceReapReport, HostResourceRequest, HostResourceRequirement, HostResourceRunError,
-    HostResourceRunReport, HostResourceWaitAdvice, default_host_resource_db_path,
-    resource_environment_key, validate_host_resource_requirements,
+    HostResourceNotReapedLease, HostResourceNotReapedReason, HostResourceReapReport,
+    HostResourceReapReportWithDiagnostics, HostResourceRequest, HostResourceRequirement,
+    HostResourceRunError, HostResourceRunReport, HostResourceWaitAdvice,
+    default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,
 };
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,

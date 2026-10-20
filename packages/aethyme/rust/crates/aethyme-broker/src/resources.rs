@@ -1344,6 +1344,38 @@ pub struct HostResourceReapReport {
     pub leases: Vec<HostResourceReapLease>,
 }
 
+/// The legacy reap counters plus diagnostics for candidate leases that were
+/// kept because the holder's absence could not be proven.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceReapReportWithDiagnostics {
+    #[serde(flatten)]
+    pub report: HostResourceReapReport,
+    pub not_reaped: Vec<HostResourceNotReapedLease>,
+}
+
+/// A quarantined lease that the reaper safely left untouched.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceNotReapedLease {
+    pub lease_id: String,
+    pub reason: HostResourceNotReapedReason,
+}
+
+/// Why a quarantined lease candidate was not reclaimed.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostResourceNotReapedReason {
+    /// The holder process could not be proven absent.
+    NotProvenGone,
+}
+
+impl HostResourceNotReapedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotProvenGone => "not_proven_gone",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HostResourceReapLease {
     pub lease_id: String,
@@ -3066,11 +3098,20 @@ impl HostResourceCoordinator {
     /// operator can run it without waiting for another acquisition to arrive.
     /// Named allocations stay quarantined until exact cleanup is reviewed.
     pub fn reap_dead_holders(&mut self) -> Result<HostResourceReapReport, HostResourceError> {
+        self.reap_dead_holders_with_diagnostics()
+            .map(|report| report.report)
+    }
+
+    /// Reap dead holders and report quarantined candidates that were retained
+    /// because their holder process was not proven gone.
+    pub fn reap_dead_holders_with_diagnostics(
+        &mut self,
+    ) -> Result<HostResourceReapReportWithDiagnostics, HostResourceError> {
         let now = now_ms();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let report = quarantine_reclaimable(&tx, now)?;
+        let report = quarantine_reclaimable_with_diagnostics(&tx, now)?;
         tx.commit()?;
         Ok(report)
     }
@@ -4977,18 +5018,25 @@ fn quarantine_reclaimable(
     conn: &Connection,
     now: i64,
 ) -> Result<HostResourceReapReport, HostResourceError> {
+    quarantine_reclaimable_with_diagnostics(conn, now).map(|report| report.report)
+}
+
+fn quarantine_reclaimable_with_diagnostics(
+    conn: &Connection,
+    now: i64,
+) -> Result<HostResourceReapReportWithDiagnostics, HostResourceError> {
     quarantine_expired(conn, now)?;
     quarantine_dead_holders(conn, now)?;
-    reclaim_dead_capacity(conn, now)
+    reclaim_dead_capacity_with_diagnostics(conn, now)
 }
 
 /// Reclaim only the allocation that becomes meaningless with the holder's
 /// process: a capacity unit. Namespaces, ports, and exclusive keys remain on
 /// the quarantined lease because they can correspond to residue on the host.
-fn reclaim_dead_capacity(
+fn reclaim_dead_capacity_with_diagnostics(
     conn: &Connection,
     now: i64,
-) -> Result<HostResourceReapReport, HostResourceError> {
+) -> Result<HostResourceReapReportWithDiagnostics, HostResourceError> {
     let candidates = {
         let mut stmt = conn.prepare(
             "SELECT lease_id,generation,holder_pid FROM resource_leases \
@@ -5021,8 +5069,13 @@ fn reclaim_dead_capacity(
         retained_quarantined_leases: 0,
         leases: Vec::new(),
     };
+    let mut not_reaped = Vec::new();
     for (lease_id, generation, holder_pid) in candidates {
         if !holder_process_is_gone(holder_pid) {
+            not_reaped.push(HostResourceNotReapedLease {
+                lease_id,
+                reason: HostResourceNotReapedReason::NotProvenGone,
+            });
             continue;
         }
         let observed = conn.execute(
@@ -5078,7 +5131,10 @@ fn reclaim_dead_capacity(
             state,
         });
     }
-    Ok(report)
+    Ok(HostResourceReapReportWithDiagnostics {
+        report,
+        not_reaped,
+    })
 }
 
 fn verify_ownership(
