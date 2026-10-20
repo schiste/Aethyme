@@ -113,6 +113,10 @@ pub(super) const VALUE_FLAGS: &[&str] = &[
 pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("readiness", &["--require"]),
     ("worktree-root", &[]),
+    ("worktree-root binding plan", &[]),
+    ("worktree-root binding apply", &["--confirm"]),
+    ("worktree-root recovery plan", &[]),
+    ("worktree-root recovery apply", &["--confirm"]),
     (
         "start",
         &[

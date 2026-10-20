@@ -1,5 +1,22 @@
 use super::*;
 
+/// Capability proving that a database belongs to the private fresh-stage
+/// bootstrap path. Only this module can construct it, after it has established
+/// exclusive stage ownership and before publishing the final database name.
+pub(super) struct FreshDatabaseStagePermit {
+    _private: (),
+}
+
+#[cfg(unix)]
+pub(super) fn fresh_database_stage_permit() -> FreshDatabaseStagePermit {
+    FreshDatabaseStagePermit { _private: () }
+}
+
+#[cfg(test)]
+pub(super) fn test_fresh_database_stage_permit() -> FreshDatabaseStagePermit {
+    FreshDatabaseStagePermit { _private: () }
+}
+
 impl BrokerStore {
     /// Open (creating and migrating if needed) the broker database for a
     /// repository root: `<repo>/.aethyme/broker.db`, or wherever
@@ -11,7 +28,7 @@ impl BrokerStore {
 
     fn open_repository_path(repo_root: &Path, path: &Path) -> Result<Self, BrokerError> {
         enroll_repository_graph_fence(repo_root)?;
-        Self::open(path)
+        super::fresh_database::open_in_repo(repo_root, path)
     }
 
     /// Open the current broker schema without creating, migrating, or
@@ -1366,6 +1383,7 @@ mod graph_fence_tests {
         let root = temp.path().canonicalize().unwrap().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let database = temp.path().join("external/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&root, &database).unwrap();
         assert!(database.is_file());
         assert!(!root.join(crate::BROKER_DB_RELPATH).exists());
@@ -1386,6 +1404,7 @@ mod graph_fence_tests {
         let nested = root.join("nested/output");
         std::fs::create_dir_all(&nested).unwrap();
         let database = temp.path().join("external/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&nested, &database).unwrap();
         assert!(database.is_file());
         assert!(

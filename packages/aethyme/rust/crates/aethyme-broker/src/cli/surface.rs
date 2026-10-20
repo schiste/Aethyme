@@ -165,7 +165,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
         "insights",
         "session funnel, time-to-land and gate reliability from local history",
     ),
-    ("worktree-root", "resolve the external worktree root"),
+    (
+        "worktree-root",
+        "resolve, bind or recover the external worktree root",
+    ),
     ("worktrees", "list broker-owned worktrees"),
     ("scaffold", "deterministic only-if-missing broker setup"),
     ("quick-test", "disposable first-run smoke test"),
@@ -479,7 +482,12 @@ fn internal_help(verb: &str, action: Option<&str>) -> Option<String> {
     }
     let (_, summary) = ADVANCED_VERBS.iter().find(|(name, _)| *name == verb)?;
     let public = format!("aethyme broker advanced {verb}");
-    let text = blocks(verb, &public);
+    let internal = if verb == "worktree-root" {
+        format!("advanced {verb}")
+    } else {
+        verb.to_string()
+    };
+    let text = blocks(&internal, &public);
     if text.trim().is_empty() {
         return Some(format!("  {public} [--json]\n      {summary}\n"));
     }
@@ -673,6 +681,22 @@ mod tests {
         }
         assert!(help_text(&args("no-such-verb --help")).is_none());
         assert!(help_text(&args("readiness --help")).is_none());
+    }
+
+    #[test]
+    fn advanced_worktree_root_help_lists_canonical_binding_and_recovery_forms() {
+        let text = help_text(&args("advanced worktree-root --help")).unwrap();
+        for form in [
+            "aethyme broker advanced worktree-root [--json]",
+            "aethyme broker advanced worktree-root binding plan",
+            "aethyme broker advanced worktree-root binding apply",
+            "aethyme broker advanced worktree-root recovery plan",
+            "aethyme broker advanced worktree-root recovery apply",
+        ] {
+            assert!(text.contains(form), "missing {form:?} from {text}");
+        }
+        let legacy_form = ["aethyme broker", "worktree-root"].join(" ");
+        assert!(!text.contains(&legacy_form));
     }
 
     #[test]

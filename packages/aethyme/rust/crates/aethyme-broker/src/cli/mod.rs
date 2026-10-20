@@ -211,13 +211,25 @@ Usage:
       session worktree. Shared caches are serialized host-wide; no command is
       ever run automatically by start or adopt. --offline refuses any step
       without a declared offline_command.
-  aethyme broker worktree-root [--json]
+  aethyme broker advanced worktree-root [--json]
       Resolve the scanner-safe external root used by future broker starts.
       Read-only: reports the preferred location, repository key and
       fallbacks without creating any directory. A [worktrees] root in
       .aethyme/config.toml supersedes the per-user default while it exists,
       is outside the repository and has worktrees.min_free_bytes free;
       otherwise starts use the default and say why.
+  aethyme broker advanced worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]
+      Review an existing marker- and registry-backed legacy root before binding.
+      This never discovers or creates a root; the emitted digest binds the exact
+      repository, database, root, layout, source and filesystem identities.
+  aethyme broker advanced worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]
+      Bind that exact legacy root only if all planned identities still match.
+  aethyme broker advanced worktree-root recovery plan [--json]
+      Inspect the exact incomplete fresh-root reservation and its filesystem
+      and registry prefix without changing any bytes.
+  aethyme broker advanced worktree-root recovery apply --confirm <sha256> [--json]
+      Finish only the reviewed fresh-root reservation when its exact digest
+      still matches and every observed artifact is a supported prefix.
   aethyme broker worktrees [--measure] [--json]
       List every worktree on this host with its repository, size, age and
       what removing it would lose (uncommitted, unpushed, recoverable).

@@ -163,6 +163,20 @@ impl Broker {
         sized: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<WorktreeReconciliation, BrokerOpError> {
+        let binding = self.store.repository_worktree_binding()?;
+        let deferred_reason = match binding.state {
+            crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound => {
+                Some(crate::WorktreeReconciliationDeferredReason::FreshRootUnbound)
+            }
+            crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound => {
+                Some(crate::WorktreeReconciliationDeferredReason::LegacyRootUnbound)
+            }
+            _ => None,
+        };
+        if let Some(reason) = deferred_reason {
+            return Ok(WorktreeReconciliation::deferred(reason));
+        }
+        self.require_bound_repository_worktree_root("worktree-directory reconciliation")?;
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             let mut summary = crate::worktree_reconcile::summarise(&[], 0);
             summary.complete = false;

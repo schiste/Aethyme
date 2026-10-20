@@ -28,13 +28,35 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn fresh_unbound_child(fixture_root: &Path, repo: &Path, args: &[&str]) -> Command {
+    let fixture_root = fixture_root
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let mut command = common::broker_cli_for_fixture(CLI, args, &fixture_root);
+    let host_state = common::fixture_host_state_dir(&fixture_root);
+    let worktree_root = fixture_root.join("worktrees");
+    command
+        .current_dir(repo)
+        .env("AETHYME_BROKER_DB", repo.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", worktree_root)
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        )
+        .env_remove("AETHYME_WORKTREE_ROOT");
+    command
+}
+
 fn run(fixture: &common::FixtureRepository, args: &[&str]) -> Output {
-    let broker = common::open_fixture_repository_broker(fixture).unwrap();
-    let mut command = common::broker_cli(CLI, args);
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
-    command.current_dir(fixture.path()).output().unwrap()
+    let _broker = common::open_fixture_repository_broker(fixture).unwrap();
+    fresh_unbound_child(fixture.owner_path(), fixture.path(), args)
+        .output()
+        .unwrap()
 }
 
 fn fixture() -> common::FixtureRepository {

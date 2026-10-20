@@ -3411,6 +3411,7 @@ impl Broker {
         include_active_gate_cache: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<GcPlan, BrokerOpError> {
+        self.require_bound_repository_worktree_root("GC planning")?;
         // The budget is cooperative: loops and stage boundaries check it, but
         // an in-flight SQLite query or filesystem syscall cannot be cancelled
         // by this deadline and may finish after it.
@@ -4385,6 +4386,7 @@ impl Broker {
     /// artifacts and remove a closed checkout only when the existing policy
     /// and ownership proofs pass; it does not create cleanup authority.
     pub(crate) fn resume_gc_maintenance(&mut self) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        self.require_bound_repository_worktree_root("GC startup recovery")?;
         let continuation_worker = std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some();
         if continuation_worker {
             // This process is deliberately cache-only. In particular, do not
@@ -4460,6 +4462,7 @@ impl Broker {
     /// scaled by disk pressure, regardless of cadence. Safety rules are the
     /// ones broker open applies; only the budget and the schedule differ.
     pub fn gc_sweep_artifacts(&mut self) -> Result<ArtifactSweepReport, BrokerOpError> {
+        self.require_bound_repository_worktree_root("artifact sweeping")?;
         let policy = load_retention_policy(self.main_root())?;
         let (budget_ms, urgency) = self.artifact_sweep_budget(&policy, ArtifactSweepScope::Drain);
         let outcome = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)?;
@@ -4479,6 +4482,7 @@ impl Broker {
     pub(crate) fn continue_artifact_sweep_backlog(
         &mut self,
     ) -> Result<Option<ArtifactSweepOutcome>, BrokerOpError> {
+        self.require_bound_repository_worktree_root("artifact-sweep continuation")?;
         if !self.artifact_sweep_backlog_pending()? {
             return Ok(None);
         }
@@ -4496,6 +4500,7 @@ impl Broker {
     /// Preparation uses this while holding its shared-cache lease, then starts
     /// the worker only after the lease has been released successfully.
     pub(crate) fn persist_artifact_sweep_recovery_request(&mut self) -> Result<(), BrokerOpError> {
+        self.require_bound_repository_worktree_root("artifact-sweep recovery request")?;
         let prior = self
             .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
@@ -4515,6 +4520,7 @@ impl Broker {
     /// Launch recovery after the request is durable and any conflicting
     /// preparation lease has been released.
     pub(crate) fn start_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
+        self.require_bound_repository_worktree_root("artifact-sweep recovery worker")?;
         self.maybe_start_artifact_sweep_worker(true)?;
         Ok(())
     }
@@ -4594,6 +4600,7 @@ impl Broker {
     /// files or a concurrent writer cannot keep a background process alive
     /// forever.
     pub(crate) fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
+        self.require_bound_repository_worktree_root("artifact-sweep recovery worker")?;
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1")) {
             self.write_artifact_sweep_worker_status("refused_environment")?;
             return Ok(());
@@ -4864,6 +4871,7 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<ArtifactSweepOutcome, BrokerOpError> {
+        self.require_bound_repository_worktree_root("closed-session artifact reclamation")?;
         let policy = load_retention_policy(self.main_root())?;
         self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::ClosedSession(session_id))
     }
@@ -5702,6 +5710,7 @@ impl Broker {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::GcConfirmationNotSha256);
         }
+        self.require_bound_repository_worktree_root("GC apply")?;
         let main_root = self.main_root().to_path_buf();
         let _lock = GcLock::acquire(&main_root)?;
         let journal_path = main_root.join(".aethyme/gc-journal.json");
@@ -6363,9 +6372,434 @@ mod tests {
     use super::*;
     use crate::disk_headroom::SweepUrgency;
 
+    #[cfg(unix)]
+    #[test]
+    fn fresh_open_defers_root_storage_until_explicit_worktree_start() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["commit", "--allow-empty", "-qm", "fixture"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let worktree_root = storage.worktree_root();
+        let preparation_cache_root = storage.root().join("deferred-preparation-cache");
+        let options = storage
+            .options()
+            .with_preparation_cache_root(preparation_cache_root.clone());
+        let mut broker = Broker::open_with_options(&repository, options).unwrap();
+
+        assert!(
+            !worktree_root.exists(),
+            "open must not create the worktree root"
+        );
+        assert!(
+            !preparation_cache_root.exists(),
+            "open must not initialize the preparation-cache root"
+        );
+        assert!(matches!(
+            broker.gc_plan(),
+            Err(BrokerOpError::WorktreeRootUnavailable { .. })
+        ));
+        assert!(matches!(
+            broker.reconcile_worktree_directories(false),
+            Err(BrokerOpError::WorktreeRootUnavailable { .. })
+        ));
+        assert!(!worktree_root.exists());
+        assert!(!preparation_cache_root.exists());
+
+        broker
+            .start_worktree("explicit root preparation", None)
+            .unwrap();
+        assert!(worktree_root.is_dir());
+        assert!(preparation_cache_root.is_dir());
+        assert!(broker.gc_plan().is_ok());
+        assert!(broker.reconcile_worktree_directories(false).is_ok());
+    }
+
     fn test_worker_retry_pending(broker: &mut Broker, now: i64) -> Result<bool, BrokerOpError> {
         let namespace = broker.ensure_artifact_sweep_namespace()?;
         worker_retry_pending(broker.store(), &namespace, now)
+    }
+
+    #[cfg(unix)]
+    struct RootBindingFixture {
+        _owner: tempfile::TempDir,
+        repository: PathBuf,
+        _storage: crate::test_storage::TestStorage,
+        options: crate::BrokerOpenOptions,
+        root: PathBuf,
+        preparation_cache: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn root_binding_fixture() -> RootBindingFixture {
+        let fixture = root_binding_fixture_unstarted();
+        let mut broker =
+            Broker::open_with_options(&fixture.repository, fixture.options.clone()).unwrap();
+        broker.start_worktree("bind test root", None).unwrap();
+        drop(broker);
+        fixture
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compatibility_backfill_open_defers_fresh_unbound_root_storage() {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        let fixture = root_binding_fixture_unstarted();
+        let broker = Broker::open_for_compatibility_backfill_with_options(
+            &fixture.repository,
+            fixture.options.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            broker
+                .store_ref()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::FreshUnbound
+        );
+        assert!(!fixture.root.exists());
+        assert!(!fixture.preparation_cache.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_binding_requires_digest_then_reopens_without_moving_registered_root() {
+        use crate::store::repository_binding::{
+            RepositoryWorktreeBindingOrigin, RepositoryWorktreeBindingState,
+            RepositoryWorktreeRootLayout,
+        };
+
+        let fixture = root_binding_fixture();
+        let entries_before: BTreeSet<_> = std::fs::read_dir(&fixture.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let marker_before = std::fs::read(fixture.root.join(WORKTREE_ROOT_MARKER)).unwrap();
+        let read_worktree_gitfiles = |root: &Path| {
+            std::fs::read_dir(root)
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.unwrap();
+                    if !entry.file_type().unwrap().is_dir() {
+                        return None;
+                    }
+                    Some((
+                        entry.file_name(),
+                        std::fs::read(entry.path().join(".git")).unwrap(),
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let gitfiles_before = read_worktree_gitfiles(&fixture.root);
+        std::fs::remove_dir_all(&fixture.preparation_cache).unwrap();
+
+        // Recreate the schema-53 migration shape without the later explicit
+        // binding. The retained marker and host registry remain untouched.
+        let database = crate::broker_db_path(&fixture.repository).unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "UPDATE repository_worktree_binding
+                 SET state = 'legacy_unbound', origin = 'legacy', path_encoding = NULL,
+                     repository_root = NULL, git_common_dir = NULL, repository_key = NULL,
+                     broker_db_path = NULL, bootstrap_nonce = NULL, worktree_root = NULL,
+                     root_layout = NULL, root_source = NULL, reservation_digest = NULL,
+                     parent_identity_json = NULL, worktree_identity_json = NULL
+                 WHERE singleton = 1;
+                 UPDATE meta SET value = '52' WHERE key = 'min_compatible_schema';",
+            )
+            .unwrap();
+
+        let backfill_broker = Broker::open_for_compatibility_backfill_with_options(
+            &fixture.repository,
+            fixture.options.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            backfill_broker
+                .store_ref()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::LegacyUnbound
+        );
+        assert!(!fixture.preparation_cache.exists());
+        drop(backfill_broker);
+
+        let mut broker =
+            Broker::open_with_options(&fixture.repository, fixture.options.clone()).unwrap();
+        let before = broker.store().repository_worktree_binding().unwrap();
+        assert_eq!(before.state, RepositoryWorktreeBindingState::LegacyUnbound);
+        assert_eq!(before.origin, Some(RepositoryWorktreeBindingOrigin::Legacy));
+        assert!(!fixture.preparation_cache.exists());
+        let layout = RepositoryWorktreeRootLayout::DirectRoot;
+        let plan = broker
+            .legacy_worktree_root_binding_plan(&fixture.root, layout)
+            .unwrap();
+        let wrong_digest = if plan.digest == "0".repeat(64) {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        };
+        assert!(matches!(
+            broker.apply_legacy_worktree_root_binding(&fixture.root, layout, &wrong_digest),
+            Err(BrokerOpError::Store(
+                crate::BrokerError::RepositoryWorktreeBindingConfirmationMismatch
+            ))
+        ));
+        assert_eq!(
+            broker.store().repository_worktree_binding().unwrap(),
+            before
+        );
+        let floor: String = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, "52");
+        assert_eq!(
+            std::fs::read_dir(&fixture.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>(),
+            entries_before,
+            "wrong confirmation must not alter the retained root"
+        );
+        assert!(!fixture.preparation_cache.exists());
+
+        broker
+            .apply_legacy_worktree_root_binding(&fixture.root, layout, &plan.digest)
+            .unwrap();
+        assert_eq!(
+            broker.store().repository_worktree_binding().unwrap().state,
+            RepositoryWorktreeBindingState::Bound
+        );
+        drop(broker);
+
+        let reopened =
+            Broker::open_with_options(&fixture.repository, fixture.options.clone()).unwrap();
+        assert_eq!(
+            reopened
+                .validate_bound_repository_worktree_root()
+                .unwrap()
+                .as_deref(),
+            Some(fixture.root.as_path())
+        );
+        assert_eq!(
+            std::fs::read_dir(&fixture.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>(),
+            entries_before,
+            "binding and reopen must preserve registered worktrees"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join(WORKTREE_ROOT_MARKER)).unwrap(),
+            marker_before,
+            "binding and reopen must preserve the exact ownership marker"
+        );
+        assert_eq!(read_worktree_gitfiles(&fixture.root), gitfiles_before);
+        assert!(fixture.preparation_cache.is_dir());
+    }
+
+    #[cfg(unix)]
+    fn root_binding_fixture_unstarted() -> RootBindingFixture {
+        let owner = tempfile::tempdir().unwrap();
+        let owner_root = owner.path().canonicalize().unwrap();
+        let repository = owner_root.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["commit", "--allow-empty", "-qm", "fixture"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let root_parent = owner_root.join("managed-roots");
+        std::fs::create_dir(&root_parent).unwrap();
+        let root = root_parent.join("worktrees");
+        let preparation_cache = storage.root().join("deferred-preparation-cache");
+        let options = storage
+            .options()
+            .with_worktree_root(root.clone())
+            .with_preparation_cache_root(preparation_cache.clone());
+        RootBindingFixture {
+            _owner: owner,
+            repository,
+            _storage: storage,
+            options,
+            root,
+            preparation_cache,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_root_identity_failures_stop_before_startup_cache_writes() {
+        for mutation in ["root", "parent", "root_mode", "marker", "registry"] {
+            let fixture = root_binding_fixture();
+            std::fs::remove_dir_all(&fixture.preparation_cache).unwrap();
+            let marker = fixture.root.join(WORKTREE_ROOT_MARKER);
+            match mutation {
+                "root" => {
+                    let old_root = fixture.root.with_file_name("old-worktrees");
+                    std::fs::rename(&fixture.root, &old_root).unwrap();
+                    std::fs::create_dir(&fixture.root).unwrap();
+                    std::fs::copy(old_root.join(WORKTREE_ROOT_MARKER), &marker).unwrap();
+                }
+                "parent" => {
+                    let old_parent = fixture.root.parent().unwrap().with_file_name("old-roots");
+                    std::fs::rename(fixture.root.parent().unwrap(), &old_parent).unwrap();
+                    std::fs::create_dir(fixture.root.parent().unwrap()).unwrap();
+                    std::fs::rename(old_parent.join("worktrees"), &fixture.root).unwrap();
+                }
+                "root_mode" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o770))
+                        .unwrap();
+                }
+                "marker" => std::fs::write(&marker, b"{}").unwrap(),
+                "registry" => {
+                    let host_db = fixture
+                        .options
+                        .host_operation_db_path
+                        .as_deref()
+                        .expect("fixture host operation database");
+                    let registry = crate::worktree_registry::registry_path(host_db).unwrap();
+                    rusqlite::Connection::open(registry)
+                        .unwrap()
+                        .execute("DELETE FROM roots", [])
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let reopened = Broker::open_with_options(&fixture.repository, fixture.options.clone());
+            assert!(
+                matches!(reopened, Err(BrokerOpError::WorktreeRootUnavailable { .. })),
+                "{mutation} identity change must refuse broker startup"
+            );
+            assert!(
+                !fixture.preparation_cache.exists(),
+                "{mutation} identity change must be rejected before preparation-cache initialization"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_reserved_and_recovery_required_states_refuse_root_operations_without_side_effects() {
+        use crate::store::repository_binding::{
+            FreshRepositoryRootReservation, RepositoryRootIdentity, RepositoryWorktreeBindingState,
+            RepositoryWorktreeRootLayout,
+        };
+
+        for recovery_required in [false, true] {
+            let fixture = root_binding_fixture_unstarted();
+            let mut broker =
+                Broker::open_with_options(&fixture.repository, fixture.options.clone()).unwrap();
+            let binding = broker.store().repository_worktree_binding().unwrap();
+            assert_eq!(binding.state, RepositoryWorktreeBindingState::FreshUnbound);
+            let identity = RepositoryRootIdentity {
+                repository_root: binding.repository_root.unwrap(),
+                git_common_dir: binding.git_common_dir.unwrap(),
+                repository_key: binding.repository_key.unwrap(),
+                broker_db_path: binding.broker_db_path.unwrap(),
+                bootstrap_nonce: binding.bootstrap_nonce.unwrap(),
+            };
+            let reservation_digest = "a".repeat(64);
+            broker
+                .store()
+                .reserve_fresh_repository_worktree_root(&FreshRepositoryRootReservation {
+                    identity: identity.clone(),
+                    worktree_root: fixture.root.clone(),
+                    layout: RepositoryWorktreeRootLayout::DirectRoot,
+                    source: crate::WorktreeRootSource::LibraryOverride,
+                    reservation_digest: reservation_digest.clone(),
+                    parent_identity_json: "{}".into(),
+                })
+                .unwrap();
+            if recovery_required {
+                broker
+                    .store()
+                    .mark_repository_worktree_recovery_required(
+                        &identity.bootstrap_nonce,
+                        &reservation_digest,
+                    )
+                    .unwrap();
+            }
+            drop(broker);
+
+            let mut reopened =
+                Broker::open_with_options(&fixture.repository, fixture.options.clone()).unwrap();
+            let expected_state = if recovery_required {
+                RepositoryWorktreeBindingState::RecoveryRequired
+            } else {
+                RepositoryWorktreeBindingState::FreshReserved
+            };
+            let binding_before_operations = reopened.store().repository_worktree_binding().unwrap();
+            assert_eq!(binding_before_operations.state, expected_state);
+            assert!(matches!(
+                reopened.gc_plan(),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.reconcile_worktree_directories(false),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.start_worktree("must not create reserved root", None),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            let valid_digest = "a".repeat(64);
+            assert!(matches!(
+                reopened.gc_apply(&valid_digest),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.gc_sweep_artifacts(),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.reclaim_closed_session_artifacts(0),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.cleanup_resolve_apply(0, &valid_digest),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.persist_artifact_sweep_recovery_request(),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.start_artifact_sweep_recovery_worker(),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.continue_artifact_sweep_backlog(),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.run_artifact_sweep_recovery_worker(),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert!(matches!(
+                reopened.resume_gc_maintenance(),
+                Err(BrokerOpError::WorktreeRootUnavailable { .. })
+            ));
+            assert_eq!(
+                reopened.store().repository_worktree_binding().unwrap(),
+                binding_before_operations,
+                "root refusal must not mutate the reserved binding"
+            );
+            assert!(!fixture.root.exists());
+            assert!(!fixture.preparation_cache.exists());
+        }
     }
 
     #[test]

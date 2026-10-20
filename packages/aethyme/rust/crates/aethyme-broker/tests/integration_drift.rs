@@ -283,7 +283,9 @@ fn doctor_cli(root: &Path, args: &[&str]) -> String {
 }
 
 /// A repository health check must find the leftover work `status` reports,
-/// with the same dry-run next action, and leave every ref where it was.
+/// with the same dry-run next action, and leave every ref where it was. The
+/// fixture has not performed an explicit root-creating operation, so doctor
+/// also reports retention health as unavailable rather than empty.
 #[test]
 fn verify_only_doctor_reports_leftover_integration_work() {
     let (tmp, mut setup_broker) = fixture(1);
@@ -359,6 +361,8 @@ fn verify_only_doctor_reports_leftover_integration_work() {
     );
     let command = "aethyme broker advanced integration reconcile --upstream origin/main --dry-run";
     assert_eq!(advice.commands, vec![command]);
+    assert!(report.retention.is_some(), "{report:#?}");
+    assert!(report.retention_unavailable_reason.is_none(), "{report:#?}");
     assert!(
         report.healthy(),
         "leftover work is reported, not unhealthy: {report:?}"

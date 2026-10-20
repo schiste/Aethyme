@@ -43,6 +43,15 @@ pub enum BrokerError {
         maximum: i64,
     },
 
+    #[error("repository worktree binding is missing or invalid: {0}")]
+    InvalidRepositoryWorktreeBinding(String),
+
+    #[error("repository worktree binding cannot transition from {current} to {requested}")]
+    RepositoryWorktreeBindingTransition { current: String, requested: String },
+
+    #[error("repository worktree binding confirmation does not match the reviewed plan digest")]
+    RepositoryWorktreeBindingConfirmationMismatch,
+
     #[error("no session with id {0}")]
     SessionNotFound(i64),
 

@@ -55,17 +55,39 @@ fn run(repo: &Path, args: &[&str]) -> Output {
     run_with_env(repo, args, &[])
 }
 
+fn fresh_unbound_child(repo: &Path, args: &[&str]) -> Command {
+    let fixture_root = repo
+        .parent()
+        .expect("fixture repository has an owner")
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let mut command = common::broker_cli_for_fixture(CLI, args, &fixture_root);
+    let host_state = common::fixture_host_state_dir(&fixture_root);
+    let worktree_root = fixture_root.join("worktrees");
+    command
+        .current_dir(repo)
+        .env("AETHYME_BROKER_DB", repo.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", worktree_root)
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        )
+        .env_remove("AETHYME_WORKTREE_ROOT");
+    command
+}
+
 fn command_with_env(repo: &Path, args: &[&str], environment: &[(&str, &str)]) -> Command {
     let broker = test_broker(repo);
-    let mut command = common::broker_cli(CLI, args);
-    command.current_dir(repo);
+    let mut command = fresh_unbound_child(repo, args);
     clear_inherited_git_environment(&mut command);
     for (key, value) in environment {
         command.env(key, value);
     }
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
     drop(broker);
     command
 }
