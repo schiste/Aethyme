@@ -1715,6 +1715,3 @@ fn write_executable(path: &Path, contents: &str) {
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
 }
-
-#[path = "common/json_error.rs"]
-mod json_error;
