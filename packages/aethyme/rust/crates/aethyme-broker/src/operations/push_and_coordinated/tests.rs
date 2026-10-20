@@ -1065,8 +1065,8 @@ fn an_unbounded_read_gets_the_read_budget_and_writes_keep_theirs() {
     }
 }
 
-/// #555 review: a read that is long by design keeps the caller's
-/// unbounded wait; only an explicit `--queue-timeout` bounds it.
+/// #555 review: a read that is long by design skips the automatic default
+/// budget; caller-selected `--queue-timeout` and `--no-wait` bounds still apply.
 fn assert_long_running_read_is_exempt(args: &[&str]) {
     let args = gh(args);
     assert_eq!(classify_gh(&args), Some(OperationEffect::Read), "{args:?}");
@@ -1081,6 +1081,17 @@ fn assert_long_running_read_is_exempt(args: &[&str]) {
         OperationProvider::Github,
     );
     assert_eq!(admission.budget, None, "{args:?} must stay unbounded");
+
+    let no_wait = AdmissionDeadline::start(QueueWait::Refuse).bounded_for(
+        OperationEffect::Read,
+        long_running,
+        OperationProvider::Github,
+    );
+    assert_eq!(
+        no_wait.budget,
+        Some(NO_WAIT_ADMISSION_BUDGET),
+        "`--no-wait` remains bounded for {args:?}"
+    );
 
     let explicit = AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(
         OperationEffect::Read,

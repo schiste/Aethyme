@@ -61,10 +61,10 @@ pub(crate) const GITHUB_READ_OPERATION_BUDGET: std::time::Duration =
 pub(crate) const GIT_READ_OPERATION_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(90);
 
-/// A read whose length is the point, so the default read budget must not cut
-/// it: following a run or checks until they finish, streaming a run's log,
-/// downloading artifacts, or paginating an API list. Only an explicit
-/// `--queue-timeout` bounds these (#555).
+/// A read whose length is the point, so the automatic default budget must
+/// not cut it: following a run or checks until they finish, streaming a run's
+/// log, downloading artifacts, or paginating an API list. Caller-selected
+/// bounds such as `--queue-timeout` and `--no-wait` still apply (#555).
 pub(crate) fn is_long_running_read(provider: OperationProvider, args: &[String]) -> bool {
     if provider != OperationProvider::Github {
         return false;
@@ -488,8 +488,8 @@ impl AdmissionDeadline {
 
     /// Bound a read its caller left unbounded. A read never queues for the
     /// lock, so "wait forever" could only mean "wait forever on the provider"
-    /// (#555). Writes keep exactly the wait their caller chose, and so does a
-    /// read that is long by design ([`is_long_running_read`]).
+    /// (#555). Writes keep exactly the wait their caller chose. Long reads
+    /// skip only the automatic default; caller-selected bounds still apply.
     fn bounded_for(
         self,
         effect: OperationEffect,
