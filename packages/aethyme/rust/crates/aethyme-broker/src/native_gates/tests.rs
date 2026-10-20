@@ -1931,8 +1931,8 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
         )
         .unwrap();
     assert_eq!(
-        migrated_floor,
-        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+        migrated_floor, 29,
+        "schema 30 keeps schema 29 as its minimum compatible floor"
     );
     let roots_before = root_count(&s.f.store, &job.id);
     assert!(roots_before > 0);
