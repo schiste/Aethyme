@@ -60,7 +60,9 @@ fn reap_reports_unproven_live_and_unverifiable_holders_without_releasing_allocat
     let live = coordinator
         .acquire(&request("live", std::process::id()))
         .unwrap();
-    let unverifiable = coordinator.acquire(&request("unverifiable", u32::MAX)).unwrap();
+    let unverifiable = coordinator
+        .acquire(&request("unverifiable", u32::MAX))
+        .unwrap();
     for grant in [&live, &unverifiable] {
         coordinator
             .quarantine(

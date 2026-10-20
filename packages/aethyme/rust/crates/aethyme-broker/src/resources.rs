@@ -5131,10 +5131,7 @@ fn reclaim_dead_capacity_with_diagnostics(
             state,
         });
     }
-    Ok(HostResourceReapReportWithDiagnostics {
-        report,
-        not_reaped,
-    })
+    Ok(HostResourceReapReportWithDiagnostics { report, not_reaped })
 }
 
 fn verify_ownership(
