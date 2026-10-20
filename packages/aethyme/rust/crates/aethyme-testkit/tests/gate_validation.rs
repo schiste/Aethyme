@@ -93,17 +93,29 @@ fn the_nextest_path_runs_the_whole_workspace_and_the_doctests() {
     assert!(
         nextest.contains("--workspace")
             && nextest.contains("--no-fail-fast")
+            && nextest.contains("--profile local ")
             && ![
                 "--lib",
                 "--bins",
                 "--tests",
                 "--examples",
-                "--profile",
+                "--retries",
                 "-E "
             ]
             .iter()
             .any(|flag| nextest.contains(flag)),
         "the nextest run must be an unrestricted, no-retry workspace run: {nextest}"
+    );
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../..");
+    let config: toml::Value =
+        std::fs::read_to_string(root.join("packages/aethyme/rust/.config/nextest.toml"))
+            .expect("read local nextest profile")
+            .parse()
+            .expect("nextest config parses");
+    assert_eq!(config["profile"]["local"]["retries"].as_integer(), Some(0));
+    assert_eq!(
+        config["profile"]["local"]["test-threads"].as_integer(),
+        Some(2)
     );
     assert!(
         command.contains("AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run")
