@@ -1042,7 +1042,7 @@ fn json_adopt_records_declared_scope_that_collides_with_a_start() {
     ));
     let adopted: serde_json::Value =
         serde_json::from_str(&adopted).expect("adopt --json stays pure JSON");
-    let session_id = adopted["session"]["id"].as_i64().unwrap();
+    let session_id = adopted["id"].as_i64().unwrap();
     let reported = adopted["scope_overlaps"].as_array().unwrap();
     assert_eq!(reported.len(), 1, "{adopted}");
     assert!(
@@ -1068,7 +1068,7 @@ fn json_start_reports_only_overlaps_involving_the_new_session() {
         ],
     ));
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
-    let first_id = first["session"]["id"].as_i64().unwrap();
+    let first_id = first["id"].as_i64().unwrap();
     assert_eq!(first["scope_overlaps"], serde_json::json!([]));
 
     let second = stdout(&run(
@@ -1083,7 +1083,7 @@ fn json_start_reports_only_overlaps_involving_the_new_session() {
         ],
     ));
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
-    let second_id = second["session"]["id"].as_i64().unwrap();
+    let second_id = second["id"].as_i64().unwrap();
     let reported = second["scope_overlaps"].as_array().unwrap();
     assert_eq!(reported.len(), 1, "{second}");
     assert_eq!(reported[0]["value"], "PaymentService");

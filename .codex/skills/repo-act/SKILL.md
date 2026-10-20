@@ -258,7 +258,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   matching tests does not validate the change. Automated focused-test runners
   should refuse a successful zero-test result; preserve the process exit
   separately from that validation refusal.
-- For changes to externally consumed CLI JSON, select the PR contract decision that matches the new surface. Mark added fields as `introduce` and document their presence, absence, and empty-value semantics with the serialized schema.
+- For changes to externally consumed CLI JSON, select the PR contract decision
+  that matches the new surface. Mark added fields as `introduce` and document
+  their presence, absence, and empty-value semantics with the serialized schema.
+  Derive fixture field paths from the actual serde producer, including
+  `flatten`, and verify the complete real CLI JSON response; do not infer wire
+  nesting from Rust struct nesting.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
   check child output on the intended stream separately. A report may retain
   the original command arguments, so searching its serialized text for a child
