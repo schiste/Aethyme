@@ -253,7 +253,6 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                 EdgeKind::ValidatesCredential,
                 EdgeKind::RewritesHeader,
                 EdgeKind::TestedBy,
-                EdgeKind::Tests,
             ],
         )],
         GraphRelation::Parents => vec![(
@@ -272,7 +271,6 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                 EdgeKind::ValidatesCredential,
                 EdgeKind::RewritesHeader,
                 EdgeKind::TestedBy,
-                EdgeKind::Tests,
             ],
         )],
         GraphRelation::Callers => vec![(NeighborDirection::Incoming, vec![EdgeKind::Calls])],
@@ -451,4 +449,32 @@ pub(super) fn configs_for_from<D: ReadableDatabase>(
     configs.sort();
     configs.dedup();
     Ok(configs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relationships_do_not_create_structural_ancestry() {
+        // A test exercising a target is a semantic relationship. It does not
+        // make either function contain or define the other function.
+        for relation in [GraphRelation::Children, GraphRelation::Parents] {
+            assert!(
+                relation_specs(relation)
+                    .iter()
+                    .all(|(_, kinds)| !kinds.contains(&EdgeKind::Tests)),
+                "test relationships must not become structural parents or children"
+            );
+        }
+        let references = relation_specs(GraphRelation::References);
+        assert_eq!(references.len(), 2);
+        assert!(
+            references
+                .iter()
+                .all(|(_, kinds)| kinds.contains(&EdgeKind::Tests))
+        );
+        assert!(matches!(references[0].0, NeighborDirection::Outgoing));
+        assert!(matches!(references[1].0, NeighborDirection::Incoming));
+    }
 }
