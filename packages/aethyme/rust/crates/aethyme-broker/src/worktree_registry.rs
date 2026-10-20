@@ -1268,6 +1268,8 @@ fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
     for component in missing.into_iter().rev() {
         let name = CString::new(component.as_bytes())
             .map_err(|_| invalid("directory component contains a NUL byte"))?;
+        // SAFETY: `parent` owns a live directory descriptor and `name` is a
+        // NUL-terminated component relative to that descriptor.
         let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
         if !created {
             let error = io::Error::last_os_error();
@@ -1276,6 +1278,9 @@ fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
             }
         }
 
+        // SAFETY: `parent` owns a live directory descriptor and `name` is a
+        // NUL-terminated component. O_NOFOLLOW/O_DIRECTORY constrain the
+        // returned descriptor to that child directory.
         let child_fd = unsafe {
             libc::openat(
                 parent.as_raw_fd(),
@@ -1294,7 +1299,7 @@ fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
         let child = unsafe { fs::File::from_raw_fd(child_fd) };
         let child_metadata = child.metadata()?;
         if !child_metadata.is_dir()
-            || child_metadata.uid() != unsafe { libc::geteuid() }
+            || child_metadata.uid() != effective_user_id()
             || child_metadata.mode() & 0o077 != 0
         {
             return Err(invalid(
@@ -1307,6 +1312,8 @@ fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
         // exact directory opened without following links.
         parent.sync_all()?;
         let mut named = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `parent` owns a live directory descriptor, `name` is a
+        // NUL-terminated component, and `named` points to writable storage.
         let stat_result = unsafe {
             libc::fstatat(
                 parent.as_raw_fd(),
@@ -1339,6 +1346,13 @@ fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn effective_user_id() -> libc::uid_t {
+    // SAFETY: geteuid takes no pointers and only returns the calling process'
+    // effective user ID.
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(not(unix))]
@@ -1386,7 +1400,7 @@ fn sync_registry_namespace(host_operation_database: &Path) -> io::Result<()> {
             || opened.dev() != named_after.dev()
             || opened.ino() != named_after.ino()
             || opened.uid() != named_after.uid()
-            || (require_current_owner && opened.uid() != unsafe { libc::geteuid() })
+            || (require_current_owner && opened.uid() != effective_user_id())
         {
             return Err(invalid(
                 "worktree registry directory identity changed before syncing",
@@ -4698,7 +4712,7 @@ mod tests {
         let parent_metadata = fs::metadata(parent).unwrap();
         let parent_owner = parent_metadata.uid();
         let parent_mode = parent_metadata.permissions().mode() & 0o7777;
-        let current_owner = unsafe { libc::geteuid() };
+        let current_owner = effective_user_id();
         if parent_owner == current_owner {
             // Some test environments run as root and therefore cannot
             // exercise the root-owned sticky-parent case.

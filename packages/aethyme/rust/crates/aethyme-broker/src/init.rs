@@ -198,6 +198,13 @@ pub fn certification_facts(repo_hint: &Path) -> Result<CertificationFacts, Broke
 
 /// The certification method: read-only, deterministic checks only.
 pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
+    certify_with_open_options(repo_hint, crate::BrokerOpenOptions::default())
+}
+
+fn certify_with_open_options(
+    repo_hint: &Path,
+    open_options: crate::BrokerOpenOptions,
+) -> Result<InitReport, BrokerOpError> {
     let facts = certification_facts(repo_hint)?;
     let mut checks = facts.checks;
     let Some(repository) = facts.repository else {
@@ -211,8 +218,8 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     // nothing — the db appears on first adopt/scaffold use).
     let db_path = repository.main_root.join(crate::BROKER_DB_RELPATH);
     if db_path.exists() {
-        let mut broker = Broker::open(&repository.main_root)?;
-        let report = broker.doctor()?;
+        let mut broker = Broker::open_with_options(&repository.main_root, open_options)?;
+        let (report, binding_state) = broker.doctor_with_binding_state()?;
         checks.push(Check {
             id: "certify.broker-db",
             status: if report.integrity == "ok" {
@@ -222,32 +229,77 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
             },
             detail: format!("integrity: {}", report.integrity),
         });
-        let retention = &report.retention;
-        let pending = retention.pending_recovery_digest.is_some();
-        let eligible =
-            retention.candidate_rows + retention.candidate_files + retention.candidate_worktrees;
-        checks.push(Check {
-            id: "certify.retention",
-            status: if pending || eligible > 0 {
-                CheckStatus::Warn
-            } else {
-                CheckStatus::Pass
+        let retention_check = match (binding_state, report.retention.as_ref()) {
+            (
+                crate::store::repository_binding::RepositoryWorktreeBindingState::Bound,
+                Some(retention),
+            ) => {
+                let pending = retention.pending_recovery_digest.is_some();
+                let eligible = retention.candidate_rows
+                    + retention.candidate_files
+                    + retention.candidate_worktrees;
+                Check {
+                    id: "certify.retention",
+                    status: if pending || eligible > 0 {
+                        CheckStatus::Warn
+                    } else {
+                        CheckStatus::Pass
+                    },
+                    detail: if let Some(digest) = &retention.pending_recovery_digest {
+                        format!(
+                            "confirmed GC recovery is pending; resume with `aethyme broker gc apply --confirm {digest}`"
+                        )
+                    } else {
+                        format!(
+                            "{} eligible rows, {} files, {} worktrees; {} reclaimable bytes; {} protected findings",
+                            retention.candidate_rows,
+                            retention.candidate_files,
+                            retention.candidate_worktrees,
+                            retention.estimated_reclaimable_bytes,
+                            retention.blockers,
+                        )
+                    },
+                }
+            }
+            (
+                crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+                | crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound,
+                None,
+            ) => Check {
+                id: "certify.retention",
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "retention health unavailable: {}",
+                    report
+                        .retention_unavailable_reason
+                        .as_deref()
+                        .unwrap_or("root binding is unavailable")
+                ),
             },
-            detail: if let Some(digest) = &retention.pending_recovery_digest {
-                format!(
-                    "confirmed GC recovery is pending; resume with `aethyme broker gc apply --confirm {digest}`"
-                )
-            } else {
-                format!(
-                    "{} eligible rows, {} files, {} worktrees; {} reclaimable bytes; {} protected findings",
-                    retention.candidate_rows,
-                    retention.candidate_files,
-                    retention.candidate_worktrees,
-                    retention.estimated_reclaimable_bytes,
-                    retention.blockers,
-                )
+            (
+                crate::store::repository_binding::RepositoryWorktreeBindingState::FreshReserved
+                | crate::store::repository_binding::RepositoryWorktreeBindingState::RecoveryRequired,
+                None,
+            ) => Check {
+                id: "certify.retention",
+                status: CheckStatus::Fail,
+                detail: format!(
+                    "retention health unavailable in incomplete binding state: {}",
+                    report
+                        .retention_unavailable_reason
+                        .as_deref()
+                        .unwrap_or("binding recovery is required")
+                ),
             },
-        });
+            (state, _) => Check {
+                id: "certify.retention",
+                status: CheckStatus::Fail,
+                detail: format!(
+                    "retention report does not match repository binding state {state:?}"
+                ),
+            },
+        };
+        checks.push(retention_check);
         for id in &report.missing_worktrees {
             checks.push(Check {
                 id: "certify.missing-worktree",
@@ -1775,5 +1827,163 @@ mod config_key_tests {
     fn worktrees_root_and_floor_are_known_keys() {
         assert!(unknown("[worktrees]\nroot = \"/Volumes/T7/wt\"\nmin_free_bytes = 1\n").is_empty());
         assert_eq!(unknown("[worktrees]\npath = \"/x\"\n"), ["worktrees.path"]);
+    }
+}
+
+#[cfg(test)]
+mod retention_health_tests {
+    use super::{CheckStatus, certify_with_open_options};
+    use crate::test_storage::TestStorage;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn init_repository(root: &Path) {
+        let init = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .output()
+            .expect("run git init");
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let commit = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(root)
+            .output()
+            .expect("create fixture commit");
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+    }
+
+    fn check_status(report: &super::InitReport, id: &str) -> CheckStatus {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .unwrap_or_else(|| panic!("missing certification check {id}: {report:#?}"))
+            .status
+    }
+
+    #[test]
+    fn certification_warns_until_a_root_operation_binds_retention_health() {
+        let repository = tempfile::tempdir().unwrap();
+        init_repository(repository.path());
+        let storage = TestStorage::new();
+        let worktree_root = storage.root().join("worktrees with spaces");
+        let options = crate::BrokerOpenOptions::default()
+            .with_host_state_dir(storage.host_state_dir())
+            .with_host_cache_dir(storage.root().join("host-cache"))
+            .with_host_operation_database(storage.host_state_dir().join("host-operations.db"))
+            .with_worktree_root(&worktree_root)
+            .with_collaboration_state(storage.root().join("collaboration"))
+            .with_preparation_cache_root(storage.root().join("preparation-cache"));
+
+        let initial = crate::Broker::open_with_options(repository.path(), options.clone())
+            .expect("open fixture broker before certification");
+        drop(initial);
+        assert!(!worktree_root.exists(), "fixture begins FreshUnbound");
+
+        let fresh = certify_with_open_options(repository.path(), options.clone()).unwrap();
+        assert!(
+            fresh.certified(),
+            "a retention warning is not DB failure: {fresh:#?}"
+        );
+        assert_eq!(check_status(&fresh, "certify.broker-db"), CheckStatus::Pass);
+        assert_eq!(check_status(&fresh, "certify.retention"), CheckStatus::Warn);
+        assert!(fresh.checks.iter().any(|check| {
+            check.id == "certify.retention"
+                && check.detail.contains("fresh worktree root is unbound")
+        }));
+        assert!(
+            !worktree_root.exists(),
+            "certify does not provision storage"
+        );
+
+        let mut broker = crate::Broker::open_with_options(repository.path(), options.clone())
+            .expect("reopen fixture broker");
+        broker
+            .start_worktree("bind retention root", None)
+            .expect("explicit managed operation binds the root");
+        drop(broker);
+        assert!(worktree_root.is_dir());
+
+        let bound = certify_with_open_options(repository.path(), options.clone()).unwrap();
+        assert!(bound.certified(), "{bound:#?}");
+        assert_eq!(check_status(&bound, "certify.broker-db"), CheckStatus::Pass);
+        assert_eq!(check_status(&bound, "certify.retention"), CheckStatus::Pass);
+
+        let mut broker = crate::Broker::open_with_options(repository.path(), options.clone())
+            .expect("open bound fixture broker");
+        let doctor = broker.doctor().unwrap();
+        assert_eq!(doctor.integrity, "ok");
+        assert!(doctor.retention.is_some(), "{doctor:#?}");
+        assert!(doctor.retention_unavailable_reason.is_none(), "{doctor:#?}");
+        assert!(doctor.healthy(), "{doctor:#?}");
+
+        let displaced_root = storage.root().join("displaced-worktrees");
+        std::fs::rename(&worktree_root, &displaced_root).unwrap();
+        std::fs::create_dir(&worktree_root).unwrap();
+        let error = broker
+            .doctor()
+            .expect_err("doctor must propagate invalidation of a bound root");
+        assert!(
+            matches!(
+                &error,
+                crate::BrokerOpError::WorktreeRootUnavailable { reason, .. }
+                    if reason.contains("bound worktree root or parent identity changed")
+            ),
+            "doctor must report the bound-root identity error, got {error:#?}"
+        );
+        drop(broker);
+        std::fs::remove_dir(&worktree_root).unwrap();
+        std::fs::rename(&displaced_root, &worktree_root).unwrap();
+
+        // Exercise certification against a shape-valid RecoveryRequired row.
+        // This fixture mutation tests classification only, not the transition
+        // or its durability.
+        let connection =
+            rusqlite::Connection::open(repository.path().join(crate::BROKER_DB_RELPATH)).unwrap();
+        let changed = connection
+            .execute(
+                "UPDATE repository_worktree_binding
+                 SET state = 'recovery_required', worktree_identity_json = NULL
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        drop(connection);
+
+        let recovery_required = certify_with_open_options(repository.path(), options).unwrap();
+        assert_eq!(
+            check_status(&recovery_required, "certify.broker-db"),
+            CheckStatus::Pass,
+            "database integrity remains distinct from binding recovery"
+        );
+        assert_eq!(
+            check_status(&recovery_required, "certify.retention"),
+            CheckStatus::Fail,
+            "recovery-required state must block certification"
+        );
+        assert!(!recovery_required.certified(), "{recovery_required:#?}");
+        assert!(recovery_required.checks.iter().any(|check| {
+            check.id == "certify.retention"
+                && check.detail.contains("incomplete binding state")
+                && check.detail.contains("requires recovery")
+        }));
     }
 }

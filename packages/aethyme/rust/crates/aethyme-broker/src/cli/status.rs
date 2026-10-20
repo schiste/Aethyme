@@ -787,96 +787,106 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             render_blockers(&blocker_report);
         }
-        out!(
-            "retention: {} rows, {} files, {} worktrees, {} retained, {} reclaimable; {} protected findings",
-            report.retention.candidate_rows,
-            report.retention.candidate_files,
-            report.retention.candidate_worktrees,
-            human_bytes(report.retention.estimated_retained_bytes),
-            human_bytes(report.retention.estimated_reclaimable_bytes),
-            report.retention.blockers,
-        );
-        for warning in &report.retention.retention_config_warnings {
-            out!("  retention warning: {warning}");
-        }
-        let closed = &report.retention.closed_worktrees;
-        if let Some(command) = closed.command.as_deref() {
+        if let Some(retention) = &report.retention {
             out!(
-                "  retention: {} closed {} still on disk ({}{}){}; see which GC would reclaim with `{command}`",
-                closed.count,
-                crate::broker::plural_word(
+                "retention: {} rows, {} files, {} worktrees, {} retained, {} reclaimable; {} protected findings",
+                retention.candidate_rows,
+                retention.candidate_files,
+                retention.candidate_worktrees,
+                human_bytes(retention.estimated_retained_bytes),
+                human_bytes(retention.estimated_reclaimable_bytes),
+                retention.blockers,
+            );
+            for warning in &retention.retention_config_warnings {
+                out!("  retention warning: {warning}");
+            }
+            let closed = &retention.closed_worktrees;
+            if let Some(command) = closed.command.as_deref() {
+                out!(
+                    "  retention: {} closed {} still on disk ({}{}){}; see which GC would reclaim with `{command}`",
                     closed.count,
-                    "session's checkout",
-                    "sessions' checkouts"
-                ),
-                if closed.unmeasured_count > 0 {
-                    "at least "
-                } else {
-                    ""
-                },
-                human_bytes(closed.estimated_bytes),
-                if closed.adopted_count > 0 {
-                    format!(
-                        ", plus {} adopted that GC never removes",
-                        closed.adopted_count
-                    )
-                } else {
-                    String::new()
-                },
-            );
-        }
-        if closed.eligibility_not_inspected_count > 0 {
-            out!(
-                "  retention: {} retained {} not inspected for cleanup eligibility within the {} s health-check budget; see all of them with `aethyme broker gc plan`",
-                closed.eligibility_not_inspected_count,
-                crate::broker::plural_word(
+                    crate::broker::plural_word(
+                        closed.count,
+                        "session's checkout",
+                        "sessions' checkouts"
+                    ),
+                    if closed.unmeasured_count > 0 {
+                        "at least "
+                    } else {
+                        ""
+                    },
+                    human_bytes(closed.estimated_bytes),
+                    if closed.adopted_count > 0 {
+                        format!(
+                            ", plus {} adopted that GC never removes",
+                            closed.adopted_count
+                        )
+                    } else {
+                        String::new()
+                    },
+                );
+            }
+            if closed.eligibility_not_inspected_count > 0 {
+                out!(
+                    "  retention: {} retained {} not inspected for cleanup eligibility within the {} s health-check budget; see all of them with `aethyme broker gc plan`",
                     closed.eligibility_not_inspected_count,
-                    "worktree was",
-                    "worktrees were",
+                    crate::broker::plural_word(
+                        closed.eligibility_not_inspected_count,
+                        "worktree was",
+                        "worktrees were",
+                    ),
+                    crate::HEALTH_CHECK_ELIGIBILITY_BUDGET.as_secs(),
+                );
+            }
+            // Doctor takes the recorded-size path, so its byte figures
+            // can be floors. Say so before the budget line: a floor
+            // under the budget is not a pass, it is an unanswered
+            // question, and reporting only the pass is how the budget
+            // stopped meaning anything (#176).
+            if retention.unmeasured_directory_count > 0 {
+                out!(
+                    "  retention: {} retained {} never been sized; byte totals above are a floor -- measure with `aethyme broker gc plan`",
+                    retention.unmeasured_directory_count,
+                    crate::broker::plural_word(
+                        retention.unmeasured_directory_count,
+                        "directory has",
+                        "directories have",
+                    ),
+                );
+            }
+            match retention.budget_verdict {
+                crate::BudgetVerdict::Over => out!(
+                    "  warning: retained storage exceeds the configured {} budget; review `aethyme broker gc plan`",
+                    human_bytes(retention.policy.retained_bytes_budget)
                 ),
-                crate::HEALTH_CHECK_ELIGIBILITY_BUDGET.as_secs(),
-            );
-        }
-        // Doctor takes the recorded-size path, so its byte figures
-        // can be floors. Say so before the budget line: a floor
-        // under the budget is not a pass, it is an unanswered
-        // question, and reporting only the pass is how the budget
-        // stopped meaning anything (#176).
-        if report.retention.unmeasured_directory_count > 0 {
+                crate::BudgetVerdict::Unknown => out!(
+                    "  warning: cannot tell whether retained storage is within the configured {} budget; run `aethyme broker gc plan`",
+                    human_bytes(retention.policy.retained_bytes_budget)
+                ),
+                crate::BudgetVerdict::Within | crate::BudgetVerdict::Unset => {}
+            }
+            if let Some(digest) = &retention.pending_recovery_digest {
+                out!("  recovery pending: aethyme broker gc apply --confirm {digest}");
+            }
+            if retention.artifact_worktrees_not_scanned > 0 {
+                out!(
+                    "  retention: {} retained {} not searched for build output within the {} s health-check budget; see all of them with `aethyme broker gc plan`",
+                    retention.artifact_worktrees_not_scanned,
+                    crate::broker::plural_word(
+                        retention.artifact_worktrees_not_scanned,
+                        "worktree was",
+                        "worktrees were",
+                    ),
+                    crate::gc::HEALTH_CHECK_ARTIFACT_SCAN_BUDGET.as_secs(),
+                );
+            }
+        } else {
             out!(
-                "  retention: {} retained {} never been sized; byte totals above are a floor -- measure with `aethyme broker gc plan`",
-                report.retention.unmeasured_directory_count,
-                crate::broker::plural_word(
-                    report.retention.unmeasured_directory_count,
-                    "directory has",
-                    "directories have",
-                ),
-            );
-        }
-        match report.retention.budget_verdict {
-            crate::BudgetVerdict::Over => out!(
-                "  warning: retained storage exceeds the configured {} budget; review `aethyme broker gc plan`",
-                human_bytes(report.retention.policy.retained_bytes_budget)
-            ),
-            crate::BudgetVerdict::Unknown => out!(
-                "  warning: cannot tell whether retained storage is within the configured {} budget; run `aethyme broker gc plan`",
-                human_bytes(report.retention.policy.retained_bytes_budget)
-            ),
-            crate::BudgetVerdict::Within | crate::BudgetVerdict::Unset => {}
-        }
-        if let Some(digest) = &report.retention.pending_recovery_digest {
-            out!("  recovery pending: aethyme broker gc apply --confirm {digest}");
-        }
-        if report.retention.artifact_worktrees_not_scanned > 0 {
-            out!(
-                "  retention: {} retained {} not searched for build output within the {} s health-check budget; see all of them with `aethyme broker gc plan`",
-                report.retention.artifact_worktrees_not_scanned,
-                crate::broker::plural_word(
-                    report.retention.artifact_worktrees_not_scanned,
-                    "worktree was",
-                    "worktrees were",
-                ),
-                crate::gc::HEALTH_CHECK_ARTIFACT_SCAN_BUDGET.as_secs(),
+                "retention health unavailable (not an empty inventory): {}",
+                report
+                    .retention_unavailable_reason
+                    .as_deref()
+                    .unwrap_or("repository worktree root is not bound")
             );
         }
         out!("debris across stores and the container runtime: `aethyme broker status doctor plan`");

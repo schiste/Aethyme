@@ -1645,6 +1645,7 @@ fn worktree_storage_minimum(source: WorktreeRootSource, configured: Option<u64>)
     }
 }
 
+#[cfg(test)]
 fn prepare_worktree_root_directory(
     main_root: &Path,
     path: &Path,
@@ -3640,16 +3641,20 @@ fn canonical_json_value_bytes<T: serde::Serialize>(
     serde_json::to_vec(&value)
 }
 
-fn legacy_worktree_root_binding_digest(
-    repository_root: &Path,
-    git_common_dir: &Path,
-    repository_key: &str,
-    broker_db_path: &Path,
-    worktree_root: &Path,
-    layout: &str,
+struct LegacyWorktreeRootBindingDigestInput<'a> {
+    repository_root: &'a Path,
+    git_common_dir: &'a Path,
+    repository_key: &'a str,
+    broker_db_path: &'a Path,
+    worktree_root: &'a Path,
+    layout: &'a str,
     source: WorktreeRootSource,
-    parent_identity: &str,
-    worktree_identity: &str,
+    parent_identity: &'a str,
+    worktree_identity: &'a str,
+}
+
+fn legacy_worktree_root_binding_digest(
+    input: LegacyWorktreeRootBindingDigestInput<'_>,
 ) -> Result<String, serde_json::Error> {
     #[derive(serde::Serialize)]
     struct LegacyBindingDigestInput<'a> {
@@ -3667,15 +3672,15 @@ fn legacy_worktree_root_binding_digest(
 
     let payload = LegacyBindingDigestInput {
         schema_version: 1,
-        repository_root,
-        git_common_dir,
-        repository_key,
-        broker_db_path,
-        worktree_root,
-        layout,
-        source,
-        parent_identity,
-        worktree_identity,
+        repository_root: input.repository_root,
+        git_common_dir: input.git_common_dir,
+        repository_key: input.repository_key,
+        broker_db_path: input.broker_db_path,
+        worktree_root: input.worktree_root,
+        layout: input.layout,
+        source: input.source,
+        parent_identity: input.parent_identity,
+        worktree_identity: input.worktree_identity,
     };
     canonical_json_value_bytes(payload).map(|bytes| hex_digest(&bytes))
 }
@@ -6422,17 +6427,17 @@ impl Broker {
                 "direct_root"
             }
         };
-        let digest = legacy_worktree_root_binding_digest(
-            &repository_root,
-            &git_common_dir,
-            &repository_key,
-            &broker_db_path,
-            &root,
-            layout_name,
+        let digest = legacy_worktree_root_binding_digest(LegacyWorktreeRootBindingDigestInput {
+            repository_root: &repository_root,
+            git_common_dir: &git_common_dir,
+            repository_key: &repository_key,
+            broker_db_path: &broker_db_path,
+            worktree_root: &root,
+            layout: layout_name,
             source,
-            &parent_json,
-            &worktree_json,
-        )
+            parent_identity: &parent_json,
+            worktree_identity: &worktree_json,
+        })
         .map_err(|error| refusal(&root, format!("cannot encode legacy binding plan: {error}")))?;
         Ok(LegacyWorktreeRootBindingPlan {
             schema_version: 1,
@@ -6508,6 +6513,37 @@ impl Broker {
                 path: requested_root.to_path_buf(),
                 reason: "legacy root binding completed but did not validate".into(),
             })?;
+        Ok(())
+    }
+
+    /// Submission may create a root only after its non-root checks have
+    /// passed. A fresh-unbound database can continue through preflight;
+    /// legacy and incomplete bindings keep the existing refusal, and a bound
+    /// root is validated immediately.
+    pub(crate) fn check_submission_root_before_planning(&self) -> Result<(), BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        if self.store.repository_worktree_binding()?.state
+            == RepositoryWorktreeBindingState::FreshUnbound
+        {
+            return Ok(());
+        }
+        self.require_bound_repository_worktree_root("session submission")?;
+        Ok(())
+    }
+
+    /// Submission is an explicit root-creating operation. Keep open, status,
+    /// and adoption observational for an unbound repository; prepare a fresh
+    /// root only after session, checkout, policy, and plan validation.
+    pub(crate) fn prepare_worktree_root_for_submission(&mut self) -> Result<(), BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        if self.store.repository_worktree_binding()?.state
+            == RepositoryWorktreeBindingState::FreshUnbound
+        {
+            self.prepare_broker_worktree_root()?;
+        }
+        self.require_bound_repository_worktree_root("session submission")?;
         Ok(())
     }
 
@@ -7379,96 +7415,6 @@ impl Broker {
             path: placement.root.clone(),
             reason,
         })
-    }
-
-    pub(super) fn prepare_worktree_root(
-        &self,
-        path: &Path,
-        source: WorktreeRootSource,
-        require_external: bool,
-    ) -> Result<PathBuf, BrokerOpError> {
-        let min_free_bytes = self.configured_worktree_minimum(source)?;
-        // Verify the write volume before creating even the registry's control
-        // state. Hold its capacity exclusion through root creation/recording;
-        // a full or unavailable history must not strand another external root.
-        preflight_worktree_root(
-            &self.main_root,
-            path,
-            source,
-            require_external,
-            min_free_bytes,
-            crate::verification::removable_volume_unavailable_reason,
-            |candidate| {
-                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
-                    .map(|headroom| headroom.bytes)
-            },
-        )
-        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
-            path: path.to_path_buf(),
-            reason,
-        })?;
-        let admission =
-            crate::worktree_registry::admit(&self.host_operation_database_path()?, path).map_err(
-                |error| BrokerOpError::WorktreeRootUnavailable {
-                    path: path.to_path_buf(),
-                    reason: format!("cannot retain worktree storage discovery: {error}"),
-                },
-            )?;
-        let root = prepare_worktree_root_directory(
-            &self.main_root,
-            path,
-            source,
-            require_external,
-            min_free_bytes,
-            crate::verification::removable_volume_unavailable_reason,
-            |candidate| {
-                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
-                    .map(|headroom| headroom.bytes)
-            },
-        )
-        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
-            path: path.to_path_buf(),
-            reason,
-        })?;
-        if require_external && self.path_is_inside_repository(&root) {
-            return Err(BrokerOpError::WorktreeRootUnavailable {
-                path: root,
-                reason: format!(
-                    "{} must resolve outside repository {}; choose an external AETHYME_WORKTREE_ROOT",
-                    source.as_str(),
-                    self.main_root.display()
-                ),
-            });
-        }
-        // Selecting a pathname is not consent to adopt its existing contents.
-        // Refuse before changing permissions on an unowned directory.
-        self.worktree_root_marker_exists_or_empty(&root)?;
-        crate::host_state::protect_host_state_path(&root, true).map_err(|error| {
-            BrokerOpError::WorktreeRootUnavailable {
-                path: root.clone(),
-                reason: format!("cannot apply private directory permissions: {error}"),
-            }
-        })?;
-        self.write_or_verify_worktree_root_marker(&root)?;
-        admission
-            .record(
-                &root,
-                &WorktreeRootMarker {
-                    schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
-                    repository_key: self.repository_worktree_key()?,
-                    repository_root: self.main_root.clone(),
-                },
-                source,
-            )
-            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
-                path: root.clone(),
-                reason: format!("cannot retain worktree storage discovery: {error}"),
-            })?;
-        // Best effort on purpose: this is a disk-hygiene default, and failing
-        // to start a session over one is a far worse outcome than building a
-        // worktree the way cargo would have anyway.
-        let _ = write_worktree_build_defaults(&root);
-        Ok(root)
     }
 
     fn worktree_root_marker_exists_or_empty(&self, root: &Path) -> Result<bool, BrokerOpError> {
@@ -8424,17 +8370,21 @@ mod worktree_root_digest_tests {
                 if reason.contains("cannot encode root reservation identity")
         ));
 
-        let legacy_result = legacy_worktree_root_binding_digest(
-            &non_utf8_root,
-            &non_utf8_root.join(".git"),
-            "repo-key",
-            &non_utf8_root.join(".aethyme/broker.db"),
-            &non_utf8_root.join(".aethyme/worktrees"),
-            "keyed_container",
-            WorktreeRootSource::RepositoryFallback,
-            r#"{"device":1,"inode":2}"#,
-            r#"{"device":1,"inode":3}"#,
-        );
+        let git_common_dir = non_utf8_root.join(".git");
+        let broker_db_path = non_utf8_root.join(".aethyme/broker.db");
+        let worktree_root = non_utf8_root.join(".aethyme/worktrees");
+        let legacy_result =
+            legacy_worktree_root_binding_digest(LegacyWorktreeRootBindingDigestInput {
+                repository_root: &non_utf8_root,
+                git_common_dir: &git_common_dir,
+                repository_key: "repo-key",
+                broker_db_path: &broker_db_path,
+                worktree_root: &worktree_root,
+                layout: "keyed_container",
+                source: WorktreeRootSource::RepositoryFallback,
+                parent_identity: r#"{"device":1,"inode":2}"#,
+                worktree_identity: r#"{"device":1,"inode":3}"#,
+            });
         assert!(legacy_result.is_err());
     }
 
@@ -8483,18 +8433,19 @@ mod worktree_root_digest_tests {
             "worktree_identity": worktree_identity,
         }))
         .unwrap();
-        let legacy_digest = legacy_worktree_root_binding_digest(
-            &identity.repository_root,
-            &identity.git_common_dir,
-            &identity.repository_key,
-            &identity.broker_db_path,
-            &root,
-            "keyed_container",
-            source,
-            parent_identity,
-            worktree_identity,
-        )
-        .unwrap();
+        let legacy_digest =
+            legacy_worktree_root_binding_digest(LegacyWorktreeRootBindingDigestInput {
+                repository_root: &identity.repository_root,
+                git_common_dir: &identity.git_common_dir,
+                repository_key: &identity.repository_key,
+                broker_db_path: &identity.broker_db_path,
+                worktree_root: &root,
+                layout: "keyed_container",
+                source,
+                parent_identity,
+                worktree_identity,
+            })
+            .unwrap();
         assert_eq!(legacy_digest, hex_digest(&expected_legacy_bytes));
     }
 }

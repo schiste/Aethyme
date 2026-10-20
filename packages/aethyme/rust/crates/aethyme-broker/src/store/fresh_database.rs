@@ -1204,19 +1204,19 @@ mod unix {
 
     fn open_existing(repo_root: &Path, paths: &DbPaths) -> Result<BrokerStore, BrokerError> {
         let header = read_header(paths)?;
-        if let Some(binding) = header.binding.as_ref() {
-            if binding.state != RepositoryWorktreeBindingState::LegacyUnbound {
-                let _bootstrap_lock = acquire_bootstrap_lock(paths)?;
-                verify_parent(paths)?;
-                if lstat_optional(&paths.final_path)?.is_none()
-                    || lstat_optional(&paths.stage_path)?.is_some()
-                {
-                    return Err(refusal(
-                        "fresh database names changed while waiting for the bootstrap lock",
-                    ));
-                }
-                return open_existing_locked(repo_root, paths, true);
+        if let Some(binding) = header.binding.as_ref()
+            && binding.state != RepositoryWorktreeBindingState::LegacyUnbound
+        {
+            let _bootstrap_lock = acquire_bootstrap_lock(paths)?;
+            verify_parent(paths)?;
+            if lstat_optional(&paths.final_path)?.is_none()
+                || lstat_optional(&paths.stage_path)?.is_some()
+            {
+                return Err(refusal(
+                    "fresh database names changed while waiting for the bootstrap lock",
+                ));
             }
+            return open_existing_locked(repo_root, paths, true);
         }
         BrokerStore::open(&paths.logical_path)
     }
@@ -1232,37 +1232,37 @@ mod unix {
     ) -> Result<BrokerStore, BrokerError> {
         check_existing_sidecars(paths, &paths.final_path)?;
         let header = read_header(paths)?;
-        if let Some(binding) = header.binding.as_ref() {
-            if binding.state != RepositoryWorktreeBindingState::LegacyUnbound {
-                let base = capture_identity_base(repo_root, &paths.final_path)?;
-                let identity = validate_binding_identity(binding, &base)?;
-                if header.floor.unwrap_or_default() < 53 {
-                    return Err(refusal(
-                        "nonlegacy repository binding exists below compatibility floor 53",
-                    ));
-                }
-                let proof = match identity.origin {
-                    RepositoryWorktreeBindingOrigin::Fresh
-                        if binding.state == RepositoryWorktreeBindingState::FreshUnbound =>
-                    {
-                        DatabaseProof::PublishedUnbound { expected_links: 1 }
-                    }
-                    RepositoryWorktreeBindingOrigin::Fresh => {
-                        DatabaseProof::PublishedIdentityOnly { expected_links: 1 }
-                    }
-                    RepositoryWorktreeBindingOrigin::Legacy => {
-                        DatabaseProof::PublishedLegacyBound { expected_links: 1 }
-                    }
-                };
-                let verified = verify_database(paths, &paths.final_path, &base, proof)?;
-                if verified.identity != identity {
-                    return Err(refusal(
-                        "repository database identity changed between read-only checks",
-                    ));
-                }
-                check_existing_sidecars(paths, &paths.final_path)?;
-                return open_verified_current(&paths.final_path, &paths.logical_path, &identity);
+        if let Some(binding) = header.binding.as_ref()
+            && binding.state != RepositoryWorktreeBindingState::LegacyUnbound
+        {
+            let base = capture_identity_base(repo_root, &paths.final_path)?;
+            let identity = validate_binding_identity(binding, &base)?;
+            if header.floor.unwrap_or_default() < 53 {
+                return Err(refusal(
+                    "nonlegacy repository binding exists below compatibility floor 53",
+                ));
             }
+            let proof = match identity.origin {
+                RepositoryWorktreeBindingOrigin::Fresh
+                    if binding.state == RepositoryWorktreeBindingState::FreshUnbound =>
+                {
+                    DatabaseProof::PublishedUnbound { expected_links: 1 }
+                }
+                RepositoryWorktreeBindingOrigin::Fresh => {
+                    DatabaseProof::PublishedIdentityOnly { expected_links: 1 }
+                }
+                RepositoryWorktreeBindingOrigin::Legacy => {
+                    DatabaseProof::PublishedLegacyBound { expected_links: 1 }
+                }
+            };
+            let verified = verify_database(paths, &paths.final_path, &base, proof)?;
+            if verified.identity != identity {
+                return Err(refusal(
+                    "repository database identity changed between read-only checks",
+                ));
+            }
+            check_existing_sidecars(paths, &paths.final_path)?;
+            return open_verified_current(&paths.final_path, &paths.logical_path, &identity);
         }
         if require_nonlegacy {
             return Err(refusal(
