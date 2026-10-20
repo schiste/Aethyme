@@ -7086,9 +7086,11 @@ mod tests {
             "[cleanup]\nauto_remove = true\n",
         )
         .unwrap();
+        // Use the minimum valid retention age; the later origin-containment
+        // proof makes this just-closed checkout eligible immediately.
         std::fs::write(
             root.join(".aethyme/broker.toml"),
-            "[retention]\nclosed_worktrees_days = 0\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+            "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
 
