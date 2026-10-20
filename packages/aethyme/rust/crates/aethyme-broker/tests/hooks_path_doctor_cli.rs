@@ -63,13 +63,30 @@ fn doctor_json(fixture: &common::FixtureRepository, global_config: &Path) -> ser
 
 fn run(fixture: &common::FixtureRepository, global_config: &Path, args: &[&str]) -> Output {
     let broker = common::open_fixture_repository_broker(fixture).unwrap();
-    let mut command = common::broker_cli(CLI, args);
+    let fixture_root = fixture
+        .owner_path()
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let mut command = common::broker_cli_for_fixture(CLI, args, &fixture_root);
+    let host_state = common::fixture_host_state_dir(&fixture_root);
     command
         .current_dir(fixture.path())
-        .env("GIT_CONFIG_GLOBAL", global_config);
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
+        .env("GIT_CONFIG_GLOBAL", global_config)
+        .env(
+            "AETHYME_BROKER_DB",
+            fixture.path().join(".aethyme/broker.db"),
+        )
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", fixture.worktree_root())
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        )
+        .env_remove("AETHYME_WORKTREE_ROOT");
     drop(broker);
     command.output().unwrap()
 }

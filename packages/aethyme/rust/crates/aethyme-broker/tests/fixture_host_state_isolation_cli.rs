@@ -9,8 +9,6 @@ const LIBRARY_CHILD_FLAG: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PLACEMENT_CHILD";
 const LIBRARY_PATH_REPORT: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PATH_REPORT";
 
 mod common;
-#[path = "common/isolation.rs"]
-mod isolation;
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -63,6 +61,31 @@ fn configured_env(command: &Command) -> HashMap<OsString, Option<OsString>> {
         .get_envs()
         .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
         .collect()
+}
+
+fn fresh_unbound_child(fixture: &common::FixtureRepository, args: &[&str]) -> Command {
+    let fixture_root = fixture
+        .owner_path()
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let repo = fixture.path();
+    let mut command = common::broker_cli_for_fixture(CLI, args, &fixture_root);
+    let host_state = common::fixture_host_state_dir(&fixture_root);
+    command
+        .current_dir(repo)
+        .env("AETHYME_BROKER_DB", repo.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", fixture.worktree_root())
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        )
+        .env_remove("AETHYME_WORKTREE_ROOT");
+    command
 }
 
 fn fixture_worktree_registry_paths(host_state: &Path) -> Vec<PathBuf> {
@@ -296,10 +319,12 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
 }
 
 #[test]
-fn fixture_command_binds_captured_storage_context() {
+fn fixture_command_sets_complete_initial_options_for_fresh_unbound_store() {
     let fixture = fixture();
+    let broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    drop(broker);
     let fixture_root = fixture.owner_path().canonicalize().unwrap();
-    let command = isolation::command(CLI, fixture.path(), &[]);
+    let command = fresh_unbound_child(&fixture, &[]);
     let env = configured_env(&command);
 
     let value = |name: &str| {
@@ -316,6 +341,14 @@ fn fixture_command_binds_captured_storage_context() {
         fixture_root.join("host-cache").as_os_str()
     );
     assert_eq!(
+        value("AETHYME_PREPARATION_CACHE_ROOT"),
+        fixture_root.join("preparation-cache").as_os_str()
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_DB"),
+        fixture.path().join(".aethyme/broker.db").as_os_str()
+    );
+    assert_eq!(
         value("AETHYME_BROKER_OPEN_HOST_OPERATION_DB"),
         fixture_root
             .join("host-state/host-operations.db")
@@ -329,18 +362,24 @@ fn fixture_command_binds_captured_storage_context() {
         value("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT"),
         OsStr::new("true")
     );
+    assert_eq!(
+        env.get(OsStr::new("AETHYME_BROKER_STORAGE_CONTEXT_V1")),
+        Some(&None),
+        "an unbound fresh store uses explicit initial options, not V4 export"
+    );
+    assert_eq!(
+        value("AETHYME_BROKER_OPEN_WORKTREE_ROOT"),
+        fixture.worktree_root().as_os_str()
+    );
+    assert_eq!(
+        env.get(OsStr::new("AETHYME_WORKTREE_ROOT")),
+        Some(&None),
+        "the exact fixture root is not sent as a container override"
+    );
     assert!(
-        env.get(OsStr::new("AETHYME_BROKER_STORAGE_CONTEXT_V1"))
-            .and_then(Option::as_ref)
-            .is_some_and(|value| value != OsStr::new("poisoned-envelope"))
+        !fixture.worktree_root().exists(),
+        "exporting initial options must leave a fresh root unbound"
     );
-    let captured_root = PathBuf::from(
-        env.get(OsStr::new("AETHYME_BROKER_OPEN_WORKTREE_ROOT"))
-            .and_then(Option::as_deref)
-            .expect("fixture child exact worktree root"),
-    );
-    let expected_root = fixture.worktree_root();
-    assert_eq!(captured_root, expected_root);
     assert!(
         env.get(OsStr::new("AETHYME_GATE_BROKER_DATABASES"))
             .is_some_and(Option::is_none)
@@ -359,13 +398,15 @@ fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
         let owned_cache = common::fixture_preparation_cache_root(repo.owner_path())
             .canonicalize()
             .unwrap();
-        let mut child_context = Command::new("not-executed");
-        broker
-            .configure_storage_context_for_child(&mut child_context)
-            .unwrap();
+        let child_context = fresh_unbound_child(&repo, &[]);
         assert_eq!(
             configured_env(&child_context).get(OsStr::new("AETHYME_PREPARATION_CACHE_ROOT")),
             Some(&Some(owned_cache.clone().into_os_string()))
+        );
+        assert_eq!(
+            configured_env(&child_context).get(OsStr::new("AETHYME_BROKER_STORAGE_CONTEXT_V1")),
+            Some(&None),
+            "the fresh store stays unbound until the real library start"
         );
         let session = broker.start_worktree("library fixture", None).unwrap();
         let owned_root = owned_root_path.canonicalize().unwrap();
