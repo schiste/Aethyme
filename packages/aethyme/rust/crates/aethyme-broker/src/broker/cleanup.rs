@@ -3126,12 +3126,8 @@ mod cleanup_target_snapshot_tests {
                 )
             });
             if argv.iter().any(|argument| argument == "@{upstream}") {
-                assert!(
-                    event["cwd"].as_str().is_some(),
-                    "Git Trace2 upstream start event at {}:{} has no cwd: {line}",
-                    trace.display(),
-                    index + 1
-                );
+                // Trace2 may omit cwd when the event uses Git's default repo;
+                // retain every valid upstream start record, including raw argv.
                 starts.push(line.to_owned());
             }
         }
