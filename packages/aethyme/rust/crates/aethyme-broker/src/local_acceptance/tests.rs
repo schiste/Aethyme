@@ -1621,16 +1621,34 @@ fn historical_completion_roots_survive_revision_release_and_gc() {
         last_receipt(&v.f.store, binding.id()).unwrap().unwrap().id,
         receipt.id
     );
-    let (generation_column, evidence_body): (i64, Vec<u8>) = v
-        .f
-        .store
-        .read_connection()
-        .query_row(
-            "SELECT generation,body FROM local_verification_evidence WHERE id=(SELECT evidence FROM local_acceptance_qualifications WHERE id=?1)",
-            [&historical.qualification],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
+    let qualification_body: Vec<u8> =
+        v.f.store
+            .read_connection()
+            .query_row(
+                "SELECT body FROM local_acceptance_qualifications WHERE id=?1",
+                [&historical.qualification],
+                |row| row.get(0),
+            )
+            .unwrap();
+    let qualification_json: serde_json::Value =
+        serde_json::from_slice(&qualification_body).unwrap();
+    let evidence_id = qualification_json["spec"]["evidence"]
+        .as_str()
+        .expect("the qualification stores the exact verifier evidence reference");
+    assert_eq!(
+        evidence_id,
+        evidence.reference().id.as_str(),
+        "the historical qualification names the trusted evidence used to grant it"
+    );
+    let (generation_column, evidence_body): (i64, Vec<u8>) =
+        v.f.store
+            .read_connection()
+            .query_row(
+                "SELECT generation,body FROM local_verification_evidence WHERE id=?1",
+                [evidence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
     let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
     let body_generation = evidence_json["observation"]["generation"]
         .as_str()
