@@ -2507,7 +2507,7 @@ mod tests {
                 .roots()
                 .iter()
                 .map(ManagedStorageRootInventoryReceipt::allocated_bytes)
-                .sum()
+                .sum::<u64>()
         );
         assert_eq!(
             receipt.entry_count(),
@@ -2515,7 +2515,7 @@ mod tests {
                 .roots()
                 .iter()
                 .map(ManagedStorageRootInventoryReceipt::entry_count)
-                .sum()
+                .sum::<usize>()
         );
         assert_eq!(receipt.inventory_digest().len(), 64);
         owner.finish().unwrap();
@@ -2576,6 +2576,8 @@ mod tests {
             .unwrap();
         }
         let binding = capture_root_set(&fixture, &[MATERIALIZATION]);
+        let repository_root = fixture.repository_root.clone();
+        let materialization_root = fixture.materialization_root.clone();
         let mut owner = fixture.root_set_owner(&binding).unwrap();
         let mut scan = owner.begin_root_set_inventory_scan(&binding).unwrap();
         assert!(matches!(
@@ -2583,10 +2585,10 @@ mod tests {
             ManagedStorageRootSetInventoryPoll::Pending
         ));
 
-        let moved = fixture.repository_root.join("bbbbbbbbbbbb-moved");
-        std::fs::rename(&fixture.materialization_root, &moved).unwrap();
-        std::fs::create_dir(&fixture.materialization_root).unwrap();
-        std::fs::write(fixture.materialization_root.join("replacement"), b"new").unwrap();
+        let moved = repository_root.join("bbbbbbbbbbbb-moved");
+        std::fs::rename(&materialization_root, &moved).unwrap();
+        std::fs::create_dir(&materialization_root).unwrap();
+        std::fs::write(materialization_root.join("replacement"), b"new").unwrap();
 
         let error = loop {
             match owner.poll_root_set_inventory_scan(&mut scan, 1) {
