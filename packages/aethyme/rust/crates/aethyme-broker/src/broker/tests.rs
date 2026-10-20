@@ -1066,7 +1066,7 @@ fn doctor_report(
         missing_worktrees: Vec::new(),
         orphaned_pidfiles: Vec::new(),
         purged_stale_leases: 0,
-        retention: crate::GcHealth {
+        retention: Some(crate::GcHealth {
             deferred_checks: Vec::new(),
             closed_worktrees: Default::default(),
             unclaimed_worktree_count: 0,
@@ -1094,7 +1094,8 @@ fn doctor_report(
             artifact_worktrees_not_scanned: 0,
             sizes_measured_at_ms: None,
             blockers: 0,
-        },
+        }),
+        retention_unavailable_reason: None,
         integration_movement: None,
         unpushed_work: Default::default(),
         recent_command_failures: Vec::new(),

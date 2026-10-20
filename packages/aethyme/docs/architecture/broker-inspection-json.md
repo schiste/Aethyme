@@ -1,6 +1,6 @@
 # Bounded broker inspection JSON
 
-Last Updated: 2026-10-08
+Last Updated: 2026-10-20
 
 The broker bounds interactive status, health and worktree reports so a large
 session inventory cannot stall an agent indefinitely. When a report omits work,
@@ -21,6 +21,17 @@ Routine `broker status --summary --json` uses recorded observations. Its
 `broker status doctor --json` exposes `deferred_checks` and `budget_cut`.
 A nonempty list means the health report is incomplete and `healthy` is false;
 fields from skipped checks remain unknown.
+
+The `retention` field is `null` when root-dependent retention inventory was
+not run, and `retention_unavailable_reason` explains why. This occurs for an
+unbound, reserved, or recovery-required worktree root. A null retention field
+is unknown, never an empty inventory or zero-byte result, and makes `healthy`
+false. The separate `integrity` field still reports the broker database
+check. `certify` keeps `certify.broker-db` tied to that integrity result and
+warns when retention is unavailable only because a fresh or legacy root is
+unbound. It fails certification for reserved or recovery-required bindings.
+Bound-root inspection failures and malformed binding rows remain errors; they
+are not converted into an unavailable-health report.
 
 ## Worktree inventory
 

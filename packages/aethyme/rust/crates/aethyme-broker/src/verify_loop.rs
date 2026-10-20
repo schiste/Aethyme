@@ -137,6 +137,8 @@ impl Broker {
                 };
                 let detail = if report.healthy() {
                     "doctor healthy".to_string()
+                } else if let Some(reason) = report.retention_unavailable_reason.as_deref() {
+                    format!("doctor retention health unavailable: {reason}")
                 } else {
                     format!("doctor found problems: {}", report.version.status.as_str())
                 };

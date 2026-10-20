@@ -811,6 +811,14 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
     // empty repository. It must not be silently interpreted as no orphans.
     let uninitialized = broker.doctor().unwrap();
     assert!(!uninitialized.healthy(), "{uninitialized:#?}");
+    assert!(uninitialized.retention.is_none(), "{uninitialized:#?}");
+    assert!(
+        uninitialized
+            .retention_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("fresh worktree root is unbound")),
+        "{uninitialized:#?}"
+    );
     assert!(
         uninitialized
             .deferred_checks
@@ -824,6 +832,8 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
         .unwrap();
     let report = broker.doctor().unwrap();
     assert_eq!(report.integrity, "ok");
+    assert!(report.retention.is_some(), "{report:#?}");
+    assert!(report.retention_unavailable_reason.is_none(), "{report:#?}");
     assert_eq!(report.version.status, VersionDriftStatus::NotAethymeSource);
     assert!(report.healthy(), "{report:#?}");
 
