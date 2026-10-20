@@ -848,11 +848,11 @@ fn same_regular_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata
     if !left.is_file()
         || !right.is_file()
         || left.len() != right.len()
-        || !left
+        || left
             .modified()
             .ok()
             .zip(right.modified().ok())
-            .is_some_and(|(left, right)| left == right)
+            .is_none_or(|(left, right)| left != right)
     {
         return false;
     }

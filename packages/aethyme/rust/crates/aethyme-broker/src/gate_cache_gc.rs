@@ -337,12 +337,14 @@ pub(crate) fn inspect(
     let (inventory, candidates, complete) = inspect_with_expiration(
         main_root,
         location,
-        rule,
-        evaluated_at,
-        scan,
-        records,
+        InspectParameters {
+            rule,
+            evaluated_at,
+            scan,
+            records,
+            entry_budget: None,
+        },
         || false,
-        None,
     );
     debug_assert!(complete);
     (
@@ -367,29 +369,42 @@ pub(crate) fn inspect_until(
     inspect_with_expiration(
         main_root,
         location,
-        rule,
-        evaluated_at,
-        scan,
-        records,
+        InspectParameters {
+            rule,
+            evaluated_at,
+            scan,
+            records,
+            entry_budget: Some(HEALTH_GATE_CACHE_ENTRY_BUDGET),
+        },
         || Instant::now() >= deadline,
-        Some(HEALTH_GATE_CACHE_ENTRY_BUDGET),
     )
+}
+
+struct InspectParameters<'a> {
+    rule: KeepRule<'a>,
+    evaluated_at: i64,
+    scan: crate::SizeScan,
+    records: &'a mut crate::measurement::SizeRecords,
+    entry_budget: Option<usize>,
 }
 
 fn inspect_with_expiration(
     main_root: &Path,
     location: &GateCacheLocation,
-    rule: KeepRule<'_>,
-    evaluated_at: i64,
-    scan: crate::SizeScan,
-    records: &mut crate::measurement::SizeRecords,
+    parameters: InspectParameters<'_>,
     mut expired: impl FnMut() -> bool,
-    entry_budget: Option<usize>,
 ) -> (
     Option<GcGateCacheInventory>,
     Vec<GcGateCacheCandidate>,
     bool,
 ) {
+    let InspectParameters {
+        rule,
+        evaluated_at,
+        scan,
+        records,
+        entry_budget,
+    } = parameters;
     let KeepRule {
         budget_bytes,
         include_active,
