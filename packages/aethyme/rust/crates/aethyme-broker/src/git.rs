@@ -3096,6 +3096,15 @@ impl GitRepo {
             return Ok(Vec::new());
         }
         let other = side_commits(other)?;
+        // No commit can have an equivalent patch on an empty opposite side.
+        // In particular, a session directly ahead of integration needs no
+        // binary patch stream merely to establish this fact (#892).
+        if other.is_empty() {
+            return Ok(listed
+                .into_iter()
+                .map(|(commit, _)| (commit, false))
+                .collect());
+        }
         let with_parent = listed
             .iter()
             .chain(other.iter())
@@ -5645,7 +5654,13 @@ mod batched_commit_tests {
     use super::*;
 
     fn run(root: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        let out = command
             .args(args)
             .current_dir(root)
             .env("GIT_AUTHOR_NAME", "t")
@@ -5660,6 +5675,102 @@ mod batched_commit_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn empty_opposite_cherry_comparison_skips_patch_streams() {
+        const ROOT: &str = "AETHYME_EMPTY_OPPOSITE_TEST_ROOT";
+        const MODE: &str = "AETHYME_EMPTY_OPPOSITE_TEST_MODE";
+        const TEST: &str =
+            "git::batched_commit_tests::empty_opposite_cherry_comparison_skips_patch_streams";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let repo = GitRepo { root: root.clone() };
+            let edit = run(&root, &["rev-parse", "main~1"]);
+            let empty = run(&root, &["rev-parse", "main"]);
+            if std::env::var(MODE).unwrap() == "ancestry" {
+                let expected = vec![(empty, false), (edit, false)];
+                assert_eq!(
+                    repo.cherry_marked("base", "main", CherrySide::Right)
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    repo.cherry_marked("main", "base", CherrySide::Left)
+                        .unwrap(),
+                    expected
+                );
+                assert!(
+                    repo.cherry_marked("base", "main", CherrySide::Left)
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                let copied = run(&root, &["rev-parse", "copied"]);
+                assert_eq!(
+                    repo.cherry_marked("main", "copied", CherrySide::Right)
+                        .unwrap(),
+                    vec![(copied, true)]
+                );
+            }
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("payload.bin"), [0_u8, 1, 2]).unwrap();
+        run(root, &["add", "payload.bin"]);
+        run(root, &["commit", "-qm", "base"]);
+        run(root, &["branch", "base"]);
+        std::fs::write(root.join("payload.bin"), [0_u8, 2, 3]).unwrap();
+        run(root, &["commit", "-qam", "binary edit"]);
+        run(root, &["commit", "--allow-empty", "-qm", "empty"]);
+        run(root, &["switch", "-q", "-c", "copied", "base"]);
+        run(root, &["cherry-pick", "-x", "main~1"]);
+
+        for mode in ["ancestry", "divergent"] {
+            let trace = root.join(format!("{mode}-trace.json"));
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", TEST, "--nocapture"]);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("GIT_") {
+                    child.env_remove(key);
+                }
+            }
+            let output = child
+                .env(ROOT, root)
+                .env(MODE, mode)
+                .env("GIT_TRACE2_EVENT", &trace)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let events = std::fs::read_to_string(trace).unwrap();
+            let mut saw_rev_list = false;
+            let mut saw_patch_stream = false;
+            for line in events.lines() {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                if event["event"] != "start" {
+                    continue;
+                }
+                let Some(argv) = event["argv"].as_array() else {
+                    continue;
+                };
+                saw_rev_list |= argv.iter().any(|arg| arg == "rev-list");
+                saw_patch_stream |= argv.iter().any(|arg| arg == "patch-id" || arg == "log");
+            }
+            assert!(saw_rev_list, "positive trace witness missing for {mode}");
+            assert_eq!(
+                saw_patch_stream,
+                mode == "divergent",
+                "patch stream for {mode}"
+            );
+        }
     }
 
     #[test]
