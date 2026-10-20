@@ -139,13 +139,19 @@ fn run_as_is(repo: &Path, container: &Path, args: &[&str]) -> Output {
     run_from_fixture(repo, repo, container, args)
 }
 
-fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Output {
+fn command_from_fixture(
+    owner: &Path,
+    cwd: &Path,
+    container: &Path,
+    args: &[&str],
+) -> Command {
     let owner = owner.canonicalize().expect("canonicalize fixture owner");
     let cwd = cwd.canonicalize().expect("canonicalize fixture working tree");
     let container = container
         .canonicalize()
         .expect("canonicalize fixture worktree root");
-    common::broker_cli(CLI, args)
+    let mut command = common::broker_cli(CLI, args);
+    command
         .current_dir(cwd)
         .env("AETHYME_WORKTREE_ROOT", &container)
         .env(
@@ -155,7 +161,12 @@ fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -
         .env(
             "AETHYME_HOST_CACHE_DIR",
             owner.join(".git/aethyme-test-cache"),
-        )
+        );
+    command
+}
+
+fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Output {
+    command_from_fixture(owner, cwd, container, args)
         .output()
         .unwrap()
 }
@@ -574,14 +585,12 @@ fn a_reviewed_worktree_that_became_active_is_skipped() {
     let digest = plan["digest"].as_str().unwrap().to_string();
     assert!(worktree.join("rust/target").exists());
 
-    let adopted = common::broker_cli(
-        CLI,
+    let adopted = run_from_fixture(
+        repo.path(),
+        &worktree,
+        container.path(),
         &["start", "--adopt", "--task", "resume work", "--json"],
-    )
-    .current_dir(&worktree)
-    .env("AETHYME_WORKTREE_ROOT", container.path())
-    .output()
-    .unwrap();
+    );
     assert!(
         adopted.status.success(),
         "adopt: {}",
@@ -2145,12 +2154,15 @@ fn gc_sweep_reports_the_pressure_scaled_budget_when_disk_is_low() {
     assert_eq!(routine["budget_ms"], 5000, "{routine}");
     assert_eq!(routine["disk_pressured"], false, "{routine}");
 
-    let output = common::broker_cli(CLI, &["gc", "sweep", "--json"])
-        .current_dir(repo.path())
-        .env("AETHYME_WORKTREE_ROOT", container.path())
-        .env("AETHYME_TEST_AVAILABLE_BYTES", "1024")
-        .output()
-        .unwrap();
+    let output = command_from_fixture(
+        repo.path(),
+        repo.path(),
+        container.path(),
+        &["gc", "sweep", "--json"],
+    )
+    .env("AETHYME_TEST_AVAILABLE_BYTES", "1024")
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
