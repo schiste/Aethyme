@@ -38,7 +38,7 @@ Paths in this section are relative to
 |---|---|---|
 | Enrollment, start, leases, submit, finish, hooks, JSON and exit codes | **Changed** since slice E | Legacy fixtures remain in `tests/json_shape_snapshots.rs`, `tests/finish_cli.rs`, `tests/merge_e2e.rs` and CLI help snapshots. A current gate-policy refusal under `--json` returned `aethyme.broker-error/v1` with code 3, unlike slice E’s historical empty stdout. Slice E is not a current universal error/exit contract. |
 | Submit and composition | **Changed** | `collaboration_submit::submit` keeps capture-off on the legacy route and binds required capture to `submit_expecting_head`; `collaboration_submit::require_capture_for_promotion` fences uncaptured heads. `composition.rs` and `composer.rs` now define a typed candidate and composer. Their existence does not prove the ordinary submit route uses multi-contribution composition. |
-| Policy trust | **Confirmed**, scoped | `merge::require_trusted_policy_at_commit` and `gate_trust::policy_at_commit` retain base-pinned policy and human trust. `gate_trust_cli` covers a new clone and a subsequently landed policy change. |
+| Policy trust | **Confirmed**, scoped | `merge::require_trusted_policy_at_commit` and `broker::gate_trust::policy_at_commit` retain base-pinned policy and human trust. `gate_trust_cli` covers a new clone and a subsequently landed policy change. |
 | Gate invocation and evidence | **Changed**, scoped | Ordinary gates still use `gates::run_gate_command` / `spawn_gate_command`. The separate `execution_supervisor::DockerExecutor` is not evidence that ordinary gates run there. `gate_profile::ExecutionProfile::capture` now feeds profile-bound cache lookup. Test `execution_profile_cache_requires_definition_and_profile_and_names_its_source_run` covers definition/profile/source-run binding. |
 | Collaboration state and retention | **Changed** | `collaboration_state::CollaborationRoot::resolve` and `CollaborationStore::open` use a private marked root and separate `state.db` (schema 30). `collaboration_gc::plan/apply/resume` intentionally reclaim there under their own ownership rules. The old statement that no collaboration code exists is historical. |
 | Legacy cleanup reach | **Confirmed only within recorded scope** | `tests/collaboration_state_cleanup.rs` exercises legacy deleters with retained collaboration bytes present, including inline sweep, GC, storage and finish paths. This is stronger than the original unactioned T35 proposal; it is not an execution of every old released binary against current state. |
@@ -84,12 +84,13 @@ and their Local owners. Emitted-edge status feeds #213. None is a new guarantee.
 
 ## Current reuse map for downstream Local work
 
-These are implemented seams to inspect, not claims that every operational path is
-wired or qualified. All broker modules are in the source directory linked above.
+These are **changed** reuse seams since the original baseline, not claims that
+every operational path is wired or qualified. The X1–X4 row explicitly retains
+unverified capabilities. All broker modules are in the source directory linked above.
 
 | Package | Current reuse seam | Remaining boundary |
 |---|---|---|
-| L1 identity / records / brief / analysis (#652–#655) | Collaboration identity/record contracts and `collaboration_identity_store`; existing graph contracts | Preserve identity wire formats and exact-source binding; no assumed FileId or graph producer provenance. |
+| L1 identity / records / brief / analysis (#652–#655) | `aethyme-contracts/src/experimental_v0` identity, record, brief and analysis contracts; `collaboration_identity_store`; existing graph contracts | Preserve identity wire formats and exact-source binding; no assumed FileId or graph producer provenance. |
 | L2 state / archive / capture / GC / opt-in (#656–#660) | `collaboration_state`, `collaboration_archive`, `collaboration_capture`, `collaboration_gc`, `collaboration_submit` | Separate state ownership, retention and old-client fences must stay enforced; no global mixed-client claim. |
 | L3 context / invalidation (#661–#662) | `collaboration_context` and its revision cache | Fresh/private views and exact subjects remain distinct from a shared indexed HEAD. |
 | L4 candidate / composer / resolution (#663–#665) | `composition`, `composer`, `resolution`, typed verification candidate | A composer profile's bounded evidence does not qualify every submit/gate integration or structural case. |
