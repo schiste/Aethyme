@@ -35,6 +35,18 @@ pub(super) fn open_in_repo(
     unix::open_in_repo(repo_root, requested_db_path)
 }
 
+#[cfg(unix)]
+pub(super) fn verify_legacy_database_file_for_binding(path: &Path) -> Result<(), BrokerError> {
+    unix::verify_legacy_database_file_for_binding(path)
+}
+
+#[cfg(not(unix))]
+pub(super) fn verify_legacy_database_file_for_binding(_path: &Path) -> Result<(), BrokerError> {
+    Err(BrokerError::InvalidRepositoryWorktreeBinding(
+        "legacy repository binding writes require Unix no-follow file checks".to_owned(),
+    ))
+}
+
 /// Serialize root reservation/publication with the fresh-database bootstrap
 /// protocol. The caller holds the returned file for the whole state change.
 #[cfg(unix)]
@@ -583,6 +595,66 @@ mod unix {
         verify_parent(paths)
     }
 
+    pub(super) fn verify_legacy_database_file_for_binding(path: &Path) -> Result<(), BrokerError> {
+        let (file, identity) = open_legacy_regular(path, 1, "legacy repository database")?;
+        drop(file);
+        verify_named_legacy_file(path, identity, 1, "legacy repository database")?;
+        Ok(())
+    }
+
+    fn checked_legacy_file(
+        metadata: &Metadata,
+        expected_links: u64,
+        label: &str,
+    ) -> Result<FileIdentity, BrokerError> {
+        if !metadata.is_file()
+            || metadata.uid() != effective_uid()
+            || metadata.mode() & 0o022 != 0
+            || metadata.nlink() != expected_links
+        {
+            return Err(refusal(format!(
+                "{label} must be an owned, non-group/world-writable regular file with {expected_links} link(s)"
+            )));
+        }
+        Ok(file_identity(metadata))
+    }
+
+    fn verify_named_legacy_file(
+        path: &Path,
+        expected: FileIdentity,
+        expected_links: u64,
+        label: &str,
+    ) -> Result<Metadata, BrokerError> {
+        let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+        let actual = checked_legacy_file(&metadata, expected_links, label)?;
+        if actual != expected {
+            return Err(refusal(format!("{label} identity changed")));
+        }
+        Ok(metadata)
+    }
+
+    fn open_legacy_regular(
+        path: &Path,
+        expected_links: u64,
+        label: &str,
+    ) -> Result<(File, FileIdentity), BrokerError> {
+        let before = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+        let expected = checked_legacy_file(&before, expected_links, label)?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        let file = options
+            .open(path)
+            .map_err(|source| io_error(path, source))?;
+        let opened = file.metadata().map_err(|source| io_error(path, source))?;
+        if checked_legacy_file(&opened, expected_links, label)? != expected {
+            return Err(refusal(format!("{label} changed while opening")));
+        }
+        verify_named_legacy_file(path, expected, expected_links, label)?;
+        Ok((file, expected))
+    }
+
     fn checked_private_file(
         metadata: &Metadata,
         expected_links: u64,
@@ -796,6 +868,7 @@ mod unix {
         PublishedStageLink { expected_links: u64 },
         PublishedUnbound { expected_links: u64 },
         PublishedIdentityOnly { expected_links: u64 },
+        PublishedLegacyBound { expected_links: u64 },
     }
 
     struct VerifiedDatabase {
@@ -810,32 +883,40 @@ mod unix {
         proof: DatabaseProof,
     ) -> Result<VerifiedDatabase, BrokerError> {
         verify_parent(paths)?;
-        let (expected_links, is_stage, integrity, cap, existing_sidecars) = match proof {
-            DatabaseProof::UnpublishedStage => (1, true, true, true, false),
-            DatabaseProof::PublishedStageLink { expected_links } => {
-                (expected_links, true, true, true, false)
-            }
-            DatabaseProof::PublishedUnbound { expected_links } => {
-                let stage_linked = expected_links == 2;
-                (
-                    expected_links,
-                    stage_linked,
-                    true,
-                    stage_linked,
-                    !stage_linked,
-                )
-            }
-            DatabaseProof::PublishedIdentityOnly { expected_links } => {
-                (expected_links, false, false, false, true)
-            }
-        };
+        let (expected_links, is_stage, integrity, cap, existing_sidecars, legacy_bound) =
+            match proof {
+                DatabaseProof::UnpublishedStage => (1, true, true, true, false, false),
+                DatabaseProof::PublishedStageLink { expected_links } => {
+                    (expected_links, true, true, true, false, false)
+                }
+                DatabaseProof::PublishedUnbound { expected_links } => {
+                    let stage_linked = expected_links == 2;
+                    (
+                        expected_links,
+                        stage_linked,
+                        true,
+                        stage_linked,
+                        !stage_linked,
+                        false,
+                    )
+                }
+                DatabaseProof::PublishedIdentityOnly { expected_links } => {
+                    (expected_links, false, false, false, true, false)
+                }
+                DatabaseProof::PublishedLegacyBound { expected_links } => {
+                    (expected_links, false, false, false, true, true)
+                }
+            };
         if existing_sidecars {
             check_existing_sidecars(paths, db_path)?;
         } else if is_stage {
             check_sidecars(db_path, false)?;
         }
-        let (file, inode) =
-            open_private_regular(db_path, expected_links, "fresh repository database")?;
+        let (file, inode) = if legacy_bound {
+            open_legacy_regular(db_path, expected_links, "legacy repository database")?
+        } else {
+            open_private_regular(db_path, expected_links, "fresh repository database")?
+        };
         let before = file
             .metadata()
             .map_err(|source| io_error(db_path, source))?;
@@ -880,6 +961,24 @@ mod unix {
         let binding = store.repository_worktree_binding()?;
         let identity = validate_binding_identity(&binding, base)?;
         match proof {
+            DatabaseProof::PublishedLegacyBound { .. }
+                if identity.origin != RepositoryWorktreeBindingOrigin::Legacy =>
+            {
+                return Err(refusal(
+                    "legacy database proof does not match the persisted repository origin",
+                ));
+            }
+            DatabaseProof::PublishedIdentityOnly { .. }
+            | DatabaseProof::PublishedStageLink { .. }
+                if identity.origin != RepositoryWorktreeBindingOrigin::Fresh =>
+            {
+                return Err(refusal(
+                    "fresh database proof does not match the persisted repository origin",
+                ));
+            }
+            _ => {}
+        }
+        match proof {
             DatabaseProof::UnpublishedStage
                 if binding.state != RepositoryWorktreeBindingState::FreshUnbound =>
             {
@@ -905,7 +1004,11 @@ mod unix {
         let after = file
             .metadata()
             .map_err(|source| io_error(db_path, source))?;
-        let named = verify_named_file(db_path, inode, expected_links, "fresh repository database")?;
+        let named = if legacy_bound {
+            verify_named_legacy_file(db_path, inode, expected_links, "legacy repository database")?
+        } else {
+            verify_named_file(db_path, inode, expected_links, "fresh repository database")?
+        };
         if before.len() != after.len() || after.len() != named.len() {
             return Err(refusal(
                 "fresh database size changed during read-only verification",
@@ -1138,15 +1241,23 @@ mod unix {
                         "nonlegacy repository binding exists below compatibility floor 53",
                     ));
                 }
-                let proof = if binding.state == RepositoryWorktreeBindingState::FreshUnbound {
-                    DatabaseProof::PublishedUnbound { expected_links: 1 }
-                } else {
-                    DatabaseProof::PublishedIdentityOnly { expected_links: 1 }
+                let proof = match identity.origin {
+                    RepositoryWorktreeBindingOrigin::Fresh
+                        if binding.state == RepositoryWorktreeBindingState::FreshUnbound =>
+                    {
+                        DatabaseProof::PublishedUnbound { expected_links: 1 }
+                    }
+                    RepositoryWorktreeBindingOrigin::Fresh => {
+                        DatabaseProof::PublishedIdentityOnly { expected_links: 1 }
+                    }
+                    RepositoryWorktreeBindingOrigin::Legacy => {
+                        DatabaseProof::PublishedLegacyBound { expected_links: 1 }
+                    }
                 };
                 let verified = verify_database(paths, &paths.final_path, &base, proof)?;
                 if verified.identity != identity {
                     return Err(refusal(
-                        "fresh database identity changed between read-only checks",
+                        "repository database identity changed between read-only checks",
                     ));
                 }
                 check_existing_sidecars(paths, &paths.final_path)?;
@@ -1357,6 +1468,7 @@ mod unix {
         use crate::store::repository_binding::{
             LegacyRepositoryRootConfirmation, RepositoryWorktreeRootLayout,
         };
+        use std::os::unix::fs::PermissionsExt;
 
         fn init_repository(repo_root: &Path) {
             let output = std::process::Command::new("git")
@@ -1397,12 +1509,14 @@ mod unix {
             (paths, base, verified)
         }
 
-        fn bind_legacy_database(repo_root: &Path) -> (DbPaths, BrokerStore) {
+        fn prepare_legacy_database(
+            repo_root: &Path,
+        ) -> (DbPaths, BrokerStore, LegacyRepositoryRootConfirmation) {
             init_repository(repo_root);
             let requested_db_path = repo_root.join(".aethyme/broker.db");
             fs::create_dir_all(requested_db_path.parent().unwrap()).unwrap();
             let paths = prepare_paths(repo_root, &requested_db_path).unwrap();
-            let mut store = BrokerStore::open(&paths.final_path).unwrap();
+            let store = BrokerStore::open(&paths.final_path).unwrap();
             let base = capture_identity_base(repo_root, &paths.final_path).unwrap();
             let digest = "c3".repeat(32);
             let confirmation = LegacyRepositoryRootConfirmation {
@@ -1418,6 +1532,12 @@ mod unix {
                 parent_identity_json: r#"{"device":1,"inode":2}"#.to_owned(),
                 worktree_identity_json: r#"{"device":1,"inode":3}"#.to_owned(),
             };
+            (paths, store, confirmation)
+        }
+
+        fn bind_legacy_database(repo_root: &Path) -> (DbPaths, BrokerStore) {
+            let (paths, mut store, confirmation) = prepare_legacy_database(repo_root);
+            fs::set_permissions(&paths.final_path, fs::Permissions::from_mode(0o644)).unwrap();
             store
                 .bind_legacy_repository_worktree(&confirmation)
                 .unwrap();
@@ -1446,6 +1566,71 @@ mod unix {
                 Some(RepositoryWorktreeBindingOrigin::Legacy)
             );
             assert_eq!(binding.bootstrap_nonce, None);
+        }
+
+        #[test]
+        fn legacy_binding_refuses_group_world_writable_database_before_transition() {
+            let repo = tempfile::tempdir().unwrap();
+            let (paths, mut store, confirmation) = prepare_legacy_database(repo.path());
+            fs::set_permissions(&paths.final_path, fs::Permissions::from_mode(0o666)).unwrap();
+
+            let error = store
+                .bind_legacy_repository_worktree(&confirmation)
+                .expect_err("a writable legacy database must not become bound");
+            assert!(matches!(
+                error,
+                BrokerError::InvalidRepositoryWorktreeBinding(message)
+                    if message.contains("non-group/world-writable regular file")
+            ));
+            let binding = store.repository_worktree_binding().unwrap();
+            assert_eq!(binding.state, RepositoryWorktreeBindingState::LegacyUnbound);
+            assert_eq!(
+                binding.origin,
+                Some(RepositoryWorktreeBindingOrigin::Legacy)
+            );
+            assert_eq!(binding.repository_root, None);
+            assert_eq!(binding.bootstrap_nonce, None);
+        }
+
+        #[test]
+        fn bound_legacy_database_refuses_group_world_writable_mode_on_reopen() {
+            let repo = tempfile::tempdir().unwrap();
+            let (paths, store) = bind_legacy_database(repo.path());
+            drop(store);
+            fs::set_permissions(&paths.final_path, fs::Permissions::from_mode(0o666)).unwrap();
+
+            let error = match open_in_repo(repo.path(), &paths.logical_path) {
+                Ok(_) => panic!("a group/world-writable bound legacy database must refuse"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                BrokerError::InvalidRepositoryWorktreeBinding(message)
+                    if message.contains("non-group/world-writable regular file")
+            ));
+        }
+
+        #[test]
+        fn fresh_database_with_legacy_readable_mode_still_refuses() {
+            let repo = tempfile::tempdir().unwrap();
+            init_repository(repo.path());
+            let database = repo.path().join(".aethyme/broker.db");
+            let store = open_in_repo(repo.path(), &database).unwrap();
+            let binding = store.repository_worktree_binding().unwrap();
+            assert_eq!(binding.origin, Some(RepositoryWorktreeBindingOrigin::Fresh));
+            assert_eq!(binding.state, RepositoryWorktreeBindingState::FreshUnbound);
+            drop(store);
+            fs::set_permissions(&database, fs::Permissions::from_mode(0o644)).unwrap();
+
+            let error = match open_in_repo(repo.path(), &database) {
+                Ok(_) => panic!("a Fresh database must retain its private-file requirement"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                BrokerError::InvalidRepositoryWorktreeBinding(message)
+                    if message.contains("owned private regular file")
+            ));
         }
 
         #[test]

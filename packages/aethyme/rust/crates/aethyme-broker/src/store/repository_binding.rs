@@ -429,6 +429,7 @@ impl BrokerStore {
             return Err(BrokerError::RepositoryWorktreeBindingConfirmationMismatch);
         }
         validate_legacy_binding(confirmation)?;
+        let database_path = self.path.clone();
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
             let current = read_repository_worktree_binding(tx)?;
@@ -445,6 +446,7 @@ impl BrokerStore {
                     "legacy-unbound row contains unexpected binding data".to_owned(),
                 ));
             }
+            super::fresh_database::verify_legacy_database_file_for_binding(&database_path)?;
             let changed = tx.execute(
                 "UPDATE repository_worktree_binding
                  SET state = 'bound', origin = 'legacy', path_encoding = ?1,
