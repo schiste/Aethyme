@@ -74,6 +74,17 @@ fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
+fn confirmed_absent_until(path: &Path, expired: &mut impl FnMut() -> bool) -> Option<bool> {
+    if expired() {
+        return None;
+    }
+    let absent = matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    (!expired()).then_some(absent)
+}
+
 fn cache_directory_status(
     metadata: std::io::Result<std::fs::Metadata>,
     fail_closed: bool,
@@ -545,6 +556,12 @@ fn inspect_with_expiration(
                     disposition,
                     reason,
                 });
+            }
+        }
+        Err(error) if entry_budget.is_some() && error.kind() == std::io::ErrorKind::NotFound => {
+            match confirmed_absent_until(&location.root, &mut expired) {
+                Some(true) => {}
+                _ => return (None, Vec::new(), false),
             }
         }
         Err(_) if entry_budget.is_some() => return (None, Vec::new(), false),
@@ -1021,6 +1038,32 @@ mod tests {
         assert!(!complete);
         assert!(inventory.is_none());
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn bounded_gate_cache_inventory_accepts_a_confirmed_absent_root() {
+        let fixture = fixture("rust-workspace-v3", 10);
+        std::fs::remove_dir_all(&fixture.location.root).unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        let (inventory, candidates, complete) = inspect_until(
+            &fixture.main_root,
+            &fixture.location,
+            KeepRule {
+                budget_bytes: 0,
+                include_active: false,
+                configured_keys: &std::collections::BTreeSet::new(),
+            },
+            crate::clock::epoch_ms(),
+            crate::SizeScan::Recorded,
+            &mut records,
+            Instant::now() + std::time::Duration::from_secs(1),
+        );
+
+        assert!(complete);
+        assert!(candidates.is_empty());
+        let inventory = inventory.expect("confirmed absence is a complete empty inventory");
+        assert!(inventory.entries.is_empty());
+        assert_eq!(inventory.total_bytes, 0);
     }
 
     #[test]
