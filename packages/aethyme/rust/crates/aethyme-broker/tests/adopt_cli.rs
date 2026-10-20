@@ -74,6 +74,8 @@ fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
         ],
     ));
     let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert!(value.get("scope_overlaps").is_none());
+    assert!(value["scope_overlaps_warning"].is_string());
     assert_eq!(value["start_base"]["ref_name"], "refs/heads/main");
     assert_eq!(value["start_base"]["evidence"], "conventional_main");
     assert_eq!(
@@ -1038,7 +1040,76 @@ fn json_adopt_records_declared_scope_that_collides_with_a_start() {
             "--json",
         ],
     ));
-    serde_json::from_str::<serde_json::Value>(&adopted).expect("adopt --json stays pure JSON");
+    let adopted: serde_json::Value =
+        serde_json::from_str(&adopted).expect("adopt --json stays pure JSON");
+    let session_id = adopted["session"]["id"].as_i64().unwrap();
+    let reported = adopted["scope_overlaps"].as_array().unwrap();
+    assert_eq!(reported.len(), 1, "{adopted}");
+    assert!(
+        reported[0]["session_a"] == session_id || reported[0]["session_b"] == session_id,
+        "{adopted}"
+    );
+    assert_eq!(overlaps(tmp.path()).len(), 1);
+}
+
+#[test]
+fn json_start_reports_only_overlaps_involving_the_new_session() {
+    let tmp = fixture();
+
+    let first = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "first",
+            "--claim",
+            "symbol:PaymentService=extend",
+            "--json",
+        ],
+    ));
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let first_id = first["session"]["id"].as_i64().unwrap();
+    assert_eq!(first["scope_overlaps"], serde_json::json!([]));
+
+    let second = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "second",
+            "--claim",
+            "symbol:PaymentService=extend",
+            "--json",
+        ],
+    ));
+    let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+    let second_id = second["session"]["id"].as_i64().unwrap();
+    let reported = second["scope_overlaps"].as_array().unwrap();
+    assert_eq!(reported.len(), 1, "{second}");
+    assert_eq!(reported[0]["value"], "PaymentService");
+    assert!(
+        (reported[0]["session_a"] == first_id && reported[0]["session_b"] == second_id)
+            || (reported[0]["session_a"] == second_id && reported[0]["session_b"] == first_id),
+        "{second}"
+    );
+
+    let third = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "third",
+            "--claim",
+            "symbol:SubscriptionService=extend",
+            "--json",
+        ],
+    ));
+    let third: serde_json::Value = serde_json::from_str(&third).unwrap();
+    assert_eq!(
+        third["scope_overlaps"],
+        serde_json::json!([]),
+        "the JSON response must exclude an overlap between older sessions"
+    );
     assert_eq!(overlaps(tmp.path()).len(), 1);
 }
 
