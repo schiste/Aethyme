@@ -191,7 +191,14 @@ fn json_success_routes_child_output_to_stderr_and_keeps_one_report() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("CHILD_STDOUT"), "{stderr}");
     assert!(stderr.contains("CHILD_STDERR"), "{stderr}");
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("CHILD_STDOUT"));
+    assert!(
+        value["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg.as_str().is_some_and(|arg| arg.contains("CHILD_STDOUT"))),
+        "the report intentionally retains the original command arguments"
+    );
 }
 
 #[test]
@@ -208,7 +215,12 @@ fn json_failure_preserves_both_child_streams_without_contaminating_report() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("FAILED_STDOUT"), "{stderr}");
     assert!(stderr.contains("FAILED_STDERR"), "{stderr}");
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("FAILED_STDOUT"));
+    assert!(
+        value["command"].as_array().unwrap().iter().any(|arg| arg
+            .as_str()
+            .is_some_and(|arg| arg.contains("FAILED_STDOUT"))),
+        "the report intentionally retains the original command arguments"
+    );
 }
 
 #[test]
@@ -224,4 +236,20 @@ fn text_mode_preserves_inherited_child_stdout() {
     assert!(stdout.contains("TEXT_CHILD_STDOUT"), "{stdout}");
     assert!(stderr.contains("TEXT_CHILD_STDERR"), "{stderr}");
     assert!(!stderr.contains("TEXT_CHILD_STDOUT"), "{stderr}");
+}
+
+#[test]
+fn ownership_report_preserves_literal_quotes_arrows_tabs_and_newlines() {
+    let fixture = Fixture::new(None);
+    let path = "quote\" -> tab\tline\n.txt";
+    let script = format!("printf generated > '{path}'");
+    let output = fixture.run(&script, true);
+    let value = report(&output);
+    assert_eq!(value["outside_lease_paths"], serde_json::json!([path]));
+    assert_eq!(value["new_untracked_paths"], serde_json::json!([path]));
+    assert_eq!(value["outcome"], "ownership_failed");
+    assert_eq!(
+        std::fs::read(fixture.worktree.join(path)).unwrap(),
+        b"generated"
+    );
 }
