@@ -21,6 +21,14 @@ pub(crate) fn load_graph_policy_at_commit(
     repository: &crate::GitRepo,
     commit: &str,
 ) -> Result<GraphIntegrityPolicy, crate::BrokerOpError> {
+    if let Some(reason) = crate::git::graph_verification_environment_refusal() {
+        return Err(crate::BrokerError::Io {
+            path: repository.root().to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason),
+        }
+        .into());
+    }
+    let _git_environment = crate::git::graph_verification_git_guard();
     match repository.file_at_commit(commit, GRAPH_CONFIG_RELPATH)? {
         Some(text) => Ok(GraphIntegrityPolicy::parse(&text)?),
         None => Ok(GraphIntegrityPolicy::default()),
@@ -169,6 +177,82 @@ impl serde::Serialize for GraphIntegrityOutcome {
 /// without modifying the session worktree or silently adding generated files
 /// to the patch being reviewed.
 pub(crate) fn verify_disposable_checkout(
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+) -> GraphIntegrityOutcome {
+    if let Some(reason) = crate::git::graph_verification_environment_refusal() {
+        return graph_error(String::new(), policy.digest(), None, reason.to_owned());
+    }
+    // This scope affects only synchronous Git commands started by this graph
+    // verifier. Earlier Git reads in callers such as native_gates remain
+    // outside this boundary.
+    let _git_environment = crate::git::graph_verification_git_guard();
+    if !policy.enforces_committed_fragments() {
+        return verify_generation_checkout(checkout, policy);
+    }
+    let tree = match checkout.working_tree_hash() {
+        Ok(tree) => tree,
+        Err(error) => return graph_error(String::new(), policy.digest(), None, error.to_string()),
+    };
+    let isolated = (|| -> Result<_, crate::BrokerOpError> {
+        let head = checkout.head_commit()?;
+        let commit = if checkout.commit_tree_id(&head)? == tree {
+            head
+        } else {
+            checkout.commit_tree(
+                &tree,
+                &[&head],
+                "chore(broker): snapshot exact graph verification source",
+                &crate::attribution::Attribution::broker_only(),
+            )?
+        };
+        // A linked verification slot still shares the canonical broker fence.
+        // Regenerate only in separately owned metadata, and keep its TempDir
+        // alive through all generation and comparison, including errors.
+        let temporary = tempfile::Builder::new()
+            .prefix("aethyme-graph-verification-")
+            .tempdir()
+            .map_err(|source| crate::BrokerError::Io {
+                path: std::env::temp_dir(),
+                source,
+            })?;
+        let (projected_bytes, projected_inodes) = checkout.graph_snapshot_inventory(&commit)?;
+        crate::verification::ensure_graph_snapshot_storage_available(
+            checkout.root(),
+            temporary.path(),
+            projected_bytes,
+            projected_inodes,
+        )
+        .map_err(|source| crate::BrokerError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+        let generated =
+            checkout.isolated_checkout_at(&temporary.path().join("repository"), &commit)?;
+        if generated.working_tree_hash()? != tree {
+            return Err(crate::BrokerError::Io {
+                path: generated.root().to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "isolated graph source does not match the exact verification tree",
+                ),
+            }
+            .into());
+        }
+        Ok((temporary, generated))
+    })();
+    match isolated {
+        Ok((_temporary, generated)) => verify_generation_checkout(&generated, policy),
+        Err(error) => graph_error(
+            tree,
+            policy.digest(),
+            None,
+            format!("cannot isolate exact graph verification source: {error}"),
+        ),
+    }
+}
+
+fn verify_generation_checkout(
     checkout: &crate::GitRepo,
     policy: &GraphIntegrityPolicy,
 ) -> GraphIntegrityOutcome {
@@ -363,6 +447,43 @@ pub(crate) fn verify_disposable_checkout(
     }
 }
 
+/// Check the exact destination's bounded copy estimate before creating a
+/// verification slot or materializing the commit there.
+fn preflight_graph_snapshot_slot(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+    commit: &str,
+    root_plan: &crate::WorktreeRootPlan,
+    namespace: &str,
+) -> Result<crate::verification::SlotPlacement, crate::BrokerOpError> {
+    let (projected_bytes, projected_inodes) = checkout.graph_snapshot_inventory(commit)?;
+    let placement = crate::verification::plan_graph_snapshot_slot_placement_with_worktree_root_plan(
+        main_root,
+        namespace,
+        root_plan,
+        projected_bytes,
+        projected_inodes,
+    );
+    if let Some(reason) = &placement.blocking_refusal {
+        return Err(crate::BrokerError::Io {
+            path: placement.directory.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason.clone()),
+        }
+        .into());
+    }
+    crate::verification::ensure_graph_snapshot_storage_available(
+        main_root,
+        &placement.directory,
+        projected_bytes,
+        projected_inodes,
+    )
+    .map_err(|source| crate::BrokerError::Io {
+        path: placement.directory.clone(),
+        source,
+    })?;
+    Ok(placement)
+}
+
 fn graph_error(
     tree_hash: String,
     policy_digest: String,
@@ -388,6 +509,15 @@ pub(crate) fn verify_checkout_without_mutation(
     checkout: &crate::GitRepo,
     policy: &GraphIntegrityPolicy,
 ) -> Result<GraphIntegrityOutcome, crate::BrokerOpError> {
+    if let Some(reason) = crate::git::graph_verification_environment_refusal() {
+        return Ok(graph_error(
+            String::new(),
+            policy.digest(),
+            None,
+            reason.to_owned(),
+        ));
+    }
+    let _git_environment = crate::git::graph_verification_git_guard();
     if !policy.enforces_committed_fragments() {
         return Ok(verify_disposable_checkout(checkout, policy));
     }
@@ -403,6 +533,15 @@ pub(crate) fn verify_checkout_without_mutation_with_worktree_root_plan(
     policy: &GraphIntegrityPolicy,
     root_plan: &crate::WorktreeRootPlan,
 ) -> Result<GraphIntegrityOutcome, crate::BrokerOpError> {
+    if let Some(reason) = crate::git::graph_verification_environment_refusal() {
+        return Ok(graph_error(
+            String::new(),
+            policy.digest(),
+            None,
+            reason.to_owned(),
+        ));
+    }
+    let _git_environment = crate::git::graph_verification_git_guard();
     if !policy.enforces_committed_fragments() {
         return Ok(verify_disposable_checkout(checkout, policy));
     }
@@ -414,10 +553,10 @@ pub(crate) fn verify_checkout_without_mutation_with_worktree_root_plan(
         "chore(broker): materialize exact graph-integrity verification tree",
         &crate::attribution::Attribution::broker_only(),
     )?;
-    let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_with_worktree_root_plan(
-        main_root,
-        "graph-integrity",
-        root_plan,
+    let placement =
+        preflight_graph_snapshot_slot(main_root, checkout, &commit, root_plan, "graph-integrity")?;
+    let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_at_planned_placement(
+        main_root, placement,
     )?;
     let disposable = slot.materialize(checkout, &commit)?;
     let outcome = verify_disposable_checkout(&disposable, policy);
@@ -452,6 +591,15 @@ pub(crate) fn verify_commit_for_advice(
     if !policy.enforces_committed_fragments() {
         return None;
     }
+    if let Some(reason) = crate::git::graph_verification_environment_refusal() {
+        return Some(graph_error(
+            String::new(),
+            policy.digest(),
+            None,
+            reason.to_owned(),
+        ));
+    }
+    let _git_environment = crate::git::graph_verification_git_guard();
     let root_plan = crate::verification::default_worktree_root_plan(main_root);
     Some(verify_commit_for_advice_with_policy_and_worktree_root_plan(
         main_root, checkout, commit, &root_plan, policy,
@@ -494,20 +642,34 @@ fn verify_commit_for_advice_with_policy_and_worktree_root_plan(
         graph_error(String::new(), policy_digest, None, reason)
     };
     let policy_digest = policy.digest();
-    if checkout
-        .resolve_ref(&format!("{commit}^{{commit}}"))
-        .is_none()
-    {
+    if let Some(reason) = crate::git::graph_verification_environment_refusal() {
+        return unknown(policy_digest, reason.to_owned());
+    }
+    let _git_environment = crate::git::graph_verification_git_guard();
+    let Some(commit_oid) = checkout.resolve_ref(commit) else {
         return unknown(
             policy_digest,
             format!("commit {commit} is not available locally; fetch it to verify its graph"),
         );
-    }
+    };
+    let placement = match preflight_graph_snapshot_slot(
+        main_root,
+        checkout,
+        &commit_oid,
+        root_plan,
+        "graph-integrity",
+    ) {
+        Ok(placement) => placement,
+        Err(error) => {
+            return unknown(
+                policy_digest,
+                format!("cannot preflight graph verification snapshot: {error}"),
+            );
+        }
+    };
     let mut slot =
-        match crate::verification::ExactTreeVerificationSlot::acquire_with_worktree_root_plan(
-            main_root,
-            "graph-integrity",
-            root_plan,
+        match crate::verification::ExactTreeVerificationSlot::acquire_at_planned_placement(
+            main_root, placement,
         ) {
             Ok(slot) => slot,
             Err(error) => {
@@ -517,13 +679,13 @@ fn verify_commit_for_advice_with_policy_and_worktree_root_plan(
                 );
             }
         };
-    let outcome = match slot.materialize(checkout, commit) {
+    let outcome = match slot.materialize(checkout, &commit_oid) {
         Ok(disposable) => verify_disposable_checkout(&disposable, &policy),
         Err(error) => graph_error(
             String::new(),
             policy_digest,
             None,
-            format!("cannot materialize commit {commit}: {error}"),
+            format!("cannot materialize commit {commit_oid}: {error}"),
         ),
     };
     slot.cleanup();
@@ -848,6 +1010,45 @@ mod tests {
         assert_eq!(outcome.verdict(), GraphIntegrityVerdict::Fresh);
         assert!(outcome.advice().is_none());
         assert!(outcome.changed_paths.is_empty());
+    }
+
+    #[test]
+    fn managed_linked_verification_preserves_the_original_checkout() {
+        let repo = graph_repo();
+        let checkout = crate::GitRepo::discover(repo.path()).unwrap();
+        let common = checkout.git_common_dir().unwrap();
+        aethyme_graph_storage::mark_broker_managed_graph(&common).unwrap();
+        let linked_owner = tempfile::tempdir().unwrap();
+        let linked_path = linked_owner.path().join("linked");
+        let head = checkout.head_commit().unwrap();
+        let linked = checkout.worktree_add_detached(&linked_path, &head).unwrap();
+        assert!(aethyme_graph_storage::ensure_isolated_graph_write(linked.root()).is_err());
+        let before_tree = linked.working_tree_hash().unwrap();
+        let before_fragment =
+            std::fs::read(linked.root().join(".aethyme/graph/src/lib.rs.bin")).unwrap();
+        let policy = GraphIntegrityPolicy::load(linked.root()).unwrap();
+        let fresh = verify_disposable_checkout(&linked, &policy);
+        assert_eq!(fresh.status, GraphIntegrityStatus::Passed, "{fresh:?}");
+        assert_eq!(fresh.tree_hash, before_tree);
+        std::fs::write(
+            linked.root().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 44 }\n",
+        )
+        .unwrap();
+        let dirty_tree = linked.working_tree_hash().unwrap();
+        let stale = verify_disposable_checkout(&linked, &policy);
+        assert_eq!(stale.status, GraphIntegrityStatus::Stale, "{stale:?}");
+        assert_eq!(stale.tree_hash, dirty_tree);
+        assert_eq!(linked.head_commit().unwrap(), head);
+        assert_eq!(linked.working_tree_hash().unwrap(), dirty_tree);
+        assert_eq!(
+            std::fs::read(linked.root().join(".aethyme/graph/src/lib.rs.bin")).unwrap(),
+            before_fragment
+        );
+        assert!(aethyme_graph_storage::ensure_isolated_graph_write(linked.root()).is_err());
+        checkout
+            .worktree_remove_registered(&linked_path, true)
+            .unwrap();
     }
 
     /// The pull-request lane checks a commit, not a worktree: a fresh head

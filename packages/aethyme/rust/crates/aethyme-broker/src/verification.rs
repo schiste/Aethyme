@@ -85,6 +85,47 @@ pub(crate) fn plan_slot_placement_with_worktree_root_plan(
     )
 }
 
+/// Choose a verification root using the expected exact-tree copy size as part
+/// of candidate admission. This preserves non-strict fallback to a later
+/// volume when an earlier candidate has the ordinary gate reserve but not
+/// enough room for this particular snapshot.
+pub(crate) fn plan_graph_snapshot_slot_placement_with_worktree_root_plan(
+    main_root: &Path,
+    namespace: &str,
+    root_plan: &crate::WorktreeRootPlan,
+    projected_bytes: u64,
+    projected_inodes: u64,
+) -> SlotPlacement {
+    if let Some(reason) = root_plan
+        .storage_context_refusal
+        .clone()
+        .or_else(|| root_plan_repository_refusal(main_root, root_plan))
+    {
+        return refused_slot_placement(main_root, namespace, reason);
+    }
+    let key = root_plan.repository_key.clone();
+    let candidates = crate::broker::lifecycle::worktree_root_candidates_for(root_plan);
+    let strict = matches!(
+        root_plan.preferred_source,
+        Some(
+            crate::WorktreeRootSource::EnvironmentOverride
+                | crate::WorktreeRootSource::LibraryOverride
+        )
+    );
+    plan_slot_placement_for_worktree_candidates_with(
+        main_root,
+        namespace,
+        &candidates,
+        &std::env::temp_dir(),
+        &key,
+        strict,
+        removable_volume_unavailable_reason,
+        |directory| {
+            graph_snapshot_capacity_refusal(main_root, directory, projected_bytes, projected_inodes)
+        },
+    )
+}
+
 fn root_plan_repository_refusal(
     main_root: &Path,
     root_plan: &crate::WorktreeRootPlan,
@@ -474,6 +515,16 @@ impl ExactTreeVerificationSlot {
         )
     }
 
+    /// Acquire the exact placement that the caller capacity-checked before
+    /// snapshot materialization. Replanning here could silently select a
+    /// different volume after that preflight.
+    pub(crate) fn acquire_at_planned_placement(
+        main_root: &Path,
+        placement: SlotPlacement,
+    ) -> Result<Self, BrokerOpError> {
+        Self::acquire_at(main_root, placement)
+    }
+
     /// One of `size` stable slots, so up to `size` verifications run at once.
     ///
     /// A single repository-wide slot made merge verification strictly serial:
@@ -747,7 +798,10 @@ fn cleanup_path_identity(path: &Path) -> Result<PathBuf, BrokerOpError> {
     })
 }
 
-fn ensure_slot_storage_available(main_root: &Path, path: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn ensure_slot_storage_available(
+    main_root: &Path,
+    path: &Path,
+) -> Result<(), std::io::Error> {
     if let Some(reason) = removable_volume_unavailable_reason(path) {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, reason));
     }
@@ -755,6 +809,71 @@ fn ensure_slot_storage_available(main_root: &Path, path: &Path) -> Result<(), st
         return Err(std::io::Error::new(std::io::ErrorKind::StorageFull, reason));
     }
     Ok(())
+}
+
+/// Admit the inventoried exact-tree copy as well as the recovery reserve.
+/// This is a conservative preflight, not a filesystem quota or a reservation
+/// against concurrent writers. Unknown byte capacity refuses the copy.
+pub(crate) fn ensure_graph_snapshot_storage_available(
+    main_root: &Path,
+    path: &Path,
+    projected_bytes: u64,
+    projected_inodes: u64,
+) -> Result<(), std::io::Error> {
+    ensure_slot_storage_available(main_root, path)?;
+    graph_snapshot_headroom(
+        crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
+        projected_bytes,
+        projected_inodes,
+    )
+}
+
+fn graph_snapshot_headroom(
+    available: Option<crate::disk_headroom::DiskHeadroom>,
+    projected_bytes: u64,
+    projected_inodes: u64,
+) -> Result<(), std::io::Error> {
+    let invalid = || std::io::Error::other("graph snapshot capacity estimate overflow");
+    // Allow for the worktree, independent Git objects and generation scratch.
+    // The bounded inventory is a separate limit; this multiplier does not
+    // promise to cap later generator output or concurrent filesystem use.
+    let required_bytes = projected_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(256 * 1024 * 1024))
+        .and_then(|bytes| bytes.checked_add(crate::DEFAULT_GATE_HEADROOM_BYTES))
+        .ok_or_else(invalid)?;
+    let required_inodes = projected_inodes
+        .checked_mul(3)
+        .and_then(|inodes| inodes.checked_add(1024))
+        .and_then(|inodes| inodes.checked_add(crate::disk_headroom::MIN_GATE_HEADROOM_INODES))
+        .ok_or_else(invalid)?;
+    let available = available.ok_or_else(|| {
+        std::io::Error::other("cannot measure destination capacity for graph snapshot")
+    })?;
+    if let Some(reason) = crate::disk_headroom::refusal_with_headroom(
+        Some(available.bytes),
+        available.inodes,
+        required_bytes,
+        required_inodes,
+    ) {
+        return Err(std::io::Error::new(std::io::ErrorKind::StorageFull, reason));
+    }
+    Ok(())
+}
+
+fn graph_snapshot_capacity_refusal(
+    main_root: &Path,
+    path: &Path,
+    projected_bytes: u64,
+    projected_inodes: u64,
+) -> Option<String> {
+    graph_snapshot_headroom(
+        crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
+        projected_bytes,
+        projected_inodes,
+    )
+    .err()
+    .map(|error| error.to_string())
 }
 
 impl Drop for ExactTreeVerificationSlot {
@@ -766,6 +885,101 @@ impl Drop for ExactTreeVerificationSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_snapshot_admission_includes_copy_and_recovery_headroom() {
+        let bytes = 1024 * 1024;
+        let inodes = 12;
+        let required_bytes = crate::DEFAULT_GATE_HEADROOM_BYTES + 256 * 1024 * 1024 + bytes * 3;
+        let required_inodes = crate::disk_headroom::MIN_GATE_HEADROOM_INODES + 1024 + inodes * 3;
+        let capacity = crate::disk_headroom::DiskHeadroom {
+            bytes: required_bytes,
+            inodes: Some(required_inodes),
+        };
+        assert!(graph_snapshot_headroom(Some(capacity), bytes, inodes).is_ok());
+        assert_eq!(
+            graph_snapshot_headroom(
+                Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: required_bytes - 1,
+                    ..capacity
+                }),
+                bytes,
+                inodes
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        assert_eq!(
+            graph_snapshot_headroom(
+                Some(crate::disk_headroom::DiskHeadroom {
+                    inodes: Some(required_inodes - 1),
+                    ..capacity
+                }),
+                bytes,
+                inodes
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        // Filesystems which do not count inodes still require byte capacity.
+        assert!(
+            graph_snapshot_headroom(
+                Some(crate::disk_headroom::DiskHeadroom {
+                    inodes: None,
+                    ..capacity
+                }),
+                bytes,
+                inodes
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn graph_snapshot_admission_refuses_unknown_capacity_and_overflow() {
+        assert!(
+            graph_snapshot_headroom(None, 1, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot measure")
+        );
+        let capacity = Some(crate::disk_headroom::DiskHeadroom {
+            bytes: u64::MAX,
+            inodes: Some(u64::MAX),
+        });
+        assert!(
+            graph_snapshot_headroom(capacity, u64::MAX, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        assert!(
+            graph_snapshot_headroom(capacity, 0, u64::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+    }
+
+    #[test]
+    fn graph_snapshot_slot_acquires_the_preflighted_placement_without_replanning() {
+        let fx = fixture();
+        let placement = SlotPlacement {
+            directory: fx.temp.join("preflighted-only").join("graph-integrity"),
+            inside_repository: false,
+            preferred: None,
+            refusals: Vec::new(),
+            blocking_refusal: None,
+        };
+        let expected = placement.directory.join("slot");
+        let slot =
+            ExactTreeVerificationSlot::acquire_at_planned_placement(&fx.main, placement).unwrap();
+        assert_eq!(slot.path, expected);
+        assert!(expected.parent().unwrap().join("slot.lock").is_file());
+        assert!(!fx.main.join(".aethyme/run/graph-integrity").exists());
+    }
 
     /// A checkout directory, and the two storage roots the placement consults.
     struct Fixture {
@@ -1106,6 +1320,56 @@ mod tests {
                 "a strict override must not fall back after {reason}"
             );
         }
+    }
+
+    #[test]
+    fn graph_snapshot_capacity_can_select_a_later_non_strict_root() {
+        let fx = fixture();
+        let first_root = fx._root.path().join("first-worktrees");
+        let second_root = fx._root.path().join("second-worktrees");
+        let candidates = vec![
+            (
+                first_root.clone(),
+                crate::WorktreeRootSource::RepositoryConfig,
+            ),
+            (second_root.clone(), crate::WorktreeRootSource::HostState),
+        ];
+
+        let placement = plan_slot_placement_for_worktree_candidates_with(
+            &fx.main,
+            "graph-integrity",
+            &candidates,
+            &fx.temp,
+            "repo-key",
+            false,
+            |_| None,
+            |directory| {
+                directory
+                    .starts_with(first_root.join(".aethyme/run/graph-integrity"))
+                    .then(|| "insufficient capacity for exact graph snapshot".into())
+            },
+        );
+
+        assert!(
+            placement
+                .directory
+                .starts_with(second_root.join(".aethyme/run/graph-integrity")),
+            "selected {} after refusing first root: {:?}",
+            placement.directory.display(),
+            placement.refusals
+        );
+        assert!(
+            placement
+                .refusals
+                .iter()
+                .any(|reason| reason.contains("insufficient capacity for exact graph snapshot")),
+            "the rejected candidate should be recorded: {:?}",
+            placement.refusals
+        );
+        assert!(
+            !placement.directory.exists(),
+            "planning must not create a slot"
+        );
     }
 
     #[test]

@@ -21,6 +21,10 @@ thread_local! {
     /// the general git timeout. Thread-local so one finish cannot shorten a
     /// concurrent operation running in another broker thread.
     static GIT_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// Ignore inherited Git environment and global/system configuration while
+    /// synchronously verifying an exact graph snapshot. Thread-local so
+    /// concurrent broker operations keep their ordinary Git behavior.
+    static GRAPH_VERIFICATION_GIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct RestoreGitDeadline(Option<Instant>);
@@ -79,6 +83,34 @@ pub(crate) fn limit_git_until(deadline: Instant) -> GitDeadlineGuard {
 
 pub(crate) fn active_git_deadline() -> Option<Instant> {
     GIT_DEADLINE.with(std::cell::Cell::get)
+}
+
+struct RestoreGraphVerificationGit(bool);
+
+impl Drop for RestoreGraphVerificationGit {
+    fn drop(&mut self) {
+        GRAPH_VERIFICATION_GIT.with(|enabled| enabled.set(self.0));
+    }
+}
+
+/// Suppress inherited Git environment and global/system configuration for
+/// synchronous graph verification, restoring any outer scope on drop. The
+/// source repository's local `.git/config` remains in effect.
+pub(crate) struct GraphVerificationGitGuard {
+    _restore: RestoreGraphVerificationGit,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(crate) fn graph_verification_git_guard() -> GraphVerificationGitGuard {
+    let previous = GRAPH_VERIFICATION_GIT.with(|enabled| enabled.replace(true));
+    GraphVerificationGitGuard {
+        _restore: RestoreGraphVerificationGit(previous),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+fn graph_verification_git_enabled() -> bool {
+    GRAPH_VERIFICATION_GIT.with(std::cell::Cell::get)
 }
 
 /// Lift the deadline for a mutation that runs inside a report. The deadline
@@ -366,7 +398,11 @@ pub fn git_output_trust() -> &'static GitOutputTrust {
 /// The probe already answers "which binary"; the cheap invariant is that no
 /// call site answers it again.
 pub(crate) fn git_command() -> Command {
-    Command::new(&git_program().program)
+    let mut command = Command::new(&git_program().program);
+    if graph_verification_git_enabled() {
+        configure_isolated_graph_git_command(&mut command);
+    }
+    command
 }
 
 fn resolve_git_program() -> GitProgram {
@@ -944,12 +980,185 @@ fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Refuse ambient routing/history overrides before graph verification can
+/// snapshot anything. Diagnostics deliberately contain no environment values.
+pub(crate) fn graph_verification_environment_refusal() -> Option<&'static str> {
+    std::env::vars_os()
+        .any(|(key, _)| unsafe_graph_git_environment_key(&key))
+        .then_some("graph verification refuses inherited GIT_* environment overrides")
+}
+
+fn unsafe_graph_git_environment_key(key: &std::ffi::OsStr) -> bool {
+    key.to_string_lossy()
+        .to_ascii_uppercase()
+        .starts_with("GIT_")
+}
+
+fn graph_snapshot_error(message: &str) -> GitError {
+    GitError::Spawn {
+        args: "isolate exact graph source".into(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+    }
+}
+
+fn graph_snapshot_object_format(commit: &str) -> Result<&'static str, GitError> {
+    match commit.len() {
+        40 if commit.bytes().all(|byte| byte.is_ascii_hexdigit()) => Ok("sha1"),
+        64 if commit.bytes().all(|byte| byte.is_ascii_hexdigit()) => Ok("sha256"),
+        _ => Err(graph_snapshot_error(
+            "graph snapshot requires an exact commit object ID",
+        )),
+    }
+}
+
+fn isolated_graph_git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(&git_program().program);
+    configure_isolated_graph_git_command(&mut command);
+    command.current_dir(cwd).args(args);
+    command
+}
+
+/// Add the command-line and environment fences used for private graph
+/// snapshots. This does not mutate the broker process environment.
+fn configure_isolated_graph_git_command(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let hooks_path = format!("core.hooksPath={null_device}");
+    command
+        .args([
+            "--no-replace-objects",
+            "-c",
+            hooks_path.as_str(),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "core.autocrlf=false",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_device)
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env(
+            "GIT_GRAFT_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
+}
+
+fn run_isolated_graph_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    let mut command = isolated_graph_git_command(cwd, args);
+    let budget = active_git_deadline().map_or_else(git_timeout, |deadline| {
+        git_timeout().min(deadline.saturating_duration_since(Instant::now()))
+    });
+    match crate::bounded_output::output_limited(&mut command, budget, 16 * 1024 * 1024).map_err(
+        |source| GitError::Spawn {
+            args: args.join(" "),
+            source,
+        },
+    )? {
+        crate::bounded_output::LimitedOutput::Completed(output) => {
+            if !output.status.success() {
+                return Err(GitError::Git {
+                    args: args.join(" "),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            Ok(output.stdout)
+        }
+        crate::bounded_output::LimitedOutput::Deadline => Err(GitError::TimedOut {
+            args: args.join(" "),
+            seconds: budget.as_secs().max(1),
+        }),
+        crate::bounded_output::LimitedOutput::OutputLimit => Err(graph_snapshot_error(
+            "graph snapshot Git output exceeds 16 MiB",
+        )),
+    }
+}
+
+fn parse_graph_snapshot_inventory(bytes: &[u8]) -> Result<(u64, u64), GitError> {
+    if !bytes.is_empty() && !bytes.ends_with(&[0]) {
+        return Err(graph_snapshot_error("incomplete graph snapshot inventory"));
+    }
+    let mut logical_bytes = 0u64;
+    let mut allocated_bytes = 0u64;
+    let mut inodes = 1u64;
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| graph_snapshot_error("invalid graph snapshot inventory row"))?;
+        if tab + 1 == record.len() {
+            return Err(graph_snapshot_error(
+                "graph snapshot inventory has an empty path",
+            ));
+        }
+        let header = std::str::from_utf8(&record[..tab])
+            .map_err(|_| graph_snapshot_error("invalid graph snapshot inventory header"))?;
+        let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 4
+            || !matches!(fields[2].len(), 40 | 64)
+            || !fields[2].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(graph_snapshot_error("invalid graph snapshot object header"));
+        }
+        let size = match (fields[0], fields[1], fields[3]) {
+            ("040000", "tree", "-") => 0,
+            ("100644" | "100755" | "120000", "blob", size) => size
+                .parse::<u64>()
+                .map_err(|_| graph_snapshot_error("unknown graph snapshot blob size"))?,
+            _ => {
+                return Err(graph_snapshot_error(
+                    "unsupported graph snapshot tree entry",
+                ));
+            }
+        };
+        logical_bytes = logical_bytes
+            .checked_add(size)
+            .ok_or_else(|| graph_snapshot_error("graph snapshot size overflow"))?;
+        if logical_bytes > 2 * 1024 * 1024 * 1024 || inodes >= 100_000 {
+            return Err(graph_snapshot_error(
+                "graph snapshot exceeds the 2 GiB or 100000 entry limit",
+            ));
+        }
+        let allocation = size
+            .div_ceil(4096)
+            .max(1)
+            .checked_mul(4096)
+            .ok_or_else(|| graph_snapshot_error("graph snapshot allocation overflow"))?;
+        allocated_bytes = allocated_bytes
+            .checked_add(allocation)
+            .ok_or_else(|| graph_snapshot_error("graph snapshot allocation overflow"))?;
+        inodes += 1;
+    }
+    Ok((allocated_bytes, inodes))
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, None, args)
 }
 
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
-    let mut command = Command::new(&git_program().program);
+    let mut command = git_command();
     command
         .args(args)
         .current_dir(cwd)
@@ -965,7 +1174,7 @@ fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<Str
 }
 
 fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<String, GitError> {
-    let mut command = Command::new(&git_program().program);
+    let mut command = git_command();
     // No opportunistic index refresh: `git status` and friends otherwise
     // rewrite a checkout's index when file stats moved, and the broker reads
     // that index's mtime as evidence the session's agent is working. Merely
@@ -1460,7 +1669,7 @@ impl GitRepo {
     /// must leave discovery incomplete instead of treating the path as safe.
     pub(crate) fn path_is_ignored_checked(&self, path: &str) -> Result<bool, GitError> {
         let args = ["check-ignore", "--quiet", "--", path];
-        let mut command = Command::new(&git_program().program);
+        let mut command = git_command();
         command
             .args(args)
             .current_dir(&self.root)
@@ -1727,7 +1936,7 @@ impl GitRepo {
         branch: &str,
         budget: std::time::Duration,
     ) -> Option<String> {
-        let mut command = Command::new(&git_program().program);
+        let mut command = git_command();
         command.arg("-C").arg(&self.root).args([
             "ls-remote",
             "--heads",
@@ -2753,6 +2962,85 @@ impl GitRepo {
         )?))
     }
 
+    /// Inventory one exact tree before allocating an independent checkout.
+    /// Output, entries and source bytes are bounded; incomplete inventories
+    /// never authorize a copy. Gitlinks are unsupported in this local lane.
+    pub(crate) fn graph_snapshot_inventory(&self, commit: &str) -> Result<(u64, u64), GitError> {
+        graph_snapshot_object_format(commit)?;
+        let bytes =
+            run_isolated_graph_git(&self.root, &["ls-tree", "-r", "-t", "-l", "-z", commit])?;
+        parse_graph_snapshot_inventory(&bytes)
+    }
+
+    /// Materialize one commit in independently owned metadata, without hooks,
+    /// templates, inherited Git configuration, filters or linked registration.
+    pub(crate) fn isolated_checkout_at(
+        &self,
+        destination: &Path,
+        commit: &str,
+    ) -> Result<GitRepo, GitError> {
+        let invalid = |message| graph_snapshot_error(message);
+        let object_format = graph_snapshot_object_format(commit)?;
+        let source = self
+            .root
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF-8 source path"))?;
+        let target = destination
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF-8 target path"))?;
+        if destination.exists() || std::fs::symlink_metadata(destination).is_ok() {
+            return Err(invalid("graph snapshot destination must not exist"));
+        }
+        let object_format_arg = format!("--object-format={object_format}");
+        run_isolated_graph_git(
+            &self.root,
+            &["init", "--quiet", "--template=", &object_format_arg, target],
+        )?;
+        run_isolated_graph_git(
+            destination,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--depth=1",
+                "--",
+                source,
+                commit,
+            ],
+        )?;
+        run_isolated_graph_git(
+            destination,
+            &[
+                "checkout",
+                "--quiet",
+                "--no-recurse-submodules",
+                "--detach",
+                commit,
+            ],
+        )?;
+        for path in [destination.to_path_buf(), destination.join(".git")] {
+            let metadata = std::fs::symlink_metadata(&path).map_err(|source| GitError::Spawn {
+                args: "inspect isolated graph checkout".into(),
+                source,
+            })?;
+            if !metadata.file_type().is_dir() {
+                return Err(invalid(
+                    "isolated graph checkout must own ordinary Git metadata",
+                ));
+            }
+        }
+        let root = destination
+            .canonicalize()
+            .map_err(|source| GitError::Spawn {
+                args: "canonicalize isolated graph checkout".into(),
+                source,
+            })?;
+        Ok(GitRepo { root })
+    }
+
     /// Create a detached worktree at `dest` checked out at `commit`.
     pub fn worktree_add_detached(&self, dest: &Path, commit: &str) -> Result<GitRepo, GitError> {
         if let Some(parent) = dest.parent() {
@@ -3213,7 +3501,7 @@ impl GitRepo {
     ) -> Result<(), GitError> {
         let refspec = format!("refs/heads/{branch}:refs/remotes/{remote}/{branch}");
         let args = ["fetch", "--no-tags", "--quiet", remote, refspec.as_str()];
-        let mut command = Command::new(&git_program().program);
+        let mut command = git_command();
         command.args(args).current_dir(&self.root);
         run_git_command(command, &args, budget)?;
         Ok(())
@@ -4749,5 +5037,358 @@ mod batched_commit_tests {
         };
         assert_eq!(marked("tabbed"), vec![(tabbed, false)], "not landed");
         assert_eq!(marked("exact"), vec![(exact, true)], "landed");
+    }
+}
+
+#[cfg(test)]
+mod graph_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn graph_environment_preflight_covers_routing_history_and_configuration() {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_GRAFT_FILE",
+            "GIT_SHALLOW_FILE",
+            "GIT_CONFIG",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_KEY_17",
+            "GIT_CONFIG_VALUE_17",
+            "GIT_EXEC_PATH",
+            "GIT_TEMPLATE_DIR",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_ATTR_NOSYSTEM",
+            "GIT_TRACE2_EVENT",
+            "GIT_TRACE_SETUP",
+            "GIT_CURL_VERBOSE",
+        ] {
+            assert!(
+                unsafe_graph_git_environment_key(std::ffi::OsStr::new(key)),
+                "{key}"
+            );
+        }
+        for key in ["HOME", "NOT_GIT_DIR", "PATH"] {
+            assert!(
+                !unsafe_graph_git_environment_key(std::ffi::OsStr::new(key)),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_inventory_counts_directories_and_unusual_paths() {
+        let oid = "a".repeat(40);
+        let input = format!(
+            "040000 tree {oid}       -\tnested\0\
+            100644 blob {oid}       1\tnested/a\tnewline\n.txt\0\
+            120000 blob {oid}       7\tlink\0"
+        );
+        assert_eq!(
+            parse_graph_snapshot_inventory(input.as_bytes()).unwrap(),
+            (3 * 4096, 4)
+        );
+        assert_eq!(parse_graph_snapshot_inventory(b"").unwrap(), (0, 1));
+        let sha256_oid = "b".repeat(64);
+        assert_eq!(graph_snapshot_object_format(&oid).unwrap(), "sha1");
+        assert_eq!(graph_snapshot_object_format(&sha256_oid).unwrap(), "sha256");
+        let sha256_row = format!("100644 blob {sha256_oid} 1\tfile\0");
+        assert_eq!(
+            parse_graph_snapshot_inventory(sha256_row.as_bytes()).unwrap(),
+            (4096, 2)
+        );
+        assert!(graph_snapshot_object_format("HEAD").is_err());
+        assert!(graph_snapshot_object_format(&"a".repeat(41)).is_err());
+    }
+
+    #[test]
+    fn graph_inventory_refuses_unknown_incomplete_and_oversized_inputs() {
+        let oid = "a".repeat(40);
+        for input in [
+            format!("100644 blob {oid} 1\tfile"),
+            format!("100644 blob {oid} -\tfile\0"),
+            format!("160000 commit {oid} -\tsubmodule\0"),
+            format!("100644 blob {oid} 2147483649\tfile\0"),
+            format!("100644 blob {oid} 18446744073709551615\tfile\0"),
+            format!("100644 blob {oid} 1\t\0"),
+        ] {
+            assert!(
+                parse_graph_snapshot_inventory(input.as_bytes()).is_err(),
+                "{input:?}"
+            );
+        }
+        let row = format!("100644 blob {oid} 0\tfile\0");
+        assert!(parse_graph_snapshot_inventory(row.repeat(100_000).as_bytes()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_graph_checkout_scrubs_foreign_metadata_and_filters() {
+        const CHILD: &str = "AETHYME_GRAPH_SNAPSHOT_TEST_CHILD";
+        const ROOT: &str = "AETHYME_GRAPH_SNAPSHOT_TEST_ROOT";
+        const TEST: &str = "git::graph_snapshot_tests::isolated_graph_checkout_scrubs_foreign_metadata_and_filters";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let mode = mode.to_string_lossy();
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let source = GitRepo {
+                root: root.join("source"),
+            };
+            let commit = std::env::var("AETHYME_GRAPH_SNAPSHOT_COMMIT").unwrap();
+            if mode == "filter" {
+                // A graph policy read is inside the same scoped Git boundary
+                // as verification. The fixture commit has no graph config, so
+                // this also proves the disabled default is returned normally.
+                assert!(!graph_verification_git_enabled());
+                assert_eq!(
+                    crate::graph_integrity::load_graph_policy_at_commit(&source, &commit).unwrap(),
+                    aethyme_graph_storage::GraphIntegrityPolicy::default()
+                );
+                assert!(
+                    !graph_verification_git_enabled(),
+                    "graph-policy read leaked its scoped Git guard"
+                );
+
+                // The ordinary path deliberately sees HOME's global clean
+                // filter; the graph scope must suppress it for the generated
+                // independent checkout, then restore ordinary behavior.
+                source.working_tree_hash().unwrap();
+                let sentinel = root.join("filter-invoked");
+                assert!(sentinel.is_file(), "global clean filter did not execute");
+                std::fs::remove_file(&sentinel).unwrap();
+                let expected_tree = source.commit_tree_id(&commit).unwrap();
+                {
+                    let _graph_environment = graph_verification_git_guard();
+                    let destination = root.join("isolated");
+                    let isolated = source.isolated_checkout_at(&destination, &commit).unwrap();
+                    assert_eq!(isolated.root(), destination.canonicalize().unwrap());
+                    assert_eq!(isolated.working_tree_hash().unwrap(), expected_tree);
+                    std::fs::write(destination.join("payload.txt"), "isolated dirty bytes\n")
+                        .unwrap();
+                    isolated.working_tree_hash().unwrap();
+                    assert!(
+                        !sentinel.exists(),
+                        "global clean filter executed inside graph scope"
+                    );
+                }
+                std::fs::write(source.root.join("payload.txt"), "after graph scope\n").unwrap();
+                source.working_tree_hash().unwrap();
+                assert!(
+                    sentinel.is_file(),
+                    "ordinary Git configuration was not restored"
+                );
+                return;
+            }
+            assert_eq!(mode, "hostile");
+            let foreign = root.join("foreign/.git");
+            let source_before = metadata_bytes(&source.root.join(".git"));
+            let foreign_before = metadata_bytes(&foreign);
+            // This source commit has no graph policy, and would otherwise
+            // resolve to the disabled default. An inherited redirect must be
+            // refused before reading that authoritative config from another
+            // repository.
+            let policy_error =
+                crate::graph_integrity::load_graph_policy_at_commit(&source, &commit)
+                    .expect_err("inherited Git redirection must block policy reads");
+            let policy_error = policy_error.to_string();
+            assert!(
+                policy_error.contains("refuses inherited GIT_* environment overrides"),
+                "unexpected policy refusal: {policy_error}"
+            );
+            assert!(
+                !policy_error.contains(&foreign.to_string_lossy().to_string()),
+                "policy refusal exposed an inherited Git environment value"
+            );
+            assert!(
+                !graph_verification_git_enabled(),
+                "refused graph-policy read changed the scoped Git guard"
+            );
+            let policy = aethyme_graph_storage::GraphIntegrityPolicy::parse(
+                "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
+            )
+            .unwrap();
+            let root_plan = crate::broker::lifecycle::plan_worktree_root_for(
+                &source.root,
+                Some(&source.root.join(".git")),
+                Some(&root.join("worktrees")),
+            );
+            let outcomes = [
+                crate::graph_integrity::verify_disposable_checkout(&source, &policy),
+                crate::graph_integrity::verify_checkout_without_mutation(
+                    &source.root,
+                    &source,
+                    &policy,
+                )
+                .unwrap(),
+                crate::graph_integrity::verify_checkout_without_mutation_with_worktree_root_plan(
+                    &source.root,
+                    &source,
+                    &policy,
+                    &root_plan,
+                )
+                .unwrap(),
+                crate::graph_integrity::verify_commit_for_advice_with_worktree_root_plan(
+                    &source.root,
+                    &source,
+                    &commit,
+                    &root_plan,
+                )
+                .unwrap(),
+            ];
+            for outcome in outcomes {
+                assert_eq!(
+                    outcome.status,
+                    crate::graph_integrity::GraphIntegrityStatus::Error
+                );
+                assert!(
+                    outcome.tree_hash.is_empty(),
+                    "Git work ran before context refusal: {outcome:?}"
+                );
+                assert!(
+                    outcome
+                        .reason
+                        .contains("refuses inherited GIT_* environment overrides")
+                );
+            }
+            assert_eq!(metadata_bytes(&foreign), foreign_before);
+            assert_eq!(metadata_bytes(&source.root.join(".git")), source_before);
+            assert!(!root.join("worktrees").exists());
+            return;
+        }
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().canonicalize().unwrap();
+        for name in ["source", "foreign"] {
+            let path = root.join(name);
+            std::fs::create_dir(&path).unwrap();
+            run_isolated_graph_git(&path, &["init", "--quiet", "--template=", "-b", "main"])
+                .unwrap();
+            let content = if name == "source" {
+                "original content\n"
+            } else {
+                "foreign content\n"
+            };
+            std::fs::write(path.join("payload.txt"), content).unwrap();
+            std::fs::write(
+                path.join(".gitattributes"),
+                "*.txt filter=aethyme_snapshot_fixture\n",
+            )
+            .unwrap();
+            run_isolated_graph_git(&path, &["add", "--all"]).unwrap();
+            run_isolated_graph_git(
+                &path,
+                &[
+                    "-c",
+                    "user.name=Snapshot Test",
+                    "-c",
+                    "user.email=snapshot@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+            )
+            .unwrap();
+        }
+        let commit = String::from_utf8(
+            run_isolated_graph_git(&root.join("source"), &["rev-parse", "HEAD"]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("source/payload.txt"), "working tree content\n").unwrap();
+        let config = root.join(".gitconfig");
+        run_isolated_graph_git(
+            &root,
+            &[
+                "config",
+                "--file",
+                config.to_str().unwrap(),
+                "filter.aethyme_snapshot_fixture.clean",
+                "touch \"$AETHYME_GRAPH_FILTER_HIT\"; cat",
+            ],
+        )
+        .unwrap();
+
+        let run_child = |mode: &str, hostile_git_env: bool| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, mode)
+                .env(ROOT, &root)
+                .env("HOME", &root)
+                .env("AETHYME_GRAPH_SNAPSHOT_COMMIT", commit.trim())
+                .env("AETHYME_GRAPH_FILTER_HIT", root.join("filter-invoked"));
+            for (key, _) in std::env::vars_os() {
+                if unsafe_graph_git_environment_key(&key) {
+                    command.env_remove(key);
+                }
+            }
+            if hostile_git_env {
+                command
+                    .env("GIT_DIR", root.join("foreign/.git"))
+                    .env("GIT_COMMON_DIR", root.join("foreign/.git"))
+                    .env("GIT_WORK_TREE", root.join("foreign"))
+                    .env("GIT_INDEX_FILE", root.join("foreign/.git/index"))
+                    .env("GIT_OBJECT_DIRECTORY", root.join("foreign/.git/objects"))
+                    .env(
+                        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                        root.join("foreign/.git/objects"),
+                    )
+                    .env("GIT_SHALLOW_FILE", root.join("foreign/.git/shallow"))
+                    .env("GIT_GRAFT_FILE", root.join("foreign/.git/info/grafts"))
+                    .env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "filter.aethyme_snapshot_fixture.clean")
+                    .env(
+                        "GIT_CONFIG_VALUE_0",
+                        "touch \"$AETHYME_GRAPH_FILTER_HIT\"; cat",
+                    );
+            }
+            match crate::bounded_output::output_limited(
+                &mut command,
+                Duration::from_secs(30),
+                1024 * 1024,
+            )
+            .unwrap()
+            {
+                crate::bounded_output::LimitedOutput::Completed(output) => assert!(
+                    output.status.success(),
+                    "stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                other => panic!("isolated graph child did not complete: {other:?}"),
+            }
+        };
+        run_child("filter", false);
+        run_child("hostile", true);
+    }
+
+    #[cfg(unix)]
+    fn metadata_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(root: &Path, path: &Path, rows: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    walk(root, &entry.unwrap().path(), rows);
+                }
+            } else {
+                assert!(metadata.is_file() && metadata.len() <= 1024 * 1024);
+                assert!(rows.len() < 500);
+                rows.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                ));
+            }
+        }
+        let mut rows = Vec::new();
+        walk(root, root, &mut rows);
+        rows.sort();
+        rows
     }
 }
