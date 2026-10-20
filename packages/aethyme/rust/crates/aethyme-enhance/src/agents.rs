@@ -334,6 +334,10 @@ Other agents may be working in sibling worktrees.
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
    session's worktree.
+   Before running repository tools or audits, check the session's preparation
+   status and follow its `next_action` when dependencies are required:
+   `aethyme broker submit prepare status --session <id> --json`. Preparation
+   is explicit; do not assume a fresh worktree has installed dependencies.
 2. Commit early and small, and after each commit run
    `aethyme broker push --session <id>`. Once there is a first meaningful
    commit, open a draft PR with `aethyme broker push --session <id> --pr`, and
@@ -356,6 +360,10 @@ Other agents may be working in sibling worktrees.
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
    session's worktree.
+   Before running repository tools or audits, check the session's preparation
+   status and follow its `next_action` when dependencies are required:
+   `aethyme broker submit prepare status --session <id> --json`. Preparation
+   is explicit; do not assume a fresh worktree has installed dependencies.
 2. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>`.
 
@@ -432,6 +440,11 @@ blocked.
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
+   Before running repository tools or audits, inspect the session's preparation
+   status and follow its `next_action` when dependencies are required:
+   `aethyme broker submit prepare status --session <your-session-id> --json`.
+   Worktrees do not inherit ignored dependencies such as `node_modules/` or
+   `.venv/` from the main checkout; preparation is explicit.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
@@ -1029,6 +1042,9 @@ mod tests {
             "work only in the worktree it\n   reports",
             "follow the working agreement it prints.",
             "Never edit another\n   session's worktree.",
+            "Before running repository tools or audits, check the session's preparation",
+            "aethyme broker submit prepare status --session <id> --json",
+            "do not assume a fresh worktree has installed dependencies.",
             "`aethyme broker submit --session <id>`",
             "`aethyme broker finish --session <id>`",
             "`aethyme broker advanced git`",
@@ -1055,6 +1071,7 @@ mod tests {
             "aethyme broker status --json",
             "--path <planned-path>",
             "aethyme broker start --adopt --task",
+            "Worktrees do not inherit ignored dependencies such as `node_modules/` or",
             "aethyme broker advanced leases claim <path>",
             "aethyme broker advanced exec --session",
             "AETHYME_TEST_DB_SUFFIX",
