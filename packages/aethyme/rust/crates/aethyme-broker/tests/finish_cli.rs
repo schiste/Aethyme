@@ -45,10 +45,7 @@ fn promoted_fixture_with_worktree_root(
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     let mut broker = match worktree_root {
-        Some(worktree_root) => {
-            let worktree_root = worktree_root.canonicalize().unwrap();
-            isolation::open_with_worktree_root(tmp.path(), &worktree_root)
-        }
+        Some(worktree_root) => isolation::open_with_worktree_root(tmp.path(), worktree_root),
         None => isolation::open(tmp.path()),
     };
     let session = broker.start_worktree("finish CLI fixture", None).unwrap();
@@ -160,11 +157,20 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
 
 #[test]
 fn finish_cli_succeeds_for_a_clean_worktree_root_with_spaces() {
-    let worktree_root = tempfile::Builder::new()
-        .prefix("aethyme finish worktrees with spaces ")
+    let worktree_parent = tempfile::Builder::new()
+        .prefix("aethyme finish worktree parent ")
         .tempdir()
         .unwrap();
-    let worktree_root_path = worktree_root.path().canonicalize().unwrap();
+    let worktree_root_path = worktree_parent
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("worktrees with spaces");
+    assert!(
+        !worktree_root_path.exists(),
+        "the selected worktree root must be absent before broker open: {}",
+        worktree_root_path.display()
+    );
     let (tmp, session_id, worktree, _) =
         promoted_fixture_with_worktree_root(Some(&worktree_root_path));
     assert!(
@@ -173,6 +179,7 @@ fn finish_cli_succeeds_for_a_clean_worktree_root_with_spaces() {
         worktree.display()
     );
     assert!(worktree.starts_with(&worktree_root_path));
+    assert!(worktree_root_path.is_dir());
 
     let mut broker = isolation::open_with_worktree_root(tmp.path(), &worktree_root_path);
     let session_arg = session_id.to_string();
