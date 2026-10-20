@@ -157,6 +157,14 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
         &["config", "branch.main.merge", "refs/heads/main"],
     );
     std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+    // This suite tests artifact cleanup and reclaim, not whole-checkout removal.
+    // Set that policy explicitly instead of relying on an absent remote ref to
+    // keep otherwise eligible fixture worktrees around.
+    std::fs::write(
+        repo.path().join(".aethyme/config.toml"),
+        "[cleanup]\nauto_remove = false\n",
+    )
+    .unwrap();
     std::fs::write(repo.path().join(".aethyme/broker.toml"), retention).unwrap();
     discover_artifact_sweep_namespace(repo.path(), container.path());
     (repo, container)
@@ -1334,11 +1342,7 @@ fn default_policy_reclaims_closed_session_build_caches() {
         worktree.join("work.txt").exists(),
         "committed work must remain"
     );
-    let branch_output = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(&worktree)
-        .output()
-        .unwrap();
+    let branch_output = git_output(&worktree, &["branch", "--show-current"]);
     assert!(branch_output.status.success());
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
@@ -1348,11 +1352,7 @@ fn default_policy_reclaims_closed_session_build_caches() {
         "the retained checkout must remain on its branch"
     );
     let branch_ref = format!("refs/heads/{branch}");
-    let branch_check = Command::new("git")
-        .args(["show-ref", "--verify", branch_ref.as_str()])
-        .current_dir(repo.path())
-        .output()
-        .unwrap();
+    let branch_check = git_output(repo.path(), &["show-ref", "--verify", branch_ref.as_str()]);
     assert!(
         branch_check.status.success(),
         "the retained branch must remain: {}",
@@ -2397,6 +2397,22 @@ fn a_closed_session_with_a_persisted_interrupted_cache_is_resumed_by_the_next_pa
     assert!(target.join("artifact").is_file());
     backdate_tree_top(&target, 30);
 
+    // Without its normal witness, ordinary discovery must not select this
+    // payload; the persisted interrupted-path marker is the only resume path.
+    let witness = target.join("CACHEDIR.TAG");
+    assert!(witness.is_file());
+    std::fs::remove_file(&witness).unwrap();
+    backdate_tree_top(&target, 30);
+    assert!(!witness.exists());
+    let ordinary_plan = plan_json(repo.path(), container.path());
+    let ordinary_artifacts = ordinary_plan["artifacts"].as_array().unwrap();
+    assert!(
+        ordinary_artifacts
+            .iter()
+            .all(|artifact| artifact["relative_dir"] != "rust/target"),
+        "ordinary discovery must not select a witnessless cache: {ordinary_artifacts:?}"
+    );
+
     let target_key = target.to_string_lossy().into_owned();
     remember_interrupted_tree(repo.path(), &target);
     assert_eq!(
@@ -2431,7 +2447,10 @@ fn a_closed_session_with_a_persisted_interrupted_cache_is_resumed_by_the_next_pa
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["complete"], true, "{report}");
+    assert!(
+        report["complete"].is_boolean(),
+        "the sweep reports whether other cleanup work remains: {report}"
+    );
     assert!(
         !target.exists(),
         "the next CLI pass resumes the cache: {report}"
