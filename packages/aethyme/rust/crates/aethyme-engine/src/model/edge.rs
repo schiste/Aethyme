@@ -21,6 +21,10 @@ pub enum EdgeKind {
     ValidatesCredential,
     RewritesHeader,
     TestedBy,
+    /// A test function exercises the function or symbol at the target.
+    /// Kept after existing variants because serialized stores use bincode's
+    /// enum discriminants; old variants must retain their ordinals.
+    Tests,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]

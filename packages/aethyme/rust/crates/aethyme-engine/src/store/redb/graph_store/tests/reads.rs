@@ -642,6 +642,69 @@ fn read_api_neighbors_filters_direction_and_kind() {
 }
 
 #[test]
+fn bounded_adjacency_caps_raw_rows_before_kind_filtering() {
+    let fixture = read_api_fixture(function_name!());
+    let store = GraphStore::open(&fixture.root).expect("open writer");
+    let mut session = store.begin_index().expect("index session");
+    insert_edge(
+        &mut session,
+        &Edge::new(
+            "call-source",
+            fixture.function.id.as_str(),
+            EdgeKind::Calls,
+            900,
+            "test",
+        ),
+    )
+    .expect("insert calls edge");
+    insert_edge(
+        &mut session,
+        &Edge::new(
+            "test-source",
+            fixture.function.id.as_str(),
+            EdgeKind::Tests,
+            900,
+            "test",
+        ),
+    )
+    .expect("insert tests edge");
+    session.commit().expect("commit");
+    drop(store);
+
+    let readonly = fixture.read_only();
+    let limited = readonly
+        .neighbors_limited(
+            fixture.function.id.as_str(),
+            NeighborDirection::Incoming,
+            Some(EdgeKind::Tests),
+            1,
+        )
+        .expect("limited adjacency");
+    assert_eq!(limited.raw_rows_scanned, 1);
+    assert!(limited.truncated);
+    assert!(
+        limited.records.is_empty(),
+        "the Calls row consumes the raw budget before Tests filtering"
+    );
+
+    let exact_budget = readonly
+        .neighbors_limited(
+            fixture.function.id.as_str(),
+            NeighborDirection::Incoming,
+            Some(EdgeKind::Tests),
+            2,
+        )
+        .expect("full bounded adjacency");
+    assert_eq!(exact_budget.raw_rows_scanned, 2);
+    assert!(
+        exact_budget.truncated,
+        "an exhausted budget is conservative"
+    );
+    assert_eq!(exact_budget.records.len(), 1);
+    assert_eq!(exact_budget.records[0].kind, EdgeKind::Tests);
+}
+
+#[test]
 fn read_api_relation_docs_configs_and_risks() {
     let fixture = read_api_fixture(function_name!());
     let readonly = fixture.read_only();
@@ -981,6 +1044,32 @@ fn schema_mismatch_is_reported() {
         }
         Err(other) => panic!("expected SchemaMismatch, got {other:?}"),
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn schema_v9_store_is_rejected_after_test_edge_kind_addition() {
+    let root = tmp_root(function_name!());
+    let _ = GraphStore::open(&root).expect("open current schema");
+    {
+        let db_path = root.join(".aethyme").join(DB_FILE_NAME);
+        let db = Database::create(&db_path).expect("open raw db");
+        let txn = db.begin_write().expect("write txn");
+        {
+            let mut meta = txn.open_table(META).expect("META");
+            meta.insert(META_KEY_SCHEMA_VERSION, &9u32.to_le_bytes()[..])
+                .expect("set prior schema");
+        }
+        txn.commit().expect("commit old version");
+    }
+
+    assert!(matches!(
+        GraphStore::open(&root),
+        Err(GraphStoreError::SchemaMismatch {
+            found: 9,
+            expected: 10
+        })
+    ));
     let _ = std::fs::remove_dir_all(&root);
 }
 

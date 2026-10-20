@@ -158,6 +158,35 @@ pub(super) fn neighbors_from<D: ReadableDatabase>(
     Ok(rows)
 }
 
+pub(super) fn neighbors_limited_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+    direction: NeighborDirection,
+    kind: Option<EdgeKind>,
+    max_raw_rows: usize,
+) -> Result<BoundedAdjacency, GraphStoreError> {
+    let table = match direction {
+        NeighborDirection::Outgoing => EDGES_OUT,
+        NeighborDirection::Incoming => EDGES_IN,
+    };
+    let (mut rows, raw_rows_scanned, truncated) =
+        collect_adjacency_limited(db, table, id, max_raw_rows)?;
+    if let Some(expected) = kind {
+        rows.retain(|row| row.kind == expected);
+    }
+    rows.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.other.cmp(&right.other))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    Ok(BoundedAdjacency {
+        records: rows,
+        raw_rows_scanned,
+        truncated,
+    })
+}
+
 pub(super) fn edge_kind_label(kind: &EdgeKind) -> &'static str {
     match kind {
         EdgeKind::Contains => "contains",
@@ -179,6 +208,7 @@ pub(super) fn edge_kind_label(kind: &EdgeKind) -> &'static str {
         EdgeKind::ValidatesCredential => "validates_credential",
         EdgeKind::RewritesHeader => "rewrites_header",
         EdgeKind::TestedBy => "tested_by",
+        EdgeKind::Tests => "tests",
     }
 }
 
@@ -223,6 +253,7 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                 EdgeKind::ValidatesCredential,
                 EdgeKind::RewritesHeader,
                 EdgeKind::TestedBy,
+                EdgeKind::Tests,
             ],
         )],
         GraphRelation::Parents => vec![(
@@ -241,6 +272,7 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                 EdgeKind::ValidatesCredential,
                 EdgeKind::RewritesHeader,
                 EdgeKind::TestedBy,
+                EdgeKind::Tests,
             ],
         )],
         GraphRelation::Callers => vec![(NeighborDirection::Incoming, vec![EdgeKind::Calls])],
@@ -274,6 +306,7 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                     EdgeKind::RewritesHeader,
                     EdgeKind::StoresCredential,
                     EdgeKind::TestedBy,
+                    EdgeKind::Tests,
                     EdgeKind::UsesCredential,
                     EdgeKind::ValidatesCredential,
                 ],
@@ -290,6 +323,7 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                     EdgeKind::RewritesHeader,
                     EdgeKind::StoresCredential,
                     EdgeKind::TestedBy,
+                    EdgeKind::Tests,
                     EdgeKind::UsesCredential,
                     EdgeKind::ValidatesCredential,
                 ],

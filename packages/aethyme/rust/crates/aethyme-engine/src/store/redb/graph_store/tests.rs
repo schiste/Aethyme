@@ -110,7 +110,7 @@ fn stored_node_id_format_is_pinned_to_the_schema_version() {
     let function = sample_function(&file, "m", None);
     assert_eq!(
         (SCHEMA_VERSION, &*class.id, &*function.id),
-        (9, "class:Repo:src/a.py:Foo@7", "fn:Repo:src/a.py:m@12"),
+        (10, "class:Repo:src/a.py:Foo@7", "fn:Repo:src/a.py:m@12"),
     );
 }
 
