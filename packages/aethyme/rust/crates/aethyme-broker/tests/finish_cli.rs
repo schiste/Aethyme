@@ -18,7 +18,8 @@ fn git_command(repo: &Path, args: &[&str]) -> Command {
     for key in git_keys {
         command.env_remove(key);
     }
-    command.args(args).current_dir(repo)
+    command.args(args).current_dir(repo);
+    command
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -977,7 +978,7 @@ fn finish_cleanup_proof_does_not_authorize_a_live_replacement_session() {
     assert!(!output.status.success());
     assert!(worktree.exists());
     assert!(!worktree.join("README.md").exists());
-    let broker = isolation::open(tmp.path());
+    let mut broker = isolation::open(tmp.path());
     assert!(!broker.store().session(live.id).unwrap().status.is_closed());
     assert!(branch_exists(tmp.path(), &branch));
 }
