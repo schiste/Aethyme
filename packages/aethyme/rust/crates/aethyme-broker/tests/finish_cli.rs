@@ -784,6 +784,9 @@ fn finish_cleanup_resumes_with_managed_runtime_and_witnessed_build_artifacts() {
     let managed_status = worktree.join(".aethyme/generated/experience-status.md");
     std::fs::create_dir_all(managed_status.parent().unwrap()).unwrap();
     std::fs::write(&managed_status, "generated status\n").unwrap();
+    let broker_log = worktree.join(".aethyme/logs/broker.log");
+    std::fs::create_dir_all(broker_log.parent().unwrap()).unwrap();
+    std::fs::write(&broker_log, "broker log\n").unwrap();
     let target = worktree.join("target");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(
@@ -809,9 +812,44 @@ fn finish_cleanup_resumes_with_managed_runtime_and_witnessed_build_artifacts() {
     assert_eq!(report["cleaned"], session_id);
     assert!(!worktree.exists());
     assert!(!managed_status.exists());
+    assert!(!broker_log.exists());
     assert!(!target.exists());
     assert!(
         !Command::new("git")
+            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn finish_cleanup_proof_does_not_authorize_a_same_named_ignored_runtime_file() {
+    // The slash-free ignore rule makes a regular file at this name ignored.
+    // The runtime catalog permits only the directory form `.aethyme/logs/`.
+    let (tmp, session_id, worktree, branch) = promoted_fixture_with_gitignore("/.aethyme/logs\n");
+    let log_file = worktree.join(".aethyme/logs");
+    std::fs::create_dir_all(log_file.parent().unwrap()).unwrap();
+    std::fs::write(&log_file, "preserve this file\n").unwrap();
+    assert!(git(&worktree, &["check-ignore", "--quiet", ".aethyme/logs"]).is_empty());
+    interrupt_finish_cleanup(&tmp, session_id, &worktree);
+    std::fs::remove_file(worktree.join("README.md")).unwrap();
+
+    let output = run(
+        tmp.path(),
+        &["finish", "cleanup", &session_id.to_string(), "--json"],
+    );
+    assert!(!output.status.success());
+    assert!(worktree.exists());
+    assert!(!worktree.join("README.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(&log_file).unwrap(),
+        "preserve this file\n"
+    );
+    assert!(
+        Command::new("git")
             .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
             .current_dir(tmp.path())
             .output()

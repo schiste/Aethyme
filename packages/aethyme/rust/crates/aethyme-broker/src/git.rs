@@ -3930,7 +3930,11 @@ impl GitRepo {
         {
             return Ok(false);
         }
-        if crate::runtime_paths::is_broker_runtime_path(relative) {
+        // Directory entries from `status --ignored=matching` retain their
+        // trailing slash; the runtime catalog uses it to distinguish an
+        // owned directory from a same-named regular file. Keep that suffix
+        // here after validating components using the normalized path above.
+        if crate::runtime_paths::is_broker_runtime_path(path) {
             return Ok(true);
         }
 
