@@ -965,10 +965,10 @@ fn retained_metric_bytes_until(
     bytes: &[u8],
     cutoff: i64,
     deadline: Option<Instant>,
-) -> Option<(Vec<u8>, bool, bool)> {
+) -> Option<(Vec<u8>, bool, usize)> {
     let mut after = Vec::with_capacity(bytes.len());
     let mut removed = false;
-    let mut malformed = false;
+    let mut malformed_lines = 0_usize;
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         if deadline_expired(deadline) {
             return None;
@@ -980,12 +980,12 @@ fn retained_metric_bytes_until(
             Some(timestamp) if timestamp < cutoff => removed = true,
             Some(_) => after.extend_from_slice(line),
             None => {
-                malformed = true;
+                malformed_lines = malformed_lines.saturating_add(1);
                 after.extend_from_slice(line);
             }
         }
     }
-    Some((after, removed, malformed))
+    Some((after, removed, malformed_lines))
 }
 
 fn retained_metric_bytes(bytes: &[u8], cutoff: i64) -> Vec<u8> {
@@ -1077,16 +1077,30 @@ fn metrics_rewrite(
     {
         return Ok(MetricsRewrite::Deferred);
     }
-    let Some((after, removed, malformed)) = retained_metric_bytes_until(&bytes, cutoff, deadline)
+    let Some((after, removed, malformed_lines)) =
+        retained_metric_bytes_until(&bytes, cutoff, deadline)
     else {
         return Ok(MetricsRewrite::Deferred);
     };
-    if malformed {
+    if deadline.is_some() && malformed_lines > 0 {
+        // Health only needs a conservative blocker. Keep this summary bounded
+        // instead of allocating one blocker per malformed input line.
         blockers.push(GcBlocker {
             kind: "command_metric_line".into(),
             id: None,
-            reason: "retained one malformed or timestamp-free command metric line".into(),
+            reason: format!(
+                "retained {malformed_lines} malformed or timestamp-free command metric line(s)"
+            ),
         });
+    } else {
+        // Preserve the full-GC report's historical one-blocker-per-line shape.
+        for _ in 0..malformed_lines {
+            blockers.push(GcBlocker {
+                kind: "command_metric_line".into(),
+                id: None,
+                reason: "retained one malformed or timestamp-free command metric line".into(),
+            });
+        }
     }
     if !removed {
         return Ok(MetricsRewrite::Complete(None));
@@ -3397,6 +3411,9 @@ impl Broker {
         include_active_gate_cache: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<GcPlan, BrokerOpError> {
+        // The budget is cooperative: loops and stage boundaries check it, but
+        // an in-flight SQLite query or filesystem syscall cannot be cancelled
+        // by this deadline and may finish after it.
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
         let retention_config = load_retention_policy_report(&main_root)?;
@@ -7066,7 +7083,7 @@ mod tests {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(1);
         let content = vec![b'x'; GC_FILE_READ_CHUNK_BYTES * 3];
-        let mut reader = std::io::Cursor::new(content);
+        let mut reader = std::io::Cursor::new(content.clone());
         let mut clock_calls = 0;
         let result = sha256_reader_until_with_clock(&mut reader, Some(deadline), || {
             clock_calls += 1;
@@ -7083,6 +7100,17 @@ mod tests {
             GC_FILE_READ_CHUNK_BYTES as u64,
             "the reader stops before consuming a second chunk"
         );
+
+        let mut retry = std::io::Cursor::new(content.clone());
+        let result = sha256_reader_until_with_clock(
+            &mut retry,
+            Some(Instant::now() + Duration::from_secs(5)),
+            Instant::now,
+        )
+        .unwrap()
+        .expect("a fresh positive pass completes after the partial pass");
+        assert_eq!(result.0, sha256(&content));
+        assert_eq!(result.1, content.len() as u64);
     }
 
     #[test]
@@ -7090,7 +7118,7 @@ mod tests {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(1);
         let content = vec![b'x'; GC_FILE_READ_CHUNK_BYTES * 3];
-        let mut reader = std::io::Cursor::new(content);
+        let mut reader = std::io::Cursor::new(content.clone());
         let mut clock_calls = 0;
         let result = read_all_until_with_clock(&mut reader, Some(deadline), || {
             clock_calls += 1;
@@ -7103,6 +7131,50 @@ mod tests {
             "partial metrics cannot produce a rewrite plan"
         );
         assert_eq!(reader.position(), GC_FILE_READ_CHUNK_BYTES as u64);
+
+        let mut retry = std::io::Cursor::new(content.clone());
+        let complete = read_all_until_with_clock(
+            &mut retry,
+            Some(Instant::now() + Duration::from_secs(5)),
+            Instant::now,
+        )
+        .unwrap()
+        .expect("a fresh positive pass completes after the partial pass");
+        assert_eq!(complete, content);
+    }
+
+    #[test]
+    fn full_metrics_rewrite_preserves_per_malformed_line_blockers_and_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join(".aethyme/logs");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("command-metrics.jsonl");
+        let before = b"{\"ts\":1}\nnot-json\n{\"ts\":3}\n{}\n";
+        let after = b"not-json\n{\"ts\":3}\n{}\n";
+        std::fs::write(&path, before).unwrap();
+        let mut blockers = Vec::new();
+
+        let MetricsRewrite::Complete(Some(candidate)) =
+            metrics_rewrite(tmp.path(), 2, &mut blockers, None).unwrap()
+        else {
+            panic!("old metrics should yield a complete rewrite candidate");
+        };
+
+        let expected_after_sha256 = sha256(after);
+        assert_eq!(candidate.before_sha256, sha256(before));
+        assert_eq!(
+            candidate.after_sha256.as_deref(),
+            Some(expected_after_sha256.as_str())
+        );
+        assert_eq!(retained_metric_bytes(before, 2), after);
+        assert_eq!(
+            blockers
+                .iter()
+                .filter(|blocker| blocker.kind == "command_metric_line")
+                .count(),
+            2,
+            "full GC retains its historical per-line blocker count"
+        );
     }
 
     #[cfg(unix)]

@@ -1102,7 +1102,7 @@ impl BrokerStore {
     /// The row inventory used by health summaries. Health reports counts and
     /// estimates but cannot authorize deletion, so it does not read every
     /// candidate row back in full merely to compute apply-time fingerprints.
-    pub fn gc_row_candidates_for_health(
+    pub(crate) fn gc_row_candidates_for_health(
         &self,
         event_cutoff: i64,
         gate_cutoff: i64,
