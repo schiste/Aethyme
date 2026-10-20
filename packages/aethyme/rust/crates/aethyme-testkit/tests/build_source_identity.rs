@@ -16,15 +16,23 @@ fn checked(command: &mut Command) -> String {
 }
 
 fn clear_git_environment(command: &mut Command) {
-    let inherited_git_variables = std::env::vars_os()
+    const BUILD_IDENTITY_VARIABLES: [&str; 6] = [
+        "AETHYME_GIT_COMMIT",
+        "AETHYME_GIT_DESCRIBE",
+        "AETHYME_GIT_REVISION",
+        "AETHYME_BROKER_GIT_COMMIT",
+        "AETHYME_BROKER_GIT_DESCRIBE",
+        "AETHYME_BROKER_GIT_REVISION",
+    ];
+    let inherited_fixture_variables = std::env::vars_os()
         .filter_map(|(name, _)| {
-            name.to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("GIT_")
-                .then_some(name)
+            let normalized = name.to_string_lossy().to_ascii_uppercase();
+            (normalized.starts_with("GIT_")
+                || BUILD_IDENTITY_VARIABLES.contains(&normalized.as_str()))
+            .then_some(name)
         })
         .collect::<Vec<_>>();
-    for name in inherited_git_variables {
+    for name in inherited_fixture_variables {
         command.env_remove(name);
     }
     // Match the build-script's isolated Git identity profile.
@@ -651,8 +659,8 @@ fn shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds()
         );
         assert_script_fresh(&detached_warm, "detached HEAD stable");
 
-        // Replacement refs and inherited Git environment cannot rewrite this
-        // profile's exact commit + tracked-dirty identity.
+        // Replacement refs and inherited Git/build identity variables cannot
+        // rewrite this profile's exact commit + tracked-dirty identity.
         git(&repo, &["checkout", "--detach", &second]);
         git(
             &repo,
