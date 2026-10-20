@@ -6342,6 +6342,9 @@ mod tests {
             std::fs::read_to_string(detached_fixture_marker(root, "host-state")).unwrap();
         let host_cache =
             std::fs::read_to_string(detached_fixture_marker(root, "host-cache")).unwrap();
+        let preparation_cache =
+            std::fs::read_to_string(detached_fixture_marker(root, "preparation-cache")).unwrap();
+        let root = root.canonicalize().expect("canonicalize detached fixture root");
         command
             .args([
                 "--exact",
@@ -6351,10 +6354,10 @@ mod tests {
             .env(DETACHED_FIXTURE_MODE_ENV, mode)
             .env(DETACHED_FIXTURE_ROOT_ENV, root)
             .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
-            .env("AETHYME_HOST_STATE_DIR", host_state.trim())
-            .env("AETHYME_HOST_CACHE_DIR", host_cache.trim())
             .env_remove(crate::BROKER_DB_ENV)
             .env_remove("AETHYME_TEST_DB_SUFFIX")
+            .env_remove("AETHYME_GATE_BROKER_DATABASES")
+            .env_remove("AETHYME_PREPARATION_CACHE_ROOT")
             .env_remove("AETHYME_WORKTREE_ROOT")
             .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
             .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
@@ -6363,6 +6366,9 @@ mod tests {
             .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
             .env_remove(crate::disk_headroom::TEST_AVAILABLE_BYTES_ENV)
             .env_remove(crate::disk_headroom::TEST_AVAILABLE_INODES_ENV)
+            .env("AETHYME_HOST_STATE_DIR", host_state.trim())
+            .env("AETHYME_HOST_CACHE_DIR", host_cache.trim())
+            .env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache.trim())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -6381,6 +6387,7 @@ mod tests {
         let options = crate::BrokerOpenOptions::default()
             .with_host_state_dir(&state)
             .with_host_cache_dir(marker_path("host-cache"))
+            .with_preparation_cache_root(marker_path("preparation-cache"))
             .with_host_operation_database(state.join("host-operations.db"))
             .with_worktree_root(marker_path("worktree-root"))
             .with_collaboration_state(state.join("collaboration"));
@@ -7654,7 +7661,8 @@ mod tests {
     #[test]
     fn detached_worker_survives_its_launcher_and_resumes_after_a_crash() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let root_path = tmp.path().canonicalize().unwrap();
+        let root = root_path.as_path();
         git(root, &["init", "-q", "-b", "main"]);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
@@ -7671,11 +7679,14 @@ mod tests {
         let worktree_root = tempfile::tempdir().unwrap();
         let host_state = tempfile::tempdir().unwrap();
         let host_cache = tempfile::tempdir().unwrap();
+        let preparation_cache = tempfile::tempdir().unwrap();
         for (name, path) in [
             ("worktree-root", worktree_root.path()),
             ("host-state", host_state.path()),
             ("host-cache", host_cache.path()),
+            ("preparation-cache", preparation_cache.path()),
         ] {
+            let path = path.canonicalize().unwrap();
             std::fs::write(
                 detached_fixture_marker(root, name),
                 path.to_string_lossy().as_ref(),
@@ -7901,9 +7912,17 @@ mod tests {
         }
 
         let resumed = detached_fixture_command(root, "resume-child")
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
             .unwrap();
-        assert!(resumed.success());
+        assert!(
+            resumed.status.success(),
+            "resume child failed with status {:?}: stdout={} stderr={}",
+            resumed.status.code(),
+            String::from_utf8_lossy(&resumed.stdout),
+            String::from_utf8_lossy(&resumed.stderr),
+        );
         assert!(detached_fixture_marker(root, "child-resumed").is_file());
         assert!(!closed_cache.exists());
         assert!(active_cache.join("debug/keep.txt").is_file());

@@ -9,8 +9,8 @@ use std::process::{Command, Output};
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
-fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+fn git_output(repo: &Path, args: &[&str]) -> Output {
+    Command::new("git")
         .args(args)
         .current_dir(repo)
         .env("GIT_AUTHOR_NAME", "t")
@@ -18,7 +18,11 @@ fn git(repo: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = git_output(repo, args);
     assert!(
         output.status.success(),
         "git {args:?}: {}",
@@ -38,6 +42,36 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
     .unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "init"]);
+    let head = git_output(repo.path(), &["rev-parse", "HEAD"]);
+    assert!(
+        head.status.success(),
+        "read fixture HEAD: {}",
+        String::from_utf8_lossy(&head.stderr)
+    );
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    git(repo.path(), &["update-ref", "refs/remotes/origin/main", &head]);
+    git(
+        repo.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(repo.path(), &["config", "remote.origin.url", "."]);
+    git(
+        repo.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(repo.path(), &["config", "branch.main.remote", "origin"]);
+    git(
+        repo.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
     std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
     std::fs::write(repo.path().join(".aethyme/broker.toml"), retention).unwrap();
     discover_artifact_sweep_namespace(repo.path(), container.path());
@@ -106,9 +140,14 @@ fn run_as_is(repo: &Path, container: &Path, args: &[&str]) -> Output {
 }
 
 fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -> Output {
+    let owner = owner.canonicalize().expect("canonicalize fixture owner");
+    let cwd = cwd.canonicalize().expect("canonicalize fixture working tree");
+    let container = container
+        .canonicalize()
+        .expect("canonicalize fixture worktree root");
     common::broker_cli(CLI, args)
         .current_dir(cwd)
-        .env("AETHYME_WORKTREE_ROOT", container)
+        .env("AETHYME_WORKTREE_ROOT", &container)
         .env(
             "AETHYME_HOST_STATE_DIR",
             owner.join(".git/aethyme-test-state"),
