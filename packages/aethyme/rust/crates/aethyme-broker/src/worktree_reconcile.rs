@@ -66,13 +66,30 @@ impl ReconciledDirectory {
 
 pub const WORKTREE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 
+/// Why a read-only worktree inventory was deferred before scanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeReconciliationDeferredReason {
+    /// A newly-created broker database has not yet explicitly created and
+    /// bound its repository worktree root.
+    FreshRootUnbound,
+    /// An existing database has not had its repository worktree root explicitly
+    /// adopted.
+    LegacyRootUnbound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorktreeReconciliation {
     pub schema_version: u32,
     /// False when a bounded report stopped before it finished reading all
-    /// roots. Counts then describe only the observed prefix.
+    /// roots, or when scanning was safely deferred. Counts then describe only
+    /// the observed prefix; a deferred report has zero scanned roots.
     #[serde(default = "default_complete", skip_serializing_if = "is_complete")]
     pub complete: bool,
+    /// Present when the broker could not safely scan a repository worktree
+    /// root. Absence means the scan either completed or stopped at its budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_reason: Option<WorktreeReconciliationDeferredReason>,
     /// Broker-owned roots actually scanned. Zero means the sweep found no root
     /// to look at, which is different from finding a root that was empty.
     pub scanned_root_count: usize,
@@ -86,6 +103,23 @@ pub struct WorktreeReconciliation {
     /// Whether every unclaimed directory carries a byte estimate.
     pub sized: bool,
     pub unclaimed: Vec<UnclaimedDirectory>,
+}
+
+impl WorktreeReconciliation {
+    pub(crate) fn deferred(reason: WorktreeReconciliationDeferredReason) -> Self {
+        Self {
+            schema_version: WORKTREE_RECONCILIATION_SCHEMA_VERSION,
+            complete: false,
+            deferred_reason: Some(reason),
+            scanned_root_count: 0,
+            directory_count: 0,
+            claimed_count: 0,
+            unclaimed_count: 0,
+            unclaimed_bytes: 0,
+            sized: false,
+            unclaimed: Vec::new(),
+        }
+    }
 }
 
 fn default_complete() -> bool {
@@ -149,6 +183,7 @@ pub fn summarise(
     WorktreeReconciliation {
         schema_version: WORKTREE_RECONCILIATION_SCHEMA_VERSION,
         complete: true,
+        deferred_reason: None,
         scanned_root_count,
         directory_count: reconciled.len(),
         claimed_count: reconciled.len() - unclaimed.len(),

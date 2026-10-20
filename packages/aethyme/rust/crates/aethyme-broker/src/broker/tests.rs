@@ -390,6 +390,117 @@ fn verification_runtime_infrastructure_is_ignored_but_a_user_run_directory_is_vi
 }
 
 #[test]
+fn fresh_unbound_status_defers_worktree_inventory_without_provisioning_storage() {
+    let (repo, _) = landing_fixture();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    assert_unbound_status_defers_without_storage_writes(
+        &broker,
+        &storage,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound,
+        crate::WorktreeReconciliationDeferredReason::FreshRootUnbound,
+    );
+
+    // The same status path returns a complete inventory after the explicit
+    // root-creating operation has established the durable binding.
+    broker.start_worktree("bound status fixture", None).unwrap();
+    let bound = broker.status_current_snapshot(0).unwrap();
+    assert!(
+        bound.cleanup_retention.reconciliation.complete,
+        "{bound:#?}"
+    );
+    assert_eq!(bound.cleanup_retention.reconciliation.deferred_reason, None);
+    let bound_json = serde_json::to_value(&bound).unwrap();
+    assert!(
+        bound_json["cleanup_retention"]["reconciliation"]
+            .get("deferred_reason")
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_unbound_status_defers_worktree_inventory_without_provisioning_storage() {
+    let (repo, _) = landing_fixture();
+    let local_database = repo.path().join(".aethyme/broker.db");
+    std::fs::create_dir_all(local_database.parent().unwrap()).unwrap();
+
+    // BrokerStore::open follows the ordinary existing-database path, which
+    // records legacy_unbound rather than fresh bootstrap provenance.
+    let legacy_store = crate::BrokerStore::open(&local_database).unwrap();
+    assert_eq!(
+        legacy_store.repository_worktree_binding().unwrap().state,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound
+    );
+    drop(legacy_store);
+
+    let storage = crate::test_storage::TestStorage::new();
+    let broker = storage.open(repo.path()).unwrap();
+    assert_unbound_status_defers_without_storage_writes(
+        &broker,
+        &storage,
+        crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound,
+        crate::WorktreeReconciliationDeferredReason::LegacyRootUnbound,
+    );
+}
+
+fn assert_unbound_status_defers_without_storage_writes(
+    broker: &super::Broker,
+    storage: &crate::test_storage::TestStorage,
+    expected_state: crate::store::repository_binding::RepositoryWorktreeBindingState,
+    expected_reason: crate::WorktreeReconciliationDeferredReason,
+) {
+    let root = storage.worktree_root();
+    let preparation_cache = storage.root().join("preparation-cache");
+    let registry = crate::worktree_registry::registry_path(
+        &storage.host_state_dir().join("host-operations.db"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        expected_state
+    );
+    assert!(
+        !root.exists(),
+        "broker open does not provision the worktree root"
+    );
+    assert!(
+        !registry.exists(),
+        "broker open does not create a root registry"
+    );
+    let cache_entries_before = std::fs::read_dir(&preparation_cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    let status = broker.status_current_snapshot(0).unwrap();
+    let reconciliation = &status.cleanup_retention.reconciliation;
+    assert!(!reconciliation.complete, "{status:#?}");
+    assert_eq!(reconciliation.deferred_reason, Some(expected_reason));
+    assert_eq!(reconciliation.scanned_root_count, 0);
+    assert!(!status.cleanup_retention.inventory_complete, "{status:#?}");
+    let serialized = serde_json::to_value(&status).unwrap();
+    assert_eq!(
+        serialized["cleanup_retention"]["reconciliation"]["deferred_reason"],
+        serde_json::to_value(expected_reason).unwrap()
+    );
+    assert_eq!(
+        broker.store().repository_worktree_binding().unwrap().state,
+        expected_state
+    );
+    assert!(!root.exists(), "status does not create a worktree root");
+    assert!(!registry.exists(), "status does not create a root registry");
+    assert_eq!(
+        std::fs::read_dir(&preparation_cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        cache_entries_before,
+        "status does not mutate the already-enrolled preparation cache"
+    );
+}
+
+#[test]
 fn slugify_is_safe_for_branches_and_paths() {
     assert_eq!(slugify("Fix auth bug!"), "fix-auth-bug");
     assert_eq!(slugify("  weird///name  "), "weird-name");
@@ -787,6 +898,7 @@ fn cleanup_retention_severity_scales_by_count_bytes_and_policy_age() {
         reconciliation: crate::WorktreeReconciliation {
             schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,
             complete: true,
+            deferred_reason: None,
             scanned_root_count: 0,
             directory_count: 0,
             claimed_count: 0,

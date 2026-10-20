@@ -655,7 +655,8 @@ pub use version::{
 pub use worktree_reconcile::{
     DirectoryClaim, ObservedDirectory, ReconciledDirectory, UnclaimedDirectory,
     WORKTREE_RECONCILIATION_SCHEMA_VERSION, WorktreeReconciliation,
-    reconcile as reconcile_worktree_directories, summarise as summarise_worktree_reconciliation,
+    WorktreeReconciliationDeferredReason, reconcile as reconcile_worktree_directories,
+    summarise as summarise_worktree_reconciliation,
 };
 pub use worktree_report::{
     GitWorktreeState, SizeSource, WORKTREE_REPORT_SIZE_BUDGET, WorkState, WorktreeReport,
