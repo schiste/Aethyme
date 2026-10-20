@@ -889,15 +889,13 @@ fn measure_pr_size(main_root: &Path, base_ref: &str, head: &str) -> Option<crate
     }
     let files = crate::parse_numstat_z(&String::from_utf8_lossy(&output.stdout));
     let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
-    let classification = crate::classify_change(
-        &policy,
-        &crate::ChangeInputs {
-            generated: crate::linguist_generated_paths(main_root, base_ref, &paths),
-            files,
-            ..Default::default()
-        },
-    );
-    Some(crate::pr_size_report(&policy, &classification))
+    let inputs = crate::ChangeInputs {
+        generated: crate::linguist_generated_paths(main_root, base_ref, &paths),
+        files,
+        ..Default::default()
+    };
+    let classification = crate::classify_change(&policy, &inputs);
+    Some(crate::pr_size_report(&policy, &classification).with_diff_totals(&inputs.files))
 }
 
 #[cfg(test)]

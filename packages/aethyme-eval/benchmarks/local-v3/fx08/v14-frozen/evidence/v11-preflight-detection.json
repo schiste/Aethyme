@@ -1,0 +1,7 @@
+{
+  "frozen_revision": "aeb15bce9b7fe5ac97ebaf822cf59e84de75aee3",
+  "agent_invocations": 0,
+  "issue": "The runner script still resolved fx08-v10-frozen rather than the v11 freeze tag.",
+  "detection": "Static inspection before running the pilot found a hard-coded tag in freeze_revision() and matching v10 labels in the report.",
+  "disposition": "Preserve v11 as-is; v12 reads the freeze tag from its frozen config and validates that reference before any agent invocation."
+}

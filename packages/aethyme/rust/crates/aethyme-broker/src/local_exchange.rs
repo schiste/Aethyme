@@ -223,7 +223,7 @@ impl PeerSpec {
             return Err(invalid("peer subject"));
         }
         if self.max_attempts == 0
-            || i64::from(self.max_attempts) > crate::delivery::MAX_DELIVERY_ATTEMPTS
+            || i64::from(self.max_attempts) > crate::outbox::MAX_DELIVERY_ATTEMPTS
             || !(1..=30).contains(&self.deadline_seconds)
         {
             return Err(invalid("finite peer limits"));

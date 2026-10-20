@@ -382,7 +382,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("operations stats", &["--repo", "--limit"]),
     (
         "operations reconcile",
-        &["--operation", "--outcome", "--reason"],
+        &["--operation", "--outcome", "--inspect-remote", "--reason"],
     ),
     ("blockers", &[]),
     ("unblock", &["--outcome", "--reason", "--confirm"]),

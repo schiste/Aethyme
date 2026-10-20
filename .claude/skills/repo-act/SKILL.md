@@ -22,6 +22,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
+- Choose focused local Cargo checks by compilation target as well as test name.
+  A name filter selects cases at runtime; `--lib` still compiles the full unit-test
+  target. Start with a relevant integration-test target when available, keep one
+  Cargo worker, and retain the remaining unit coverage as pending qualification.
+  A resource-stopped compile provides no test result.
 - Smoke-test each binary against its own CLI contract. Run read-only probes
   outside a Git checkout with isolated home/state; preserve an unsupported
   command as a failed probe instead of treating it as a successful smoke check.
@@ -59,11 +64,18 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   capabilities in the actual interpreter at every spawn entrypoint. For owned
   groups, retain the leader unreaped through bounded TERM/KILL cleanup, probe
   non-zombie members, reap once, then probe final group absence; never signal
-  the group after reaping. Refuse when ownership or capabilities are unknown.
+  the group after reaping. A TERM/KILL error can be discharged only after the
+  leader is reaped and a successful final probe proves group absence; EPERM
+  itself never proves absence. Refuse when ownership or capabilities are unknown.
   Test early leader exits with open and closed pipes, setup and monitoring
   exceptions, and finite deadlines for every synthetic process. Original group
   absence proves only that group's absence; it says nothing about escaped or
   detached descendants.
+- When verifying mutable file inputs, open with no-follow and nonblocking flags
+  before checking the descriptor is a regular file. A path replaced with a FIFO
+  can block an ordinary read-only open before the type check. Verify bounded,
+  stable bytes through that same descriptor; include a finite FIFO refusal
+  control that cannot start the expensive work.
 - Before adding strict validation or recovery for persisted data, inspect every
   production writer and test its exact serialized bytes. Accept only known
   producer encodings, and bind the exact observed bytes across plan/apply when
@@ -121,6 +133,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   positive Cargo run; a `cp -p` restore can otherwise reuse mutation output. If
   restoration cannot be proven, retain the lock and backup and report cleanup
   as unknown. SIGKILL or power loss may require manual recovery.
+  Bound mutation readback and restoration by the larger of the exact original
+  and mutant byte lengths plus one byte. Before touching source, exercise the
+  actual mutation and restoration on scratch files seeded with pinned source bytes;
+  equal-sized toy replacements cannot validate a size-changing mutation.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only

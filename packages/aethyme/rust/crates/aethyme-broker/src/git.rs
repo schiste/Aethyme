@@ -7,6 +7,7 @@
 //! throwaway repositories.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,6 +16,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Bound the effective config copied into a one-shot exact-endpoint query.
+/// It is captured from the real checkout, but replayed in an isolated Gitdir
+/// after URL rewrite rules and include directives have been removed.
+const MAX_PUSH_QUERY_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_PUSH_QUERY_CONFIG_ENTRIES: usize = 256;
+const PUSH_EVIDENCE_REMOTE: &str = "aethyme-push-evidence";
 
 thread_local! {
     /// A command-scoped deadline for callers that need a tighter bound than
@@ -1256,6 +1264,417 @@ fn run_git_command_output(
     Ok(output)
 }
 
+#[derive(Debug, Clone)]
+struct GitConfigEntry {
+    key: String,
+    value: String,
+}
+
+/// Capture the effective config once, with a strict memory and entry bound.
+/// `--includes` expands conditional includes in the source checkout; replay
+/// later drops the include directives themselves so they cannot be resolved
+/// again against the temporary Gitdir.
+fn capture_bounded_git_config(root: &Path) -> Result<Vec<GitConfigEntry>, GitError> {
+    const DISPLAY_ARGS: &str = "config --null --list --includes";
+    let mut command = git_command();
+    command
+        .args(["config", "--null", "--list", "--includes"])
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let output = match crate::bounded_output::output_limited(
+        &mut command,
+        git_timeout(),
+        MAX_PUSH_QUERY_CONFIG_BYTES,
+    )
+    .map_err(|source| GitError::Spawn {
+        args: DISPLAY_ARGS.into(),
+        source,
+    })? {
+        crate::bounded_output::LimitedOutput::Completed(output) => output,
+        crate::bounded_output::LimitedOutput::Deadline => {
+            return Err(GitError::TimedOut {
+                args: DISPLAY_ARGS.into(),
+                seconds: git_timeout().as_secs().max(1),
+            });
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => {
+            return Err(GitError::Git {
+                args: DISPLAY_ARGS.into(),
+                stderr: "effective Git configuration exceeded its bounded capture limit".into(),
+            });
+        }
+    };
+    if !output.status.success() {
+        return Err(GitError::Git {
+            args: DISPLAY_ARGS.into(),
+            stderr: "effective Git configuration could not be captured".into(),
+        });
+    }
+
+    parse_bounded_git_config(&output.stdout)
+}
+
+fn parse_bounded_git_config(bytes: &[u8]) -> Result<Vec<GitConfigEntry>, GitError> {
+    const DISPLAY_ARGS: &str = "config --null --list --includes";
+    if bytes.len() > MAX_PUSH_QUERY_CONFIG_BYTES {
+        return Err(GitError::Git {
+            args: DISPLAY_ARGS.into(),
+            stderr: "effective Git configuration exceeded its bounded capture limit".into(),
+        });
+    }
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        return Err(GitError::Git {
+            args: DISPLAY_ARGS.into(),
+            stderr: "effective Git configuration was truncated".into(),
+        });
+    }
+    let mut entries = Vec::new();
+    if bytes.is_empty() {
+        return Ok(entries);
+    }
+    for record in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        if entries.len() >= MAX_PUSH_QUERY_CONFIG_ENTRIES {
+            return Err(GitError::Git {
+                args: DISPLAY_ARGS.into(),
+                stderr: "effective Git configuration exceeded its bounded entry limit".into(),
+            });
+        }
+        let Some(separator) = record.iter().position(|byte| *byte == b'\n') else {
+            return Err(GitError::Git {
+                args: DISPLAY_ARGS.into(),
+                stderr: "effective Git configuration contained a valueless or malformed entry"
+                    .into(),
+            });
+        };
+        let key = std::str::from_utf8(&record[..separator]).map_err(|_| GitError::Git {
+            args: DISPLAY_ARGS.into(),
+            stderr: "effective Git configuration contained a non-UTF-8 key".into(),
+        })?;
+        let value = std::str::from_utf8(&record[separator + 1..]).map_err(|_| GitError::Git {
+            args: DISPLAY_ARGS.into(),
+            stderr: "effective Git configuration contained a non-UTF-8 value".into(),
+        })?;
+        if key.is_empty() {
+            return Err(GitError::Git {
+                args: DISPLAY_ARGS.into(),
+                stderr: "effective Git configuration contained an empty key".into(),
+            });
+        }
+        entries.push(GitConfigEntry {
+            key: key.into(),
+            value: value.into(),
+        });
+    }
+    Ok(entries)
+}
+
+fn is_remote_config_key(key: &str) -> bool {
+    key.get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("remote."))
+}
+
+fn is_rewrite_or_include_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    (lower.starts_with("url.")
+        && (lower.ends_with(".insteadof") || lower.ends_with(".pushinsteadof")))
+        || lower == "include.path"
+        || (lower.starts_with("includeif.") && lower.ends_with(".path"))
+}
+
+fn is_repository_context_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "core.bare" | "core.worktree" | "core.repositoryformatversion"
+    ) || lower.starts_with("extensions.")
+}
+
+fn selected_remote_option<'a>(key: &'a str, remote: &str) -> Option<&'a str> {
+    if !is_remote_config_key(key) {
+        return None;
+    }
+    let section = key.get(7..)?;
+    let (name, option) = section.rsplit_once('.')?;
+    (name == remote).then_some(option)
+}
+
+fn push_query_config(
+    entries: &[GitConfigEntry],
+    remote: &str,
+    exact_url: &str,
+) -> Result<Vec<GitConfigEntry>, GitError> {
+    if exact_url.len() > MAX_PUSH_QUERY_CONFIG_BYTES {
+        return Err(GitError::Git {
+            args: "ls-remote --refs <endpoint>".into(),
+            stderr: "push endpoint exceeded its bounded replay limit".into(),
+        });
+    }
+    let mut replay = Vec::with_capacity(entries.len() + 1);
+    for entry in entries {
+        if is_rewrite_or_include_key(&entry.key) || is_repository_context_key(&entry.key) {
+            continue;
+        }
+        if is_remote_config_key(&entry.key) {
+            if let Some(option) = selected_remote_option(&entry.key, remote) {
+                if option.eq_ignore_ascii_case("url") || option.eq_ignore_ascii_case("pushurl") {
+                    continue;
+                }
+                replay.push(GitConfigEntry {
+                    key: format!("remote.{PUSH_EVIDENCE_REMOTE}.{option}"),
+                    value: entry.value.clone(),
+                });
+            }
+            continue;
+        }
+        replay.push(entry.clone());
+    }
+    replay.push(GitConfigEntry {
+        key: format!("remote.{PUSH_EVIDENCE_REMOTE}.url"),
+        value: exact_url.into(),
+    });
+    let replay_bytes = replay.iter().try_fold(0usize, |total, entry| {
+        total
+            .checked_add(entry.key.len())
+            .and_then(|total| total.checked_add(entry.value.len()))
+    });
+    if replay.len() > MAX_PUSH_QUERY_CONFIG_ENTRIES
+        || replay_bytes.is_none_or(|bytes| bytes > MAX_PUSH_QUERY_CONFIG_BYTES)
+    {
+        return Err(GitError::Git {
+            args: "ls-remote --refs <endpoint>".into(),
+            stderr: "effective Git configuration exceeded its bounded replay limit".into(),
+        });
+    }
+    Ok(replay)
+}
+
+/// Remove inherited repository/config routing and then use an isolated bare
+/// Gitdir. Other effective config is explicitly replayed by the caller, so
+/// credential helpers and transport settings retain their source-checkout
+/// values while URL rewrite rules cannot be applied a second time.
+fn clear_git_repository_context(command: &mut Command, empty_global: &Path) {
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_PREFIX",
+        "GIT_CONFIG",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", empty_global);
+}
+
+fn exact_push_endpoint_output(
+    root: &Path,
+    remote: &str,
+    exact_url: &str,
+    destinations: &[String],
+    display_args: &str,
+) -> Result<std::process::Output, GitError> {
+    if exact_url.len() > MAX_PUSH_QUERY_CONFIG_BYTES
+        || exact_url.is_empty()
+        || exact_url.chars().any(char::is_control)
+    {
+        return Err(GitError::Git {
+            args: display_args.into(),
+            stderr: "push endpoint was empty or malformed".into(),
+        });
+    }
+    let captured = capture_bounded_git_config(root)?;
+    let replay = push_query_config(&captured, remote, exact_url)?;
+    let private = tempfile::tempdir().map_err(|source| GitError::Spawn {
+        args: display_args.into(),
+        source,
+    })?;
+    let empty_global = private.path().join("empty-global-config");
+    fs::write(&empty_global, []).map_err(|source| GitError::Spawn {
+        args: display_args.into(),
+        source,
+    })?;
+    let empty_template = private.path().join("empty-template");
+    fs::create_dir(&empty_template).map_err(|source| GitError::Spawn {
+        args: display_args.into(),
+        source,
+    })?;
+    let isolated_git_dir = private.path().join("gitdir");
+
+    let mut init = git_command();
+    clear_git_repository_context(&mut init, &empty_global);
+    init.args(["init", "--quiet", "--bare", "--template"])
+        .arg(&empty_template)
+        .arg(&isolated_git_dir)
+        .current_dir(private.path());
+    let init_output = run_git_process_output(
+        init,
+        &["init --quiet --bare --template <private> <private>"],
+        git_timeout(),
+    )?;
+    if !init_output.status.success() {
+        return Err(GitError::Git {
+            args: "init --quiet --bare --template <private> <private>".into(),
+            stderr: "could not initialize isolated remote-query Gitdir".into(),
+        });
+    }
+
+    let mut command = git_command();
+    command
+        .args(["ls-remote", "--refs", PUSH_EVIDENCE_REMOTE])
+        .args(destinations)
+        .current_dir(root);
+    clear_git_repository_context(&mut command, &empty_global);
+    command.env("GIT_DIR", &isolated_git_dir);
+    for (index, entry) in replay.iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), &entry.key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), &entry.value);
+    }
+    command.env("GIT_CONFIG_COUNT", replay.len().to_string());
+    run_git_process_output(command, &[display_args], git_timeout())
+}
+
+#[cfg(test)]
+mod exact_push_endpoint_config_tests {
+    use super::{
+        GitConfigEntry, MAX_PUSH_QUERY_CONFIG_BYTES, MAX_PUSH_QUERY_CONFIG_ENTRIES,
+        PUSH_EVIDENCE_REMOTE, is_repository_context_key, parse_bounded_git_config,
+        push_query_config,
+    };
+
+    fn entry(key: &str, value: &str) -> GitConfigEntry {
+        GitConfigEntry {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn replay_drops_rewrites_and_includes_but_keeps_auth_and_selected_remote_options() {
+        let entries = vec![
+            entry("url.file:///peer-b.insteadof", "file:///peer-a"),
+            entry("url.file:///peer-b.pushinsteadof", "push-peer-a"),
+            entry("include.path", "/private/config/auth.inc"),
+            entry(
+                "includeif.gitdir:/repo/.path",
+                "/private/config/conditional.inc",
+            ),
+            entry("credential.helper", "credential-helper --use-keychain"),
+            entry("core.sshcommand", "ssh -F relative-config"),
+            entry("core.bare", "false"),
+            entry("core.worktree", "/source/repository"),
+            entry("core.repositoryformatversion", "1"),
+            entry("extensions.objectformat", "sha256"),
+            entry(
+                "http.https://peer.example/.extraheader",
+                "Authorization: secret",
+            ),
+            entry("remote.publication.url", "push-peer-a"),
+            entry("remote.publication.pushurl", "file:///peer-b"),
+            entry("remote.publication.uploadpack", "git-upload-pack --strict"),
+            entry("remote.publication.proxy", "http://proxy.example"),
+            entry("remote.other.uploadpack", "unexpected-helper"),
+        ];
+
+        let replay = push_query_config(&entries, "publication", "file:///peer-a").unwrap();
+        assert!(!replay.iter().any(|entry| {
+            let key = entry.key.to_ascii_lowercase();
+            key.starts_with("url.")
+                || key == "include.path"
+                || (key.starts_with("includeif.") && key.ends_with(".path"))
+        }));
+        assert!(replay.iter().any(|entry| {
+            entry.key == "credential.helper" && entry.value == "credential-helper --use-keychain"
+        }));
+        assert!(replay.iter().any(|entry| {
+            entry.key == "core.sshcommand" && entry.value == "ssh -F relative-config"
+        }));
+        assert!(
+            !replay
+                .iter()
+                .any(|entry| { is_repository_context_key(&entry.key) })
+        );
+        assert!(replay.iter().any(|entry| {
+            entry.key == "http.https://peer.example/.extraheader"
+                && entry.value == "Authorization: secret"
+        }));
+        assert!(
+            replay
+                .iter()
+                .any(|entry| { entry.key == format!("remote.{PUSH_EVIDENCE_REMOTE}.uploadpack") })
+        );
+        assert!(
+            replay
+                .iter()
+                .any(|entry| entry.key == format!("remote.{PUSH_EVIDENCE_REMOTE}.proxy"))
+        );
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|entry| entry.key == format!("remote.{PUSH_EVIDENCE_REMOTE}.url"))
+                .map(|entry| entry.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file:///peer-a"]
+        );
+        assert!(
+            !replay
+                .iter()
+                .any(|entry| entry.value == "unexpected-helper")
+        );
+        assert!(!replay.iter().any(|entry| {
+            entry.key == "remote.publication.url" || entry.key == "remote.publication.pushurl"
+        }));
+    }
+
+    #[test]
+    fn config_capture_refuses_oversize_truncated_valueless_and_non_utf8_data() {
+        assert!(parse_bounded_git_config(&vec![b'x'; MAX_PUSH_QUERY_CONFIG_BYTES + 1]).is_err());
+        assert!(parse_bounded_git_config(b"core.example\nvalue").is_err());
+        assert!(parse_bounded_git_config(b"core.flag\0").is_err());
+        assert!(parse_bounded_git_config(b"core.example\n\xff\0").is_err());
+        assert_eq!(
+            parse_bounded_git_config(b"credential.helper\n\0").unwrap()[0]
+                .value
+                .as_str(),
+            ""
+        );
+
+        let mut too_many = Vec::new();
+        for _ in 0..=MAX_PUSH_QUERY_CONFIG_ENTRIES {
+            too_many.extend_from_slice(b"core.example\nvalue\0");
+        }
+        assert!(parse_bounded_git_config(&too_many).is_err());
+    }
+
+    #[test]
+    fn replay_refuses_a_query_config_that_exceeds_the_byte_bound() {
+        let oversized = "x".repeat(MAX_PUSH_QUERY_CONFIG_BYTES + 1);
+        assert!(push_query_config(&[], "publication", &oversized).is_err());
+
+        let full_capture = vec![entry(
+            "core.value",
+            &"x".repeat(MAX_PUSH_QUERY_CONFIG_BYTES),
+        )];
+        assert!(push_query_config(&full_capture, "publication", "x").is_err());
+
+        let full_entry_count = (0..MAX_PUSH_QUERY_CONFIG_ENTRIES)
+            .map(|index| entry(&format!("core.option{index}"), "value"))
+            .collect::<Vec<_>>();
+        assert!(push_query_config(&full_entry_count, "publication", "x").is_err());
+    }
+}
+
 /// Run Git within its ordinary timeout, or the remaining part of the
 /// enclosing interactive inspection deadline. Unlike
 /// [`run_git_command_output`], this preserves non-zero exit status for
@@ -1421,12 +1840,18 @@ impl GitRepo {
     pub fn discover(path: &Path) -> Result<Self, GitError> {
         let root =
             run_git(path, &["rev-parse", "--show-toplevel"]).map_err(|error| match error {
-                GitError::Git { .. } => GitError::NotARepository {
-                    path: path.to_path_buf(),
-                },
-                // A deadline or an unavailable/untrusted Git executable says
-                // nothing about whether the checkout is a repository. Preserve
-                // that cause so cleanup can report its real blocker and retry.
+                GitError::Git { args, stderr }
+                    if args == "rev-parse --show-toplevel"
+                        && stderr.to_ascii_lowercase().contains("not a git repository") =>
+                {
+                    GitError::NotARepository {
+                        path: path.to_path_buf(),
+                    }
+                }
+                // A timeout, spawn failure, or unrelated Git error says nothing
+                // about whether the path belongs to a repository. Preserve the
+                // original invocation and failure instead of disguising it as an
+                // invalid checkout.
                 other => other,
             })?;
         Ok(Self {
@@ -1748,18 +2173,29 @@ impl GitRepo {
         remote: &str,
         destinations: &[String],
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
-        self.observe_remote_ref_oids(remote, destinations, true)
+        self.observe_remote_ref_oids(remote, destinations, true, None)
     }
 
-    /// Observe a configured fetch endpoint directly. Git expands its URL once,
-    /// so chained `insteadOf` rules cannot rewrite an already-expanded URL.
-    /// Callers observing publication must first establish equal fetch/push URLs.
+    /// Bind the endpoint actually queried to the original operation identity.
+    pub(crate) fn checked_push_remote_ref_oids(
+        &self,
+        remote: &str,
+        recorded_repository: &str,
+        destinations: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, GitError> {
+        self.observe_remote_ref_oids(remote, destinations, true, Some(recorded_repository))
+    }
+
+    /// Observe the configured fetch endpoint through its remote alias. Push
+    /// observations instead capture the verified push URL and query it in an
+    /// isolated Gitdir with URL rewrites removed. Callers observing publication
+    /// must first establish equal fetch/push URLs.
     pub(crate) fn remote_fetch_ref_oids(
         &self,
         remote: &str,
         destinations: &[String],
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
-        self.observe_remote_ref_oids(remote, destinations, false)
+        self.observe_remote_ref_oids(remote, destinations, false, None)
     }
 
     fn observe_remote_ref_oids(
@@ -1767,21 +2203,27 @@ impl GitRepo {
         remote: &str,
         destinations: &[String],
         push_endpoint: bool,
+        recorded_repository: Option<&str>,
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
         let display_args = format!("ls-remote --refs <endpoint> {}", destinations.join(" "));
-        let mut command = git_command();
-        if push_endpoint {
-            let push_url = run_git(&self.root, &["remote", "get-url", "--push", remote])?;
-            command
-                .args(["ls-remote", "--refs", "aethyme-push-evidence"])
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "remote.aethyme-push-evidence.url")
-                .env("GIT_CONFIG_VALUE_0", push_url);
+        let output = if push_endpoint {
+            let push_url = match recorded_repository {
+                Some(repository) => crate::remote_target::inspection_push_url(
+                    self, remote, repository,
+                )
+                .map_err(|_| GitError::Git {
+                    args: "inspect recorded push endpoint".into(),
+                    stderr: "push endpoint identity could not be verified".into(),
+                })?,
+                None => run_git(&self.root, &["remote", "get-url", "--push", remote])?,
+            };
+            exact_push_endpoint_output(&self.root, remote, &push_url, destinations, &display_args)?
         } else {
+            let mut command = git_command();
             command.args(["ls-remote", "--refs", remote]);
-        }
-        command.args(destinations).current_dir(&self.root);
-        let output = run_git_process_output(command, &[&display_args], git_timeout())?;
+            command.args(destinations).current_dir(&self.root);
+            run_git_process_output(command, &[&display_args], git_timeout())?
+        };
         if !output.status.success() {
             return Err(GitError::Git {
                 args: display_args,

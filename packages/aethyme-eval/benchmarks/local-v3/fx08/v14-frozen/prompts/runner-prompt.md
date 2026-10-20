@@ -1,0 +1,1 @@
+Read HANDOFF.md before editing. It contains a previous contributor decision brief, or an explicit statement that none was provided. Then read TASK.md and complete the follow-up request. Run relevant checks that are available and report briefly what changed.

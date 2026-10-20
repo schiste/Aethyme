@@ -19,7 +19,7 @@
 //!   unknown, and every consumer that relaxes something on a clean signal must
 //!   treat unknown as set.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -753,6 +753,40 @@ pub struct PrSizeReport {
     pub over_threshold: bool,
     /// Whether the repository wrote `[review] pr_size` or the default applied.
     pub configured: bool,
+    /// `files` and `changed_lines` apply review-policy exclusions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<ExcludedFile>,
+    /// Unfiltered Git diff totals, when the complete local diff is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_totals: Option<PrDiffTotals>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDiffTotals {
+    pub files: u64,
+    pub changed_lines: u64,
+}
+
+impl PrSizeReport {
+    /// Bind raw totals from the same diff used for classification. Policy
+    /// thresholds continue to apply to the existing filtered review counts.
+    pub fn with_diff_totals(mut self, files: &[ChangedFile]) -> Self {
+        let unique: BTreeMap<&str, &ChangedFile> = files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        self.diff_totals = Some(PrDiffTotals {
+            files: unique.len() as u64,
+            changed_lines: unique
+                .values()
+                .map(|file| match (file.added, file.deleted) {
+                    (Some(added), Some(deleted)) => added + deleted,
+                    _ => 0,
+                })
+                .sum(),
+        });
+        self
+    }
 }
 
 /// Compare a change against `[review] pr_size`.
@@ -767,6 +801,8 @@ pub fn pr_size_report(
         changed_lines: classification.size.churn,
         over_threshold: classification.tier == SizeTier::Large,
         configured: policy.pr_size_configured,
+        excluded: classification.size.excluded.clone(),
+        diff_totals: None,
     }
 }
 
@@ -1009,6 +1045,34 @@ mod tests {
         let b = inputs(vec![file("a.rs", 2, 0), file("b.rs", 1, 0)]);
         let policy = ChangeClassificationPolicy::default();
         assert_eq!(classify(&policy, &a), classify(&policy, &b));
+    }
+
+    #[test]
+    fn pr_size_distinguishes_review_counts_from_unfiltered_diff_totals() {
+        let policy = ChangeClassificationPolicy::default();
+        let mut i = inputs(vec![file("src/main.rs", 3, 2), file("generated.rs", 11, 3)]);
+        i.generated = Some(BTreeSet::from(["generated.rs".to_string()]));
+        let c = classify(&policy, &i);
+        let report = pr_size_report(&policy, &c).with_diff_totals(&i.files);
+        assert_eq!(report.files, 1);
+        assert_eq!(report.changed_lines, 5);
+        let raw = report.diff_totals.as_ref().unwrap();
+        assert_eq!(raw.files, 2);
+        assert_eq!(raw.changed_lines, 19);
+        assert_eq!(
+            report.excluded,
+            vec![ExcludedFile {
+                path: "generated.rs".into(),
+                why: "generated".into()
+            }]
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["diff_totals"]["changed_lines"], 19);
+        assert_eq!(value["changed_lines"], 5);
+        assert_eq!(
+            report.over_threshold,
+            pr_size_report(&policy, &c).over_threshold
+        );
     }
 
     #[test]
