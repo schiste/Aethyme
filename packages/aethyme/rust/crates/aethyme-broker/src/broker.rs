@@ -2323,6 +2323,9 @@ pub struct GuardedExecReport {
     pub command: Vec<String>,
     pub exit_code: Option<i32>,
     pub command_success: bool,
+    /// The post-execution ownership audit, independent of the child exit status.
+    pub ownership_ok: bool,
+    pub conflicting_leases: Vec<LeaseBlocker>,
     pub before_dirty_paths: Vec<String>,
     pub after_dirty_paths: Vec<String>,
     pub newly_dirty_paths: Vec<String>,
