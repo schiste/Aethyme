@@ -1451,10 +1451,11 @@ fn an_error_after_a_report_keeps_its_exit_code_without_a_second_json_document() 
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let recovery = "blocked; recover with broker reconcile --plan reviewed-digest";
     let (code, rendering) =
-        error_output_for_command(&args, crate::exit_status::REFUSED, "blocked", true);
+        error_output_for_command(&args, crate::exit_status::REFUSED, recovery, true);
     assert_eq!(code, crate::exit_status::REFUSED);
-    assert_eq!(rendering, ErrorRendering::Suppressed);
+    assert_eq!(rendering, ErrorRendering::Diagnostic(recovery.into()));
 
     let report = serde_json::json!({
         "status": "blocked",
@@ -1513,8 +1514,9 @@ fn a_partial_report_write_suppresses_fallback_json_and_keeps_its_exit_code() {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let recovery = "blocked; recover with broker reconcile --plan reviewed-digest";
     let (code, rendering) =
-        error_output_for_command(&args, crate::exit_status::REFUSED, "blocked", attempted);
+        error_output_for_command(&args, crate::exit_status::REFUSED, recovery, attempted);
     assert_eq!(code, crate::exit_status::REFUSED);
-    assert_eq!(rendering, ErrorRendering::Suppressed);
+    assert_eq!(rendering, ErrorRendering::Diagnostic(recovery.into()));
 }

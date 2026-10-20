@@ -344,15 +344,17 @@ fn push_is_refused_until_the_repository_authorizes_it() {
     let refused = fixture.push(session, &[]);
     assert!(!refused.status.success());
     assert!(
-        stderr(&refused).contains("delivery.push_session_branches"),
+        json_error::message(&refused).contains("delivery.push_session_branches"),
         "{}",
-        stderr(&refused)
+        json_error::message(&refused)
     );
     assert_eq!(fixture.remote_branch(&branch), None);
 
     // Enabling it in a worktree is not authorization: only the default branch is.
     fixture.authorize(false);
-    assert!(!fixture.push(session, &[]).status.success());
+    let refused_again = fixture.push(session, &[]);
+    assert!(!refused_again.status.success());
+    assert!(json_error::message(&refused_again).contains("delivery.push_session_branches"));
     assert_eq!(fixture.remote_branch(&branch), None);
 }
 
@@ -469,7 +471,11 @@ fn a_closed_session_cannot_push() {
 
     let refused = fixture.push(session, &[]);
     assert!(!refused.status.success());
-    assert!(stderr(&refused).contains("closed"), "{}", stderr(&refused));
+    assert!(
+        json_error::message(&refused).contains("closed"),
+        "{}",
+        json_error::message(&refused)
+    );
     assert_eq!(fixture.remote_branch(&branch), None);
 }
 
@@ -661,6 +667,22 @@ fn both_push_paths_surface_hook_streams_and_missing_path_guidance() {
 
     let broker_push = fixture.push(session, &[]);
     assert!(!broker_push.status.success());
+    let broker_report: serde_json::Value = serde_json::from_slice(&broker_push.stdout).unwrap();
+    assert_eq!(broker_report["command_success"], false);
+    assert!(
+        broker_report["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("hook stdout: checks could not start"),
+        "{broker_report}"
+    );
+    assert!(
+        broker_report["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("env: node: No such file or directory"),
+        "{broker_report}"
+    );
     let push_error = stderr(&broker_push);
     assert!(
         push_error.contains("hook stdout: checks could not start"),
@@ -713,6 +735,15 @@ fn opted_in_pre_push_refusals_show_hook_stderr_and_path_guidance_on_both_pushes(
 
     let broker_push = fixture.push(session, &[]);
     assert!(!broker_push.status.success());
+    let broker_report: serde_json::Value = serde_json::from_slice(&broker_push.stdout).unwrap();
+    assert_eq!(broker_report["command_success"], false);
+    assert!(
+        broker_report["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("env: node: No such file or directory"),
+        "{broker_report}"
+    );
     let push_error = stderr(&broker_push);
     assert!(
         push_error.contains("env: node: No such file or directory"),
@@ -737,3 +768,6 @@ fn opted_in_pre_push_refusals_show_hook_stderr_and_path_guidance_on_both_pushes(
     let branch = fixture.broker().store().session(session).unwrap().branch;
     assert_eq!(fixture.remote_branch(&branch), None);
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

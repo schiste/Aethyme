@@ -620,7 +620,7 @@ fn list_is_read_only_and_reports_corruption_without_hiding_valid_artifacts() {
         &["advanced", "report", "show", "corrupt.json", "--json"],
     );
     assert!(!shown.status.success());
-    assert!(String::from_utf8_lossy(&shown.stderr).contains("invalid report JSON"));
+    assert!(json_error::message(&shown).contains("invalid report JSON"));
 }
 
 #[test]
@@ -717,7 +717,7 @@ fn show_rejects_path_escape_and_symlinked_artifacts() {
         &["advanced", "report", "show", "link.json", "--json"],
     );
     assert!(!linked.status.success());
-    assert!(String::from_utf8_lossy(&linked.stderr).contains("regular file"));
+    assert!(json_error::message(&linked).contains("regular file"));
 }
 
 #[test]
@@ -1413,3 +1413,6 @@ fn successful_command_without_a_parseable_issue_url_is_ambiguous() {
             .contains("success_result_not_recorded")
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

@@ -269,7 +269,7 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
         ],
     );
     assert!(!apply.status.success());
-    let refusal = String::from_utf8_lossy(&apply.stderr).into_owned();
+    let refusal = json_error::message(&apply);
     assert!(
         refusal.contains("no longer matches current state")
             && refusal.contains("aethyme broker finish cleanup --all-cleaned"),
@@ -475,3 +475,6 @@ impl Holder {
         &self.0
     }
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

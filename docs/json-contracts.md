@@ -46,15 +46,18 @@ code; `message` is human-readable and may vary between releases.
 {"schema":"aethyme.broker-error/v1","error":{"code":3,"message":"the request was refused"}}
 ```
 
-When a command has already produced a JSON report, that report remains the
-single JSON document. A blocked `finish --json` keeps its existing report
-fields, adds an `error` object with `code` and `message`, and exits with the
-matching nonzero code. If writing to stdout fails after output begins, the
-broker does not append a second error document; it preserves the command's
-nonzero exit code (or returns the environment-failure code for an otherwise
-successful command). Arguments after `--` belong to a child and do not enable
-broker JSON mode. Commands that deliberately stream raw output retain their
-documented output format.
+When a command has already emitted a JSON report and then fails, the report
+remains the only JSON document on stdout. The broker writes the failure
+diagnostic to stderr; it includes any required recovery handoff, and the
+process exits with the command's nonzero code. A blocked `finish --json` keeps
+its existing report fields, adds an `error` object with `code` and `message`,
+and exits with the matching nonzero code. If writing to stdout fails after
+output begins, the broker does not append a second error document; it writes
+the diagnostic to stderr and preserves the command's nonzero exit code (or
+returns the environment-failure code for an otherwise successful command).
+The stdout bytes may be incomplete if that write failed. Arguments after `--`
+belong to a child and do not enable broker JSON mode. Commands that
+deliberately stream raw output retain their documented output format.
 
 ## Field inventory (v1)
 

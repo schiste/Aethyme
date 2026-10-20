@@ -327,8 +327,10 @@ fn dirty_finish_guidance_is_stash_free() {
     std::fs::write(worktree.join("dirty.txt"), "keep me\n").unwrap();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(3));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["error"]["code"], 3);
+    assert_eq!(report["error"]["message"], "session is not ready to finish");
     let rendered = report.to_string();
     assert!(rendered.contains("managed pre-commit lane"), "{rendered}");
     assert!(!rendered.contains("stash"), "{rendered}");
@@ -495,3 +497,6 @@ fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() 
             .success()
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

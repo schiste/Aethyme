@@ -617,9 +617,9 @@ fn apply_refuses_a_stale_digest_and_removes_nothing() {
     let output = world.apply(stale["digest"].as_str().unwrap());
     assert!(!output.status.success(), "a stale digest must be refused");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("no longer matches"),
+        json_error::message(&output).contains("no longer matches"),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        json_error::message(&output)
     );
     assert_eq!(size(&world.gates.join("rust-workspace-v2")), 3100);
     assert!(world.gates.join("rust-workspace-v1").is_dir());
@@ -758,3 +758,6 @@ fn a_resumed_journal_never_removes_a_gate_cache_unattended_or_changed() {
     assert!(!world.gates.join(&world.retired).exists());
     assert_eq!(report["reclaimed_bytes"], 1500, "{report:#}");
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

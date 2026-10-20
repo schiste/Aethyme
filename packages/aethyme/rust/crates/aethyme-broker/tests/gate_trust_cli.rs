@@ -171,22 +171,22 @@ fn succeeded(output: &Output) {
 }
 
 fn assert_refused_with_hint(output: &Output, root: &Path) {
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error = json_error::message(output);
     assert_eq!(
         output.status.code(),
         Some(REFUSED),
-        "stdout={}\nstderr={stderr}",
+        "stdout={}\nerror={error}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
-        stderr.contains(&format!(
+        error.contains(&format!(
             "aethyme broker advanced trust --repo {}",
             root.display()
-        )) || stderr.contains(&format!(
+        )) || error.contains(&format!(
             "aethyme broker advanced trust --repo '{}'",
             root.display()
         )),
-        "refusal does not name the trust command: {stderr}"
+        "refusal does not name the trust command: {error}"
     );
 }
 
@@ -240,9 +240,9 @@ fn a_landed_gate_change_refuses_the_next_submit_until_trusted_again() {
     let refused = fixture.run(&worktree, &verify);
     assert_refused_with_hint(&refused, &root);
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("changed since it was last trusted"),
+        json_error::message(&refused).contains("changed since it was last trusted"),
         "{}",
-        String::from_utf8_lossy(&refused.stderr)
+        json_error::message(&refused)
     );
     assert!(
         !fixture.marker("after.marker"),
@@ -397,3 +397,6 @@ fn trust_status_next_action_approves_the_exact_linked_checkout_policy() {
     assert!(!fixture.marker("main.marker"));
     assert!(!checkout.join("changed.marker").exists());
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

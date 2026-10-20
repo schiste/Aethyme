@@ -114,9 +114,9 @@ fn low_space_preparation_preserves_state_and_does_not_run_install() {
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("dependency preparation storage"),
+        json_error::message(&output).contains("dependency preparation storage"),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        json_error::message(&output)
     );
     for path in [
         "node_modules",
@@ -183,9 +183,9 @@ fn preparation_rechecks_headroom_before_the_next_step() {
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("dependency preparation storage"),
+        json_error::message(&output).contains("dependency preparation storage"),
         "{}",
-        String::from_utf8_lossy(&output.stderr)
+        json_error::message(&output)
     );
     assert!(temp.path().join("node_modules").is_dir());
     assert!(
@@ -633,3 +633,6 @@ cache = "repository_shared"
     assert!(!store.join("old-artifact").exists());
     assert!(temp.path().join("node_modules").is_dir());
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

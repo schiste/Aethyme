@@ -876,11 +876,19 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
         assert!(!stderr.contains("stash"), "{stderr}");
     }
 
-    let finish = json(&run(
+    let finish_output = run(
         &repo,
         &["broker", "finish", "--session", &session_arg, "--json"],
-    ));
+    );
+    assert_eq!(finish_output.status.code(), Some(3));
+    let finish: serde_json::Value = serde_json::from_slice(&finish_output.stdout).unwrap();
     assert_eq!(finish["status"], "blocked");
+    assert_eq!(finish["error"]["code"], 3);
+    assert!(
+        finish["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())
+    );
     assert!(
         finish["recommended_next_action"]
             .as_str()
@@ -1707,3 +1715,6 @@ fn write_executable(path: &Path, contents: &str) {
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

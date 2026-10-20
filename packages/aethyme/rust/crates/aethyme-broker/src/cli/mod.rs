@@ -1061,7 +1061,7 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
 enum ErrorRendering {
     Json(String),
     Text(String),
-    Suppressed,
+    Diagnostic(String),
 }
 
 pub fn json_requested(args: &[String]) -> bool {
@@ -1089,7 +1089,11 @@ fn render_cli_error(
 ) -> ErrorRendering {
     if json_requested(args) {
         if output_attempted {
-            return ErrorRendering::Suppressed;
+            // Keep an already-started report as the only stdout document,
+            // while preserving the failure reason and any recovery handoff.
+            // This also covers a partial stdout write, where appending a
+            // second JSON value could not repair the first one.
+            return ErrorRendering::Diagnostic(message.to_string());
         }
         ErrorRendering::Json(
             serde_json::json!({
@@ -1110,7 +1114,7 @@ fn emit_cli_error(rendering: ErrorRendering) {
     match rendering {
         ErrorRendering::Json(json) => out!("{}", json),
         ErrorRendering::Text(message) => eprintln!("Error: {message}"),
-        ErrorRendering::Suppressed => {}
+        ErrorRendering::Diagnostic(message) => eprintln!("Error: {message}"),
     }
 }
 
