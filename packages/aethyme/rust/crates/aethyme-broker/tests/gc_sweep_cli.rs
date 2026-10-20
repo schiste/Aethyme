@@ -1342,11 +1342,7 @@ fn default_policy_reclaims_closed_session_build_caches() {
         worktree.join("work.txt").exists(),
         "committed work must remain"
     );
-    let branch_output = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(&worktree)
-        .output()
-        .unwrap();
+    let branch_output = git_output(&worktree, &["branch", "--show-current"]);
     assert!(branch_output.status.success());
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
@@ -1356,11 +1352,7 @@ fn default_policy_reclaims_closed_session_build_caches() {
         "the retained checkout must remain on its branch"
     );
     let branch_ref = format!("refs/heads/{branch}");
-    let branch_check = Command::new("git")
-        .args(["show-ref", "--verify", branch_ref.as_str()])
-        .current_dir(repo.path())
-        .output()
-        .unwrap();
+    let branch_check = git_output(repo.path(), &["show-ref", "--verify", branch_ref.as_str()]);
     assert!(
         branch_check.status.success(),
         "the retained branch must remain: {}",
