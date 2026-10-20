@@ -7103,17 +7103,34 @@ mod tests {
         std::fs::write(abandoned_worktree.join("unrepresented.txt"), "local\n").unwrap();
         git(&abandoned_worktree, &["add", "unrepresented.txt"]);
         git(&abandoned_worktree, &["commit", "-qm", "unrepresented"]);
-        let abandoned_report = broker
-            .finish_abandoning_unpushed(
-                abandoned.id,
-                crate::FinishOptions {
-                    keep_worktree: true,
-                },
-                "fixture backlog owner",
-            )
+        // This deliberately closed cache owner has an unrepresented commit,
+        // so it must stay out of whole-checkout cleanup. The public finish
+        // path rejects that state before its --abandon-unpushed check; use the
+        // low-level close API to create the closed owner this sweep fixture
+        // needs. No explicit paths were leased, and low-level close leaves
+        // active leases in place, so assert this fixture is lease-free.
+        broker
+            .close_abandoning_unpushed(abandoned.id, "fixture backlog owner")
             .unwrap();
-        assert!(abandoned_report.closed);
-        assert!(abandoned_report.cleanup.kept);
+        let abandoned_status = broker.store().session(abandoned.id).unwrap().status;
+        assert_eq!(
+            abandoned_status,
+            crate::SessionStatus::Closed,
+            "the backlog owner must already be closed before its cache is seeded"
+        );
+        assert!(
+            abandoned_worktree.join("README.md").is_file(),
+            "low-level close must retain the checkout for this fixture"
+        );
+        assert!(
+            broker
+                .store()
+                .active_leases()
+                .unwrap()
+                .iter()
+                .all(|lease| lease.session_id != abandoned.id),
+            "the fixture must not leave active leases on a low-level-closed session"
+        );
 
         let cache = abandoned_worktree.join("target");
         std::fs::create_dir_all(&cache).unwrap();
@@ -7161,10 +7178,35 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(report.closed);
-        assert!(report.cleanup.kept);
-        assert!(!report.cleanup.worktree_removed);
+        assert!(
+            report.closed,
+            "finish should close the represented current session: status={:?}, unsubmitted_commits={}, warnings={:?}, next_commands={:?}",
+            report.status,
+            report.unsubmitted_commits,
+            report.warnings,
+            report.next_commands
+        );
+        assert!(
+            report.cleanup.kept,
+            "finish should keep the current checkout: status={:?}, warnings={:?}",
+            report.status,
+            report.warnings
+        );
+        assert!(
+            !report.cleanup.worktree_removed,
+            "finish removed the current checkout: status={:?}, warnings={:?}",
+            report.status,
+            report.warnings
+        );
         assert!(current_worktree.join("README.md").is_file());
+        assert!(
+            abandoned_worktree.join("README.md").is_file(),
+            "finish must not clean up the whole unrepresented cache-owner checkout"
+        );
+        assert!(
+            abandoned_worktree.join("unrepresented.txt").is_file(),
+            "finish must preserve the unrepresented commit that excludes this checkout from cleanup"
+        );
         assert!(
             !cache.exists(),
             "finish should drain the pending cache backlog"
@@ -7190,6 +7232,10 @@ mod tests {
         assert!(
             selected.contains(&current_worktree.to_string_lossy().into_owned()),
             "the retained checkout must remain eligible under explicit auto_remove=true"
+        );
+        assert!(
+            !selected.contains(&abandoned_worktree.to_string_lossy().into_owned()),
+            "the unrepresented cache owner must remain ineligible for whole-checkout cleanup"
         );
     }
 
