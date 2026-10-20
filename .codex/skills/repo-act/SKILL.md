@@ -20,6 +20,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For deadline-bounded cleanup, separate candidate discovery from the
+  assertion that partial work completed. One short wall-clock budget may expire
+  during discovery. Use a deterministic deadline seam to prove partial progress
+  and a seeded persisted marker to test fresh-process resume; assert the marker
+  before invoking the resume path.
+
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
 - Choose focused local Cargo checks by compilation target as well as test name.
