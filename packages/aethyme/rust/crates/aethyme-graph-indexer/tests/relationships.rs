@@ -53,6 +53,14 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
     );
     assert!(summary.total_edges >= 11);
     assert!(!summary.coverage.report.safe_to_use);
+    assert!(summary.coverage.report.edge_counts_by_kind["tests"] > 0);
+    assert!(
+        !summary
+            .coverage
+            .report
+            .edge_counts_by_kind
+            .contains_key("Tests")
+    );
 
     let handler = read_fragment(&repository, "src/handlers.py").unwrap();
     let handler_id = node_id(&handler, NodeKind::Function, "handle_request");

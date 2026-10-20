@@ -383,17 +383,75 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
     );
 }
 
+fn finish_guidance_text(report: &serde_json::Value) -> String {
+    let rendered = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        report["error"]["message"],
+        report["summary"],
+        report["recommended_next_action"],
+        report["warnings"],
+        report["next_commands"],
+    );
+    match report["worktree_path"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+    {
+        Some(worktree_path) => rendered.replace(worktree_path, "<worktree>"),
+        None => rendered,
+    }
+}
+
 #[test]
 fn dirty_finish_guidance_is_stash_free() {
     let (tmp, session_id, worktree, _) = promoted_fixture();
     std::fs::write(worktree.join("dirty.txt"), "keep me\n").unwrap();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(3));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let rendered = report.to_string();
-    assert!(rendered.contains("managed pre-commit lane"), "{rendered}");
-    assert!(!rendered.contains("stash"), "{rendered}");
+    assert_eq!(report["error"]["code"], 3);
+    assert_eq!(report["error"]["message"], "session is not ready to finish");
+    let guidance = finish_guidance_text(&report);
+    assert!(guidance.contains("managed pre-commit lane"), "{guidance}");
+    assert!(!guidance.contains("stash"), "{guidance}");
+
+    let path_with_token = "/tmp/dirty_finish_guidance_is_stash_free/worktrees/finish-cli-fixture";
+    let path_only_report = serde_json::json!({
+        "worktree_path": path_with_token,
+        "error": {"message": "session is not ready to finish"},
+        "summary": "session is not finished yet",
+        "recommended_next_action": "inspect the worktree",
+        "warnings": [],
+        "next_commands": [format!("git -C {path_with_token} status --short")]
+    });
+    let path_control_guidance = finish_guidance_text(&path_only_report);
+    assert!(
+        path_control_guidance.contains("<worktree>"),
+        "{path_control_guidance}"
+    );
+    assert!(
+        path_control_guidance.contains("git -C <worktree> status --short"),
+        "{path_control_guidance}"
+    );
+    assert!(
+        !path_control_guidance.contains("stash"),
+        "{path_control_guidance}"
+    );
+
+    let stash_instruction_report = serde_json::json!({
+        "worktree_path": path_with_token,
+        "error": {"message": "session is not ready to finish"},
+        "summary": "session is not finished yet",
+        "recommended_next_action": "inspect the worktree",
+        "warnings": [],
+        "next_commands": [format!("git -C {path_with_token} stash")]
+    });
+    let stash_instruction = finish_guidance_text(&stash_instruction_report);
+    assert!(
+        stash_instruction.contains("git -C <worktree> stash"),
+        "{stash_instruction}"
+    );
+    assert!(stash_instruction.contains("stash"), "{stash_instruction}");
 }
 
 #[test]
@@ -557,3 +615,6 @@ fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() 
             .success()
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

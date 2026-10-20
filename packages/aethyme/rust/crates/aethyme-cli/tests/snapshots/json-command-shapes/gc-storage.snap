@@ -1,0 +1,95 @@
+{
+  "candidates": [],
+  "digest": "string",
+  "evaluated_at": "integer",
+  "orphan_worktree_roots_days": "integer",
+  "preparation_candidates": [],
+  "preparation_entries": [],
+  "primary_candidates": [],
+  "primary_checkouts": [
+    {
+      "artifacts": [],
+      "blockers": [
+        "string"
+      ],
+      "clean": "bool",
+      "dirty_paths": [
+        "string"
+      ],
+      "path": "string",
+      "repository_key": "string"
+    }
+  ],
+  "roots": [
+    {
+      "age_days": "integer",
+      "blockers": [],
+      "empty": "bool",
+      "filesystem_kind": "string",
+      "git_registered_count": "integer",
+      "ledger_claimed_count": "integer",
+      "marker_sha256": "string",
+      "marker_status": "string",
+      "on_disk_directory_count": "integer",
+      "owner_exists": "bool",
+      "path": "string",
+      "reconciliation": {
+        "entries": [],
+        "git_registered_count": "integer",
+        "ledger_claimed_count": "integer",
+        "on_disk_count": "integer",
+        "retired_count": "integer",
+        "schema_version": "integer"
+      },
+      "repository_key": "string",
+      "repository_root": "string",
+      "retired_count": "integer",
+      "session_branch_inventory_complete": "bool",
+      "session_branches": [
+        {
+          "checked_out_paths": [
+            "string"
+          ],
+          "head": "string",
+          "name": "string",
+          "ownership": "string",
+          "retention_reason": "string",
+          "session_ids": [
+            "integer"
+          ],
+          "uncleared_session_ids": []
+        }
+      ],
+      "sized": "bool",
+      "worktree_count": "integer"
+    }
+  ],
+  "schema_version": "integer",
+  "storage_root": "string",
+  "summary": {
+    "broker_branch_ref_count": "integer",
+    "candidate_count": "integer",
+    "empty_root_count": "integer",
+    "incomplete_branch_inventory_root_count": "integer",
+    "on_disk_directory_count": "integer",
+    "orphan_root_count": "integer",
+    "owner_missing_count": "integer",
+    "owner_present_count": "integer",
+    "preparation_candidate_count": "integer",
+    "preparation_entry_count": "integer",
+    "preparation_reclaimable_bytes": "integer",
+    "preparation_reclaimable_inodes": "integer",
+    "primary_artifact_count": "integer",
+    "primary_candidate_count": "integer",
+    "primary_checkout_count": "integer",
+    "primary_reclaimable_bytes": "integer",
+    "primary_reclaimable_inodes": "integer",
+    "reclaimable_bytes": "integer",
+    "reclaimable_inodes": "integer",
+    "root_count": "integer",
+    "sized": "bool",
+    "stray_directory_count": "integer",
+    "unclaimed_agent_branch_ref_count": "integer"
+  },
+  "warnings": []
+}

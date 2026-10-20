@@ -277,7 +277,7 @@ the code without parsing output. They apply with or without `--json`.
 | 0 | Success, including a verified submission that promotion did not move | Continue |
 | 1 | Unclassified failure | Read the error message |
 | 2 | Usage error | Fix the command line; see `--help` |
-| 3 | Refused: a policy, lease, confirmation or state precondition blocked the request, or a submission conflicted. Nothing changed. | Fix the precondition, then retry |
+| 3 | Refused: a policy, lease, confirmation or state precondition blocked the request, or a submission conflicted. | Inspect the report and follow its recovery guidance; fix the precondition before retrying |
 | 4 | Verification failed: a gate or graph-integrity check did not pass | Fix the code; the gate output names the failure |
 | 5 | Outcome unknown: a remote write may or may not have happened | Inspect external state, then `broker advanced operations reconcile`. Never retry blindly. |
 | 6 | Environment: a missing tool, path or remote base, or host I/O failure; also a `submit` deferred because the host stopped a gate before it judged the change | Fix the host, then retry without changing code |
@@ -285,6 +285,26 @@ the code without parsing output. They apply with or without `--json`.
 Before 2026-09-23, `submit --json` exited 0 for rejected and conflicted
 entries, and every refusal exited 1. Some subcommands keep their own
 documented codes, for example `check-contract` and the `exec` guard.
+
+#### JSON errors
+
+A broker error that has no report payload is written to stdout as one
+versioned object. Its schema is `aethyme.broker-error/v1`:
+
+    {"schema":"aethyme.broker-error/v1","error":{"code":3,"message":"the request was refused"}}
+
+The envelope code matches the process exit code. If a command has already
+written its report, that report remains the single JSON document; a blocked
+`finish --json` adds an `error` object to its existing report and exits 3.
+Commands that deliberately stream raw output, such as `report render --stdout`,
+keep that output format. `advanced exec` captures the child result and reports
+the broker's guarded-execution result; it does not forward child stdout.
+Arguments after `--` belong to the child and do not enable broker JSON mode.
+
+Exit code 3 means the requested action was refused; it does not guarantee that
+the command made no state change. Some refusal paths record safe quarantine or
+other maintenance while declining the requested action. Inspect the command's
+report and recovery guidance before retrying.
 
 `broker advanced worktree-root` is a strictly read-only placement plan. It reports the
 canonical checkout identity, the preferred private host-state root, whether

@@ -239,6 +239,7 @@ fn main() -> ExitCode {
     {
         return answer_help(route, &args);
     }
+    let invocation_args = args.clone();
     let args = match resolve_spelling(args) {
         Ok(args) => args,
         Err(code) => return code,
@@ -292,11 +293,20 @@ fn main() -> ExitCode {
         if let Some(decision) = decision {
             if let Some(message) = decision.refusal_message() {
                 if let Some(hook_message) = decision.managed_pre_commit_refusal_message() {
+                    if aethyme_broker::cli::json_requested(&invocation_args) {
+                        let code = aethyme_broker::cli::report_dispatch_error(
+                            &invocation_args,
+                            1,
+                            &hook_message,
+                        );
+                        return ExitCode::from(code);
+                    }
                     eprintln!("{hook_message}");
-                } else {
-                    eprintln!("Error: {message}");
+                    return ExitCode::from(1);
                 }
-                return ExitCode::from(1);
+                let code =
+                    aethyme_broker::cli::report_dispatch_error(&invocation_args, 1, &message);
+                return ExitCode::from(code);
             }
             if decision.execution == repository_upgrade::CompatibilityExecution::ReadOnlySnapshot {
                 broker_compatibility_mode =
@@ -753,8 +763,8 @@ fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
         "broker" => {
             let resolved = aethyme_broker::cli::resolve(&args[1..]);
             if let Some(refusal) = &resolved.refusal {
-                eprintln!("Error: {refusal}");
-                return Err(ExitCode::from(2));
+                let code = aethyme_broker::cli::report_dispatch_error(&args, 2, refusal);
+                return Err(ExitCode::from(code));
             }
             if resolved.args.is_empty() {
                 return Ok(args);
@@ -764,35 +774,29 @@ fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
                 .collect())
         }
         "readiness" => {
-            eprintln!(
-                "Error: {}",
-                aethyme_broker::cli::removed_spelling_message(
-                    "aethyme readiness",
-                    "aethyme broker status readiness"
-                )
+            let message = aethyme_broker::cli::removed_spelling_message(
+                "aethyme readiness",
+                "aethyme broker status readiness",
             );
-            Err(ExitCode::from(2))
+            let code = aethyme_broker::cli::report_dispatch_error(&args, 2, &message);
+            Err(ExitCode::from(code))
         }
         "enhance" => match args.get(1).map(String::as_str) {
             Some("deploy") => {
-                eprintln!(
-                    "Error: {}",
-                    aethyme_broker::cli::removed_spelling_message(
-                        "aethyme enhance deploy",
-                        "aethyme deploy --generated-only"
-                    )
+                let message = aethyme_broker::cli::removed_spelling_message(
+                    "aethyme enhance deploy",
+                    "aethyme deploy --generated-only",
                 );
-                Err(ExitCode::from(2))
+                let code = aethyme_broker::cli::report_dispatch_error(&args, 2, &message);
+                Err(ExitCode::from(code))
             }
             Some("verify") => {
-                eprintln!(
-                    "Error: {}",
-                    aethyme_broker::cli::removed_spelling_message(
-                        "aethyme enhance verify",
-                        "aethyme deploy verify --generated-only"
-                    )
+                let message = aethyme_broker::cli::removed_spelling_message(
+                    "aethyme enhance verify",
+                    "aethyme deploy verify --generated-only",
                 );
-                Err(ExitCode::from(2))
+                let code = aethyme_broker::cli::report_dispatch_error(&args, 2, &message);
+                Err(ExitCode::from(code))
             }
             _ => Ok(args),
         },

@@ -158,6 +158,35 @@ pub(super) fn neighbors_from<D: ReadableDatabase>(
     Ok(rows)
 }
 
+pub(super) fn neighbors_limited_from<D: ReadableDatabase>(
+    db: &D,
+    id: &str,
+    direction: NeighborDirection,
+    kind: Option<EdgeKind>,
+    max_raw_rows: usize,
+) -> Result<BoundedAdjacency, GraphStoreError> {
+    let table = match direction {
+        NeighborDirection::Outgoing => EDGES_OUT,
+        NeighborDirection::Incoming => EDGES_IN,
+    };
+    let (mut rows, raw_rows_scanned, truncated) =
+        collect_adjacency_limited(db, table, id, max_raw_rows)?;
+    if let Some(expected) = kind {
+        rows.retain(|row| row.kind == expected);
+    }
+    rows.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.other.cmp(&right.other))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    Ok(BoundedAdjacency {
+        records: rows,
+        raw_rows_scanned,
+        truncated,
+    })
+}
+
 pub(super) fn edge_kind_label(kind: &EdgeKind) -> &'static str {
     match kind {
         EdgeKind::Contains => "contains",
@@ -179,6 +208,7 @@ pub(super) fn edge_kind_label(kind: &EdgeKind) -> &'static str {
         EdgeKind::ValidatesCredential => "validates_credential",
         EdgeKind::RewritesHeader => "rewrites_header",
         EdgeKind::TestedBy => "tested_by",
+        EdgeKind::Tests => "tests",
     }
 }
 
@@ -274,6 +304,7 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                     EdgeKind::RewritesHeader,
                     EdgeKind::StoresCredential,
                     EdgeKind::TestedBy,
+                    EdgeKind::Tests,
                     EdgeKind::UsesCredential,
                     EdgeKind::ValidatesCredential,
                 ],
@@ -290,6 +321,7 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
                     EdgeKind::RewritesHeader,
                     EdgeKind::StoresCredential,
                     EdgeKind::TestedBy,
+                    EdgeKind::Tests,
                     EdgeKind::UsesCredential,
                     EdgeKind::ValidatesCredential,
                 ],
@@ -417,4 +449,32 @@ pub(super) fn configs_for_from<D: ReadableDatabase>(
     configs.sort();
     configs.dedup();
     Ok(configs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relationships_do_not_create_structural_ancestry() {
+        // A test exercising a target is a semantic relationship. It does not
+        // make either function contain or define the other function.
+        for relation in [GraphRelation::Children, GraphRelation::Parents] {
+            assert!(
+                relation_specs(relation)
+                    .iter()
+                    .all(|(_, kinds)| !kinds.contains(&EdgeKind::Tests)),
+                "test relationships must not become structural parents or children"
+            );
+        }
+        let references = relation_specs(GraphRelation::References);
+        assert_eq!(references.len(), 2);
+        assert!(
+            references
+                .iter()
+                .all(|(_, kinds)| kinds.contains(&EdgeKind::Tests))
+        );
+        assert!(matches!(references[0].0, NeighborDirection::Outgoing));
+        assert!(matches!(references[1].0, NeighborDirection::Incoming));
+    }
 }

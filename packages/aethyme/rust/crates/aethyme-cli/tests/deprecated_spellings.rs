@@ -46,20 +46,28 @@ fn fixture() -> tempfile::TempDir {
     tmp
 }
 
-fn assert_removed(output: &Output, old: &str, new: &str) {
+fn assert_removed(output: &Output, old: &str, new: &str, expect_json: bool) {
     assert_eq!(
         output.status.code(),
         Some(2),
         "expected removed-spelling refusal for {old}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let expected = format!("Error: '{old}' was removed in v0.8.8; use '{new}'");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr).trim(),
-        expected,
-        "unexpected refusal for {old}"
-    );
-    assert!(output.stdout.is_empty(), "removed route printed to stdout");
+    let expected = format!("'{old}' was removed in v0.8.8; use '{new}'");
+    if expect_json {
+        assert_eq!(
+            json_error::message(output),
+            expected,
+            "unexpected refusal for {old}"
+        );
+    } else {
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            format!("Error: {expected}"),
+            "unexpected refusal for {old}"
+        );
+        assert!(output.stdout.is_empty(), "removed route printed to stdout");
+    }
 }
 
 #[test]
@@ -79,7 +87,7 @@ fn removed_adopt_spellings_fail_with_specific_replacements() {
         ),
     ] {
         let output = aethyme(&repo, args);
-        assert_removed(&output, old, new);
+        assert_removed(&output, old, new, true);
     }
     assert!(
         !repo.join(".aethyme").exists(),
@@ -114,7 +122,7 @@ fn removed_merged_and_advanced_spellings_fail_with_replacements() {
         ),
     ] {
         let output = aethyme(&repo, args);
-        assert_removed(&output, old, new);
+        assert_removed(&output, old, new, true);
     }
 }
 
@@ -127,6 +135,7 @@ fn removed_top_level_spellings_fail_and_canonical_routes_stay_usable() {
         &aethyme(&repo, &["readiness", "--json"]),
         "aethyme readiness",
         "aethyme broker status readiness",
+        true,
     );
     let readiness = aethyme(&repo, &["broker", "status", "readiness", "--json"]);
     assert!(
@@ -139,6 +148,7 @@ fn removed_top_level_spellings_fail_and_canonical_routes_stay_usable() {
         &aethyme(&repo, &["broker", "certify", "--json"]),
         "aethyme broker certify",
         "aethyme certify",
+        true,
     );
     let certify = aethyme(&repo, &["certify", "--json"]);
     assert!(
@@ -151,6 +161,7 @@ fn removed_top_level_spellings_fail_and_canonical_routes_stay_usable() {
         &aethyme(&repo, &["enhance", "verify", "--repo", "."]),
         "aethyme enhance verify",
         "aethyme deploy verify --generated-only",
+        false,
     );
 }
 
@@ -189,7 +200,8 @@ fn removed_public_spellings_and_advanced_duplicates_refuse_before_preflight() {
             "aethyme broker submit promote",
         ),
     ] {
-        assert_removed(&aethyme(&repo, args), old, new);
+        let output = aethyme(&repo, args);
+        assert_removed(&output, old, new, true);
     }
 
     for line in [
@@ -202,7 +214,7 @@ fn removed_public_spellings_and_advanced_duplicates_refuse_before_preflight() {
             output.status.code(),
             Some(1),
             "`{line}` must be refused by compatibility policy: {}",
-            String::from_utf8_lossy(&output.stderr)
+            json_error::message(&output)
         );
     }
 
@@ -226,12 +238,24 @@ fn removed_public_spellings_and_advanced_duplicates_refuse_before_preflight() {
     ] {
         let args: Vec<&str> = line.split(' ').collect();
         let output = aethyme(&repo, &args);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(2), "`{line}`: {stderr}");
-        assert!(
-            stderr.contains(&format!("use 'aethyme broker {public}'")),
-            "`{line}`: {stderr}"
-        );
-        assert!(output.stdout.is_empty(), "`{line}` printed on stdout");
+        if line.contains("--json") {
+            let error = json_error::message(&output);
+            assert_eq!(output.status.code(), Some(2), "`{line}`: {error}");
+            assert!(
+                error.contains(&format!("use 'aethyme broker {public}'")),
+                "`{line}`: {error}"
+            );
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(2), "`{line}`: {stderr}");
+            assert!(
+                stderr.contains(&format!("use 'aethyme broker {public}'")),
+                "`{line}`: {stderr}"
+            );
+            assert!(output.stdout.is_empty(), "`{line}` printed on stdout");
+        }
     }
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

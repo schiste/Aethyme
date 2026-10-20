@@ -290,3 +290,6 @@ fn originating_github_write_prints_the_complete_reconciliation_handoff() {
     assert!(shown_text.contains("Automatic retry: forbidden"));
     assert!(shown_text.contains("Blind retry is forbidden"));
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

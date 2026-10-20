@@ -433,7 +433,7 @@ fn sync_refuses_a_dirty_tree_and_changes_nothing() {
 
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("modified"),
+        json_error::message(&output).contains("modified"),
         "{output:?}"
     );
     assert_eq!(head(&worktree), before);
@@ -501,7 +501,10 @@ fn sync_refuses_while_a_rebase_is_in_progress() {
 
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("rebase is already in progress"),
+        json_error::message(&output).contains("rebase is already in progress"),
         "{output:?}"
     );
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

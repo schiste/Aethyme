@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "integer",
+    "message": "string"
+  },
+  "schema": "string"
+}

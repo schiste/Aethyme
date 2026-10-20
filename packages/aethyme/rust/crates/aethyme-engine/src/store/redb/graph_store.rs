@@ -47,7 +47,7 @@ use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// Public compatibility identity used by the immutable materialization cache.
 pub const GRAPH_STORE_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
@@ -156,6 +156,17 @@ pub struct AdjacencyRecord {
     pub other: InternedStr,
     pub confidence: u16,
     pub source: InternedStr,
+}
+
+/// Adjacency read with a strict raw-row budget. `truncated` is conservative:
+/// it is true whenever the scan consumes the whole budget, because proving
+/// there is no next row would require reading beyond that budget. Rows are
+/// counted before an optional edge-kind filter is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedAdjacency {
+    pub records: Vec<AdjacencyRecord>,
+    pub raw_rows_scanned: usize,
+    pub truncated: bool,
 }
 
 /// Strictly bounded callable ids contained by one exact repository-relative

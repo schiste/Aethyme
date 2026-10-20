@@ -149,6 +149,9 @@ pub(crate) fn apply(
             }
         }
 
+        // This producer still uses a path convention to select test files.
+        // Consumers can honor any explicit Tests edge, including one from a
+        // producer with broader test-file metadata.
         if is_test_file(&built.source_path) {
             let test_ids: HashSet<NodeId> = built
                 .fragment

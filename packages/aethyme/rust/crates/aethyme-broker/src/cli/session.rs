@@ -1460,13 +1460,33 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
             return Err(finish_error_context(error, timeout_seconds, session, state));
         }
     };
+    if report.status == crate::FinishStatus::Blocked {
+        let message = "session is not ready to finish";
+        if parsed.json {
+            let mut value = serde_json::to_value(&report)?;
+            value
+                .as_object_mut()
+                .expect("finish report is an object")
+                .insert(
+                    "error".into(),
+                    serde_json::json!({
+                        "code": crate::exit_status::REFUSED,
+                        "message": message,
+                    }),
+                );
+            out!("{}", serde_json::to_string_pretty(&value)?);
+            return Err(UsageError::SilentExit(crate::exit_status::REFUSED));
+        }
+        render_finish_report(&report);
+        return Err(UsageError::Exit {
+            message: message.into(),
+            code: crate::exit_status::REFUSED,
+        });
+    }
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         render_finish_report(&report);
-        if report.status == crate::FinishStatus::Blocked {
-            return Err(UsageError::Message("session is not ready to finish".into()));
-        }
     }
     Ok(())
 }

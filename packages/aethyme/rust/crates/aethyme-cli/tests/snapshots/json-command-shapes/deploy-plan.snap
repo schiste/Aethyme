@@ -1,0 +1,119 @@
+{
+  "blockers": [],
+  "dirty_paths": [],
+  "disjoint_dirty_paths": [],
+  "generated_changes": [
+    {
+      "action": "string",
+      "after_sha256": "string",
+      "before_sha256": "null",
+      "file_mode": "string",
+      "ownership": "string",
+      "path": "string",
+      "requires_resolution": "bool"
+    }
+  ],
+  "generated_tree": {
+    "active_sessions": [],
+    "applied": "bool",
+    "blockers": [],
+    "changes": [
+      {
+        "action": "string",
+        "after_sha256": "string",
+        "before_sha256": "null",
+        "file_mode": "string",
+        "ownership": "string",
+        "path": "string",
+        "requires_resolution": "bool"
+      }
+    ],
+    "compatibility": {
+      "allowed": "bool",
+      "capability": "string",
+      "execution": "string",
+      "reason": "string",
+      "remediation": "null",
+      "repository": "string",
+      "repository_schema": "integer",
+      "severity": "string",
+      "surface": "string"
+    },
+    "customizations": [
+      {
+        "classification": "string",
+        "path": "string",
+        "resolution": "null"
+      }
+    ],
+    "diff_sha256": "string",
+    "dirty_paths": [],
+    "disjoint_dirty_paths": [],
+    "examined_paths": [
+      "string"
+    ],
+    "existing_managed_state_digest": "string",
+    "from_schema": "integer",
+    "migrations": [
+      "string"
+    ],
+    "mode": "string",
+    "next_action": "string",
+    "overlapping_dirty_paths": [],
+    "plan_digest": "string",
+    "planned_paths": [
+      "string"
+    ],
+    "relevant_leases": [],
+    "repository_head": "string",
+    "resolution_choices": [],
+    "safe": "bool",
+    "schema_version": "integer",
+    "shared_policy_or_gate_migration": "bool",
+    "to_schema": "integer",
+    "warnings": []
+  },
+  "hook_manager": {
+    "configured_value_sha256": "null",
+    "kind": "string"
+  },
+  "integration": {
+    "exact_sha": "null",
+    "ref_name": "string"
+  },
+  "integration_can_rebase_to_upstream": "bool",
+  "live_session_ids": [],
+  "local_ahead_upstream_commits": "integer",
+  "local_behind_upstream_commits": "integer",
+  "local_default": {
+    "exact_sha": "string",
+    "ref_name": "string"
+  },
+  "local_exclude_after_sha256": "string",
+  "local_exclude_before_sha256": "string",
+  "local_exclude_update_required": "bool",
+  "next_action": "string",
+  "nonterminal_queue_entry_ids": [],
+  "overlapping_dirty_paths": [],
+  "plan_digest": "string",
+  "planned_paths": [
+    "string"
+  ],
+  "preservation_refs": [
+    {
+      "existing_sha": "null",
+      "ref_name": "string",
+      "target_sha": "string"
+    }
+  ],
+  "remote_base": {
+    "default_branch_ref": "string",
+    "exact_sha": "string",
+    "remote": "string"
+  },
+  "safe": "bool",
+  "schema_version": "integer",
+  "shared_activation_present": "bool",
+  "shared_activation_sha256": "null",
+  "warnings": []
+}

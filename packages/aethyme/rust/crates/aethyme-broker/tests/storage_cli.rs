@@ -481,7 +481,7 @@ fn storage_apply_refuses_a_plan_when_a_new_stray_appears() {
         &["gc", "storage", "apply", "--confirm", &digest, "--json"],
     );
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no longer matches current state"));
+    assert!(json_error::message(&output).contains("no longer matches current state"));
     assert!(owner_root.join("new-stray").exists());
 }
 
@@ -525,7 +525,7 @@ fn storage_apply_binds_preparation_candidates_to_confirmation() {
         ],
     );
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("no longer matches current state"));
+    assert!(json_error::message(&refused).contains("no longer matches current state"));
     assert!(entry.join("payload").is_file());
 
     let applied = json(run(
@@ -1128,3 +1128,6 @@ fn a_shared_branch_named_by_a_session_is_reported_shared_not_session_owned() {
     );
     assert_eq!(plan["summary"]["broker_branch_ref_count"], 0);
 }
+
+#[path = "common/json_error.rs"]
+mod json_error;

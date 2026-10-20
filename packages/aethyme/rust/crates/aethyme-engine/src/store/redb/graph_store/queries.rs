@@ -209,6 +209,19 @@ impl GraphStore {
         neighbors_from(&self.db, id, direction, kind)
     }
 
+    /// Read adjacency while scanning at most `max_raw_rows` stored rows.
+    /// The cap applies before `kind` filtering so high-degree mixed-kind
+    /// nodes cannot evade the caller's work budget.
+    pub fn neighbors_limited(
+        &self,
+        id: &str,
+        direction: NeighborDirection,
+        kind: Option<EdgeKind>,
+        max_raw_rows: usize,
+    ) -> Result<BoundedAdjacency, GraphStoreError> {
+        neighbors_limited_from(&self.db, id, direction, kind, max_raw_rows)
+    }
+
     /// Resolve an exact repo-relative path to the persisted file node.
     pub fn resolve_file_path(&self, path: &str) -> Result<Option<FileNode>, GraphStoreError> {
         resolve_file_path_from(&self.db, path)
@@ -461,6 +474,19 @@ impl ReadOnlyGraphStore {
         kind: Option<EdgeKind>,
     ) -> Result<Vec<AdjacencyRecord>, GraphStoreError> {
         neighbors_from(&self.db, id, direction, kind)
+    }
+
+    /// Read adjacency while scanning at most `max_raw_rows` stored rows.
+    /// See `GraphStore::neighbors_limited` for the conservative truncation
+    /// rule at an exactly exhausted budget.
+    pub fn neighbors_limited(
+        &self,
+        id: &str,
+        direction: NeighborDirection,
+        kind: Option<EdgeKind>,
+        max_raw_rows: usize,
+    ) -> Result<BoundedAdjacency, GraphStoreError> {
+        neighbors_limited_from(&self.db, id, direction, kind, max_raw_rows)
     }
 
     /// Resolve an exact repo-relative path to the persisted file node.

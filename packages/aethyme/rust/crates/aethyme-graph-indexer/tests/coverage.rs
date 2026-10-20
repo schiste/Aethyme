@@ -44,6 +44,9 @@ fn revision_bound_artifacts_are_content_free_and_exactly_digest_units() {
     assert_eq!(coverage.unit_count, units.len() as u64);
     assert_eq!(summary.coverage.report, coverage);
     assert!(units.iter().any(|unit| unit.kind == "function"));
+    assert_eq!(coverage.coverage_mode, "complete");
+    assert_eq!(coverage.edge_counts_by_kind.get("tests"), Some(&0));
+    assert!(!coverage.edge_counts_by_kind.contains_key("Tests"));
 
     let function = units.iter().find(|unit| unit.kind == "function").unwrap();
     assert_eq!(function.path, "app.py");
