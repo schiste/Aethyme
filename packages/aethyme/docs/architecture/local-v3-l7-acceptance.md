@@ -1,6 +1,6 @@
 # Provisional Local source acceptance
 
-Last Updated: 2026-10-11
+Last Updated: 2026-10-20
 
 Issue #675; profile `aethyme.acceptance.exact-source/provisional-v0`.
 This draft builds on #745. Composition remains provisional until E1 #650.
@@ -50,6 +50,13 @@ held through the qualification commit. Expiry is checked again before commit.
 The resulting permission is private and cannot be deserialized from a receipt.
 The controller's explicit final disposition is integrated with generation handoff
 separately. Ordinary ship publication and its review lifecycle remain intact.
+
+Persisted qualification specs retain the raw CAS object digests for the execution
+snapshot, assertion inventory, and sealed artifact. Older specs without those
+fields still deserialize for inspection, but historical verification refuses
+to reuse them rather than deriving object paths from domain-separated record IDs.
+This compatibility path does not rewrite or reset legacy proof roots, charged
+states, or attempts.
 
 Collaboration state schema/floor 13 adds the acceptance journal. Quiesce older
 open clients before upgrade; the floor guards fresh opens. Local target roots

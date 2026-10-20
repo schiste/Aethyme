@@ -359,13 +359,19 @@ pub fn gate_result_payload(
     gate: &str,
     tree: &str,
     failure_class: Option<crate::types::GateFailureClass>,
+    run_id: i64,
+    cache_provenance: Option<&crate::GateCacheProvenance>,
 ) -> String {
-    json!({
+    let mut payload = json!({
         "gate": gate,
         "tree": tree,
         "failure_class": failure_class.map(|class| class.as_str()),
-    })
-    .to_string()
+        "run_id": run_id,
+    });
+    if let Some(provenance) = cache_provenance {
+        payload["cache_provenance"] = json!(provenance);
+    }
+    payload.to_string()
 }
 
 /// `saved_ms` is the cached run's recorded duration — the execution time
@@ -376,6 +382,8 @@ pub fn gate_cached_payload(
     saved_ms: i64,
     cached_status: crate::types::GateStatus,
     failure_class: Option<crate::types::GateFailureClass>,
+    run_id: i64,
+    cache_provenance: &crate::GateCacheProvenance,
 ) -> String {
     json!({
         "gate": gate,
@@ -383,6 +391,8 @@ pub fn gate_cached_payload(
         "saved_ms": saved_ms,
         "cached_status": cached_status.as_str(),
         "failure_class": failure_class.map(|class| class.as_str()),
+        "run_id": run_id,
+        "cache_provenance": cache_provenance,
     })
     .to_string()
 }

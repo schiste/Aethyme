@@ -826,8 +826,8 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
         )
         .unwrap();
     assert_eq!(
-        floor,
-        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION.to_string()
+        floor, "29",
+        "schema 30 keeps schema 29 as its minimum compatible floor"
     );
 }
 

@@ -131,6 +131,40 @@ use the same captured root and repository-scoped lease. The root setting
 changes placement only; it does not impose a disk quota or bound arbitrary
 writes made by preparation commands.
 
+### Managed-storage ledger schema v4
+
+The host-resource database contains a separate managed-storage ledger version
+in `managed_storage_meta`. It is independent of the host-resource store version
+in `meta`. Ordinary writable coordinator opens validate the managed-storage
+schema they find and preserve its version; they do not advance a v1 ledger to
+v4. This keeps the managed-storage floor unchanged for other repository
+worktrees sharing the host database.
+
+The crate-private managed-storage activation path is bound to the coordinator's
+already-open database identity. It requires the exact host-wide confirmation,
+rechecks the captured database path identity around an immediate transaction,
+and applies v1→v2 claim-group, v2→v3 producer/step, and v3→v4 settlement-proof
+and adoption-table migrations. The migration adds ledger tables and replaces
+the producer fences needed by v4; it retains existing claims, lineages,
+producers and steps and does not synthesize settlement proofs for old rows.
+
+Activation is not exposed as a CLI command and must not run as part of a
+repository-only deployment. The host database is shared across repositories,
+so an operator must coordinate quiescence of every writer that may use it,
+including older installed binaries, before any explicit activation. The path
+identity checks detect observed replacement or alias drift, but do not
+atomically pin SQLite's file handle against an uncooperative replacement
+between checks; they are not a substitute for that coordination.
+
+A producer is resolved only when its steps are complete and a settled claim
+group and immutable settlement proof agree on the producer, lease generation,
+root set, inventories, manifest, plan and resulting receipt digests. Existing
+v3 settled rows have no v4 proof because migration does not backfill one; they
+remain unresolved and root mutations stay fenced until separately reconciled
+with evidence that satisfies the v4 contract. The v4 schema and migration do
+not by themselves enable profile-bound root capture or connect preparation
+dispatch to managed-ledger admission.
+
 ### Private spawned-agent supervision (#831)
 
 The router and broker shim dispatch the reserved

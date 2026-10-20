@@ -563,8 +563,13 @@ own; `update-ref` does not.
 
 ## Choose Gate Cache Policy Deliberately
 
-Gate results prove an exact Git tree. Normal gate runs use the cache when the
-same gate has already passed or failed for that tree:
+Gate results prove an exact Git tree, gate definition, and execution profile.
+The profile hashes the OS and architecture, effective PATH, selected build,
+compiler, Python, and locale environment variables, and bounded version
+output from relevant tools. Those probes run from the gate checkout so
+repository-local tool selectors affect the profile; the worktree path itself
+is not hashed. Normal gate runs use a cached result only when
+all three identities match:
 
 ```bash
 aethyme broker advanced gates run --session 111
@@ -580,6 +585,10 @@ landing check.
 
 Text output shows an abbreviated 12-character tree hash. JSON returns the full
 hash in `tree_hash` and identifies whether the result was executed or cached.
+Persisted outcomes include their producing `run_id`; a cache hit retains the
+source run ID. Cacheable outcomes include `cache_provenance`, which declares the
+profile scope and digest. If a version probe is incomplete or exceeds its
+output budget, the gate still runs but its result is not reusable.
 Executed results also separate `wait_duration_ms` from command `duration_ms`,
 record `first_output_ms`, and count combined `output_bytes` without storing
 output content in telemetry. They also record the machine they ran on:

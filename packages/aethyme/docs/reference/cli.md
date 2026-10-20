@@ -1007,6 +1007,10 @@ to the checkpoint planner.
 Gate-run and submit outcomes identify the exact Git tree each result proves.
 Human-readable output abbreviates the tree hash to 12 characters; JSON retains
 the full hash in `tree_hash` for both executed and cached results.
+Cache reuse also requires the same gate definition and complete execution
+profile. Persisted JSON outcomes report `run_id`; a cache hit retains the
+source run ID, and cacheable outcomes include `cache_provenance` with the profile
+digest and declared scope. An incomplete profile disables reuse for that run.
 Pass `--no-cache` to either gate-run form or submit to require fresh gate
 execution. Bypass skips cache lookup only: the fresh result is stored normally
 and is available to a subsequent run using the default cache policy.

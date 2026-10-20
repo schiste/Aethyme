@@ -382,10 +382,10 @@ were one per overlapping path, so totals spanning that date mix both units.
       "commands": [ "...", ... ]
     }
   ],
-  "gate_outcomes": [ { "gate", "status", "cached", "exit_code",
+  "gate_outcomes": [ { "gate", "run_id", "status", "cached", "exit_code",
                        "duration_ms", "log_path", "load_avg_1m_start",
                        "load_avg_1m_end", "cpu_count",
-                       "free_disk_bytes_start" } ],
+                       "free_disk_bytes_start", "cache_provenance" } ],
   "no_changes": true|false,
   "promoted": true|false,
   "verified_against": {                      // omitted when not recorded
@@ -414,6 +414,12 @@ platform could not report it; all four are `null` for a cache hit (the
 reused verdict's machine state is not re-reported) and for a result recorded
 before the command stage. `broker advanced gates run --json` and
 `broker advanced gates pre-push --json` outcomes carry the same fields.
+
+When a result row was stored, `run_id` identifies it; a cache hit keeps the
+source run's ID. Cacheable outcomes include `cache_provenance`,
+with the execution-profile digest and a declared scope. A missing digest means
+profile capture was incomplete, so the executed result is not eligible for
+cache reuse.
 
 A gate outcome may also carry `"host_fault": true` (introduced 2026-10-01,
 absent when false): the broker itself observed that the host, not the change,
@@ -670,3 +676,24 @@ Two additive fields explain the scope:
 The human warning labels the policy-filtered counts and prints the unfiltered
 totals when exclusions explain a difference. These totals do not change review
 classification or make an advisory threshold a gate.
+
+### `broker advanced resources acquire --json` (stable conflict codes)
+
+The acquire failure object keeps its existing fields: `code`, `request_id`,
+`retryable`, `waited_ms`, and `conflicts`. Each conflict keeps `code`,
+`resource_key`, `kind`, `requested`, `reason`, and optional `owning_lease`.
+The following codes are stable automation values:
+
+| Code | `retryable` | Meaning |
+|---|---:|---|
+| `resource_contention` | `true` | An active owner or occupied TCP range may release enough resources for the request. This includes capacity and TCP conflicts even when one recorded holder is known to be gone. |
+| `capacity_policy_mismatch` | `false` | Existing leases use a different limit for the same capacity pool; waiting cannot change that policy. |
+| `orphaned_holder` (introduced 2026-10-20, #876) | `false` | A requested exclusive key is still reserved by a lease whose recorded holder process is confirmed gone. The lease and key remain quarantined; the conflict identifies its lease and gives the generation-bound reconciliation command. Waiting does not release it. |
+
+`orphaned_holder` is emitted for an exact exclusive-key conflict only. It does
+not mean that every dead resource holder is unrecoverable: capacity and TCP
+range conflicts remain `resource_contention` because other owners can still
+make the request feasible. `resources explain --json` reports the matching
+`wait` as `{"waitable": false, "reason": "orphaned_holder"}`. Reconciliation
+is an explicit operator action and is required before the quarantined key can
+be reused.

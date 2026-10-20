@@ -80,6 +80,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- Carry the selected worktree-root layout through planning, attribution, and
+  apply. A `LibraryOverride` with no `root_container` is a direct repository
+  root: inventory that root itself, not its children as keyed repositories.
+  Test direct-root and keyed-container layouts, preserving existing keyed
+  confirmation digests.
 - Keep authoritative frozen plans, validation helpers, inputs and receipts on
   durable storage before execution; use temporary directories for scratch only.
   Before a long validation, choose a unique durable output directory outside
@@ -110,10 +115,15 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   summed path allocation, deduplicated physical allocation, and observed
   volume-free-space change distinct. Registration time does not establish
   worktree creation or preparation time.
-- For guard-removal controls that temporarily mutate source, restore exact bytes
-  and verify the source hash, then refresh the owned source file's mtime before
-  the restored positive Cargo run. A `cp -p` restore can otherwise let Cargo
-  reuse output from the mutation build.
+- For guard-removal controls that mutate source in place, reject sources with
+  multiple links. Before the first write, create an exclusive no-follow backup,
+  fsync and read it back to verify the exact original bytes, then create and
+  fsync an exclusive recovery-intent record. Sync the run directory and its
+  parent when newly created. After mutation, restore exact bytes, verify the
+  source hash, and refresh the owned source file's mtime before the restored
+  positive Cargo run; a `cp -p` restore can otherwise reuse mutation output. If
+  restoration cannot be proven, retain the lock and backup and report cleanup
+  as unknown. SIGKILL or power loss may require manual recovery.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only

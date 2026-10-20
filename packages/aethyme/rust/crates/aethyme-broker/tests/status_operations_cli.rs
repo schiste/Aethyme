@@ -14,8 +14,8 @@ use std::process::Command;
 mod common;
 
 use aethyme_broker::{
-    Broker, NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance,
-    OperationProvider, OperationStatus,
+    NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance, OperationProvider,
+    OperationStatus,
 };
 use common::{FixtureRepository, open_fixture_repository_broker};
 
