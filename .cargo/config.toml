@@ -17,6 +17,12 @@ AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS = "1"
 # value. See `aethyme_broker::TEST_AVAILABLE_BYTES_ENV`.
 AETHYME_TEST_AVAILABLE_BYTES = "1099511627776"
 
+# Exact root fingerprint for the source-identity build scripts. This keeps a
+# shared Cargo target correct across worktrees. Invocations from outside the
+# repository must pass this file with `--config` to retain warm reuse; without
+# it, build scripts use the conservative always-recheck fallback.
+AETHYME_BUILD_SOURCE_ROOT = { value = ".", relative = true, force = true }
+
 # Dev/test builds: keep file:line backtraces for workspace crates but drop the
 # full DWARF that made `target/` several GiB per worktree. `profile.test`
 # inherits from `profile.dev`, so `cargo test` gets the same settings. The
