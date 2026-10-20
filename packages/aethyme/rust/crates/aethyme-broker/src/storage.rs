@@ -823,9 +823,11 @@ fn build_plan(
     };
     let digest = decision_digest(
         &storage_root,
-        storage_layout.digest_tag(),
-        preparation_cache_root_identity,
-        preparation_cache_root_nonce,
+        DecisionRootMetadata {
+            storage_root_layout: storage_layout.digest_tag(),
+            preparation_cache_root_identity,
+            preparation_cache_root_nonce,
+        },
         orphan_worktree_roots_days,
         &candidates,
         &primary_candidates,
@@ -4787,11 +4789,16 @@ fn write_attributed_marker(root: &Path, this: &ThisRepository) -> std::io::Resul
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct DecisionRootMetadata<'a> {
+    storage_root_layout: Option<&'static str>,
+    preparation_cache_root_identity: Option<&'a [u8]>,
+    preparation_cache_root_nonce: Option<&'a str>,
+}
+
 fn decision_digest(
     storage_root: &Path,
-    storage_root_layout: Option<&'static str>,
-    preparation_cache_root_identity: Option<&[u8]>,
-    preparation_cache_root_nonce: Option<&str>,
+    root_metadata: DecisionRootMetadata<'_>,
     orphan_worktree_roots_days: u32,
     candidates: &[StorageCandidate],
     primary_candidates: &[StoragePrimaryCandidate],
@@ -4836,9 +4843,9 @@ fn decision_digest(
     }
     let bytes = serde_json::to_vec(&Decision {
         storage_root,
-        storage_root_layout,
-        preparation_cache_root_identity,
-        preparation_cache_root_nonce,
+        storage_root_layout: root_metadata.storage_root_layout,
+        preparation_cache_root_identity: root_metadata.preparation_cache_root_identity,
+        preparation_cache_root_nonce: root_metadata.preparation_cache_root_nonce,
         orphan_worktree_roots_days,
         candidates: candidates
             .iter()
@@ -5233,7 +5240,7 @@ mod tests {
             )
             .unwrap_err(),
             format!(
-                "session ledger is missing or is not a regular file at {}",
+                "session ledger is missing or is not a regular file at {}; no stray directory is swept",
                 repository_root.join(crate::BROKER_DB_RELPATH).display()
             )
         );
@@ -6657,9 +6664,7 @@ mod tests {
         assert_eq!(
             decision_digest(
                 Path::new("/storage"),
-                None,
-                None,
-                None,
+                DecisionRootMetadata::default(),
                 1,
                 &[candidate],
                 &[],
@@ -6667,9 +6672,7 @@ mod tests {
             ),
             decision_digest(
                 Path::new("/storage"),
-                None,
-                None,
-                None,
+                DecisionRootMetadata::default(),
                 1,
                 &[changed],
                 &[],
@@ -6691,9 +6694,7 @@ mod tests {
         let digest = |candidates: &[StoragePreparationCandidate]| {
             decision_digest(
                 Path::new("/storage"),
-                None,
-                None,
-                None,
+                DecisionRootMetadata::default(),
                 1,
                 &[],
                 &[],
@@ -6707,9 +6708,10 @@ mod tests {
         assert_ne!(
             decision_digest(
                 Path::new("/storage"),
-                None,
-                Some(&root_a),
-                None,
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_a),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6717,9 +6719,10 @@ mod tests {
             ),
             decision_digest(
                 Path::new("/storage"),
-                None,
-                Some(&root_b),
-                None,
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_b),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6730,9 +6733,11 @@ mod tests {
         assert_ne!(
             decision_digest(
                 Path::new("/storage"),
-                None,
-                Some(&root_a),
-                Some("a".repeat(64).as_str()),
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_a),
+                    preparation_cache_root_nonce: Some("a".repeat(64).as_str()),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6740,9 +6745,11 @@ mod tests {
             ),
             decision_digest(
                 Path::new("/storage"),
-                None,
-                Some(&root_a),
-                Some("b".repeat(64).as_str()),
+                DecisionRootMetadata {
+                    preparation_cache_root_identity: Some(&root_a),
+                    preparation_cache_root_nonce: Some("b".repeat(64).as_str()),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
@@ -6751,17 +6758,32 @@ mod tests {
             "the confirmation must bind the cache-root instance nonce",
         );
         assert_eq!(
-            decision_digest(Path::new("/storage"), None, None, None, 1, &[], &[], &[],),
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata::default(),
+                1,
+                &[],
+                &[],
+                &[],
+            ),
             "0052d7a07108db59d67115eba0c2f99b6f277169e0dae7cdfbba91bc8168b415",
             "absence of an override preserves the legacy decision payload",
         );
         assert_ne!(
-            decision_digest(Path::new("/storage"), None, None, None, 1, &[], &[], &[],),
             decision_digest(
                 Path::new("/storage"),
-                Some("direct_root"),
-                None,
-                None,
+                DecisionRootMetadata::default(),
+                1,
+                &[],
+                &[],
+                &[],
+            ),
+            decision_digest(
+                Path::new("/storage"),
+                DecisionRootMetadata {
+                    storage_root_layout: Some("direct_root"),
+                    ..DecisionRootMetadata::default()
+                },
                 1,
                 &[],
                 &[],
