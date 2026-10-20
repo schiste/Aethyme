@@ -27,6 +27,7 @@ const MAX_TTL_SECONDS: u64 = 86_400;
 /// per-repository bound; it does not constrain unrelated repositories sharing
 /// the host resource database.
 const MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY: i64 = 16_384;
+const ORPHANED_HOLDER_CONFLICT_CODE: &str = "orphaned_holder";
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -1867,6 +1868,14 @@ impl HostResourceCoordinator {
         let (allocations, conflicts) = plan_allocations(request, &occupied)?;
         if !conflicts.is_empty() {
             let code = aggregate_conflict_code(&conflicts).to_string();
+            if code == ORPHANED_HOLDER_CONFLICT_CODE {
+                quarantine_conflicting_orphaned_holders(&tx, now, &conflicts, &occupied)?;
+                // This commits the existing safe cleanup sweep plus quarantine
+                // for the exact dead owners behind the non-waitable result.
+                // Named allocations remain, and rejected-bundle allocations
+                // are not inserted before this branch.
+                tx.commit()?;
+            }
             let message = conflicts
                 .iter()
                 .map(|c| format!("{}: {}", c.resource_key, c.reason))
@@ -1981,10 +1990,10 @@ impl HostResourceCoordinator {
             match self.acquire_inner(request, supervised) {
                 Ok(grant) => return Ok(grant),
                 Err(HostResourceError::Conflict {
-                    code: _,
+                    code,
                     message,
                     conflicts: _,
-                }) if std::time::Instant::now() < deadline => {
+                }) if code == "resource_contention" && std::time::Instant::now() < deadline => {
                     on_conflict(&message);
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     std::thread::sleep(remaining.min(std::time::Duration::from_millis(250)));
@@ -3313,7 +3322,7 @@ fn supervised_request_digest(request: &HostResourceRequest) -> Result<String, Ho
 
 struct Occupied {
     lease_id: String,
-    generation: u64,
+    generation: i64,
     kind: String,
     value: String,
     units: Option<u32>,
@@ -3363,7 +3372,7 @@ fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> 
             let holder_pid = row.get::<_, Option<i64>>(6)?;
             Ok(Occupied {
                 lease_id: row.get(0)?,
-                generation: row.get::<_, i64>(1)? as u64,
+                generation: row.get(1)?,
                 kind: row.get(2)?,
                 value: row.get(3)?,
                 units: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
@@ -3470,20 +3479,7 @@ fn plan_allocations(
                     .iter()
                     .find(|o| o.kind == "exclusive_key" && o.value == *name)
                 {
-                    let reason = if owner.holder_gone {
-                        let holder = owner.holder_pid.map_or_else(
-                            || "holder PID unknown".into(),
-                            |pid| format!("holder PID {pid}"),
-                        );
-                        format!(
-                            "exclusive key is held by lease {} ({holder}) whose holder process is gone; \
-                             waiting cannot release it, review cleanup and run `aethyme broker \
-                             advanced resources reconcile {} --confirm {}`",
-                            owner.lease_id, owner.lease_id, owner.generation
-                        )
-                    } else {
-                        format!("exclusive key is held by lease {}", owner.lease_id)
-                    };
+                    let reason = format!("exclusive key is held by lease {}", owner.lease_id);
                     conflicts.push(conflict(
                         "resource_contention",
                         &requirement.key,
@@ -3504,7 +3500,67 @@ fn plan_allocations(
             }
         }
     }
+    mark_orphaned_holder_conflicts(&mut conflicts, occupied);
     Ok((proposed, conflicts))
+}
+
+fn quarantine_conflicting_orphaned_holders(
+    tx: &rusqlite::Transaction<'_>,
+    now: i64,
+    conflicts: &[HostResourceConflict],
+    occupied: &[Occupied],
+) -> Result<(), HostResourceError> {
+    for conflict in conflicts
+        .iter()
+        .filter(|conflict| conflict.code == ORPHANED_HOLDER_CONFLICT_CODE)
+    {
+        let Some(lease_id) = conflict.owning_lease.as_deref() else {
+            continue;
+        };
+        let Some(holder) = occupied.iter().find(|owner| {
+            owner.lease_id == lease_id
+                && owner.kind == "exclusive_key"
+                && owner.holder_gone
+                && owner.holder_pid.is_some()
+        }) else {
+            continue;
+        };
+        let Some(holder_pid) = holder.holder_pid else {
+            continue;
+        };
+        tx.execute(
+            "UPDATE resource_leases SET state='quarantined',updated_at=?4 \
+             WHERE lease_id=?1 AND generation=?2 AND holder_pid=?3 AND state='active'",
+            params![lease_id, holder.generation, holder_pid, now],
+        )?;
+    }
+    Ok(())
+}
+
+fn mark_orphaned_holder_conflicts(conflicts: &mut [HostResourceConflict], occupied: &[Occupied]) {
+    for conflict in conflicts {
+        if conflict.kind != "exclusive_key" {
+            continue;
+        }
+        let Some(holder) = occupied.iter().find(|owner| {
+            owner.kind == "exclusive_key" && owner.value == conflict.requested && owner.holder_gone
+        }) else {
+            continue;
+        };
+
+        conflict.code = ORPHANED_HOLDER_CONFLICT_CODE.into();
+        conflict.owning_lease = Some(holder.lease_id.clone());
+        let pid = holder.holder_pid.map_or_else(
+            || "holder PID unknown".into(),
+            |pid| format!("holder PID {pid}"),
+        );
+        conflict.reason = format!(
+            "exclusive key is held by lease {} ({pid}) whose holder process is gone; \
+             waiting cannot release it, review cleanup and run aethyme broker \
+             advanced resources reconcile {} --confirm {}",
+            holder.lease_id, holder.lease_id, holder.generation
+        );
+    }
 }
 
 fn allocation(
@@ -3644,14 +3700,18 @@ fn wait_advice(blockers: &[HostResourceBlocker]) -> HostResourceWaitAdvice {
             action: "align the requested pool limit with the existing lease; waiting cannot change policy".into(),
         };
     }
+    // Only an exact exclusive-key collision is made impossible by this
+    // holder alone. A dead capacity holder or one port in a range can leave
+    // room for the request when another live holder releases its allocation.
     if let Some(holder) = blockers
         .iter()
+        .filter(|blocker| blocker.conflict.kind == "exclusive_key")
         .flat_map(|blocker| &blocker.holders)
         .find(|holder| holder.process_alive == Some(false))
     {
         return HostResourceWaitAdvice {
             waitable: false,
-            reason: "orphaned_holder".into(),
+            reason: ORPHANED_HOLDER_CONFLICT_CODE.into(),
             action: format!(
                 "review cleanup for lease {} (holder PID {}), then run `aethyme broker advanced resources reconcile {} --confirm {}`",
                 holder.lease_id,
@@ -3676,6 +3736,11 @@ fn aggregate_conflict_code(conflicts: &[HostResourceConflict]) -> &'static str {
         .any(|conflict| conflict.code == "capacity_policy_mismatch")
     {
         "capacity_policy_mismatch"
+    } else if conflicts
+        .iter()
+        .any(|conflict| conflict.code == ORPHANED_HOLDER_CONFLICT_CODE)
+    {
+        ORPHANED_HOLDER_CONFLICT_CODE
     } else {
         "resource_contention"
     }
@@ -4742,7 +4807,11 @@ mod tests {
             c.acquire(&r2),
             Err(HostResourceError::Conflict { .. })
         ));
-        assert_eq!(c.list(true).unwrap().len(), 1);
+        let remaining = c.list(false).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].lease_id, a.lease.lease_id);
+        assert_eq!(remaining[0].state, HostLeaseState::Active);
+        assert_eq!(remaining[0].allocations.len(), 1);
     }
     #[test]
     fn credentials_fence_release() {
@@ -5378,23 +5447,395 @@ mod tests {
     /// may have left a database or directory dirty, so its exclusive key stays
     /// reserved until reconciliation proves cleanup.
     #[test]
-    fn dead_holder_still_reserves_its_named_resources() {
+    fn dead_holder_still_reserves_its_named_resources_without_waiting() {
         let t = tempfile::tempdir().unwrap();
         let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
         let mut leaked = req("leaked", vec![exclusive("shared")]);
         leaked.ttl_seconds = 3_600;
         leaked.holder_pid = Some(reaped_pid());
-        c.acquire(&leaked).unwrap();
+        let leaked = c.acquire(&leaked).unwrap();
 
-        let Err(HostResourceError::Conflict { message, .. }) =
-            c.acquire(&req("next", vec![exclusive("shared")]))
+        let explanation = c
+            .explain(&req("explained", vec![exclusive("shared")]))
+            .unwrap();
+        assert!(!explanation.wait.waitable);
+        assert_eq!(explanation.wait.reason, ORPHANED_HOLDER_CONFLICT_CODE);
+
+        let mut conflict_callbacks = 0;
+        let error = c
+            .acquire_with_wait(
+                &req("next", vec![exclusive("shared")]),
+                std::time::Duration::from_secs(30),
+                |_| conflict_callbacks += 1,
+            )
+            .unwrap_err();
+        let HostResourceError::Conflict {
+            code,
+            message,
+            conflicts,
+        } = error
         else {
             panic!("a dead holder's exclusive key must stay reserved");
         };
-        // Waiting is futile here, so the message has to say so and name the remedy.
+        assert_eq!(code, ORPHANED_HOLDER_CONFLICT_CODE);
+        assert_eq!(
+            conflict_callbacks, 0,
+            "a dead holder must not enter the wait loop"
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].owning_lease.as_deref(),
+            Some(leaked.lease.lease_id.as_str())
+        );
         assert!(
-            message.contains("holder process is gone") && message.contains("reconcile"),
-            "conflict must explain that waiting cannot resolve it: {message}"
+            message.contains("holder process is gone")
+                && message.contains(&format!(
+                    "aethyme broker advanced resources reconcile {} --confirm {}",
+                    leaked.lease.lease_id, leaked.lease.generation
+                )),
+            "conflict must identify the exact reconciliation action: {message}"
+        );
+        drop(c);
+        let c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let leases = c.list(false).unwrap();
+        assert_eq!(
+            leases.len(),
+            1,
+            "the rejected request must not create a lease"
+        );
+        let retained = leases
+            .into_iter()
+            .find(|lease| lease.lease_id == leaked.lease.lease_id)
+            .unwrap();
+        assert_eq!(retained.state, HostLeaseState::Quarantined);
+        assert_eq!(retained.allocations.len(), 1);
+        assert_eq!(retained.allocations[0].value, "shared");
+    }
+
+    #[test]
+    fn orphaned_exclusive_refusal_commits_safe_capacity_reclaim_only() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("h.db");
+        let mut c = HostResourceCoordinator::open(&path).unwrap();
+        let mut dead_owner = capacity_request("dead-owner", "workers", 1, 1, Some(reaped_pid()));
+        dead_owner.resources.push(exclusive("shared"));
+        let dead_owner = c.acquire(&dead_owner).unwrap();
+        assert_eq!(dead_owner.lease.allocations.len(), 2);
+
+        let mut rejected = capacity_request("rejected", "workers", 1, 1, None);
+        rejected.resources.push(exclusive("shared"));
+        let error = c.acquire(&rejected).unwrap_err();
+        let HostResourceError::Conflict { code, .. } = error else {
+            panic!("the dead exclusive key must refuse the bundle");
+        };
+        assert_eq!(code, ORPHANED_HOLDER_CONFLICT_CODE);
+
+        drop(c);
+        let c = HostResourceCoordinator::open(&path).unwrap();
+        let leases = c.list(true).unwrap();
+        assert_eq!(
+            leases.len(),
+            1,
+            "the rejected bundle must not create a lease"
+        );
+        let retained = &leases[0];
+        assert_eq!(retained.lease_id, dead_owner.lease.lease_id);
+        assert_eq!(retained.state, HostLeaseState::Quarantined);
+        assert_eq!(retained.allocations.len(), 1);
+        assert_eq!(retained.allocations[0].kind, "exclusive_key");
+        assert_eq!(retained.allocations[0].value, "shared");
+    }
+
+    #[test]
+    fn capacity_policy_mismatch_does_not_commit_orphan_quarantine() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        c.acquire(&capacity_request(
+            "live-capacity",
+            "workers",
+            1,
+            2,
+            Some(std::process::id()),
+        ))
+        .unwrap();
+        let mut dead_exclusive = req("dead-exclusive", vec![exclusive("shared")]);
+        dead_exclusive.holder_pid = Some(reaped_pid());
+        let dead_exclusive = c.acquire(&dead_exclusive).unwrap();
+
+        let mut request = req(
+            "mismatched-bundle",
+            vec![
+                exclusive("shared"),
+                HostResourceRequirement {
+                    key: "workers".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "workers".into(),
+                        units: 1,
+                        limit: 3,
+                    },
+                },
+            ],
+        );
+        request.holder_pid = Some(std::process::id());
+        let error = c.acquire(&request).unwrap_err();
+        let HostResourceError::Conflict {
+            code, conflicts, ..
+        } = error
+        else {
+            panic!("the pool policy mismatch must refuse the bundle");
+        };
+        assert_eq!(code, "capacity_policy_mismatch");
+        assert!(conflicts.iter().any(|conflict| {
+            conflict.code == ORPHANED_HOLDER_CONFLICT_CODE
+                && conflict.owning_lease.as_deref() == Some(dead_exclusive.lease.lease_id.as_str())
+        }));
+        let retained = c
+            .list(false)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == dead_exclusive.lease.lease_id)
+            .unwrap();
+        assert_eq!(retained.state, HostLeaseState::Active);
+        assert_eq!(retained.allocations.len(), 1);
+        assert_eq!(retained.allocations[0].value, "shared");
+    }
+
+    #[test]
+    fn dead_holder_conflict_precedes_waitable_conflicts_in_a_bundle() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let mut dead_key = req("dead-key", vec![exclusive("shared")]);
+        dead_key.holder_pid = Some(reaped_pid());
+        let dead_key = c.acquire(&dead_key).unwrap();
+        c.acquire(&whole_pool("live-capacity")).unwrap();
+
+        let mut request = req(
+            "bundle",
+            vec![
+                exclusive("shared"),
+                HostResourceRequirement {
+                    key: "host-work".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "host-work".into(),
+                        units: 1,
+                        limit: 4,
+                    },
+                },
+            ],
+        );
+        request.holder_pid = Some(std::process::id());
+        let mut conflict_callbacks = 0;
+        let error = c
+            .acquire_with_wait(&request, std::time::Duration::from_secs(30), |_| {
+                conflict_callbacks += 1
+            })
+            .unwrap_err();
+        let HostResourceError::Conflict {
+            code, conflicts, ..
+        } = error
+        else {
+            panic!("the bundle must remain blocked by both existing leases");
+        };
+        assert_eq!(code, ORPHANED_HOLDER_CONFLICT_CODE);
+        assert_eq!(conflict_callbacks, 0);
+        assert!(conflicts.iter().any(|conflict| {
+            conflict.code == ORPHANED_HOLDER_CONFLICT_CODE
+                && conflict.owning_lease.as_deref() == Some(dead_key.lease.lease_id.as_str())
+        }));
+        assert!(conflicts.iter().any(|conflict| {
+            conflict.kind == "capacity" && conflict.code == "resource_contention"
+        }));
+    }
+
+    #[test]
+    fn dead_capacity_and_tcp_holders_do_not_make_a_bundle_unwaitable() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+
+        let dead_capacity =
+            capacity_request("supervised-dead", "supervised", 1, 4, Some(reaped_pid()));
+        c.acquire_inner(&dead_capacity, true).unwrap();
+        c.acquire(&capacity_request(
+            "live-capacity",
+            "supervised",
+            3,
+            4,
+            Some(std::process::id()),
+        ))
+        .unwrap();
+        let next_capacity = capacity_request(
+            "next-capacity",
+            "supervised",
+            1,
+            4,
+            Some(std::process::id()),
+        );
+        let capacity_explanation = c.explain(&next_capacity).unwrap();
+        assert!(capacity_explanation.wait.waitable);
+        assert_eq!(capacity_explanation.wait.reason, "resource_contention");
+        let mut capacity_callbacks = 0;
+        let capacity_error = c
+            .acquire_with_wait(
+                &next_capacity,
+                std::time::Duration::from_millis(250),
+                |_| capacity_callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(conflict_code(capacity_error), "resource_contention");
+        assert!(
+            capacity_callbacks > 0,
+            "the live capacity holder may release enough units for this request"
+        );
+
+        let (dead_port, live_port) = adjacent_bindable_ports();
+        let mut dead_port_request = req(
+            "dead-port",
+            vec![HostResourceRequirement {
+                key: "port".into(),
+                resource: HostResourceKind::TcpPort {
+                    start: dead_port,
+                    end: dead_port,
+                },
+            }],
+        );
+        dead_port_request.holder_pid = Some(reaped_pid());
+        let dead_port_lease = c.acquire(&dead_port_request).unwrap();
+        let live_listener =
+            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, live_port)).unwrap();
+        let next_port = req(
+            "next-port",
+            vec![HostResourceRequirement {
+                key: "port-range".into(),
+                resource: HostResourceKind::TcpPort {
+                    start: dead_port,
+                    end: live_port,
+                },
+            }],
+        );
+        let tcp_explanation = c.explain(&next_port).unwrap();
+        assert!(tcp_explanation.wait.waitable);
+        assert_eq!(tcp_explanation.wait.reason, "resource_contention");
+        let mut tcp_callbacks = 0;
+        let tcp_error = c
+            .acquire_with_wait(&next_port, std::time::Duration::from_millis(250), |_| {
+                tcp_callbacks += 1
+            })
+            .unwrap_err();
+        assert_eq!(conflict_code(tcp_error), "resource_contention");
+        assert!(
+            tcp_callbacks > 0,
+            "the live listener may release another port in the requested range"
+        );
+        let retained_dead_port = c
+            .list(false)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == dead_port_lease.lease.lease_id)
+            .unwrap();
+        assert_eq!(
+            retained_dead_port.state,
+            HostLeaseState::Active,
+            "a retryable TCP contention refusal rolls back the opportunistic quarantine sweep"
+        );
+        assert_eq!(
+            retained_dead_port.allocations, dead_port_lease.lease.allocations,
+            "the refused request must not quietly release the dead holder's named TCP allocation"
+        );
+        drop(live_listener);
+    }
+
+    fn adjacent_bindable_ports() -> (u16, u16) {
+        for _ in 0..8 {
+            let anchor = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let pivot = anchor.local_addr().unwrap().port();
+            drop(anchor);
+            let first = pivot.saturating_sub(64).max(1_024);
+            let last = pivot.saturating_add(64).min(u16::MAX - 1);
+            for port in first..=last {
+                let Ok(first_listener) =
+                    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+                else {
+                    continue;
+                };
+                let Ok(second_listener) =
+                    TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port + 1))
+                else {
+                    continue;
+                };
+                drop(second_listener);
+                drop(first_listener);
+                return (port, port + 1);
+            }
+        }
+        panic!("could not find a free adjacent TCP port pair for the test");
+    }
+
+    #[test]
+    fn capacity_policy_mismatch_keeps_precedence_and_its_original_owner() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let mut dead_key = req("dead-key", vec![exclusive("shared")]);
+        dead_key.holder_pid = Some(reaped_pid());
+        c.acquire(&dead_key).unwrap();
+        let live_capacity =
+            capacity_request("live-capacity", "workers", 1, 4, Some(std::process::id()));
+        let capacity_lease = c.acquire(&live_capacity).unwrap();
+
+        let request = req(
+            "bundle",
+            vec![
+                exclusive("shared"),
+                HostResourceRequirement {
+                    key: "workers".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "workers".into(),
+                        units: 1,
+                        limit: 5,
+                    },
+                },
+            ],
+        );
+        let error = c.acquire(&request).unwrap_err();
+        let HostResourceError::Conflict {
+            code, conflicts, ..
+        } = error
+        else {
+            panic!("both the dead key and mismatched pool policy must block the bundle");
+        };
+        assert_eq!(code, "capacity_policy_mismatch");
+        assert!(conflicts.iter().any(|conflict| {
+            conflict.code == ORPHANED_HOLDER_CONFLICT_CODE && conflict.kind == "exclusive_key"
+        }));
+        let policy_conflict = conflicts
+            .iter()
+            .find(|conflict| conflict.code == "capacity_policy_mismatch")
+            .unwrap();
+        assert_eq!(
+            policy_conflict.owning_lease.as_deref(),
+            Some(capacity_lease.lease.lease_id.as_str())
+        );
+    }
+
+    #[test]
+    fn unknown_holder_pid_keeps_ordinary_contention_waitable() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let mut holder = req("unknown-holder", vec![exclusive("shared")]);
+        holder.holder_pid = None;
+        c.acquire(&holder).unwrap();
+
+        let mut callbacks = 0;
+        let error = c
+            .acquire_with_wait(
+                &req("next", vec![exclusive("shared")]),
+                std::time::Duration::from_millis(250),
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        assert_eq!(conflict_code(error), "resource_contention");
+        assert!(
+            callbacks > 0,
+            "an unknown holder must retain ordinary retry behavior"
         );
     }
 

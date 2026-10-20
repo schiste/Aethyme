@@ -656,3 +656,24 @@ Under `capture = "advisory"`, `broker submit --json`'s `collaboration_capture`
 gains `ignored_settings` (sorted) when the config carries `[collaboration]`
 keys this binary does not implement; text output adds one warning line.
 Under `required` such a key is refused as `unknown_setting`.
+
+### `broker advanced resources acquire --json` (stable conflict codes)
+
+The acquire failure object keeps its existing fields: `code`, `request_id`,
+`retryable`, `waited_ms`, and `conflicts`. Each conflict keeps `code`,
+`resource_key`, `kind`, `requested`, `reason`, and optional `owning_lease`.
+The following codes are stable automation values:
+
+| Code | `retryable` | Meaning |
+|---|---:|---|
+| `resource_contention` | `true` | An active owner or occupied TCP range may release enough resources for the request. This includes capacity and TCP conflicts even when one recorded holder is known to be gone. |
+| `capacity_policy_mismatch` | `false` | Existing leases use a different limit for the same capacity pool; waiting cannot change that policy. |
+| `orphaned_holder` (introduced 2026-10-20, #876) | `false` | A requested exclusive key is still reserved by a lease whose recorded holder process is confirmed gone. The lease and key remain quarantined; the conflict identifies its lease and gives the generation-bound reconciliation command. Waiting does not release it. |
+
+`orphaned_holder` is emitted for an exact exclusive-key conflict only. It does
+not mean that every dead resource holder is unrecoverable: capacity and TCP
+range conflicts remain `resource_contention` because other owners can still
+make the request feasible. `resources explain --json` reports the matching
+`wait` as `{"waitable": false, "reason": "orphaned_holder"}`. Reconciliation
+is an explicit operator action and is required before the quarantined key can
+be reused.
