@@ -60,6 +60,7 @@ impl RuntimePathRule {
 
 const BROKER_RUNTIME_PATH_RULES: &[RuntimePathRule] = &[
     RuntimePathRule::file_prefix(".aethyme/broker.db*"),
+    RuntimePathRule::exact(".aethyme/.broker.db.bootstrap.lock"),
     RuntimePathRule::directory(".aethyme/logs/"),
     RuntimePathRule::directory(".aethyme/locks/"),
     RuntimePathRule::directory(".aethyme/reports/"),
@@ -110,7 +111,8 @@ pub(crate) fn managed_gitignore_block() -> String {
 mod tests {
     use super::{
         BROKER_RUNTIME_PATH_RULES, MANAGED_GITIGNORE_BEGIN_LINE, MANAGED_GITIGNORE_END_LINE,
-        RuntimePathKind, is_broker_runtime_path, managed_gitignore_block,
+        RuntimePathKind, broker_runtime_ignore_patterns, is_broker_runtime_path,
+        managed_gitignore_block,
     };
 
     #[test]
@@ -163,5 +165,17 @@ mod tests {
         assert!(!is_broker_runtime_path(".aethyme/graph/example.rs.bin"));
         assert!(!is_broker_runtime_path("operator-note.txt"));
         assert!(is_broker_runtime_path(".aethyme/gc.lock/child"));
+
+        let hidden_bootstrap_lock = ".aethyme/.broker.db.bootstrap.lock";
+        assert!(is_broker_runtime_path(hidden_bootstrap_lock));
+        assert!(
+            broker_runtime_ignore_patterns().any(|pattern| pattern == hidden_bootstrap_lock),
+            "the bootstrap lock must be emitted in the managed ignore block"
+        );
+        const CHECKED_IN_GITIGNORE: &str = include_str!("../../../../../../.gitignore");
+        assert!(
+            CHECKED_IN_GITIGNORE.contains(&managed_gitignore_block()),
+            "the checked-in managed ignore block must match the runtime path catalog"
+        );
     }
 }

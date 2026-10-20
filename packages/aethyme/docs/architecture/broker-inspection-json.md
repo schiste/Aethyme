@@ -45,6 +45,14 @@ The `reconciliation.complete` field is false when the inventory deadline
 ends before every root is read. In that case its counts describe only the
 observed prefix.
 
+When root-dependent reconciliation is deferred because the worktree root is
+unbound, `reconciliation.deferred_reason` is `fresh_root_unbound` or
+`legacy_root_unbound`. The report has `complete: false`,
+`scanned_root_count: 0`, `sized: false`, zero-valued counts and bytes, and an
+empty `unclaimed` list. Those placeholders mean the root was not inspected;
+they do not mean it contains no work or is empty. Read-only reporting does not
+create or bind the root.
+
 ## Retention health
 
 `gc plan --json` and the retention report in `status doctor --json` include
