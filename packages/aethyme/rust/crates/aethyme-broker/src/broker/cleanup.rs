@@ -1761,7 +1761,8 @@ impl Broker {
                     }
                 }
                 self.refuse_live_checkout(session_id, &worktree_path)?;
-                self.repo.worktree_remove(&worktree_path, force)?;
+                self.repo
+                    .worktree_remove_registered(&worktree_path, force)?;
             }
             self.store
                 .set_session_status(session_id, SessionStatus::Cleaned, None)?;
@@ -1795,7 +1796,8 @@ impl Broker {
 
         if worktree_path.exists() {
             self.refuse_live_checkout(session_id, &worktree_path)?;
-            self.repo.worktree_remove(&worktree_path, force)?;
+            self.repo
+                .worktree_remove_registered(&worktree_path, force)?;
         }
         if let Some(branch_tip) = item.and_then(|item| item.branch_tip)
             && session.origin == SessionOrigin::Spawned
@@ -2085,5 +2087,79 @@ mod ownership_witness_tests {
             receiver.recv_timeout(Duration::from_secs(1)),
             Ok(Ok(None))
         ));
+    }
+}
+
+#[cfg(test)]
+mod registered_removal_failure_tests {
+    use crate::{SessionCleanupState, git::with_git_deadline};
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn registered_cleanup_preserves_checkout_after_git_removal_timeout() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.name", "Cleanup test"]);
+        git(
+            &repository,
+            &["config", "user.email", "cleanup@example.invalid"],
+        );
+        git(&repository, &["commit", "--allow-empty", "-qm", "initial"]);
+
+        let worktree = owner.path().join("registered-worktree");
+        let worktree_text = worktree.to_string_lossy().into_owned();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fixture-adopted",
+                &worktree_text,
+                "HEAD",
+            ],
+        );
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let adopted = broker
+            .adopt(&worktree, Some("closed checkout cleanup"))
+            .unwrap();
+        broker.close(adopted.id).unwrap();
+        let evidence = worktree.join("keep-for-retry.txt");
+        std::fs::write(&evidence, b"preserve this checkout").unwrap();
+
+        let result = with_git_deadline(Duration::ZERO, || broker.cleanup(adopted.id, true));
+        assert!(result.is_err(), "expired Git budget must refuse removal");
+        assert_eq!(std::fs::read(&evidence).unwrap(), b"preserve this checkout");
+        assert_eq!(
+            broker.store().session(adopted.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed,
+            "failed removal must leave the session available for retry"
+        );
+        assert!(
+            crate::git::GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref("refs/heads/fixture-adopted")
+                .is_some(),
+            "failed removal must retain its branch"
+        );
     }
 }

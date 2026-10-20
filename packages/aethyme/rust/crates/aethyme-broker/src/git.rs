@@ -290,7 +290,7 @@ mod interrupted_finish_status_tests {
 
     #[test]
     fn interrupted_finish_accepts_only_unstaged_tracked_deletions() {
-        let no_ignored = |_| false;
+        let no_ignored = |_: &str| false;
         assert!(only_unstaged_tracked_deletions(
             &[(*b" D", "gone".into())],
             no_ignored
@@ -4552,8 +4552,8 @@ impl GitRepo {
     }
 
     /// Remove only through Git, preserving every refusal and registration.
-    /// Callers that own disposable checkouts can request force without opting
-    /// into the orphan-directory fallback used by ordinary session cleanup.
+    /// Force requests Git's force behavior; it never authorizes a recursive
+    /// filesystem deletion when Git cannot establish a successful removal.
     pub(crate) fn worktree_remove_registered(
         &self,
         worktree: &Path,

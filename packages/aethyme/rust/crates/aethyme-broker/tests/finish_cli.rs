@@ -1,7 +1,7 @@
 #[path = "common/isolation.rs"]
 mod isolation;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use aethyme_broker::{GateStatus, NewGateResult, events};
@@ -28,6 +28,66 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 fn run(repo: &Path, args: &[&str]) -> Output {
     isolation::command(CLI, repo, args).output().unwrap()
+}
+
+#[cfg(unix)]
+fn run_with_transient_git_removal_failure(
+    repo: &Path,
+    args: &[&str],
+    artifacts: &Path,
+) -> (Output, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(artifacts).unwrap();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("the test runner PATH contains Git");
+    let shim_dir = artifacts.join("git-shim");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("git");
+    std::fs::write(
+        &shim,
+        r##"#!/bin/sh
+case "$*" in
+  *"worktree remove"*)
+    : > "$AETHYME_TEST_GIT_REMOVE_MARKER"
+    echo 'injected transient worktree removal failure' >&2
+    exit 73
+    ;;
+esac
+if [ -e "$AETHYME_TEST_GIT_REMOVE_MARKER" ]; then
+  case "$*" in
+    *"rev-parse --show-toplevel"*)
+      : > "$AETHYME_TEST_GIT_DISCOVERY_MARKER"
+      echo 'injected transient repository discovery failure' >&2
+      exit 74
+      ;;
+  esac
+fi
+exec "$AETHYME_TEST_REAL_GIT" "$@"
+"##,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+
+    let prior_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(shim_dir).chain(std::env::split_paths(&prior_path)))
+            .unwrap();
+    let removal_marker = artifacts.join("git-removal-attempted");
+    let discovery_marker = artifacts.join("git-discovery-attempted");
+    let mut command = isolation::command(CLI, repo, args);
+    let output = command
+        .env("PATH", path)
+        .env("AETHYME_TEST_REAL_GIT", real_git)
+        .env("AETHYME_TEST_GIT_REMOVE_MARKER", &removal_marker)
+        .env("AETHYME_TEST_GIT_DISCOVERY_MARKER", &discovery_marker)
+        .output()
+        .unwrap();
+    (output, removal_marker, discovery_marker)
 }
 
 fn promoted_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
@@ -1098,3 +1158,71 @@ fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() 
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[cfg(unix)]
+#[test]
+fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
+    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[cleanup]\nauto_remove = false\n",
+    )
+    .unwrap();
+
+    let session = session_id.to_string();
+    let finish = run(
+        tmp.path(),
+        &["finish", "--session", &session, "--keep-worktree", "--json"],
+    );
+    assert!(
+        finish.status.success(),
+        "{}",
+        String::from_utf8_lossy(&finish.stderr)
+    );
+    assert!(worktree.exists());
+    {
+        let mut broker = isolation::open(tmp.path());
+        // This legacy intent has no immutable proof. The complete checkout is
+        // still eligible through ordinary cleanup, which must retain it when
+        // Git cannot establish that registered removal succeeded.
+        broker
+            .store()
+            .begin_finish_cleanup(
+                session_id,
+                r#"{"worktree_present":true,"branch_present":true}"#,
+            )
+            .unwrap();
+    }
+
+    let artifacts = tmp.path().join("transient-git-failure");
+    let (output, removal_marker, discovery_marker) = run_with_transient_git_removal_failure(
+        tmp.path(),
+        &["finish", "cleanup", &session, "--json"],
+        &artifacts,
+    );
+    assert!(
+        !output.status.success(),
+        "transient Git failure must be reported, not converted to success"
+    );
+    assert!(
+        removal_marker.exists(),
+        "the registered removal was attempted"
+    );
+    assert!(
+        !discovery_marker.exists(),
+        "ordinary cleanup must not use an unrelated discovery error as orphan proof"
+    );
+    assert!(worktree.join("README.md").is_file());
+    assert!(worktree.exists());
+    assert!(
+        Command::new("git")
+            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "a failed cleanup must preserve the branch"
+    );
+}

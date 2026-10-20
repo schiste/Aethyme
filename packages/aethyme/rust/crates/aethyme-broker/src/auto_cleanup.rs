@@ -1090,7 +1090,7 @@ impl Broker {
         // only untracked file they let through is Finder's `.DS_Store`, which
         // a plain `worktree remove` refuses.
         self.repo_handle()
-            .worktree_remove(&candidate.worktree, true)?;
+            .worktree_remove_registered(&candidate.worktree, true)?;
         if candidate.worktree.exists() {
             let outcome = crate::removal::remove_tree(&candidate.worktree);
             if !outcome.removed {
@@ -1283,5 +1283,74 @@ mod tests {
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_removal_tests {
+    use super::{AutoCleanupCandidate, ContainmentProof};
+    use crate::{SessionCleanupState, git::with_git_deadline};
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn auto_cleanup_preserves_candidate_after_git_removal_timeout() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.name", "Auto cleanup test"]);
+        git(
+            &repository,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
+        git(&repository, &["commit", "--allow-empty", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("auto cleanup candidate", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        broker.close(session.id).unwrap();
+        let evidence = worktree.join("keep-for-retry.txt");
+        std::fs::write(&evidence, b"preserve this candidate").unwrap();
+        let candidate = AutoCleanupCandidate {
+            worktree: worktree.clone(),
+            sessions: vec![broker.store().session(session.id).unwrap()],
+        };
+        let proof = ContainmentProof {
+            head: "fixture-head".into(),
+            containing_commit: "fixture-containing-commit".into(),
+            proof: "ancestry".into(),
+        };
+
+        let result = with_git_deadline(Duration::ZERO, || {
+            broker.remove_auto_cleanup_candidate(&candidate, &proof)
+        });
+        assert!(result.is_err(), "expired Git budget must refuse removal");
+        assert_eq!(
+            std::fs::read(&evidence).unwrap(),
+            b"preserve this candidate"
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed,
+            "failed removal must leave the candidate available for retry"
+        );
     }
 }
