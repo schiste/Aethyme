@@ -249,6 +249,55 @@ removes a store other worktrees may be reading. Declaring a budget without a
 tracked-file mutation the worktree guard refuses without an explicit lease.
 Commit `package-lock.json` and the draft uses `npm ci`.
 
+## Tune Git For Repeated Worktree Status
+
+Linked worktrees already share the repository object database. Avoid cloning
+the repository again or configuring object alternates for broker sessions:
+those add lifecycle and portability risks without removing work Aethyme is
+already sharing.
+
+For a large checkout, benchmark Git's filesystem monitor and many-files
+defaults against the broker's actual command mix before changing configuration.
+Use a clean and a dirty worktree, include ignored build output and untracked
+files, and compare several warm runs. `GIT_TRACE2_PERF` records Git's internal
+timings when a command remains slow:
+
+```bash
+GIT_TRACE2_PERF=/tmp/git-status.perf git -C <worktree> status --porcelain=v1
+git -C <worktree> -c core.fsmonitor=true status --porcelain=v1
+git -C <worktree> -c feature.manyFiles=true status --porcelain=v1
+```
+
+On macOS and Windows, `core.fsmonitor=true` opts into Git's built-in
+filesystem-monitor daemon. It can reduce repeated filesystem scans, but has
+startup and maintenance cost and may lose on small or mostly clean checkouts.
+It is unsupported on some filesystems, including network mounts by default.
+The setting is shared by linked worktrees when written to repository config;
+all Git clients using that checkout must understand the boolean form (Git
+2.36 or newer).
+
+`feature.manyFiles=true` enables Git's many-files defaults: index v4, the
+untracked cache and skipped index checksums. It can help status and index
+writes, but measure first. The untracked cache assumes reliable filesystem
+modification times. Older Git versions may reject or misreport indexes using
+skipped checksums; keep all clients on a supported Git version before enabling
+it in shared repository configuration.
+
+Only persist a setting after it wins on representative worktrees. Repository
+local settings affect every linked worktree and IDE using the common Git
+directory:
+
+```bash
+git -C <main-checkout> config --local feature.manyFiles true
+git -C <main-checkout> config --local core.fsmonitor true
+```
+
+Undo an opt-in with `git config --local --unset <key>`. These settings are
+machine-local and are not part of `.aethyme/config.toml` or the repository.
+Do not enable `feature.experimental` as a performance shortcut: it bundles
+changing fetch, pack and new-repository ref-format defaults, so evaluate those
+individually with compatibility and migration plans.
+
 ## Reuse A Bounded Artifact Cache
 
 For compilers or package managers whose artifacts are safe to reuse across
