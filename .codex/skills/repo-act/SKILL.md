@@ -70,6 +70,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- Carry the selected worktree-root layout through planning, attribution, and
+  apply. A `LibraryOverride` with no `root_container` is a direct repository
+  root: inventory that root itself, not its children as keyed repositories.
+  Test direct-root and keyed-container layouts, preserving existing keyed
+  confirmation digests.
 - Keep authoritative frozen plans, validation helpers, inputs and receipts on
   durable storage before execution; use temporary directories for scratch only.
   Before a long validation, choose a unique durable output directory outside
