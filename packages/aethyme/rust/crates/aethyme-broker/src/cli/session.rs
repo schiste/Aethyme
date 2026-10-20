@@ -843,6 +843,75 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
         let plan = broker.worktree_root_plan()?;
         return display_worktree_root_plan(&plan, parsed.json);
     }
+    if parsed.positional.len() == 2 && parsed.positional[0] == "recovery" {
+        if parsed.read_only_snapshot {
+            return Err(UsageError::Message(
+                "worktree-root recovery requires the current writable repository database, not a compatibility snapshot".into(),
+            ));
+        }
+        match parsed.positional[1].as_str() {
+            "plan" => {
+                if parsed.confirm.is_some() {
+                    return Err(UsageError::Message(
+                        "worktree-root recovery plan does not accept --confirm".into(),
+                    ));
+                }
+                let broker = open_broker(false)?;
+                let plan = broker.fresh_worktree_root_recovery_plan()?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    out!("Fresh worktree-root recovery plan");
+                    out!("Repository: {}", plan.repository_root.display());
+                    out!(
+                        "Exact root: {} ({:?})",
+                        plan.worktree_root.display(),
+                        plan.layout
+                    );
+                    out!("Root source: {}", plan.source.as_str());
+                    out!("Registry state: {:?}", plan.registry.state);
+                    out!("Applicable: {}", plan.can_apply);
+                    if let Some(reason) = &plan.refusal {
+                        out!("Refusal: {reason}");
+                    }
+                    out!("Plan digest: {}", plan.digest);
+                    out!(
+                        "Apply only after reviewing this exact recovery plan: aethyme broker worktree-root recovery apply --confirm {}",
+                        plan.digest
+                    );
+                }
+            }
+            "apply" => {
+                let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                    UsageError::Message(
+                        "worktree-root recovery apply requires --confirm <sha256> from its plan"
+                            .into(),
+                    )
+                })?;
+                let mut broker = open_broker(false)?;
+                broker.apply_fresh_worktree_root_recovery(confirm)?;
+                let binding = broker.store().repository_worktree_binding()?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&binding)?);
+                } else {
+                    out!(
+                        "Fresh worktree-root recovery completed: {}",
+                        binding
+                            .worktree_root
+                            .as_deref()
+                            .unwrap_or(Path::new("<unknown>"))
+                            .display()
+                    );
+                }
+            }
+            _ => {
+                return Err(UsageError::Message(
+                    "worktree-root recovery action must be plan or apply".into(),
+                ));
+            }
+        }
+        return Ok(());
+    }
     if parsed.positional.len() != 4 || parsed.positional[0] != "binding" {
         return Err(UsageError::Message(
             "usage: aethyme broker worktree-root [binding plan <exact-root> <keyed_container|direct_root> | binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256>] [--json]".into(),

@@ -224,6 +224,12 @@ Usage:
       repository, database, root, layout, source and filesystem identities.
   aethyme broker worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]
       Bind that exact legacy root only if all planned identities still match.
+  aethyme broker worktree-root recovery plan [--json]
+      Inspect the exact incomplete fresh-root reservation and its filesystem
+      and registry prefix without changing any bytes.
+  aethyme broker worktree-root recovery apply --confirm <sha256> [--json]
+      Finish only the reviewed fresh-root reservation when its exact digest
+      still matches and every observed artifact is a supported prefix.
   aethyme broker worktrees [--measure] [--json]
       List every worktree on this host with its repository, size, age and
       what removing it would lose (uncommitted, unpushed, recoverable).

@@ -1683,6 +1683,583 @@ struct FreshWorktreeRootCandidate {
     source: WorktreeRootSource,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FreshRootRecoveryPathState {
+    Missing,
+    Empty,
+    ExactMarker,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FreshRootRecoveryCargoState {
+    EmptyDirectory,
+    ExactConfig,
+    ExactWriterTemporary { name: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct FreshRootRecoveryCargoInventory {
+    directory_identity: crate::worktree_registry::RecoveryArtifactIdentity,
+    state: FreshRootRecoveryCargoState,
+    file_identity: Option<crate::worktree_registry::RecoveryArtifactIdentity>,
+    bytes_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct FreshRootRecoveryInventory {
+    state: FreshRootRecoveryPathState,
+    root_identity: Option<BoundDirectoryIdentity>,
+    root_mode: Option<u32>,
+    entries: Vec<String>,
+    marker_bytes_sha256: Option<String>,
+    cargo: Option<FreshRootRecoveryCargoInventory>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FreshRootRecoveryPlan {
+    pub(crate) schema_version: u32,
+    pub(crate) binding: crate::store::repository_binding::RepositoryWorktreeBinding,
+    pub(crate) repository_root: PathBuf,
+    pub(crate) repository_key: String,
+    pub(crate) broker_database: PathBuf,
+    pub(crate) host_operation_database: PathBuf,
+    pub(crate) worktree_root: PathBuf,
+    pub(crate) layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
+    pub(crate) source: WorktreeRootSource,
+    pub(crate) parent_identity: BoundDirectoryIdentity,
+    root_inventory: FreshRootRecoveryInventory,
+    pub(crate) registry: crate::worktree_registry::FreshRootRegistryObservation,
+    pub(crate) expected_marker_bytes_sha256: String,
+    pub(crate) binding_record_sha256: String,
+    pub(crate) can_apply: bool,
+    pub(crate) refusal: Option<String>,
+    pub(crate) digest: String,
+}
+
+#[derive(serde::Serialize)]
+struct FreshRootRecoveryDigestInput<'a> {
+    schema_version: u32,
+    binding: &'a crate::store::repository_binding::RepositoryWorktreeBinding,
+    repository_root: &'a Path,
+    repository_key: &'a str,
+    broker_database: &'a Path,
+    host_operation_database: &'a Path,
+    worktree_root: &'a Path,
+    layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
+    source: WorktreeRootSource,
+    parent_identity: &'a BoundDirectoryIdentity,
+    root_inventory: &'a FreshRootRecoveryInventory,
+    registry: &'a crate::worktree_registry::FreshRootRegistryObservation,
+    expected_marker_bytes_sha256: &'a str,
+    binding_record_sha256: &'a str,
+    can_apply: bool,
+    refusal: &'a Option<String>,
+}
+
+fn fresh_root_recovery_marker_bytes(marker: &WorktreeRootMarker) -> Result<Vec<u8>, String> {
+    let mut bytes = serde_json::to_vec_pretty(marker).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if bytes.len() > crate::worktree_registry::MAX_RECORD_BYTES {
+        return Err("ownership marker exceeds its byte limit".into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn recovery_path_file_bytes(
+    path: &Path,
+) -> Result<(Vec<u8>, crate::worktree_registry::RecoveryArtifactIdentity), String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let before = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.len() > crate::worktree_registry::MAX_RECORD_BYTES as u64
+    {
+        return Err(format!(
+            "{} is not a bounded regular recovery file",
+            path.display()
+        ));
+    }
+    let identity = crate::worktree_registry::RecoveryArtifactIdentity {
+        device: before.dev(),
+        inode: before.ino(),
+        owner: before.uid(),
+        mode: before.mode() & 0o7777,
+        links: before.nlink(),
+        bytes: before.len(),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    let opened_identity = crate::worktree_registry::RecoveryArtifactIdentity {
+        device: opened.dev(),
+        inode: opened.ino(),
+        owner: opened.uid(),
+        mode: opened.mode() & 0o7777,
+        links: opened.nlink(),
+        bytes: opened.len(),
+    };
+    if opened_identity != identity {
+        return Err(format!("{} changed while opening", path.display()));
+    }
+    let mut bytes = Vec::with_capacity(identity.bytes as usize);
+    file.take(crate::worktree_registry::MAX_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let after = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let after_identity = crate::worktree_registry::RecoveryArtifactIdentity {
+        device: after.dev(),
+        inode: after.ino(),
+        owner: after.uid(),
+        mode: after.mode() & 0o7777,
+        links: after.nlink(),
+        bytes: after.len(),
+    };
+    if after_identity != identity || bytes.len() as u64 != identity.bytes {
+        return Err(format!("{} changed while reading", path.display()));
+    }
+    Ok((bytes, identity))
+}
+
+#[cfg(not(unix))]
+fn recovery_path_file_bytes(
+    _path: &Path,
+) -> Result<(Vec<u8>, crate::worktree_registry::RecoveryArtifactIdentity), String> {
+    Err("fresh-root recovery requires Unix no-follow file checks".into())
+}
+
+#[cfg(unix)]
+fn fresh_root_recovery_inventory(
+    root: &Path,
+    expected_marker: &WorktreeRootMarker,
+) -> Result<FreshRootRecoveryInventory, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if canonical_prefix(root)? != root {
+        return Err("reserved root path is not its canonical unresolved name".into());
+    }
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FreshRootRecoveryInventory {
+                state: FreshRootRecoveryPathState::Missing,
+                root_identity: None,
+                root_mode: None,
+                entries: Vec::new(),
+                marker_bytes_sha256: None,
+                cargo: None,
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("reserved root is not a real directory owned by the current user".into());
+    }
+    let root_identity = bound_directory_identity(root)?;
+    verify_private_worktree_root_permissions(root)?;
+    let root_mode = root_metadata.permissions().mode() & 0o7777;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
+        if entries.len() >= 4 {
+            return Err("reserved root exceeds the recovery entry limit".into());
+        }
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "reserved root contains a non-UTF-8 entry".to_owned())?;
+        if !matches!(
+            name.as_str(),
+            crate::broker::WORKTREE_ROOT_MARKER | ".cargo"
+        ) {
+            return Err(format!("unexpected reserved-root entry {name:?}"));
+        }
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_symlink()
+            || (name == ".cargo" && !kind.is_dir())
+            || (name != ".cargo" && !kind.is_file())
+        {
+            return Err(format!(
+                "reserved-root entry {name:?} has an unexpected type"
+            ));
+        }
+        entries.push(name);
+    }
+    entries.sort();
+    let marker_path = root.join(crate::broker::WORKTREE_ROOT_MARKER);
+    let marker_bytes_sha256 = if entries
+        .iter()
+        .any(|name| name == crate::broker::WORKTREE_ROOT_MARKER)
+    {
+        let (bytes, _) = recovery_path_file_bytes(&marker_path)?;
+        let expected_bytes = fresh_root_recovery_marker_bytes(expected_marker)?;
+        if bytes != expected_bytes {
+            return Err(
+                "reserved-root marker bytes differ from the exact fresh reservation".into(),
+            );
+        }
+        Some(hex_digest(&bytes))
+    } else {
+        None
+    };
+    let cargo = if entries.iter().any(|name| name == ".cargo") {
+        Some(fresh_root_recovery_cargo_inventory(&root.join(".cargo"))?)
+    } else {
+        None
+    };
+    if bound_directory_identity(root)? != root_identity {
+        return Err("reserved root identity changed during inspection".into());
+    }
+    let state = if marker_bytes_sha256.is_some() {
+        FreshRootRecoveryPathState::ExactMarker
+    } else if entries.is_empty() {
+        FreshRootRecoveryPathState::Empty
+    } else {
+        return Err("unmarked reserved root is not empty".into());
+    };
+    Ok(FreshRootRecoveryInventory {
+        state,
+        root_identity: Some(root_identity),
+        root_mode: Some(root_mode),
+        entries,
+        marker_bytes_sha256,
+        cargo,
+    })
+}
+
+#[cfg(not(unix))]
+fn fresh_root_recovery_inventory(
+    _root: &Path,
+    _expected_marker: &WorktreeRootMarker,
+) -> Result<FreshRootRecoveryInventory, String> {
+    Err("fresh-root recovery requires Unix no-follow filesystem checks".into())
+}
+
+#[cfg(unix)]
+fn fresh_root_recovery_cargo_inventory(
+    directory: &Path,
+) -> Result<FreshRootRecoveryCargoInventory, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err("reserved root .cargo is not a private real directory".into());
+    }
+    let directory_identity = crate::worktree_registry::RecoveryArtifactIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+        links: metadata.nlink(),
+        bytes: metadata.len(),
+    };
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+        if entries.len() >= 2 {
+            return Err("reserved root .cargo exceeds the recovery entry limit".into());
+        }
+        entries.push(entry.map_err(|error| error.to_string())?);
+    }
+    if entries.is_empty() {
+        let directory_after =
+            std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+        let identity_after = crate::worktree_registry::RecoveryArtifactIdentity {
+            device: directory_after.dev(),
+            inode: directory_after.ino(),
+            owner: directory_after.uid(),
+            mode: directory_after.mode() & 0o7777,
+            links: directory_after.nlink(),
+            bytes: directory_after.len(),
+        };
+        if identity_after != directory_identity {
+            return Err("reserved root .cargo changed during inspection".into());
+        }
+        return Ok(FreshRootRecoveryCargoInventory {
+            directory_identity,
+            state: FreshRootRecoveryCargoState::EmptyDirectory,
+            file_identity: None,
+            bytes_sha256: None,
+        });
+    }
+    if entries.len() != 1 {
+        return Err("reserved root .cargo has multiple recovery artifacts".into());
+    }
+    let entry = entries
+        .pop()
+        .ok_or_else(|| "reserved root .cargo entry disappeared".to_owned())?;
+    let name = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| "reserved root .cargo contains a non-UTF-8 entry".to_owned())?;
+    let state = if name == "config.toml" {
+        FreshRootRecoveryCargoState::ExactConfig
+    } else if let Some(suffix) = name
+        .strip_prefix(".config.")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    {
+        let mut parts = suffix.split('.');
+        let pid = parts.next().unwrap_or_default();
+        let timestamp = parts.next().unwrap_or_default();
+        if parts.next().is_some()
+            || pid.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || timestamp.is_empty()
+            || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err("reserved root .cargo temporary name is not the exact writer form".into());
+        }
+        let pid_value = pid
+            .parse::<u32>()
+            .map_err(|_| "reserved root .cargo temporary PID is outside its writer range")?;
+        let timestamp_value = timestamp
+            .parse::<u64>()
+            .map_err(|_| "reserved root .cargo temporary time is outside its writer range")?;
+        if pid_value == 0
+            || timestamp_value == 0
+            || pid != pid_value.to_string()
+            || timestamp != timestamp_value.to_string()
+        {
+            return Err(
+                "reserved root .cargo temporary name is not canonical writer output".into(),
+            );
+        }
+        FreshRootRecoveryCargoState::ExactWriterTemporary { name: name.clone() }
+    } else {
+        return Err(format!("unexpected reserved root .cargo entry {name:?}"));
+    };
+    if entry
+        .file_type()
+        .map_err(|error| error.to_string())?
+        .is_symlink()
+        || !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+    {
+        return Err("reserved root .cargo config is not a regular file".into());
+    }
+    let (bytes, file_identity) = recovery_path_file_bytes(&directory.join(&name))?;
+    if bytes != crate::broker::WORKTREE_CARGO_CONFIG.as_bytes() {
+        return Err("reserved root .cargo bytes differ from the exact broker defaults".into());
+    }
+    let directory_after =
+        std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    let directory_identity_after = crate::worktree_registry::RecoveryArtifactIdentity {
+        device: directory_after.dev(),
+        inode: directory_after.ino(),
+        owner: directory_after.uid(),
+        mode: directory_after.mode() & 0o7777,
+        links: directory_after.nlink(),
+        bytes: directory_after.len(),
+    };
+    if directory_identity_after != directory_identity {
+        return Err("reserved root .cargo changed during inspection".into());
+    }
+    Ok(FreshRootRecoveryCargoInventory {
+        directory_identity,
+        state,
+        file_identity: Some(file_identity),
+        bytes_sha256: Some(hex_digest(&bytes)),
+    })
+}
+
+#[cfg(unix)]
+fn create_fresh_root_recovery_marker(
+    root: &Path,
+    marker: &WorktreeRootMarker,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let expected_root = bound_directory_identity(root)?;
+    let path = root.join(crate::broker::WORKTREE_ROOT_MARKER);
+    let bytes = fresh_root_recovery_marker_bytes(marker)?;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("cannot create marker without replacement: {error}"))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("new recovery marker is not a single-link file owned by this user".into());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot protect fresh recovery marker: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("cannot durably write fresh recovery marker: {error}"))?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    let opened_identity = crate::worktree_registry::RecoveryArtifactIdentity {
+        device: opened.dev(),
+        inode: opened.ino(),
+        owner: opened.uid(),
+        mode: opened.mode() & 0o7777,
+        links: opened.nlink(),
+        bytes: opened.len(),
+    };
+    let (actual, named_identity) = recovery_path_file_bytes(&path)?;
+    if actual != bytes
+        || named_identity != opened_identity
+        || bound_directory_identity(root)? != expected_root
+    {
+        return Err("fresh recovery marker or root changed during publication".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_fresh_root_recovery_marker(
+    _root: &Path,
+    _marker: &WorktreeRootMarker,
+) -> Result<(), String> {
+    Err("fresh-root recovery requires Unix no-follow marker creation".into())
+}
+
+#[cfg(not(unix))]
+fn fresh_root_recovery_cargo_inventory(
+    _directory: &Path,
+) -> Result<FreshRootRecoveryCargoInventory, String> {
+    Err("fresh-root recovery requires Unix no-follow directory checks".into())
+}
+
+#[cfg(all(test, unix))]
+mod fresh_root_recovery_inventory_tests {
+    use super::*;
+
+    fn marker(repository_root: &Path) -> WorktreeRootMarker {
+        WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "test-repository".into(),
+            repository_root: repository_root.to_path_buf(),
+        }
+    }
+
+    fn create_private_directory(path: &Path) {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path).unwrap();
+    }
+
+    #[test]
+    fn root_inventory_accepts_only_missing_empty_and_exact_marker_prefixes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        create_private_directory(&repository);
+        let root = temporary.path().join("reserved-root");
+        let expected_marker = marker(&repository);
+
+        assert_eq!(
+            fresh_root_recovery_inventory(&root, &expected_marker)
+                .unwrap()
+                .state,
+            FreshRootRecoveryPathState::Missing
+        );
+        create_private_directory(&root);
+        assert_eq!(
+            fresh_root_recovery_inventory(&root, &expected_marker)
+                .unwrap()
+                .state,
+            FreshRootRecoveryPathState::Empty
+        );
+        std::fs::write(
+            root.join(crate::broker::WORKTREE_ROOT_MARKER),
+            fresh_root_recovery_marker_bytes(&expected_marker).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fresh_root_recovery_inventory(&root, &expected_marker)
+                .unwrap()
+                .state,
+            FreshRootRecoveryPathState::ExactMarker
+        );
+        std::fs::write(
+            root.join(crate::broker::WORKTREE_ROOT_MARKER),
+            b"same owner fields, different bytes",
+        )
+        .unwrap();
+        assert!(fresh_root_recovery_inventory(&root, &expected_marker).is_err());
+    }
+
+    #[test]
+    fn cargo_inventory_accepts_only_empty_or_exact_writer_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        create_private_directory(&repository);
+        let root = temporary.path().join("reserved-root");
+        create_private_directory(&root);
+        let expected_marker = marker(&repository);
+        std::fs::write(
+            root.join(crate::broker::WORKTREE_ROOT_MARKER),
+            fresh_root_recovery_marker_bytes(&expected_marker).unwrap(),
+        )
+        .unwrap();
+        let cargo = root.join(".cargo");
+        create_private_directory(&cargo);
+
+        assert_eq!(
+            fresh_root_recovery_inventory(&root, &expected_marker)
+                .unwrap()
+                .cargo
+                .unwrap()
+                .state,
+            FreshRootRecoveryCargoState::EmptyDirectory
+        );
+        let config = cargo.join("config.toml");
+        std::fs::write(&config, crate::broker::WORKTREE_CARGO_CONFIG.as_bytes()).unwrap();
+        assert_eq!(
+            fresh_root_recovery_inventory(&root, &expected_marker)
+                .unwrap()
+                .cargo
+                .unwrap()
+                .state,
+            FreshRootRecoveryCargoState::ExactConfig
+        );
+        let temporary_config = cargo.join(".config.123.456.tmp");
+        std::fs::rename(&config, &temporary_config).unwrap();
+        assert_eq!(
+            fresh_root_recovery_inventory(&root, &expected_marker)
+                .unwrap()
+                .cargo
+                .unwrap()
+                .state,
+            FreshRootRecoveryCargoState::ExactWriterTemporary {
+                name: ".config.123.456.tmp".into()
+            }
+        );
+        let noncanonical_temporary = cargo.join(".config.0123.456.tmp");
+        std::fs::rename(&temporary_config, &noncanonical_temporary).unwrap();
+        assert!(fresh_root_recovery_inventory(&root, &expected_marker).is_err());
+        std::fs::rename(&noncanonical_temporary, &temporary_config).unwrap();
+        std::fs::write(&config, crate::broker::WORKTREE_CARGO_CONFIG.as_bytes()).unwrap();
+        assert!(fresh_root_recovery_inventory(&root, &expected_marker).is_err());
+        std::fs::remove_file(&config).unwrap();
+        std::fs::write(&temporary_config, b"arbitrary cargo configuration").unwrap();
+        assert!(fresh_root_recovery_inventory(&root, &expected_marker).is_err());
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct LegacyWorktreeRootBindingPlan {
     pub(crate) schema_version: u32,
@@ -1767,6 +2344,146 @@ fn fresh_root_identity(
         broker_db_path,
         bootstrap_nonce,
     })
+}
+
+fn fresh_root_recovery_identity(
+    binding: &crate::store::repository_binding::RepositoryWorktreeBinding,
+    main_root: &Path,
+    repo: &GitRepo,
+    database_path: &Path,
+) -> Result<
+    (
+        crate::store::repository_binding::RepositoryRootIdentity,
+        PathBuf,
+        crate::store::repository_binding::RepositoryWorktreeRootLayout,
+        WorktreeRootSource,
+        BoundDirectoryIdentity,
+    ),
+    BrokerOpError,
+> {
+    use crate::store::repository_binding::{
+        RepositoryRootIdentity, RepositoryWorktreeBindingOrigin, RepositoryWorktreeBindingState,
+    };
+
+    let refuse = |reason: String| BrokerOpError::WorktreeRootUnavailable {
+        path: binding
+            .worktree_root
+            .clone()
+            .unwrap_or_else(|| main_root.to_path_buf()),
+        reason,
+    };
+    if !matches!(
+        binding.state,
+        RepositoryWorktreeBindingState::FreshReserved
+            | RepositoryWorktreeBindingState::RecoveryRequired
+    ) || binding.origin != Some(RepositoryWorktreeBindingOrigin::Fresh)
+    {
+        return Err(refuse(
+            "fresh-root recovery requires a fresh_reserved or recovery_required binding".into(),
+        ));
+    }
+    let repository_root = binding
+        .repository_root
+        .clone()
+        .ok_or_else(|| refuse("fresh reservation has no repository root".into()))?;
+    let git_common_dir = binding
+        .git_common_dir
+        .clone()
+        .ok_or_else(|| refuse("fresh reservation has no Git common directory".into()))?;
+    let repository_key = binding
+        .repository_key
+        .clone()
+        .ok_or_else(|| refuse("fresh reservation has no repository key".into()))?;
+    let broker_db_path = binding
+        .broker_db_path
+        .clone()
+        .ok_or_else(|| refuse("fresh reservation has no broker database path".into()))?;
+    let bootstrap_nonce = binding
+        .bootstrap_nonce
+        .clone()
+        .ok_or_else(|| refuse("fresh reservation has no bootstrap nonce".into()))?;
+    let root = binding
+        .worktree_root
+        .clone()
+        .ok_or_else(|| refuse("fresh reservation has no exact worktree root".into()))?;
+    let layout = binding
+        .root_layout
+        .ok_or_else(|| refuse("fresh reservation has no root layout".into()))?;
+    let source = binding
+        .root_source
+        .ok_or_else(|| refuse("fresh reservation has no root source".into()))?;
+    let reservation_digest = binding
+        .reservation_digest
+        .as_deref()
+        .ok_or_else(|| refuse("fresh reservation has no reservation digest".into()))?;
+    let parent_json = binding
+        .parent_identity_json
+        .as_deref()
+        .ok_or_else(|| refuse("fresh reservation has no parent identity".into()))?;
+    if binding.worktree_identity_json.is_some() {
+        return Err(refuse(
+            "incomplete fresh reservation unexpectedly contains a bound root identity".into(),
+        ));
+    }
+    let expected_parent: BoundDirectoryIdentity = serde_json::from_str(parent_json)
+        .map_err(|error| refuse(format!("reserved parent identity is invalid: {error}")))?;
+    let parent = root
+        .parent()
+        .ok_or_else(|| refuse("reserved root has no parent".into()))?;
+    if !root.is_absolute() || expected_parent.canonical_path != parent {
+        return Err(refuse(
+            "reserved root or parent path differs from the persisted exact path".into(),
+        ));
+    }
+    let current_repository_root = main_root
+        .canonicalize()
+        .map_err(|error| refuse(format!("cannot verify repository root: {error}")))?;
+    let current_git_common_dir = repo
+        .git_common_dir()?
+        .canonicalize()
+        .map_err(|error| refuse(format!("cannot verify Git common directory: {error}")))?;
+    let current_repository_key =
+        crate::host_state::repository_key(&current_repository_root, Some(&current_git_common_dir));
+    let current_database_path = database_path
+        .canonicalize()
+        .map_err(|error| refuse(format!("cannot verify broker database path: {error}")))?;
+    if repository_root != current_repository_root
+        || git_common_dir != current_git_common_dir
+        || repository_key != current_repository_key
+        || broker_db_path != current_database_path
+    {
+        return Err(refuse(
+            "fresh reservation identity differs from this repository or broker database".into(),
+        ));
+    }
+    let identity = RepositoryRootIdentity {
+        repository_root,
+        git_common_dir,
+        repository_key,
+        broker_db_path,
+        bootstrap_nonce,
+    };
+    let recomputed_reservation =
+        fresh_root_reservation_digest(&identity, &root, layout, source, parent_json)?;
+    if recomputed_reservation != reservation_digest {
+        return Err(refuse(
+            "fresh reservation digest does not match its stored root, layout, source, or parent identity".into(),
+        ));
+    }
+    if canonical_prefix(&root)
+        .map_err(|reason| refuse(format!("cannot resolve reserved root: {reason}")))?
+        != root
+    {
+        return Err(refuse(
+            "reserved root path is not its canonical unresolved name".into(),
+        ));
+    }
+    let actual_parent = bound_directory_identity(parent)
+        .map_err(|reason| refuse(format!("cannot verify reserved root parent: {reason}")))?;
+    if actual_parent != expected_parent {
+        return Err(refuse("reserved root parent identity changed".into()));
+    }
+    Ok((identity, root, layout, source, expected_parent))
 }
 
 fn fresh_root_reservation_digest(
@@ -3839,13 +4556,433 @@ impl Broker {
             }
             RepositoryWorktreeBindingState::FreshReserved
             | RepositoryWorktreeBindingState::RecoveryRequired => {
-                "root reservation is incomplete; automatic fallback is disabled and this version has no recovery command. Preserve the database and filesystem evidence for a future reviewed recovery path"
+                "root reservation is incomplete; automatic fallback is disabled. Inspect `aethyme broker worktree-root recovery plan`, then apply only its exact digest-confirmed supported prefix"
             }
         };
         Err(BrokerOpError::WorktreeRootUnavailable {
             path,
             reason: format!("{operation} is unavailable: {reason}"),
         })
+    }
+
+    fn build_fresh_root_recovery_plan(
+        &self,
+        binding: crate::store::repository_binding::RepositoryWorktreeBinding,
+        registry: crate::worktree_registry::FreshRootRegistryObservation,
+    ) -> Result<FreshRootRecoveryPlan, BrokerOpError> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+        use crate::worktree_registry::FreshRootRegistryState;
+
+        let refuse = |path: &Path, reason: String| BrokerOpError::WorktreeRootUnavailable {
+            path: path.to_path_buf(),
+            reason,
+        };
+        if !matches!(
+            binding.state,
+            RepositoryWorktreeBindingState::FreshReserved
+                | RepositoryWorktreeBindingState::RecoveryRequired
+        ) {
+            return Err(refuse(
+                &self.main_root,
+                format!(
+                    "fresh-root recovery requires an incomplete reservation, found {:?}",
+                    binding.state
+                ),
+            ));
+        }
+        let (identity, root, layout, source, parent_identity) = fresh_root_recovery_identity(
+            &binding,
+            &self.main_root,
+            &self.repo,
+            self.store.db_path(),
+        )?;
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: identity.repository_key.clone(),
+            repository_root: identity.repository_root.clone(),
+        };
+        let root_inventory = fresh_root_recovery_inventory(&root, &marker).map_err(|reason| {
+            refuse(
+                &root,
+                format!("cannot inspect reserved root for recovery: {reason}"),
+            )
+        })?;
+        let (can_apply, refusal) = match (root_inventory.state, registry.state) {
+            (
+                FreshRootRecoveryPathState::Missing | FreshRootRecoveryPathState::Empty,
+                FreshRootRegistryState::MissingDatabase,
+            ) => (true, None),
+            (
+                FreshRootRecoveryPathState::Missing | FreshRootRecoveryPathState::Empty,
+                FreshRootRegistryState::ExistingNoTargetRow,
+            ) => {
+                let available = registry
+                    .row_count
+                    .is_some_and(|count| count < crate::worktree_registry::MAX_RECORDS);
+                if available {
+                    (true, None)
+                } else {
+                    (
+                        false,
+                        Some("worktree registry is full; recovery will not create the root or prune existing rows".into()),
+                    )
+                }
+            }
+            (
+                FreshRootRecoveryPathState::Missing | FreshRootRecoveryPathState::Empty,
+                FreshRootRegistryState::ExactTargetRow,
+            ) => {
+                return Err(refuse(
+                    &root,
+                    "target registry row without its exact ownership marker is not a supported recovery prefix".into(),
+                ));
+            }
+            (FreshRootRecoveryPathState::ExactMarker, FreshRootRegistryState::MissingDatabase) => {
+                return Err(refuse(
+                    &root,
+                    "an exact marker with a missing registry database is not a valid durable prefix".into(),
+                ));
+            }
+            (
+                FreshRootRecoveryPathState::ExactMarker,
+                FreshRootRegistryState::ExistingNoTargetRow,
+            ) => {
+                if root_inventory.cargo.is_some() {
+                    return Err(refuse(
+                        &root,
+                        "Cargo defaults cannot precede the durable target registry row".into(),
+                    ));
+                }
+                let available = registry
+                    .row_count
+                    .is_some_and(|count| count < crate::worktree_registry::MAX_RECORDS);
+                if available {
+                    (true, None)
+                } else {
+                    (
+                        false,
+                        Some(
+                            "worktree registry is full; recovery will not prune existing rows"
+                                .into(),
+                        ),
+                    )
+                }
+            }
+            (FreshRootRecoveryPathState::ExactMarker, FreshRootRegistryState::ExactTargetRow) => {
+                (true, None)
+            }
+        };
+        let expected_marker_bytes = fresh_root_recovery_marker_bytes(&marker)
+            .map_err(|reason| refuse(&root, format!("cannot encode expected marker: {reason}")))?;
+        let expected_marker_bytes_sha256 = hex_digest(&expected_marker_bytes);
+        let binding_bytes = canonical_json_value_bytes(&binding).map_err(|error| {
+            refuse(
+                &root,
+                format!("cannot encode the exact binding row: {error}"),
+            )
+        })?;
+        let binding_record_sha256 = hex_digest(&binding_bytes);
+        let host_operation_database = self.host_operation_database_path()?;
+        let mut plan = FreshRootRecoveryPlan {
+            schema_version: 1,
+            binding,
+            repository_root: identity.repository_root,
+            repository_key: identity.repository_key,
+            broker_database: identity.broker_db_path,
+            host_operation_database,
+            worktree_root: root,
+            layout,
+            source,
+            parent_identity,
+            root_inventory,
+            registry,
+            expected_marker_bytes_sha256,
+            binding_record_sha256,
+            can_apply,
+            refusal,
+            digest: String::new(),
+        };
+        let digest_input = FreshRootRecoveryDigestInput {
+            schema_version: plan.schema_version,
+            binding: &plan.binding,
+            repository_root: &plan.repository_root,
+            repository_key: &plan.repository_key,
+            broker_database: &plan.broker_database,
+            host_operation_database: &plan.host_operation_database,
+            worktree_root: &plan.worktree_root,
+            layout: plan.layout,
+            source: plan.source,
+            parent_identity: &plan.parent_identity,
+            root_inventory: &plan.root_inventory,
+            registry: &plan.registry,
+            expected_marker_bytes_sha256: &plan.expected_marker_bytes_sha256,
+            binding_record_sha256: &plan.binding_record_sha256,
+            can_apply: plan.can_apply,
+            refusal: &plan.refusal,
+        };
+        let bytes = canonical_json_value_bytes(digest_input).map_err(|error| {
+            refuse(
+                &plan.worktree_root,
+                format!("cannot encode fresh-root recovery plan: {error}"),
+            )
+        })?;
+        plan.digest = hex_digest(&bytes);
+        Ok(plan)
+    }
+
+    pub(crate) fn fresh_worktree_root_recovery_plan(
+        &self,
+    ) -> Result<FreshRootRecoveryPlan, BrokerOpError> {
+        let binding = self.store.repository_worktree_binding()?;
+        let (identity, root, _layout, source, _parent_identity) = fresh_root_recovery_identity(
+            &binding,
+            &self.main_root,
+            &self.repo,
+            self.store.db_path(),
+        )?;
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: identity.repository_key,
+            repository_root: identity.repository_root,
+        };
+        let host_operation_database = self.host_operation_database_path()?;
+        let registry = crate::worktree_registry::plan_fresh_root_registry_recovery(
+            &host_operation_database,
+            &root,
+            &marker,
+            source,
+        )
+        .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason: format!("cannot inspect worktree registry for recovery: {error}"),
+        })?;
+        self.build_fresh_root_recovery_plan(binding, registry)
+    }
+
+    pub(crate) fn apply_fresh_worktree_root_recovery(
+        &mut self,
+        confirmed_digest: &str,
+    ) -> Result<(), BrokerOpError> {
+        let _binding_lock = crate::store::fresh_database::acquire_repository_binding_lock(
+            &self.main_root,
+            self.store.db_path(),
+        )?;
+        let binding = self.store.repository_worktree_binding()?;
+        let (identity, root, _layout, source, parent_identity) = fresh_root_recovery_identity(
+            &binding,
+            &self.main_root,
+            &self.repo,
+            self.store.db_path(),
+        )?;
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: identity.repository_key.clone(),
+            repository_root: identity.repository_root.clone(),
+        };
+        let host_operation_database = self.host_operation_database_path()?;
+        let mut registry_guard = crate::worktree_registry::begin_fresh_root_registry_recovery(
+            &host_operation_database,
+            &root,
+            &marker,
+            source,
+        )
+        .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+            path: root.clone(),
+            reason: format!("cannot lock and inspect worktree registry for recovery: {error}"),
+        })?;
+        let plan = self.build_fresh_root_recovery_plan(
+            binding.clone(),
+            registry_guard.observation().clone(),
+        )?;
+        if plan.digest != confirmed_digest {
+            return Err(BrokerOpError::Store(
+                crate::error::BrokerError::RepositoryWorktreeBindingConfirmationMismatch,
+            ));
+        }
+        if !plan.can_apply {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: root,
+                reason: plan
+                    .refusal
+                    .unwrap_or_else(|| "fresh-root recovery plan is not applicable".into()),
+            });
+        }
+        if plan.registry.state != crate::worktree_registry::FreshRootRegistryState::MissingDatabase
+        {
+            registry_guard
+                .check_capacity_before_marker()
+                .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: format!("recovery preflight refused before root writes: {error}"),
+                })?;
+        }
+        let current_inventory = fresh_root_recovery_inventory(&plan.worktree_root, &marker)
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("reserved root changed after plan review: {reason}"),
+            })?;
+        if current_inventory != plan.root_inventory {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "reserved root inventory changed after plan review".into(),
+            });
+        }
+
+        let mut root_created = false;
+        if plan.root_inventory.state == FreshRootRecoveryPathState::Missing {
+            let parent = plan.worktree_root.parent().ok_or_else(|| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: "reserved root has no parent".into(),
+                }
+            })?;
+            if bound_directory_identity(parent).as_ref() != Ok(&parent_identity) {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: "reserved root parent identity changed before creation".into(),
+                });
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder.create(&plan.worktree_root).map_err(|error| {
+                    BrokerOpError::WorktreeRootUnavailable {
+                        path: plan.worktree_root.clone(),
+                        reason: format!("cannot create reserved root without replacement: {error}"),
+                    }
+                })?;
+            }
+            #[cfg(not(unix))]
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "fresh-root recovery requires Unix no-follow directory creation".into(),
+            });
+            crate::host_state::protect_host_state_path(&plan.worktree_root, true).map_err(
+                |error| BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: format!("cannot protect recovered root: {error}"),
+                },
+            )?;
+            verify_private_worktree_root_permissions(&plan.worktree_root).map_err(|reason| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: format!("cannot verify recovered root permissions: {reason}"),
+                }
+            })?;
+            sync_bound_directory(parent, &parent_identity).map_err(|reason| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: parent.to_path_buf(),
+                    reason: format!("cannot sync recovered root name: {reason}"),
+                }
+            })?;
+            root_created = true;
+        }
+
+        if registry_guard.observation().state
+            == crate::worktree_registry::FreshRootRegistryState::MissingDatabase
+        {
+            registry_guard
+                .ensure_initialized_after_root()
+                .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: format!(
+                        "cannot durably initialize the missing recovery registry: {error}"
+                    ),
+                })?;
+        }
+        registry_guard
+            .check_capacity_before_marker()
+            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("recovery capacity check failed before marker creation: {error}"),
+            })?;
+
+        let root_before_marker = fresh_root_recovery_inventory(&plan.worktree_root, &marker)
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("cannot recheck recovery root before marker creation: {reason}"),
+            })?;
+        if plan.root_inventory.state == FreshRootRecoveryPathState::ExactMarker {
+            if root_before_marker != plan.root_inventory {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: "exact marker root changed before registry completion".into(),
+                });
+            }
+        } else if root_before_marker.state != FreshRootRecoveryPathState::Empty
+            || root_before_marker.cargo.is_some()
+        {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "unmarked root changed before marker creation".into(),
+            });
+        }
+
+        if plan.root_inventory.state != FreshRootRecoveryPathState::ExactMarker {
+            create_fresh_root_recovery_marker(&plan.worktree_root, &marker).map_err(|reason| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.join(WORKTREE_ROOT_MARKER),
+                    reason,
+                }
+            })?;
+        }
+        registry_guard.record_exact_target().map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("cannot durably record recovered worktree root: {error}"),
+            }
+        })?;
+        let root_identity = bound_directory_identity(&plan.worktree_root).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("cannot capture recovered root identity: {reason}"),
+            }
+        })?;
+        sync_bound_directory(&plan.worktree_root, &root_identity).map_err(|reason| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("cannot sync recovered root contents: {reason}"),
+            }
+        })?;
+        if root_created {
+            let parent = plan.worktree_root.parent().ok_or_else(|| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: plan.worktree_root.clone(),
+                    reason: "reserved root has no parent".into(),
+                }
+            })?;
+            sync_bound_directory(parent, &parent_identity).map_err(|reason| {
+                BrokerOpError::WorktreeRootUnavailable {
+                    path: parent.to_path_buf(),
+                    reason: format!("cannot sync recovered root parent: {reason}"),
+                }
+            })?;
+        }
+        let root_identity_json = serde_json::to_string(&root_identity).map_err(|error| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: format!("cannot encode recovered root identity: {error}"),
+            }
+        })?;
+        let reservation_digest = binding.reservation_digest.as_deref().ok_or_else(|| {
+            BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.clone(),
+                reason: "fresh reservation has no digest".into(),
+            }
+        })?;
+        self.store.complete_fresh_repository_worktree_binding(
+            &identity,
+            reservation_digest,
+            &root_identity_json,
+        )?;
+        self.validate_bound_repository_worktree_root()?
+            .ok_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root,
+                reason: "recovered root completed binding but did not validate".into(),
+            })?;
+        Ok(())
     }
 
     pub(crate) fn legacy_worktree_root_binding_plan(
@@ -4064,7 +5201,7 @@ impl Broker {
             | RepositoryWorktreeBindingState::RecoveryRequired => {
                 return Err(BrokerOpError::WorktreeRootUnavailable {
                     path: binding.worktree_root.unwrap_or_else(|| self.main_root.clone()),
-                    reason: "fresh worktree-root reservation is incomplete; automatic fallback is disabled and this version has no recovery command. Preserve the database and filesystem evidence for a future reviewed recovery path".into(),
+                    reason: "fresh worktree-root reservation is incomplete; automatic fallback is disabled. Inspect `aethyme broker worktree-root recovery plan`, then apply only its exact digest-confirmed supported prefix".into(),
                 });
             }
             RepositoryWorktreeBindingState::FreshUnbound => {}

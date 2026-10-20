@@ -977,7 +977,8 @@ fn initialize_fresh_recovery_registry(host_operation_database: &Path) -> io::Res
         )
         .map_err(invalid)?;
     let named_after = fs::symlink_metadata(&database_path)?;
-    if recovery_artifact_identity(&named_after) != created_identity {
+    if !same_recovery_artifact_object(&recovery_artifact_identity(&named_after), &created_identity)
+    {
         return Err(invalid(
             "recovery registry database changed during initialization",
         ));
@@ -1033,6 +1034,17 @@ fn recovery_artifact_identity(metadata: &Metadata) -> RecoveryArtifactIdentity {
         links: metadata.nlink(),
         bytes: metadata.len(),
     }
+}
+
+fn same_recovery_artifact_object(
+    left: &RecoveryArtifactIdentity,
+    right: &RecoveryArtifactIdentity,
+) -> bool {
+    left.device == right.device
+        && left.inode == right.inode
+        && left.owner == right.owner
+        && left.mode == right.mode
+        && left.links == right.links
 }
 
 #[cfg(not(unix))]
@@ -2834,6 +2846,49 @@ mod tests {
     }
 
     #[test]
+    fn fresh_root_registry_recovery_initializes_only_after_the_root_exists() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.database.parent().unwrap()).unwrap();
+        let root = fixture._owned.path().join("reserved-root");
+        fs::create_dir(&root).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "reserved-root".into(),
+            repository_root: fixture.origin.clone(),
+        };
+
+        let mut guard = begin_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+        assert_eq!(
+            guard.observation().state,
+            FreshRootRegistryState::MissingDatabase
+        );
+        assert!(!registry_directory(&fixture.database).unwrap().exists());
+
+        guard.ensure_initialized_after_root().unwrap();
+        assert_eq!(
+            guard.observation().state,
+            FreshRootRegistryState::ExistingNoTargetRow
+        );
+        guard.check_capacity_before_marker().unwrap();
+        let mut marker_bytes = serde_json::to_vec_pretty(&marker).unwrap();
+        marker_bytes.push(b'\n');
+        fs::write(root.join(WORKTREE_ROOT_MARKER), marker_bytes).unwrap();
+        guard.record_exact_target().unwrap();
+
+        assert_eq!(
+            guard.observation().state,
+            FreshRootRegistryState::ExactTargetRow
+        );
+        assert_eq!(guard.observation().row_count, Some(1));
+    }
+
+    #[test]
     fn fresh_root_registry_plan_rejects_sidecars_without_changing_them() {
         let fixture = Fixture::new();
         let root = fixture._owned.path().join("reserved-root");
@@ -2865,6 +2920,37 @@ mod tests {
             fs::read(&sidecar).unwrap(),
             b"preserve uncertain SQLite state"
         );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn fresh_root_registry_plan_preserves_a_zero_byte_database_as_conflicting_evidence() {
+        let fixture = Fixture::new();
+        let root = fixture._owned.path().join("reserved-root");
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "reserved-root".into(),
+            repository_root: fixture.origin.clone(),
+        };
+        ensure_registry_directory(&fixture.database).unwrap();
+        drop(registry_lock(&fixture.database, true).unwrap());
+        let database = registry_path(&fixture.database).unwrap();
+        fs::write(&database, b"").unwrap();
+
+        let error = plan_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("size is outside its recovery bound")
+        );
+        assert_eq!(fs::metadata(&database).unwrap().len(), 0);
         assert!(!root.exists());
     }
 
