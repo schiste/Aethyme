@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 51;
+pub const SCHEMA_VERSION: i64 = 52;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -71,7 +71,18 @@ pub const SCHEMA_VERSION: i64 = 51;
 ///   `[collaboration] capture = "required"` (#660). Repositories that do not
 ///   require capture keep this minimum; one that does has its own floor
 ///   raised to [`COLLABORATION_FENCE_SCHEMA`] (see that constant).
-pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
+/// - v52: adds the nullable gate execution-profile digest. Older readers
+///   query only gate, tree and definition, so they could reuse a result
+///   without checking its execution profile. The global floor therefore
+///   rises to v52.
+pub const MIN_COMPATIBLE_SCHEMA: i64 = 52;
+
+/// Migration that introduced profile-bound gate-cache reads and writes.
+const EXECUTION_PROFILE_CACHE_SCHEMA: i64 = 52;
+
+/// Migration that fenced old writers from deleting cleared gate history.
+/// Retain this floor while a database is partway through upgrading to v52.
+const CLEARED_GATE_HISTORY_SCHEMA: i64 = 47;
 
 /// The first schema whose binaries implement required collaboration capture
 /// (#660): the version of [`MIGRATION_V51`].
@@ -1740,6 +1751,12 @@ const MIGRATION_V51: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// v52: nullable means legacy rows and runs with incomplete profile capture
+/// are deliberately ineligible for execution-profile cache reuse.
+const MIGRATION_V52: &str = "
+ALTER TABLE gate_results ADD COLUMN execution_profile_hash TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1792,13 +1809,16 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V49,
     MIGRATION_V50,
     MIGRATION_V51,
+    MIGRATION_V52,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
 /// already exists, which a build from an unmerged branch may have done under
 /// the same version number (see the module docs).
-const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] =
-    &[(49, &[("coordinated_operations", "agent_provenance_json")])];
+const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] = &[
+    (49, &[("coordinated_operations", "agent_provenance_json")]),
+    (52, &[("gate_results", "execution_profile_hash")]),
+];
 
 /// Migrations whose tables the repair pass re-creates, with `IF NOT EXISTS`,
 /// when a database records the version but lacks one of the tables.
@@ -1980,8 +2000,8 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 [version.to_string()],
             )?;
-            if version >= MIN_COMPATIBLE_SCHEMA {
-                record_min_compatible_schema(conn)?;
+            if let Some(minimum) = compatibility_floor_for_migration(version) {
+                record_min_compatible_schema_floor(conn, minimum)?;
             }
             Ok(())
         })();
@@ -2001,11 +2021,25 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
 /// Record [`MIN_COMPATIBLE_SCHEMA`], never lowering a value a newer binary
 /// already wrote: that binary knows about migrations this one does not.
 fn record_min_compatible_schema(conn: &Connection) -> Result<(), BrokerError> {
+    record_min_compatible_schema_floor(conn, MIN_COMPATIBLE_SCHEMA)
+}
+
+fn compatibility_floor_for_migration(version: i64) -> Option<i64> {
+    if version >= EXECUTION_PROFILE_CACHE_SCHEMA {
+        Some(EXECUTION_PROFILE_CACHE_SCHEMA)
+    } else if version >= CLEARED_GATE_HISTORY_SCHEMA {
+        Some(CLEARED_GATE_HISTORY_SCHEMA)
+    } else {
+        None
+    }
+}
+
+fn record_min_compatible_schema_floor(conn: &Connection, minimum: i64) -> Result<(), BrokerError> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value
          WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
-        [MIN_COMPATIBLE_SCHEMA.to_string()],
+        [minimum.to_string()],
     )?;
     Ok(())
 }
@@ -2073,14 +2107,15 @@ mod tests {
         let index = usize::try_from(COLLABORATION_FENCE_SCHEMA - 1).unwrap();
         assert_eq!(MIGRATIONS[index], MIGRATION_V51);
         const { assert!(SCHEMA_VERSION >= COLLABORATION_FENCE_SCHEMA) };
-        const { assert!(MIN_COMPATIBLE_SCHEMA < COLLABORATION_FENCE_SCHEMA) };
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= COLLABORATION_FENCE_SCHEMA) };
     }
 
     /// Without the fence a pre-#660 binary (schema 49) still opens a v51
     /// database; with it, that binary is refused and this one is not.
     #[test]
     fn the_collaboration_fence_refuses_older_binaries_and_is_never_lowered() {
-        let conn = migrated();
+        let conn = migrated_through(51);
+        set_meta(&conn, "min_compatible_schema", CLEARED_GATE_HISTORY_SCHEMA);
         let found = current_version(&conn).unwrap();
         assert!(schema_is_compatible_with(&conn, found, 49).unwrap());
         assert_eq!(collaboration_fence(&conn).unwrap(), None);
@@ -2123,7 +2158,8 @@ mod tests {
     /// so the connection keeps working and other processes are not blocked.
     #[test]
     fn a_failed_fence_raise_leaves_no_open_transaction() {
-        let conn = migrated();
+        let conn = migrated_through(51);
+        set_meta(&conn, "min_compatible_schema", CLEARED_GATE_HISTORY_SCHEMA);
         conn.execute_batch(
             "CREATE TRIGGER refuse_fence_source BEFORE INSERT ON meta
              WHEN NEW.key = 'collaboration_fence_source'
@@ -2425,14 +2461,12 @@ mod tests {
     }
 
     #[test]
-    fn v47_requires_a_v47_reader_to_preserve_cleared_gate_history() {
-        // v48 is additive (#606), so the floor stays at the v47 reader.
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
-
+    fn v52_requires_a_profile_aware_reader_for_gate_cache_reuse() {
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
         let conn = migrated();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 47).unwrap());
-        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 46).unwrap());
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 51).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 42).unwrap());
     }
 
@@ -2476,21 +2510,32 @@ mod tests {
                 "repository_watches_due",
             ]
         );
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
         assert!(schema_is_compatible_with(&conn, 48, 47).unwrap());
     }
 
     #[test]
-    fn v49_adds_agent_provenance_without_raising_the_compatibility_floor() {
+    fn v49_adds_agent_provenance_without_changing_its_historical_floor() {
         const { assert!(SCHEMA_VERSION >= 49) };
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
-
         let conn = migrated_through(48);
-        assert_eq!(current_version(&conn).unwrap(), 48);
-        migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 47).unwrap());
-        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 46).unwrap());
+        set_meta(&conn, "min_compatible_schema", 47);
+        conn.execute_batch(MIGRATION_V49).unwrap();
+        set_meta(&conn, "schema_version", 49);
+        assert_eq!(current_version(&conn).unwrap(), 49);
+        assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
+        let floor: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, "47", "v49 must preserve its historical floor");
+
+        let from_v47 = migrated_through(49);
+        set_meta(&from_v47, "min_compatible_schema", 47);
+        assert_eq!(current_version(&from_v47).unwrap(), 49);
+        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
 
         let nullable: i64 = conn
             .query_row(
@@ -2501,26 +2546,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(nullable, 0);
-
-        // A v47 database, the compatibility floor, applies v48 and v49 while
-        // retaining the same minimum; v50 is covered by its own test.
-        let from_v47 = migrated_through(47);
-        migrate(&from_v47).unwrap();
-        assert_eq!(current_version(&from_v47).unwrap(), SCHEMA_VERSION);
-        assert!(schema_is_compatible_with(&from_v47, SCHEMA_VERSION, 47).unwrap());
     }
 
-    /// v51 changes nothing: a v50 database migrates to it, the floor stays at
-    /// 47, and a v50 binary still opens the result. Only the collaboration
-    /// fence, raised per repository, shuts v49 binaries out.
+    /// v51 changes nothing and retains the historical v47 floor until v52
+    /// installs profile-bound cache semantics.
     #[test]
     fn v51_is_a_compatible_marker_that_leaves_the_floor_alone() {
-        assert_eq!(SCHEMA_VERSION, 51);
         let conn = migrated_through(50);
+        set_meta(&conn, "min_compatible_schema", 47);
         let tables: i64 = conn
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
             .unwrap();
-        migrate(&conn).unwrap();
+        conn.execute_batch(MIGRATION_V51).unwrap();
+        set_meta(&conn, "schema_version", 51);
         assert_eq!(current_version(&conn).unwrap(), 51);
         let after: i64 = conn
             .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
@@ -2532,13 +2570,159 @@ mod tests {
     }
 
     #[test]
-    fn v50_adds_and_repairs_the_typed_verification_candidate_table() {
-        let conn = migrated_through(49);
+    fn v52_adds_nullable_gate_profiles_and_fences_older_cache_readers() {
+        let conn = migrated_through(51);
+        set_meta(&conn, "min_compatible_schema", 47);
+        conn.execute(
+            "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status, created_at)
+             VALUES ('unit', 'tree', 'definition', 'pass', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 52);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
+        assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 52, 51).unwrap());
+
+        let nullable: i64 = conn
+            .query_row(
+                r#"SELECT "notnull" FROM pragma_table_info('gate_results')
+                   WHERE name = 'execution_profile_hash'"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nullable, 0);
+        let legacy_profile: Option<String> = conn
+            .query_row(
+                "SELECT execution_profile_hash FROM gate_results WHERE gate_name = 'unit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_profile, None);
+    }
+
+    #[test]
+    fn v52_upgrades_v47_and_v48_gate_history_with_the_profile_floor() {
+        for from_version in [47, 48] {
+            let conn = migrated_through(from_version);
+            set_meta(&conn, "min_compatible_schema", 47);
+            conn.execute(
+                "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status, created_at)
+                 VALUES ('legacy', 'tree', 'definition', 'pass', 1)",
+                [],
+            )
+            .unwrap();
+
+            migrate(&conn).unwrap();
+
+            assert_eq!(current_version(&conn).unwrap(), 52);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                "52"
+            );
+            assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
+            assert!(!schema_is_compatible_with(&conn, 52, 51).unwrap());
+
+            let nullable: i64 = conn
+                .query_row(
+                    r#"SELECT "notnull" FROM pragma_table_info('gate_results')
+                       WHERE name = 'execution_profile_hash'"#,
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(nullable, 0);
+            let profile: Option<String> = conn
+                .query_row(
+                    "SELECT execution_profile_hash FROM gate_results WHERE gate_name = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(profile, None, "v{from_version} history remains unprofiled");
+        }
+    }
+
+    #[test]
+    fn v52_raises_its_compatibility_floor_atomically_with_the_profile_column() {
+        let conn = migrated_through(51);
+        set_meta(&conn, "min_compatible_schema", 47);
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_profile_floor_raise
+             BEFORE UPDATE OF value ON meta
+             WHEN OLD.key = 'min_compatible_schema'
+                  AND CAST(NEW.value AS INTEGER) > CAST(OLD.value AS INTEGER)
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected profile-floor failure');
+             END;",
+        )
+        .unwrap();
+
+        assert!(migrate(&conn).is_err());
+        assert_eq!(current_version(&conn).unwrap(), 51);
+        let minimum: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(minimum, "47");
+        let columns = conn
+            .prepare("PRAGMA table_info(gate_results)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "execution_profile_hash")
+        );
+    }
+
+    #[test]
+    fn v52_repairs_when_its_nullable_profile_column_was_added_before_the_marker() {
+        let conn = migrated_through(51);
+        conn.execute_batch("ALTER TABLE gate_results ADD COLUMN execution_profile_hash TEXT")
+            .unwrap();
         set_meta(&conn, "min_compatible_schema", 47);
 
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
+        assert_eq!(current_version(&conn).unwrap(), 52);
+        assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
+        let columns = conn
+            .prepare("PRAGMA table_info(gate_results)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "execution_profile_hash")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn v50_adds_and_repairs_the_typed_verification_candidate_table() {
+        let conn = migrated_through(50);
+        set_meta(&conn, "min_compatible_schema", 47);
+
+        assert_eq!(current_version(&conn).unwrap(), 50);
         assert!(schema_is_compatible_with(&conn, 50, 47).unwrap());
 
         let columns = conn
@@ -2588,17 +2772,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            floor, "50",
-            "migration must not invent committed capture intent"
-        );
+        assert_eq!(floor, "52", "v52 requires profile-aware cache readers");
         raise_collaboration_fence(&conn, "committed").unwrap();
         assert_eq!(
             collaboration_fence(&conn)
                 .unwrap()
                 .unwrap()
                 .min_compatible_schema,
-            51
+            52
         );
         assert!(!schema_is_compatible_with(&conn, 51, 50).unwrap());
     }

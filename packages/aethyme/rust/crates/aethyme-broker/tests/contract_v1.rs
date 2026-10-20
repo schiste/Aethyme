@@ -442,13 +442,32 @@ fn v1_constructor_payload_field_names_are_frozen() {
         "lease.release_acked / lease.release_declined / lease.release_granted",
     );
     assert_keys(
-        &events::gate_result_payload("g", "t", None),
-        &["failure_class", "gate", "tree"],
+        &events::gate_result_payload("g", "t", None, 1, None),
+        &["failure_class", "gate", "run_id", "tree"],
         "gate.pass / gate.fail / gate.cancelled / gate.error",
     );
     assert_keys(
-        &events::gate_cached_payload("g", "t", 1, GateStatus::Pass, None),
-        &["cached_status", "failure_class", "gate", "saved_ms", "tree"],
+        &events::gate_cached_payload(
+            "g",
+            "t",
+            1,
+            GateStatus::Pass,
+            None,
+            2,
+            &aethyme_broker::GateCacheProvenance {
+                execution_profile_digest: Some("sha256:profile".into()),
+                profile_scope: "fixture profile scope".into(),
+            },
+        ),
+        &[
+            "cache_provenance",
+            "cached_status",
+            "failure_class",
+            "gate",
+            "run_id",
+            "saved_ms",
+            "tree",
+        ],
         "gate.cached",
     );
     assert_keys(

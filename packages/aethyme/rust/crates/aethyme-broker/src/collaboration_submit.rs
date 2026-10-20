@@ -1213,14 +1213,6 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
-    /// What a schema-49 binary (every release before #660) decides about
-    /// this repository's broker database.
-    fn older_binary_opens(repo: &Path) -> bool {
-        let conn = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
-        let found = crate::schema::current_version(&conn).unwrap();
-        crate::schema::schema_is_compatible_with(&conn, found, 49).unwrap()
-    }
-
     fn fence(repo: &Path) -> Option<crate::CollaborationFence> {
         let conn = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
         crate::schema::collaboration_fence(&conn).unwrap()
@@ -1250,26 +1242,24 @@ mod tests {
         broker.collaboration_fence_state(crate::broker::FenceTrigger::Config(config.as_ref()))
     }
 
-    /// Any writable open by a #660 binary of a repository whose committed
-    /// config requires capture fences older binaries out; off and advisory
-    /// leave the floor alone.
+    /// A committed required policy records the collaboration fence.
+    /// Off and advisory do not add collaboration-fence metadata; the current
+    /// schema compatibility floor applies independently.
     #[test]
-    fn opening_a_required_repository_fences_older_binaries_out() {
+    fn opening_a_required_repository_records_the_collaboration_fence() {
         let required = fixture_with("required", true);
         assert_eq!(
             fence(required.repo.path()),
             Some(crate::CollaborationFence {
-                min_compatible_schema: crate::COLLABORATION_FENCE_SCHEMA,
+                min_compatible_schema: crate::schema::MIN_COMPATIBLE_SCHEMA,
                 reason: crate::schema::COLLABORATION_FENCE_REASON.into(),
                 source: "committed".into(),
                 state: "active",
             })
         );
-        assert!(!older_binary_opens(required.repo.path()));
         for policy in ["advisory", "off"] {
             let fixture = fixture_with(policy, true);
             assert_eq!(fence(fixture.repo.path()), None, "{policy}");
-            assert!(older_binary_opens(fixture.repo.path()), "{policy}");
         }
     }
 
@@ -1281,7 +1271,6 @@ mod tests {
         let local = fixture_with("required", false);
         assert_eq!(fence(local.repo.path()), None);
         assert!(effective_fence(&local.broker).is_none());
-        assert!(older_binary_opens(local.repo.path()));
 
         // Committed off, working copy edited to required.
         let fixture = fixture_with("off", true);
@@ -1293,11 +1282,10 @@ mod tests {
         let reopened = crate::Broker::open(fixture.repo.path()).unwrap();
         assert!(effective_fence(&reopened).is_none());
         assert_eq!(fence(fixture.repo.path()), None);
-        assert!(older_binary_opens(fixture.repo.path()));
     }
 
-    /// The fence is one-way: committing required off does not let older
-    /// binaries back in.
+    /// The collaboration-fence record is one-way: committing required off
+    /// does not erase the fence previously recorded for required capture.
     #[test]
     fn turning_required_off_keeps_the_fence() {
         let fixture = fixture_with("required", true);
@@ -1309,7 +1297,7 @@ mod tests {
         .unwrap();
         let reopened = crate::Broker::open(fixture.repo.path()).unwrap();
         assert_eq!(effective_fence(&reopened).unwrap().state, "active");
-        assert!(!older_binary_opens(fixture.repo.path()));
+        assert_eq!(fence(fixture.repo.path()).unwrap().state, "active");
     }
 
     /// A typo is refused at submit but is not a reason to lock older binaries
@@ -1319,7 +1307,6 @@ mod tests {
         let fixture = fixture_with("requried", true);
         assert!(effective_fence(&fixture.broker).is_none());
         assert_eq!(fence(fixture.repo.path()), None);
-        assert!(older_binary_opens(fixture.repo.path()));
     }
 
     /// Read-only status (snapshot opens: `status --read-only-snapshot`,
@@ -1346,12 +1333,10 @@ mod tests {
             );
         }
         assert_eq!(fence(fixture.repo.path()), None);
-        assert!(older_binary_opens(fixture.repo.path()));
 
         let mut writable = crate::Broker::open(fixture.repo.path()).unwrap();
         let view = writable.status_current(0).unwrap();
         assert_eq!(view.collaboration_fence.unwrap().state, "active");
-        assert!(!older_binary_opens(fixture.repo.path()));
     }
 
     /// Without any broker database, the snapshot status runs on an in-memory

@@ -382,10 +382,10 @@ were one per overlapping path, so totals spanning that date mix both units.
       "commands": [ "...", ... ]
     }
   ],
-  "gate_outcomes": [ { "gate", "status", "cached", "exit_code",
+  "gate_outcomes": [ { "gate", "run_id", "status", "cached", "exit_code",
                        "duration_ms", "log_path", "load_avg_1m_start",
                        "load_avg_1m_end", "cpu_count",
-                       "free_disk_bytes_start" } ],
+                       "free_disk_bytes_start", "cache_provenance" } ],
   "no_changes": true|false,
   "promoted": true|false,
   "verified_against": {                      // omitted when not recorded
@@ -414,6 +414,12 @@ platform could not report it; all four are `null` for a cache hit (the
 reused verdict's machine state is not re-reported) and for a result recorded
 before the command stage. `broker advanced gates run --json` and
 `broker advanced gates pre-push --json` outcomes carry the same fields.
+
+When a result row was stored, `run_id` identifies it; a cache hit keeps the
+source run's ID. Cacheable outcomes include `cache_provenance`,
+with the execution-profile digest and a declared scope. A missing digest means
+profile capture was incomplete, so the executed result is not eligible for
+cache reuse.
 
 A gate outcome may also carry `"host_fault": true` (introduced 2026-10-01,
 absent when false): the broker itself observed that the host, not the change,
