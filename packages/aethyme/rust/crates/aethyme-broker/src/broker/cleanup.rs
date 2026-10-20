@@ -1493,9 +1493,192 @@ impl Broker {
     /// Remove a session's worktree and mark it cleaned. Refuses when the
     /// worktree has uncommitted changes or commits not represented on a
     /// delivery target, unless `force`.
+    pub(super) fn interrupted_finish_cleanup_proof(
+        &self,
+        session: &Session,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        let current = self.store.session(session.id).ok()?;
+        if current.origin != SessionOrigin::Spawned
+            || current.cleanup_state != crate::SessionCleanupState::Closed
+            || current.worktree_path != session.worktree_path
+            || current.branch != session.branch
+        {
+            return None;
+        }
+
+        let event = self
+            .store
+            .latest_session_finish_cleanup_started_event(session.id)
+            .ok()??;
+        let payload = event
+            .payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())?;
+        if payload
+            .get("worktree_present")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+            || payload
+                .get("branch_present")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return None;
+        }
+        let proof = serde_json::from_value::<crate::events::FinishCleanupRecoveryProof>(
+            payload.get("recovery_proof")?.clone(),
+        )
+        .ok()?;
+        if proof.schema_version != 1
+            || proof.branch_ref != format!("refs/heads/{}", current.branch)
+            || proof.head != proof.branch_tip
+        {
+            return None;
+        }
+
+        let worktree_path = Path::new(&current.worktree_path);
+        let path_metadata = std::fs::symlink_metadata(worktree_path).ok()?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_dir() {
+            return None;
+        }
+        let canonical_path = worktree_path.canonicalize().ok()?;
+        if canonical_path.to_str()? != proof.worktree_path
+            || !self
+                .is_broker_owned_worktree_checked(&current, worktree_path)
+                .ok()?
+        {
+            return None;
+        }
+        let checkout = GitRepo::discover(&canonical_path).ok()?;
+        if checkout.root() != canonical_path
+            || checkout.finish_cleanup_recovery_proof(&proof.branch_ref)? != proof
+            || !checkout.has_only_unstaged_tracked_deletions().ok()?
+            || checkout.dirty_paths().ok()?.is_empty()
+            || self.repo.resolve_ref(&proof.branch_ref).as_deref()
+                != Some(proof.branch_tip.as_str())
+        {
+            return None;
+        }
+
+        let inventory = self.repo.worktree_inventory().ok()?;
+        let matching_path = inventory
+            .iter()
+            .filter(|entry| entry.path.canonicalize().ok().as_ref() == Some(&canonical_path))
+            .collect::<Vec<_>>();
+        if matching_path.len() != 1 {
+            return None;
+        }
+        let registration = matching_path[0];
+        if registration.prunable
+            || registration.bare
+            || (registration.locked
+                && registration.lock_reason.as_deref()
+                    != Some(crate::git::BROKER_WORKTREE_LOCK_REASON))
+            || registration.head.as_deref() != Some(proof.head.as_str())
+            || registration.branch.as_deref() != Some(proof.branch_ref.as_str())
+            || inventory
+                .iter()
+                .filter(|entry| entry.branch.as_deref() == Some(proof.branch_ref.as_str()))
+                .count()
+                != 1
+        {
+            return None;
+        }
+
+        let delivery_targets = self.cleanup_delivery_targets().ok()?;
+        let (provenance, _) = self
+            .cleanup_provenance(&current, &proof.head, &delivery_targets)
+            .ok()?;
+        if provenance.representation != CleanupRepresentation::Represented
+            || self
+                .refuse_live_checkout(current.id, worktree_path)
+                .is_err()
+        {
+            return None;
+        }
+        Some(proof)
+    }
+
+    fn resume_interrupted_finish_cleanup(
+        &mut self,
+        session: &Session,
+        expected_proof: &crate::events::FinishCleanupRecoveryProof,
+    ) -> Result<(), BrokerOpError> {
+        let worktree_path = PathBuf::from(&session.worktree_path);
+        self.refuse_live_checkout(session.id, &worktree_path)?;
+        if self.interrupted_finish_cleanup_proof(session) != Some(expected_proof.clone()) {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the interrupted finish cleanup identity or safety checks changed; inspect the worktree before retrying".into(),
+            });
+        }
+
+        // `--force` is confined to this validated interrupted finish. The
+        // exact registered checkout, represented head, and unstaged-deletion
+        // only status were rechecked immediately above.
+        self.repo.worktree_remove(&worktree_path, true)?;
+        match std::fs::symlink_metadata(&worktree_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(BrokerOpError::DirtyWorktree {
+                    id: session.id,
+                    reason: "the interrupted finish worktree path still exists after Git removal"
+                        .into(),
+                });
+            }
+            Err(source) => {
+                return Err(BrokerError::Io {
+                    path: worktree_path.clone(),
+                    source,
+                }
+                .into());
+            }
+        }
+
+        self.refuse_live_checkout(session.id, &worktree_path)?;
+        let current = self.store.session(session.id)?;
+        if current.cleanup_state != crate::SessionCleanupState::Closed
+            || current.origin != SessionOrigin::Spawned
+            || current.worktree_path != session.worktree_path
+            || current.branch != session.branch
+        {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the session is no longer the same closed cleanup owner".into(),
+            });
+        }
+        let inventory = self.repo.worktree_inventory()?;
+        if inventory
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some(expected_proof.branch_ref.as_str()))
+        {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the session branch is now checked out by a registered worktree".into(),
+            });
+        }
+        let delivery_targets = self.cleanup_delivery_targets()?;
+        let (provenance, _) =
+            self.cleanup_provenance(&current, &expected_proof.head, &delivery_targets)?;
+        if provenance.representation != CleanupRepresentation::Represented {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "the session head is no longer represented on a delivery target".into(),
+            });
+        }
+        self.repo
+            .delete_branch_ref_checked(&session.branch, &expected_proof.branch_tip)?;
+        self.store
+            .set_session_status(session.id, SessionStatus::Cleaned, None)?;
+        Ok(())
+    }
+
     pub fn cleanup(&mut self, session_id: i64, force: bool) -> Result<(), BrokerOpError> {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
+        if !force && let Some(proof) = self.interrupted_finish_cleanup_proof(&session) {
+            return self.resume_interrupted_finish_cleanup(&session, &proof);
+        }
         if session.origin == SessionOrigin::Adopted {
             if worktree_path.exists() {
                 if !force {

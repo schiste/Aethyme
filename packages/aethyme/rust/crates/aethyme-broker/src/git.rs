@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -269,6 +271,68 @@ fn parse_porcelain_entries_z(out: &[u8]) -> Result<Vec<([u8; 2], String)>, GitEr
         entries.push((xy, path.to_owned()));
     }
     Ok(entries)
+}
+
+fn only_unstaged_tracked_deletions(
+    entries: &[([u8; 2], String)],
+    safe_ignored: impl Fn(&str) -> bool,
+) -> bool {
+    let has_deletion = entries.iter().any(|(xy, _)| *xy == [b' ', b'D']);
+    has_deletion
+        && entries
+            .iter()
+            .all(|(xy, path)| *xy == [b' ', b'D'] || (*xy == [b'!', b'!'] && safe_ignored(path)))
+}
+
+#[cfg(test)]
+mod interrupted_finish_status_tests {
+    use super::only_unstaged_tracked_deletions;
+
+    #[test]
+    fn interrupted_finish_accepts_only_unstaged_tracked_deletions() {
+        let no_ignored = |_| false;
+        assert!(only_unstaged_tracked_deletions(
+            &[(*b" D", "gone".into())],
+            no_ignored
+        ));
+        assert!(!only_unstaged_tracked_deletions(&[], no_ignored));
+        assert!(!only_unstaged_tracked_deletions(
+            &[(*b"D ", "staged".into())],
+            no_ignored
+        ));
+        assert!(!only_unstaged_tracked_deletions(
+            &[(*b" M", "modified".into())],
+            no_ignored
+        ));
+        assert!(!only_unstaged_tracked_deletions(
+            &[(*b"??", "untracked".into())],
+            no_ignored
+        ));
+        assert!(!only_unstaged_tracked_deletions(
+            &[(*b"!!", "ignored".into())],
+            |_| true
+        ));
+        assert!(!only_unstaged_tracked_deletions(
+            &[(*b"UU", "conflict".into())],
+            no_ignored
+        ));
+        assert!(!only_unstaged_tracked_deletions(
+            &[(*b" D", "gone".into()), (*b"??", "untracked".into()),],
+            no_ignored
+        ));
+        assert!(only_unstaged_tracked_deletions(
+            &[
+                (*b" D", "gone".into()),
+                (*b"!!", ".aethyme/generated/experience-status.md".into()),
+                (*b"!!", "target/".into()),
+            ],
+            |path| path.starts_with(".aethyme/generated/") || path == "target/"
+        ));
+        assert!(!only_unstaged_tracked_deletions(
+            &[(*b" D", "gone".into()), (*b"!!", ".env".into()),],
+            |path| path == "target/"
+        ));
+    }
 }
 
 /// Extract paths from newline-separated path listings (`git diff
@@ -1875,6 +1939,125 @@ impl GitRepo {
         // Canonicalize to strip the `..` segments git emits from linked
         // worktrees.
         Ok(common_dir.canonicalize().unwrap_or(common_dir))
+    }
+
+    /// Capture the exact linked-worktree and Git-admin identities needed to
+    /// recognize a finish removal that stopped after deleting tracked files.
+    /// Unsupported platforms and ambiguous filesystem state return `None`,
+    /// which leaves ordinary cleanup available but disables interrupted
+    /// cleanup recovery.
+    pub(crate) fn finish_cleanup_recovery_proof(
+        &self,
+        branch_ref: &str,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        #[cfg(unix)]
+        {
+            self.finish_cleanup_recovery_proof_unix(branch_ref)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = branch_ref;
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn finish_cleanup_recovery_proof_unix(
+        &self,
+        branch_ref: &str,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        use std::os::unix::fs::MetadataExt;
+
+        fn directory_identity(path: &Path) -> Option<(u64, u64)> {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = fs::symlink_metadata(path).ok()?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return None;
+            }
+            Some((metadata.dev(), metadata.ino()))
+        }
+
+        let root = self.root.canonicalize().ok()?;
+        let (worktree_device, worktree_inode) = directory_identity(&root)?;
+        let branch = branch_ref.strip_prefix("refs/heads/")?;
+        if self.current_branch().ok()?.trim() != branch {
+            return None;
+        }
+        let head = self.head_commit().ok()?;
+        let branch_tip = self.resolve_ref(branch_ref)?;
+        if head != branch_tip {
+            return None;
+        }
+
+        let pointer_path = root.join(".git");
+        let mut pointer_options = fs::OpenOptions::new();
+        pointer_options.read(true);
+        use std::os::unix::fs::OpenOptionsExt;
+        pointer_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let mut pointer = pointer_options.open(&pointer_path).ok()?;
+        let pointer_metadata = pointer.metadata().ok()?;
+        if !pointer_metadata.is_file() {
+            return None;
+        }
+        let git_pointer_device = pointer_metadata.dev();
+        let git_pointer_inode = pointer_metadata.ino();
+        let mut pointer_bytes = Vec::new();
+        pointer.take(4097).read_to_end(&mut pointer_bytes).ok()?;
+        if pointer_bytes.len() > 4096 {
+            return None;
+        }
+        let pointer_text = std::str::from_utf8(&pointer_bytes).ok()?;
+        let pointed_admin = pointer_text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))?
+            .trim();
+        let pointed_admin = PathBuf::from(pointed_admin);
+        let pointed_admin = if pointed_admin.is_absolute() {
+            pointed_admin
+        } else {
+            root.join(pointed_admin)
+        };
+        let pointed_admin_metadata = fs::symlink_metadata(&pointed_admin).ok()?;
+        if pointed_admin_metadata.file_type().is_symlink() || !pointed_admin_metadata.is_dir() {
+            return None;
+        }
+        let pointer_admin = pointed_admin.canonicalize().ok()?;
+        let git_admin = PathBuf::from(
+            run_git(&root, &["rev-parse", "--absolute-git-dir"])
+                .ok()?
+                .trim(),
+        )
+        .canonicalize()
+        .ok()?;
+        if pointer_admin != git_admin {
+            return None;
+        }
+        let (git_admin_device, git_admin_inode) = directory_identity(&git_admin)?;
+
+        let git_common = self.git_common_dir().ok()?.canonicalize().ok()?;
+        let (git_common_device, git_common_inode) = directory_identity(&git_common)?;
+        if git_admin == git_common {
+            return None;
+        }
+
+        Some(crate::events::FinishCleanupRecoveryProof {
+            schema_version: 1,
+            worktree_path: root.to_str()?.to_string(),
+            worktree_device,
+            worktree_inode,
+            git_pointer_device,
+            git_pointer_inode,
+            git_admin_path: git_admin.to_str()?.to_string(),
+            git_admin_device,
+            git_admin_inode,
+            git_common_path: git_common.to_str()?.to_string(),
+            git_common_device,
+            git_common_inode,
+            branch_ref: branch_ref.to_string(),
+            head,
+            branch_tip,
+        })
     }
 
     /// Root of the **main** checkout, even when `self` is a linked
@@ -3706,6 +3889,79 @@ impl GitRepo {
         .into_iter()
         .map(|(_, path)| path)
         .collect())
+    }
+
+    /// Whether every remaining non-ignored change is an unstaged deletion of
+    /// a tracked path, and each ignored path is broker runtime state or a
+    /// witnessed regenerable artifact. This narrow state is used only to
+    /// resume an authenticated finish cleanup after Git has already removed
+    /// part of the worktree.
+    pub(crate) fn has_only_unstaged_tracked_deletions(&self) -> Result<bool, GitError> {
+        require_trustworthy_porcelain()?;
+        let entries = parse_porcelain_entries_z(&run_git_bytes(
+            &self.root,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )?)?;
+        Ok(only_unstaged_tracked_deletions(&entries, |path| {
+            self.safe_interrupted_cleanup_ignored_path(path)
+                .unwrap_or(false)
+        }))
+    }
+
+    /// The ordinary cleanup path already permits broker runtime files and
+    /// catalogued regenerable output because they are ignored by Git. The
+    /// interrupted path keeps that policy narrow: arbitrary ignored content
+    /// is not covered by the recovery proof.
+    fn safe_interrupted_cleanup_ignored_path(&self, path: &str) -> Result<bool, GitError> {
+        use std::path::Component;
+
+        let relative = path.strip_suffix('/').unwrap_or(path);
+        let relative_path = Path::new(relative);
+        if relative.is_empty()
+            || relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Ok(false);
+        }
+        if crate::runtime_paths::is_broker_runtime_path(relative) {
+            return Ok(true);
+        }
+
+        let mut candidate = PathBuf::new();
+        for component in relative_path.components() {
+            let Component::Normal(name) = component else {
+                return Ok(false);
+            };
+            candidate.push(name);
+            let Some(name) = name.to_str() else {
+                return Ok(false);
+            };
+            let Some(witness) = crate::artifact_catalog::unattended_witness(name, &[]) else {
+                continue;
+            };
+            let Some(candidate_relative) = candidate.to_str() else {
+                return Ok(false);
+            };
+            let candidate_path = self.root.join(&candidate);
+            let candidate_is_directory = fs::symlink_metadata(&candidate_path)
+                .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir());
+            if candidate_is_directory
+                && witness.confirms(&candidate_path)
+                && !self.is_tracked(candidate_relative)?
+                && self.path_is_ignored_checked(candidate_relative)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Untracked paths from porcelain status. Used for the adoption-time
