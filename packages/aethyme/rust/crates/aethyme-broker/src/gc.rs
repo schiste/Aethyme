@@ -7115,7 +7115,7 @@ mod tests {
 
         let cache = abandoned_worktree.join("target");
         std::fs::create_dir_all(&cache).unwrap();
-        std::fs::write(&cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
         std::fs::write(cache.join("payload"), b"interrupted artifact backlog").unwrap();
         let cache_key = cache.canonicalize().unwrap().to_string_lossy().into_owned();
 
