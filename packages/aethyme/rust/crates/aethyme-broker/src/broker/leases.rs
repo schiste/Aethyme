@@ -495,6 +495,55 @@ impl Broker {
         ))
     }
 
+    /// Reuse the status call's liveness sample after `agents()` persisted its
+    /// derived statuses. The returned `AgentView` retains the original stored
+    /// status, so pairing must use `derived_status` to match the store state
+    /// that a second snapshot would observe.
+    pub(super) fn lease_overlaps_after_agent_reconciliation(
+        &self,
+        agents: &[AgentView],
+    ) -> Result<Vec<crate::Overlap>, BrokerOpError> {
+        self.lease_overlaps_for_agent_views(agents, true)
+    }
+
+    /// Reuse a read-only status sample while retaining its stored-status rule:
+    /// a dead PID with recent activity still holds its recorded lease until a
+    /// writable liveness pass persists an exit.
+    pub(super) fn lease_overlaps_from_stored_status_views(
+        &self,
+        agents: &[AgentView],
+    ) -> Result<Vec<crate::Overlap>, BrokerOpError> {
+        self.lease_overlaps_for_agent_views(agents, false)
+    }
+
+    fn lease_overlaps_for_agent_views(
+        &self,
+        agents: &[AgentView],
+        use_derived_status: bool,
+    ) -> Result<Vec<crate::Overlap>, BrokerOpError> {
+        // Match `coordinating_session_ids`: pairing uses current wall time,
+        // independently of the caller-supplied time used to derive agents.
+        let now = now_ms();
+        let coordinating = agents
+            .iter()
+            .filter(|agent| {
+                let status = if use_derived_status {
+                    agent.derived_status
+                } else {
+                    agent.session.status
+                };
+                matches!(
+                    status,
+                    SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+                ) && now.saturating_sub(agent.activity_at) <= STALE_AFTER_MS
+            })
+            .map(|agent| agent.session.id)
+            .collect();
+        Ok(crate::detect_overlaps(
+            &self.coordinating_leases(&coordinating)?,
+        ))
+    }
+
     /// Collisions between what live sessions say they will work on.
     ///
     /// Read-only and independent of leases: a scope exists before any edit, so

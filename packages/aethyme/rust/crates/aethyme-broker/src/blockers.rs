@@ -504,24 +504,24 @@ impl Broker {
             .map_err(|error| BrokerOpError::InvalidCoordinatedOperation {
                 reason: error.to_string(),
             })?;
+        let leases = coordinator.quarantined_leases().map_err(|error| {
+            BrokerOpError::InvalidCoordinatedOperation {
+                reason: error.to_string(),
+            }
+        })?;
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let repository = self.origin_fingerprint();
         let sessions = self.sessions_by_worktree_fingerprint()?;
         let mut found = Vec::new();
-        for lease in
-            coordinator
-                .list(false)
-                .map_err(|error| BrokerOpError::InvalidCoordinatedOperation {
-                    reason: error.to_string(),
-                })?
-        {
+        for lease in leases {
             if lease.repository != repository
                 && !sessions
                     .iter()
                     .any(|(fp, _)| *fp == lease.worktree_fingerprint)
             {
-                continue;
-            }
-            if lease.state != crate::HostLeaseState::Quarantined {
                 continue;
             }
             let owner = sessions

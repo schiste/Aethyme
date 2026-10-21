@@ -793,6 +793,11 @@ pub struct GcPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred_checks: Vec<String>,
     pub evaluated_at: i64,
+    /// UTC-day floor used for retention-age decisions in schema 4 plans.
+    /// Exact evaluation time remains separate for reporting and live checks.
+    /// Missing on older plans and journals, which retain their exact-time rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_anchor_ms: Option<i64>,
     pub policy: RetentionPolicy,
     /// Unknown fields are ignored for forward compatibility, but remain in
     /// the plan so the operator sees exactly what this binary did not apply.
@@ -1096,6 +1101,8 @@ impl GcPlan {
         #[derive(serde::Serialize)]
         struct Authorization<'a> {
             schema_version: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            age_anchor_ms: Option<i64>,
             policy: &'a RetentionPolicy,
             rows: &'a [GcRowCandidate],
             files: &'a [GcFileCandidate],
@@ -1116,6 +1123,7 @@ impl GcPlan {
         }
         let bytes = serde_json::to_vec(&Authorization {
             schema_version: self.schema_version,
+            age_anchor_ms: self.age_anchor_ms,
             policy: &self.policy,
             rows: &self.rows,
             files: &self.files,
@@ -1225,6 +1233,27 @@ mod tests {
         small.finish_digest().unwrap();
         large.finish_digest().unwrap();
         assert_ne!(small.digest, large.digest);
+    }
+
+    #[test]
+    fn gc_age_anchor_is_authorized_but_exact_evaluation_time_is_not() {
+        let mut legacy = empty_plan(RetentionPolicy::default());
+        legacy.schema_version = 3;
+        legacy.age_anchor_ms = None;
+        legacy.finish_digest().unwrap();
+        let mut legacy_later = legacy.clone();
+        legacy_later.evaluated_at = 123_456;
+        legacy_later.finish_digest().unwrap();
+        assert_eq!(legacy.digest, legacy_later.digest);
+
+        let mut anchored = empty_plan(RetentionPolicy::default());
+        anchored.schema_version = 4;
+        anchored.age_anchor_ms = Some(86_400_000);
+        anchored.finish_digest().unwrap();
+        let mut different_anchor = anchored.clone();
+        different_anchor.age_anchor_ms = Some(172_800_000);
+        different_anchor.finish_digest().unwrap();
+        assert_ne!(anchored.digest, different_anchor.digest);
     }
 
     #[test]

@@ -7,11 +7,18 @@
     "languages": [
       "rust",
       "python",
-      "typescript"
+      "typescript",
+      "javascript"
     ],
     "primary_language": "rust",
     "package_manager": "cargo",
     "manifests": [
+      "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H01/a-state/package.json",
+      "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H02/a-state/package.json",
+      "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P01/a-state/package.json",
+      "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P02/a-state/package.json",
+      "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P03/a-state/package.json",
+      "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P04/a-state/package.json",
       "packages/aethyme-eval/benchmarks/performance/fixture/package.json",
       "packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml",
       "packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
@@ -19,6 +26,7 @@
       "packages/aethyme/rust/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-broker/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-cli/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-contracts/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-engine/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml",
@@ -43,6 +51,7 @@
       "members": [
         "packages/aethyme/rust/crates/aethyme-broker",
         "packages/aethyme/rust/crates/aethyme-cli",
+        "packages/aethyme/rust/crates/aethyme-contracts",
         "packages/aethyme/rust/crates/aethyme-engine",
         "packages/aethyme/rust/crates/aethyme-enhance",
         "packages/aethyme/rust/crates/aethyme-graph-indexer",
@@ -77,7 +86,7 @@
         },
         {
           "kind": "workspace_members",
-          "detail": "10 tracked member roots",
+          "detail": "11 tracked member roots",
           "confidence": "high"
         },
         {
@@ -91,10 +100,10 @@
       "ranking": {
         "root_manifest": false,
         "declares_workspace": true,
-        "member_count": 10,
+        "member_count": 11,
         "ci_mentions": 63,
         "executable_entrypoints": 1,
-        "source_files": 604
+        "source_files": 855
       }
     },
     {
@@ -131,7 +140,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 3 time(s) in CI",
+          "detail": "workspace root mentioned 5 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -141,9 +150,9 @@
         "root_manifest": false,
         "declares_workspace": false,
         "member_count": 0,
-        "ci_mentions": 3,
+        "ci_mentions": 5,
         "executable_entrypoints": 2,
-        "source_files": 83
+        "source_files": 113
       }
     },
     {
@@ -274,6 +283,192 @@
         "executable_entrypoints": 1,
         "source_files": 2
       }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P01/a-state",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P01/a-state/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P01/a-state/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 2
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P02/a-state",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P02/a-state/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P02/a-state/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 2
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H01/a-state",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H01/a-state/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H01/a-state/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H02/a-state",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H02/a-state/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H02/a-state/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P03/a-state",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P03/a-state/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P03/a-state/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P04/a-state",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P04/a-state/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P04/a-state/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
     }
   ],
   "primary_workspace": {
@@ -289,6 +484,7 @@
     "members": [
       "packages/aethyme/rust/crates/aethyme-broker",
       "packages/aethyme/rust/crates/aethyme-cli",
+      "packages/aethyme/rust/crates/aethyme-contracts",
       "packages/aethyme/rust/crates/aethyme-engine",
       "packages/aethyme/rust/crates/aethyme-enhance",
       "packages/aethyme/rust/crates/aethyme-graph-indexer",
@@ -323,7 +519,7 @@
       },
       {
         "kind": "workspace_members",
-        "detail": "10 tracked member roots",
+        "detail": "11 tracked member roots",
         "confidence": "high"
       },
       {
@@ -337,10 +533,10 @@
     "ranking": {
       "root_manifest": false,
       "declares_workspace": true,
-      "member_count": 10,
+      "member_count": 11,
       "ci_mentions": 63,
       "executable_entrypoints": 1,
-      "source_files": 604
+      "source_files": 855
     }
   },
   "commands": [
@@ -409,6 +605,12 @@
       "path": "scripts",
       "role": "tooling",
       "reason": "developer tooling or scripts",
+      "confidence": "high"
+    },
+    {
+      "path": "target",
+      "role": "generated_or_vendor",
+      "reason": "generated output or vendored dependencies",
       "confidence": "high"
     }
   ],
@@ -514,7 +716,12 @@
       "relevance": "primary"
     }
   },
-  "caution_zones": [],
+  "caution_zones": [
+    {
+      "path": "target",
+      "reason": "likely generated, vendored, fixture, or migration-heavy area"
+    }
+  ],
   "generated_paths": [
     {
       "path": ".aethyme/generated",
@@ -523,6 +730,11 @@
     },
     {
       "path": "packages/aethyme/rust/crates/aethyme-quality/tests/fixtures/quality_surface/src/generated",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": "target",
       "reason": "tracked generated or vendored surface; verify ownership before editing",
       "provenance": "tracked path classification"
     }
@@ -571,9 +783,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "39d0a018a471a52f5e28f9a948e6961eae43654a3647d226f20bef4f18ba4c0b",
+    "source_digest": "d4bd5194feaa28a9e6a263ea2e3241b8c14db15b20ef1fffb67e2c0d1b1695d2",
     "source_commit": null,
-    "source_file_count": 1061,
+    "source_file_count": 3612,
     "generator": "deterministic"
   },
   "notes": [
@@ -603,12 +815,12 @@
       "freshness"
     ],
     "counts": {
-      "workspaces": 5,
+      "workspaces": 11,
       "commands": 5,
-      "areas": 4,
+      "areas": 5,
       "entrypoints": 8,
-      "caution_zones": 0,
-      "generated_paths": 2,
+      "caution_zones": 1,
+      "generated_paths": 3,
       "dangerous_paths": 2,
       "navigation_recipes": 3,
       "notes": 9

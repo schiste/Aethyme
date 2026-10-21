@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 fn repository(root: &Path) -> PathBuf {
     let repo = root.join("repo");
     fs::create_dir(&repo).unwrap();
-    let initialized = Command::new("git")
+    fs::write(root.join("empty-git-config"), "").unwrap();
+    let initialized = git_command(&repo)
         .args(["init", "-b", "main"])
-        .arg(&repo)
         .output()
         .unwrap();
     assert!(initialized.status.success());
@@ -33,17 +33,43 @@ fn command(repo: &Path) -> Command {
             "AETHYME_CHAU7_MCP_BRIDGE",
             "/__aethyme_test_no_chau7_bridge__",
         );
+    isolate_fixture_git_environment(&mut command, repo);
+    command
+}
+
+fn isolate_fixture_git_environment(command: &mut Command, repo: &Path) {
+    clear_inherited_git_environment(command);
+
+    let fixture_home = repo.parent().expect("fixture repo has a temp root");
+    command
+        .env("HOME", fixture_home)
+        .env("GIT_CONFIG_GLOBAL", fixture_home.join("empty-git-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+fn clear_inherited_git_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(repo);
+    isolate_fixture_git_environment(&mut command, repo);
     command
 }
 
 fn commit_all(repo: &Path, message: &str) {
-    let added = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(repo)
-        .output()
-        .unwrap();
+    let added = git_command(repo).args(["add", "-A"]).output().unwrap();
     assert!(added.status.success());
-    let committed = Command::new("git")
+    let committed = git_command(repo)
         .args([
             "-c",
             "user.name=Aethyme Test",
@@ -66,6 +92,54 @@ fn commit_all(repo: &Path, message: &str) {
 
 fn run(repo: &Path, args: &[&str]) -> Output {
     command(repo).args(args).output().unwrap()
+}
+
+#[test]
+fn repository_fixture_git_children_ignore_host_global_excludes() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let settings = repo.join(".claude/settings.local.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "{}\n").unwrap();
+
+    let hostile_ignore = temp.path().join("hostile-ignore");
+    fs::write(&hostile_ignore, "**/.claude/settings.local.json\n").unwrap();
+    let hostile_config = temp.path().join("hostile-git-config");
+    fs::write(
+        &hostile_config,
+        "[core]\n\texcludesFile = ~/hostile-ignore\n",
+    )
+    .unwrap();
+
+    let mut host_configured = Command::new("git");
+    clear_inherited_git_environment(&mut host_configured);
+    host_configured
+        .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
+        .current_dir(&repo)
+        .env("HOME", temp.path())
+        .env("GIT_CONFIG_GLOBAL", &hostile_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let host_result = host_configured.output().unwrap();
+    assert!(
+        host_result.status.success(),
+        "positive control: hostile global excludes file must ignore the generated settings file"
+    );
+
+    let mut isolated = Command::new("git");
+    isolated
+        .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
+        .current_dir(&repo)
+        .env("HOME", temp.path())
+        .env("GIT_CONFIG_GLOBAL", &hostile_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    isolate_fixture_git_environment(&mut isolated, &repo);
+    let isolated_result = isolated.output().unwrap();
+    assert_eq!(
+        isolated_result.status.code(),
+        Some(1),
+        "fixture Git environment must ignore the host global excludes file; stderr: {}",
+        String::from_utf8_lossy(&isolated_result.stderr)
+    );
 }
 
 fn old_canonical_deployment(repo: &Path) {
@@ -148,6 +222,144 @@ fn write_resolutions(root: &Path, name: &str, resolutions: Value) -> PathBuf {
     )
     .unwrap();
     path
+}
+
+#[test]
+fn upgrade_proposal_fetches_only_the_pinned_commit_without_changing_the_plan() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    fs::write(repo.join("removed-history.txt"), "historical content\n").unwrap();
+    commit_all(&repo, "add historical content");
+    let historical_head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    fs::remove_file(repo.join("removed-history.txt")).unwrap();
+    commit_all(&repo, "remove historical content");
+    old_canonical_deployment(&repo);
+    fs::write(repo.join("private-notes.txt"), "uncommitted user content\n").unwrap();
+    let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    let before = json(&run(&repo, &["upgrade", "plan", "--json"]));
+
+    git(&repo, &["branch", "unrelated-history", &historical_head]);
+    git(&repo, &["tag", "historical-tag", &historical_head]);
+    let refs_before = git_stdout(&repo, &["show-ref"]);
+    let dirty_before = git_stdout(&repo, &["status", "--porcelain=v1"]);
+    let trace = temp.path().join("proposal-git-trace.jsonl");
+    let output = command(&repo)
+        .args(["upgrade", "plan", "--json"])
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    let after = json(&output);
+    assert_eq!(before, after, "unrelated history must not change the plan");
+    assert_eq!(git_stdout(&repo, &["show-ref"]), refs_before);
+    assert_eq!(
+        git_stdout(&repo, &["status", "--porcelain=v1"]),
+        dirty_before
+    );
+    assert_eq!(git_stdout(&repo, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read_to_string(repo.join("private-notes.txt")).unwrap(),
+        "uncommitted user content\n"
+    );
+    let starts = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event"] == "start")
+        .map(|event| event["argv"].as_array().unwrap().clone())
+        .collect::<Vec<_>>();
+    let fetches = starts
+        .iter()
+        .filter(|argv| argv.get(3).is_some_and(|arg| arg == "fetch"))
+        .collect::<Vec<_>>();
+    assert_eq!(fetches.len(), 1, "materialize the proposal with one fetch");
+    assert_eq!(
+        fetches[0][1..],
+        vec![
+            serde_json::json!("-c"),
+            serde_json::json!("core.hooksPath=/dev/null"),
+            serde_json::json!("fetch"),
+            serde_json::json!("--quiet"),
+            serde_json::json!("--depth=1"),
+            serde_json::json!("--no-tags"),
+            serde_json::json!("--no-recurse-submodules"),
+            serde_json::json!("--"),
+            serde_json::json!(repo),
+            serde_json::json!(head),
+        ]
+    );
+    assert!(
+        starts
+            .iter()
+            .all(|argv| argv.get(1).is_none_or(|arg| arg != "clone")),
+        "proposal must not import all refs and historical objects"
+    );
+}
+
+#[test]
+fn upgrade_proposal_accepts_a_shallow_source() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let shallow = temp.path().join("shallow source with spaces");
+    let cloned = Command::new("git")
+        .args(["clone", "--quiet", "--no-local", "--depth=1"])
+        .arg(&repo)
+        .arg(&shallow)
+        .output()
+        .unwrap();
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    assert_eq!(
+        git_stdout(&shallow, &["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+    git(&shallow, &["checkout", "--quiet", "--detach", "HEAD"]);
+    assert!(git_stdout(&shallow, &["branch", "--show-current"]).is_empty());
+    let before = git_stdout(&shallow, &["status", "--porcelain=v1"]);
+    let plan = json(&run(&shallow, &["upgrade", "plan", "--json"]));
+    assert_eq!(
+        plan["repository_head"],
+        git_stdout(&repo, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(plan["safe"], true);
+    assert_eq!(plan["from_schema"], 0);
+    assert_eq!(plan["to_schema"], 1);
+    assert_eq!(git_stdout(&shallow, &["status", "--porcelain=v1"]), before);
+}
+
+#[test]
+fn upgrade_proposal_preserves_sha256_object_format() {
+    let temp = tmp_dir();
+    let repo = temp.path().join("sha256");
+    let initialized = Command::new("git")
+        .args(["init", "--quiet", "--object-format=sha256", "-b", "main"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    fs::create_dir(repo.join(".aethyme")).unwrap();
+    fs::write(
+        repo.join(".aethyme/repository.json"),
+        r#"{"schema_version":1,"applied_migrations":["repository-deployment-v1"]}"#,
+    )
+    .unwrap();
+    commit_all(&repo, "seed sha256 repository");
+    let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(head.len(), 64);
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(plan["repository_head"], head);
+    assert_eq!(plan["safe"], true);
+    assert_eq!(
+        git_stdout(&repo, &["rev-parse", "--show-object-format"]),
+        "sha256"
+    );
 }
 
 #[test]
@@ -772,9 +984,8 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     assert!(local_settings.is_file());
     let empty_git_config = temp.path().join("empty-git-config");
     fs::write(&empty_git_config, "").unwrap();
-    let ignored = Command::new("git")
+    let ignored = git_command(&repo)
         .args(["check-ignore", "-v", "--", ".claude/settings.local.json"])
-        .current_dir(&repo)
         .env("XDG_CONFIG_HOME", repo.join("empty-config"))
         .env("GIT_CONFIG_GLOBAL", &empty_git_config)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1706,9 +1917,8 @@ fn reviewed_migration_diff_exactly_matches_the_applied_tree() {
 }
 
 fn git_status(repo: &Path) -> String {
-    let output = Command::new("git")
+    let output = git_command(repo)
         .args(["status", "--porcelain", "--untracked-files=all"])
-        .current_dir(repo)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -1716,11 +1926,7 @@ fn git_status(repo: &Path) -> String {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Output {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap();
+    let output = git_command(repo).args(args).output().unwrap();
     assert!(
         output.status.success(),
         "git {args:?} failed: {}",
@@ -1736,7 +1942,7 @@ fn git_stdout(repo: &Path, args: &[&str]) -> String {
 }
 
 fn git_commit(repo: &Path, message: &str) -> Output {
-    Command::new("git")
+    git_command(repo)
         .args([
             "-c",
             "user.name=Aethyme Test",
@@ -1746,7 +1952,6 @@ fn git_commit(repo: &Path, message: &str) -> Output {
             "-m",
             message,
         ])
-        .current_dir(repo)
         .output()
         .unwrap()
 }

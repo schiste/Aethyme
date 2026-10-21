@@ -3395,6 +3395,40 @@ impl HostResourceCoordinator {
         Ok(leases)
     }
 
+    /// Read only leases that are quarantined now, for blocker advice.
+    ///
+    /// The general inventory remains `list`; this narrower path uses the
+    /// state index instead of walking released history in generation order.
+    pub(crate) fn quarantined_leases(&self) -> Result<Vec<HostResourceLease>, HostResourceError> {
+        self.quarantined_leases_at(now_ms())
+    }
+
+    fn quarantined_leases_at(&self, now: i64) -> Result<Vec<HostResourceLease>, HostResourceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lease_id FROM resource_leases
+             WHERE state IN ('active','quarantined')
+             ORDER BY generation",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut leases = Vec::new();
+        for id in ids {
+            let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? else {
+                continue;
+            };
+            match lease.state {
+                HostLeaseState::Quarantined => leases.push(lease),
+                HostLeaseState::Active if lease.expires_at <= now => {
+                    lease.state = HostLeaseState::Quarantined;
+                    leases.push(lease);
+                }
+                HostLeaseState::Active | HostLeaseState::Released => {}
+            }
+        }
+        Ok(leases)
+    }
+
     /// Read active leases with a caller-owned time and count bound. `None`
     /// means the inventory is incomplete and must not be interpreted as an
     /// empty or complete lease set.
@@ -8327,5 +8361,69 @@ mod tests {
         c.reconcile(&grant.lease.lease_id, grant.lease.generation)
             .unwrap();
         assert!(c.acquire(&req("three", vec![exclusive("shared")])).is_ok());
+    }
+
+    #[test]
+    fn resource_lease_candidates_include_expiry_boundary_and_skip_active_or_released() {
+        const NOW: i64 = 100;
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+
+        let boundary = c
+            .acquire(&req("boundary", vec![exclusive("boundary")]))
+            .unwrap();
+        let future = c
+            .acquire(&req("future", vec![exclusive("future")]))
+            .unwrap();
+        let quarantined = c
+            .acquire(&req("quarantined", vec![exclusive("quarantined")]))
+            .unwrap();
+        c.quarantine(
+            &quarantined.lease.lease_id,
+            quarantined.lease.generation,
+            &quarantined.ownership_token,
+        )
+        .unwrap();
+        let released = c
+            .acquire(&req("released", vec![exclusive("released")]))
+            .unwrap();
+        c.release(
+            &released.lease.lease_id,
+            released.lease.generation,
+            &released.ownership_token,
+        )
+        .unwrap();
+
+        c.conn
+            .execute(
+                "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+                rusqlite::params![NOW, boundary.lease.lease_id.as_str()],
+            )
+            .unwrap();
+        c.conn
+            .execute(
+                "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+                rusqlite::params![NOW + 1, future.lease.lease_id.as_str()],
+            )
+            .unwrap();
+
+        let leases = c.quarantined_leases_at(NOW).unwrap();
+        let ids = leases
+            .iter()
+            .map(|lease| lease.lease_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                boundary.lease.lease_id.clone(),
+                quarantined.lease.lease_id.clone()
+            ]
+        );
+        assert!(
+            leases
+                .iter()
+                .all(|lease| lease.state == HostLeaseState::Quarantined)
+        );
+        assert!(leases.iter().all(|lease| lease.allocations.len() == 1));
     }
 }
