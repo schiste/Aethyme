@@ -669,23 +669,27 @@ impl Broker {
         };
         let reference = format!("{}/{}", default.remote, default.branch);
         let catch_up = crate::main_drift::CatchUp::for_branch(repo, &default.remote, branch);
-        let drift = crate::main_drift::measure(repo, &reference, &commit, head, catch_up);
-        match &drift {
-            Some(drift) => {
-                if let Ok(raw) = serde_json::to_string(drift) {
+        let drift = match crate::main_drift::measure(repo, &reference, &commit, head, catch_up) {
+            Ok(drift) => {
+                if let Ok(raw) = serde_json::to_string(&drift) {
                     crate::warn_unrecorded(
                         "cache the default-branch comparison",
                         self.store()
                             .meta_set(&crate::main_drift::cache_key(session_id), &raw),
                     );
                 }
+                Some(drift)
             }
-            None => {
-                note.get_or_insert_with(|| {
-                    format!("could not compare the session with {reference}")
+            Err(error) => {
+                let comparison_note =
+                    format!("could not compare the session with {reference}: {error}");
+                note = Some(match note {
+                    Some(fetch_note) => format!("{fetch_note}; {comparison_note}"),
+                    None => comparison_note,
                 });
+                None
             }
-        }
+        };
         (drift, note)
     }
 
