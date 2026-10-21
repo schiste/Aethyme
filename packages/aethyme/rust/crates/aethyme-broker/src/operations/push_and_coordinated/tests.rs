@@ -989,26 +989,97 @@ fn classification_closes_the_audited_bypasses() {
 }
 
 #[test]
+fn provider_read_budgets_keep_github_bounded_and_git_unchanged() {
+    assert_eq!(GITHUB_READ_OPERATION_BUDGET, Duration::from_secs(30));
+    assert_eq!(GIT_READ_OPERATION_BUDGET, Duration::from_secs(90));
+    assert_eq!(
+        read_operation_budget_from(None, GITHUB_READ_OPERATION_BUDGET),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        read_operation_budget_from(None, GIT_READ_OPERATION_BUDGET),
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        read_operation_budget_from(Some("7"), GITHUB_READ_OPERATION_BUDGET),
+        Duration::from_secs(7),
+        "a configured budget must remain available"
+    );
+    assert_eq!(
+        read_operation_budget_from(Some("0"), GITHUB_READ_OPERATION_BUDGET),
+        Duration::from_secs(30),
+        "zero is not a usable operation budget"
+    );
+    assert_eq!(
+        read_operation_budget_from(Some("invalid"), GIT_READ_OPERATION_BUDGET),
+        Duration::from_secs(90),
+        "invalid configuration must fall back to the provider default"
+    );
+}
+
+#[test]
 fn an_unbounded_read_gets_the_read_budget_and_writes_keep_theirs() {
-    // #555: "wait forever" on a read can only mean waiting on the provider.
-    let read =
-        AdmissionDeadline::start(QueueWait::Forever).bounded_for(OperationEffect::Read, false);
-    assert_eq!(read.budget, Some(READ_OPERATION_BUDGET));
+    // #555/#706: an ordinary GitHub read gets a provider deadline by default.
+    let issue_list = gh(&["issue", "list"]);
+    let issue_list_effect = classify_gh(&issue_list).expect("issue list is classified");
+    assert_eq!(issue_list_effect, OperationEffect::Read);
+    let issue_list_long_running = is_long_running_read(OperationProvider::Github, &issue_list);
+    assert!(
+        !issue_list_long_running,
+        "an ordinary issue list should get the default read bound"
+    );
+    let read = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+        issue_list_effect,
+        issue_list_long_running,
+        OperationProvider::Github,
+    );
+    let configured = std::env::var("AETHYME_BROKER_READ_BUDGET_SECS").ok();
+    assert_eq!(
+        read.budget,
+        Some(read_operation_budget_from(
+            configured.as_deref(),
+            GITHUB_READ_OPERATION_BUDGET,
+        ))
+    );
     assert!(read.at.is_some());
 
+    // Git keeps its longer default; a caller's own bound still wins.
+    let git_status = args(&["status"]);
+    let git_status_effect = classify_git(&git_status).expect("git status is classified");
+    assert_eq!(git_status_effect, OperationEffect::Read);
+    let git_read = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+        git_status_effect,
+        false,
+        OperationProvider::Git,
+    );
+    assert_eq!(
+        git_read.budget,
+        Some(read_operation_budget_from(
+            configured.as_deref(),
+            GIT_READ_OPERATION_BUDGET,
+        ))
+    );
+
     // A caller's own bound wins, and writes keep the wait they asked for.
-    let explicit =
-        AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(OperationEffect::Read, false);
+    let explicit = AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(
+        OperationEffect::Read,
+        false,
+        OperationProvider::Github,
+    );
     assert_eq!(explicit.budget, Some(Duration::from_secs(5)));
     for effect in [OperationEffect::Write, OperationEffect::Destructive] {
-        let write = AdmissionDeadline::start(QueueWait::Forever).bounded_for(effect, false);
+        let write = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+            effect,
+            false,
+            OperationProvider::Github,
+        );
         assert_eq!(write.budget, None, "{effect:?} must stay unbounded");
         assert!(write.at.is_none());
     }
 }
 
-/// #555 review: a read that is long by design keeps the caller's
-/// unbounded wait; only an explicit `--queue-timeout` bounds it.
+/// #555 review: a read that is long by design skips the automatic default
+/// budget; caller-selected `--queue-timeout` and `--no-wait` bounds still apply.
 fn assert_long_running_read_is_exempt(args: &[&str]) {
     let args = gh(args);
     assert_eq!(classify_gh(&args), Some(OperationEffect::Read), "{args:?}");
@@ -1016,11 +1087,35 @@ fn assert_long_running_read_is_exempt(args: &[&str]) {
         is_long_running_read(OperationProvider::Github, &args),
         "{args:?}"
     );
+    let long_running = is_long_running_read(OperationProvider::Github, &args);
     let admission = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
         OperationEffect::Read,
-        is_long_running_read(OperationProvider::Github, &args),
+        long_running,
+        OperationProvider::Github,
     );
     assert_eq!(admission.budget, None, "{args:?} must stay unbounded");
+
+    let no_wait = AdmissionDeadline::start(QueueWait::Refuse).bounded_for(
+        OperationEffect::Read,
+        long_running,
+        OperationProvider::Github,
+    );
+    assert_eq!(
+        no_wait.budget,
+        Some(NO_WAIT_ADMISSION_BUDGET),
+        "`--no-wait` remains bounded for {args:?}"
+    );
+
+    let explicit = AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(
+        OperationEffect::Read,
+        long_running,
+        OperationProvider::Github,
+    );
+    assert_eq!(
+        explicit.budget,
+        Some(Duration::from_secs(5)),
+        "an explicit caller bound still applies to {args:?}"
+    );
 }
 
 #[test]
@@ -1269,6 +1364,77 @@ fn the_lock_only_gets_what_preparation_left() {
     assert_eq!(
         AdmissionDeadline::start(QueueWait::Forever).remaining_queue_wait(QueueWait::Forever),
         QueueWait::Forever
+    );
+}
+
+/// A provider can exit while its descendant still holds the captured pipes.
+#[cfg(unix)]
+#[test]
+fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ready = tmp.path().join("descendant-ready");
+    let release = tmp.path().join("release-descendant");
+    let done = tmp.path().join("descendant-done");
+    let ready_for_thread = ready.clone();
+    let release_for_thread = release.clone();
+    let done_for_thread = done.clone();
+    let releaser = std::thread::spawn(move || {
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !ready_for_thread.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready_seen = ready_for_thread.exists();
+        if ready_seen {
+            // Keep both inherited output descriptors open beyond the provider's
+            // deadline, then release the finite child so the test leaves no
+            // process behind.
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        std::fs::write(release_for_thread, b"release").unwrap();
+        let done_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while ready_seen && !done_for_thread.exists() && std::time::Instant::now() < done_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (ready_seen, done_for_thread.exists())
+    });
+
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "(i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 120 ]; do sleep 0.05; i=$((i + 1)); done; : > \"$3\") & printf child; : > \"$2\"; exit 0",
+        "sh",
+        release.to_str().unwrap(),
+        ready.to_str().unwrap(),
+        done.to_str().unwrap(),
+    ]);
+    let started = std::time::Instant::now();
+    let budget = Duration::from_secs(2);
+    let error = output_within(
+        command,
+        AdmissionDeadline {
+            started,
+            at: Some(started + budget),
+            budget: Some(budget),
+        },
+        "owner/repo",
+        "capturing provider output",
+        None,
+    );
+    let provider_wait = started.elapsed();
+    let (ready_seen, descendant_done) = releaser.join().unwrap();
+
+    assert!(ready_seen, "the provider leader must exit before pipe EOF");
+    assert!(
+        descendant_done,
+        "the finite descendant must exit after release"
+    );
+    assert!(
+        provider_wait < Duration::from_secs(3),
+        "reader drain exceeded the 2s operation deadline: {provider_wait:?}"
+    );
+    assert!(
+        matches!(&error, Err(BrokerOpError::AdmissionTimedOut { .. })),
+        "an inherited pipe held past the deadline must time out, got {error:?}"
     );
 }
 

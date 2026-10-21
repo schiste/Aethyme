@@ -16,10 +16,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Run Aethyme Explore on the user task before broad manual search.
 - Verify answer candidates before concluding when trust_policy is not answer-safe.
 - Identify the nearest fast test or validation command before editing.
+- Before declaring a regression missing during issue triage, inspect likely
+  test bodies and their assertions, not only test names. An interruption or
+  recovery test may already exercise the exact state under a broader name.
 - Inspect caution zones before changing generated or vendored areas.
 
 ## Validation Checklist
 
+- Before standalone `rustfmt` or `rustc` validation, resolve the owning
+  crate's Cargo edition, including workspace inheritance, and pass that edition.
+  Formatting rules vary by edition even when the source compiles in both; a
+  successful check with a guessed edition can fail workspace CI.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
   runs rather than wall-clock assertions in ordinary tests. Retain complete CLI
@@ -74,6 +81,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Retain complete stdout and stderr before parsing exact session IDs and
   structured advice fields such as severity and commands. Never infer absence
   from truncated output or suppressed stderr.
+- Before writing a broker PR body, prepare the exact body file and run the
+  pinned CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`.
+  Review each refusal; use a `Contract justification:` of at least 24 characters
+  only for a verified false-positive, while preserving the actual retirement
+  label. Confirm the actual verdict is `none` or every reported symbol has an
+  accurate contract decision; exit status or help output alone is not evidence.
+  Retain the local result before the public body write.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
@@ -84,7 +98,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   clear inherited `GIT_*` variables; it only adds or overrides values. For
   isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
   preserve unrelated variables such as `PATH`, then set the fixture's intended
-  author/committer values. If a fixture PATH excludes real provider binaries,
+  author/committer values. For Git-backed fixtures that generate managed files
+  before staging, also set a fixture-owned `HOME`, an empty
+  `GIT_CONFIG_GLOBAL`, and `GIT_CONFIG_NOSYSTEM=1` on every CLI and Git child
+  before initial deployment and `git add`; a host `core.excludesFile` can hide
+  generated files from `git add -A`. Keep isolation on each child command and
+  do not compensate with fixture ignore rules or force-adds. If a fixture PATH
+  excludes real provider binaries,
   retain required CLI dependencies: install a prevalidated Git executable beside
   the fake provider instead of removing Git and failing before provider startup.
   Treat `core.sshCommand` as shell syntax: quote fixture executable paths for
@@ -104,6 +124,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.
+  Complete fixture branch/ref setup before opening the broker whenever
+  possible: its live default database may be .aethyme/broker.db, and a later
+  git add -A can commit it. Before any post-open branch switch, assert the
+  database and WAL paths are absent from git ls-files; stage exact fixture
+  paths so a checkout cannot unlink a live SQLite database.
 - In shell shims that branch on a child process's working directory, inspect it
   with `pwd -P` and compare it with an explicitly passed canonical fixture path.
   Rust `Command::current_dir` changes the child's directory without rewriting
@@ -164,6 +189,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
+- Before sealing a validation packet, require every input referenced by its
+  plan, argv, or README to exist and match its pinned hash; hashing only the
+  files that happen to be present can silently bless an incomplete packet.
+  Recheck every required path after copying the packet to durable storage.
+  Before freezing execution argv, check it against the actual helper parser
+  and environment allowlist; do not pass defaults already fixed by the runner as
+  caller overrides. Successful plan or intent generation alone does not prove
+  that execution accepts the same argv.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Check which filenames the delegated monitor
   owns; store caller summaries under distinct names instead of overwriting or
@@ -251,6 +284,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   protect its split-index backing files.
   Use the same isolated-index probes for operator status checks during pinned
   validation; an ordinary Git status command can refresh the watched index.
+- When testing configurable duration or deadline selection, put selection behind
+  a pure seam and assert defaults, provider classes and explicit overrides
+  without sleeping. Test real timeout cleanup separately with a short test-only
+  budget; never reduce a production budget just to speed up a test.
 - For repeated CI build-script runs, inspect the checkout action's local Git
   config before attributing recompilation to profiles or cache keys. Persisted
   credentials can add `includeIf.*.path` entries that a fail-closed source
@@ -269,6 +306,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
   target is a setup failure; stop before Cargo instead of treating it as a
   product failure or zero-test result.
+- Treat release-signing failures as workflow failures, not automatically as
+  transient. Inspect the exact failed step and the tag/release asset state
+  before retrying. For a Rekor conflict, confirm the pinned signer's released
+  conflict handling and security status; exercise signer, bundle conversion,
+  and verification commands with fail-closed fakes while preserving identity,
+  issuer, and transparency-log checks. Keep intermediate signature files out
+  of the published asset directory.
 - Bound compilation and test execution separately. With `cargo nextest run`,
   use `--build-jobs 1` for Cargo and `--test-threads 1` or `2` for nextest;
   nextest's `-j` aliases test parallelism, so never use it as the Cargo worker
@@ -313,6 +357,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   check child output on the intended stream separately. A report may retain
   the original command arguments, so searching its serialized text for a child
   marker cannot establish output isolation. Assert command metadata separately.
+- For CLI subprocess-count regressions, trace the complete invoked path,
+  including contract preflight, human-only rendering, and the operation itself.
+  Derive expectations from the exact argv and fixture preconditions; use JSON
+  mode when human rendering is outside the behavior under test, and retain an
+  intended guard-removal failure plus a restored positive to prove the count
+  detects the removed optimization.
 - For a production guard that must prevent side effects, test the real entrypoint
   with a fixture command that writes a unique sentinel. Assert the typed refusal
   and sentinel absence, then remove only the call-site guard in a mutation run
@@ -322,7 +372,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unmodified source, with the deliberate break, and after byte-for-byte
   restoration. Require positive, intended runtime failure, positive; a compile
   failure or a test that also fails without the break does not validate the
-  guard. A passing adjacent suite cannot replace either positive run.
+  guard. Classify a negative control by the exact selected test, exit status,
+  and expected failure message; a custom Rust panic need not contain the
+  literal word `assertion`. A passing adjacent suite cannot replace either
+  positive run.
   Freeze the intended review snapshot before running mutations, or build it
   from the intended commit and selected patch. Exclude an in-flight deliberate
   mutation from the review snapshot so it is not mistaken for proposed code.

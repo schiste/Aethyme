@@ -15,8 +15,11 @@
 //! argument that nothing ever reads. It is not carried over — it has no
 //! observable behavior — and the CLI never passed it.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use toml::Value;
 
 use crate::fix::command::{CommandRunner, RunOutcome, SystemCommandRunner};
 use crate::fix::fixers::base::Fixer;
@@ -49,6 +52,8 @@ fn language_for(file_path: &Path) -> Option<&'static str> {
 }
 
 pub struct FormatFixer {
+    repo_path: PathBuf,
+    repo_path_prefix: PathBuf,
     runner: Box<dyn CommandRunner>,
     /// `(language, tools)` in `FORMATTERS` order; every language key is
     /// present even when its tool list is empty, matching the Python
@@ -57,14 +62,23 @@ pub struct FormatFixer {
 }
 
 impl FormatFixer {
-    pub fn new(_repo_path: &Path) -> Self {
-        Self::with_runner(Box::new(SystemCommandRunner))
+    pub fn new(repo_path: &Path) -> Self {
+        Self::with_repo_path_and_runner(repo_path, Box::new(SystemCommandRunner))
+    }
+
+    /// Preserve the injectable constructor for callers that do not need to
+    /// supply a repository root. Such callers resolve relative paths from the
+    /// current directory captured at construction time.
+    pub fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
+        Self::with_repo_path_and_runner(Path::new("."), runner)
     }
 
     /// Port of `__init__`: discovery runs eagerly, one `--version`
     /// probe per (language, tool) pair — so `prettier` is probed twice,
     /// once for javascript and once for typescript.
-    pub fn with_runner(runner: Box<dyn CommandRunner>) -> Self {
+    fn with_repo_path_and_runner(repo_path: &Path, runner: Box<dyn CommandRunner>) -> Self {
+        let repo_path_prefix = repo_path.to_path_buf();
+        let repo_path = freeze_repo_path(repo_path);
         let mut available_tools: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
         for (language, tools) in FORMATTERS {
             let mut found: Vec<&'static str> = Vec::new();
@@ -76,6 +90,8 @@ impl FormatFixer {
             available_tools.push((language, found));
         }
         FormatFixer {
+            repo_path,
+            repo_path_prefix,
             runner,
             available_tools,
         }
@@ -116,12 +132,15 @@ impl FormatFixer {
             "gofmt" => self
                 .runner
                 .run(&["gofmt"], Some(input), Some(FORMAT_TIMEOUT), None),
-            "rustfmt" => self.runner.run(
-                &["rustfmt", "--emit", "stdout"],
-                Some(input),
-                Some(FORMAT_TIMEOUT),
-                None,
-            ),
+            "rustfmt" => {
+                let edition = rust_edition(&self.repo_path, &self.repo_path_prefix, file_path)?;
+                self.runner.run(
+                    &["rustfmt", "--edition", edition.as_str(), "--emit", "stdout"],
+                    Some(input),
+                    Some(FORMAT_TIMEOUT),
+                    None,
+                )
+            }
             "autopep8" => {
                 self.runner
                     .run(&["autopep8", "-"], Some(input), Some(FORMAT_TIMEOUT), None)
@@ -143,6 +162,156 @@ fn is_tool_available(runner: &dyn CommandRunner, tool: &str) -> bool {
         runner.run(&[tool, "--version"], None, Some(VERSION_TIMEOUT), None),
         RunOutcome::Completed { code: 0, .. }
     )
+}
+
+/// Editions Cargo currently accepts. Refuse unknown values so rustfmt
+/// cannot silently use its default edition when the manifest is malformed
+/// or ahead of the installed toolchain.
+fn supported_rust_edition(edition: &str) -> bool {
+    matches!(edition, "2015" | "2018" | "2021" | "2024")
+}
+
+/// Capture the repository root at construction time so a later current
+/// directory change cannot retarget edition lookup.
+fn freeze_repo_path(repo_path: &Path) -> PathBuf {
+    let absolute = if repo_path.is_absolute() {
+        repo_path.to_path_buf()
+    } else if let Ok(current_dir) = std::env::current_dir() {
+        current_dir.join(repo_path)
+    } else {
+        return repo_path.to_path_buf();
+    };
+    fs::canonicalize(&absolute).unwrap_or(absolute)
+}
+
+/// Return `None` for manifest access or parse errors, `Some(None)` when the
+/// manifest does not exist, and `Some(Some(_))` for a parsed manifest.
+fn manifest_if_present(path: &Path) -> Option<Option<Value>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_manifest(path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// Resolve the edition for a Rust source file. A source tree without any
+/// Cargo manifest keeps rustfmt's historical 2015 default. If a manifest is
+/// present but malformed, has no owning package, or declares unresolved
+/// inheritance, decline the proposal instead of formatting with the wrong
+/// edition.
+fn rust_edition(repo_path: &Path, repo_path_prefix: &Path, file_path: &Path) -> Option<String> {
+    let repo_root = fs::canonicalize(repo_path).ok()?;
+    let candidate = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        let relative_path = file_path
+            .strip_prefix(repo_path_prefix)
+            .unwrap_or(file_path);
+        repo_root.join(relative_path)
+    };
+    let file_path = fs::canonicalize(candidate).ok()?;
+    if !file_path.starts_with(&repo_root) {
+        return None;
+    }
+
+    let mut directory = file_path.parent()?.to_path_buf();
+    loop {
+        let manifest_path = directory.join("Cargo.toml");
+        if let Some(manifest) = manifest_if_present(&manifest_path)? {
+            let canonical_manifest = fs::canonicalize(&manifest_path).ok()?;
+            if !canonical_manifest.starts_with(&repo_root) {
+                return None;
+            }
+            let package = manifest.get("package")?.as_table()?;
+            return match package.get("edition") {
+                None => Some("2015".to_owned()),
+                Some(Value::String(edition)) if supported_rust_edition(edition) => {
+                    Some(edition.clone())
+                }
+                Some(Value::Table(inheritance))
+                    if inheritance.len() == 1
+                        && inheritance.get("workspace").and_then(Value::as_bool) == Some(true) =>
+                {
+                    inherited_workspace_edition(&manifest_path, &manifest, package)
+                }
+                _ => None,
+            };
+        }
+
+        if directory == repo_root {
+            break;
+        }
+        let parent = directory.parent()?;
+        if !parent.starts_with(&repo_root) {
+            break;
+        }
+        directory = parent.to_path_buf();
+    }
+
+    Some("2015".to_owned())
+}
+
+fn read_manifest(path: &Path) -> Option<Value> {
+    fs::read_to_string(path).ok()?.parse::<Value>().ok()
+}
+
+fn inherited_workspace_edition(
+    package_manifest_path: &Path,
+    package_manifest: &Value,
+    package: &toml::map::Map<String, Value>,
+) -> Option<String> {
+    let workspace_manifest_path = match package.get("workspace") {
+        Some(Value::String(path)) if package_manifest.get("workspace").is_none() => {
+            let workspace_root = Path::new(path);
+            let workspace_root = if workspace_root.is_absolute() {
+                workspace_root.to_path_buf()
+            } else {
+                package_manifest_path.parent()?.join(workspace_root)
+            };
+            workspace_root.join("Cargo.toml")
+        }
+        Some(_) => return None,
+        None => nearest_workspace_manifest(package_manifest_path, package_manifest)?,
+    };
+    let workspace_manifest = if workspace_manifest_path == package_manifest_path {
+        package_manifest.clone()
+    } else {
+        read_manifest(&workspace_manifest_path)?
+    };
+    let workspace = workspace_manifest.get("workspace")?.as_table()?;
+    let workspace_package = workspace.get("package")?.as_table()?;
+    let edition = workspace_package.get("edition")?.as_str()?;
+    supported_rust_edition(edition).then(|| edition.to_owned())
+}
+
+fn nearest_workspace_manifest(
+    package_manifest_path: &Path,
+    package_manifest: &Value,
+) -> Option<PathBuf> {
+    let mut directory = package_manifest_path.parent()?.to_path_buf();
+    loop {
+        let manifest_path = directory.join("Cargo.toml");
+        if let Some(manifest) = manifest_if_present(&manifest_path)? {
+            let manifest = if manifest_path == package_manifest_path {
+                package_manifest.clone()
+            } else {
+                manifest
+            };
+            if manifest
+                .get("workspace")
+                .and_then(Value::as_table)
+                .is_some()
+            {
+                return Some(manifest_path);
+            }
+        }
+
+        let parent = directory.parent()?;
+        if parent == directory {
+            return None;
+        }
+        directory = parent.to_path_buf();
+    }
 }
 
 /// Port of the prettier parser map. Keyed on the VERBATIM suffix (not
@@ -311,10 +480,73 @@ mod tests {
         tools: Vec<(&'static str, Vec<&'static str>)>,
         fake: &Arc<FakeRunner>,
     ) -> FormatFixer {
+        let repo_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         FormatFixer {
+            repo_path: freeze_repo_path(&repo_path),
+            repo_path_prefix: repo_path,
             runner: Box::new(SharedRunner(fake.clone())),
             available_tools: tools,
         }
+    }
+
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "aethyme-format-edition-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            TempRepo(path)
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rust_fixer(repo: &TempRepo, fake: &Arc<FakeRunner>) -> FormatFixer {
+        preloaded_at(&repo.0, vec![("rust", vec!["rustfmt"])], fake)
+    }
+
+    fn preloaded_at(
+        repo_path: &Path,
+        tools: Vec<(&'static str, Vec<&'static str>)>,
+        fake: &Arc<FakeRunner>,
+    ) -> FormatFixer {
+        FormatFixer {
+            repo_path: freeze_repo_path(repo_path),
+            repo_path_prefix: repo_path.to_path_buf(),
+            runner: Box::new(SharedRunner(fake.clone())),
+            available_tools: tools,
+        }
+    }
+
+    fn assert_rustfmt_edition(fake: &FakeRunner, edition: &str) {
+        assert_eq!(
+            fake.format_calls(),
+            vec![vec![
+                "rustfmt".to_string(),
+                "--edition".to_string(),
+                edition.to_string(),
+                "--emit".to_string(),
+                "stdout".to_string(),
+            ]]
+        );
     }
 
     // ── Discovery ────────────────────────────────────────────────────
@@ -425,13 +657,15 @@ mod tests {
                 "rust",
                 "rustfmt",
                 "a.rs",
-                vec!["rustfmt", "--emit", "stdout"],
+                vec!["rustfmt", "--edition", "2015", "--emit", "stdout"],
             ),
         ] {
+            let repo = TempRepo::new();
+            let file_path = repo.write(file, "in\n");
             let fake = FakeRunner::new(vec![]).formatting("out\n");
-            let fixer = preloaded(vec![(language, vec![tool])], &fake);
+            let fixer = preloaded_at(&repo.0, vec![(language, vec![tool])], &fake);
             assert_eq!(
-                fixer.fix(Path::new(file), "in\n"),
+                fixer.fix(&file_path, "in\n"),
                 Some("out\n".to_string()),
                 "{tool} on {file}"
             );
@@ -444,6 +678,257 @@ mod tests {
                 "{tool} timeout"
             );
         }
+    }
+
+    #[test]
+    fn rustfmt_uses_the_nearest_package_manifest_edition() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/member\"]\n[workspace.package]\nedition = \"2018\"\n",
+        );
+        repo.write(
+            "crates/member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        let file = repo.write("crates/member/src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), Some("formatted\n".to_string()));
+        assert_rustfmt_edition(&fake, "2024");
+    }
+
+    #[test]
+    fn repo_root_constructor_passes_the_supplied_root_to_rustfmt() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        repo.write("src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec!["rustfmt"]).formatting("formatted\n");
+        let fixer =
+            FormatFixer::with_repo_path_and_runner(&repo.0, Box::new(SharedRunner(fake.clone())));
+
+        assert_eq!(
+            fixer.fix(Path::new("src/lib.rs"), "input\n"),
+            Some("formatted\n".to_string())
+        );
+        assert_rustfmt_edition(&fake, "2024");
+    }
+
+    #[test]
+    fn rustfmt_inherits_edition_from_the_nearest_workspace() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/member\"]\n[workspace.package]\nedition = \"2024\"\n",
+        );
+        repo.write(
+            "crates/member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+        );
+        repo.write("crates/member/src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(
+            fixer.fix(Path::new("crates/member/src/lib.rs"), "input\n"),
+            Some("formatted\n".to_string())
+        );
+        assert_rustfmt_edition(&fake, "2024");
+    }
+
+    #[test]
+    fn rustfmt_prefers_a_package_explicit_workspace_path() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = []\n[workspace.package]\nedition = \"2018\"\n",
+        );
+        repo.write(
+            "workspace-b/Cargo.toml",
+            "[workspace]\nmembers = [\"../members/crate\"]\n[workspace.package]\nedition = \"2024\"\n",
+        );
+        repo.write(
+            "members/crate/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nworkspace = \"../../workspace-b\"\nedition.workspace = true\n",
+        );
+        let file = repo.write("members/crate/src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), Some("formatted\n".to_string()));
+        assert_rustfmt_edition(&fake, "2024");
+    }
+
+    #[test]
+    fn rustfmt_uses_the_cargo_default_when_package_omits_edition() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\n",
+        );
+        let file = repo.write("src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), Some("formatted\n".to_string()));
+        assert_rustfmt_edition(&fake, "2015");
+    }
+
+    #[test]
+    fn rustfmt_declines_malformed_or_unknown_manifest_editions() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/malformed\", \"crates/nonstring\", \"crates/unknown\"]\n[workspace.package]\nedition = \"2024\"\n",
+        );
+        repo.write(
+            "crates/malformed/Cargo.toml",
+            "[package\nedition = \"2024\"\n",
+        );
+        repo.write(
+            "crates/nonstring/Cargo.toml",
+            "[package]\nname = \"nonstring\"\nversion = \"0.1.0\"\nedition = 2024\n",
+        );
+        repo.write(
+            "crates/unknown/Cargo.toml",
+            "[package]\nname = \"unknown\"\nversion = \"0.1.0\"\nedition = \"2030\"\n",
+        );
+        let malformed = repo.write("crates/malformed/src/lib.rs", "fn f() {}\n");
+        let nonstring = repo.write("crates/nonstring/src/lib.rs", "fn f() {}\n");
+        let unknown = repo.write("crates/unknown/src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&malformed, "input\n"), None);
+        assert_eq!(fixer.fix(&nonstring, "input\n"), None);
+        assert_eq!(fixer.fix(&unknown, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
+    }
+
+    #[test]
+    fn rustfmt_declines_unresolved_workspace_inheritance() {
+        let repo = TempRepo::new();
+        repo.write("Cargo.toml", "[workspace]\nmembers = [\"crates/member\"]\n");
+        repo.write(
+            "crates/member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+        );
+        let file = repo.write("crates/member/src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
+    }
+
+    #[test]
+    fn rustfmt_declines_inheritance_without_a_discoverable_workspace() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"parent\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        repo.write(
+            "nested/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition.workspace = true\n",
+        );
+        let file = repo.write("nested/src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
+    }
+
+    #[test]
+    fn rustfmt_declines_a_virtual_workspace_without_an_owning_package() {
+        let repo = TempRepo::new();
+        repo.write("Cargo.toml", "[workspace]\nmembers = []\n");
+        let file = repo.write("src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
+    }
+
+    #[test]
+    fn rustfmt_declines_nested_virtual_or_invalid_package_manifests() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"outer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        repo.write("nested-virtual/Cargo.toml", "[workspace]\nmembers = []\n");
+        repo.write(
+            "nested-wrong-type/Cargo.toml",
+            "package = \"not a table\"\n",
+        );
+        let virtual_file = repo.write("nested-virtual/src/lib.rs", "fn f() {}\n");
+        let wrong_type_file = repo.write("nested-wrong-type/src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&virtual_file, "input\n"), None);
+        assert_eq!(fixer.fix(&wrong_type_file, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
+    }
+
+    #[test]
+    fn rustfmt_declines_a_present_but_unreadable_manifest() {
+        let repo = TempRepo::new();
+        fs::create_dir_all(repo.0.join("Cargo.toml")).unwrap();
+        let file = repo.write("src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustfmt_resolves_symlinks_before_parent_components() {
+        let repo = TempRepo::new();
+        let outside = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"inside\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        repo.write("src/lib.rs", "fn f() {}\n");
+        fs::create_dir_all(outside.0.join("nested")).unwrap();
+        let outside_file = outside.write("src/lib.rs", "fn f() {}\n");
+        std::os::unix::fs::symlink(outside.0.join("nested"), repo.0.join("alias")).unwrap();
+        let path_with_symlink_and_parent = repo.0.join("alias/../src/lib.rs");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(
+            fs::canonicalize(&path_with_symlink_and_parent).unwrap(),
+            outside_file
+        );
+        assert_eq!(fixer.fix(&path_with_symlink_and_parent, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
+    }
+
+    #[test]
+    fn rustfmt_declines_a_file_that_resolves_outside_the_repository() {
+        let repo = TempRepo::new();
+        let outside = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"inside\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        let file = outside.write("src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec![]).formatting("formatted\n");
+        let fixer = rust_fixer(&repo, &fake);
+
+        assert_eq!(fixer.fix(&file, "input\n"), None);
+        assert!(fake.format_calls().is_empty());
     }
 
     #[test]

@@ -1069,6 +1069,39 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Lease release request events, oldest first.
+    ///
+    /// This query is limited to the four event kinds interpreted by the
+    /// release-request consumer. Keep `events_after_filtered` for callers
+    /// that need arbitrary event-kind prefixes.
+    pub(crate) fn lease_release_events(&self) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events
+             WHERE kind IN (?1, ?2, ?3, ?4)
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                crate::events::LEASE_RELEASE_REQUESTED,
+                crate::events::LEASE_RELEASE_ACKED,
+                crate::events::LEASE_RELEASE_DECLINED,
+                crate::events::LEASE_RELEASE_GRANTED,
+            ],
+            |row| {
+                Ok(Event {
+                    id: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    ts: row.get(2)?,
+                    kind: row.get(3)?,
+                    session_id: row.get(4)?,
+                    payload_json: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Retention: delete events strictly older than `before_ts_ms`,
     /// returning the number removed. Event ids stay strictly increasing
     /// forever (AUTOINCREMENT never reuses rowids), so existing `--since`

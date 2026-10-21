@@ -48,20 +48,23 @@ pub enum QueueWait {
 /// turning a slow network into a refusal on every call.
 const NO_WAIT_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The bound a read-only coordinated operation gets when its caller set none.
+/// Default budgets for read-only coordinated operations whose caller set none.
 ///
 /// A read takes no lock and no write block applies to it, so the only thing an
-/// unbounded read can wait on is the provider. A stalled `gh api` therefore
-/// outlived the caller's own timeout and said nothing about why (#555). The
-/// bound sits under the 120 s most agent harnesses give a command, so the
-/// caller gets the diagnostic instead of a kill; `--queue-timeout` still sets
-/// it explicitly, and `AETHYME_BROKER_READ_BUDGET_SECS` changes the default.
-pub(crate) const READ_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+/// unbounded read can wait on is the provider. The 30 s GitHub bound leaves
+/// callers with a 45 s deadline time to report the broker diagnostic instead
+/// of killing it. Keep Git's 90 s allowance for slower local repository reads.
+/// `--queue-timeout` still sets the bound explicitly, and
+/// `AETHYME_BROKER_READ_BUDGET_SECS` overrides either default (#555, #706).
+pub(crate) const GITHUB_READ_OPERATION_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(30);
+pub(crate) const GIT_READ_OPERATION_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(90);
 
-/// A read whose length is the point, so the default read budget must not cut
-/// it: following a run or checks until they finish, streaming a run's log,
-/// downloading artifacts, or paginating an API list. Only an explicit
-/// `--queue-timeout` bounds these (#555).
+/// A read whose length is the point, so the automatic default budget must
+/// not cut it: following a run or checks until they finish, streaming a run's
+/// log, downloading artifacts, or paginating an API list. Caller-selected
+/// bounds such as `--queue-timeout` and `--no-wait` still apply (#555).
 pub(crate) fn is_long_running_read(provider: OperationProvider, args: &[String]) -> bool {
     if provider != OperationProvider::Github {
         return false;
@@ -77,12 +80,23 @@ pub(crate) fn is_long_running_read(provider: OperationProvider, args: &[String])
     watches || streams_log || downloads || paginates
 }
 
-fn read_operation_budget() -> std::time::Duration {
-    std::env::var("AETHYME_BROKER_READ_BUDGET_SECS")
-        .ok()
+fn read_operation_budget(provider: OperationProvider) -> std::time::Duration {
+    let default = match provider {
+        OperationProvider::Git => GIT_READ_OPERATION_BUDGET,
+        OperationProvider::Github => GITHUB_READ_OPERATION_BUDGET,
+    };
+    let configured = std::env::var("AETHYME_BROKER_READ_BUDGET_SECS").ok();
+    read_operation_budget_from(configured.as_deref(), default)
+}
+
+fn read_operation_budget_from(
+    configured: Option<&str>,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    configured
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .map_or(READ_OPERATION_BUDGET, std::time::Duration::from_secs)
+        .map_or(default, std::time::Duration::from_secs)
 }
 
 /// How often a bounded child is checked for completion.
@@ -474,13 +488,18 @@ impl AdmissionDeadline {
 
     /// Bound a read its caller left unbounded. A read never queues for the
     /// lock, so "wait forever" could only mean "wait forever on the provider"
-    /// (#555). Writes keep exactly the wait their caller chose, and so does a
-    /// read that is long by design ([`is_long_running_read`]).
-    fn bounded_for(self, effect: OperationEffect, long_running: bool) -> Self {
+    /// (#555). Writes keep exactly the wait their caller chose. Long reads
+    /// skip only the automatic default; caller-selected bounds still apply.
+    fn bounded_for(
+        self,
+        effect: OperationEffect,
+        long_running: bool,
+        provider: OperationProvider,
+    ) -> Self {
         if effect != OperationEffect::Read || long_running || self.budget.is_some() {
             return self;
         }
-        let budget = read_operation_budget();
+        let budget = read_operation_budget(provider);
         Self {
             started: self.started,
             at: Some(self.started + budget),
@@ -537,11 +556,13 @@ impl AdmissionDeadline {
     }
 }
 
-/// Run a child to completion, or kill it when the admission budget is gone.
+/// Run a child and drain its output, or time out at the admission deadline.
 ///
 /// The output readers run concurrently with the child. Apart from avoiding a
 /// pipe-capacity deadlock, that gives the operation heartbeat a meaningful
-/// progress signal while a provider is still working.
+/// progress signal while a provider is still working. A child that is still
+/// running is killed and reaped on timeout; readers held by its descendants are
+/// detached rather than allowed to extend the caller's deadline.
 fn output_within(
     mut command: Command,
     deadline: AdmissionDeadline,
@@ -573,20 +594,29 @@ fn output_within(
         })?;
     let stdout_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
     let stderr_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
-    let stdout_reader = spawn_output_reader(stdout, stdout_state, "provider stdout");
-    let stderr_reader = spawn_output_reader(stderr, stderr_state, "provider stderr");
+    let (reader_done_tx, reader_done_rx) = mpsc::channel();
+    let stdout_reader = spawn_output_reader(
+        stdout,
+        stdout_state,
+        "provider stdout",
+        reader_done_tx.clone(),
+    );
+    let stderr_reader =
+        spawn_output_reader(stderr, stderr_state, "provider stderr", reader_done_tx);
 
+    let mut open_readers: usize = 2;
+    let mut exited = None;
     let status = loop {
         if deadline.expired() {
-            // Killing is the point: leaving it behind would keep contacting the
-            // remote after the caller was told nothing happened.
-            let _ = child.kill();
-            let _ = child.wait();
-            // A provider may have grandchildren that inherited the pipes.
-            // Joining here would make a bounded operation wait for those
-            // grandchildren even after the provider itself was killed. Drop
-            // the handles and let those readers end when their inherited
-            // descriptors close.
+            // Reap the provider if it is still alive. If it has already exited,
+            // a descendant may still hold an inherited output pipe; stop waiting
+            // for that pipe at the same deadline without killing an unowned
+            // process tree.
+            if exited.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Detached readers end when their inherited descriptors close.
             drop(stdout_reader);
             drop(stderr_reader);
             return Err(BrokerOpError::AdmissionTimedOut {
@@ -595,21 +625,41 @@ fn output_within(
                 budget: deadline.budget_label(),
             });
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(source) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(stdout_reader);
-                drop(stderr_reader);
-                return Err(BrokerOpError::OperationIo {
-                    path: PathBuf::from("git"),
-                    source,
-                });
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some(status),
+                Ok(None) => {}
+                Err(source) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    drop(stdout_reader);
+                    drop(stderr_reader);
+                    return Err(BrokerOpError::OperationIo {
+                        path: PathBuf::from("git"),
+                        source,
+                    });
+                }
             }
         }
-        std::thread::sleep(ADMISSION_POLL_INTERVAL);
+        if open_readers == 0
+            && let Some(status) = exited.as_ref()
+        {
+            break *status;
+        }
+        let poll = deadline
+            .remaining()
+            .map_or(ADMISSION_POLL_INTERVAL, |remaining| {
+                remaining.min(ADMISSION_POLL_INTERVAL)
+            });
+        if open_readers == 0 {
+            std::thread::sleep(poll);
+            continue;
+        }
+        match reader_done_rx.recv_timeout(poll) {
+            Ok(()) => open_readers = open_readers.saturating_sub(1),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => open_readers = 0,
+        }
     };
     let stdout = join_output_reader(stdout_reader)?;
     let stderr = join_output_reader(stderr_reader)?;
@@ -624,28 +674,35 @@ fn spawn_output_reader<R>(
     mut reader: R,
     state: Option<Arc<Mutex<OperationHeartbeatState>>>,
     stream: &'static str,
+    done: mpsc::Sender<()>,
 ) -> JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 8 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let result = (|| -> std::io::Result<Vec<u8>> {
+            let mut output = Vec::new();
+            let mut buffer = [0u8; 8 * 1024];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..read]);
+                if let Some(state) = &state
+                    && let Ok(mut state) = state.lock()
+                {
+                    state.progress = format!("{stream} output received");
+                    state.last_progress_at = unix_now_ms();
+                    state.output_bytes = state.output_bytes.saturating_add(read as u64);
+                }
             }
-            output.extend_from_slice(&buffer[..read]);
-            if let Some(state) = &state
-                && let Ok(mut state) = state.lock()
-            {
-                state.progress = format!("{stream} output received");
-                state.last_progress_at = unix_now_ms();
-                state.output_bytes = state.output_bytes.saturating_add(read as u64);
-            }
-        }
-        Ok(output)
+            Ok(output)
+        })();
+        // A timeout or another reader error drops the receiver; this notification
+        // is only needed while the caller is waiting for pipe EOF.
+        let _completion = done.send(());
+        result
     })
 }
 
@@ -1088,7 +1145,7 @@ impl OperationShowReport {
 const OPERATION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OPERATION_LOCK_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
-struct RepositoryWriteLock {
+pub(crate) struct RepositoryWriteLock {
     file: File,
     acquired_at: Instant,
     acquired_at_ms: i64,
@@ -1096,6 +1153,39 @@ struct RepositoryWriteLock {
 }
 
 impl RepositoryWriteLock {
+    /// Try the same repository-wide lock used by coordinated Git writes,
+    /// without waiting or registering a coordinated-operation row.
+    ///
+    /// A caller that gets `None` must proceed without assumptions protected by
+    /// this lock. The guard is only for internal work that can safely fall back
+    /// when a writer is already active.
+    fn try_acquire_nonblocking(
+        main_root: &Path,
+        repository: &str,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        let path = repository_write_lock_path(main_root, repository);
+        let file = open_repository_write_lock_file(main_root, &path)?;
+        // SAFETY: `file` is a live descriptor opened above and remains owned by
+        // this guard. `flock` only applies an advisory lock to that descriptor.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(Self {
+                file,
+                acquired_at: Instant::now(),
+                acquired_at_ms: unix_now_ms(),
+                queue_wait_ms: 0,
+            }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        Err(BrokerOpError::OperationIo {
+            path,
+            source: error,
+        })
+    }
+
     fn acquire(
         main_root: &Path,
         repository: &str,
@@ -1126,22 +1216,8 @@ impl RepositoryWriteLock {
         mut report_progress: impl FnMut(&str, Duration),
     ) -> Result<Self, BrokerOpError> {
         debug_assert!(!progress_interval.is_zero());
-        let dir = main_root.join(".aethyme/locks/operations");
-        std::fs::create_dir_all(&dir).map_err(|source| BrokerOpError::OperationIo {
-            path: dir.clone(),
-            source,
-        })?;
-        let path = dir.join(format!("{:016x}.lock", stable_hash(repository.as_bytes())));
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| BrokerOpError::OperationIo {
-                path: path.clone(),
-                source,
-            })?;
+        let path = repository_write_lock_path(main_root, repository);
+        let file = open_repository_write_lock_file(main_root, &path)?;
         // Try without blocking first, so the uncontended path stays a single
         // syscall and the holder lookup only runs when it can actually help.
         // SAFETY: `file` is a live `File` opened above and still owned here, so
@@ -1253,6 +1329,63 @@ impl RepositoryWriteLock {
     fn hold_duration_ms(&self) -> i64 {
         self.acquired_at.elapsed().as_millis() as i64
     }
+}
+
+fn repository_write_lock_path(main_root: &Path, repository: &str) -> PathBuf {
+    main_root
+        .join(".aethyme/locks/operations")
+        .join(format!("{:016x}.lock", stable_hash(repository.as_bytes())))
+}
+
+fn open_repository_write_lock_file(main_root: &Path, path: &Path) -> Result<File, BrokerOpError> {
+    let dir = main_root.join(".aethyme/locks/operations");
+    std::fs::create_dir_all(&dir)
+        .map_err(|source| BrokerOpError::OperationIo { path: dir, source })?;
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| BrokerOpError::OperationIo {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Acquire the write lock that coordinated local Git writes use for this
+/// checkout. Reusable submit planning is allowed only when `origin` identifies
+/// the repository, so this key is the same canonical one used by those writes.
+pub(crate) fn try_acquire_local_repository_write_lock(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+) -> Result<Option<(String, RepositoryWriteLock)>, BrokerOpError> {
+    let Some(repository) = local_repository_coordination_key(checkout, None)? else {
+        return Ok(None);
+    };
+    Ok(
+        RepositoryWriteLock::try_acquire_nonblocking(main_root, &repository)?
+            .map(|lock| (repository, lock)),
+    )
+}
+
+/// Whether a repo-wide mutating operation has an outcome that may still affect
+/// the repository after its writer process lost the shared flock. Prepared
+/// records can be queued before taking the lock, so they do not prove that a
+/// child may have escaped; Running and OutcomeUnknown do.
+pub(crate) fn has_unresolved_repository_wide_mutation(
+    store: &crate::BrokerStore,
+    repository: &str,
+) -> Result<bool, crate::BrokerError> {
+    Ok(store
+        .unresolved_coordinated_operations(repository)?
+        .iter()
+        .any(|operation| {
+            matches!(
+                operation.status,
+                OperationStatus::Running | OperationStatus::OutcomeUnknown
+            ) && stored_resource_scope(operation).is_none()
+        }))
 }
 
 /// Probe with signal 0: reports whether a process can be signalled without
@@ -2877,6 +3010,13 @@ fn canonical_local_repository(
     let Ok(repo) = crate::GitRepo::discover(cwd) else {
         return Ok(None);
     };
+    local_repository_coordination_key(&repo, assertion)
+}
+
+fn local_repository_coordination_key(
+    repo: &crate::GitRepo,
+    assertion: Option<&str>,
+) -> Result<Option<String>, BrokerOpError> {
     match repo.resolve_remote_target("origin", assertion) {
         Ok(target) => Ok(Some(target.coordination_key)),
         Err(crate::RemoteTargetError::AssertionMismatch {
