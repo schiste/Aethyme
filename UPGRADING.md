@@ -16,7 +16,7 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
@@ -72,6 +72,45 @@ sections below keep the Compatibility, Before upgrading, Migrate and verify,
 and Rollback parts of the breaking ones. The full per-release guides, including
 the non-breaking ones, remain in Git history under
 `packages/aethyme/docs/guides/`.
+
+## v0.8.27
+
+v0.8.27 migrates the machine-wide broker database from schema 49 to schema 52.
+After that migration, v0.8.26 and earlier cannot open the database.
+
+### Compatibility
+
+The migration adds typed verification-candidate storage and a gate execution
+profile digest, and establishes schema 52 as the minimum compatible version.
+The first writable v0.8.27 broker open applies it. Every installed Aethyme copy
+that accesses this database must be upgraded before any one copy opens it;
+install the router and engine pair together.
+
+### Before upgrading
+
+Stop active broker operations, make a consistent backup of the machine-wide
+broker database, and record the installed router and engine versions. Upgrade
+every installed copy that can access this database to the matching v0.8.27
+pair before resuming broker work.
+
+### Migrate and verify
+
+The migration runs when the broker next opens the database. Confirm the pair
+and the broker state:
+
+```bash
+aethyme --version && aethyme-engine-cli --version
+aethyme broker status --json
+aethyme broker advanced quick-test
+```
+
+### Rollback
+
+Before a v0.8.27 broker has opened the database, reinstall the v0.8.26 pair.
+After the schema 52 migration, v0.8.26 refuses that database. To roll back,
+stop every broker process, reinstall the router and engine pair together, and
+restore the backup made before upgrading. Broker state recorded after that
+backup is lost; Git commits and worktrees are unaffected.
 
 ## v0.8.26
 
