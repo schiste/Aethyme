@@ -301,7 +301,9 @@ pub(super) fn run_quality_report(parsed: Parsed) -> Result<(), UsageError> {
             return Err(UsageError::Message(error.to_string()));
         }
     };
-    let external_id = extract_quality_report_external_id(&operation.stdout);
+    let external_id = (!operation.stdout_truncated)
+        .then(|| extract_quality_report_external_id(&operation.stdout))
+        .flatten();
     let succeeded = operation.command_success;
     let event_kind = if succeeded {
         crate::events::QUALITY_REPORT_PUBLISHED

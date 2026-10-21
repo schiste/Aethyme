@@ -223,6 +223,14 @@ impl Broker {
                 status: verification.operation.status.as_str(),
             });
         }
+        if verification.stdout_truncated {
+            return Err(BrokerOpError::ExposurePlanUnavailable {
+                reason: format!(
+                    "remote verification operation {} exceeded the broker output limit; refusing incomplete evidence",
+                    verification.operation.id
+                ),
+            });
+        }
         let verified_sha = verification
             .stdout
             .lines()
