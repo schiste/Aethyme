@@ -11,32 +11,25 @@ mod common;
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
 fn clear_git_selectors(command: &mut Command) {
-    for selector in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
-    ] {
-        command.env_remove(selector);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
     }
 }
 
 fn git(repo: &Path, args: &[&str]) {
     let mut command = Command::new("git");
+    clear_git_selectors(&mut command);
     command
         .args(args)
         .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "compact-status-test")
         .env("GIT_AUTHOR_EMAIL", "compact-status-test@example.invalid")
         .env("GIT_COMMITTER_NAME", "compact-status-test")
         .env("GIT_COMMITTER_EMAIL", "compact-status-test@example.invalid");
-    clear_git_selectors(&mut command);
     let output = command.output().expect("run fixture Git command");
     assert!(
         output.status.success(),
@@ -55,8 +48,12 @@ fn init_repo(repo: &Path) {
     git(repo, &["commit", "-qm", "init"]);
 }
 
-fn add_worktree(repo: &Path, name: &str) -> PathBuf {
-    let path = repo.join(".aethyme/worktrees").join(name);
+fn add_worktree(repo: &Path, worktree_root: &Path, name: &str) -> PathBuf {
+    let path = worktree_root.join(name);
+    assert!(
+        !path.starts_with(repo),
+        "fixture worktrees stay outside the repository"
+    );
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     git(
         repo,
@@ -98,8 +95,9 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     init_repo(fixture.path());
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
 
+    let worktree_root = fixture.worktree_root();
     for name in ["agent-a", "agent-b", "agent-c"] {
-        let worktree = add_worktree(fixture.path(), name);
+        let worktree = add_worktree(fixture.path(), &worktree_root, name);
         broker.adopt(&worktree, Some(name)).unwrap();
         std::fs::write(worktree.join("src/shared.txt"), format!("{name}\n")).unwrap();
     }
@@ -116,6 +114,37 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     let compact = json_status(fixture.path(), &["status", "--compact", "--json"]);
     assert_eq!(compact["schema"], "aethyme.broker-status-compact/v1");
     assert_eq!(compact["data_freshness"]["leases_refreshed"], false);
+    assert_eq!(
+        compact["summary"]["dirty_sessions"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        compact["summary"]["promoted_conflict_count"],
+        serde_json::Value::Null
+    );
+    assert_eq!(compact["summary"]["integration_relation"], "not_checked");
+    assert_eq!(
+        compact["summary"]["integration_ahead_main_commits"],
+        serde_json::Value::Null
+    );
+    let unknown_summary_fields = compact["summary"]["unknown_fields"]
+        .as_array()
+        .expect("unknown summary fields are listed");
+    for field in [
+        "dirty_sessions",
+        "promoted_conflict_count",
+        "integration_ahead_main_commits",
+        "integration_head",
+        "baseline_ref",
+        "baseline_head",
+        "main_head",
+        "integration_ahead_local_main_commits",
+    ] {
+        assert!(
+            unknown_summary_fields.iter().any(|listed| listed == field),
+            "null summary field {field} is declared unknown"
+        );
+    }
     assert_eq!(
         compact["data_freshness"]["deferred_checks_are_unknown"],
         true
@@ -159,6 +188,8 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     assert!(text.contains("count 3, 2 duplicates"));
     assert!(text.contains("Deferred checks (unknown, not clean)"));
     assert!(text.contains("aethyme broker status --json"));
+    assert!(text.contains("Dirty sessions and promoted conflicts: not checked."));
+    assert!(!text.contains("0 dirty"));
     if let Some(command) = compact["summary"]["commands"]
         .as_array()
         .and_then(|items| items.first())

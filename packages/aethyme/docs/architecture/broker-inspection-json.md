@@ -16,8 +16,9 @@ observation and duplicate counts, and every distinct category and its
 drilldown commands remain present. `omitted_details` names evidence and
 per-item identity fields the view leaves out. `data_freshness.deferred_checks`
 are explicitly unknown, not clean, and `leases_refreshed: false` means the
-counts reflect the last recorded refresh. `waiters.count` is retained while
-per-waiter details are omitted.
+counts reflect the last recorded refresh. Null summary fields are listed in
+`summary.unknown_fields`. `waiters.count` is retained while per-waiter
+details are omitted.
 
 The older `broker status --summary --json` shape remains available. Plain
 `broker status --json` still returns the full recorded view. Use that full

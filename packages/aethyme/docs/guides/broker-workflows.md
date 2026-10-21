@@ -1402,7 +1402,8 @@ as `aethyme.broker-status-compact/v1`; it groups advice by id and severity,
 counts repeated observations, retains every category and its commands, and
 marks per-observation evidence and identities as omitted. `deferred_checks`
 are unknown, not clean, and `leases_refreshed: false` means the lease counts
-come from the last recorded refresh.
+come from the last recorded refresh. Null summary fields are listed in
+`summary.unknown_fields`.
 
 `aethyme broker status --summary --json` keeps its existing brief JSON shape.
 `aethyme broker status --json` keeps the full recorded status shape and its
