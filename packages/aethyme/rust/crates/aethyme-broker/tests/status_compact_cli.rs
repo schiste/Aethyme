@@ -178,7 +178,12 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
             .iter()
             .any(|field| field == "advice.evidence")
     );
-    assert_eq!(compact["waiters"]["details_omitted"], true);
+    assert_eq!(compact["waiters"]["details_omitted"], false);
+    assert_eq!(compact["waiters"]["count"], 0);
+    assert_eq!(compact["waiters"]["omitted_count"], 0);
+    assert_eq!(compact["waiters"]["records"], serde_json::json!([]));
+    assert_eq!(compact["coordinated_operations"]["count"], 0);
+    assert_eq!(compact["lease_release_requests"]["count"], 0);
 
     let text = run_status(fixture.path(), &["status"]);
     assert!(text.status.success());
@@ -247,4 +252,48 @@ fn compact_json_is_additive_and_legacy_json_shapes_are_unchanged() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("--compact"));
     }
+}
+
+#[test]
+fn compact_status_retains_bounded_waiter_resources() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    drop(broker);
+    let waits = fixture.path().join(".aethyme/run/waits");
+    std::fs::create_dir_all(&waits).unwrap();
+    for i in 0..12 {
+        let record = aethyme_broker::WaitRecord {
+            pid: i64::from(std::process::id()),
+            session_id: Some(100 + i),
+            kind: "lease".into(),
+            resource: format!("resource-{i}"),
+            holder: format!("session {}", 200 + i),
+            started_at_ms: i,
+        };
+        std::fs::write(
+            waits.join(format!("fixture-{i}.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+    let compact = json_status(fixture.path(), &["status", "--compact", "--json"]);
+    assert_eq!(compact["waiters"]["count"], 12);
+    assert_eq!(compact["waiters"]["omitted_count"], 2);
+    assert_eq!(compact["waiters"]["details_omitted"], true);
+    let rows = compact["waiters"]["records"].as_array().unwrap();
+    assert_eq!(rows.len(), 10);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row["resource"], format!("resource-{i}"));
+        assert_eq!(row["holder"], format!("session {}", 200 + i));
+    }
+    let text = run_status(fixture.path(), &["status"]);
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        text.contains("Waiters: 12 (2 additional rows omitted)."),
+        "{text}"
+    );
+    assert!(text.contains("resource-0: session 200"), "{text}");
+    assert!(!text.contains("resource-11"), "{text}");
 }

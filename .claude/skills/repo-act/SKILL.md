@@ -270,6 +270,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   flag allowlist through to the handler. A handler alone may not describe the
   accepted public spelling. Exercise the emitted command through the real CLI
   entrypoint and run the deprecated-spelling caller ratchet before publication.
+- Before changing a default CLI display, find existing consumer assertions
+  as well as new feature tests. Include safety fences, session attribution,
+  waiter/holder relationships, pending operations and help snapshots in the
+  focused selection. Test bounded output with explicit omission counts; a
+  smaller display must still surface the coordination state callers need.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
   check child output on the intended stream separately. A report may retain
   the original command arguments, so searching its serialized text for a child

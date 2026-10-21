@@ -305,6 +305,32 @@ impl Broker {
         self.build_status_brief(self.agents_snapshot(now_ms)?, now_ms)
     }
 
+    /// Read coordination records for compact presentation without inspecting
+    /// retained checkouts, Git history, or submission recovery remedies.
+    pub(crate) fn routine_status_context(
+        &self,
+        now_ms: i64,
+    ) -> Result<RoutineStatusContext, BrokerOpError> {
+        let session_contexts = self
+            .store
+            .live_sessions()?
+            .into_iter()
+            .filter_map(|session| session.context_label().map(|context| (session.id, context)))
+            .collect();
+        let lease_release_requests = self
+            .lease_release_requests()?
+            .into_iter()
+            .filter(|request| request.state == crate::lease_requests::RequestState::Pending)
+            .collect();
+        let pending = self.store.pending_coordinated_operations()?;
+        Ok(RoutineStatusContext {
+            session_contexts,
+            collaboration_fence: self.collaboration_fence_state(FenceTrigger::Open),
+            lease_release_requests,
+            coordinated_operations: pending_operation_views(&pending, now_ms),
+        })
+    }
+
     pub(super) fn build_status_brief(
         &self,
         agents: Vec<AgentView>,
@@ -1274,38 +1300,7 @@ impl Broker {
         // other unresolved row there is parked behind it. Naming that
         // relationship is the point -- a parked caller cannot say so itself.
         let pending_rows = self.store.pending_coordinated_operations()?;
-        let mut holder_by_repository: std::collections::HashMap<&str, i64> =
-            std::collections::HashMap::new();
-        for operation in &pending_rows {
-            if operation.status == crate::types::OperationStatus::Running {
-                holder_by_repository
-                    .entry(operation.repository.as_str())
-                    .or_insert(operation.id);
-            }
-        }
-        let coordinated_operations = pending_rows
-            .iter()
-            .map(|operation| {
-                let holder = holder_by_repository
-                    .get(operation.repository.as_str())
-                    .copied();
-                let holding_lock = holder == Some(operation.id);
-                PendingOperationView {
-                    id: operation.id,
-                    session_id: operation.session_id,
-                    provider: operation.provider.as_str().to_string(),
-                    repository: operation.repository.clone(),
-                    scope: operation.scope.clone(),
-                    status: operation.status.as_str().to_string(),
-                    pid: operation.pid,
-                    elapsed_seconds: now_ms.saturating_sub(operation.created_at).max(0) as u64
-                        / 1_000,
-                    holding_lock,
-                    blocked_by: if holding_lock { None } else { holder },
-                    liveness: crate::operations::operation_liveness_view(operation),
-                }
-            })
-            .collect::<Vec<_>>();
+        let coordinated_operations = pending_operation_views(&pending_rows, now_ms);
         if let Some(stalled) = self.stalled_coordinated_operation_advice(&pending_rows) {
             advice.push(stalled);
         }
@@ -2654,4 +2649,41 @@ impl Broker {
             handoff,
         })
     }
+}
+
+fn pending_operation_views(
+    pending_rows: &[crate::types::CoordinatedOperation],
+    now_ms: i64,
+) -> Vec<PendingOperationView> {
+    let mut holder_by_repository: std::collections::HashMap<&str, i64> =
+        std::collections::HashMap::new();
+    for operation in pending_rows {
+        if operation.status == crate::types::OperationStatus::Running {
+            holder_by_repository
+                .entry(operation.repository.as_str())
+                .or_insert(operation.id);
+        }
+    }
+    pending_rows
+        .iter()
+        .map(|operation| {
+            let holder = holder_by_repository
+                .get(operation.repository.as_str())
+                .copied();
+            let holding_lock = holder == Some(operation.id);
+            PendingOperationView {
+                id: operation.id,
+                session_id: operation.session_id,
+                provider: operation.provider.as_str().to_string(),
+                repository: operation.repository.clone(),
+                scope: operation.scope.clone(),
+                status: operation.status.as_str().to_string(),
+                pid: operation.pid,
+                elapsed_seconds: now_ms.saturating_sub(operation.created_at).max(0) as u64 / 1_000,
+                holding_lock,
+                blocked_by: if holding_lock { None } else { holder },
+                liveness: crate::operations::operation_liveness_view(operation),
+            }
+        })
+        .collect::<Vec<_>>()
 }

@@ -104,11 +104,17 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             broker.status_brief(now_ms())?
         };
+        let context_started = std::time::Instant::now();
+        let context = broker.routine_status_context(now_ms())?;
+        brief.phase_timings_ms.insert(
+            "context_records".into(),
+            context_started.elapsed().as_millis() as u64,
+        );
         brief.phase_timings_ms.insert("open".into(), open_ms);
         brief
             .phase_timings_ms
             .insert("command_total".into(), opened.elapsed().as_millis() as u64);
-        let compact = super::status_compact::CompactStatus::from_brief(brief);
+        let compact = super::status_compact::CompactStatus::from_brief(brief, context);
         if parsed.json {
             out!("{}", serde_json::to_string_pretty(&compact)?);
         } else {

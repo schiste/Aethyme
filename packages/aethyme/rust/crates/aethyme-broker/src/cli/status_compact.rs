@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
+const DETAIL_LIMIT: usize = 10;
+
 const SCHEMA: &str = "aethyme.broker-status-compact/v1";
 
 #[derive(Debug, Serialize)]
@@ -15,6 +17,11 @@ pub(crate) struct CompactStatus {
     data_freshness: CompactFreshness,
     advice: CompactAdvice,
     waiters: CompactWaiters,
+    session_contexts: BoundedRecords<CompactSessionContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collaboration_fence: Option<crate::CollaborationFence>,
+    lease_release_requests: BoundedRecords<CompactLeaseRequest>,
+    coordinated_operations: CompactOperations,
     phase_timings_ms: BTreeMap<String, u64>,
     omitted_details: &'static [&'static str],
     drilldown: CompactDrilldown,
@@ -127,6 +134,74 @@ struct CompactAdviceCategory {
 struct CompactWaiters {
     count: usize,
     details_omitted: bool,
+    omitted_count: usize,
+    records: Vec<crate::CurrentWaiter>,
+}
+
+#[derive(Debug, Serialize)]
+struct BoundedRecords<T> {
+    count: usize,
+    omitted_count: usize,
+    records: Vec<T>,
+}
+
+impl<T> BoundedRecords<T> {
+    fn new(rows: Vec<T>) -> Self {
+        let count = rows.len();
+        Self {
+            count,
+            omitted_count: count.saturating_sub(DETAIL_LIMIT),
+            records: rows.into_iter().take(DETAIL_LIMIT).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CompactSessionContext {
+    session_id: i64,
+    context: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactLeaseRequest {
+    request_id: i64,
+    requester_session_id: i64,
+    holder_session_id: i64,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactOperation {
+    id: i64,
+    session_id: i64,
+    repository: String,
+    scope: String,
+    status: String,
+    holding_lock: bool,
+    blocked_by: Option<i64>,
+}
+
+impl CompactOperation {
+    fn role(&self) -> String {
+        if self.status == "outcome_unknown" {
+            "needs reconciliation".to_string()
+        } else if self.holding_lock {
+            "holding".to_string()
+        } else if let Some(blocker) = self.blocked_by {
+            format!("blocked by {blocker}")
+        } else {
+            "not holding".to_string()
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CompactOperations {
+    count: usize,
+    holding_lock_count: usize,
+    waiting_count: usize,
+    omitted_count: usize,
+    records: Vec<CompactOperation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,7 +218,64 @@ struct AdviceGroup {
 }
 
 impl CompactStatus {
-    pub(crate) fn from_brief(brief: crate::StatusBrief) -> Self {
+    pub(crate) fn from_brief(
+        brief: crate::StatusBrief,
+        context: crate::broker::RoutineStatusContext,
+    ) -> Self {
+        let session_contexts = BoundedRecords::new(
+            context
+                .session_contexts
+                .into_iter()
+                .map(|(session_id, context)| CompactSessionContext {
+                    session_id,
+                    context,
+                })
+                .collect(),
+        );
+        let lease_release_requests = BoundedRecords::new(
+            context
+                .lease_release_requests
+                .into_iter()
+                .map(|request| CompactLeaseRequest {
+                    request_id: request.request_id,
+                    requester_session_id: request.requester_session_id,
+                    holder_session_id: request.holder_session_id,
+                    path: request.path,
+                })
+                .collect(),
+        );
+        let operations_count = context.coordinated_operations.len();
+        let holding_lock_count = context
+            .coordinated_operations
+            .iter()
+            .filter(|op| op.holding_lock)
+            .count();
+        let waiting_count = context
+            .coordinated_operations
+            .iter()
+            .filter(|op| !op.holding_lock && op.status == "prepared")
+            .count();
+        let coordinated_operations = CompactOperations {
+            count: operations_count,
+            holding_lock_count,
+            waiting_count,
+            omitted_count: operations_count.saturating_sub(DETAIL_LIMIT),
+            records: context
+                .coordinated_operations
+                .into_iter()
+                .take(DETAIL_LIMIT)
+                .map(|op| CompactOperation {
+                    id: op.id,
+                    session_id: op.session_id,
+                    repository: op.repository,
+                    scope: op.scope,
+                    status: op.status,
+                    holding_lock: op.holding_lock,
+                    blocked_by: op.blocked_by,
+                })
+                .collect(),
+        };
+        let waiter_count = brief.waiters.len();
         let observation_count = brief.advice.len();
         let mut groups = BTreeMap::<(String, String), AdviceGroup>::new();
         for item in brief.advice {
@@ -199,9 +331,15 @@ impl CompactStatus {
                 categories,
             },
             waiters: CompactWaiters {
-                count: brief.waiters.len(),
-                details_omitted: true,
+                count: waiter_count,
+                details_omitted: waiter_count > DETAIL_LIMIT,
+                omitted_count: waiter_count.saturating_sub(DETAIL_LIMIT),
+                records: brief.waiters.into_iter().take(DETAIL_LIMIT).collect(),
             },
+            session_contexts,
+            collaboration_fence: context.collaboration_fence,
+            lease_release_requests,
+            coordinated_operations,
             phase_timings_ms: brief.phase_timings_ms,
             omitted_details: &[
                 "advice.reason",
@@ -209,7 +347,8 @@ impl CompactStatus {
                 "advice.session_id",
                 "advice.queue_entry_id",
                 "per-observation summary variants when a category is grouped",
-                "waiter identities and resources",
+                "session contexts, pending lease requests, operations and waiters after the first 10 rows of each list",
+                "lease request reasons, operation liveness details and other per-session metadata",
             ],
             drilldown: CompactDrilldown {
                 full_status_json: "aethyme broker status --json",
@@ -236,6 +375,76 @@ impl CompactStatus {
             self.summary.stale_sessions,
             self.summary.overlap_count,
         );
+        for session in &self.session_contexts.records {
+            line!("  session {}: {}", session.session_id, session.context);
+        }
+        if self.session_contexts.omitted_count > 0 {
+            line!(
+                "  {} additional session contexts omitted; inspect full status.",
+                self.session_contexts.omitted_count
+            );
+        }
+        if let Some(fence) = &self.collaboration_fence {
+            line!(
+                "Collaboration fence: broker.db requires schema {} or newer ({}; {}).",
+                fence.min_compatible_schema,
+                fence.reason,
+                fence.state
+            );
+        }
+        if self.lease_release_requests.count > 0 {
+            line!(
+                "Lease waiters: {} pending release requests",
+                self.lease_release_requests.count
+            );
+            for request in &self.lease_release_requests.records {
+                line!(
+                    "  request {}: session {} waiting for {} held by session {}",
+                    request.request_id,
+                    request.requester_session_id,
+                    request.path,
+                    request.holder_session_id
+                );
+                line!(
+                    "  run: aethyme broker advanced leases ack {} --session {}",
+                    request.request_id,
+                    request.holder_session_id
+                );
+            }
+            if self.lease_release_requests.omitted_count > 0 {
+                line!(
+                    "  {} additional pending lease requests omitted; inspect full status.",
+                    self.lease_release_requests.omitted_count
+                );
+            }
+        }
+        if self.coordinated_operations.count > 0 {
+            line!(
+                "Coordinated operations: {} unresolved, {} holding a write lock, {} waiting (recorded prepared rows; process waits not verified)",
+                self.coordinated_operations.count,
+                self.coordinated_operations.holding_lock_count,
+                self.coordinated_operations.waiting_count
+            );
+            for op in &self.coordinated_operations.records {
+                let role = op.role();
+                line!(
+                    "  op {} sess {} lock {} scope {} {} {}",
+                    op.id,
+                    op.session_id,
+                    op.repository,
+                    op.scope,
+                    op.status,
+                    role
+                );
+            }
+            if self.coordinated_operations.omitted_count > 0 {
+                line!(
+                    "  {} additional operations omitted.",
+                    self.coordinated_operations.omitted_count
+                );
+            }
+            line!("  inspect: aethyme broker advanced operations list");
+        }
         let lease_freshness = match self.data_freshness.leases_refreshed_at_ms {
             Some(at) => format!("last recorded refresh at {at}"),
             None => "no lease refresh has been recorded".to_string(),
@@ -287,12 +496,47 @@ impl CompactStatus {
             }
         }
         line!(
-            "Waiters: {} (per-waiter details omitted).",
-            self.waiters.count
+            "Waiters: {} ({} additional rows omitted).",
+            self.waiters.count,
+            self.waiters.omitted_count
         );
-        line!("Details omitted: reasons, evidence, item identities and waiter resources.");
+        for waiter in &self.waiters.records {
+            line!("  {}", crate::waiters::describe(waiter));
+        }
+        line!(
+            "Details omitted: advice reasons/evidence, request reasons, operation liveness and other session metadata."
+        );
         line!("Full details: {}.", self.drilldown.full_status_json);
         line!("Fresh audit: {}.", self.drilldown.fresh_audit_json);
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompactOperation;
+
+    #[test]
+    fn compact_operation_roles_do_not_invent_waits() {
+        let mut operation = CompactOperation {
+            id: 1,
+            session_id: 2,
+            repository: "fixture/repo".into(),
+            scope: "repository".into(),
+            status: "outcome_unknown".into(),
+            holding_lock: false,
+            blocked_by: None,
+        };
+        assert_eq!(operation.role(), "needs reconciliation");
+        operation.status = "prepared".into();
+        assert_eq!(operation.role(), "not holding");
+        operation.blocked_by = Some(3);
+        assert_eq!(operation.role(), "blocked by 3");
+        operation.status = "outcome_unknown".into();
+        assert_eq!(operation.role(), "needs reconciliation");
+        operation.status = "running".into();
+        operation.holding_lock = true;
+        operation.blocked_by = None;
+        assert_eq!(operation.role(), "holding");
     }
 }
