@@ -2888,6 +2888,24 @@ fn unsafe_repair_guidance_preserves_pending_commits_before_any_reset() {
     assert!(error.contains("git cherry-pick"), "{error}");
 }
 
+// Aged queue history must not become recovery work or be resurrected.
+fn seed_terminal_queue_history(database: &rusqlite::Connection, session_id: i64) {
+    database
+        .execute(
+            "WITH RECURSIVE history(n) AS (
+                 VALUES(1) UNION ALL SELECT n + 1 FROM history WHERE n < 1000
+             )
+             INSERT INTO merge_queue
+                 (session_id, head_commit, base_commit, status, created_at, updated_at)
+             SELECT ?1, 'terminal-history-' || n, 'old-base',
+                 CASE n % 3 WHEN 0 THEN 'externally_landed'
+                            WHEN 1 THEN 'rejected' ELSE 'superseded' END, 1, 1
+             FROM history",
+            [session_id],
+        )
+        .unwrap();
+}
+
 #[test]
 fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
     let tmp = common::FixtureRepository::new();
@@ -2915,6 +2933,7 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
     // Reopen recovery must also read candidates produced before the typed
     // table existed.
     let database = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    seed_terminal_queue_history(&database, session.id);
     assert_eq!(
         database
             .execute(
@@ -2996,6 +3015,7 @@ fn broker_open_backfills_exposure_for_a_pre_v17_promotion() {
     drop(broker);
 
     let database = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    seed_terminal_queue_history(&database, session.id);
     database
         .execute(
             "DELETE FROM entry_path_exposures WHERE queue_entry_id = ?1",
@@ -3015,6 +3035,15 @@ fn broker_open_backfills_exposure_for_a_pre_v17_promotion() {
     assert_eq!(exposure.promotion_sha, promotion_sha);
     assert_eq!(exposure.paths, vec!["src/a.py"]);
     assert_eq!(exposure.state, EntryExposureState::Outstanding);
+    let history = reopened.store().merge_queue().unwrap();
+    assert_eq!(history.len(), 1001);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|entry| entry.status == MergeStatus::Promoted)
+            .count(),
+        1
+    );
 }
 
 /// Upstream that kept the promotion merge itself is conclusive by ancestry,
