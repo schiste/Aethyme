@@ -1315,10 +1315,14 @@ is based on the effective report, not only on `--path` arguments in the current
 invocation. The field is omitted when that set is empty.
 `cache_available` says whether a fresh cached listing for the current local
 default branch was usable; `warning` explains a missing, stale, or mismatched
-listing. When the listing is available, `overlaps` names open PRs whose changed
+listing, including a listing timestamp in the future. When the listing is available,
+`overlaps` names open PRs whose changed
 paths are present in cached ranges and equal or fall under a declared path.
 `unknown_prs` names listed PRs whose current changed paths are not in the
-cache. `listed_at_ms` gives the listing time, and
+cache. Range reuse requires both the PR head and local default-branch commit to
+match. Older entries without that base identity and provider-only diffs without
+a verified local base remain unknown until locally refreshed.
+`listed_at_ms` gives the listing time, and
 `checked_open_pr_limit` reports the 30-PR cache limit; `listing_may_be_truncated`
 is true if the listing reached that limit. Human output prints matching PRs and
 warns when the cache is unavailable, unknown PR paths remain, or the listing

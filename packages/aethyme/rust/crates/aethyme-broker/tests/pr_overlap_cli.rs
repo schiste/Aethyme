@@ -493,6 +493,7 @@ fn start_path_reports_cached_pr_path_overlap_without_network_or_graph() {
             "pr_overlap.ranges.12",
             &serde_json::json!({
                 "head_oid": head_oid,
+                "base_oid": git_output(&prefix_fixture.repo, &["rev-parse", "origin/main"]),
                 "ranges": {
                     "src/child.rs": [[1, 1]],
                     "src-neighbor/child.rs": [[1, 1]],
@@ -554,6 +555,7 @@ fn start_path_reports_cached_pr_path_overlap_without_network_or_graph() {
             "pr_overlap.ranges.12",
             &serde_json::json!({
                 "head_oid": head_oid,
+                "base_oid": git_output(&own_fixture.repo, &["rev-parse", "origin/main"]),
                 "ranges": {"shared.txt": [[1, 1]]}
             })
             .to_string(),
@@ -621,7 +623,14 @@ fn start_path_discloses_missing_cached_pr_listing_without_network() {
 
 #[test]
 fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
-    for changed in ["stale-listing", "wrong-base", "unknown-pr-paths"] {
+    for changed in [
+        "stale-listing",
+        "future-listing",
+        "wrong-base",
+        "unknown-pr-paths",
+        "old-range-format",
+        "changed-base-oid",
+    ] {
         let fixture = Fixture::new();
         cache_one_open_pr(&fixture);
         let mut broker = fixture.broker();
@@ -635,6 +644,26 @@ fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
         .unwrap();
         if changed == "stale-listing" {
             listing["fetched_at_ms"] = serde_json::json!(0);
+        } else if changed == "future-listing" {
+            listing["fetched_at_ms"] = serde_json::json!(i64::MAX);
+        } else if changed == "old-range-format" || changed == "changed-base-oid" {
+            let mut ranges: serde_json::Value = serde_json::from_str(
+                &broker
+                    .store()
+                    .meta_get("pr_overlap.ranges.12")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            if changed == "old-range-format" {
+                ranges.as_object_mut().unwrap().remove("base_oid");
+            } else {
+                ranges["base_oid"] = serde_json::json!("0".repeat(40));
+            }
+            broker
+                .store()
+                .meta_set("pr_overlap.ranges.12", &ranges.to_string())
+                .unwrap();
         } else if changed == "wrong-base" {
             listing["base"] = serde_json::json!("develop");
         } else {
@@ -664,6 +693,14 @@ fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
                     .as_str()
                     .unwrap()
                     .contains("older than 24 hours")
+            );
+        } else if changed == "future-listing" {
+            assert_eq!(check["cache_available"], false, "{report}");
+            assert!(
+                check["warning"]
+                    .as_str()
+                    .unwrap()
+                    .contains("dated in the future")
             );
         } else if changed == "wrong-base" {
             assert_eq!(check["cache_available"], false, "{report}");

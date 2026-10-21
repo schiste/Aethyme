@@ -139,6 +139,8 @@ fn other_open_prs<'a>(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CachedRanges {
     head_oid: String,
+    #[serde(default)]
+    base_oid: Option<String>,
     ranges: FileRanges,
 }
 
@@ -368,11 +370,12 @@ impl Broker {
             .unwrap_or_default()
     }
 
-    fn cached_ranges(&self, pr: &OpenPr) -> Option<FileRanges> {
+    fn cached_ranges(&self, pr: &OpenPr, base_oid: &str) -> Option<FileRanges> {
         let head_oid = pr.head_oid.as_deref()?;
         let text = self.store_ref().meta_get(&ranges_key(pr.number)).ok()??;
         let cached: CachedRanges = serde_json::from_str(&text).ok()?;
-        (cached.head_oid == head_oid).then_some(cached.ranges)
+        (cached.head_oid == head_oid && cached.base_oid.as_deref() == Some(base_oid))
+            .then_some(cached.ranges)
     }
 
     /// Compare explicit planned paths with cached open-PR changed paths.
@@ -422,6 +425,13 @@ impl Broker {
                 Some(listing.fetched_at_ms),
             ));
         }
+        if listing.fetched_at_ms > now_ms {
+            return Some(unavailable(
+                "the cached open-PR listing is dated in the future; refresh it with broker push"
+                    .into(),
+                Some(listing.fetched_at_ms),
+            ));
+        }
         if now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS {
             return Some(unavailable(
                 "the cached open-PR listing is older than 24 hours; refresh it with broker push"
@@ -440,7 +450,7 @@ impl Broker {
             warning: None,
         };
         for pr in other_open_prs(&listing, &session.branch).take(MAX_OPEN_PRS) {
-            let Some(ranges) = self.cached_ranges(pr) else {
+            let Some(ranges) = self.cached_ranges(pr, &default.commit) else {
                 check.unknown_prs.push(pr.number);
                 continue;
             };
@@ -524,6 +534,7 @@ impl Broker {
         let listing = match self.cached_listing() {
             Some(listing)
                 if listing.base == default.branch
+                    && listing.fetched_at_ms <= now_ms
                     && now_ms.saturating_sub(listing.fetched_at_ms) < LIST_REUSE_MS =>
             {
                 Some(listing)
@@ -577,10 +588,13 @@ impl Broker {
             ..Default::default()
         };
         for pr in listing.prs.iter().filter(|pr| pr.head != branch) {
-            let ranges = match self.cached_ranges(pr) {
+            let ranges = match self.cached_ranges(pr, &default.commit) {
                 Some(ranges) => Some(ranges),
                 None => {
                     let mut fresh = self.local_pr_ranges(&default, pr);
+                    // Provider diffs do not prove their base matches our local
+                    // tracking ref, so only local diffs may populate this cache.
+                    let local_base_verified = fresh.is_some();
                     if fresh.is_none() && gh_budget > 0 {
                         gh_budget -= 1;
                         fresh = self
@@ -593,9 +607,11 @@ impl Broker {
                             )
                             .and_then(|diff| parse_unified_diff(&diff));
                     }
-                    if let (Some(ranges), Some(head_oid)) = (&fresh, &pr.head_oid)
+                    if local_base_verified
+                        && let (Some(ranges), Some(head_oid)) = (&fresh, &pr.head_oid)
                         && let Ok(text) = serde_json::to_string(&CachedRanges {
                             head_oid: head_oid.clone(),
+                            base_oid: Some(default.commit.clone()),
                             ranges: ranges.clone(),
                         })
                     {
@@ -653,6 +669,7 @@ impl Broker {
         let default = tracked_default(self.repo_handle())?;
         let listing = self.cached_listing()?;
         if listing.base != default.branch
+            || listing.fetched_at_ms > now_ms
             || now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS
         {
             return None;
@@ -670,7 +687,7 @@ impl Broker {
         };
         for pr in other_open_prs(&listing, &session.branch) {
             let ranges = self
-                .cached_ranges(pr)
+                .cached_ranges(pr, &default.commit)
                 .or_else(|| self.local_pr_ranges(&default, pr));
             match ranges {
                 Some(ranges) => {
@@ -703,7 +720,9 @@ impl Broker {
         let Ok(listing) = serde_json::from_str::<OpenPrListing>(&listing_raw) else {
             return Vec::new();
         };
-        if now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS {
+        if listing.fetched_at_ms > now_ms
+            || now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS
+        {
             return Vec::new();
         }
         // A repository without origin/HEAD labels its publication baseline
