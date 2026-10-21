@@ -2,6 +2,18 @@ use super::*;
 use std::io::Read;
 
 const WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES: u64 = 8 * 1024;
+const CLEANUP_TARGET_SNAPSHOT_UNAVAILABLE: &str = "the cleanup plan could not resolve primary HEAD, so session eligibility was not checked against a target bound to the plan";
+
+#[derive(Clone, Copy)]
+enum CleanupDeliveryTargets<'a> {
+    /// Resolve fresh for one direct cleanup inspection.
+    Fresh,
+    /// Reuse the targets bound into a cleanup plan.
+    Snapshot(&'a [String]),
+    /// The plan's initial primary HEAD lookup failed, so its target set is not
+    /// suitable for proving that any session's work is represented.
+    SnapshotUnavailable,
+}
 
 /// Read the two small files used as ownership witnesses without following a
 /// replacement symlink or blocking on a FIFO. A witness that is not a
@@ -245,6 +257,16 @@ impl Broker {
         session_id: i64,
         worktree_path: &Path,
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
+        let delivery_targets = self.cleanup_delivery_targets()?;
+        self.cleanup_eligibility_with_targets(session_id, worktree_path, &delivery_targets)
+    }
+
+    fn cleanup_eligibility_with_targets(
+        &self,
+        session_id: i64,
+        worktree_path: &Path,
+        delivery_targets: &[String],
+    ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         if worktree_path == self.main_root.as_path() {
             return Ok((
                 CleanupDisposition::UnsafePath,
@@ -289,9 +311,8 @@ impl Broker {
 
         let session_head = checkout.head_commit()?;
         let session = self.store.session(session_id)?;
-        let delivery_targets = self.cleanup_delivery_targets()?;
         let (provenance, reason) =
-            self.cleanup_provenance(&session, &session_head, &delivery_targets)?;
+            self.cleanup_provenance(&session, &session_head, delivery_targets)?;
         let disposition = match provenance.representation {
             CleanupRepresentation::Represented => CleanupDisposition::Eligible,
             CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
@@ -669,22 +690,29 @@ impl Broker {
     }
 
     /// Eligibility judged from the session branch rather than the worktree.
-    pub(super) fn branch_provenance_disposition(
+    fn branch_provenance_disposition(
         &self,
         session: &Session,
         session_head: &str,
+        delivery_targets: CleanupDeliveryTargets<'_>,
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
-        let mut delivery_targets = vec![self.repo.head_commit()?];
-        if let Some(integration) = self.integration_tip() {
-            delivery_targets.push(integration);
-        }
-        if let Some((_upstream, head)) = self.repo.tracking_upstream() {
-            delivery_targets.push(head);
-        }
-        delivery_targets.sort();
-        delivery_targets.dedup();
+        let owned_delivery_targets;
+        let delivery_targets = match delivery_targets {
+            CleanupDeliveryTargets::Snapshot(targets) => targets,
+            CleanupDeliveryTargets::Fresh => {
+                owned_delivery_targets = self.cleanup_delivery_targets()?;
+                &owned_delivery_targets
+            }
+            CleanupDeliveryTargets::SnapshotUnavailable => {
+                return Ok((
+                    CleanupDisposition::InspectionFailed,
+                    CLEANUP_TARGET_SNAPSHOT_UNAVAILABLE.into(),
+                    None,
+                ));
+            }
+        };
         Ok(
-            match self.cleanup_provenance(session, session_head, &delivery_targets) {
+            match self.cleanup_provenance(session, session_head, delivery_targets) {
                 Ok((provenance, reason)) => {
                     let disposition = match provenance.representation {
                         CleanupRepresentation::Represented => CleanupDisposition::Eligible,
@@ -722,19 +750,26 @@ impl Broker {
         scan: crate::SizeScan,
         records: &mut crate::measurement::SizeRecords,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
-        self.cleanup_item_scanned_with_tips(session, scan, records, None)
+        self.cleanup_item_scanned_with_tips(
+            session,
+            scan,
+            records,
+            None,
+            CleanupDeliveryTargets::Fresh,
+        )
     }
 
     /// [`Self::cleanup_item_scanned`] with every local branch tip already read
     /// (see [`GitRepo::local_branch_tips`]). A plan visits every session ever
     /// recorded, most of whose branch and worktree are long gone; looking the
     /// branch up in one listing lets those return without forking `git`.
-    pub(super) fn cleanup_item_scanned_with_tips(
+    fn cleanup_item_scanned_with_tips(
         &self,
         session: &Session,
         scan: crate::SizeScan,
         records: &mut crate::measurement::SizeRecords,
         branch_tips: Option<&std::collections::BTreeMap<String, String>>,
+        delivery_targets: CleanupDeliveryTargets<'_>,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
@@ -778,7 +813,7 @@ impl Broker {
             )
         } else if worktree_present {
             if let Some(proof) = self.interrupted_finish_orphan_cleanup_proof(session) {
-                self.branch_provenance_disposition(session, &proof.head)?
+                self.branch_provenance_disposition(session, &proof.head, delivery_targets)?
             } else {
                 match self.is_orphaned_worktree_of_this_repository_checked(&worktree_path) {
                     Err(error) => (
@@ -796,14 +831,32 @@ impl Broker {
                         "the checkout is not a usable worktree and its repository ownership could not be proven; preserved it for inspection".into(),
                         None,
                     ),
-                    Ok(false) => match self.cleanup_eligibility(session.id, &worktree_path) {
-                        Ok(result) => result,
-                        Err(error) => (
-                            CleanupDisposition::InspectionFailed,
-                            self.cleanup_inspection_failure(&error),
-                            None,
-                        ),
-                    },
+                    Ok(false) => {
+                        let eligibility = match delivery_targets {
+                            CleanupDeliveryTargets::Snapshot(targets) => self
+                                .cleanup_eligibility_with_targets(
+                                    session.id,
+                                    &worktree_path,
+                                    targets,
+                                ),
+                            CleanupDeliveryTargets::Fresh => {
+                                self.cleanup_eligibility(session.id, &worktree_path)
+                            }
+                            CleanupDeliveryTargets::SnapshotUnavailable => Ok((
+                                CleanupDisposition::InspectionFailed,
+                                CLEANUP_TARGET_SNAPSHOT_UNAVAILABLE.into(),
+                                None,
+                            )),
+                        };
+                        match eligibility {
+                            Ok(result) => result,
+                            Err(error) => (
+                                CleanupDisposition::InspectionFailed,
+                                self.cleanup_inspection_failure(&error),
+                                None,
+                            ),
+                        }
+                    }
                 }
             }
         } else if let Some(session_head) = branch_tip.as_deref() {
@@ -811,7 +864,7 @@ impl Broker {
             // commit provenance. Existing orphan directories take the
             // proof-bound branch above because their remaining bytes are not
             // described by the commit alone.
-            self.branch_provenance_disposition(session, session_head)?
+            self.branch_provenance_disposition(session, session_head, delivery_targets)?
         } else {
             unreachable!("entries without a worktree or a branch return None above")
         };
@@ -966,8 +1019,9 @@ impl Broker {
         }
         self.landing_deadline.set(deadline);
         let _clear_landing_deadline = ClearOnDrop(&self.landing_deadline);
+        let target_snapshot = self.cleanup_target_snapshot();
         let mut plan = CleanupPlan {
-            target_snapshot: self.cleanup_target_snapshot(),
+            target_snapshot: target_snapshot.refs.clone(),
             ..CleanupPlan::default()
         };
         let mut records = crate::measurement::load_size_records(&self.main_root);
@@ -998,6 +1052,11 @@ impl Broker {
                     scan,
                     &mut records,
                     branch_tips.as_ref(),
+                    target_snapshot
+                        .delivery_targets
+                        .as_deref()
+                        .map(CleanupDeliveryTargets::Snapshot)
+                        .unwrap_or(CleanupDeliveryTargets::SnapshotUnavailable),
                 )?;
                 // A landing search the deadline stopped reads as a failed
                 // inspection; it is the budget, so say so instead (#460).
@@ -2964,5 +3023,374 @@ mod registered_removal_failure_tests {
                 "{invalid_pointer} pointer must retain the branch"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_target_snapshot_tests {
+    use super::CleanupDisposition;
+    use crate::test_storage::TestStorage;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+
+    const ROOT_ENV: &str = "AETHYME_CLEANUP_TARGET_TRACE_ROOT";
+    const CHILD_TEST: &str = "broker::cleanup::cleanup_target_snapshot_tests::cleanup_plan_reuses_one_delivery_target_snapshot";
+    const TRANSIENT_ROOT_ENV: &str = "AETHYME_CLEANUP_TARGET_FAILURE_ROOT";
+    const FAIL_HEAD_ROOT_ENV: &str = "AETHYME_CLEANUP_TARGET_FAIL_HEAD_ROOT";
+    const FAIL_HEAD_MARKER_ENV: &str = "AETHYME_CLEANUP_TARGET_FAIL_HEAD_MARKER";
+    const REAL_GIT_ENV: &str = "AETHYME_CLEANUP_TARGET_REAL_GIT";
+    const TRANSIENT_CHILD_TEST: &str = "broker::cleanup::cleanup_target_snapshot_tests::cleanup_plan_fails_closed_after_transient_primary_head_failure";
+
+    fn clear_git_environment(command: &mut Command) {
+        let keys = std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+            .collect::<Vec<_>>();
+        for key in keys {
+            command.env_remove(key);
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) -> Output {
+        let mut command = Command::new("git");
+        clear_git_environment(&mut command);
+        let output = command.args(args).current_dir(root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn git_text(root: &Path, args: &[&str]) -> String {
+        String::from_utf8(git(root, args).stdout)
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn initialized_repository(parent: &Path) -> PathBuf {
+        let repository = parent.join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.name", "Cleanup target test"]);
+        git(
+            &repository,
+            &["config", "user.email", "cleanup-target@example.invalid"],
+        );
+        std::fs::write(repository.join("README.md"), "base\n").unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+        repository
+    }
+
+    struct UpstreamLookupTrace {
+        starts: Vec<String>,
+    }
+
+    impl UpstreamLookupTrace {
+        fn count(&self) -> usize {
+            self.starts.len()
+        }
+
+        fn diagnostic(&self) -> String {
+            self.starts.join("\n")
+        }
+    }
+
+    fn upstream_lookup_trace(trace: &Path) -> UpstreamLookupTrace {
+        let contents = std::fs::read_to_string(trace)
+            .unwrap_or_else(|error| panic!("read Git Trace2 file {}: {error}", trace.display()));
+        let mut starts = Vec::new();
+        for (index, line) in contents.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event = serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!(
+                    "invalid Git Trace2 JSON at {}:{}: {error}; record={line:?}",
+                    trace.display(),
+                    index + 1
+                )
+            });
+            if event["event"] != "start" {
+                continue;
+            }
+            let argv = event["argv"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "Git Trace2 start event at {}:{} has no argv array: {line}",
+                    trace.display(),
+                    index + 1
+                )
+            });
+            if argv.iter().any(|argument| argument == "@{upstream}") {
+                // Trace2 may omit cwd when the event uses Git's default repo;
+                // retain every valid upstream start record, including raw argv.
+                starts.push(line.to_owned());
+            }
+        }
+        UpstreamLookupTrace { starts }
+    }
+
+    #[test]
+    fn cleanup_plan_reuses_one_delivery_target_snapshot() {
+        // `cleanup_plan_scanned_within` captures targets once, then passes
+        // that snapshot through `cleanup_item_scanned_with_tips`. Trace2
+        // catches a regression that resolves `@{upstream}` per worktree.
+        if let Some(parent) = std::env::var_os(ROOT_ENV) {
+            let parent = PathBuf::from(parent);
+            let repository = initialized_repository(&parent);
+            let storage = TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let represented_one = broker.start_worktree("represented one", None).unwrap();
+            let represented_one_worktree = PathBuf::from(&represented_one.worktree_path);
+            std::fs::write(
+                represented_one_worktree.join("represented-one.txt"),
+                "delivered\n",
+            )
+            .unwrap();
+            git(&represented_one_worktree, &["add", "represented-one.txt"]);
+            git(
+                &represented_one_worktree,
+                &["commit", "-qm", "first delivered commit"],
+            );
+            git(
+                &repository,
+                &["merge", "--ff-only", represented_one.branch.as_str()],
+            );
+            let one_worktree_main_head = git_text(&repository, &["rev-parse", "HEAD"]);
+            broker.close(represented_one.id).unwrap();
+
+            let trace = std::env::var_os("GIT_TRACE2_EVENT")
+                .map(PathBuf::from)
+                .expect("parent supplies a private Git trace path");
+            std::fs::write(&trace, "").unwrap();
+            let one_worktree_plan = broker.cleanup_plan_recorded().unwrap();
+            assert!(
+                one_worktree_plan
+                    .target_snapshot
+                    .contains(&format!("HEAD={one_worktree_main_head}"))
+            );
+            assert_eq!(one_worktree_plan.worktrees.len(), 1);
+            assert_eq!(
+                one_worktree_plan.worktrees[0].disposition,
+                CleanupDisposition::Eligible,
+                "the worktree represented on the captured primary target remains eligible"
+            );
+            let one_worktree_trace = upstream_lookup_trace(&trace);
+            assert!(
+                one_worktree_trace.count() > 0,
+                "the trace observes the target-capture lookup; Trace2 starts:\n{}",
+                one_worktree_trace.diagnostic()
+            );
+
+            let represented_two = broker.start_worktree("represented two", None).unwrap();
+            let pending = broker.start_worktree("pending", None).unwrap();
+            let represented_two_worktree = PathBuf::from(&represented_two.worktree_path);
+            let pending_worktree = PathBuf::from(&pending.worktree_path);
+            std::fs::write(
+                represented_two_worktree.join("represented-two.txt"),
+                "delivered\n",
+            )
+            .unwrap();
+            git(&represented_two_worktree, &["add", "represented-two.txt"]);
+            git(
+                &represented_two_worktree,
+                &["commit", "-qm", "second delivered commit"],
+            );
+            git(
+                &repository,
+                &["merge", "--ff-only", represented_two.branch.as_str()],
+            );
+            let main_head = git_text(&repository, &["rev-parse", "HEAD"]);
+            std::fs::write(pending_worktree.join("pending.txt"), "not delivered\n").unwrap();
+            git(&pending_worktree, &["add", "pending.txt"]);
+            git(&pending_worktree, &["commit", "-qm", "session-only commit"]);
+            let pending_head = git_text(&pending_worktree, &["rev-parse", "HEAD"]);
+            for session in [&represented_two, &pending] {
+                broker.close(session.id).unwrap();
+            }
+
+            std::fs::write(&trace, "").unwrap();
+            let plan = broker.cleanup_plan_recorded().unwrap();
+
+            assert!(
+                plan.target_snapshot.contains(&format!("HEAD={main_head}")),
+                "the digest records the primary checkout target"
+            );
+            assert!(
+                !plan
+                    .target_snapshot
+                    .contains(&format!("HEAD={pending_head}")),
+                "a session checkout head must not become the plan target"
+            );
+            assert_eq!(plan.worktrees.len(), 3);
+            assert_eq!(
+                plan.worktrees
+                    .iter()
+                    .filter(|item| item.disposition == CleanupDisposition::Eligible)
+                    .count(),
+                2,
+                "the two worktrees represented by a plan target remain eligible"
+            );
+            assert_eq!(
+                plan.worktrees
+                    .iter()
+                    .find(|item| item.session_id == pending.id)
+                    .map(|item| item.disposition),
+                Some(CleanupDisposition::PendingCommits),
+                "the unique session commit stays pending against the primary targets"
+            );
+            let three_worktree_trace = upstream_lookup_trace(&trace);
+            assert_eq!(
+                three_worktree_trace.count(),
+                one_worktree_trace.count(),
+                "a cleanup plan's upstream lookup count must not grow when worktrees grow from one to three; one-worktree Trace2 starts:\n{}\nthree-worktree Trace2 starts:\n{}",
+                one_worktree_trace.diagnostic(),
+                three_worktree_trace.diagnostic()
+            );
+            return;
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let parent_path = parent.path().canonicalize().unwrap();
+        let trace = parent_path.join("git-trace.json");
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", CHILD_TEST, "--nocapture"]);
+        clear_git_environment(&mut child);
+        let output = child
+            .env(ROOT_ENV, &parent_path)
+            .env("GIT_TRACE2_EVENT", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_plan_fails_closed_after_transient_primary_head_failure() {
+        if let Some(parent) = std::env::var_os(TRANSIENT_ROOT_ENV) {
+            let parent = PathBuf::from(parent);
+            let repository = initialized_repository(&parent);
+            let expected_primary = std::env::var_os(FAIL_HEAD_ROOT_ENV)
+                .map(PathBuf::from)
+                .expect("parent supplies the canonical primary checkout path");
+            assert_eq!(repository.canonicalize().unwrap(), expected_primary);
+
+            let storage = TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let session = broker.start_worktree("delivered", None).unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            std::fs::write(worktree.join("delivered.txt"), "represented on main\n").unwrap();
+            git(&worktree, &["add", "delivered.txt"]);
+            git(&worktree, &["commit", "-qm", "commit for main"]);
+            let session_head = git_text(&worktree, &["rev-parse", "HEAD"]);
+            git(
+                &repository,
+                &["merge", "--ff-only", session.branch.as_str()],
+            );
+            let main_head = git_text(&repository, &["rev-parse", "HEAD"]);
+            assert_eq!(main_head, session_head);
+            broker.close(session.id).unwrap();
+
+            let marker = PathBuf::from(
+                std::env::var_os(FAIL_HEAD_MARKER_ENV)
+                    .expect("parent supplies one-shot failure marker"),
+            );
+            std::fs::write(&marker, "fail primary HEAD once").unwrap();
+            let plan = broker.cleanup_plan_recorded().unwrap();
+            assert!(
+                !marker.exists(),
+                "the Git shim must consume the one-shot primary HEAD failure"
+            );
+            assert!(
+                !plan.target_snapshot.contains(&format!("HEAD={main_head}")),
+                "a later successful lookup must not silently change the plan's target digest"
+            );
+            let item = plan
+                .worktrees
+                .iter()
+                .find(|item| item.session_id == session.id)
+                .expect("the closed session remains visible in the plan");
+            assert_eq!(
+                item.disposition,
+                CleanupDisposition::InspectionFailed,
+                "an unbound target must not make a session eligible"
+            );
+            assert!(item.reason.contains("could not resolve primary HEAD"));
+
+            let (disposition, _, _) = broker
+                .cleanup_eligibility(session.id, &worktree)
+                .expect("the fresh direct inspection can now resolve primary HEAD");
+            assert_eq!(
+                disposition,
+                CleanupDisposition::Eligible,
+                "the same session is eligible once a fresh target set is resolved"
+            );
+            return;
+        }
+
+        let real_git = match crate::git::git_output_trust() {
+            crate::git::GitOutputTrust::Undecorated { resolved, .. } => resolved
+                .canonicalize()
+                .expect("trusted Git executable should have a canonical path"),
+            other => panic!("transient-failure fixture requires trusted Git: {other:?}"),
+        };
+        let parent = tempfile::tempdir().unwrap();
+        let parent_path = parent.path().canonicalize().unwrap();
+        let shim_dir = parent_path.join("bin");
+        std::fs::create_dir(&shim_dir).unwrap();
+        let marker = parent_path.join("fail-first-primary-head");
+        let primary = parent_path.join("repository");
+        let wrapper = shim_dir.join("git");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+if [ "$1" = "rev-parse" ] &&
+   [ "$2" = "HEAD" ] &&
+   [ "$(pwd -P)" = "$AETHYME_CLEANUP_TARGET_FAIL_HEAD_ROOT" ] &&
+   [ -f "$AETHYME_CLEANUP_TARGET_FAIL_HEAD_MARKER" ]; then
+  rm -f "$AETHYME_CLEANUP_TARGET_FAIL_HEAD_MARKER"
+  echo "one-shot injected primary HEAD failure" >&2
+  exit 128
+fi
+exec "$AETHYME_CLEANUP_TARGET_REAL_GIT" "$@"
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(shim_dir).chain(std::env::split_paths(&original_path)),
+        )
+        .unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", TRANSIENT_CHILD_TEST, "--nocapture"]);
+        clear_git_environment(&mut child);
+        let output = child
+            .env(TRANSIENT_ROOT_ENV, &parent_path)
+            .env(FAIL_HEAD_ROOT_ENV, &primary)
+            .env(FAIL_HEAD_MARKER_ENV, &marker)
+            .env(REAL_GIT_ENV, &real_git)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
