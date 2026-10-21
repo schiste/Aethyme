@@ -104,6 +104,10 @@ pub struct SessionPushReport {
     /// Open pull requests whose change could not be read, so their overlap
     /// is unknown rather than absent.
     pub pr_overlaps_unknown: Vec<i64>,
+    /// True when the open-PR listing was unavailable or incomplete, so no
+    /// overlap conclusion could be drawn for the listing as a whole.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pr_overlap_listing_unavailable: bool,
     /// Other sessions that look like the same work: the same branch, the same
     /// open PR, or a task naming the same PR. Omitted when none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -203,7 +207,12 @@ fn operation_failure(phase: &'static str, report: &CoordinatedOperationReport) -
             phase,
             operation_id: report.operation.id,
             status: report.operation.status.as_str(),
-            stderr: push_failure_output(&report.stdout, &report.stderr),
+            stderr: push_failure_output(
+                &report.stdout,
+                &report.stderr,
+                report.stdout_truncated,
+                report.stderr_truncated,
+            ),
         }
     }
 }
@@ -244,7 +253,12 @@ pub(crate) fn with_pre_push_path_hint(reason: &str) -> String {
     }
 }
 
-fn push_failure_output(stdout: &str, stderr: &str) -> String {
+fn push_failure_output(
+    stdout: &str,
+    stderr: &str,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> String {
     const MAX_LINES_PER_STREAM: usize = 3;
     const MAX_CHARS_PER_LINE: usize = 400;
 
@@ -262,13 +276,22 @@ fn push_failure_output(stdout: &str, stderr: &str) -> String {
     }
 
     let mut details = Vec::new();
-    if let Some(stdout) = tail(stdout) {
+    if !stdout_truncated && let Some(stdout) = tail(stdout) {
         details.push(format!("push stdout: {stdout}"));
     }
-    if let Some(stderr) = tail(stderr) {
+    if !stderr_truncated && let Some(stderr) = tail(stderr) {
         details.push(format!("push stderr: {stderr}"));
     }
-    if let Some(hint) = missing_executable_path_hint(stdout, stderr) {
+    if stdout_truncated {
+        details.push("push stdout was truncated after the broker capture limit".into());
+    }
+    if stderr_truncated {
+        details.push("push stderr was truncated after the broker capture limit".into());
+    }
+    if !stdout_truncated
+        && !stderr_truncated
+        && let Some(hint) = missing_executable_path_hint(stdout, stderr)
+    {
         details.push(hint.to_string());
     }
     details.join("\n")
@@ -548,6 +571,7 @@ impl Broker {
             pr,
             pr_overlaps: overlap.overlaps,
             pr_overlaps_unknown: overlap.unknown_prs,
+            pr_overlap_listing_unavailable: overlap.listing_unavailable,
             duplicate_work,
             default_branch,
             default_branch_note,
@@ -818,7 +842,7 @@ impl Broker {
         if !list.ok() {
             return Err(operation_failure("pull request lookup", &list));
         }
-        Ok(parse_pull_request_list(&list.stdout, branch))
+        parse_complete_pull_request_list(&list.stdout, branch, list.stdout_truncated)
     }
 }
 
@@ -871,6 +895,19 @@ fn parse_pull_request_list(stdout: &str, branch: &str) -> Option<SessionPullRequ
             draft: pr["isDraft"].as_bool().unwrap_or(false),
         })
     })
+}
+
+fn parse_complete_pull_request_list(
+    stdout: &str,
+    branch: &str,
+    stdout_truncated: bool,
+) -> Result<Option<SessionPullRequest>, BrokerOpError> {
+    if stdout_truncated {
+        return Err(BrokerOpError::InvalidCoordinatedOperation {
+            reason: "GitHub pull request listing exceeded the broker capture limit; refusing to assume no matching pull request exists".into(),
+        });
+    }
+    Ok(parse_pull_request_list(stdout, branch))
 }
 
 /// Measure a pushed change against `[review] pr_size` (#239).
@@ -957,6 +994,11 @@ mod tests {
         let found = parse_pull_request_list(listing, "agent/mine").unwrap();
         assert_eq!(found.number, 7);
         assert!(!found.created);
+        assert!(parse_complete_pull_request_list(listing, "agent/mine", false).is_ok());
+        assert!(
+            parse_complete_pull_request_list(listing, "agent/mine", true).is_err(),
+            "a valid JSON prefix must not be treated as a complete absence/presence check"
+        );
         assert_eq!(parse_pull_request_list(listing, "agent/none"), None);
         assert_eq!(parse_pull_request_list("not json", "agent/mine"), None);
     }
