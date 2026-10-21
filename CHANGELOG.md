@@ -20,6 +20,11 @@ additional migration.
   follow-up for the deployed repository.
 - Coordinated provider commands enforce their deadline while waiting for
   inherited output pipes, including after the provider process exits.
+- Coordinated command capture retains at most 16 MiB per stream, keeps
+  draining longer output, and marks truncation so consumers reject incomplete
+  evidence.
+- Worktree Cargo defaults are synced before publication and preserve an
+  existing configuration without replacement.
 - Ordinary coordinated GitHub reads use their own shorter admission budget;
   explicit caller budgets remain authoritative.
 - Submission preflight reuses its invocation-local plan when its exact inputs
