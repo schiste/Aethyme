@@ -375,7 +375,8 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
-        let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
+        let promote_config = PromoteConfig::load(&self.main_root);
+        let promotes = promote_config.mode.promotes_at_all();
         let summary = status_summary(
             &agents,
             overlaps.len(),
@@ -389,7 +390,7 @@ impl Broker {
             0,
             0,
             &SummaryIntegration {
-                branch: PromoteConfig::load(&self.main_root).branch,
+                branch: promote_config.branch,
                 head: String::new(),
                 baseline_ref: "not inspected".into(),
                 baseline_head: String::new(),

@@ -2254,6 +2254,129 @@ fn summary_reuses_recent_dead_pid_liveness_with_stored_status_semantics() {
 }
 
 #[test]
+fn status_brief_loads_promotion_config_once_from_committed_default() {
+    const CHILD: &str = "AETHYME_STATUS_BRIEF_CONFIG_TRACE_CHILD";
+    const NAME: &str = "status_brief_loads_promotion_config_once_from_committed_default";
+    if std::env::var_os(CHILD).is_some() {
+        let tmp = common::FixtureRepository::new();
+        init_repo(tmp.path());
+        let config_path = tmp.path().join(".aethyme/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "[promote]\nmode = \"verify-only\"\nbranch = \"review/integration\"\n",
+        )
+        .unwrap();
+        sh(tmp.path(), &["add", "-f", ".aethyme/config.toml"]);
+        sh(tmp.path(), &["commit", "-qm", "committed promote policy"]);
+        sh(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        sh(tmp.path(), &["config", "remote.origin.url", "."]);
+        sh(
+            tmp.path(),
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+        sh(
+            tmp.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+
+        // The working copy conflicts in both fields. Summary must use the
+        // committed default config for mode and branch, from one Git read.
+        std::fs::write(
+            &config_path,
+            "[promote]\nmode = \"auto\"\nbranch = \"working/integration\"\n",
+        )
+        .unwrap();
+        let mut broker = open_fixture_broker(tmp.path()).unwrap();
+        broker
+            .adopt(tmp.path(), Some("summary config task"))
+            .unwrap();
+
+        let trace = std::path::PathBuf::from(
+            std::env::var_os("GIT_TRACE2_EVENT").expect("parent supplies private trace"),
+        );
+        std::fs::write(&trace, "").unwrap();
+        let brief = broker.status_brief(now_ms()).unwrap();
+        assert!(!brief.summary.may_move_integration);
+        assert!(
+            brief
+                .summary
+                .message
+                .contains("review/integration relation to not inspected not checked"),
+            "summary must name the committed default branch: {}",
+            brief.summary.message
+        );
+        assert!(
+            brief
+                .summary
+                .message
+                .contains("verify-only: submit does not move integration"),
+            "summary must use the committed default mode: {}",
+            brief.summary.message
+        );
+
+        let events = std::fs::read_to_string(&trace).unwrap();
+        let config_reads = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "start")
+            .filter(|event| {
+                event["argv"].as_array().is_some_and(|argv| {
+                    argv.get(1).and_then(serde_json::Value::as_str) == Some("show")
+                        && argv.iter().any(|arg| {
+                            arg.as_str()
+                                .is_some_and(|arg| arg.ends_with(":.aethyme/config.toml"))
+                        })
+                })
+            })
+            .count();
+        assert_eq!(
+            config_reads, 1,
+            "one summary must read committed config once, trace={events}"
+        );
+        return;
+    }
+
+    let owner = tempfile::tempdir().unwrap();
+    let trace = owner
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("status-config-trace.jsonl");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .args(["--exact", NAME, "--nocapture"])
+        .env(CHILD, "1")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status summary config child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "child must execute exactly the selected regression: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn summary_keeps_stale_lease_rows_without_pairing_them() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
