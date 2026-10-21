@@ -2002,6 +2002,7 @@ fn verify_ship_only_tree(
     let Some(gates) = broker.load_and_sync_gates_at_commit(base_sha)? else {
         return Ok(Vec::new());
     };
+    broker.require_bound_repository_worktree_root("ship-only gate verification")?;
     broker.require_trusted_policy_at_commit(base_sha, Some(session_id))?;
     let main_root = broker.main_root().to_path_buf();
     let repo = GitRepo::discover(&main_root)?;

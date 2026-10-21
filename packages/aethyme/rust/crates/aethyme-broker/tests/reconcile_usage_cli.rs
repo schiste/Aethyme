@@ -36,25 +36,41 @@ fn repository(repo: &Path) {
     git(repo, &["commit", "-qm", "initial"]);
 }
 
+fn fixture_cli(fixture: &common::FixtureRepository, args: &[&str]) -> Command {
+    let owner = fixture
+        .owner_path()
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let repository = fixture
+        .path()
+        .canonicalize()
+        .expect("canonicalize fixture repository");
+    let host_state = common::fixture_host_state_dir(&owner);
+    let mut command = common::broker_cli_for_fixture(CLI, args, &owner);
+    command
+        .env("AETHYME_BROKER_DB", repository.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", owner.join("worktrees"))
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        );
+    command
+}
+
 fn run(fixture: &common::FixtureRepository, args: &[&str]) -> Output {
-    let broker = common::open_fixture_repository_broker(fixture).unwrap();
-    let mut command = common::broker_cli(CLI, args);
+    let mut command = fixture_cli(fixture, args);
     command.current_dir(fixture.path());
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
-    drop(broker);
     command.output().unwrap()
 }
 
 fn run_with_path(fixture: &common::FixtureRepository, args: &[&str], path: &str) -> Output {
-    let broker = common::open_fixture_repository_broker(fixture).unwrap();
-    let mut command = common::broker_cli(CLI, args);
+    let mut command = fixture_cli(fixture, args);
     command.current_dir(fixture.path()).env("PATH", path);
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
-    drop(broker);
     command.output().unwrap()
 }
 

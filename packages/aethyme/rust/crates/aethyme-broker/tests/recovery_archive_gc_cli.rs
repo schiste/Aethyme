@@ -29,13 +29,26 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    let broker = common::open_fixture_repository_path_broker(repo).unwrap();
-    let mut command = common::broker_cli(CLI, args);
+    let owner = repo.parent().expect("fixture repository has an owner");
+    let owner = owner.canonicalize().expect("canonicalize fixture owner");
+    let repository = repo
+        .canonicalize()
+        .expect("canonicalize fixture repository");
+    let host_state = common::fixture_host_state_dir(&owner);
+    let mut command = common::broker_cli_for_fixture(CLI, args, &owner);
+    command
+        .env("AETHYME_BROKER_DB", repository.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", owner.join("worktrees"))
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        );
     command.current_dir(repo);
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
-    drop(broker);
     command.output().unwrap()
 }
 
@@ -230,6 +243,13 @@ fn landed_commits_with_uncommitted_changes_wait_for_the_retention_period() {
 #[test]
 fn a_hand_made_archive_is_reported_and_never_proposed() {
     let tmp = repo();
+    let mut broker = common::open_fixture_repository_path_broker(tmp.path()).unwrap();
+    let binding_session = broker
+        .start_worktree("bind manual recovery archive fixture", None)
+        .unwrap();
+    assert!(broker.finish(binding_session.id).unwrap().closed);
+    drop(broker);
+
     let manual = archive_root(tmp.path()).join("20260921T071003Z");
     std::fs::create_dir_all(&manual).unwrap();
     std::fs::write(manual.join("repository-history.bundle"), b"bundle").unwrap();

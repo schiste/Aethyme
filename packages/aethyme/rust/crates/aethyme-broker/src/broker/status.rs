@@ -2248,6 +2248,21 @@ impl Broker {
     /// orphaned gate pidfiles (whose process group is gone) — the latter
     /// are removed as part of the check.
     pub fn doctor(&mut self) -> Result<DoctorReport, BrokerOpError> {
+        self.doctor_inner(false).map(|(report, _)| report)
+    }
+
+    /// The same doctor snapshot plus the typed binding state used to decide
+    /// whether missing retention health is an expected pre-bind condition or
+    /// an incomplete/recovery-required repository state.
+    pub(crate) fn doctor_with_binding_state(
+        &mut self,
+    ) -> Result<
+        (
+            DoctorReport,
+            crate::store::repository_binding::RepositoryWorktreeBindingState,
+        ),
+        BrokerOpError,
+    > {
         self.doctor_inner(false)
     }
 
@@ -2256,13 +2271,19 @@ impl Broker {
     /// integration branch. The repair installs from a detached worktree at
     /// integration, not from the operator's possibly dirty checkout.
     pub fn doctor_with_version_fix(&mut self) -> Result<DoctorReport, BrokerOpError> {
-        self.doctor_inner(true)
+        self.doctor_inner(true).map(|(report, _)| report)
     }
 
     pub(super) fn doctor_inner(
         &mut self,
         fix_version: bool,
-    ) -> Result<DoctorReport, BrokerOpError> {
+    ) -> Result<
+        (
+            DoctorReport,
+            crate::store::repository_binding::RepositoryWorktreeBindingState,
+        ),
+        BrokerOpError,
+    > {
         let started = std::time::Instant::now();
         let deadline = started + status_inspection_budget();
         let _git_deadline = crate::git::limit_git_until(deadline);
@@ -2335,8 +2356,32 @@ impl Broker {
         let mut version = crate::version::inspect_version(&self.main_root);
         phase("version", version_started);
         let retention_started = std::time::Instant::now();
-        let retention = self.gc_health_until(deadline)?;
-        budget_cut.extend(retention.deferred_checks.iter().cloned());
+        let binding = self.store.repository_worktree_binding()?;
+        let binding_state = binding.state;
+        let (retention, retention_unavailable_reason) = match binding_state {
+            crate::store::repository_binding::RepositoryWorktreeBindingState::Bound => {
+                (Some(self.gc_health_until(deadline)?), None)
+            }
+            crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound => (
+                None,
+                Some("legacy worktree root is unbound; retention health is unavailable until an explicit digest-confirmed binding is applied".into()),
+            ),
+            crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound => (
+                None,
+                Some("fresh worktree root is unbound; retention health is unavailable until an explicit root-creating broker operation binds it".into()),
+            ),
+            crate::store::repository_binding::RepositoryWorktreeBindingState::FreshReserved => (
+                None,
+                Some("fresh worktree root reservation is incomplete; retention health is unavailable and this version has no automatic recovery path".into()),
+            ),
+            crate::store::repository_binding::RepositoryWorktreeBindingState::RecoveryRequired => (
+                None,
+                Some("worktree root binding requires recovery; retention health is unavailable and this version has no automatic recovery path".into()),
+            ),
+        };
+        if let Some(retention) = &retention {
+            budget_cut.extend(retention.deferred_checks.iter().cloned());
+        }
         phase("retention", retention_started);
         // Keep explicit repair after read-only inventory, as before. Refresh
         // its source after inventory and include repair in the version timing.
@@ -2424,23 +2469,27 @@ impl Broker {
         phase("leftover_and_hooks", rest_started);
         phase("total", started);
 
-        Ok(DoctorReport {
-            integrity,
-            version,
-            version_repair,
-            missing_worktrees,
-            orphaned_pidfiles,
-            purged_stale_leases,
-            retention,
-            integration_movement,
-            unpushed_work,
-            recent_command_failures,
-            hooks_path,
-            leftover_integration_work,
-            phase_timings_ms,
-            deferred_checks: budget_cut.clone(),
-            budget_cut,
-        })
+        Ok((
+            DoctorReport {
+                integrity,
+                version,
+                version_repair,
+                missing_worktrees,
+                orphaned_pidfiles,
+                purged_stale_leases,
+                retention,
+                retention_unavailable_reason,
+                integration_movement,
+                unpushed_work,
+                recent_command_failures,
+                hooks_path,
+                leftover_integration_work,
+                phase_timings_ms,
+                deferred_checks: budget_cut.clone(),
+                budget_cut,
+            },
+            binding_state,
+        ))
     }
 
     /// The `status` leftover-work check, for `doctor`. Reads the integration

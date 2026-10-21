@@ -599,7 +599,17 @@ pub fn probe_gate_quality(
             crate::broker::gate_trust::require_trusted_standalone(&main_root, &policy)
         })
         .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
-    let worktree_root_plan = crate::verification::default_worktree_root_plan(&main_root);
+    // Gate doctor is a standalone diagnostic and must not create the durable
+    // broker worktree root as a side effect. Keep its exact-tree checkout and
+    // temporary broker database in one owned temp directory instead.
+    let runtime = tempfile::tempdir().map_err(|error| GateDoctorError::Probe(error.to_string()))?;
+    let isolated_worktree_root = runtime.path().join("verification-worktrees");
+    let git_common_dir = repo.git_common_dir()?;
+    let worktree_root_plan = crate::broker::lifecycle::plan_worktree_root_for(
+        &main_root,
+        Some(&git_common_dir),
+        Some(&isolated_worktree_root),
+    );
     let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_with_worktree_root_plan(
         &main_root,
         "gate-doctor-probe",
@@ -610,7 +620,6 @@ pub fn probe_gate_quality(
         .materialize(repo, &head)
         .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
     let before = capture_probe_state(checkout.root())?;
-    let runtime = tempfile::tempdir().map_err(|error| GateDoctorError::Probe(error.to_string()))?;
     let mut store = crate::BrokerStore::open(&runtime.path().join("probe.db"))
         .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
     let outcomes = if let Some(name) = only {

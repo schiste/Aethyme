@@ -1084,6 +1084,7 @@ impl Broker {
     ) -> Result<crate::GraphIntegrityOutcome, BrokerOpError> {
         let policy = crate::GraphIntegrityPolicy::load(checkout.root())?;
         let outcome = if policy.enforces_committed_fragments() {
+            self.require_bound_repository_worktree_root("graph-integrity verification")?;
             let worktree_root_plan = self.worktree_root_plan()?;
             crate::graph_integrity::verify_checkout_without_mutation_with_worktree_root_plan(
                 &self.main_root,

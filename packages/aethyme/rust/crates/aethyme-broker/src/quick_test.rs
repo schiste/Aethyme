@@ -91,6 +91,15 @@ pub enum QuickTestError {
         expected: PathBuf,
         resolved: PathBuf,
     },
+    #[error(
+        "quick-test broker worktree escaped its owned fixture: expected a child of {expected_root}, resolved {resolved}"
+    )]
+    BrokerWorktreeRedirected {
+        expected_root: PathBuf,
+        resolved: PathBuf,
+    },
+    #[error("quick-test start did not use the fixture's current committed base: {reason}")]
+    StartWorktreeFixtureMismatch { reason: String },
     #[error("broker submit did not promote the smoke commit: {reason}")]
     SubmitNotPromoted { reason: String },
     #[error("broker gated quick test did not run the fixture gate")]
@@ -195,14 +204,54 @@ pub fn run_broker_quick_test_with_options(
         )?;
     }
 
+    let expected_start_base = git(temp_repo.path(), &["rev-parse", "HEAD"])?;
+    let expected_start_base = expected_start_base.trim();
     let mut broker = temp_repo.open_broker()?;
-    let session = broker.adopt(temp_repo.path(), Some("broker quick test"))?;
+    // A fresh broker database must bind its worktree root through an explicit
+    // root-creating operation. Pin the disposable session to the fixture's
+    // latest commit so a stale integration ref cannot omit scaffold or gate
+    // files from the smoke test.
+    let started = broker.start_worktree_with_planned_paths_and_context(
+        "broker quick test",
+        &[],
+        None,
+        crate::SessionContext::default(),
+        Some(expected_start_base),
+    )?;
+    if started.start_base.commit != expected_start_base {
+        return Err(QuickTestError::StartWorktreeFixtureMismatch {
+            reason: format!(
+                "selected base {} differs from current fixture HEAD {}",
+                started.start_base.commit, expected_start_base
+            ),
+        });
+    }
+    let session = started.session;
+    let session_worktree = temp_repo.ensure_broker_worktree_is_owned(&session.worktree_path)?;
+    temp_repo.verify_started_worktree_fixture(
+        &session_worktree,
+        expected_start_base,
+        options.with_gate,
+    )?;
     steps.push(step(
-        "broker-adopt",
+        "broker-start-worktree",
         "pass",
-        format!("session {}", session.id),
+        format!(
+            "session {} at {} from {}",
+            session.id,
+            session_worktree.display(),
+            short_commit(expected_start_base)
+        ),
     ));
     let baseline_head = broker.integration_head()?.1;
+    if baseline_head != expected_start_base {
+        return Err(QuickTestError::StartWorktreeFixtureMismatch {
+            reason: format!(
+                "integration baseline {} differs from current fixture HEAD {}",
+                baseline_head, expected_start_base
+            ),
+        });
+    }
     steps.push(step(
         "integration-baseline",
         "pass",
@@ -211,11 +260,11 @@ pub fn run_broker_quick_test_with_options(
 
     std::fs::OpenOptions::new()
         .append(true)
-        .open(temp_repo.path().join("README.md"))?
+        .open(session_worktree.join("README.md"))?
         .write_all(b"world\n")?;
-    git(temp_repo.path(), &["add", "README.md"])?;
+    git(&session_worktree, &["add", "README.md"])?;
     git(
-        temp_repo.path(),
+        &session_worktree,
         &["commit", "-q", "-m", "test: broker quick change"],
     )?;
     steps.push(step(
@@ -251,15 +300,15 @@ pub fn run_broker_quick_test_with_options(
     ));
 
     let gate_fixture = if options.with_gate {
-        std::fs::remove_file(temp_repo.path().join("PASS_GATE"))?;
+        std::fs::remove_file(session_worktree.join("PASS_GATE"))?;
         std::fs::OpenOptions::new()
             .append(true)
-            .open(temp_repo.path().join("README.md"))?
+            .open(session_worktree.join("README.md"))?
             .write_all(b"gate failure variant\n")?;
-        git(temp_repo.path(), &["add", "README.md"])?;
-        git(temp_repo.path(), &["rm", "-q", "PASS_GATE"])?;
+        git(&session_worktree, &["add", "README.md"])?;
+        git(&session_worktree, &["rm", "-q", "PASS_GATE"])?;
         git(
-            temp_repo.path(),
+            &session_worktree,
             &["commit", "-q", "-m", "test: broker quick gate failure"],
         )?;
         steps.push(step(
@@ -497,6 +546,66 @@ impl TempRepo {
         Ok(())
     }
 
+    fn ensure_broker_worktree_is_owned(&self, worktree: &str) -> Result<PathBuf, QuickTestError> {
+        let expected_root = self
+            .storage()
+            .worktree_root()
+            .canonicalize()
+            .map_err(QuickTestError::Io)?;
+        let worktree = PathBuf::from(worktree);
+        let metadata = std::fs::symlink_metadata(&worktree)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(QuickTestError::BrokerWorktreeRedirected {
+                expected_root,
+                resolved: worktree,
+            });
+        }
+        let resolved = worktree.canonicalize().map_err(QuickTestError::Io)?;
+        if !resolved.starts_with(&expected_root) || resolved == expected_root {
+            return Err(QuickTestError::BrokerWorktreeRedirected {
+                expected_root,
+                resolved,
+            });
+        }
+        Ok(resolved)
+    }
+
+    fn verify_started_worktree_fixture(
+        &self,
+        worktree: &Path,
+        expected_head: &str,
+        with_gate: bool,
+    ) -> Result<(), QuickTestError> {
+        let actual_head = git(worktree, &["rev-parse", "HEAD"])?;
+        if actual_head.trim() != expected_head {
+            return Err(QuickTestError::StartWorktreeFixtureMismatch {
+                reason: format!(
+                    "worktree HEAD {} differs from expected fixture commit {expected_head}",
+                    actual_head.trim()
+                ),
+            });
+        }
+
+        let mut committed_paths = vec![Path::new("README.md"), Path::new(".aethyme/config.toml")];
+        if with_gate {
+            committed_paths.push(Path::new(".aethyme/gates.toml"));
+            committed_paths.push(Path::new("PASS_GATE"));
+        }
+        for relative in committed_paths {
+            let expected = std::fs::read(self.path.join(relative))?;
+            let actual = std::fs::read(worktree.join(relative))?;
+            if actual != expected {
+                return Err(QuickTestError::StartWorktreeFixtureMismatch {
+                    reason: format!(
+                        "worktree copy of {} differs from the committed fixture",
+                        relative.display()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn open_broker(&self) -> Result<Broker, QuickTestError> {
         self.ensure_broker_database_is_owned()?;
         self.storage()
@@ -550,6 +659,12 @@ mod tests {
         assert!(report.integration_head.is_some());
         assert!(report.gate_fixture.is_none());
         assert!(report.steps.iter().any(|step| step.name == "broker-submit"));
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.name == "broker-start-worktree")
+        );
         assert_fixture_container_removed(&report);
     }
 
@@ -587,6 +702,12 @@ mod tests {
                 .steps
                 .iter()
                 .any(|step| step.name == "broker-submit-failing-gate")
+        );
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.name == "broker-start-worktree")
         );
     }
 

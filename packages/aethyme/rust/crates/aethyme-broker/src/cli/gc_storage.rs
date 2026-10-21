@@ -602,6 +602,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .unwrap_or("plan");
     let mut broker = open_broker(true)?;
+    broker.require_bound_repository_worktree_root("single-worktree storage reclamation")?;
     let retention_policy = crate::load_retention_policy(broker.main_root())?;
     // This repository's own worktree directory, not the shared container:
     // reclaiming another repository's build output from here would be a

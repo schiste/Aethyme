@@ -386,6 +386,7 @@ impl Broker {
         session_id: i64,
         confirm: &str,
     ) -> Result<CleanupResolveOutcome, BrokerOpError> {
+        self.require_bound_repository_worktree_root("cleanup recovery-archive application")?;
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }

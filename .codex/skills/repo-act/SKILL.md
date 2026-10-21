@@ -110,6 +110,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the constructor has already performed.
   Keep that storage owner alive for the whole fixture, including every broker
   drop/reopen; dropping one broker handle must not delete session checkouts.
+  When the broker creates the worktree root exclusively, keep the `TempDir` as
+  its owner and configure a new absent child leaf (for example, the canonical
+  owner joined with `worktrees`); the already-existing owner itself is not a
+  fresh root. For child CLI commands and reopens, pass the complete storage
+  context with `configure_storage_context_for_child`, not a hand-copied subset
+  of its environment variables.
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.

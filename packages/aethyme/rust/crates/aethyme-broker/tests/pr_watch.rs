@@ -87,6 +87,33 @@ impl PullRequestWatchProvider for ResultProvider {
     }
 }
 
+fn fixture_cli(root: &FixtureRepository, args: &[&str]) -> Command {
+    let owner = root
+        .owner_path()
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let repository = root
+        .path()
+        .canonicalize()
+        .expect("canonicalize fixture repository");
+    let host_state = common::fixture_host_state_dir(&owner);
+    let mut command =
+        common::broker_cli_for_fixture(env!("CARGO_BIN_EXE_broker-cli-shim"), args, &owner);
+    command
+        .env("AETHYME_BROKER_DB", repository.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", owner.join("worktrees"))
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        );
+    command
+}
+
 fn snapshot(state: &str, sha: char, activity: &[&str]) -> PullRequestSnapshot {
     PullRequestSnapshot {
         number: 7,
@@ -607,16 +634,12 @@ fn a_delivery_that_is_always_deferred_is_eventually_dead_lettered() {
 /// a completion are still recorded, and listing the outbox is a read.
 #[test]
 fn an_empty_delivery_poll_records_no_command_telemetry() {
-    const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
     let (root, mut broker, session_id) = broker_fixture();
-    let run = |broker: &Broker, args: &[&str]| {
-        let mut command = common::broker_cli(CLI, args);
+    let run = |args: &[&str]| {
+        let mut command = fixture_cli(&root, args);
         command
             .current_dir(root.path())
             .env_remove("AETHYME_MEASURE_OUTPUT");
-        broker
-            .configure_storage_context_for_child(&mut command)
-            .unwrap();
         command.output().unwrap()
     };
     let metrics_path = root.path().join(".aethyme/logs/command-metrics.jsonl");
@@ -662,7 +685,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
     ];
 
     for args in [&claim[..], &dispatch[..]] {
-        let output = run(&broker, args);
+        let output = run(args);
         assert!(
             output.status.success(),
             "{}",
@@ -673,7 +696,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
                 || String::from_utf8_lossy(&output.stdout).contains("\"claimed\":false")
         );
     }
-    let listed = run(&broker, &["advanced", "deliveries", "list", "--json"]);
+    let listed = run(&["advanced", "deliveries", "list", "--json"]);
     assert!(listed.status.success());
     assert_eq!(
         metric_lines(),
@@ -714,7 +737,7 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
         .poll_pull_request_watch(watch.id, &provider, 61_000)
         .unwrap();
 
-    let claimed = run(&broker, &claim);
+    let claimed = run(&claim);
     assert!(
         claimed.status.success(),
         "{}",
@@ -730,16 +753,13 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
     );
     assert_eq!(command_events(&mut broker), 1);
 
-    let failed = run(
-        &broker,
-        &[
-            "advanced",
-            "deliveries",
-            "claim",
-            "--adapter",
-            "test-adapter",
-        ],
-    );
+    let failed = run(&[
+        "advanced",
+        "deliveries",
+        "claim",
+        "--adapter",
+        "test-adapter",
+    ]);
     assert!(!failed.status.success());
     assert_eq!(metric_lines(), 2, "a failed poll is recorded");
     assert_eq!(command_events(&mut broker), 2);

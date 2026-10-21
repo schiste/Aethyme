@@ -2485,6 +2485,77 @@ fn a_closed_session_with_a_persisted_interrupted_cache_is_resumed_by_the_next_pa
         meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
         Some("")
     );
+}
+
+/// A queued interrupted path is resumed by an explicit CLI sweep. This seeds
+/// the durable consumer state directly so the test does not depend on a
+/// machine-dependent discovery deadline; the inline producer is covered by
+/// `inline_partial_cache_removal_respects_spacing_and_resumes_afterward`.
+#[test]
+fn a_seeded_interrupted_removal_in_a_closed_session_is_finished_by_the_next_pass() {
+    let (repo, container) = fixture(
+        "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+    );
+    let (worktree, id) = closed_session_with_target(repo.path(), container.path(), "paused");
+    let target = worktree.join("rust/target");
+    let witness = target.join("CACHEDIR.TAG");
+    let witness_bytes = std::fs::read(&witness).unwrap();
+    assert_eq!(
+        witness_bytes, b"Signature: 8a477f597d28d172\n",
+        "the simulated interrupted removal starts with the catalog witness"
+    );
+
+    // Model an unlink that removed one leaf but left the witnessed cache and
+    // another nested artifact behind. The test intentionally labels this as
+    // seeded recovery state; the forced-deadline unit test covers production
+    // creation of the interrupted-path record.
+    std::fs::remove_file(target.join("artifact")).unwrap();
+    let remaining = target.join("debug/deps/remnant.rlib");
+    std::fs::create_dir_all(remaining.parent().unwrap()).unwrap();
+    std::fs::write(&remaining, b"remaining artifact\n").unwrap();
+    assert!(!target.join("artifact").exists());
+    assert!(remaining.is_file());
+
+    let target_key = target.to_path_buf();
+    remember_interrupted_tree(repo.path(), &target_key);
+    scoped_meta_set(repo.path(), "gc.artifact_sweep.cursor_session_id", &id);
+    let partial_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    scoped_meta_set(repo.path(), SWEEP_PARTIAL, &partial_ms);
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktrees_days = 30\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
+    )
+    .unwrap();
+
+    let target_key = target_key.to_string_lossy().into_owned();
+    assert_eq!(interrupted_paths(repo.path()), vec![target_key.clone()]);
+    assert!(witness.is_file());
+    assert!(remaining.is_file());
+    let source = worktree.join("README.md");
+    let source_bytes = std::fs::read(&source).unwrap();
+
+    let report = sweep(repo.path(), container.path());
+    assert_eq!(report["complete"], true, "{report}");
+    assert_eq!(report["directories_reclaimed"], 1, "{report}");
+    assert!(
+        !target.exists(),
+        "the queued partial tree is resumed: {report}"
+    );
+    assert!(worktree.is_dir(), "the closed worktree remains");
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    assert!(interrupted_paths(repo.path()).is_empty());
+    assert_eq!(meta(repo.path(), SWEEP_PARTIAL).as_deref(), Some("0"));
+
+    let repeated = sweep(repo.path(), container.path());
+    assert_eq!(repeated["complete"], true, "{repeated}");
+    assert_eq!(repeated["directories_reclaimed"], 0, "{repeated}");
+    assert!(!target.exists());
+    assert!(worktree.is_dir());
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
     assert!(interrupted_paths(repo.path()).is_empty());
 }
 

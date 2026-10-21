@@ -18,7 +18,7 @@ use crate::WorktreeRootSource;
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
 
 pub(crate) const MAX_RECORD_BYTES: usize = 8192;
-const MAX_RECORDS: usize = 8192;
+pub(crate) const MAX_RECORDS: usize = 8192;
 const PAGE_RECORDS: usize = 64;
 const MAX_INVENTORY_BYTES: usize = 8 * 1024 * 1024;
 const REGISTRATION_LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -266,6 +266,881 @@ pub(crate) fn registry_path(host_operation_database: &Path) -> io::Result<PathBu
     Ok(registry_directory(host_operation_database)?.join("registry.sqlite3"))
 }
 
+const MAX_RECOVERY_REGISTRY_BYTES: u64 = 8192 * 65_536;
+const RECOVERY_LOCK_NAME: &str = "registry.lock";
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FreshRootRegistryState {
+    MissingDatabase,
+    ExistingNoTargetRow,
+    ExactTargetRow,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct RecoveryArtifactIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) owner: u32,
+    pub(crate) mode: u32,
+    pub(crate) links: u64,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct FreshRootRegistryObservation {
+    pub(crate) host_operation_database: PathBuf,
+    pub(crate) registry_directory: PathBuf,
+    pub(crate) database_path: PathBuf,
+    pub(crate) lock_path: PathBuf,
+    pub(crate) directory_identity: Option<RecoveryArtifactIdentity>,
+    pub(crate) database_identity: Option<RecoveryArtifactIdentity>,
+    pub(crate) lock_identity: Option<RecoveryArtifactIdentity>,
+    pub(crate) directory_entries: Vec<String>,
+    pub(crate) state: FreshRootRegistryState,
+    pub(crate) schema_version: Option<u32>,
+    pub(crate) journal_mode: Option<String>,
+    pub(crate) integrity_check: Option<String>,
+    pub(crate) row_count: Option<usize>,
+    pub(crate) target_payload: Option<String>,
+    pub(crate) prune_cursor: Option<String>,
+}
+
+/// A recovery guard keeps an already-existing registry lock through the
+/// root/marker/row sequence. When the reviewed state has no lock, the guard
+/// deliberately stays lockless until the root exists, then creates exactly
+/// the missing lock with create-new semantics.
+pub(crate) struct FreshRootRegistryRecoveryGuard {
+    host_operation_database: PathBuf,
+    root: PathBuf,
+    expected_marker: WorktreeRootMarker,
+    expected_source: WorktreeRootSource,
+    exclusion: Option<crate::file_lock::ExclusiveFileLock>,
+    observation: FreshRootRegistryObservation,
+}
+
+impl FreshRootRegistryRecoveryGuard {
+    pub(crate) fn observation(&self) -> &FreshRootRegistryObservation {
+        &self.observation
+    }
+
+    pub(crate) fn ensure_initialized_after_root(&mut self) -> io::Result<()> {
+        if self.observation.state != FreshRootRegistryState::MissingDatabase {
+            return Ok(());
+        }
+        if self.exclusion.is_none() {
+            self.create_or_acquire_recovery_lock()?;
+        }
+        let latest = observe_fresh_root_registry_locked(
+            &self.host_operation_database,
+            &self.root,
+            &self.expected_marker,
+            self.expected_source,
+        )?;
+        match latest.state {
+            FreshRootRegistryState::MissingDatabase => {
+                initialize_fresh_recovery_registry(&self.host_operation_database)?;
+            }
+            FreshRootRegistryState::ExistingNoTargetRow
+            | FreshRootRegistryState::ExactTargetRow => {
+                // A cooperating registrar may have initialized the registry
+                // between the read-only plan and this process acquiring the
+                // previously absent lock. Its exact schema and target state
+                // are revalidated under the acquired lock.
+            }
+        }
+        self.observation = observe_fresh_root_registry_locked(
+            &self.host_operation_database,
+            &self.root,
+            &self.expected_marker,
+            self.expected_source,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn check_capacity_before_marker(&mut self) -> io::Result<()> {
+        if self.exclusion.is_none() {
+            return Err(invalid("recovery registry exclusion is not held"));
+        }
+        let current = observe_fresh_root_registry_locked(
+            &self.host_operation_database,
+            &self.root,
+            &self.expected_marker,
+            self.expected_source,
+        )?;
+        match current.state {
+            FreshRootRegistryState::MissingDatabase => {
+                return Err(invalid("fresh recovery registry is still missing"));
+            }
+            FreshRootRegistryState::ExistingNoTargetRow
+                if current.row_count.unwrap_or(usize::MAX) >= MAX_RECORDS =>
+            {
+                return Err(invalid(
+                    "worktree registry is full; recovery will not create the root marker or prune existing rows",
+                ));
+            }
+            FreshRootRegistryState::ExistingNoTargetRow
+            | FreshRootRegistryState::ExactTargetRow => {}
+        }
+        self.observation = current;
+        Ok(())
+    }
+
+    pub(crate) fn record_exact_target(&mut self) -> io::Result<()> {
+        if self.exclusion.is_none() {
+            return Err(invalid("recovery registry exclusion is not held"));
+        }
+        let current = observe_fresh_root_registry_locked(
+            &self.host_operation_database,
+            &self.root,
+            &self.expected_marker,
+            self.expected_source,
+        )?;
+        if current.state == FreshRootRegistryState::MissingDatabase {
+            return Err(invalid("fresh recovery registry is still missing"));
+        }
+        if current.state == FreshRootRegistryState::ExactTargetRow {
+            self.observation = current;
+            return Ok(());
+        }
+        let count = current
+            .row_count
+            .ok_or_else(|| invalid("registry row count is unavailable"))?;
+        if count >= MAX_RECORDS {
+            return Err(invalid(
+                "worktree registry is full; recovery did not prune or change it",
+            ));
+        }
+
+        let root = fs::canonicalize(&self.root)?;
+        if root != self.root {
+            return Err(invalid("recovery root changed its reserved path"));
+        }
+        let record = RootRecord {
+            schema_version: 1,
+            root: root.clone(),
+            repository_key: self.expected_marker.repository_key.clone(),
+            repository_root: self.expected_marker.repository_root.clone(),
+            source: self.expected_source,
+            identity: directory_identity(&root, &real_directory(&root)?)?,
+            origin_identity: directory_identity(
+                &self.expected_marker.repository_root,
+                &real_directory(&self.expected_marker.repository_root)?,
+            )?,
+        };
+        let payload = serde_json::to_string(&record).map_err(invalid)?;
+        if payload.len() > MAX_RECORD_BYTES {
+            return Err(invalid(
+                "worktree root identity exceeds registry byte limit",
+            ));
+        }
+        marker_matches(&record)?;
+
+        let mut connection = open_existing_registry_for_write(&self.host_operation_database)?;
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(invalid)?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(invalid)?;
+        let existing = retained_registration(&transaction, &root)?;
+        if existing.is_some() {
+            return Err(invalid(
+                "target registry row changed after recovery observation",
+            ));
+        }
+        let count: usize = transaction
+            .query_row("SELECT count(*) FROM roots", [], |row| row.get(0))
+            .map_err(invalid)?;
+        if count >= MAX_RECORDS {
+            return Err(invalid(
+                "worktree registry became full; recovery did not prune or change it",
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO roots(key,payload) VALUES(?1,?2)",
+                params![record_key(&root), payload],
+            )
+            .map_err(invalid)?;
+        transaction.commit().map_err(invalid)?;
+        drop(connection);
+        sync_registry_database(&self.host_operation_database)?;
+        self.observation = observe_fresh_root_registry_locked(
+            &self.host_operation_database,
+            &self.root,
+            &self.expected_marker,
+            self.expected_source,
+        )?;
+        if self.observation.state != FreshRootRegistryState::ExactTargetRow {
+            return Err(invalid(
+                "durable target row did not verify after recovery insert",
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_or_acquire_recovery_lock(&mut self) -> io::Result<()> {
+        let directory = registry_directory(&self.host_operation_database)?;
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                validate_recovery_registry_directory(&directory, &metadata)?;
+            }
+            Ok(_) => return Err(invalid("worktree registry directory changed type")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                create_recovery_registry_directory(&self.host_operation_database)?;
+            }
+            Err(error) => return Err(error),
+        }
+        let lock_path = registry_path(&self.host_operation_database)?.with_extension("lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        }
+        match options.open(&lock_path) {
+            Ok(file) => {
+                let opened_metadata = file.metadata()?;
+                validate_recovery_regular_file(&lock_path, &opened_metadata, true)?;
+                let opened_identity = recovery_artifact_identity(&opened_metadata);
+                file.sync_all()?;
+                sync_registry_namespace(&self.host_operation_database)?;
+                let named_before_lock = fs::symlink_metadata(&lock_path)?;
+                if recovery_artifact_identity(&named_before_lock) != opened_identity {
+                    return Err(invalid(
+                        "new recovery lock changed before exclusion was acquired",
+                    ));
+                }
+                self.exclusion = Some(
+                    crate::file_lock::ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::WouldBlock, "new registry lock is busy")
+                    })?,
+                );
+                let named_after_lock = fs::symlink_metadata(&lock_path)?;
+                if recovery_artifact_identity(&named_after_lock) != opened_identity {
+                    return Err(invalid(
+                        "new recovery lock changed while exclusion was acquired",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                self.exclusion = Some(registry_lock(&self.host_operation_database, false)?);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn plan_fresh_root_registry_recovery(
+    host_operation_database: &Path,
+    root: &Path,
+    expected_marker: &WorktreeRootMarker,
+    expected_source: WorktreeRootSource,
+) -> io::Result<FreshRootRegistryObservation> {
+    let guard = begin_fresh_root_registry_recovery(
+        host_operation_database,
+        root,
+        expected_marker,
+        expected_source,
+    )?;
+    Ok(guard.observation.clone())
+}
+
+pub(crate) fn begin_fresh_root_registry_recovery(
+    host_operation_database: &Path,
+    root: &Path,
+    expected_marker: &WorktreeRootMarker,
+    expected_source: WorktreeRootSource,
+) -> io::Result<FreshRootRegistryRecoveryGuard> {
+    registry_outside_root(host_operation_database, root)?;
+    let lock_path = registry_path(host_operation_database)?.with_extension("lock");
+    let exclusion = match fs::symlink_metadata(&lock_path) {
+        Ok(_) => Some(registry_lock(host_operation_database, false)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let observation = observe_fresh_root_registry_locked(
+        host_operation_database,
+        root,
+        expected_marker,
+        expected_source,
+    )?;
+    Ok(FreshRootRegistryRecoveryGuard {
+        host_operation_database: host_operation_database.to_path_buf(),
+        root: root.to_path_buf(),
+        expected_marker: expected_marker.clone(),
+        expected_source,
+        exclusion,
+        observation,
+    })
+}
+
+fn observe_fresh_root_registry_locked(
+    host_operation_database: &Path,
+    root: &Path,
+    expected_marker: &WorktreeRootMarker,
+    expected_source: WorktreeRootSource,
+) -> io::Result<FreshRootRegistryObservation> {
+    #[cfg(not(unix))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fresh-root recovery requires Unix no-follow filesystem identity checks",
+    ));
+
+    #[cfg(unix)]
+    {
+        let directory = registry_directory(host_operation_database)?;
+        let database_path = registry_path(host_operation_database)?;
+        let lock_path = database_path.with_extension("lock");
+        let mut observation = FreshRootRegistryObservation {
+            host_operation_database: host_operation_database.to_path_buf(),
+            registry_directory: directory.clone(),
+            database_path: database_path.clone(),
+            lock_path: lock_path.clone(),
+            directory_identity: None,
+            database_identity: None,
+            lock_identity: None,
+            directory_entries: Vec::new(),
+            state: FreshRootRegistryState::MissingDatabase,
+            schema_version: None,
+            journal_mode: None,
+            integrity_check: None,
+            row_count: None,
+            target_payload: None,
+            prune_cursor: None,
+        };
+        let directory_metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let database_exists = match fs::symlink_metadata(&database_path) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error),
+                };
+                let lock_exists = match fs::symlink_metadata(&lock_path) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error),
+                };
+                if database_exists || lock_exists {
+                    return Err(invalid("registry artifacts exist without their directory"));
+                }
+                match fs::symlink_metadata(&directory) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(invalid(
+                            "worktree registry directory appeared during inspection",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                return Ok(observation);
+            }
+            Err(error) => return Err(error),
+        };
+        validate_recovery_registry_directory(&directory, &directory_metadata)?;
+        observation.directory_identity = Some(recovery_artifact_identity(&directory_metadata));
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&directory)? {
+            if entries.len() >= 8 {
+                return Err(invalid(
+                    "registry recovery directory exceeds its entry limit",
+                ));
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            let text = name
+                .to_str()
+                .ok_or_else(|| invalid("registry recovery entry name is not UTF-8"))?
+                .to_owned();
+            if !matches!(text.as_str(), "registry.sqlite3" | RECOVERY_LOCK_NAME) {
+                return Err(invalid(format!(
+                    "unexpected worktree registry artifact {text:?}; preserve it for operator review"
+                )));
+            }
+            let kind = entry.file_type()?;
+            if kind.is_symlink() || !kind.is_file() {
+                return Err(invalid(format!(
+                    "worktree registry artifact {text:?} is not a regular file"
+                )));
+            }
+            entries.push(text);
+        }
+        entries.sort();
+        observation.directory_entries = entries;
+
+        let lock_metadata = match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) => {
+                validate_recovery_regular_file(&lock_path, &metadata, true)?;
+                Some(metadata)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        observation.lock_identity = lock_metadata.as_ref().map(recovery_artifact_identity);
+        let database_metadata = match fs::symlink_metadata(&database_path) {
+            Ok(metadata) => {
+                validate_recovery_regular_file(&database_path, &metadata, false)?;
+                if metadata.len() == 0 || metadata.len() > MAX_RECOVERY_REGISTRY_BYTES {
+                    return Err(invalid(
+                        "worktree registry database size is outside its recovery bound",
+                    ));
+                }
+                if lock_metadata.is_none() {
+                    return Err(invalid("existing registry database has no recovery lock"));
+                }
+                Some(metadata)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let Some(database_metadata) = database_metadata else {
+            let directory_after = fs::symlink_metadata(&directory)?;
+            if recovery_artifact_identity(&directory_after)
+                != recovery_artifact_identity(&directory_metadata)
+            {
+                return Err(invalid(
+                    "worktree registry directory identity changed during inspection",
+                ));
+            }
+            let lock_after = match fs::symlink_metadata(&lock_path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if lock_after.as_ref().map(recovery_artifact_identity)
+                != lock_metadata.as_ref().map(recovery_artifact_identity)
+            {
+                return Err(invalid(
+                    "worktree registry lock identity changed during inspection",
+                ));
+            }
+            match fs::symlink_metadata(&database_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(invalid(
+                        "worktree registry database appeared during inspection",
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+            return Ok(observation);
+        };
+        observation.database_identity = Some(recovery_artifact_identity(&database_metadata));
+        let open_path = fs::canonicalize(&directory)?.join("registry.sqlite3");
+        let connection = Connection::open_with_flags(
+            &open_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(invalid)?;
+        connection
+            .busy_timeout(Duration::from_millis(25))
+            .map_err(invalid)?;
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(invalid)?;
+        if version != 1 {
+            return Err(invalid(format!(
+                "worktree registry schema version {version} is unsupported; preserve the database"
+            )));
+        }
+        validate_recovery_registry_schema(&connection)?;
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(invalid)?;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(invalid(format!(
+                "worktree registry journal mode {journal_mode:?} is unsupported for recovery"
+            )));
+        }
+        let mut integrity = connection
+            .prepare("PRAGMA integrity_check")
+            .map_err(invalid)?;
+        let mut rows = integrity.query([]).map_err(invalid)?;
+        let first = rows
+            .next()
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("worktree registry integrity check returned no result"))?;
+        let integrity_result: String = first.get(0).map_err(invalid)?;
+        if integrity_result != "ok" || rows.next().map_err(invalid)?.is_some() {
+            return Err(invalid(
+                "worktree registry integrity check did not return only ok",
+            ));
+        }
+        drop(rows);
+        drop(integrity);
+        let row_count: i64 = connection
+            .query_row("SELECT count(*) FROM roots", [], |row| row.get(0))
+            .map_err(invalid)?;
+        let row_count = usize::try_from(row_count)
+            .map_err(|_| invalid("worktree registry row count is invalid"))?;
+        if row_count > MAX_RECORDS {
+            return Err(invalid(
+                "worktree registry exceeds its supported record limit",
+            ));
+        }
+        let prune_cursor: Option<String> = connection
+            .query_row(
+                "SELECT value FROM registry_meta WHERE key='prune_cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(invalid)?;
+        let mut meta = connection
+            .prepare("SELECT key,value FROM registry_meta ORDER BY key")
+            .map_err(invalid)?;
+        let meta_rows = meta
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(invalid)?;
+        let mut meta_count = 0;
+        for row in meta_rows {
+            let (key, value) = row.map_err(invalid)?;
+            meta_count += 1;
+            if key != "prune_cursor" || value.len() > 64 {
+                return Err(invalid("worktree registry contains unknown metadata"));
+            }
+            if !value.is_empty()
+                && (value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+            {
+                return Err(invalid("worktree registry prune cursor is malformed"));
+            }
+        }
+        if meta_count > 1 {
+            return Err(invalid("worktree registry contains duplicate metadata"));
+        }
+        let key = record_key(root);
+        let target_payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM roots WHERE key=?1",
+                [key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(invalid)?;
+        if let Some(payload) = &target_payload {
+            if payload.len() > MAX_RECORD_BYTES {
+                return Err(invalid("target root registry row exceeds its byte bound"));
+            }
+            let record = decode(&key, payload)?;
+            if record.root != root
+                || record.repository_key != expected_marker.repository_key
+                || record.repository_root != expected_marker.repository_root
+                || record.source != expected_source
+            {
+                return Err(invalid(
+                    "target registry row conflicts with the reserved root",
+                ));
+            }
+            marker_owner_matches(&record, &read_marker(root)?)?;
+            validate_retained_registration(root, payload)?;
+            observation.state = FreshRootRegistryState::ExactTargetRow;
+        } else {
+            observation.state = FreshRootRegistryState::ExistingNoTargetRow;
+        }
+        observation.schema_version = Some(version);
+        observation.journal_mode = Some(journal_mode);
+        observation.integrity_check = Some(integrity_result);
+        observation.row_count = Some(row_count);
+        observation.target_payload = target_payload;
+        observation.prune_cursor = prune_cursor;
+        let after = fs::symlink_metadata(&database_path)?;
+        if recovery_artifact_identity(&after) != recovery_artifact_identity(&database_metadata) {
+            return Err(invalid(
+                "worktree registry database identity changed during inspection",
+            ));
+        }
+        let directory_after = fs::symlink_metadata(&directory)?;
+        if recovery_artifact_identity(&directory_after)
+            != recovery_artifact_identity(&directory_metadata)
+        {
+            return Err(invalid(
+                "worktree registry directory identity changed during inspection",
+            ));
+        }
+        let lock_after = match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if lock_after.as_ref().map(recovery_artifact_identity)
+            != lock_metadata.as_ref().map(recovery_artifact_identity)
+        {
+            return Err(invalid(
+                "worktree registry lock identity changed during inspection",
+            ));
+        }
+        Ok(observation)
+    }
+}
+
+#[cfg(unix)]
+fn create_recovery_registry_directory(host_operation_database: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let directory = registry_directory(host_operation_database)?;
+    let parent = directory
+        .parent()
+        .ok_or_else(|| invalid("worktree registry has no parent directory"))?;
+    real_directory(parent)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&directory)?;
+    let metadata = fs::symlink_metadata(&directory)?;
+    validate_recovery_registry_directory(&directory, &metadata)?;
+    sync_registry_namespace(host_operation_database)
+}
+
+#[cfg(not(unix))]
+fn create_recovery_registry_directory(_host_operation_database: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fresh-root recovery requires Unix directory durability",
+    ))
+}
+
+#[cfg(unix)]
+fn initialize_fresh_recovery_registry(host_operation_database: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let database_path = registry_path(host_operation_database)?;
+    let directory = database_path
+        .parent()
+        .ok_or_else(|| invalid("worktree registry has no directory"))?;
+    let directory_metadata = fs::symlink_metadata(directory)?;
+    validate_recovery_registry_directory(directory, &directory_metadata)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = match options.open(&database_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    file.sync_all()?;
+    let created_identity = recovery_artifact_identity(&file.metadata()?);
+    drop(file);
+    let open_path = fs::canonicalize(directory)?.join("registry.sqlite3");
+    let connection = Connection::open_with_flags(
+        &open_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(invalid)?;
+    let named_before = fs::symlink_metadata(&database_path)?;
+    if recovery_artifact_identity(&named_before) != created_identity {
+        return Err(invalid(
+            "new recovery registry database changed before initialization",
+        ));
+    }
+    connection
+        .busy_timeout(Duration::from_millis(25))
+        .map_err(invalid)?;
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA max_page_count=8192;",
+        )
+        .map_err(invalid)?;
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(invalid)?;
+    let object_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(invalid)?;
+    if version != 0 || object_count != 0 {
+        return Err(invalid("new recovery registry database is not empty"));
+    }
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE roots (key TEXT PRIMARY KEY, payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 8192));
+             CREATE TABLE registry_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             PRAGMA user_version=1;
+             COMMIT;",
+        )
+        .map_err(invalid)?;
+    let named_after = fs::symlink_metadata(&database_path)?;
+    if !same_recovery_artifact_object(&recovery_artifact_identity(&named_after), &created_identity)
+    {
+        return Err(invalid(
+            "recovery registry database changed during initialization",
+        ));
+    }
+    drop(connection);
+    sync_registry_database(host_operation_database)
+}
+
+#[cfg(not(unix))]
+fn initialize_fresh_recovery_registry(_host_operation_database: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fresh-root recovery requires Unix no-follow database creation",
+    ))
+}
+
+#[cfg(unix)]
+fn sync_registry_database(host_operation_database: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let database_path = registry_path(host_operation_database)?;
+    let metadata = fs::symlink_metadata(&database_path)?;
+    validate_recovery_regular_file(&database_path, &metadata, false)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let database = options.open(&database_path)?;
+    if recovery_artifact_identity(&database.metadata()?) != recovery_artifact_identity(&metadata) {
+        return Err(invalid("worktree registry changed before durable sync"));
+    }
+    database.sync_all()?;
+    sync_registry_namespace(host_operation_database)
+}
+
+#[cfg(not(unix))]
+fn sync_registry_database(_host_operation_database: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fresh-root recovery requires Unix database syncing",
+    ))
+}
+
+#[cfg(unix)]
+fn recovery_artifact_identity(metadata: &Metadata) -> RecoveryArtifactIdentity {
+    use std::os::unix::fs::MetadataExt;
+    RecoveryArtifactIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+        links: metadata.nlink(),
+        bytes: metadata.len(),
+    }
+}
+
+fn same_recovery_artifact_object(
+    left: &RecoveryArtifactIdentity,
+    right: &RecoveryArtifactIdentity,
+) -> bool {
+    left.device == right.device
+        && left.inode == right.inode
+        && left.owner == right.owner
+        && left.mode == right.mode
+        && left.links == right.links
+}
+
+#[cfg(not(unix))]
+fn recovery_artifact_identity(metadata: &Metadata) -> RecoveryArtifactIdentity {
+    RecoveryArtifactIdentity {
+        device: 0,
+        inode: 0,
+        owner: 0,
+        mode: 0,
+        links: 0,
+        bytes: metadata.len(),
+    }
+}
+
+#[cfg(unix)]
+fn validate_recovery_registry_directory(path: &Path, metadata: &Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(invalid(format!(
+            "registry directory {} is not a private directory owned by the current user",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_recovery_registry_directory(_path: &Path, metadata: &Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid("registry directory is not a real directory"));
+    }
+    Ok(())
+}
+
+fn validate_recovery_regular_file(path: &Path, metadata: &Metadata, lock: bool) -> io::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid(format!(
+            "registry artifact {} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(invalid(format!(
+                "registry artifact {} is not a single-link file owned by the current user",
+                path.display()
+            )));
+        }
+        if lock && metadata.mode() & 0o022 != 0 {
+            return Err(invalid("registry lock is writable by group or other users"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_registry_schema(connection: &Connection) -> io::Result<()> {
+    let mut statement = connection
+        .prepare("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")
+        .map_err(invalid)?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(invalid)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(invalid)?;
+    let expected = vec![
+        (
+            "table".to_owned(),
+            "registry_meta".to_owned(),
+            Some("CREATE TABLE registry_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)".to_owned()),
+        ),
+        (
+            "table".to_owned(),
+            "roots".to_owned(),
+            Some("CREATE TABLE roots (key TEXT PRIMARY KEY, payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB)) <= 8192))".to_owned()),
+        ),
+    ];
+    if objects != expected {
+        return Err(invalid(
+            "worktree registry schema differs from the supported exact schema",
+        ));
+    }
+    Ok(())
+}
+
 fn record_key(root: &Path) -> String {
     format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()))
 }
@@ -282,6 +1157,304 @@ fn regular_file(path: &Path) -> io::Result<()> {
             return Err(invalid("worktree registry has multiple hard links"));
         }
     }
+    Ok(())
+}
+
+/// Create a private directory chain one component at a time, syncing the
+/// parent that names each newly-created directory before descending into it.
+/// Existing ancestors are never chmodded or required to be owned by this user
+/// (the host-state parent may intentionally be shared, such as `/tmp`).
+#[cfg(unix)]
+fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const MAX_MISSING_COMPONENTS: usize = 256;
+
+    // `libc::stat` field widths vary between Unix targets; normalize them to
+    // the stable `MetadataExt` widths for a single identity comparison.
+    #[allow(clippy::unnecessary_cast)]
+    fn named_directory_matches(named: &libc::stat, opened: &Metadata) -> bool {
+        named.st_dev as u64 == opened.dev()
+            && named.st_ino as u64 == opened.ino()
+            && named.st_uid as u32 == opened.uid()
+            && named.st_mode & libc::S_IFMT == libc::S_IFDIR
+    }
+
+    fn normalized_absolute(path: &Path) -> io::Result<PathBuf> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+                std::path::Component::RootDir => normalized.push(component.as_os_str()),
+                std::path::Component::CurDir => {}
+                // Removing `..` lexically before resolving symlink ancestors
+                // can create a different directory than the later filesystem
+                // open names. Reject it rather than guessing which path the
+                // caller intended.
+                std::path::Component::ParentDir => {
+                    return Err(invalid("directory path must not contain parent components"));
+                }
+                std::path::Component::Normal(name) => normalized.push(name),
+            }
+        }
+        if !normalized.is_absolute() {
+            return Err(invalid("directory path must be absolute"));
+        }
+        Ok(normalized)
+    }
+
+    fn open_directory(path: &Path) -> io::Result<fs::File> {
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+        options.open(path)
+    }
+
+    let target = normalized_absolute(path)?;
+    let mut missing = Vec::new();
+    let mut cursor = target.as_path();
+    let (existing, existing_identity) = loop {
+        match fs::metadata(cursor) {
+            Ok(metadata) if metadata.is_dir() => {
+                let canonical = fs::canonicalize(cursor)?;
+                let canonical_metadata = fs::metadata(&canonical)?;
+                if !canonical_metadata.is_dir()
+                    || metadata.dev() != canonical_metadata.dev()
+                    || metadata.ino() != canonical_metadata.ino()
+                    || metadata.uid() != canonical_metadata.uid()
+                {
+                    return Err(invalid(
+                        "existing directory ancestor changed while resolving its path",
+                    ));
+                }
+                break (canonical, canonical_metadata);
+            }
+            Ok(_) => return Err(invalid("directory path contains a non-directory")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = cursor
+                    .file_name()
+                    .ok_or_else(|| invalid("directory path has no existing ancestor"))?;
+                missing.push(name.to_os_string());
+                if missing.len() > MAX_MISSING_COMPONENTS {
+                    return Err(invalid("directory path exceeds the component limit"));
+                }
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| invalid("directory path has no existing ancestor"))?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    let mut parent = open_directory(&existing)?;
+    let parent_metadata = parent.metadata()?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.dev() != existing_identity.dev()
+        || parent_metadata.ino() != existing_identity.ino()
+        || parent_metadata.uid() != existing_identity.uid()
+    {
+        return Err(invalid("existing directory ancestor changed identity"));
+    }
+
+    for component in missing.into_iter().rev() {
+        let name = CString::new(component.as_bytes())
+            .map_err(|_| invalid("directory component contains a NUL byte"))?;
+        // SAFETY: `parent` owns a live directory descriptor and `name` is a
+        // NUL-terminated component relative to that descriptor.
+        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0;
+        if !created {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error);
+            }
+        }
+
+        // SAFETY: `parent` owns a live directory descriptor and `name` is a
+        // NUL-terminated component. O_NOFOLLOW/O_DIRECTORY constrain the
+        // returned descriptor to that child directory.
+        let child_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+            )
+        };
+        if child_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let child = unsafe { fs::File::from_raw_fd(child_fd) };
+        let child_metadata = child.metadata()?;
+        if !child_metadata.is_dir()
+            || child_metadata.uid() != effective_user_id()
+            || child_metadata.mode() & 0o077 != 0
+        {
+            return Err(invalid(
+                "new host-state directory is not privately owned by this user",
+            ));
+        }
+
+        // Sync the parent after either our mkdir or a concurrent same-owner
+        // creation, then verify that the child name still resolves to the
+        // exact directory opened without following links.
+        parent.sync_all()?;
+        let mut named = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `parent` owns a live directory descriptor, `name` is a
+        // NUL-terminated component, and `named` points to writable storage.
+        let stat_result = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                named.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat initialized the structure on success.
+        let named = unsafe { named.assume_init() };
+        if !named_directory_matches(&named, &child_metadata) {
+            return Err(invalid(
+                "new host-state directory name changed during durable creation",
+            ));
+        }
+        parent = child;
+    }
+    let opened_final = parent.metadata()?;
+    let named_final = fs::metadata(&target)?;
+    if !named_final.is_dir()
+        || opened_final.dev() != named_final.dev()
+        || opened_final.ino() != named_final.ino()
+        || opened_final.uid() != named_final.uid()
+    {
+        return Err(invalid(
+            "directory path changed while creating its durable component chain",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn effective_user_id() -> libc::uid_t {
+    // SAFETY: geteuid takes no pointers and only returns the calling process'
+    // effective user ID.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn ensure_durable_directory_chain(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+fn ensure_registry_directory(host_operation_database: &Path) -> io::Result<PathBuf> {
+    let directory = registry_directory(host_operation_database)?;
+    ensure_durable_directory_chain(&directory)?;
+    real_directory(&directory)?;
+    crate::host_state::protect_host_state_path(&directory, true)?;
+    Ok(directory)
+}
+
+/// Sync the entries that name the host registry before its row can be used to
+/// complete a repository-root binding. SQLite's FULL commit makes registry
+/// contents durable; these directory syncs make a newly-created registry file
+/// and its containing directory reachable after a crash as well.
+#[cfg(unix)]
+fn sync_registry_namespace(host_operation_database: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn open_checked_directory(
+        path: &Path,
+        require_current_owner: bool,
+    ) -> io::Result<(fs::File, Metadata)> {
+        let named_before = fs::symlink_metadata(path)?;
+        if !named_before.is_dir() || named_before.file_type().is_symlink() {
+            return Err(invalid("worktree registry directory changed type"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+        let directory = options.open(path)?;
+        let opened = directory.metadata()?;
+        let named_after = fs::symlink_metadata(path)?;
+        if !opened.is_dir()
+            || !named_after.is_dir()
+            || named_after.file_type().is_symlink()
+            || opened.dev() != named_before.dev()
+            || opened.ino() != named_before.ino()
+            || opened.uid() != named_before.uid()
+            || opened.dev() != named_after.dev()
+            || opened.ino() != named_after.ino()
+            || opened.uid() != named_after.uid()
+            || (require_current_owner && opened.uid() != effective_user_id())
+        {
+            return Err(invalid(
+                "worktree registry directory identity changed before syncing",
+            ));
+        }
+        Ok((directory, opened))
+    }
+
+    let host_parent = host_operation_database
+        .parent()
+        .ok_or_else(|| invalid("host operation database has no parent"))?;
+    let host_parent = fs::canonicalize(host_parent)?;
+    let directory_name = registry_directory(host_operation_database)?
+        .file_name()
+        .ok_or_else(|| invalid("worktree registry has no directory name"))?
+        .to_os_string();
+    let registry_directory = host_parent.join(directory_name);
+
+    // Open both names without following their final components. The registry
+    // directory is a child of the existing host database parent; syncing the
+    // child makes registry.sqlite3 durable, and syncing the parent makes the
+    // child directory name durable.
+    let (registry, registry_identity) = open_checked_directory(&registry_directory, true)?;
+    // The host database parent may be an intentionally shared, root-owned
+    // sticky directory such as /tmp. Pin its identity for the sync without
+    // changing its ownership or requiring it to belong to this user.
+    let (parent, parent_identity) = open_checked_directory(&host_parent, false)?;
+    registry.sync_all()?;
+    parent.sync_all()?;
+
+    for (path, opened) in [
+        (&registry_directory, registry_identity),
+        (&host_parent, parent_identity),
+    ] {
+        let named_after = fs::symlink_metadata(path)?;
+        if !named_after.is_dir()
+            || named_after.file_type().is_symlink()
+            || named_after.dev() != opened.dev()
+            || named_after.ino() != opened.ino()
+            || named_after.uid() != opened.uid()
+        {
+            return Err(invalid(
+                "worktree registry directory identity changed while syncing",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Fresh/bound repository-root provisioning is refused on non-Unix platforms,
+// where this module cannot open and sync directory entries without following
+// links. Ordinary legacy registry operations remain available there.
+#[cfg(not(unix))]
+fn sync_registry_namespace(_host_operation_database: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -305,12 +1478,11 @@ fn registry_lock(
 ) -> io::Result<crate::file_lock::ExclusiveFileLock> {
     let path = registry_path(host_database)?.with_extension("lock");
     if create {
+        ensure_registry_directory(host_database)?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("registry lock has no parent"))?;
-        fs::create_dir_all(parent)?;
         real_directory(parent)?;
-        crate::host_state::protect_host_state_path(parent, true)?;
     }
     let mut options = OpenOptions::new();
     options
@@ -405,12 +1577,11 @@ fn open_registry_with_mode(
 ) -> io::Result<Connection> {
     let path = registry_path(host_database)?;
     if create {
+        ensure_registry_directory(host_database)?;
         let parent = path
             .parent()
             .ok_or_else(|| invalid("registry has no parent"))?;
-        fs::create_dir_all(parent)?;
         real_directory(parent)?;
-        crate::host_state::protect_host_state_path(parent, true)?;
     }
     match regular_file(&path) {
         Ok(()) => {}
@@ -476,6 +1647,9 @@ fn open_registry_with_mode(
         return Err(invalid("unsupported worktree registry schema"));
     }
     regular_file(&path)?;
+    if create {
+        sync_registry_namespace(host_database)?;
+    }
     Ok(connection)
 }
 
@@ -1388,6 +2562,45 @@ pub(crate) fn inventory(host_database: &Path, deadline: Option<Instant>) -> Inve
     result
 }
 
+/// Verify that a bound repository root still has its exact retained
+/// registration. This is read-only: an absent or damaged record is a refusal,
+/// never an invitation to recreate ownership from the current environment.
+pub(crate) fn verify_exact_registration(
+    host_database: &Path,
+    root: &Path,
+    marker: &WorktreeRootMarker,
+    source: WorktreeRootSource,
+) -> io::Result<()> {
+    let registered_source = registered_source(host_database, root, marker)?;
+    if registered_source != source {
+        return Err(invalid("retained root source differs from binding"));
+    }
+    Ok(())
+}
+
+pub(crate) fn registered_source(
+    host_database: &Path,
+    root: &Path,
+    marker: &WorktreeRootMarker,
+) -> io::Result<WorktreeRootSource> {
+    // A bound repository needs only its exact retained row. A host-wide
+    // inventory here would make an unrelated damaged registration prevent
+    // this repository from opening, even though the inventory remains
+    // bounded and is still used for global discovery/GC.
+    let connection = open_registry(host_database, false)?;
+    let payload = retained_registration(&connection, root)?
+        .ok_or_else(|| invalid("bound root has no retained registry record"))?;
+    let record = validate_retained_registration(root, &payload)?;
+    if record.root != root
+        || record.repository_key != marker.repository_key
+        || record.repository_root != marker.repository_root
+    {
+        return Err(invalid("retained root registration differs from marker"));
+    }
+    marker_owner_matches(&record, marker)?;
+    Ok(record.source)
+}
+
 pub(crate) fn ownership_fingerprint(record: &RootRecord) -> io::Result<String> {
     if !root_still_present(record)? || !origin_is_missing(record)? {
         return Err(invalid("root is no longer an orphan"));
@@ -1621,6 +2834,260 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn fresh_root_registry_plan_keeps_a_missing_registry_read_only() {
+        let fixture = Fixture::new();
+        let root = fixture._owned.path().join("reserved-root");
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "reserved-root".into(),
+            repository_root: fixture.origin.clone(),
+        };
+
+        let observation = plan_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+
+        assert_eq!(observation.state, FreshRootRegistryState::MissingDatabase);
+        assert!(!observation.registry_directory.exists());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn fresh_root_registry_recovery_initializes_only_after_the_root_exists() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.database.parent().unwrap()).unwrap();
+        let root = fixture._owned.path().join("reserved-root");
+        fs::create_dir(&root).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "reserved-root".into(),
+            repository_root: fixture.origin.clone(),
+        };
+
+        let mut guard = begin_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+        assert_eq!(
+            guard.observation().state,
+            FreshRootRegistryState::MissingDatabase
+        );
+        assert!(!registry_directory(&fixture.database).unwrap().exists());
+
+        guard.ensure_initialized_after_root().unwrap();
+        assert_eq!(
+            guard.observation().state,
+            FreshRootRegistryState::ExistingNoTargetRow
+        );
+        guard.check_capacity_before_marker().unwrap();
+        let mut marker_bytes = serde_json::to_vec_pretty(&marker).unwrap();
+        marker_bytes.push(b'\n');
+        fs::write(root.join(WORKTREE_ROOT_MARKER), marker_bytes).unwrap();
+        guard.record_exact_target().unwrap();
+
+        assert_eq!(
+            guard.observation().state,
+            FreshRootRegistryState::ExactTargetRow
+        );
+        assert_eq!(guard.observation().row_count, Some(1));
+    }
+
+    #[test]
+    fn fresh_root_registry_plan_rejects_sidecars_without_changing_them() {
+        let fixture = Fixture::new();
+        let root = fixture._owned.path().join("reserved-root");
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "reserved-root".into(),
+            repository_root: fixture.origin.clone(),
+        };
+        drop(open_registry(&fixture.database, true).unwrap());
+        let sidecar = registry_path(&fixture.database)
+            .unwrap()
+            .with_extension("sqlite3-wal");
+        fs::write(&sidecar, b"preserve uncertain SQLite state").unwrap();
+
+        let error = plan_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected worktree registry artifact")
+        );
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            b"preserve uncertain SQLite state"
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn fresh_root_registry_plan_preserves_a_zero_byte_database_as_conflicting_evidence() {
+        let fixture = Fixture::new();
+        let root = fixture._owned.path().join("reserved-root");
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "reserved-root".into(),
+            repository_root: fixture.origin.clone(),
+        };
+        ensure_registry_directory(&fixture.database).unwrap();
+        drop(registry_lock(&fixture.database, true).unwrap());
+        let database = registry_path(&fixture.database).unwrap();
+        fs::write(&database, b"").unwrap();
+
+        let error = plan_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("size is outside its recovery bound")
+        );
+        assert_eq!(fs::metadata(&database).unwrap().len(), 0);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn fresh_root_registry_plan_recognizes_only_the_exact_target_row() {
+        let fixture = Fixture::new();
+        let (root, marker) = fixture.root("reserved-root");
+        fixture.register(&root, &marker);
+
+        let observation = plan_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+
+        assert_eq!(observation.state, FreshRootRegistryState::ExactTargetRow);
+        assert!(observation.target_payload.is_some());
+        assert_eq!(observation.row_count, Some(1));
+    }
+
+    #[test]
+    fn fresh_root_registry_capacity_precheck_does_not_prune_or_change_cursor() {
+        let fixture = Fixture::new();
+        let root = fixture._owned.path().join("reserved-root");
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "reserved-root".into(),
+            repository_root: fixture.origin.clone(),
+        };
+        let mut connection = open_registry(&fixture.database, true).unwrap();
+        {
+            let transaction = connection.transaction().unwrap();
+            for index in 0..MAX_RECORDS {
+                transaction
+                    .execute(
+                        "INSERT INTO roots(key,payload) VALUES(?1,?2)",
+                        params![
+                            record_key(&fixture._owned.path().join(format!("old-{index}"))),
+                            "{}"
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction
+                .execute(
+                    "INSERT INTO registry_meta(key,value) VALUES('prune_cursor',?1)",
+                    ["a".repeat(64)],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        drop(connection);
+
+        let mut guard = begin_fresh_root_registry_recovery(
+            &fixture.database,
+            &root,
+            &marker,
+            WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+        let error = guard.check_capacity_before_marker().unwrap_err();
+
+        assert!(error.to_string().contains("registry is full"));
+        let connection = open_registry(&fixture.database, false).unwrap();
+        let count: usize = connection
+            .query_row("SELECT count(*) FROM roots", [], |row| row.get(0))
+            .unwrap();
+        let cursor: String = connection
+            .query_row(
+                "SELECT value FROM registry_meta WHERE key='prune_cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, MAX_RECORDS);
+        assert_eq!(cursor, "a".repeat(64));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn exact_registration_ignores_an_unrelated_corrupt_registry_row() {
+        let fixture = Fixture::new();
+        let (root, marker) = fixture.root("bound");
+        fixture.register(&root, &marker);
+        let unrelated_key = record_key(&fixture._owned.path().join("unrelated"));
+        open_registry(&fixture.database, true)
+            .unwrap()
+            .execute(
+                "INSERT INTO roots(key, payload) VALUES(?1, ?2)",
+                params![unrelated_key, "{not-json"],
+            )
+            .unwrap();
+
+        assert!(
+            !inventory(&fixture.database, None).complete,
+            "the unrelated malformed row makes host-wide inventory incomplete"
+        );
+        assert_eq!(
+            registered_source(&fixture.database, &root, &marker).unwrap(),
+            WorktreeRootSource::LibraryOverride,
+            "a healthy exact row remains usable when a different registry row is malformed"
+        );
+    }
+
+    #[test]
+    fn exact_registration_refuses_its_own_corrupt_registry_row() {
+        let fixture = Fixture::new();
+        let (root, marker) = fixture.root("bound");
+        fixture.register(&root, &marker);
+        open_registry(&fixture.database, true)
+            .unwrap()
+            .execute(
+                "UPDATE roots SET payload=?1 WHERE key=?2",
+                params!["{not-json", record_key(&root)],
+            )
+            .unwrap();
+
+        assert!(
+            registered_source(&fixture.database, &root, &marker).is_err(),
+            "damage to the bound root's exact registry row must still fail closed"
+        );
     }
 
     #[derive(Debug, Deserialize)]
@@ -3174,5 +4641,98 @@ mod tests {
         );
         assert!(!registry_directory(&database).unwrap().exists());
         assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+    }
+
+    #[test]
+    fn registry_creation_builds_a_missing_host_parent_chain() {
+        let owned = tempfile::tempdir().unwrap();
+        let host_database = owned
+            .path()
+            .join("missing-one/missing-two/host-operations.db");
+        let connection = open_registry(&host_database, true).unwrap();
+        drop(connection);
+
+        let host_parent = host_database.parent().unwrap();
+        assert!(host_parent.is_dir());
+        assert!(registry_directory(&host_database).unwrap().is_dir());
+        assert!(registry_path(&host_database).unwrap().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_creation_refuses_parent_components_around_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let owned = tempfile::tempdir().unwrap();
+        let base = owned.path().join("base");
+        let destination = owned.path().join("destination");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(&destination).unwrap();
+        symlink(&destination, base.join("alias")).unwrap();
+
+        let ambiguous = base.join("alias/../created");
+        assert!(ensure_durable_directory_chain(&ambiguous).is_err());
+        assert!(!base.join("created").exists());
+        assert!(!owned.path().join("created").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_namespace_sync_accepts_real_directories_and_refuses_symlinked_registry_dir() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        let directory = registry_directory(&fixture.database).unwrap();
+        let registry = registry_path(&fixture.database).unwrap();
+        assert!(directory.is_dir());
+        assert!(registry.is_file());
+        // Admission invokes this sync before it can return the connection
+        // that writes a registry row used by root-binding completion.
+        sync_registry_namespace(&fixture.database).unwrap();
+
+        let retained = directory.with_extension("retained");
+        fs::rename(&directory, &retained).unwrap();
+        symlink(&retained, &directory).unwrap();
+        assert!(sync_registry_namespace(&fixture.database).is_err());
+        fs::remove_file(&directory).unwrap();
+        fs::rename(&retained, &directory).unwrap();
+        sync_registry_namespace(&fixture.database).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_namespace_sync_does_not_require_ownership_of_shared_parent() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let host_database = tempfile::NamedTempFile::new_in("/tmp").unwrap();
+        let parent = host_database.path().parent().unwrap();
+        let parent_metadata = fs::metadata(parent).unwrap();
+        let parent_owner = parent_metadata.uid();
+        let parent_mode = parent_metadata.permissions().mode() & 0o7777;
+        let current_owner = effective_user_id();
+        if parent_owner == current_owner {
+            // Some test environments run as root and therefore cannot
+            // exercise the root-owned sticky-parent case.
+            return;
+        }
+
+        let directory = registry_directory(host_database.path()).unwrap();
+        assert!(
+            !directory.exists(),
+            "the random host DB name isolates this fixture"
+        );
+        let connection = open_registry(host_database.path(), true).unwrap();
+        drop(connection);
+        assert!(registry_path(host_database.path()).unwrap().is_file());
+        sync_registry_namespace(host_database.path()).unwrap();
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o7777,
+            parent_mode,
+            "shared parent permissions are preserved"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

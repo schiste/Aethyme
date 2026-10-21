@@ -38,7 +38,45 @@ fn command(repo: &std::path::Path) -> Command {
         // disposable fixture repos and must exercise their normal DB layout,
         // not share the gate's database across otherwise independent tests.
         .env_remove("AETHYME_BROKER_DB")
+        .env_remove("AETHYME_WORKTREE_ROOT")
         .env("XDG_CONFIG_HOME", repo.join("empty-config"));
+    command
+}
+
+fn first_deploy_command(repo: &std::path::Path) -> Command {
+    let owner = repo
+        .parent()
+        .expect("fixture repository has a private owner directory");
+    let home = owner.join("first-deploy-home");
+    let host_state = owner.join("first-deploy-host-state");
+    let host_cache = owner.join("first-deploy-host-cache");
+    let xdg_state = owner.join("first-deploy-xdg-state");
+    let xdg_cache = owner.join("first-deploy-xdg-cache");
+    let preparation_cache = owner.join("first-deploy-preparation-cache");
+    for directory in [
+        &home,
+        &host_state,
+        &host_cache,
+        &xdg_state,
+        &xdg_cache,
+        &preparation_cache,
+    ] {
+        fs::create_dir_all(directory).expect("create owned first-deploy fixture storage");
+    }
+
+    let mut command = command(repo);
+    command
+        .env("HOME", home)
+        .env("AETHYME_HOST_STATE_DIR", &host_state)
+        .env("AETHYME_HOST_CACHE_DIR", host_cache)
+        .env("XDG_STATE_HOME", xdg_state)
+        .env("XDG_CACHE_HOME", xdg_cache)
+        .env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache)
+        .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
+        .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT");
     command
 }
 
@@ -52,6 +90,35 @@ fn fixture_commands_remove_the_outer_gate_database_override() {
         }),
         "fixture subprocesses must explicitly remove an inherited broker DB override"
     );
+
+    let repo = repository(temp.path());
+    let command = first_deploy_command(&repo);
+    let host_state = temp.path().join("first-deploy-host-state");
+    let host_cache = temp.path().join("first-deploy-host-cache");
+    assert!(command.get_envs().any(|(key, value)| {
+        key == std::ffi::OsStr::new("AETHYME_HOST_STATE_DIR")
+            && value == Some(host_state.as_os_str())
+    }));
+    assert!(command.get_envs().any(|(key, value)| {
+        key == std::ffi::OsStr::new("AETHYME_HOST_CACHE_DIR")
+            && value == Some(host_cache.as_os_str())
+    }));
+    for name in [
+        "AETHYME_BROKER_STORAGE_CONTEXT_V1",
+        "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+        "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
+        "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+        "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+        "AETHYME_WORKTREE_ROOT",
+        "AETHYME_BROKER_DB",
+    ] {
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() }),
+            "first-deploy subprocess must clear inherited {name}"
+        );
+    }
 }
 
 fn commit_all(repo: &std::path::Path, message: &str) {
@@ -95,7 +162,9 @@ fn status(repo: &std::path::Path) -> String {
 fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
-    let deployed = command(&repo)
+    let host_state = temp.path().join("first-deploy-host-state");
+    let host_worktree_container = host_state.join("worktrees");
+    let deployed = first_deploy_command(&repo)
         .args(["deploy", "--repo"])
         .arg(&repo)
         .output()
@@ -105,6 +174,21 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&deployed.stdout),
         String::from_utf8_lossy(&deployed.stderr)
+    );
+    let deploy_stdout = String::from_utf8_lossy(&deployed.stdout);
+    assert!(
+        deploy_stdout.contains("pass     certify.broker-db")
+            && deploy_stdout.contains("warn     certify.retention")
+            && deploy_stdout.contains("fresh worktree root is unbound"),
+        "first deploy must preserve DB integrity certification while reporting retention as unavailable until an explicit root-creating operation; stdout:\n{deploy_stdout}"
+    );
+    assert!(
+        !repo.join(".aethyme/worktrees").exists(),
+        "certification must not provision the unbound worktree root"
+    );
+    assert!(
+        !host_worktree_container.exists(),
+        "certification must not provision the captured host-state worktree container"
     );
 
     for relative in [
@@ -197,7 +281,7 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     ));
     assert!(!stdout.contains("Operating mode:"));
 
-    let verified = command(&repo)
+    let verified = first_deploy_command(&repo)
         .args(["deploy", "verify", "--repo"])
         .arg(&repo)
         .output()
@@ -210,6 +294,53 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     assert!(
         !String::from_utf8_lossy(&verified.stdout).contains("Operating mode:"),
         "deploy verify keeps its existing certification-only output contract"
+    );
+    let verify_stdout = String::from_utf8_lossy(&verified.stdout);
+    assert!(
+        verify_stdout.contains("pass     certify.broker-db")
+            && verify_stdout.contains("warn     certify.retention")
+            && verify_stdout.contains("fresh worktree root is unbound"),
+        "verify must preserve DB certification while reporting unavailable retention; stdout:\n{verify_stdout}"
+    );
+    assert!(
+        !repo.join(".aethyme/worktrees").exists(),
+        "deploy verify must not provision the unbound worktree root"
+    );
+    assert!(
+        !host_worktree_container.exists(),
+        "deploy verify must not provision the captured host-state worktree container"
+    );
+
+    let doctor = first_deploy_command(&repo)
+        .args(["broker", "status", "doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["integrity"], "ok", "{doctor}");
+    assert!(doctor["retention"].is_null(), "{doctor}");
+    assert!(
+        doctor["retention_unavailable_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("fresh worktree root is unbound")),
+        "{doctor}"
+    );
+    assert!(
+        host_state.join("host-operations.db").is_file(),
+        "the first-deploy CLI must keep host operations in fixture-owned state"
+    );
+    assert!(
+        host_state.join("host-resources.db").is_file(),
+        "the first-deploy CLI must keep host resources in fixture-owned state"
+    );
+    assert!(
+        temp.path().join("first-deploy-host-cache").is_dir(),
+        "the first-deploy CLI must use fixture-owned host cache"
     );
 }
 

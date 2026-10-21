@@ -1323,7 +1323,13 @@ pub struct DoctorReport {
     /// retention for databases written before leases were purged on clean.
     pub purged_stale_leases: usize,
     /// Read-only retention candidates and any already-authorized recovery.
-    pub retention: crate::GcHealth,
+    /// `None` means no root-dependent retention inventory was run.
+    pub retention: Option<crate::GcHealth>,
+    /// Why retention could not be inspected. This is present only when
+    /// `retention` is `None`; unavailable health is never represented as
+    /// synthetic zero counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_unavailable_reason: Option<String>,
     /// Present when live sessions can still submit and move integration;
     /// never in a verify-only repository.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1414,6 +1420,7 @@ impl DoctorReport {
         self.deferred_checks.is_empty()
             && self.integrity == "ok"
             && self.missing_worktrees.is_empty()
+            && self.retention.is_some()
             && version_ok
     }
 }

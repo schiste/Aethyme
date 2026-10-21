@@ -90,11 +90,29 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
             ..make("issues/1/comments", r#"["gh","api"]"#)
         })
         .unwrap();
-    let mut command = common::broker_cli(CLI, &["status"]);
+    let owner = tmp
+        .owner_path()
+        .canonicalize()
+        .expect("canonicalize fixture owner");
+    let repository = tmp
+        .path()
+        .canonicalize()
+        .expect("canonicalize fixture repository");
+    let host_state = common::fixture_host_state_dir(&owner);
+    let mut command = common::broker_cli_for_fixture(CLI, &["status"], &owner);
+    command
+        .env("AETHYME_BROKER_DB", repository.join(".aethyme/broker.db"))
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", owner.join("worktrees"))
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        );
     command.current_dir(tmp.path());
-    broker
-        .configure_storage_context_for_child(&mut command)
-        .unwrap();
     drop(broker);
 
     let output = command.output().unwrap();
