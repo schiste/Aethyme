@@ -310,7 +310,7 @@ impl Broker {
     }
 
     /// Recorded blocker observations for routine status. Recovery commands need
-    /// fresh worktree inspection and are deliberately deferred to `broker blockers`.
+    /// fresh worktree inspection and are deliberately deferred to `broker unblock`.
     pub(crate) fn blocker_status_advice_snapshot(&self) -> Vec<crate::StatusAdvice> {
         let report = self.collect_blockers(false);
         let mut advice = Vec::new();
@@ -327,9 +327,9 @@ impl Broker {
                 })
                 .count();
             item.summary = format!(
-                "{count} blocker observations across broker stores; run `aethyme broker blockers` to inspect recovery remedies"
+                "{count} blocker observations across broker stores; run `aethyme broker unblock` to inspect recovery remedies"
             );
-            item.commands = vec!["aethyme broker blockers".into()];
+            item.commands = vec!["aethyme broker unblock".into()];
             advice.push(item);
         }
         if !report.unavailable.is_empty() {
@@ -348,7 +348,7 @@ impl Broker {
                     .into_iter()
                     .map(|error| format!("{}: {}", error.source, error.error))
                     .collect(),
-                commands: vec!["aethyme broker blockers".into()],
+                commands: vec!["aethyme broker unblock".into()],
             });
         }
         advice
