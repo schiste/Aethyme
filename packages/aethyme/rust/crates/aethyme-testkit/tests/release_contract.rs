@@ -20,6 +20,44 @@ fn manifest(path: &Path) -> toml::Value {
     toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
+fn workflow_step_block<'a>(workflow: &'a str, name: &str) -> &'a str {
+    let marker = format!("      - name: {name}\n");
+    let start = workflow
+        .find(&marker)
+        .unwrap_or_else(|| panic!("workflow step {name:?} is missing"));
+    let tail = &workflow[start..];
+    let end = tail[marker.len()..]
+        .find("\n      - name:")
+        .map(|end| marker.len() + end)
+        .unwrap_or(tail.len());
+    &tail[..end]
+}
+
+fn workflow_step_script(workflow: &str, name: &str) -> String {
+    let block = workflow_step_block(workflow, name);
+    let marker = "        run: |\n";
+    let start = block
+        .find(marker)
+        .unwrap_or_else(|| panic!("workflow step {name:?} has no literal run block"))
+        + marker.len();
+    let mut script = String::new();
+    for line in block[start..].lines() {
+        if line.is_empty() {
+            script.push('\n');
+        } else if let Some(line) = line.strip_prefix("          ") {
+            script.push_str(line);
+            script.push('\n');
+        } else {
+            break;
+        }
+    }
+    assert!(
+        !script.is_empty(),
+        "workflow step {name:?} has an empty run block"
+    );
+    script
+}
+
 fn product_version() -> String {
     manifest(&rust_workspace_root().join("Cargo.toml"))["workspace"]["package"]["version"]
         .as_str()
@@ -589,6 +627,205 @@ fn homebrew_tap_workflow_publishes_from_the_signed_manifest() {
 }
 
 #[test]
+#[cfg(unix)]
+fn release_signing_uses_retry_safe_legacy_cosign_and_preserves_standard_bundle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let repository = aethyme_testkit::paths::repo_root();
+    let release =
+        std::fs::read_to_string(repository.join(".github/workflows/release.yml")).unwrap();
+    let homebrew =
+        std::fs::read_to_string(repository.join(".github/workflows/homebrew-tap.yml")).unwrap();
+    let legacy_install = workflow_step_block(&release, "Install retry-safe legacy Cosign signer");
+    assert!(legacy_install.contains("cosign-release: v2.6.5"));
+    assert!(legacy_install.contains("install-dir: ${{ runner.temp }}/cosign-v2.6.5"));
+    let modern_install =
+        workflow_step_block(&release, "Install standard-bundle converter and verifier");
+    assert!(modern_install.contains("cosign-release: v3.1.3"));
+    assert!(modern_install.contains("install-dir: ${{ runner.temp }}/cosign-v3.1.3"));
+    let homebrew_install = workflow_step_block(&homebrew, "Install Cosign");
+    assert!(homebrew_install.contains("cosign-release: v3.1.3"));
+    let homebrew_verify =
+        workflow_step_block(&homebrew, "Verify signed manifest and regenerate formula");
+    assert!(homebrew_verify.contains("--certificate-identity"));
+    assert!(homebrew_verify.contains("--certificate-oidc-issuer"));
+    assert!(!homebrew_verify.contains("--ignore-tlog"));
+
+    let sign_script = workflow_step_script(
+        &release,
+        "Sign release assets with retry-safe legacy Cosign",
+    );
+    let convert_script = workflow_step_script(
+        &release,
+        "Create standard bundles and verify release assets",
+    );
+    assert!(
+        workflow_step_block(
+            &release,
+            "Sign release assets with retry-safe legacy Cosign"
+        )
+        .contains("COSIGN_V2: ${{ runner.temp }}/cosign-v2.6.5/cosign")
+    );
+    assert!(
+        workflow_step_block(
+            &release,
+            "Create standard bundles and verify release assets"
+        )
+        .contains("COSIGN_V3: ${{ runner.temp }}/cosign-v3.1.3/cosign")
+    );
+    for forbidden in ["--ignore-tlog", "--tlog-upload=false", "--offline"] {
+        assert!(!sign_script.contains(forbidden));
+        assert!(!convert_script.contains(forbidden));
+    }
+
+    let fixture = tempfile::Builder::new()
+        .prefix("aethyme cosign release contract ")
+        .tempdir()
+        .unwrap();
+    let fixture_root = fixture.path();
+    let runner_temp = fixture_root.join("runner temp");
+    let dist = fixture_root.join("dist");
+    std::fs::create_dir_all(&runner_temp).unwrap();
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("release-manifest.json"), "fixture manifest\n").unwrap();
+    let zip_relative = "dist/aethyme-v0.8.29-x86_64-pc-windows-msvc.zip";
+    std::fs::write(fixture_root.join(zip_relative), "fixture zip\n").unwrap();
+
+    let legacy_cosign = runner_temp.join("cosign-v2.6.5/cosign");
+    let modern_cosign = runner_temp.join("cosign-v3.1.3/cosign");
+    std::fs::create_dir_all(legacy_cosign.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(modern_cosign.parent().unwrap()).unwrap();
+    let trace = fixture_root.join("cosign trace.txt");
+    executable(
+        &legacy_cosign,
+        r#"#!/bin/sh
+set -eu
+printf 'v2:%s\n' "${1:-}" >> "$COSIGN_TRACE"
+[ "${1:-}" = sign-blob ] || exit 91
+[ "$#" -eq 7 ] || exit 92
+[ "$2" = --yes ] && [ "$3" = --new-bundle-format=false ] && [ "$4" = --use-signing-config=false ] && [ "$5" = --bundle ] || exit 93
+bundle="$6"
+artifact="$7"
+case "$artifact" in
+  dist/release-manifest.json|dist/aethyme-v0.8.29-x86_64-pc-windows-msvc.zip) ;;
+  *) exit 94 ;;
+esac
+mkdir -p "$(dirname "$bundle")"
+[ -f "$artifact" ] || exit 95
+printf 'legacy bundle\n' > "$bundle"
+"#,
+    );
+    executable(
+        &modern_cosign,
+        r#"#!/bin/sh
+set -eu
+for arg do
+  case "$arg" in --ignore-tlog|--tlog-upload=false|--offline) exit 94 ;; esac
+done
+printf 'v3:%s %s\n' "${1:-}" "${2:-}" >> "$COSIGN_TRACE"
+case "${1:-} ${2:-}" in
+  "bundle create")
+    shift 2
+    artifact=
+    bundle=
+    out=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --artifact) shift; artifact="${1:?}" ;;
+        --bundle) shift; bundle="${1:?}" ;;
+        --out) shift; out="${1:?}" ;;
+        *) exit 95 ;;
+      esac
+      shift
+    done
+    [ -f "$artifact" ] && [ -f "$bundle" ] && [ -n "$out" ] || exit 96
+    printf 'standard bundle\n' > "$out"
+    ;;
+  verify-blob*)
+    shift
+    bundle=
+    identity=
+    issuer=
+    artifact=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --bundle) shift; bundle="${1:?}" ;;
+        --certificate-identity) shift; identity="${1:?}" ;;
+        --certificate-oidc-issuer) shift; issuer="${1:?}" ;;
+        --*) exit 97 ;;
+        *) [ -z "$artifact" ] || exit 98; artifact="$1" ;;
+      esac
+      shift
+    done
+    expected_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}"
+    [ -f "$bundle" ] && [ -f "$artifact" ] || exit 99
+    [ "$identity" = "$expected_identity" ] || exit 100
+    [ "$issuer" = https://token.actions.githubusercontent.com ] || exit 101
+    ;;
+  *) exit 102 ;;
+esac
+"#,
+    );
+
+    let run_script = |script: &str| {
+        Command::new("bash")
+            .args(["-euo", "pipefail", "-c", script])
+            .current_dir(fixture_root)
+            .env("RUNNER_TEMP", &runner_temp)
+            .env("COSIGN_V2", &legacy_cosign)
+            .env("COSIGN_V3", &modern_cosign)
+            .env("COSIGN_TRACE", &trace)
+            .env("GITHUB_REPOSITORY", "schiste/Aethyme")
+            .env("REF_NAME", "v0.8.29")
+            .output()
+            .unwrap()
+    };
+    let sign = run_script(&sign_script);
+    assert!(
+        sign.status.success(),
+        "legacy signing step failed: {}",
+        String::from_utf8_lossy(&sign.stderr)
+    );
+    let convert = run_script(&convert_script);
+    assert!(
+        convert.status.success(),
+        "standard bundle conversion/verification step failed: {}",
+        String::from_utf8_lossy(&convert.stderr)
+    );
+
+    let signature_dir = runner_temp.join("aethyme-release-signatures");
+    assert!(signature_dir.join("release-manifest.legacy.json").exists());
+    assert!(
+        signature_dir
+            .join("aethyme-v0.8.29-x86_64-pc-windows-msvc.legacy.json")
+            .exists()
+    );
+    assert!(dist.join("release-manifest.sigstore.json").exists());
+    assert!(
+        fixture_root
+            .join(format!("{zip_relative}.sigstore.json"))
+            .exists()
+    );
+    assert!(!dist.join("release-manifest.legacy.json").exists());
+
+    let expected_trace = [
+        "v2:sign-blob",
+        "v2:sign-blob",
+        "v3:bundle create",
+        "v3:verify-blob --bundle",
+        "v3:bundle create",
+        "v3:verify-blob --bundle",
+    ];
+    let trace = std::fs::read_to_string(trace).unwrap();
+    assert_eq!(trace.lines().collect::<Vec<_>>(), expected_trace);
+}
+
+#[test]
 fn reviewed_homebrew_formula_installs_the_published_binary_pair() {
     let formula = std::fs::read_to_string(
         aethyme_testkit::paths::repo_root().join("packaging/homebrew/Formula/aethyme.rb"),
@@ -819,7 +1056,8 @@ fn windows_release_builds_and_smokes_the_native_zip() {
         "needs: [build, build-windows]",
         "windows_count",
         "test \"$windows_count\" = \"1\"",
-        "Sign and verify the detached Windows zip",
+        "Sign release assets with retry-safe legacy Cosign",
+        "Create standard bundles and verify release assets",
     ] {
         assert!(
             release.contains(fragment),

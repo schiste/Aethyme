@@ -1946,15 +1946,21 @@ debug = \"line-tables-only\"
 pub(super) fn write_worktree_build_defaults(root: &Path) -> std::io::Result<()> {
     let directory = root.join(".cargo");
     let config = directory.join("config.toml");
-    if config.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(&config) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     std::fs::create_dir_all(&directory)?;
-    let temporary = directory.join(format!(".config.{}.{}.tmp", std::process::id(), now_ms()));
-    std::fs::write(&temporary, WORKTREE_CARGO_CONFIG)?;
-    // Rename so a worktree created concurrently never reads a half-written
-    // config and builds with a truncated profile.
-    std::fs::rename(&temporary, &config).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temporary);
-    })
+    if !is_real_directory(&directory) {
+        return Err(std::io::Error::other(
+            "worktree Cargo defaults require a real directory",
+        ));
+    }
+    crate::atomic_file::write_synced_if_absent(&config, WORKTREE_CARGO_CONFIG.as_bytes())?;
+    // Persist a newly created .cargo entry as well as the config entry synced
+    // by the shared writer. Directory syncing is supported on Unix only.
+    #[cfg(unix)]
+    std::fs::File::open(root)?.sync_all()?;
+    Ok(())
 }
