@@ -496,7 +496,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--confirm",
         ],
     ),
-    ("status", &["--summary", "--refresh"]),
+    ("status", &["--summary", "--refresh", "--compact"]),
     ("events", &["--since", "--kind", "--follow"]),
     ("events prune", &["--keep-days"]),
     ("metrics", &[]),
