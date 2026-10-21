@@ -87,6 +87,18 @@ impl Fixture {
         }
     }
 
+    fn broker(&self) -> Broker {
+        let root = self._owner.path().canonicalize().unwrap();
+        let options = BrokerOpenOptions::default()
+            .with_host_state_dir(&self.state)
+            .with_host_cache_dir(root.join("host-cache"))
+            .with_host_operation_database(self.state.join("host-operations.db"))
+            .with_worktree_root(&self.worktree_root)
+            .with_collaboration_state(root.join("collaboration"))
+            .with_preparation_cache_root(root.join("preparation-cache"));
+        Broker::open_with_options(&root.join("repository"), options).unwrap()
+    }
+
     fn run(&self, script: &str, json: bool) -> Output {
         let mut command = Command::new(CLI);
         command.args(["advanced", "exec", "--session", &self.session.to_string()]);
@@ -324,4 +336,54 @@ fn guard_status_snapshots_match_existing_queries_for_renames_and_named_untracked
         value["modified_preexisting_dirty_paths"],
         serde_json::json!(["renamed -> tracked.txt"])
     );
+}
+
+#[test]
+fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
+    let fixture = Fixture::new(Some("tracked.txt"));
+    let mut broker = fixture.broker();
+    let other = broker.start_worktree("overlapping owner", None).unwrap();
+    // Fixture setup records both owners without pre-classifying their pair.
+    broker
+        .store()
+        .claim_lease(other.id, "tracked.txt", None)
+        .unwrap();
+    std::fs::write(fixture.worktree.join("tracked.txt"), "acting edit\n").unwrap();
+    std::fs::write(
+        Path::new(&other.worktree_path).join("tracked.txt"),
+        "other edit\n",
+    )
+    .unwrap();
+    let overlaps = broker.refresh_leases().unwrap();
+    let pairs = broker.overlap_pairs_snapshot(&overlaps);
+    assert_eq!(pairs.len(), 1);
+    assert!(
+        pairs[0].classified,
+        "fixture must start with a cached diagnosis"
+    );
+    drop(broker);
+
+    let output = fixture.run("true", true);
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ownership_ok"], true);
+    let mut broker = fixture.broker();
+    let pairs = broker.overlap_pairs_snapshot(&overlaps);
+    assert_eq!(pairs.len(), 1);
+    assert!(
+        !pairs[0].classified,
+        "deferred diagnostics must not appear current"
+    );
+    assert!(pairs[0].reason.contains("guarded exec deferred"));
+    // The performance change must retain the acting session's refreshed
+    // implicit lease, even though its dirty file was not changed by the child.
+    assert!(broker.store().active_leases().unwrap().iter().any(|lease| {
+        lease.session_id == fixture.session
+            && lease.path == "tracked.txt"
+            && lease.kind == aethyme_broker::LeaseKind::Implicit
+    }));
+    // Explicit refresh still performs the deferred diagnosis. This is also a
+    // positive control proving the fixture really has an analyzable overlap.
+    let overlaps = broker.refresh_leases().unwrap();
+    assert!(broker.overlap_pairs_snapshot(&overlaps)[0].classified);
 }

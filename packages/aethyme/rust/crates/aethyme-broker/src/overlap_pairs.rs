@@ -379,6 +379,31 @@ impl Broker {
         pairs
     }
 
+    /// Refresh recorded overlap geometry without reading worktrees or simulating
+    /// merges. A guard does not need conflict verdicts; mark them unclassified so
+    /// status cannot mistake an earlier cached result for a current diagnosis.
+    /// Retain announcement signatures to avoid repeating unchanged findings at
+    /// the next ordinary refresh, and forget pairs that stopped overlapping.
+    pub(crate) fn defer_overlap_classification(
+        &mut self,
+        overlaps: &[Overlap],
+    ) -> Result<(), BrokerOpError> {
+        let grouped = group_overlaps(overlaps);
+        let mut cache = self.overlap_pair_cache();
+        cache.retain(|key, _| grouped.keys().any(|pair| pair_key_string(*pair) == *key));
+        for key in grouped.keys() {
+            let entry = cache.entry(pair_key_string(*key)).or_default();
+            entry.input_key.clear();
+            entry.severity = None;
+            entry.conflicting_paths.clear();
+            entry.classified = false;
+            entry.reason = "not classified: guarded exec deferred merge diagnostics; run aethyme broker status --refresh".into();
+        }
+        self.store()
+            .meta_set(PAIR_CACHE_META_KEY, &serde_json::to_string(&cache)?)?;
+        Ok(())
+    }
+
     /// Classify every overlapping pair whose inputs changed, and emit one
     /// `lease.overlap` event per pair that started overlapping or whose
     /// severity or conflicting paths changed. Returns the ranked pairs.
