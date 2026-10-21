@@ -117,6 +117,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.
+  Complete fixture branch/ref setup before opening the broker whenever
+  possible: its live default database may be .aethyme/broker.db, and a later
+  git add -A can commit it. Before any post-open branch switch, assert the
+  database and WAL paths are absent from git ls-files; stage exact fixture
+  paths so a checkout cannot unlink a live SQLite database.
 - In shell shims that branch on a child process's working directory, inspect it
   with `pwd -P` and compare it with an explicitly passed canonical fixture path.
   Rust `Command::current_dir` changes the child's directory without rewriting
@@ -338,6 +343,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   check child output on the intended stream separately. A report may retain
   the original command arguments, so searching its serialized text for a child
   marker cannot establish output isolation. Assert command metadata separately.
+- For CLI subprocess-count regressions, trace the complete invoked path,
+  including contract preflight, human-only rendering, and the operation itself.
+  Derive expectations from the exact argv and fixture preconditions; use JSON
+  mode when human rendering is outside the behavior under test, and retain an
+  intended guard-removal failure plus a restored positive to prove the count
+  detects the removed optimization.
 - For a production guard that must prevent side effects, test the real entrypoint
   with a fixture command that writes a unique sentinel. Assert the typed refusal
   and sentinel absence, then remove only the call-site guard in a mutation run
@@ -347,7 +358,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unmodified source, with the deliberate break, and after byte-for-byte
   restoration. Require positive, intended runtime failure, positive; a compile
   failure or a test that also fails without the break does not validate the
-  guard. A passing adjacent suite cannot replace either positive run.
+  guard. Classify a negative control by the exact selected test, exit status,
+  and expected failure message; a custom Rust panic need not contain the
+  literal word `assertion`. A passing adjacent suite cannot replace either
+  positive run.
   Freeze the intended review snapshot before running mutations, or build it
   from the intended commit and selected patch. Exclude an in-flight deliberate
   mutation from the review snapshot so it is not mistaken for proposed code.

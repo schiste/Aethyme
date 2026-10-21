@@ -496,6 +496,144 @@ pub struct SubmissionPlan {
     pub warnings: Vec<String>,
 }
 
+/// Inputs that determine commit provenance in `build_submission_plan`.
+/// Kept beside, rather than inside, the public plan so reusing one within a
+/// single submit does not change the serialized plan contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubmissionPlanInputs {
+    session_id: i64,
+    session_head: String,
+    integration_head: String,
+    accepted_session_head: Option<String>,
+    diff_base: Option<String>,
+    adoption_base: Option<String>,
+}
+
+impl SubmissionPlanInputs {
+    fn new(session: &crate::types::Session, session_head: &str, integration_head: &str) -> Self {
+        Self {
+            session_id: session.id,
+            session_head: session_head.to_string(),
+            integration_head: integration_head.to_string(),
+            accepted_session_head: session.accepted_session_head.clone(),
+            diff_base: session.diff_base.clone(),
+            adoption_base: session.adoption_base.clone(),
+        }
+    }
+}
+
+/// A preflight plan that may be reused only by the submit invocation that
+/// produced it, and only after all of its inputs are reread unchanged.
+#[derive(Debug)]
+struct PreparedSubmissionPlan {
+    inputs: SubmissionPlanInputs,
+    plan: SubmissionPlan,
+}
+
+/// A plan that can be reused only while holding the repository lock shared
+/// with coordinated local Git writes.
+struct PreparedSubmissionReuse {
+    prepared: PreparedSubmissionPlan,
+    repository_write_lock: crate::operations::RepositoryWriteLock,
+}
+
+/// Base references resolved for one queue-entry simulation.
+struct SimulationBase {
+    base: String,
+    pre_refresh: Option<String>,
+}
+
+impl PreparedSubmissionPlan {
+    fn new(
+        session: &crate::types::Session,
+        session_head: &str,
+        integration_head: &str,
+        plan: SubmissionPlan,
+    ) -> Self {
+        Self {
+            inputs: SubmissionPlanInputs::new(session, session_head, integration_head),
+            plan,
+        }
+    }
+
+    fn matches(
+        &self,
+        entry: &MergeQueueEntry,
+        session: &crate::types::Session,
+        session_head: &str,
+        integration_head: &str,
+    ) -> bool {
+        entry.session_id == self.inputs.session_id
+            && entry.head_commit == self.inputs.session_head
+            && entry.base_commit == self.inputs.integration_head
+            && self.inputs == SubmissionPlanInputs::new(session, session_head, integration_head)
+    }
+}
+
+fn build_or_reuse_submission_plan(
+    repo: &GitRepo,
+    prepared: Option<PreparedSubmissionPlan>,
+    entry: &MergeQueueEntry,
+    session: &crate::types::Session,
+    session_head: &str,
+    integration_head: &str,
+    build: impl FnOnce() -> Result<SubmissionPlan, BrokerOpError>,
+) -> Result<SubmissionPlan, BrokerOpError> {
+    if let Some(prepared) = prepared
+        && prepared.matches(entry, session, session_head, integration_head)
+        // An incomplete or overridden Git history can change the graph view
+        // without changing these object IDs. Reuse only in the ordinary,
+        // complete history view, checked again after the preflight pass.
+        && repo.has_complete_unmodified_history().unwrap_or(false)
+    {
+        return Ok(prepared.plan);
+    }
+    build()
+}
+
+fn try_submission_plan_reuse_lock(
+    main_root: &Path,
+    repo: &GitRepo,
+    store: &crate::BrokerStore,
+) -> Option<crate::operations::RepositoryWriteLock> {
+    let (repository, lock) =
+        match crate::operations::try_acquire_local_repository_write_lock(main_root, repo) {
+            Ok(Some(locked)) => locked,
+            Ok(None) => return None,
+            Err(error) => {
+                crate::warn_unrecorded(
+                    "acquire optional submission-plan history lock",
+                    Err::<(), _>(error),
+                );
+                return None;
+            }
+        };
+
+    // Do not plan under a history view that the coordinated writer lock does
+    // not make complete. A shallow boundary, replace ref, or graft keeps the
+    // established fresh-plan behavior.
+    if repo.has_complete_unmodified_history().unwrap_or(false) {
+        match crate::operations::has_unresolved_repository_wide_mutation(store, &repository) {
+            Ok(false) => Some(lock),
+            Ok(true) => {
+                drop(lock);
+                None
+            }
+            Err(error) => {
+                drop(lock);
+                crate::warn_unrecorded(
+                    "inspect unresolved operations before submission-plan reuse",
+                    Err::<(), _>(error),
+                );
+                None
+            }
+        }
+    } else {
+        drop(lock);
+        None
+    }
+}
+
 impl SubmissionPlan {
     pub(crate) fn pending_owned_commit_ids(&self) -> Vec<String> {
         self.commits
@@ -595,6 +733,13 @@ impl SubmissionReplay {
 }
 
 impl Broker {
+    #[cfg(test)]
+    fn observe_submission_plan_test_phase(&self, phase: crate::broker::SubmissionPlanTestPhase) {
+        if let Some(observer) = &self.submission_plan_test_observer {
+            observer(phase);
+        }
+    }
+
     /// Build the exact plan used by submission before creating a queue entry
     /// or running gates. Verify-only repositories use the same fetched-default
     /// base as submit, while the plan remains read-only when falling back to
@@ -798,24 +943,46 @@ impl Broker {
 
         // Provenance and replay planning are deterministic and ref-free. Run
         // them before creating a live queue row so a fail-closed ownership
-        // decision cannot leave behind misleading `submitted` residue. The
-        // persisted entry is still planned again against the then-current
-        // integration tip below, because another process may move that ref.
+        // decision cannot leave behind misleading `submitted` residue.
+        // Keep the plan only as submit-invocation state: simulation rereads
+        // the current session, base, and history inputs, reusing this plan only
+        // when they still match and rebuilding it otherwise.
+        // A coordinated `git replace` write can change provenance without
+        // changing captured commit IDs. Reuse is optional: when the shared
+        // repository lock is busy or unavailable, keep the ordinary fresh
+        // planning path instead.
         progress.phase("planning the submission");
-        let planning = self
+        let reuse_lock = try_submission_plan_reuse_lock(
+            &self.main_root_path(),
+            self.repo_handle(),
+            self.store_ref(),
+        );
+        let plan = self
             .build_submission_plan(&session, &head, &base)
-            .and_then(|plan| self.replay_submission_plan(&plan).map(|_| ()));
-        if let Err(error) = planning {
-            self.store().append_event(
-                crate::events::MERGE_SUBMISSION_PLANNING_FAILED,
-                Some(session_id),
-                Some(&crate::events::merge_submission_planning_failed_payload(
-                    &head,
-                    submission_planning_failure_class(&error),
-                )),
-            )?;
-            return Err(error);
-        }
+            .and_then(|plan| self.replay_submission_plan(&plan).map(|_| plan));
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                drop(reuse_lock);
+                self.store().append_event(
+                    crate::events::MERGE_SUBMISSION_PLANNING_FAILED,
+                    Some(session_id),
+                    Some(&crate::events::merge_submission_planning_failed_payload(
+                        &head,
+                        submission_planning_failure_class(&error),
+                    )),
+                )?;
+                return Err(error);
+            }
+        };
+        let prepared_plan = reuse_lock.map(|repository_write_lock| PreparedSubmissionReuse {
+            prepared: PreparedSubmissionPlan::new(&session, &head, &base, plan),
+            repository_write_lock,
+        });
+        #[cfg(test)]
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::PreflightPlanReady,
+        );
 
         // Planning can be expensive. Refuse if the checkout changed identity
         // while it ran so a branch switch or new head cannot redirect the
@@ -848,8 +1015,13 @@ impl Broker {
             self.store()
                 .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
         }
-        let mut outcome =
-            self.simulate_and_gate_with_policy(entry.id, cache_policy, intent, Some(&progress))?;
+        let mut outcome = self.simulate_and_gate_with_policy(
+            entry.id,
+            cache_policy,
+            intent,
+            Some(&progress),
+            prepared_plan,
+        )?;
         outcome.lease_warnings = ownership.warned_leases;
         Ok(outcome)
     }
@@ -897,6 +1069,7 @@ impl Broker {
             crate::gates::CachePolicy::Use,
             PromotionIntent::Configured,
             None,
+            None,
         )
     }
 
@@ -906,6 +1079,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
         progress: Option<&crate::submit_progress::SubmitProgress>,
+        prepared_plan: Option<PreparedSubmissionReuse>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // #42: remember where the integration branch stood BEFORE the
         // follows-main refresh. Gate selection must diff against this —
@@ -931,9 +1105,9 @@ impl Broker {
             entry_id,
             cache_policy,
             intent,
-            base,
-            pre_refresh,
+            SimulationBase { base, pre_refresh },
             progress,
+            prepared_plan,
         )?;
         outcome.verified_against = Some(verification);
         Ok(outcome)
@@ -944,10 +1118,11 @@ impl Broker {
         entry_id: i64,
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
-        base: String,
-        pre_refresh: Option<String>,
+        simulation_base: SimulationBase,
         progress: Option<&crate::submit_progress::SubmitProgress>,
+        prepared_plan: Option<PreparedSubmissionReuse>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
+        let SimulationBase { base, pre_refresh } = simulation_base;
         let entry = self
             .store()
             .merge_queue()?
@@ -959,8 +1134,23 @@ impl Broker {
         // promotion), and the base may have moved onto a new policy. Checked
         // before the entry changes state, so a refusal leaves it as it was.
         self.require_trusted_policy_at_commit(&base, Some(entry.session_id))?;
-        let mut submission_plan =
-            self.build_submission_plan(&session, &entry.head_commit, &base)?;
+        let (prepared_plan, repository_write_lock) = match prepared_plan {
+            Some(reuse) => (Some(reuse.prepared), Some(reuse.repository_write_lock)),
+            None => (None, None),
+        };
+        #[cfg(test)]
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::ConsumerStarting,
+        );
+        let mut submission_plan = build_or_reuse_submission_plan(
+            self.repo_handle(),
+            prepared_plan,
+            &entry,
+            &session,
+            &entry.head_commit,
+            &base,
+            || self.build_submission_plan(&session, &entry.head_commit, &base),
+        )?;
 
         if let Some(progress) = progress {
             progress.phase("simulating the merge");
@@ -972,6 +1162,11 @@ impl Broker {
                 .changed_between(&base, &simulation.tree)?;
         }
         let base_tree = self.repo_handle().commit_tree_id(&base)?;
+        #[cfg(test)]
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
+        );
+        drop(repository_write_lock);
         let main_checkout_session = Path::new(&session.worktree_path) == self.main_root_path();
         self.store()
             .set_merge_status(entry.id, MergeStatus::Simulating, None, None)?;
@@ -2647,9 +2842,25 @@ mod owned_merge_history_tests {
     use super::*;
 
     fn git(root: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        let output = command
             .args(args)
             .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", root.join("missing-system-gitconfig"))
+            .env("GIT_CONFIG_GLOBAL", root.join("missing-global-gitconfig"))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_AUTHOR_NAME", "History Test")
             .env("GIT_AUTHOR_EMAIL", "history@example.invalid")
             .env("GIT_COMMITTER_NAME", "History Test")
@@ -2705,6 +2916,636 @@ mod owned_merge_history_tests {
             .unwrap();
         assert!(broker.can_preserve_owned_merge_history(&plan).unwrap());
         (tmp, broker, plan)
+    }
+
+    #[test]
+    fn prepared_submission_plan_rebuilds_after_base_or_session_inputs_move() {
+        let (tmp, mut broker, original) = fixture();
+        let root = tmp.path();
+        let session = broker.store().session(original.session_id).unwrap();
+        let entry = broker
+            .store()
+            .submit(
+                session.id,
+                &original.session_head,
+                &original.integration_head,
+            )
+            .unwrap();
+        let base = original.integration_head.clone();
+
+        let unchanged = build_or_reuse_submission_plan(
+            broker.repo_handle(),
+            Some(PreparedSubmissionPlan::new(
+                &session,
+                &original.session_head,
+                &base,
+                original.clone(),
+            )),
+            &entry,
+            &session,
+            &original.session_head,
+            &base,
+            || panic!("unchanged inputs must reuse the preflight plan"),
+        )
+        .unwrap();
+        assert_eq!(unchanged, original);
+
+        for (label, changed_session, changed_head, changed_base) in [
+            (
+                "session id",
+                {
+                    let mut changed = session.clone();
+                    changed.id += 1;
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "accepted checkpoint",
+                {
+                    let mut changed = session.clone();
+                    changed.accepted_session_head = Some("new accepted checkpoint".into());
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "diff base",
+                {
+                    let mut changed = session.clone();
+                    changed.diff_base = Some("new diff base".into());
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "adoption base",
+                {
+                    let mut changed = session.clone();
+                    changed.adoption_base = Some("new adoption base".into());
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "session head",
+                session.clone(),
+                format!("{}-moved", original.session_head),
+                base.clone(),
+            ),
+            (
+                "integration base",
+                session.clone(),
+                original.session_head.clone(),
+                format!("{}-moved", base),
+            ),
+        ] {
+            let build_calls = std::cell::Cell::new(0);
+            let rebuilt = build_or_reuse_submission_plan(
+                broker.repo_handle(),
+                Some(PreparedSubmissionPlan::new(
+                    &session,
+                    &original.session_head,
+                    &base,
+                    original.clone(),
+                )),
+                &entry,
+                &changed_session,
+                &changed_head,
+                &changed_base,
+                || {
+                    build_calls.set(build_calls.get() + 1);
+                    Ok(original.clone())
+                },
+            )
+            .unwrap();
+            assert_eq!(build_calls.get(), 1, "{label} changes require a fresh plan");
+            assert_eq!(rebuilt, original);
+        }
+
+        // Move the actual integration ref after the cached plan was prepared.
+        // The caller's freshly resolved base must therefore take the builder
+        // path and produce provenance bound to that new commit.
+        git(root, &["switch", "-q", "main"]);
+        edit(root, "fresh-integration-base.txt", "fresh base\n");
+        let moved_base = git(root, &["rev-parse", "HEAD"]);
+        git(
+            root,
+            &["update-ref", "refs/heads/aethyme/integration", &moved_base],
+        );
+        assert_eq!(
+            broker
+                .repo_handle()
+                .resolve_ref("refs/heads/aethyme/integration")
+                .as_deref(),
+            Some(moved_base.as_str())
+        );
+        let build_calls = std::cell::Cell::new(0);
+        let rebuilt = build_or_reuse_submission_plan(
+            broker.repo_handle(),
+            Some(PreparedSubmissionPlan::new(
+                &session,
+                &original.session_head,
+                &base,
+                original.clone(),
+            )),
+            &entry,
+            &session,
+            &entry.head_commit,
+            &moved_base,
+            || {
+                build_calls.set(build_calls.get() + 1);
+                broker.build_submission_plan(&session, &entry.head_commit, &moved_base)
+            },
+        )
+        .unwrap();
+        assert_eq!(build_calls.get(), 1);
+        assert_eq!(rebuilt.integration_head, moved_base);
+    }
+
+    #[test]
+    fn prepared_submission_plan_rebuilds_when_git_history_view_is_overridden() {
+        let (tmp, mut broker, original) = fixture();
+        let root = tmp.path().canonicalize().unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        let session = broker.store().session(original.session_id).unwrap();
+        let base = original.integration_head.clone();
+        let entry = broker
+            .store()
+            .submit(session.id, &original.session_head, &base)
+            .unwrap();
+        assert!(
+            broker
+                .repo_handle()
+                .has_complete_unmodified_history()
+                .unwrap(),
+            "fixture starts with the ordinary Git history view"
+        );
+        assert!(
+            try_submission_plan_reuse_lock(&root, broker.repo_handle(), broker.store_ref())
+                .is_some(),
+            "a complete history with canonical origin should allow plan reuse"
+        );
+
+        // Replace the pinned base with a same-tree root commit. The plan's
+        // object IDs remain unchanged, but Git now exposes a different graph.
+        let replacement = broker
+            .repo_handle()
+            .commit_tree(
+                &broker.repo_handle().commit_tree_id(&base).unwrap(),
+                &[],
+                "same-tree history-view replacement",
+                &crate::attribution::Attribution::broker_only(),
+            )
+            .unwrap();
+        git(&root, &["replace", &base, &replacement]);
+        assert!(
+            !broker
+                .repo_handle()
+                .has_complete_unmodified_history()
+                .unwrap()
+        );
+        assert!(
+            try_submission_plan_reuse_lock(&root, broker.repo_handle(), broker.store_ref())
+                .is_none(),
+            "a persistent replacement ref must disable the reuse lease"
+        );
+
+        let build_calls = std::cell::Cell::new(0);
+        let rebuilt = build_or_reuse_submission_plan(
+            broker.repo_handle(),
+            Some(PreparedSubmissionPlan::new(
+                &session,
+                &original.session_head,
+                &base,
+                original.clone(),
+            )),
+            &entry,
+            &session,
+            &entry.head_commit,
+            &base,
+            || {
+                build_calls.set(build_calls.get() + 1);
+                Ok(original.clone())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            build_calls.get(),
+            1,
+            "history overrides require a fresh plan"
+        );
+        assert_eq!(rebuilt, original);
+    }
+
+    fn wait_for_writer_waiter(
+        root: &Path,
+        repository: &str,
+        session_id: i64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let waiting = crate::waiters::current_waiters(root, crate::clock::epoch_ms())
+                .into_iter()
+                .any(|waiter| {
+                    waiter.alive
+                        && waiter.session_id == Some(session_id)
+                        && waiter.kind == crate::waiters::WAIT_COORDINATED_WRITE_LOCK
+                        && waiter.resource == repository
+                });
+            if waiting {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn try_reuse_lock_is_busy(root: &Path, repo: &GitRepo) -> Result<bool, String> {
+        match crate::operations::try_acquire_local_repository_write_lock(root, repo) {
+            Ok(None) => Ok(true),
+            Ok(Some((_repository, lock))) => {
+                drop(lock);
+                Ok(false)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn join_before<T>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: std::time::Duration,
+        worker: &str,
+    ) -> Result<T, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !handle.is_finished() {
+            return Err(format!(
+                "{worker} thread did not finish before its deadline"
+            ));
+        }
+        handle
+            .join()
+            .map_err(|_| format!("{worker} thread panicked"))
+    }
+
+    #[test]
+    fn submit_holds_the_reuse_lock_until_base_tree_capture_before_coordinated_replace() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+
+        let (tmp, mut submit_broker, plan) = fixture();
+        let owner = Arc::new(tmp);
+        let root = owner.path().canonicalize().unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        let session_id = plan.session_id;
+        let mut writer_broker = Broker::open(&root).unwrap();
+        let checkout = GitRepo::discover(&root).unwrap();
+        let repository = checkout
+            .resolve_remote_target("origin", None)
+            .unwrap()
+            .coordination_key;
+        let initial_reuse_lock =
+            try_submission_plan_reuse_lock(&root, &checkout, submit_broker.store_ref())
+                .expect("the fixture has a canonical origin and no unresolved writer");
+        drop(initial_reuse_lock);
+        let base = plan.integration_head.clone();
+        let base_tree = checkout.commit_tree_id(&base).unwrap();
+        let replacement = checkout
+            .commit_tree(
+                &base_tree,
+                &[],
+                "same-tree replacement from coordinated writer",
+                &crate::attribution::Attribution::broker_only(),
+            )
+            .unwrap();
+        let replace_ref = format!("refs/replace/{base}");
+        assert!(checkout.resolve_ref(&replace_ref).is_none());
+
+        let (phase_sender, phase_receiver) = mpsc::channel();
+        let (resume_sender, resume_receiver) = mpsc::channel();
+        let resume_receiver = Arc::new(Mutex::new(resume_receiver));
+        submit_broker.submission_plan_test_observer = Some(Arc::new(move |phase| {
+            let _ = phase_sender.send(phase);
+            if let Ok(receiver) = resume_receiver.lock() {
+                let _ = receiver.recv_timeout(Duration::from_secs(8));
+            }
+        }));
+        let submit_owner = Arc::clone(&owner);
+        let submit = std::thread::Builder::new()
+            .name("submit-with-reuse-lock-test".into())
+            .spawn(move || {
+                let _owner = submit_owner;
+                submit_broker.submit_with_intent(
+                    session_id,
+                    crate::gates::CachePolicy::Bypass,
+                    crate::PromotionIntent::VerifyOnly,
+                )
+            })
+            .unwrap();
+
+        let mut failures = Vec::new();
+        let mut writer: Option<std::thread::JoinHandle<Result<_, _>>> = None;
+        let first_phase = phase_receiver.recv_timeout(Duration::from_secs(6));
+        if first_phase != Ok(crate::broker::SubmissionPlanTestPhase::PreflightPlanReady) {
+            failures.push(format!(
+                "submit did not pause after its preflight plan: {first_phase:?}"
+            ));
+        } else {
+            let writer_owner = Arc::clone(&owner);
+            let request = crate::CoordinatedCommand {
+                session_id,
+                provider: crate::OperationProvider::Git,
+                repository: None,
+                resolved_target: None,
+                scope: None,
+                declared_effect: Some(crate::OperationEffect::Write),
+                destructive_confirmed: false,
+                cross_session: None,
+                ref_write_acknowledged: false,
+                authorization_reason: Some(
+                    "serialize the test replacement against submission provenance".into(),
+                ),
+                args: vec!["replace".into(), base.clone(), replacement.clone()],
+            };
+            match std::thread::Builder::new()
+                .name("coordinated-replace-writer-test".into())
+                .spawn(move || {
+                    let _owner = writer_owner;
+                    writer_broker
+                        .run_coordinated_operation_with_wait(request, crate::QueueWait::Seconds(8))
+                }) {
+                Ok(handle) => writer = Some(handle),
+                Err(error) => failures.push(format!("could not start coordinated writer: {error}")),
+            }
+            if let Some(handle) = writer.as_ref() {
+                if !wait_for_writer_waiter(&root, &repository, session_id, Duration::from_secs(3)) {
+                    failures.push(
+                        "coordinated writer never appeared in the repository lock waiter list"
+                            .into(),
+                    );
+                }
+                if handle.is_finished() {
+                    failures
+                        .push("coordinated writer finished before submit released the lock".into());
+                }
+                match try_reuse_lock_is_busy(&root, &checkout) {
+                    Ok(true) => {}
+                    Ok(false) => failures.push(
+                        "submit's shared repository lock was available during preflight pause"
+                            .into(),
+                    ),
+                    Err(error) => failures.push(format!("could not probe reuse lock: {error}")),
+                }
+                if checkout.resolve_ref(&replace_ref).is_some() {
+                    failures
+                        .push("replace ref appeared before submit captured its base tree".into());
+                }
+            }
+        }
+        let _ = resume_sender.send(());
+
+        for expected in [
+            crate::broker::SubmissionPlanTestPhase::ConsumerStarting,
+            crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
+        ] {
+            match phase_receiver.recv_timeout(Duration::from_secs(6)) {
+                Ok(actual) => {
+                    if actual != expected {
+                        failures.push(format!(
+                            "submit phase order changed: expected {expected:?}, observed {actual:?}"
+                        ));
+                    }
+                    if let Some(handle) = writer.as_ref() {
+                        let waiting =
+                            crate::waiters::current_waiters(&root, crate::clock::epoch_ms())
+                                .into_iter()
+                                .any(|waiter| {
+                                    waiter.alive
+                                        && waiter.session_id == Some(session_id)
+                                        && waiter.kind
+                                            == crate::waiters::WAIT_COORDINATED_WRITE_LOCK
+                                        && waiter.resource == repository
+                                });
+                        if !waiting || handle.is_finished() {
+                            failures.push(format!(
+                                "coordinated writer was not still blocked at {actual:?}"
+                            ));
+                        }
+                        match try_reuse_lock_is_busy(&root, &checkout) {
+                            Ok(true) => {}
+                            Ok(false) => failures.push(format!(
+                                "submit's shared repository lock was available at {actual:?}"
+                            )),
+                            Err(error) => failures
+                                .push(format!("could not probe reuse lock at {actual:?}: {error}")),
+                        }
+                        if checkout.resolve_ref(&replace_ref).is_some() {
+                            failures.push(format!(
+                                "replace ref appeared before submit released the lock at {actual:?}"
+                            ));
+                        }
+                    }
+                    let _ = resume_sender.send(());
+                }
+                Err(error) => failures.push(format!(
+                    "submit did not reach expected phase {expected:?}: {error}"
+                )),
+            }
+        }
+
+        // Release any phase callbacks the test failed to observe before
+        // joining. Each callback has a timeout as a backstop, but explicit
+        // tokens keep failure paths from leaving either test thread paused.
+        for _ in 0..3 {
+            let _ = resume_sender.send(());
+        }
+
+        match join_before(submit, Duration::from_secs(20), "submit") {
+            Ok(Ok(_outcome)) => {}
+            Ok(Err(error)) => failures.push(format!("submit failed: {error}")),
+            Err(error) => failures.push(error),
+        }
+        match writer {
+            Some(handle) => match join_before(handle, Duration::from_secs(20), "writer") {
+                Ok(Ok(report)) if report.ok() => {}
+                Ok(Ok(report)) => failures.push(format!(
+                    "coordinated replace did not succeed: {:?}",
+                    report.operation.status
+                )),
+                Ok(Err(error)) => failures.push(format!("coordinated replace failed: {error}")),
+                Err(error) => failures.push(error),
+            },
+            None => failures.push("coordinated writer was not started".into()),
+        }
+        if checkout.resolve_ref(&replace_ref).is_none() {
+            failures.push(
+                "coordinated writer did not install the replacement ref after release".into(),
+            );
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn submission_plan_reuse_falls_back_without_canonical_origin_or_when_lock_is_busy() {
+        let (tmp, broker, _plan) = fixture();
+        let root = tmp.path().canonicalize().unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        let checkout = GitRepo::discover(&root).unwrap();
+        let (repository, held) =
+            crate::operations::try_acquire_local_repository_write_lock(&root, &checkout)
+                .unwrap()
+                .expect("fixture origin provides the canonical writer key");
+        assert_eq!(repository, "github.com/example/repo");
+        assert!(
+            try_submission_plan_reuse_lock(&root, &checkout, broker.store_ref()).is_none(),
+            "a busy coordinated writer must make optional plan reuse fall back"
+        );
+        drop(held);
+        git(&root, &["remote", "remove", "origin"]);
+        let checkout_without_origin = GitRepo::discover(&root).unwrap();
+        assert!(
+            try_submission_plan_reuse_lock(&root, &checkout_without_origin, broker.store_ref())
+                .is_none(),
+            "without a canonical origin, submit must not guess a lock key"
+        );
+    }
+
+    #[test]
+    fn submission_plan_reuse_refuses_unresolved_repo_wide_writers_but_not_failed_rows() {
+        use crate::{
+            NewCoordinatedOperation, OperationEffect, OperationIdentityProvenance,
+            OperationProvider, OperationStatus,
+        };
+
+        for status in [
+            OperationStatus::Prepared,
+            OperationStatus::Running,
+            OperationStatus::OutcomeUnknown,
+        ] {
+            let (tmp, mut broker, plan) = fixture();
+            let root = tmp.path().canonicalize().unwrap();
+            git(
+                &root,
+                &["remote", "add", "origin", "git@github.com:example/repo.git"],
+            );
+            let checkout = GitRepo::discover(&root).unwrap();
+            let repository = checkout
+                .resolve_remote_target("origin", None)
+                .unwrap()
+                .coordination_key;
+            let session_id = plan.session_id;
+            let operation = broker
+                .store()
+                .create_coordinated_operation(&NewCoordinatedOperation {
+                    session_id,
+                    provider: OperationProvider::Git,
+                    repository,
+                    scope: "repository".into(),
+                    effect: OperationEffect::Write,
+                    authorization_reason: Some("seed an unresolved test writer".into()),
+                    command_json: r#"["replace","old","new"]"#.into(),
+                    pid: i64::from(std::process::id()),
+                    host_operation_id: None,
+                    identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+                })
+                .unwrap();
+            if status != OperationStatus::Prepared {
+                broker
+                    .store()
+                    .transition_coordinated_operation(
+                        operation.id,
+                        OperationStatus::Running,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            if status == OperationStatus::OutcomeUnknown {
+                broker
+                    .store()
+                    .transition_coordinated_operation(
+                        operation.id,
+                        OperationStatus::OutcomeUnknown,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let lock = try_submission_plan_reuse_lock(&root, &checkout, broker.store_ref());
+            if status == OperationStatus::Prepared {
+                assert!(
+                    lock.is_some(),
+                    "a queued Prepared operation has not spawned a Git writer"
+                );
+                drop(lock);
+            } else {
+                assert!(
+                    lock.is_none(),
+                    "{status:?} repository-wide operation may have changed history"
+                );
+            }
+        }
+
+        let (tmp, mut broker, plan) = fixture();
+        let root = tmp.path().canonicalize().unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        let checkout = GitRepo::discover(&root).unwrap();
+        let repository = checkout
+            .resolve_remote_target("origin", None)
+            .unwrap()
+            .coordination_key;
+        let operation = broker
+            .store()
+            .create_coordinated_operation(&NewCoordinatedOperation {
+                session_id: plan.session_id,
+                provider: OperationProvider::Git,
+                repository,
+                scope: "repository".into(),
+                effect: OperationEffect::Write,
+                authorization_reason: Some("seed a terminal test writer".into()),
+                command_json: r#"["replace","old","new"]"#.into(),
+                pid: i64::from(std::process::id()),
+                host_operation_id: None,
+                identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+            })
+            .unwrap();
+        broker
+            .store()
+            .transition_coordinated_operation(operation.id, OperationStatus::Running, None, None)
+            .unwrap();
+        broker
+            .store()
+            .transition_coordinated_operation(operation.id, OperationStatus::Failed, Some(1), None)
+            .unwrap();
+        let lock = try_submission_plan_reuse_lock(&root, &checkout, broker.store_ref());
+        assert!(
+            lock.is_some(),
+            "terminal Failed must not veto reuse forever"
+        );
+        drop(lock);
     }
 
     #[test]
