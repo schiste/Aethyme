@@ -342,10 +342,7 @@ impl Broker {
         let ids = agents.iter().map(|a| a.session.id).collect::<Vec<_>>();
         let latest = self.store.latest_merge_queue_for_sessions(&ids)?;
         let mut advice = self.status_advice(&agents, &[], &latest, ("", ""), promotes, None);
-        let blockers = self.blockers();
-        if let Some(item) = crate::blockers::status_advice(&blockers.blockers) {
-            advice.push(item);
-        }
+        advice.extend(self.blocker_status_advice_snapshot());
         advice.extend(stalled_submit_advice(
             &crate::submit_progress::in_flight_submits(&self.main_root, now_ms),
         ));
