@@ -48,20 +48,23 @@ pub enum QueueWait {
 /// turning a slow network into a refusal on every call.
 const NO_WAIT_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The bound a read-only coordinated operation gets when its caller set none.
+/// Default budgets for read-only coordinated operations whose caller set none.
 ///
 /// A read takes no lock and no write block applies to it, so the only thing an
-/// unbounded read can wait on is the provider. A stalled `gh api` therefore
-/// outlived the caller's own timeout and said nothing about why (#555). The
-/// bound sits under the 120 s most agent harnesses give a command, so the
-/// caller gets the diagnostic instead of a kill; `--queue-timeout` still sets
-/// it explicitly, and `AETHYME_BROKER_READ_BUDGET_SECS` changes the default.
-pub(crate) const READ_OPERATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+/// unbounded read can wait on is the provider. The 30 s GitHub bound leaves
+/// callers with a 45 s deadline time to report the broker diagnostic instead
+/// of killing it. Keep Git's 90 s allowance for slower local repository reads.
+/// `--queue-timeout` still sets the bound explicitly, and
+/// `AETHYME_BROKER_READ_BUDGET_SECS` overrides either default (#555, #706).
+pub(crate) const GITHUB_READ_OPERATION_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(30);
+pub(crate) const GIT_READ_OPERATION_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(90);
 
-/// A read whose length is the point, so the default read budget must not cut
-/// it: following a run or checks until they finish, streaming a run's log,
-/// downloading artifacts, or paginating an API list. Only an explicit
-/// `--queue-timeout` bounds these (#555).
+/// A read whose length is the point, so the automatic default budget must
+/// not cut it: following a run or checks until they finish, streaming a run's
+/// log, downloading artifacts, or paginating an API list. Caller-selected
+/// bounds such as `--queue-timeout` and `--no-wait` still apply (#555).
 pub(crate) fn is_long_running_read(provider: OperationProvider, args: &[String]) -> bool {
     if provider != OperationProvider::Github {
         return false;
@@ -77,12 +80,23 @@ pub(crate) fn is_long_running_read(provider: OperationProvider, args: &[String])
     watches || streams_log || downloads || paginates
 }
 
-fn read_operation_budget() -> std::time::Duration {
-    std::env::var("AETHYME_BROKER_READ_BUDGET_SECS")
-        .ok()
+fn read_operation_budget(provider: OperationProvider) -> std::time::Duration {
+    let default = match provider {
+        OperationProvider::Git => GIT_READ_OPERATION_BUDGET,
+        OperationProvider::Github => GITHUB_READ_OPERATION_BUDGET,
+    };
+    let configured = std::env::var("AETHYME_BROKER_READ_BUDGET_SECS").ok();
+    read_operation_budget_from(configured.as_deref(), default)
+}
+
+fn read_operation_budget_from(
+    configured: Option<&str>,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    configured
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
-        .map_or(READ_OPERATION_BUDGET, std::time::Duration::from_secs)
+        .map_or(default, std::time::Duration::from_secs)
 }
 
 /// How often a bounded child is checked for completion.
@@ -474,13 +488,18 @@ impl AdmissionDeadline {
 
     /// Bound a read its caller left unbounded. A read never queues for the
     /// lock, so "wait forever" could only mean "wait forever on the provider"
-    /// (#555). Writes keep exactly the wait their caller chose, and so does a
-    /// read that is long by design ([`is_long_running_read`]).
-    fn bounded_for(self, effect: OperationEffect, long_running: bool) -> Self {
+    /// (#555). Writes keep exactly the wait their caller chose. Long reads
+    /// skip only the automatic default; caller-selected bounds still apply.
+    fn bounded_for(
+        self,
+        effect: OperationEffect,
+        long_running: bool,
+        provider: OperationProvider,
+    ) -> Self {
         if effect != OperationEffect::Read || long_running || self.budget.is_some() {
             return self;
         }
-        let budget = read_operation_budget();
+        let budget = read_operation_budget(provider);
         Self {
             started: self.started,
             at: Some(self.started + budget),

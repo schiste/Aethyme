@@ -989,26 +989,97 @@ fn classification_closes_the_audited_bypasses() {
 }
 
 #[test]
+fn provider_read_budgets_keep_github_bounded_and_git_unchanged() {
+    assert_eq!(GITHUB_READ_OPERATION_BUDGET, Duration::from_secs(30));
+    assert_eq!(GIT_READ_OPERATION_BUDGET, Duration::from_secs(90));
+    assert_eq!(
+        read_operation_budget_from(None, GITHUB_READ_OPERATION_BUDGET),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        read_operation_budget_from(None, GIT_READ_OPERATION_BUDGET),
+        Duration::from_secs(90)
+    );
+    assert_eq!(
+        read_operation_budget_from(Some("7"), GITHUB_READ_OPERATION_BUDGET),
+        Duration::from_secs(7),
+        "a configured budget must remain available"
+    );
+    assert_eq!(
+        read_operation_budget_from(Some("0"), GITHUB_READ_OPERATION_BUDGET),
+        Duration::from_secs(30),
+        "zero is not a usable operation budget"
+    );
+    assert_eq!(
+        read_operation_budget_from(Some("invalid"), GIT_READ_OPERATION_BUDGET),
+        Duration::from_secs(90),
+        "invalid configuration must fall back to the provider default"
+    );
+}
+
+#[test]
 fn an_unbounded_read_gets_the_read_budget_and_writes_keep_theirs() {
-    // #555: "wait forever" on a read can only mean waiting on the provider.
-    let read =
-        AdmissionDeadline::start(QueueWait::Forever).bounded_for(OperationEffect::Read, false);
-    assert_eq!(read.budget, Some(READ_OPERATION_BUDGET));
+    // #555/#706: an ordinary GitHub read gets a provider deadline by default.
+    let issue_list = gh(&["issue", "list"]);
+    let issue_list_effect = classify_gh(&issue_list).expect("issue list is classified");
+    assert_eq!(issue_list_effect, OperationEffect::Read);
+    let issue_list_long_running = is_long_running_read(OperationProvider::Github, &issue_list);
+    assert!(
+        !issue_list_long_running,
+        "an ordinary issue list should get the default read bound"
+    );
+    let read = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+        issue_list_effect,
+        issue_list_long_running,
+        OperationProvider::Github,
+    );
+    let configured = std::env::var("AETHYME_BROKER_READ_BUDGET_SECS").ok();
+    assert_eq!(
+        read.budget,
+        Some(read_operation_budget_from(
+            configured.as_deref(),
+            GITHUB_READ_OPERATION_BUDGET,
+        ))
+    );
     assert!(read.at.is_some());
 
+    // Git keeps its longer default; a caller's own bound still wins.
+    let git_status = args(&["status"]);
+    let git_status_effect = classify_git(&git_status).expect("git status is classified");
+    assert_eq!(git_status_effect, OperationEffect::Read);
+    let git_read = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+        git_status_effect,
+        false,
+        OperationProvider::Git,
+    );
+    assert_eq!(
+        git_read.budget,
+        Some(read_operation_budget_from(
+            configured.as_deref(),
+            GIT_READ_OPERATION_BUDGET,
+        ))
+    );
+
     // A caller's own bound wins, and writes keep the wait they asked for.
-    let explicit =
-        AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(OperationEffect::Read, false);
+    let explicit = AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(
+        OperationEffect::Read,
+        false,
+        OperationProvider::Github,
+    );
     assert_eq!(explicit.budget, Some(Duration::from_secs(5)));
     for effect in [OperationEffect::Write, OperationEffect::Destructive] {
-        let write = AdmissionDeadline::start(QueueWait::Forever).bounded_for(effect, false);
+        let write = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
+            effect,
+            false,
+            OperationProvider::Github,
+        );
         assert_eq!(write.budget, None, "{effect:?} must stay unbounded");
         assert!(write.at.is_none());
     }
 }
 
-/// #555 review: a read that is long by design keeps the caller's
-/// unbounded wait; only an explicit `--queue-timeout` bounds it.
+/// #555 review: a read that is long by design skips the automatic default
+/// budget; caller-selected `--queue-timeout` and `--no-wait` bounds still apply.
 fn assert_long_running_read_is_exempt(args: &[&str]) {
     let args = gh(args);
     assert_eq!(classify_gh(&args), Some(OperationEffect::Read), "{args:?}");
@@ -1016,11 +1087,35 @@ fn assert_long_running_read_is_exempt(args: &[&str]) {
         is_long_running_read(OperationProvider::Github, &args),
         "{args:?}"
     );
+    let long_running = is_long_running_read(OperationProvider::Github, &args);
     let admission = AdmissionDeadline::start(QueueWait::Forever).bounded_for(
         OperationEffect::Read,
-        is_long_running_read(OperationProvider::Github, &args),
+        long_running,
+        OperationProvider::Github,
     );
     assert_eq!(admission.budget, None, "{args:?} must stay unbounded");
+
+    let no_wait = AdmissionDeadline::start(QueueWait::Refuse).bounded_for(
+        OperationEffect::Read,
+        long_running,
+        OperationProvider::Github,
+    );
+    assert_eq!(
+        no_wait.budget,
+        Some(NO_WAIT_ADMISSION_BUDGET),
+        "`--no-wait` remains bounded for {args:?}"
+    );
+
+    let explicit = AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(
+        OperationEffect::Read,
+        long_running,
+        OperationProvider::Github,
+    );
+    assert_eq!(
+        explicit.budget,
+        Some(Duration::from_secs(5)),
+        "an explicit caller bound still applies to {args:?}"
+    );
 }
 
 #[test]
