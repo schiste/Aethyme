@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 fn repository(root: &Path) -> PathBuf {
     let repo = root.join("repo");
     fs::create_dir(&repo).unwrap();
-    let initialized = Command::new("git")
+    fs::write(root.join("empty-git-config"), "").unwrap();
+    let initialized = git_command(&repo)
         .args(["init", "-b", "main"])
-        .arg(&repo)
         .output()
         .unwrap();
     assert!(initialized.status.success());
@@ -33,17 +33,43 @@ fn command(repo: &Path) -> Command {
             "AETHYME_CHAU7_MCP_BRIDGE",
             "/__aethyme_test_no_chau7_bridge__",
         );
+    isolate_fixture_git_environment(&mut command, repo);
+    command
+}
+
+fn isolate_fixture_git_environment(command: &mut Command, repo: &Path) {
+    clear_inherited_git_environment(command);
+
+    let fixture_home = repo.parent().expect("fixture repo has a temp root");
+    command
+        .env("HOME", fixture_home)
+        .env("GIT_CONFIG_GLOBAL", fixture_home.join("empty-git-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+fn clear_inherited_git_environment(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(name);
+        }
+    }
+}
+
+fn git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(repo);
+    isolate_fixture_git_environment(&mut command, repo);
     command
 }
 
 fn commit_all(repo: &Path, message: &str) {
-    let added = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(repo)
-        .output()
-        .unwrap();
+    let added = git_command(repo).args(["add", "-A"]).output().unwrap();
     assert!(added.status.success());
-    let committed = Command::new("git")
+    let committed = git_command(repo)
         .args([
             "-c",
             "user.name=Aethyme Test",
@@ -66,6 +92,54 @@ fn commit_all(repo: &Path, message: &str) {
 
 fn run(repo: &Path, args: &[&str]) -> Output {
     command(repo).args(args).output().unwrap()
+}
+
+#[test]
+fn repository_fixture_git_children_ignore_host_global_excludes() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    let settings = repo.join(".claude/settings.local.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, "{}\n").unwrap();
+
+    let hostile_ignore = temp.path().join("hostile-ignore");
+    fs::write(&hostile_ignore, "**/.claude/settings.local.json\n").unwrap();
+    let hostile_config = temp.path().join("hostile-git-config");
+    fs::write(
+        &hostile_config,
+        "[core]\n\texcludesFile = ~/hostile-ignore\n",
+    )
+    .unwrap();
+
+    let mut host_configured = Command::new("git");
+    clear_inherited_git_environment(&mut host_configured);
+    host_configured
+        .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
+        .current_dir(&repo)
+        .env("HOME", temp.path())
+        .env("GIT_CONFIG_GLOBAL", &hostile_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let host_result = host_configured.output().unwrap();
+    assert!(
+        host_result.status.success(),
+        "positive control: hostile global excludes file must ignore the generated settings file"
+    );
+
+    let mut isolated = Command::new("git");
+    isolated
+        .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
+        .current_dir(&repo)
+        .env("HOME", temp.path())
+        .env("GIT_CONFIG_GLOBAL", &hostile_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    isolate_fixture_git_environment(&mut isolated, &repo);
+    let isolated_result = isolated.output().unwrap();
+    assert_eq!(
+        isolated_result.status.code(),
+        Some(1),
+        "fixture Git environment must ignore the host global excludes file; stderr: {}",
+        String::from_utf8_lossy(&isolated_result.stderr)
+    );
 }
 
 fn old_canonical_deployment(repo: &Path) {
@@ -910,9 +984,8 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     assert!(local_settings.is_file());
     let empty_git_config = temp.path().join("empty-git-config");
     fs::write(&empty_git_config, "").unwrap();
-    let ignored = Command::new("git")
+    let ignored = git_command(&repo)
         .args(["check-ignore", "-v", "--", ".claude/settings.local.json"])
-        .current_dir(&repo)
         .env("XDG_CONFIG_HOME", repo.join("empty-config"))
         .env("GIT_CONFIG_GLOBAL", &empty_git_config)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1844,9 +1917,8 @@ fn reviewed_migration_diff_exactly_matches_the_applied_tree() {
 }
 
 fn git_status(repo: &Path) -> String {
-    let output = Command::new("git")
+    let output = git_command(repo)
         .args(["status", "--porcelain", "--untracked-files=all"])
-        .current_dir(repo)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -1854,11 +1926,7 @@ fn git_status(repo: &Path) -> String {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Output {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap();
+    let output = git_command(repo).args(args).output().unwrap();
     assert!(
         output.status.success(),
         "git {args:?} failed: {}",
@@ -1874,7 +1942,7 @@ fn git_stdout(repo: &Path, args: &[&str]) -> String {
 }
 
 fn git_commit(repo: &Path, message: &str) -> Output {
-    Command::new("git")
+    git_command(repo)
         .args([
             "-c",
             "user.name=Aethyme Test",
@@ -1884,7 +1952,6 @@ fn git_commit(repo: &Path, message: &str) -> Output {
             "-m",
             message,
         ])
-        .current_dir(repo)
         .output()
         .unwrap()
 }
