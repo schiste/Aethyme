@@ -192,9 +192,10 @@ fn deploy_enrolls_and_verifies_a_repository_without_a_source_checkout() {
     assert!(stdout.contains("Optional local Claude integration:"));
     assert!(stdout.contains("settings.local.json (machine-local; never commit)"));
     assert!(stdout.contains("graph authority disabled (optional)"));
-    assert!(stdout.contains("Operating mode: conflict_only"));
-    assert!(stdout.contains("Validation: limited"));
-    assert!(stdout.contains("Graph: disabled by repository policy; no action required."));
+    assert!(stdout.contains(
+        "For the full operational readiness report, run `aethyme broker status readiness` from the deployed repository."
+    ));
+    assert!(!stdout.contains("Operating mode:"));
 
     let verified = command(&repo)
         .args(["deploy", "verify", "--repo"])
@@ -264,7 +265,7 @@ fn generated_only_deployment_preserves_the_discoverability_only_workflow() {
 }
 
 #[test]
-fn complete_deployment_reports_parallel_ready_without_materializing_host_state() {
+fn complete_deployment_prints_readiness_followup_without_materializing_host_state() {
     let temp = tmp_dir();
     let repo = repository(temp.path());
     fs::create_dir_all(repo.join(".aethyme")).unwrap();
@@ -293,9 +294,10 @@ fn complete_deployment_reports_parallel_ready_without_materializing_host_state()
         String::from_utf8_lossy(&deployed.stderr)
     );
     let stdout = String::from_utf8_lossy(&deployed.stdout);
-    assert!(stdout.contains("Operating mode: parallel_ready"));
-    assert!(stdout.contains("All mandatory agent-readiness dimensions are ready."));
-    assert!(stdout.contains("Graph: disabled by repository policy; no action required."));
+    assert!(stdout.contains(
+        "For the full operational readiness report, run `aethyme broker status readiness` from the deployed repository."
+    ));
+    assert!(!stdout.contains("Operating mode:"));
     assert!(
         !host_state.exists(),
         "readiness must not materialize lazy host coordination state"
@@ -530,8 +532,10 @@ fn local_only_activation_is_clean_and_does_not_follow_a_clone() {
         String::from_utf8_lossy(&activated.stderr)
     );
     let activated_stdout = String::from_utf8_lossy(&activated.stdout);
-    assert!(activated_stdout.contains("Operating mode: conflict_only"));
-    assert!(activated_stdout.contains("Graph: disabled by repository policy; no action required."));
+    assert!(activated_stdout.contains(
+        "For the full operational readiness report, run `aethyme broker status readiness` from the deployed repository."
+    ));
+    assert!(!activated_stdout.contains("Operating mode:"));
     assert!(repo.join(".aethyme/local/enabled").is_file());
     let policy = fs::read_to_string(repo.join(".aethyme/local/AGENTS.md")).unwrap();
     assert!(policy.contains("## Broker Coordination"));
