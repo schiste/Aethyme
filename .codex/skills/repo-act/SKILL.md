@@ -303,6 +303,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   restoration. Require positive, intended runtime failure, positive; a compile
   failure or a test that also fails without the break does not validate the
   guard. A passing adjacent suite cannot replace either positive run.
+  Freeze the intended review snapshot before running mutations, or build it
+  from the intended commit and selected patch. Exclude an in-flight deliberate
+  mutation from the review snapshot so it is not mistaken for proposed code.
 - Before reclaiming a completed worktree, inspect ignored paths for qualification
   records; a clean Git status does not cover them. Preserve irreplaceable
   reports outside the worktree and build target, verify copied file sizes and
