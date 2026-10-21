@@ -257,6 +257,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   protect its split-index backing files.
   Use the same isolated-index probes for operator status checks during pinned
   validation; an ordinary Git status command can refresh the watched index.
+- When testing configurable duration or deadline selection, put selection behind
+  a pure seam and assert defaults, provider classes and explicit overrides
+  without sleeping. Test real timeout cleanup separately with a short test-only
+  budget; never reduce a production budget just to speed up a test.
 - For repeated CI build-script runs, inspect the checkout action's local Git
   config before attributing recompilation to profiles or cache keys. Persisted
   credentials can add `includeIf.*.path` entries that a fail-closed source
