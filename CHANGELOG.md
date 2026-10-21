@@ -4,6 +4,47 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.29] - 2026-10-22
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0829).
+
+This patch includes the broker inspection, verification-identity and cleanup
+repairs described in v0.8.28. Upgrades from v0.8.26 migrate each repository's
+broker database from schema 49 to 52; databases already at schema 52 need no
+additional migration.
+
+### Fixed
+
+- Successful deployment no longer repeats the full readiness scan after
+  verification. It prints the explicit `aethyme broker status readiness`
+  follow-up for the deployed repository.
+- Coordinated provider commands enforce their deadline while waiting for
+  inherited output pipes, including after the provider process exits.
+- Coordinated command capture retains at most 16 MiB per stream, keeps
+  draining longer output, and marks truncation so consumers reject incomplete
+  evidence.
+- Worktree Cargo defaults are synced before publication and preserve an
+  existing configuration without replacement.
+- Ordinary coordinated GitHub reads use their own shorter admission budget;
+  explicit caller budgets remain authoritative.
+- Submission preflight reuses its invocation-local plan when its exact inputs
+  remain unchanged, and rebuilds it when ownership or history is uncertain.
+- Cleanup reuses one target snapshot while retaining recovery and identity
+  checks.
+- Rust formatting selects the containing Cargo package's edition.
+- Release signing recovers equivalent transparency-log entry conflicts and
+  verifies the published standard signature bundle before publication.
+
+### Changed
+
+- Start and adopt can report offline PR overlap advice for explicit planned
+  paths. Missing, stale, unknown or truncated evidence remains incomplete;
+  this advice does not claim a fresh network inspection.
+- Performance checks include a narrow CI lane and an optional isolated
+  Playground workload with aged, released resource-lease history. These are
+  measurement and validation tools; no end-to-end latency gain is asserted
+  before combined-runtime measurements.
+
 ## [0.8.28] - 2026-10-21
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0828).
