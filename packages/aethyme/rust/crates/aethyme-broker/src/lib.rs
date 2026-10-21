@@ -422,6 +422,7 @@ pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
 };
+pub(crate) use pr_overlap::PlannedPathPrOverlapCheck;
 pub use pr_overlap::{PrOverlap, PrOverlapCheck};
 pub use pr_projection::{
     COMMENT_MARKER, OwnedComment, PR_PROJECTION_SCHEMA_VERSION, PrProjectionAction,

@@ -82,6 +82,35 @@ pub struct PrOverlapCheck {
     pub listed_at_ms: Option<i64>,
 }
 
+/// Cached changed paths that intersect a session's explicit planned leases.
+/// This is intentionally path-only; it does not estimate line conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PlannedPathPrOverlap {
+    pub(crate) pr: i64,
+    pub(crate) url: String,
+    /// Changed PR paths that equal or fall under an explicit planned path.
+    pub(crate) files: Vec<String>,
+}
+
+/// Availability and path-only overlap results for explicit `start --path`
+/// declarations. Missing or stale data is represented as a warning rather
+/// than an empty result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PlannedPathPrOverlapCheck {
+    /// Whether the cached PR listing is fresh and matches the local default.
+    pub(crate) cache_available: bool,
+    pub(crate) overlaps: Vec<PlannedPathPrOverlap>,
+    /// PRs in a usable listing whose current changed paths could not be read.
+    pub(crate) unknown_prs: Vec<i64>,
+    pub(crate) listed_at_ms: Option<i64>,
+    /// The listing is capped at this many PRs when it is refreshed by push.
+    pub(crate) checked_open_pr_limit: usize,
+    /// True when the cached listing reached its cap and more PRs may exist.
+    pub(crate) listing_may_be_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) warning: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct OpenPr {
     number: i64,
@@ -97,9 +126,21 @@ struct OpenPrListing {
     prs: Vec<OpenPr>,
 }
 
+fn other_open_prs<'a>(
+    listing: &'a OpenPrListing,
+    session_branch: &'a str,
+) -> impl Iterator<Item = &'a OpenPr> + 'a {
+    listing
+        .prs
+        .iter()
+        .filter(move |pr| pr.head != session_branch)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CachedRanges {
     head_oid: String,
+    #[serde(default)]
+    base_oid: Option<String>,
     ranges: FileRanges,
 }
 
@@ -304,7 +345,9 @@ impl Broker {
     /// The committed change of `branch_ref` against the default branch.
     fn ranges_for_head(&self, default: &TrackedDefault, head: &str) -> Option<FileRanges> {
         let repo = self.repo_handle();
-        let base = repo.merge_base(&default.tracking_ref, head).ok()?;
+        // Use the captured commit, not a tracking ref that a concurrent fetch
+        // can move before the result is stored under this base identity.
+        let base = repo.merge_base(&default.commit, head).ok()?;
         if base == head {
             return Some(FileRanges::new());
         }
@@ -329,11 +372,108 @@ impl Broker {
             .unwrap_or_default()
     }
 
-    fn cached_ranges(&self, pr: &OpenPr) -> Option<FileRanges> {
+    fn cached_ranges(&self, pr: &OpenPr, base_oid: &str) -> Option<FileRanges> {
         let head_oid = pr.head_oid.as_deref()?;
         let text = self.store_ref().meta_get(&ranges_key(pr.number)).ok()??;
         let cached: CachedRanges = serde_json::from_str(&text).ok()?;
-        (cached.head_oid == head_oid).then_some(cached.ranges)
+        (cached.head_oid == head_oid && cached.base_oid.as_deref() == Some(base_oid))
+            .then_some(cached.ranges)
+    }
+
+    /// Compare explicit planned paths with cached open-PR changed paths.
+    /// Reads only the broker cache; it never inspects Git history or calls GitHub.
+    pub(crate) fn cached_planned_path_pr_overlaps(
+        &self,
+        session: &crate::Session,
+        planned_leases: &[crate::Lease],
+        now_ms: i64,
+    ) -> Option<PlannedPathPrOverlapCheck> {
+        let paths = planned_leases
+            .iter()
+            .map(|lease| lease.path.as_str())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return None;
+        }
+
+        let unavailable = |warning: String, listed_at_ms| PlannedPathPrOverlapCheck {
+            cache_available: false,
+            overlaps: Vec::new(),
+            unknown_prs: Vec::new(),
+            listed_at_ms,
+            checked_open_pr_limit: MAX_OPEN_PRS,
+            listing_may_be_truncated: false,
+            warning: Some(warning),
+        };
+        let Some(default) = tracked_default(self.repo_handle()) else {
+            return Some(unavailable(
+                "the current default branch is unavailable from local tracking refs".into(),
+                None,
+            ));
+        };
+        let Some(listing) = self.cached_listing() else {
+            return Some(unavailable(
+                "no readable cached open-PR listing is available; refresh it with broker push"
+                    .into(),
+                None,
+            ));
+        };
+        if listing.base != default.branch {
+            return Some(unavailable(
+                format!(
+                    "the cached PR listing is for base {}, but the local default is {}",
+                    listing.base, default.branch
+                ),
+                Some(listing.fetched_at_ms),
+            ));
+        }
+        if listing.fetched_at_ms > now_ms {
+            return Some(unavailable(
+                "the cached open-PR listing is dated in the future; refresh it with broker push"
+                    .into(),
+                Some(listing.fetched_at_ms),
+            ));
+        }
+        if now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS {
+            return Some(unavailable(
+                "the cached open-PR listing is older than 24 hours; refresh it with broker push"
+                    .into(),
+                Some(listing.fetched_at_ms),
+            ));
+        }
+
+        let mut check = PlannedPathPrOverlapCheck {
+            cache_available: true,
+            overlaps: Vec::new(),
+            unknown_prs: Vec::new(),
+            listed_at_ms: Some(listing.fetched_at_ms),
+            checked_open_pr_limit: MAX_OPEN_PRS,
+            listing_may_be_truncated: listing.prs.len() >= MAX_OPEN_PRS,
+            warning: None,
+        };
+        for pr in other_open_prs(&listing, &session.branch).take(MAX_OPEN_PRS) {
+            let Some(ranges) = self.cached_ranges(pr, &default.commit) else {
+                check.unknown_prs.push(pr.number);
+                continue;
+            };
+            let files = ranges
+                .keys()
+                .filter(|file| {
+                    paths
+                        .iter()
+                        .any(|path| crate::leases::paths_overlap(path, file))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !files.is_empty() {
+                check.overlaps.push(PlannedPathPrOverlap {
+                    pr: pr.number,
+                    url: pr.url.clone(),
+                    files,
+                });
+            }
+        }
+        Some(check)
     }
 
     /// A PR's ranges from its local remote-tracking ref, when that ref is at
@@ -396,6 +536,7 @@ impl Broker {
         let listing = match self.cached_listing() {
             Some(listing)
                 if listing.base == default.branch
+                    && listing.fetched_at_ms <= now_ms
                     && now_ms.saturating_sub(listing.fetched_at_ms) < LIST_REUSE_MS =>
             {
                 Some(listing)
@@ -449,10 +590,13 @@ impl Broker {
             ..Default::default()
         };
         for pr in listing.prs.iter().filter(|pr| pr.head != branch) {
-            let ranges = match self.cached_ranges(pr) {
+            let ranges = match self.cached_ranges(pr, &default.commit) {
                 Some(ranges) => Some(ranges),
                 None => {
                     let mut fresh = self.local_pr_ranges(&default, pr);
+                    // Provider diffs do not prove their base matches our local
+                    // tracking ref, so only local diffs may populate this cache.
+                    let local_base_verified = fresh.is_some();
                     if fresh.is_none() && gh_budget > 0 {
                         gh_budget -= 1;
                         fresh = self
@@ -465,9 +609,11 @@ impl Broker {
                             )
                             .and_then(|diff| parse_unified_diff(&diff));
                     }
-                    if let (Some(ranges), Some(head_oid)) = (&fresh, &pr.head_oid)
+                    if local_base_verified
+                        && let (Some(ranges), Some(head_oid)) = (&fresh, &pr.head_oid)
                         && let Ok(text) = serde_json::to_string(&CachedRanges {
                             head_oid: head_oid.clone(),
+                            base_oid: Some(default.commit.clone()),
                             ranges: ranges.clone(),
                         })
                     {
@@ -525,6 +671,7 @@ impl Broker {
         let default = tracked_default(self.repo_handle())?;
         let listing = self.cached_listing()?;
         if listing.base != default.branch
+            || listing.fetched_at_ms > now_ms
             || now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS
         {
             return None;
@@ -540,9 +687,9 @@ impl Broker {
             listed_at_ms: Some(listing.fetched_at_ms),
             ..Default::default()
         };
-        for pr in listing.prs.iter().filter(|pr| pr.head != session.branch) {
+        for pr in other_open_prs(&listing, &session.branch) {
             let ranges = self
-                .cached_ranges(pr)
+                .cached_ranges(pr, &default.commit)
                 .or_else(|| self.local_pr_ranges(&default, pr));
             match ranges {
                 Some(ranges) => {
@@ -575,7 +722,9 @@ impl Broker {
         let Ok(listing) = serde_json::from_str::<OpenPrListing>(&listing_raw) else {
             return Vec::new();
         };
-        if now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS {
+        if listing.fetched_at_ms > now_ms
+            || now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS
+        {
             return Vec::new();
         }
         // A repository without origin/HEAD labels its publication baseline
