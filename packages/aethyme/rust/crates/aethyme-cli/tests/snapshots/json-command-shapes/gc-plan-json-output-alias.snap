@@ -1,4 +1,5 @@
 {
+  "age_anchor_ms": "integer",
   "artifacts": [],
   "auto_cleanup": {
     "deferred": "integer",
