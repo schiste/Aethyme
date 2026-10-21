@@ -310,13 +310,17 @@ impl Broker {
     }
 
     /// Recorded blocker observations for routine status. Recovery commands need
-    /// fresh worktree inspection and are deliberately deferred to `unblock`.
+    /// fresh worktree inspection and are deliberately deferred to `broker blockers`.
     pub(crate) fn blocker_status_advice_snapshot(&self) -> Vec<crate::StatusAdvice> {
         let report = self.collect_blockers(false);
         let mut advice = Vec::new();
         if let Some(mut item) = status_advice(&report.blockers) {
             item.reason = "recorded coordination blockers; worktree recovery remedies have not been inspected";
-            item.commands = vec!["aethyme broker unblock".into()];
+            item.summary = item.summary.replace(
+                "`aethyme broker unblock` lists",
+                "`aethyme broker blockers` lists",
+            );
+            item.commands = vec!["aethyme broker blockers".into()];
             advice.push(item);
         }
         if !report.unavailable.is_empty() {
@@ -335,7 +339,7 @@ impl Broker {
                     .into_iter()
                     .map(|error| format!("{}: {}", error.source, error.error))
                     .collect(),
-                commands: vec!["aethyme broker unblock".into()],
+                commands: vec!["aethyme broker blockers".into()],
             });
         }
         advice

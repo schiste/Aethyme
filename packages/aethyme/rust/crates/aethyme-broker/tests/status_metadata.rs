@@ -109,7 +109,7 @@ fn brief_defers_git_remedies_but_full_blockers_preserves_them() {
         .find(|item| item.id == "blockers.present")
         .unwrap();
     assert!(item.summary.starts_with("1 blocker"), "{item:?}");
-    assert_eq!(item.commands, ["aethyme broker unblock"]);
+    assert_eq!(item.commands, ["aethyme broker blockers"]);
     assert!(item.reason.contains("not been inspected"));
     assert!(item.evidence.iter().any(|line| line.starts_with(&lease.id)));
     assert!(
@@ -140,5 +140,5 @@ fn brief_reports_unavailable_blocker_sources() {
             .any(|line| line.starts_with("host-operations.db:")),
         "{item:?}"
     );
-    assert_eq!(item.commands, ["aethyme broker unblock"]);
+    assert_eq!(item.commands, ["aethyme broker blockers"]);
 }
