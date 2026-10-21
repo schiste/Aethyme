@@ -140,7 +140,10 @@ fn init_reftable_repo(root: &Path) {
         String::from_utf8_lossy(&output.stderr).trim()
     );
 
-    let storage = git_output(root, &["config", "--local", "--get", "extensions.refStorage"]);
+    let storage = git_output(
+        root,
+        &["config", "--local", "--get", "extensions.refStorage"],
+    );
     assert!(
         storage.status.success(),
         "Git accepted --ref-format=reftable but did not record extensions.refStorage: {}",
@@ -174,8 +177,7 @@ fn reftable_repo() -> (tempfile::TempDir, GitRepo, String, String) {
     std::fs::create_dir(&root).expect("create fixture repo");
     std::fs::create_dir(tmp.path().join("empty-template")).expect("create empty template");
     std::fs::create_dir(tmp.path().join("empty-hooks")).expect("create empty hooks directory");
-    std::fs::write(tmp.path().join("empty-global-config"), "")
-        .expect("create empty global config");
+    std::fs::write(tmp.path().join("empty-global-config"), "").expect("create empty global config");
     init_reftable_repo(&root);
 
     std::fs::write(root.join("README.md"), "first\n").expect("write first commit");
@@ -244,7 +246,10 @@ fn reftable_checked_branch_update_rejects_stale_expected_old_and_can_restore() {
 
     repo.update_branch_ref_checked(branch, &second, &first)
         .expect("advance branch from its exact old tip");
-    assert_eq!(repo.resolve_ref(&reference).as_deref(), Some(second.as_str()));
+    assert_eq!(
+        repo.resolve_ref(&reference).as_deref(),
+        Some(second.as_str())
+    );
 
     assert!(
         repo.update_branch_ref_checked(branch, &first, &first)
@@ -259,7 +264,10 @@ fn reftable_checked_branch_update_rejects_stale_expected_old_and_can_restore() {
 
     repo.update_branch_ref_checked(branch, &first, &second)
         .expect("restore branch from its exact updated tip");
-    assert_eq!(repo.resolve_ref(&reference).as_deref(), Some(first.as_str()));
+    assert_eq!(
+        repo.resolve_ref(&reference).as_deref(),
+        Some(first.as_str())
+    );
 
     let tips = repo.local_branch_tips().expect("list restored branch tips");
     for name in [
