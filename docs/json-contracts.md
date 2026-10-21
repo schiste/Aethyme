@@ -288,6 +288,7 @@ than beside any worktree:
 ```
 {
   ...,
+  "age_anchor_ms": n,
   "gate_caches": [
     { "entry", "cache_key", "path", "estimated_bytes",
       "last_used_at_ms", "age_days", "reason" }
@@ -318,6 +319,11 @@ digest must be applied with the same flag, and `include_active` records it.
 `gate_cache_bytes_budget` applies only to the older entries. Held and active
 entries are outside the budget, so a running gate never pushes an idle entry
 out of it.
+
+Schema 4 plans add `age_anchor_ms`, the UTC-day floor of `evaluated_at`. It is
+part of the authorization digest and supplies one stable reference for all
+age-derived candidate fields and cutoff reasons. Exact `evaluated_at` remains
+available for reporting; apply-time liveness checks use current time.
 
 Gate cache candidates are part of the authorization digest, sizes and
 `last_used_at_ms` included, so a gate that runs between plan and apply
