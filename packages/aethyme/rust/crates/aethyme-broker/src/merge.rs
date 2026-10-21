@@ -887,8 +887,9 @@ impl Broker {
         // Provenance and replay planning are deterministic and ref-free. Run
         // them before creating a live queue row so a fail-closed ownership
         // decision cannot leave behind misleading `submitted` residue. The
-        // persisted entry is still planned again against the then-current
-        // integration tip below, because another process may move that ref.
+        // Keep the plan only as submit-invocation state: simulation rereads
+        // the current session, base, and history inputs, reusing this plan only
+        // when they still match and rebuilding it otherwise.
         // Record whether this repository has an ordinary complete history
         // view; a shallow boundary, replacement ref, or graft can change
         // provenance without changing the captured commit IDs.

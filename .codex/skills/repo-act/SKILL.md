@@ -85,6 +85,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.
+  Complete fixture branch/ref setup before opening the broker whenever
+  possible: its live default database may be .aethyme/broker.db, and a later
+  git add -A can commit it. Before any post-open branch switch, assert the
+  database and WAL paths are absent from git ls-files; stage exact fixture
+  paths so a checkout cannot unlink a live SQLite database.
 - In shell shims that branch on a child process's working directory, inspect it
   with `pwd -P` and compare it with an explicitly passed canonical fixture path.
   Rust `Command::current_dir` changes the child's directory without rewriting

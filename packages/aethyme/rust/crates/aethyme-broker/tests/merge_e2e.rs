@@ -128,30 +128,98 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
         "[promote]\nmode = \"manual\"\n",
     )
     .unwrap();
-    sh(tmp.path(), &["add", ".aethyme/config.toml"]);
+    sh(tmp.path(), &["add", "--", ".aethyme/config.toml"]);
     sh(tmp.path(), &["commit", "-qm", "use manual promotion"]);
+
+    // Finish fixture history before opening the broker: its default database
+    // lives in the repository and must not be staged by later branch commits.
+    // Main and integration each receive an independent commit from the same
+    // initial tree, so the session plan includes both nonempty patch streams.
+    sh(tmp.path(), &["switch", "-qc", "integration-only"]);
+    std::fs::write(
+        tmp.path().join("src/integration-only.py"),
+        "integration = 1\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", "--", "src/integration-only.py"]);
+    sh(tmp.path(), &["commit", "-qm", "edit integration"]);
+    let integration = resolve(tmp.path(), "HEAD");
+    sh(tmp.path(), &["switch", "main"]);
+    std::fs::write(tmp.path().join("src/main-only.py"), "main = 1\n").unwrap();
+    sh(tmp.path(), &["add", "--", "src/main-only.py"]);
+    sh(tmp.path(), &["commit", "-qm", "edit main"]);
+
     let mut broker = common::open_fixture_repository_broker(&tmp)
         .unwrap()
         .into_broker();
-
-    // The session starts from a newer main than integration, so its provenance
-    // contains both a nonempty session patch stream and a nonempty integration
-    // comparison stream.
-    sh(tmp.path(), &["switch", "-qc", "integration-only"]);
-    commit_edit(tmp.path(), "src/integration-only.py", "integration = 1\n");
-    let integration = resolve(tmp.path(), "HEAD");
+    // Broker startup may reconcile refs, so restore the intended divergent
+    // integration tip after open and before building the session plan.
     sh(
         tmp.path(),
         &["update-ref", "refs/heads/aethyme/integration", &integration],
     );
-    sh(tmp.path(), &["switch", "main"]);
-    commit_edit(tmp.path(), "src/main-only.py", "main = 1\n");
+    assert_ne!(
+        resolve(tmp.path(), "refs/heads/aethyme/integration"),
+        resolve(tmp.path(), "HEAD"),
+        "fixture integration must remain distinct from main"
+    );
+    assert_eq!(
+        resolve(tmp.path(), "refs/heads/aethyme/integration^"),
+        resolve(tmp.path(), "HEAD^"),
+        "fixture integration and main must diverge from their shared initial commit"
+    );
 
     let session_worktree = agent_worktree(tmp.path(), "trace-reuse");
     let session = broker
         .adopt(&session_worktree, Some("trace submit plan reuse"))
         .unwrap();
-    commit_edit(&session_worktree, "src/session-only.py", "session = 1\n");
+    std::fs::write(
+        session_worktree.join("src/session-only.py"),
+        "session = 1\n",
+    )
+    .unwrap();
+    sh(&session_worktree, &["add", "--", "src/session-only.py"]);
+    sh(&session_worktree, &["commit", "-qm", "edit session"]);
+
+    let database_path = broker.store().db_path().to_path_buf();
+    assert!(
+        database_path.is_file(),
+        "fixture broker database must still exist before child startup"
+    );
+    broker
+        .store()
+        .session(session.id)
+        .expect("the adopted session must be readable before child startup");
+    let tracked = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("list tracked fixture paths");
+    assert!(tracked.status.success(), "git ls-files failed");
+    let tracked_paths = String::from_utf8_lossy(&tracked.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut database_prefixes = vec![".aethyme/broker.db".to_owned()];
+    if let Ok(relative_database) = database_path.strip_prefix(tmp.path()) {
+        database_prefixes.push(relative_database.to_string_lossy().into_owned());
+    }
+    let tracked_database_paths = tracked_paths
+        .iter()
+        .filter(|path| {
+            database_prefixes.iter().any(|prefix| {
+                path.as_str() == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|suffix| suffix.starts_with('-'))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        tracked_database_paths.is_empty(),
+        "the live broker database and WAL files must remain untracked: {tracked_database_paths:?}"
+    );
 
     let trace_path = tmp.path().parent().unwrap().join("submit-trace.json");
     let session_id = session.id.to_string();
@@ -168,6 +236,13 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
             command.env_remove(key);
         }
     }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1");
     broker
         .configure_storage_context_for_child(&mut command)
         .unwrap();
