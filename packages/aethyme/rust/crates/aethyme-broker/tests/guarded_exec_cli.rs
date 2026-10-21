@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, BrokerOpenOptions};
+use aethyme_broker::{Broker, BrokerOpenOptions, GitRepo};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -39,7 +39,26 @@ impl Fixture {
         let preparation = root.join("preparation-cache");
         std::fs::create_dir(&repository).unwrap();
         std::fs::create_dir(&preparation).unwrap();
-        git(&repository, &["init", "-q", "-b", "main"]);
+        let empty_hooks = root.join("empty-hooks");
+        std::fs::create_dir(&empty_hooks).unwrap();
+        git(&repository, &["init", "-q", "--template=", "-b", "main"]);
+        let hooks_path = empty_hooks.to_str().unwrap();
+        git(
+            &repository,
+            &["config", "--local", "core.hooksPath", hooks_path],
+        );
+        git(
+            &repository,
+            &["config", "--local", "commit.gpgsign", "false"],
+        );
+        git(
+            &repository,
+            &["config", "--local", "core.fsmonitor", "false"],
+        );
+        git(
+            &repository,
+            &["config", "--local", "core.untrackedCache", "false"],
+        );
         std::fs::write(repository.join("tracked.txt"), "original\n").unwrap();
         git(&repository, &["add", "tracked.txt"]);
         git(&repository, &["commit", "-qm", "fixture"]);
@@ -251,5 +270,58 @@ fn ownership_report_preserves_literal_quotes_arrows_tabs_and_newlines() {
     assert_eq!(
         std::fs::read(fixture.worktree.join(path)).unwrap(),
         b"generated"
+    );
+}
+
+#[test]
+fn guard_status_snapshots_match_existing_queries_for_renames_and_named_untracked_files() {
+    let fixture = Fixture::new(None);
+    git(
+        &fixture.worktree,
+        &["mv", "tracked.txt", "renamed -> tracked.txt"],
+    );
+    let preexisting_untracked = "preexisting untracked name.txt";
+    std::fs::write(fixture.worktree.join(preexisting_untracked), "before\\n").unwrap();
+
+    let repo = GitRepo::discover(&fixture.worktree).unwrap();
+    let mut before_dirty = repo.dirty_paths().unwrap();
+    before_dirty.sort();
+    before_dirty.dedup();
+    let mut before_untracked = repo.untracked_paths().unwrap();
+    before_untracked.sort();
+    before_untracked.dedup();
+    assert_eq!(
+        before_dirty,
+        vec!["preexisting untracked name.txt", "renamed -> tracked.txt"]
+    );
+    assert_eq!(before_untracked, vec![preexisting_untracked]);
+
+    let output = fixture.run(
+        "printf changed >> 'renamed -> tracked.txt'; printf generated > 'new generated name.txt'",
+        true,
+    );
+    let value = report(&output);
+
+    let mut after_dirty = repo.dirty_paths().unwrap();
+    after_dirty.sort();
+    after_dirty.dedup();
+    let mut after_untracked = repo.untracked_paths().unwrap();
+    after_untracked.sort();
+    after_untracked.dedup();
+    let new_untracked: Vec<_> = after_untracked
+        .iter()
+        .filter(|path| !before_untracked.contains(path))
+        .cloned()
+        .collect();
+
+    assert_eq!(value["before_dirty_paths"], serde_json::json!(before_dirty));
+    assert_eq!(value["after_dirty_paths"], serde_json::json!(after_dirty));
+    assert_eq!(
+        value["new_untracked_paths"],
+        serde_json::json!(new_untracked)
+    );
+    assert_eq!(
+        value["modified_preexisting_dirty_paths"],
+        serde_json::json!(["renamed -> tracked.txt"])
     );
 }

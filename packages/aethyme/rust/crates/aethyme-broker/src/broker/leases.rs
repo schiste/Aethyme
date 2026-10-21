@@ -1876,18 +1876,17 @@ impl Broker {
         let session = self.store.session(session_id)?;
         self.refresh_leases_including(Some(session_id))?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        let mut before_dirty = checkout.dirty_paths()?;
+        let (mut before_dirty, before_untracked) = checkout.dirty_and_untracked_paths()?;
         before_dirty.sort();
         before_dirty.dedup();
-        let before_untracked = checkout
-            .untracked_paths()?
+        let before_untracked = before_untracked
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
 
         let status = run(&session)?;
 
-        let mut after_dirty = checkout.dirty_paths()?;
+        let (mut after_dirty, after_untracked) = checkout.dirty_and_untracked_paths()?;
         after_dirty.sort();
         after_dirty.dedup();
         let before_set: std::collections::BTreeSet<String> = before_dirty.iter().cloned().collect();
@@ -1896,8 +1895,7 @@ impl Broker {
             .filter(|path| !before_set.contains(*path))
             .cloned()
             .collect();
-        let mut new_untracked_paths = checkout
-            .untracked_paths()?
+        let mut new_untracked_paths = after_untracked
             .into_iter()
             .filter(|path| !before_untracked.contains(path))
             .collect::<Vec<_>>();
