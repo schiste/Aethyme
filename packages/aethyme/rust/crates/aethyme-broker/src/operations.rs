@@ -680,11 +680,9 @@ where
             }
             Ok(output)
         })();
-        if done.send(()).is_err() {
-            // The caller drops this receiver when it times out or returns after
-            // another reader error; losing this completion notification is then
-            // expected because that caller is no longer waiting for pipe EOF.
-        }
+        // A timeout or another reader error drops the receiver; this notification
+        // is only needed while the caller is waiting for pipe EOF.
+        let _completion = done.send(());
         result
     })
 }

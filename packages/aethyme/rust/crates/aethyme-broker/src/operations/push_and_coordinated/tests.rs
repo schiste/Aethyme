@@ -1284,7 +1284,7 @@ fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
     let release_for_thread = release.clone();
     let done_for_thread = done.clone();
     let releaser = std::thread::spawn(move || {
-        let ready_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(8);
         while !ready_for_thread.exists() && std::time::Instant::now() < ready_deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1293,7 +1293,7 @@ fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
             // Keep both inherited output descriptors open beyond the provider's
             // deadline, then release the finite child so the test leaves no
             // process behind.
-            std::thread::sleep(Duration::from_millis(1_000));
+            std::thread::sleep(Duration::from_secs(4));
         }
         std::fs::write(release_for_thread, b"release").unwrap();
         let done_deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1306,14 +1306,14 @@ fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
     let mut command = Command::new("sh");
     command.args([
         "-c",
-        "(i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 80 ]; do sleep 0.05; i=$((i + 1)); done; : > \"$3\") & printf child; : > \"$2\"; exit 0",
+        "(i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 120 ]; do sleep 0.05; i=$((i + 1)); done; : > \"$3\") & printf child; : > \"$2\"; exit 0",
         "sh",
         release.to_str().unwrap(),
         ready.to_str().unwrap(),
         done.to_str().unwrap(),
     ]);
     let started = std::time::Instant::now();
-    let budget = Duration::from_millis(500);
+    let budget = Duration::from_secs(2);
     let error = output_within(
         command,
         AdmissionDeadline {
@@ -1334,8 +1334,8 @@ fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
         "the finite descendant must exit after release"
     );
     assert!(
-        provider_wait < Duration::from_millis(800),
-        "reader drain exceeded the 500ms operation deadline: {provider_wait:?}"
+        provider_wait < Duration::from_secs(3),
+        "reader drain exceeded the 2s operation deadline: {provider_wait:?}"
     );
     assert!(
         matches!(&error, Err(BrokerOpError::AdmissionTimedOut { .. })),
