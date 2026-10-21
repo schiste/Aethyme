@@ -7,6 +7,16 @@ fn add_operation_liveness(details: &mut serde_json::Value, liveness: serde_json:
     }
 }
 
+fn add_failure_stderr_if_complete(
+    details: &mut serde_json::Value,
+    stderr: &[u8],
+    stderr_truncated: bool,
+) {
+    if !stderr_truncated {
+        add_failure_stderr(details, stderr);
+    }
+}
+
 fn with_push_planning(mut extra: serde_json::Value, planning: &PushPlanning) -> serde_json::Value {
     if let (Some(extra), Some(push)) = (extra.as_object_mut(), planning.journal_value()) {
         extra.insert("push_reconciliation".into(), push);
@@ -2334,7 +2344,11 @@ impl Broker {
                     // Failing here is the point: nothing is queued, and no other
                     // session waited on a gate that was going to refuse anyway.
                     let mut details = json!({ "reason": "pre_push_refused" });
-                    add_failure_stderr(&mut details, &output.stderr);
+                    add_failure_stderr_if_complete(
+                        &mut details,
+                        &output.stderr,
+                        output.stderr_truncated,
+                    );
                     if output.stdout_truncated || output.stderr_truncated {
                         details["output_truncated"] = json!({
                             "stdout": output.stdout_truncated,
@@ -2909,11 +2923,11 @@ impl Broker {
                 ),
             )
         };
-        // Every failed Git write keeps its stderr tail: a failed local
+        // Keep complete stderr for failed Git writes: a failed local
         // `merge --ff-only` (main reconcile) is as undiagnosable without it as
-        // a refused push (#415).
+        // a refused push (#415). A truncated capture is a prefix, not a tail.
         if request.provider == OperationProvider::Git && !output.status.success() {
-            add_failure_stderr(&mut details, &output.stderr);
+            add_failure_stderr_if_complete(&mut details, &output.stderr, output.stderr_truncated);
         }
         if output.stdout_truncated || output.stderr_truncated {
             details["output_truncated"] = json!({

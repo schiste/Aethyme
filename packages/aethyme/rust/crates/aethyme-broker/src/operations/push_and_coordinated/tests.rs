@@ -1474,6 +1474,22 @@ fn capture_limit_boundary_flags_only_omitted_bytes() {
     assert!(capture.truncated, "the first omitted byte marks truncation");
 }
 
+#[test]
+fn truncated_failure_stderr_is_not_persisted_as_a_tail() {
+    let mut details = json!({"output_truncated": {"stdout": false, "stderr": true}});
+    add_failure_stderr_if_complete(&mut details, b"captured prefix", true);
+
+    assert_eq!(details["output_truncated"]["stderr"], true);
+    assert!(details.get("failure_output").is_none());
+
+    let mut complete_details = json!({});
+    add_failure_stderr_if_complete(&mut complete_details, b"complete diagnostic", false);
+    assert_eq!(
+        complete_details["failure_output"]["stderr_tail"],
+        json!(["complete diagnostic"])
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn capture_limit_keeps_draining_and_preserves_provider_exit_status() {
