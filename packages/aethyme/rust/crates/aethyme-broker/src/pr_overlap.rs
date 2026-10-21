@@ -436,10 +436,10 @@ impl Broker {
             unknown_prs: Vec::new(),
             listed_at_ms: Some(listing.fetched_at_ms),
             checked_open_pr_limit: MAX_OPEN_PRS,
-            listing_may_be_truncated: listing.prs.len() == MAX_OPEN_PRS,
+            listing_may_be_truncated: listing.prs.len() >= MAX_OPEN_PRS,
             warning: None,
         };
-        for pr in other_open_prs(&listing, &session.branch) {
+        for pr in other_open_prs(&listing, &session.branch).take(MAX_OPEN_PRS) {
             let Some(ranges) = self.cached_ranges(pr) else {
                 check.unknown_prs.push(pr.number);
                 continue;

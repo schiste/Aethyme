@@ -700,6 +700,61 @@ fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
         "",
         "uncached paths must remain unknown without GitHub fallback"
     );
+
+    // A malformed/older cache may contain more PRs than the listing command's
+    // limit. The advisory inspects only the first MAX_OPEN_PRS entries and
+    // explicitly reports that additional open PRs may have been omitted.
+    let fixture = Fixture::new();
+    let fetched_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let prs = (100..=130)
+        .map(|number| {
+            serde_json::json!({
+                "number": number,
+                "url": format!("https://github.com/acme/project/pull/{number}"),
+                "head": format!("agent/pr-{number}"),
+                "head_oid": "f".repeat(40),
+            })
+        })
+        .collect::<Vec<_>>();
+    let listing = serde_json::json!({
+        "fetched_at_ms": fetched_at_ms,
+        "base": "main",
+        "prs": prs,
+    });
+    let broker = fixture.broker();
+    broker
+        .store()
+        .meta_set("pr_overlap.open_prs", &listing.to_string())
+        .unwrap();
+    drop(broker);
+    fixture.clear_gh_log();
+
+    let report = json(&fixture.run(&[
+        "start",
+        "--task",
+        "work on a planned path",
+        "--path",
+        "shared.txt",
+        "--json",
+    ]));
+    let check = &report["planned_path_pr_overlaps"];
+    assert_eq!(check["cache_available"], true, "{report}");
+    assert_eq!(check["checked_open_pr_limit"], 30, "{report}");
+    assert_eq!(check["listing_may_be_truncated"], true, "{report}");
+    let unknown = check["unknown_prs"].as_array().unwrap();
+    assert_eq!(unknown.len(), 30, "{report}");
+    assert_eq!(unknown.first(), Some(&serde_json::json!(100)), "{report}");
+    assert_eq!(unknown.last(), Some(&serde_json::json!(129)), "{report}");
+    assert!(!unknown.contains(&serde_json::json!(130)), "{report}");
+    assert_eq!(check["overlaps"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        fixture.gh_log(),
+        "",
+        "the cached-listing check stays offline"
+    );
 }
 
 /// Changed lines two apart from an open PR's: Git would conflict on them.
