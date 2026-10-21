@@ -415,3 +415,74 @@ fn promoting_doctor_does_not_report_pending_layer_as_leftover() {
 
     assert!(broker.doctor().unwrap().leftover_integration_work.is_none());
 }
+
+/// Trace real doctor phases without a wall-clock race or a deliberately slow Git.
+#[test]
+fn doctor_inspects_version_before_retention_inventory() {
+    const CHILD: &str = "AETHYME_DOCTOR_VERSION_ORDER_CHILD";
+    const NAME: &str = "doctor_inspects_version_before_retention_inventory";
+    if std::env::var_os(CHILD).is_some() {
+        let (_owner, mut broker) = fixture(0);
+        let session = broker.start_worktree("doctor ordering", None).unwrap();
+        broker.close(session.id).unwrap();
+        let trace = std::path::PathBuf::from(
+            std::env::var_os("GIT_TRACE2_EVENT").expect("parent supplies private trace"),
+        );
+        std::fs::write(&trace, "").unwrap();
+        let report = broker.doctor().unwrap();
+        assert_eq!(report.integrity, "ok");
+        let events = std::fs::read_to_string(&trace).unwrap();
+        let starts = events
+            .lines()
+            .filter_map(|line| {
+                let event: serde_json::Value =
+                    serde_json::from_str(line).expect("valid Git Trace2 JSON");
+                if event["event"] != "start" {
+                    return None;
+                }
+                Some(event["argv"].as_array().expect("start has argv").clone())
+            })
+            .collect::<Vec<_>>();
+        let version = starts
+            .iter()
+            .position(|argv| argv.iter().any(|arg| arg == "describe"))
+            .expect("version inspection describes integration");
+        let inventory = starts
+            .iter()
+            .position(|argv| argv.iter().any(|arg| arg == "for-each-ref"))
+            .expect("retention inventories local branch tips");
+        assert!(
+            version < inventory,
+            "doctor must inspect version before retention inventory can spend its Git deadline; starts={starts:?}"
+        );
+        return;
+    }
+    let owner = tempfile::tempdir().unwrap();
+    let trace = owner
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("doctor-trace.jsonl");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .args(["--exact", NAME, "--nocapture"])
+        .env(CHILD, "1")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "doctor phase child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "child must execute exactly the selected regression"
+    );
+}
