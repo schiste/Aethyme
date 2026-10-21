@@ -996,9 +996,8 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
     let reason = refusal["reason"].as_str().unwrap();
     assert!(
         reason.contains("1 committed change not yet delivered")
-            && reason.contains(&finish)
             && reason.ends_with(&submit)
-            && !reason.contains("finish close"),
+            && !reason.contains(&finish),
         "the refusal names submit, not a finish that would refuse: {reason}"
     );
 
