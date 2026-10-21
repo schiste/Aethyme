@@ -318,6 +318,31 @@ fn a_squash_landing_still_reaches_the_deep_proof() {
 }
 
 #[test]
+#[cfg(unix)]
+fn worktree_build_defaults_preserve_a_dangling_config_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let directory = tmp.path().join(".cargo");
+    std::fs::create_dir(&directory).unwrap();
+    let target = tmp.path().join("operator-missing-config");
+    let config = directory.join("config.toml");
+    std::os::unix::fs::symlink(&target, &config).unwrap();
+    write_worktree_build_defaults(tmp.path()).unwrap();
+    assert_eq!(std::fs::read_link(&config).unwrap(), target);
+    assert!(!target.exists());
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn worktree_build_defaults_refuse_a_linked_cargo_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join(".cargo")).unwrap();
+    assert!(write_worktree_build_defaults(tmp.path()).is_err());
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn worktree_build_defaults_are_written_once_and_never_over_a_choice() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join(".cargo/config.toml");
