@@ -700,6 +700,25 @@ mod tests {
     }
 
     #[test]
+    fn repo_root_constructor_passes_the_supplied_root_to_rustfmt() {
+        let repo = TempRepo::new();
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        repo.write("src/lib.rs", "fn f() {}\n");
+        let fake = FakeRunner::new(vec!["rustfmt"]).formatting("formatted\n");
+        let fixer =
+            FormatFixer::with_repo_path_and_runner(&repo.0, Box::new(SharedRunner(fake.clone())));
+
+        assert_eq!(
+            fixer.fix(Path::new("src/lib.rs"), "input\n"),
+            Some("formatted\n".to_string())
+        );
+        assert_rustfmt_edition(&fake, "2024");
+    }
+
+    #[test]
     fn rustfmt_inherits_edition_from_the_nearest_workspace() {
         let repo = TempRepo::new();
         repo.write(
