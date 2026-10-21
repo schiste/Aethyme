@@ -159,6 +159,15 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
         env!("CARGO_BIN_EXE_broker-cli-shim"),
         &["submit", "--session", &session_id],
     );
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
     broker
         .configure_storage_context_for_child(&mut command)
         .unwrap();
@@ -177,7 +186,10 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
     let trace = std::fs::read_to_string(&trace_path).unwrap();
     let patch_history_reads = trace
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("Git Trace2 event log contains valid JSON records")
+        })
         .filter(|event| event["event"] == "start")
         .filter(|event| {
             event["argv"].as_array().is_some_and(|argv| {

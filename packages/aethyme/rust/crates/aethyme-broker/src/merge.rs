@@ -2972,6 +2972,71 @@ mod owned_merge_history_tests {
     }
 
     #[test]
+    fn prepared_submission_plan_rebuilds_when_git_history_view_is_overridden() {
+        let (tmp, mut broker, original) = fixture();
+        let root = tmp.path();
+        let session = broker.store().session(original.session_id).unwrap();
+        let base = original.integration_head.clone();
+        let entry = broker
+            .store()
+            .submit(session.id, &original.session_head, &base)
+            .unwrap();
+        assert!(
+            broker
+                .repo_handle()
+                .has_complete_unmodified_history()
+                .unwrap(),
+            "fixture starts with the ordinary Git history view"
+        );
+
+        // Replace the pinned base with a same-tree root commit. The plan's
+        // object IDs remain unchanged, but Git now exposes a different graph.
+        let replacement = broker
+            .repo_handle()
+            .commit_tree(
+                &broker.repo_handle().commit_tree_id(&base).unwrap(),
+                &[],
+                "same-tree history-view replacement",
+                &crate::attribution::Attribution::broker_only(),
+            )
+            .unwrap();
+        git(root, &["replace", &base, &replacement]);
+        assert!(
+            !broker
+                .repo_handle()
+                .has_complete_unmodified_history()
+                .unwrap()
+        );
+
+        let build_calls = std::cell::Cell::new(0);
+        let rebuilt = build_or_reuse_submission_plan(
+            broker.repo_handle(),
+            Some(PreparedSubmissionPlan::new(
+                &session,
+                &original.session_head,
+                &base,
+                original.clone(),
+            )),
+            &entry,
+            &session,
+            &entry.head_commit,
+            &base,
+            || {
+                build_calls.set(build_calls.get() + 1);
+                Ok(original.clone())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            build_calls.get(),
+            1,
+            "history overrides require a fresh plan"
+        );
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
     fn owned_merge_proof_requires_exact_complete_pending_history() {
         let (_tmp, broker, original) = fixture();
         let merge = original
