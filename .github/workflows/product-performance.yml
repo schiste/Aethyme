@@ -36,6 +36,9 @@ jobs:
         with:
           workspaces: packages/aethyme/rust
 
+      - name: Check warning-only broker budget policy
+        run: python3 -m unittest discover -s packages/aethyme-eval/benchmarks/performance -p 'test_broker_latency.py'
+
       - name: Compare the recorded product revision with this checkout
         run: |
           set -euo pipefail
@@ -73,6 +76,21 @@ jobs:
               --save-baseline product-reference
           bash packages/aethyme/scripts/bench-product-latency.sh \
             --baseline product-reference
+
+      - name: Measure broker budgets using the existing release build
+        run: |
+          python3 packages/aethyme-eval/benchmarks/performance/broker_latency.py \
+            --binary "$CARGO_TARGET_DIR/release/aethyme" \
+            --output "$RUNNER_TEMP/broker-latency" --samples 3
+
+      - name: Upload broker timings and warning report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: broker-latency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/broker-latency
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload Criterion comparisons
         if: always()

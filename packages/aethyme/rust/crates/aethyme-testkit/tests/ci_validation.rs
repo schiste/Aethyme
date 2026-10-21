@@ -339,6 +339,21 @@ fn contract_check_reads_the_same_sources_on_prs_and_on_main() {
     assert!(gate.contains("--commit-messages --merged-pr"), "{gate}");
 
     let pr_check = workflow("cross-process-contract.yml");
+    assert!(pr_check.contains("fetch-depth: 0"));
+    assert!(pr_check.contains("ref: ${{ github.event.pull_request.head.sha }}"));
+    assert!(pr_check.contains("BASE_REF: ${{ github.base_ref }}"));
+    assert!(pr_check.contains("PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}"));
+    assert!(pr_check.contains("git merge-base \"origin/${BASE_REF}\" \"${PR_HEAD_SHA}\""));
+    assert!(pr_check.contains("--base \"$CONTRACT_BASE\""));
+    let pr_check_step = pr_check
+        .split("      - name: Run cross-process contract check")
+        .nth(1)
+        .unwrap();
+    let run_script = block(pr_check_step, "        run: |").join("\n");
+    assert!(
+        !run_script.contains("${{"),
+        "GitHub context values must enter the shell through env:"
+    );
     assert!(pr_check.contains("--pr-body /tmp/pr-body.md \\\n            --commit-messages"));
 
     let gates = workflow("aethyme-gates.yml");

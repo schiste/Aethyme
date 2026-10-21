@@ -75,11 +75,16 @@
       "relevance": "primary"
     }
   },
-  "caution_zones": [],
+  "caution_zones": [
+    {
+      "path": "target",
+      "reason": "likely generated, vendored, fixture, or migration-heavy area"
+    }
+  ],
   "telemetry": {
     "derived_from": ".aethyme/generated/onboarding.json",
     "entrypoint_count": 8,
     "primary_entrypoint_count": 1,
-    "caution_zone_count": 0
+    "caution_zone_count": 1
   }
 }

@@ -3982,6 +3982,24 @@ impl GitRepo {
         .collect())
     }
 
+    /// Dirty paths and their untracked subset from one trustworthy status snapshot.
+    pub(crate) fn dirty_and_untracked_paths(&self) -> Result<(Vec<String>, Vec<String>), GitError> {
+        require_trustworthy_porcelain()?;
+        let entries = parse_porcelain_entries_z(&run_git_bytes(
+            &self.root,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?)?;
+        let mut dirty = Vec::with_capacity(entries.len());
+        let mut untracked = Vec::new();
+        for (status, path) in entries {
+            if status == [b'?', b'?'] {
+                untracked.push(path.clone());
+            }
+            dirty.push(path);
+        }
+        Ok((dirty, untracked))
+    }
+
     /// Whether every remaining non-ignored change is an unstaged deletion of
     /// a tracked path, and each ignored path is broker runtime state or a
     /// witnessed regenerable artifact. This narrow state is used only to

@@ -246,7 +246,7 @@ pub(super) fn record_command_metric(args: &[String], exit: u8, duration_ms: i64)
     // the frequent, expensive ones. Measuring them is therefore opt-in: unset,
     // nothing changes; set, the operator has accepted that inspection now
     // writes one telemetry line.
-    if !command_records_metric(args) && !output_measurement_opted_in() && details.is_none() {
+    if !command_metric_enabled(args, output_measurement_opted_in(), details.is_some()) {
         return;
     }
     let Some(label) = safe_command_surface(args) else {
@@ -383,6 +383,22 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
     }
 }
 
+/// Decide whether this invocation writes a timing line. A GC plan is a
+/// special case: its candidate set may rewrite this same metrics file, so
+/// recording the plan afterward would invalidate the digest it just produced.
+fn command_metric_enabled(args: &[String], opted_in: bool, has_details: bool) -> bool {
+    if matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("gc"), Some("plan"))
+    ) {
+        return false;
+    }
+    command_records_metric(args) || opted_in || has_details
+}
+
 /// `gates affected` opts into a timing line while preserving its read-only
 /// event-store contract. Other outcome events follow the command metric policy.
 fn command_records_outcome(args: &[String]) -> bool {
@@ -397,7 +413,10 @@ fn command_records_outcome(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_records_metric, command_records_outcome, safe_command_surface};
+    use super::{
+        command_metric_enabled, command_records_metric, command_records_outcome,
+        safe_command_surface,
+    };
 
     /// Labels are built from the resolved internal spelling, which is what
     /// the dispatcher records.
@@ -444,5 +463,18 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>();
         assert!(command_records_outcome(&run));
+    }
+
+    #[test]
+    fn opted_in_measurement_does_not_make_gc_plan_rewrite_its_own_input() {
+        let gc_plan = ["gc", "plan"].map(str::to_string);
+        assert!(!command_metric_enabled(&gc_plan, true, false));
+        assert!(!command_metric_enabled(&gc_plan, true, true));
+
+        let status = ["status"].map(str::to_string);
+        assert!(command_metric_enabled(&status, true, false));
+
+        let gc_apply = ["gc", "apply"].map(str::to_string);
+        assert!(command_metric_enabled(&gc_apply, false, false));
     }
 }

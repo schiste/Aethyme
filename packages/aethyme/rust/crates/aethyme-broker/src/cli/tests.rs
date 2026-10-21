@@ -1147,7 +1147,7 @@ fn flags_the_subcommand_reads_are_accepted() {
             &[],
             &["--session", "--verify-only", "--no-cache", "--json"],
         ),
-        ("status", &[], &["--summary", "--json"]),
+        ("status", &[], &["--summary", "--compact", "--json"]),
         ("gates", &["scope"], &["--base", "--head"]),
         ("gates", &["doctor"], &["--probe", "--only"]),
         ("leases", &["claim", "src/"], &["--session", "--ttl"]),
