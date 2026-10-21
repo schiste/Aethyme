@@ -127,7 +127,7 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
         "status must distinguish the lock holder from the current waiter; got:\n{text}"
     );
     assert!(
-        text.contains(&format!("lock {repository}")),
+        text.contains(&format!("lock {}", repository.display())),
         "status must name the lock resource; got:\n{text}"
     );
     assert!(

@@ -14,7 +14,7 @@ use aethyme_broker::{
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
     let tmp = tempfile::tempdir().unwrap();
-    let store = BrokerStore::open(tmp.path().join("broker.db")).unwrap();
+    let store = BrokerStore::open(&tmp.path().join("broker.db")).unwrap();
     (tmp, store)
 }
 
