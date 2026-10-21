@@ -75,6 +75,16 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             "--refresh and --summary cannot be combined".into(),
         ));
     }
+    if parsed.compact && parsed.summary {
+        return Err(UsageError::Message(
+            "--compact and --summary cannot be combined".into(),
+        ));
+    }
+    if parsed.compact && parsed.refresh {
+        return Err(UsageError::Message(
+            "--compact and --refresh cannot be combined".into(),
+        ));
+    }
     if parsed.refresh && parsed.read_only_snapshot {
         return Err(read_only_refusal(
             &parsed,
@@ -85,6 +95,27 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     let opened = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let open_ms = opened.elapsed().as_millis() as u64;
+    // Routine text is the compact, recorded-observation path. Full JSON stays
+    // on the established StatusView contract; --compact opts JSON callers into
+    // the separate versioned envelope below.
+    if parsed.compact || (!parsed.json && !parsed.summary && !parsed.refresh) {
+        let mut brief = if parsed.read_only_snapshot {
+            broker.status_brief_snapshot(now_ms())?
+        } else {
+            broker.status_brief(now_ms())?
+        };
+        brief.phase_timings_ms.insert("open".into(), open_ms);
+        brief
+            .phase_timings_ms
+            .insert("command_total".into(), opened.elapsed().as_millis() as u64);
+        let compact = super::status_compact::CompactStatus::from_brief(brief);
+        if parsed.json {
+            out!("{}", serde_json::to_string_pretty(&compact)?);
+        } else {
+            out!("{}", compact.render_text().trim_end());
+        }
+        return Ok(());
+    }
     // The mandated first step of every session, so its cost is a tax
     // on every agent. `--summary` skips the per-session diff that
     // dominates it and prints only what that step is read for (#182).
