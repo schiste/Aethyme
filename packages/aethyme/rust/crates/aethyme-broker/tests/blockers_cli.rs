@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use aethyme_broker::{
-    Broker, GateFailureClass, GateStatus, HostOperationGuard, HostResourceCoordinator,
-    HostResourceKind, HostResourceRequest, HostResourceRequirement, NewCoordinatedOperation,
-    NewGateResult, OperationEffect, OperationIdentityProvenance, OperationProvider,
-    OperationStatus, SessionStatus,
+    Broker, BrokerOpenOptions, GateFailureClass, GateStatus, HostOperationGuard,
+    HostResourceCoordinator, HostResourceKind, HostResourceRequest, HostResourceRequirement,
+    NewCoordinatedOperation, NewGateResult, OperationEffect, OperationIdentityProvenance,
+    OperationProvider, OperationStatus, SessionStatus,
 };
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -721,6 +721,182 @@ fn a_resource_lease_owned_by_a_closed_session_is_cleared() {
     assert_eq!(cleared.status.code(), Some(0), "{}", stderr(&cleared));
     assert!(fixture.blocker(&id).is_none());
     let _ = &fixture.worktree;
+}
+
+#[test]
+fn resource_lease_blockers_keep_quarantined_and_expired_owned_rows_only() {
+    let fixture = Fixture::new();
+    let worktree_path = fixture
+        .broker()
+        .store()
+        .session(fixture.session_id)
+        .unwrap()
+        .worktree_path;
+    let fingerprint = format!("{:x}", Sha256::digest(worktree_path.as_bytes()));
+    let mut coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    let acquire = |coordinator: &mut HostResourceCoordinator, request_id: &str| {
+        coordinator
+            .acquire(&HostResourceRequest {
+                schema_version: aethyme_broker::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+                request_id: request_id.into(),
+                repository: "unrelated-origin".into(),
+                worktree_fingerprint: fingerprint.clone(),
+                run_id: format!("run-{request_id}"),
+                ttl_seconds: 600,
+                holder_pid: Some(std::process::id()),
+                resources: vec![HostResourceRequirement {
+                    key: "db".into(),
+                    resource: HostResourceKind::Namespace {
+                        prefix: format!("{request_id}-"),
+                    },
+                }],
+            })
+            .unwrap()
+    };
+
+    let explicit = acquire(&mut coordinator, "explicit");
+    coordinator
+        .quarantine(
+            &explicit.lease.lease_id,
+            explicit.lease.generation,
+            &explicit.ownership_token,
+        )
+        .unwrap();
+    let expired = acquire(&mut coordinator, "expired");
+    let active = acquire(&mut coordinator, "active");
+    let released = acquire(&mut coordinator, "released");
+    coordinator
+        .release(
+            &released.lease.lease_id,
+            released.lease.generation,
+            &released.ownership_token,
+        )
+        .unwrap();
+    drop(coordinator);
+
+    let host_db = fixture.state.join("host-resources.db");
+    let connection = Connection::open(&host_db).unwrap();
+    connection
+        .execute(
+            "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+            rusqlite::params![0_i64, expired.lease.lease_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+            rusqlite::params![i64::MAX, active.lease.lease_id.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let blockers = fixture.blockers();
+    let has_lease = |lease_id: &str| {
+        blockers
+            .iter()
+            .any(|blocker| blocker["id"] == format!("resource:{lease_id}"))
+    };
+    assert!(has_lease(&explicit.lease.lease_id));
+    assert!(has_lease(&expired.lease.lease_id));
+    assert!(!has_lease(&active.lease.lease_id));
+    assert!(!has_lease(&released.lease.lease_id));
+}
+
+#[test]
+fn blocker_collection_decodes_unexpired_resource_leases() {
+    let fixture = Fixture::new();
+    let mut coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    let grant = coordinator
+        .acquire(&HostResourceRequest {
+            schema_version: aethyme_broker::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: "malformed-active".into(),
+            repository: "unrelated-origin".into(),
+            worktree_fingerprint: "unrelated-worktree".into(),
+            run_id: "run-malformed-active".into(),
+            ttl_seconds: 600,
+            holder_pid: Some(std::process::id()),
+            resources: vec![HostResourceRequirement {
+                key: "db".into(),
+                resource: HostResourceKind::Namespace {
+                    prefix: "malformed-active-".into(),
+                },
+            }],
+        })
+        .unwrap();
+    drop(coordinator);
+
+    // The old non-released inventory decoded unexpired active rows too. Keep
+    // blocker diagnostics surfacing malformed active-row data after indexing.
+    Connection::open(fixture.state.join("host-resources.db"))
+        .unwrap()
+        .execute(
+            "UPDATE resource_leases SET repository=?1 WHERE lease_id=?2",
+            rusqlite::params![
+                rusqlite::types::Value::Blob(vec![0xff]),
+                grant.lease.lease_id.as_str()
+            ],
+        )
+        .unwrap();
+
+    let broker = Broker::open_with_options(
+        &fixture.repo,
+        BrokerOpenOptions::default().with_host_state_dir(fixture.state.clone()),
+    )
+    .unwrap();
+    let report = broker.blockers();
+    assert!(
+        report
+            .unavailable
+            .iter()
+            .any(|source| source.source == "host-resources.db"),
+        "blocker collection must surface malformed unexpired active lease rows: {:?}",
+        report.unavailable
+    );
+}
+
+#[test]
+fn no_quarantined_resource_leases_skip_cleaned_session_decoding() {
+    let fixture = Fixture::new();
+    let broker = Broker::open_with_options(
+        &fixture.repo,
+        BrokerOpenOptions::default().with_host_state_dir(fixture.state.clone()),
+    )
+    .unwrap();
+    let coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    assert!(coordinator.list(false).unwrap().is_empty());
+    drop(coordinator);
+
+    // A BLOB bypasses SQLite's TEXT affinity and makes decoding this archived
+    // session's worktree path fail if blocker collection reads all history.
+    Connection::open(aethyme_broker::broker_db_path(&fixture.repo).unwrap())
+        .unwrap()
+        .execute(
+            "UPDATE sessions
+             SET status = 'cleaned', cleanup_state = 'cleaned', worktree_path = ?1
+             WHERE id = ?2",
+            rusqlite::params![rusqlite::types::Value::Blob(vec![0xff]), fixture.session_id],
+        )
+        .unwrap();
+
+    let report = broker.blockers();
+    assert!(
+        !report
+            .unavailable
+            .iter()
+            .any(|source| source.source == "host-resources.db"),
+        "an empty quarantined-lease inventory should not decode archived sessions: {:?}",
+        report.unavailable
+    );
+    assert!(
+        !report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.id.starts_with("resource:")),
+        "an empty resource inventory has no resource blockers"
+    );
 }
 
 #[test]

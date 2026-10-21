@@ -489,7 +489,7 @@ stashing multi-worktree changes.
 - `aethyme broker status readiness plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]`
 - `aethyme broker status readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]`
 - `aethyme broker status readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
-- `aethyme broker status [--json]`
+- `aethyme broker status [--json] [--compact] [--summary] [--refresh]`
 - `aethyme broker advanced worktree-root [--json]`
 - `aethyme broker start --task "..." --short-name <name> [--pull-request <number>] [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
 - `aethyme broker start --task "..." --cmd <command> --short-name <name> [--pull-request <number>] [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`

@@ -689,9 +689,18 @@ help; only manual audit of every consumer can.
 
 `broker status --refresh` explicitly requests fresh lease derivation, dirty
 worktree inspection, Git conflict/history checks and cleanup eligibility.
-Routine `broker status` and `--summary` report recorded observations instead.
-Consumers must check `deferred_checks`, `leases_refreshed` and
-`leases_refreshed_at_ms` before interpreting zero counts as an absence of work.
+Routine `broker status` renders compact text by default; `broker status
+--compact` selects that text explicitly. Compact output groups repeated advice,
+keeps each warning category visible, and marks omitted details and unknown or
+deferred checks instead of presenting them as absent. Use `broker status
+--compact --json` for the versioned `aethyme.broker-status-compact/v1` shape.
+`broker status --json` keeps the existing full JSON shape, and
+`broker status --summary --json` keeps the existing summary JSON shape.
+Routine `--summary` reports recorded observations instead. Consumers of the
+full and summary JSON shapes must check top-level `deferred_checks`,
+`leases_refreshed` and `leases_refreshed_at_ms` before interpreting zero counts
+as an absence of work. Compact JSON exposes the corresponding freshness values
+under `data_freshness`, including `deferred_checks_are_unknown`.
 `--refresh` names in `deferred_checks` any check its inspection budget cut
 short, and lists the sessions it did not reach (#460).
 `integration_relation: not_checked` and empty ref heads in summary mean unknown,

@@ -68,6 +68,28 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn wait_for_agent_pid_exit(broker: &Broker, session_id: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let view = broker
+            .agents_snapshot(now_ms())
+            .unwrap()
+            .into_iter()
+            .find(|view| view.session.id == session_id);
+        if view
+            .as_ref()
+            .is_some_and(|view| view.pid_alive == Some(false))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spawned process for session {session_id} did not exit before the deadline"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
     let tmp = common::FixtureRepository::new();
@@ -2153,6 +2175,272 @@ fn status_brief_still_records_liveness_transitions() {
         broker.store().session(session.id).unwrap().status,
         SessionStatus::Stale,
         "the transition must be persisted, unlike status_snapshot"
+    );
+}
+
+#[test]
+fn summary_reuses_recent_dead_pid_liveness_with_stored_status_semantics() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
+    let live = broker.adopt(tmp.path(), Some("live lease owner")).unwrap();
+    let exited = broker.start_agent("recent-dead", "true", None).unwrap();
+    assert!(exited.pid.is_some());
+    wait_for_agent_pid_exit(&broker, exited.id);
+
+    broker
+        .store()
+        .claim_lease(live.id, "src/shared.rs", None)
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(exited.id, "src/shared.rs", None)
+        .unwrap();
+    let stored = broker.store().session(exited.id).unwrap();
+    assert_eq!(stored.status, SessionStatus::Active);
+    assert!(now_ms().saturating_sub(stored.last_activity_at) < 60_000);
+
+    let snapshot = Broker::open_snapshot(tmp.path()).unwrap();
+    let read_only = snapshot.status_brief_snapshot(now_ms()).unwrap();
+    assert_eq!(read_only.summary.overlap_count, 1);
+    assert_eq!(
+        broker.store().session(exited.id).unwrap().status,
+        SessionStatus::Active,
+        "read-only summary must leave the stored status untouched"
+    );
+
+    let brief = broker.status_brief(now_ms()).unwrap();
+    assert_eq!(brief.summary.overlap_count, 0);
+    assert_eq!(
+        broker.store().session(exited.id).unwrap().status,
+        SessionStatus::Exited,
+        "writable summary persists the dead PID transition before pairing"
+    );
+    assert!(
+        broker
+            .store()
+            .session_leases(exited.id)
+            .unwrap()
+            .iter()
+            .any(|lease| lease.path == "src/shared.rs")
+    );
+    for phase in [
+        "agents",
+        "overlaps",
+        "status_advice",
+        "blockers",
+        "ownership",
+        "submits",
+        "total",
+    ] {
+        assert!(
+            brief.phase_timings_ms.contains_key(phase),
+            "missing {phase}"
+        );
+    }
+    let longest_phase = [
+        "agents",
+        "overlaps",
+        "status_advice",
+        "blockers",
+        "ownership",
+        "submits",
+    ]
+    .into_iter()
+    .map(|phase| brief.phase_timings_ms[phase])
+    .max()
+    .unwrap();
+    assert!(brief.phase_timings_ms["total"] >= longest_phase);
+}
+
+#[test]
+fn status_brief_loads_promotion_config_once_from_committed_default() {
+    const CHILD: &str = "AETHYME_STATUS_BRIEF_CONFIG_TRACE_CHILD";
+    const NAME: &str = "status_brief_loads_promotion_config_once_from_committed_default";
+    if std::env::var_os(CHILD).is_some() {
+        let tmp = common::FixtureRepository::new();
+        init_repo(tmp.path());
+        let config_path = tmp.path().join(".aethyme/config.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "[promote]\nmode = \"verify-only\"\nbranch = \"review/integration\"\n",
+        )
+        .unwrap();
+        sh(tmp.path(), &["add", "-f", ".aethyme/config.toml"]);
+        sh(tmp.path(), &["commit", "-qm", "committed promote policy"]);
+        sh(
+            tmp.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        sh(tmp.path(), &["config", "remote.origin.url", "."]);
+        sh(
+            tmp.path(),
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+        sh(
+            tmp.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+
+        // The working copy conflicts in both fields. Summary must use the
+        // committed default config for mode and branch, from one Git read.
+        std::fs::write(
+            &config_path,
+            "[promote]\nmode = \"auto\"\nbranch = \"working/integration\"\n",
+        )
+        .unwrap();
+        let mut broker = open_fixture_broker(tmp.path()).unwrap();
+        broker
+            .adopt(tmp.path(), Some("summary config task"))
+            .unwrap();
+
+        let trace = std::path::PathBuf::from(
+            std::env::var_os("GIT_TRACE2_EVENT").expect("parent supplies private trace"),
+        );
+        std::fs::write(&trace, "").unwrap();
+        let brief = broker.status_brief(now_ms()).unwrap();
+        assert!(!brief.summary.may_move_integration);
+        assert!(
+            brief
+                .summary
+                .message
+                .contains("review/integration relation to not inspected not checked"),
+            "summary must name the committed default branch: {}",
+            brief.summary.message
+        );
+        assert!(
+            brief
+                .summary
+                .message
+                .contains("verify-only: submit does not move integration"),
+            "summary must use the committed default mode: {}",
+            brief.summary.message
+        );
+
+        let events = std::fs::read_to_string(&trace).unwrap();
+        let config_reads = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["event"] == "start")
+            .filter(|event| {
+                event["argv"].as_array().is_some_and(|argv| {
+                    argv.get(1).and_then(serde_json::Value::as_str) == Some("show")
+                        && argv.iter().any(|arg| {
+                            arg.as_str()
+                                .is_some_and(|arg| arg.ends_with(":.aethyme/config.toml"))
+                        })
+                })
+            })
+            .count();
+        assert_eq!(
+            config_reads, 1,
+            "one summary must read committed config once, trace={events}"
+        );
+        return;
+    }
+
+    let owner = tempfile::tempdir().unwrap();
+    let trace = owner
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("status-config-trace.jsonl");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .args(["--exact", NAME, "--nocapture"])
+        .env(CHILD, "1")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status summary config child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "child must execute exactly the selected regression: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn summary_keeps_stale_lease_rows_without_pairing_them() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
+    let mut sessions = Vec::new();
+    for name in ["fresh-a", "fresh-b", "quiet"] {
+        let worktree = tmp.path().join(".aethyme/worktrees").join(name);
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        let branch = format!("agent/summary-{name}");
+        sh(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let session = broker.adopt(&worktree, Some(name)).unwrap();
+        broker
+            .store()
+            .claim_lease(session.id, "src/shared.rs", None)
+            .unwrap();
+        sessions.push((name, session));
+    }
+
+    let quiet_id = sessions
+        .iter()
+        .find(|(name, _)| *name == "quiet")
+        .unwrap()
+        .1
+        .id;
+    let stale_at = now_ms() - 3 * 60 * 60 * 1_000;
+    broker
+        .store()
+        .touch_session_activity(quiet_id, stale_at)
+        .unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 60 * 60);
+    for file in ["index", "HEAD"] {
+        std::fs::File::open(tmp.path().join(".git/worktrees/quiet").join(file))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    let brief = broker.status_brief(now_ms()).unwrap();
+    assert_eq!(
+        brief.summary.overlap_count, 1,
+        "only the two fresh sessions pair"
+    );
+    assert_eq!(
+        broker.store().session(quiet_id).unwrap().status,
+        SessionStatus::Stale
+    );
+    assert!(
+        broker
+            .store()
+            .active_leases()
+            .unwrap()
+            .iter()
+            .any(|lease| lease.session_id == quiet_id && lease.path == "src/shared.rs")
     );
 }
 
