@@ -115,7 +115,7 @@ broker processes that can access it and make a separate, WAL-aware SQLite
 backup. The SQLite `.backup` command includes committed WAL content:
 
 ```bash
-sqlite3 "/path/to/repo/.aethyme/broker.db" ".backup /safe/backups/repo-broker.db.pre-0.8.28"
+sqlite3 "/path/to/repo/.aethyme/broker.db" ".backup /safe/backups/repo-broker.db.pre-0.8.29"
 ```
 
 If `AETHYME_BROKER_DB` redirects that repository's database, back up the
