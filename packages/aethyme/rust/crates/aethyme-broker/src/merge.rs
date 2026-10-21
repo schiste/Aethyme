@@ -530,6 +530,12 @@ struct PreparedSubmissionPlan {
     plan: SubmissionPlan,
 }
 
+/// Base references resolved for one queue-entry simulation.
+struct SimulationBase {
+    base: String,
+    pre_refresh: Option<String>,
+}
+
 impl PreparedSubmissionPlan {
     fn new(
         session: &crate::types::Session,
@@ -1032,8 +1038,7 @@ impl Broker {
             entry_id,
             cache_policy,
             intent,
-            base,
-            pre_refresh,
+            SimulationBase { base, pre_refresh },
             progress,
             prepared_plan,
         )?;
@@ -1046,11 +1051,11 @@ impl Broker {
         entry_id: i64,
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
-        base: String,
-        pre_refresh: Option<String>,
+        simulation_base: SimulationBase,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionPlan>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
+        let SimulationBase { base, pre_refresh } = simulation_base;
         let entry = self
             .store()
             .merge_queue()?
@@ -2819,7 +2824,7 @@ mod owned_merge_history_tests {
 
     #[test]
     fn prepared_submission_plan_rebuilds_after_base_or_session_inputs_move() {
-        let (tmp, broker, original) = fixture();
+        let (tmp, mut broker, original) = fixture();
         let root = tmp.path();
         let session = broker.store().session(original.session_id).unwrap();
         let entry = broker
@@ -2950,7 +2955,7 @@ mod owned_merge_history_tests {
                 &session,
                 &original.session_head,
                 &base,
-                original,
+                original.clone(),
             )),
             &entry,
             &session,
