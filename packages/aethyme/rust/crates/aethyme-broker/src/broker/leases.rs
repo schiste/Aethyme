@@ -674,6 +674,8 @@ impl Broker {
         }
         if classify_overlaps {
             self.classify_and_announce_overlaps(&after)?;
+        } else {
+            self.defer_overlap_classification(&after)?;
         }
         if let Some(preparation) = preparation {
             preparation.check()?;

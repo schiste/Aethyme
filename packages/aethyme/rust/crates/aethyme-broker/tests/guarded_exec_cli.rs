@@ -348,13 +348,19 @@ fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
         .store()
         .claim_lease(other.id, "tracked.txt", None)
         .unwrap();
-    let before = broker.store().meta_get("lease.overlap.pairs.v1").unwrap();
     std::fs::write(fixture.worktree.join("tracked.txt"), "acting edit\n").unwrap();
     std::fs::write(
         Path::new(&other.worktree_path).join("tracked.txt"),
         "other edit\n",
     )
     .unwrap();
+    let overlaps = broker.refresh_leases().unwrap();
+    let pairs = broker.overlap_pairs_snapshot(&overlaps);
+    assert_eq!(pairs.len(), 1);
+    assert!(
+        pairs[0].classified,
+        "fixture must start with a cached diagnosis"
+    );
     drop(broker);
 
     let output = fixture.run("true", true);
@@ -362,11 +368,13 @@ fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["ownership_ok"], true);
     let mut broker = fixture.broker();
-    assert_eq!(
-        broker.store().meta_get("lease.overlap.pairs.v1").unwrap(),
-        before,
-        "a guarded no-op must not compute or publish speculative merge verdicts"
+    let pairs = broker.overlap_pairs_snapshot(&overlaps);
+    assert_eq!(pairs.len(), 1);
+    assert!(
+        !pairs[0].classified,
+        "deferred diagnostics must not appear current"
     );
+    assert!(pairs[0].reason.contains("guarded exec deferred"));
     // The performance change must retain the acting session's refreshed
     // implicit lease, even though its dirty file was not changed by the child.
     assert!(broker.store().active_leases().unwrap().iter().any(|lease| {
@@ -376,9 +384,6 @@ fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
     }));
     // Explicit refresh still performs the deferred diagnosis. This is also a
     // positive control proving the fixture really has an analyzable overlap.
-    broker.refresh_leases().unwrap();
-    assert_ne!(
-        broker.store().meta_get("lease.overlap.pairs.v1").unwrap(),
-        before
-    );
+    let overlaps = broker.refresh_leases().unwrap();
+    assert!(broker.overlap_pairs_snapshot(&overlaps)[0].classified);
 }
