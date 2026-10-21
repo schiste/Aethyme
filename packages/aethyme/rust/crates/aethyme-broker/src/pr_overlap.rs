@@ -56,6 +56,10 @@ fn ranges_key(number: i64) -> String {
     format!("pr_overlap.ranges.{number}")
 }
 
+fn complete_github_read_output(stdout: String, stdout_truncated: bool) -> Option<String> {
+    (!stdout_truncated).then_some(stdout)
+}
+
 /// Changed old-side line ranges per path, inclusive, sorted and merged.
 pub(crate) type FileRanges = BTreeMap<String, Vec<(u32, u32)>>;
 
@@ -80,6 +84,9 @@ pub struct PrOverlapCheck {
     pub unknown_prs: Vec<i64>,
     /// When the PR listing used was taken, Unix epoch milliseconds.
     pub listed_at_ms: Option<i64>,
+    /// True when a complete open-PR listing could not be read for this check.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub listing_unavailable: bool,
 }
 
 /// Cached changed paths that intersect a session's explicit planned leases.
@@ -515,7 +522,10 @@ impl Broker {
                 wait(),
             )
             .ok()?;
-        report.ok().then_some(report.stdout)
+        if !report.ok() {
+            return None;
+        }
+        complete_github_read_output(report.stdout, report.stdout_truncated)
     }
 
     /// Refresh the open-PR listing and the PR ranges a push needs, then
@@ -567,7 +577,10 @@ impl Broker {
                 }),
         };
         let Some(listing) = listing else {
-            return PrOverlapCheck::default();
+            return PrOverlapCheck {
+                listing_unavailable: true,
+                ..Default::default()
+            };
         };
         if let Ok(text) = serde_json::to_string(&listing) {
             // The cache only saves the next command a `gh` call; the check
@@ -911,6 +924,42 @@ fn overlap_advice(session_id: i64, check: &PrOverlapCheck) -> Option<StatusAdvic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_truncated_github_read_is_not_passed_to_listing_or_diff_parsers() {
+        let valid_prefix = "[{\"number\":12}]".to_string();
+        assert_eq!(
+            complete_github_read_output(valid_prefix.clone(), true),
+            None,
+            "even a valid JSON prefix is incomplete evidence"
+        );
+        assert_eq!(
+            complete_github_read_output(valid_prefix.clone(), false),
+            Some(valid_prefix)
+        );
+    }
+
+    #[test]
+    fn listing_unavailable_is_backward_compatible_and_explicit_when_set() {
+        let previous = r#"{"overlaps":[],"unknown_prs":[],"listed_at_ms":null}"#;
+        let restored: PrOverlapCheck = serde_json::from_str(previous).unwrap();
+        assert!(!restored.listing_unavailable);
+        assert!(
+            serde_json::to_value(&restored)
+                .unwrap()
+                .get("listing_unavailable")
+                .is_none()
+        );
+
+        let unavailable = PrOverlapCheck {
+            listing_unavailable: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(unavailable).unwrap()["listing_unavailable"],
+            true
+        );
+    }
 
     const DIFF: &str = "\
 diff --git a/src/a.rs b/src/a.rs

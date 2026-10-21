@@ -384,6 +384,16 @@ pub(super) fn render_coordinated_operation(
                 eprintln!();
             }
         }
+        if report.stdout_truncated {
+            eprintln!(
+                "provider stdout exceeded the broker capture limit; displayed output is incomplete"
+            );
+        }
+        if report.stderr_truncated {
+            eprintln!(
+                "provider stderr exceeded the broker capture limit; displayed output is incomplete"
+            );
+        }
         out!(
             "operation {}: {} {} on {} ({} effect)",
             report.operation.id,
@@ -914,19 +924,33 @@ fn coordinated_failure_message(
     if let Some(code) = report.operation.exit_code {
         message.push_str(&format!(" (exit {code})"));
     }
-    let lines: Vec<&str> = report
-        .stderr
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    let tail = &lines[lines.len().saturating_sub(COORDINATED_FAILURE_STDERR_LINES)..];
-    if !tail.is_empty() {
-        message.push_str(": ");
-        message.push_str(&tail.join(" | "));
+    if !report.stdout_truncated && !report.stderr_truncated {
+        let lines: Vec<&str> = report
+            .stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let tail = &lines[lines.len().saturating_sub(COORDINATED_FAILURE_STDERR_LINES)..];
+        if !tail.is_empty() {
+            message.push_str(": ");
+            message.push_str(&tail.join(" | "));
+        }
     }
-    if let Some(hint) =
-        crate::session_push::missing_executable_path_hint(&report.stdout, &report.stderr)
+    if report.stdout_truncated {
+        message.push_str(
+            "\nprovider stdout exceeded the broker capture limit; captured output is incomplete",
+        );
+    }
+    if report.stderr_truncated {
+        message.push_str(
+            "\nprovider stderr exceeded the broker capture limit; captured output is incomplete",
+        );
+    }
+    if !report.stdout_truncated
+        && !report.stderr_truncated
+        && let Some(hint) =
+            crate::session_push::missing_executable_path_hint(&report.stdout, &report.stderr)
     {
         message.push('\n');
         message.push_str(hint);

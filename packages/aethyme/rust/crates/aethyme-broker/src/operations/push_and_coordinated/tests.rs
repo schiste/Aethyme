@@ -145,6 +145,22 @@ fn only_a_url_under_the_asserted_repository_counts_as_a_created_resource() {
         created_resource_url("could not add label: dette not found\n", "schiste/aethyme"),
         None
     );
+    assert_eq!(
+        created_resource_url_if_complete(
+            "https://github.com/schiste/aethyme/issues/184\n",
+            "schiste/aethyme",
+            true,
+        ),
+        None,
+        "a URL in a truncated prefix is not complete create evidence"
+    );
+}
+
+#[test]
+fn truncated_github_listing_is_not_parsed_even_when_the_prefix_is_valid_json() {
+    let prefix = br#"[{"number":1}]"#;
+    assert!(parse_github_listing(prefix, true).is_none());
+    assert_eq!(parse_github_listing(prefix, false).unwrap().len(), 1);
 }
 
 /// The watermark is what separates the resource this run created from one
@@ -350,6 +366,14 @@ fn an_ambiguous_github_failure_is_not_a_refusal() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn truncated_github_stderr_cannot_prove_a_refusal() {
+    let args = gh_args(&["pr", "update-branch", "506"]);
+    let refusal = b"X Cannot update PR branch due to conflicts\n";
+    assert!(classify_github_refusal(&args, Some(1), refusal).is_some());
+    assert!(classify_github_refusal_if_complete(&args, Some(1), refusal, true).is_none());
 }
 
 /// A create nobody could recognise afterwards is unknown, not failed.
@@ -1435,6 +1459,117 @@ fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
     assert!(
         matches!(&error, Err(BrokerOpError::AdmissionTimedOut { .. })),
         "an inherited pipe held past the deadline must time out, got {error:?}"
+    );
+}
+
+#[test]
+fn capture_limit_boundary_flags_only_omitted_bytes() {
+    let mut capture = OutputCaptureState::new(4);
+    capture.append(b"1234");
+    assert_eq!(capture.bytes, b"1234");
+    assert!(!capture.truncated, "exactly-at-limit output is complete");
+
+    capture.append(b"5");
+    assert_eq!(capture.bytes, b"1234");
+    assert!(capture.truncated, "the first omitted byte marks truncation");
+}
+
+#[test]
+fn truncated_failure_stderr_is_not_persisted_as_a_tail() {
+    let mut details = json!({"output_truncated": {"stdout": false, "stderr": true}});
+    add_failure_stderr_if_complete(&mut details, b"captured prefix", true);
+
+    assert_eq!(details["output_truncated"]["stderr"], true);
+    assert!(details.get("failure_output").is_none());
+
+    let mut complete_details = json!({});
+    add_failure_stderr_if_complete(&mut complete_details, b"complete diagnostic", false);
+    assert_eq!(
+        complete_details["failure_output"]["stderr_tail"],
+        json!(["complete diagnostic"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_limit_keeps_draining_and_preserves_provider_exit_status() {
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2",
+    ]);
+    let output = output_within_capture_limit(
+        command,
+        AdmissionDeadline::start(QueueWait::Seconds(10)),
+        "owner/repo",
+        "testing bounded output capture",
+        None,
+        8,
+    )
+    .expect("the readers keep draining after the capture limit");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, [0; 8]);
+    assert_eq!(output.stderr, [0; 8]);
+    assert!(output.stdout_truncated);
+    assert!(output.stderr_truncated);
+}
+
+#[test]
+fn discarded_output_reader_drains_without_retaining_after_timeout() {
+    struct GatedReader {
+        started: Option<std::sync::mpsc::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+        sent: bool,
+    }
+
+    impl std::io::Read for GatedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                return Ok(0);
+            }
+            self.sent = true;
+            let _notified = self.started.take().expect("one read start").send(());
+            self.release
+                .recv()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let payload = b"arrived after timeout";
+            buffer[..payload.len()].copy_from_slice(payload);
+            Ok(payload.len())
+        }
+    }
+
+    let capture = Arc::new(Mutex::new(OutputCaptureState::new(64)));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (done_tx, _done_rx) = std::sync::mpsc::channel();
+    let reader = spawn_output_reader(
+        GatedReader {
+            started: Some(started_tx),
+            release: release_rx,
+            sent: false,
+        },
+        Arc::clone(&capture),
+        None,
+        "provider stdout",
+        done_tx,
+    );
+
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the detached reader reached its blocking read");
+    discard_output_capture(&capture);
+    release_tx.send(()).unwrap();
+    join_output_reader(reader).unwrap();
+
+    let (bytes, truncated) = finish_output_capture(&capture);
+    assert!(bytes.is_empty());
+    assert!(!truncated);
+    let capture = capture.lock().unwrap();
+    assert_eq!(
+        capture.bytes.capacity(),
+        0,
+        "timeout releases the buffer allocation"
     );
 }
 
