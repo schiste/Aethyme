@@ -1033,7 +1033,14 @@ fn an_unbounded_read_gets_the_read_budget_and_writes_keep_theirs() {
         issue_list_long_running,
         OperationProvider::Github,
     );
-    assert_eq!(read.budget, Some(GITHUB_READ_OPERATION_BUDGET));
+    let configured = std::env::var("AETHYME_BROKER_READ_BUDGET_SECS").ok();
+    assert_eq!(
+        read.budget,
+        Some(read_operation_budget_from(
+            configured.as_deref(),
+            GITHUB_READ_OPERATION_BUDGET,
+        ))
+    );
     assert!(read.at.is_some());
 
     // Git keeps its longer default; a caller's own bound still wins.
@@ -1045,7 +1052,13 @@ fn an_unbounded_read_gets_the_read_budget_and_writes_keep_theirs() {
         false,
         OperationProvider::Git,
     );
-    assert_eq!(git_read.budget, Some(GIT_READ_OPERATION_BUDGET));
+    assert_eq!(
+        git_read.budget,
+        Some(read_operation_budget_from(
+            configured.as_deref(),
+            GIT_READ_OPERATION_BUDGET,
+        ))
+    );
 
     // A caller's own bound wins, and writes keep the wait they asked for.
     let explicit = AdmissionDeadline::start(QueueWait::Seconds(5)).bounded_for(
