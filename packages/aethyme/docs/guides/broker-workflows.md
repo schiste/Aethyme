@@ -1396,17 +1396,26 @@ The new session ID may differ from the old one. Always use the ID printed by
 
 ### Routine status and explicit audits
 
-`aethyme broker status --summary` reads session liveness, the queue and recorded
-lease overlaps without scanning Git history or retained checkouts. It carries
-`deferred_checks`, `leases_refreshed: false`, and `leases_refreshed_at_ms` (null
-until a refresh has been recorded). Ref heads and commit counts in this summary
-are uninspected; use the explicit audit when those values matter.
+Default text and `aethyme broker status --compact --json` use the recorded
+observation path without scanning each checkout. The compact JSON is versioned
+as `aethyme.broker-status-compact/v1`; it groups advice by id and severity,
+counts repeated observations, retains every category and its commands, and
+marks per-observation evidence and identities as omitted. `deferred_checks`
+are unknown, not clean, and `leases_refreshed: false` means the lease counts
+come from the last recorded refresh. Null summary fields are listed in
+`summary.unknown_fields`.
 
-Ordinary `broker status` adds recorded size observations. Its retention
-inventory checks ownership but limits work between sessions; an incomplete
-inventory reports `inventory_complete: false` and `inventory_deferred_sessions`.
-Cleanup eligibility is always uninspected on this path. Zero counts for a
-check named in `deferred_checks` do not mean that nothing needs attention.
+`aethyme broker status --summary --json` keeps its existing brief JSON shape.
+`aethyme broker status --json` keeps the full recorded status shape and its
+per-session details. Use it when you need exact session, lease-path or
+per-observation evidence; use `--refresh --json` when current Git, conflict and
+cleanup eligibility checks are required.
+
+The full JSON retention inventory checks ownership but limits work between
+sessions; an incomplete inventory reports `inventory_complete: false` and
+`inventory_deferred_sessions`. Cleanup eligibility is uninspected on routine
+paths. Zero counts for a check named in `deferred_checks` do not mean that
+nothing needs attention.
 
 The status JSON cleanup_retention object also reports inode pressure:
 inodes_free and host_inode_volume_probe describe free inodes on the most
@@ -1419,9 +1428,9 @@ so the sum is only a floor while that count is non-zero.
 
 `aethyme broker status --refresh` explicitly runs the expensive lease, Git
 conflict, publication and cleanup eligibility checks. It cannot be combined
-with `--summary` or used in degraded read-only compatibility mode. Neither
-routine view authorizes deletion: `broker gc plan`, apply, finish and submit
-continue to perform their independent checks. Routine size observations carry
+with `--summary` or `--compact`, or used in degraded read-only compatibility
+mode. Routine views do not authorize deletion: `broker gc plan`, apply, finish and
+submit continue to perform their independent checks. Routine size observations carry
 their measurement timestamp and are not silently refreshed by a directory walk.
 
 Recorded PR-overlap warnings come from the last push and are invalidated when
