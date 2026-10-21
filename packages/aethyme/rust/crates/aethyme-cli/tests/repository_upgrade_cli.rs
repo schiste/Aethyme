@@ -38,6 +38,16 @@ fn command(repo: &Path) -> Command {
 }
 
 fn isolate_fixture_git_environment(command: &mut Command, repo: &Path) {
+    clear_inherited_git_environment(command);
+
+    let fixture_home = repo.parent().expect("fixture repo has a temp root");
+    command
+        .env("HOME", fixture_home)
+        .env("GIT_CONFIG_GLOBAL", fixture_home.join("empty-git-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+fn clear_inherited_git_environment(command: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if name
             .to_string_lossy()
@@ -47,12 +57,6 @@ fn isolate_fixture_git_environment(command: &mut Command, repo: &Path) {
             command.env_remove(name);
         }
     }
-
-    let fixture_home = repo.parent().expect("fixture repo has a temp root");
-    command
-        .env("HOME", fixture_home)
-        .env("GIT_CONFIG_GLOBAL", fixture_home.join("empty-git-config"))
-        .env("GIT_CONFIG_NOSYSTEM", "1");
 }
 
 fn git_command(repo: &Path) -> Command {
@@ -108,6 +112,7 @@ fn repository_fixture_git_children_ignore_host_global_excludes() {
     .unwrap();
 
     let mut host_configured = Command::new("git");
+    clear_inherited_git_environment(&mut host_configured);
     host_configured
         .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
         .current_dir(&repo)
