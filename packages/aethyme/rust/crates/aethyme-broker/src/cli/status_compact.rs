@@ -229,7 +229,7 @@ impl CompactStatus {
         line!("Broker status (compact)");
         line!("{}", self.summary.message);
         line!(
-            "Sessions: {} live ({} active, {} idle, {} stale); {} recorded overlap pairs.",
+            "Sessions: {} live ({} active, {} idle, {} stale); {} recorded lease-overlap observations.",
             self.summary.live_sessions,
             self.summary.active_sessions,
             self.summary.idle_sessions,
