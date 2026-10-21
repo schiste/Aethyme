@@ -1367,6 +1367,77 @@ fn the_lock_only_gets_what_preparation_left() {
     );
 }
 
+/// A provider can exit while its descendant still holds the captured pipes.
+#[cfg(unix)]
+#[test]
+fn provider_exit_does_not_outwait_deadline_for_inherited_output_pipes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ready = tmp.path().join("descendant-ready");
+    let release = tmp.path().join("release-descendant");
+    let done = tmp.path().join("descendant-done");
+    let ready_for_thread = ready.clone();
+    let release_for_thread = release.clone();
+    let done_for_thread = done.clone();
+    let releaser = std::thread::spawn(move || {
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !ready_for_thread.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready_seen = ready_for_thread.exists();
+        if ready_seen {
+            // Keep both inherited output descriptors open beyond the provider's
+            // deadline, then release the finite child so the test leaves no
+            // process behind.
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        std::fs::write(release_for_thread, b"release").unwrap();
+        let done_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while ready_seen && !done_for_thread.exists() && std::time::Instant::now() < done_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (ready_seen, done_for_thread.exists())
+    });
+
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "(i=0; while [ ! -e \"$1\" ] && [ \"$i\" -lt 120 ]; do sleep 0.05; i=$((i + 1)); done; : > \"$3\") & printf child; : > \"$2\"; exit 0",
+        "sh",
+        release.to_str().unwrap(),
+        ready.to_str().unwrap(),
+        done.to_str().unwrap(),
+    ]);
+    let started = std::time::Instant::now();
+    let budget = Duration::from_secs(2);
+    let error = output_within(
+        command,
+        AdmissionDeadline {
+            started,
+            at: Some(started + budget),
+            budget: Some(budget),
+        },
+        "owner/repo",
+        "capturing provider output",
+        None,
+    );
+    let provider_wait = started.elapsed();
+    let (ready_seen, descendant_done) = releaser.join().unwrap();
+
+    assert!(ready_seen, "the provider leader must exit before pipe EOF");
+    assert!(
+        descendant_done,
+        "the finite descendant must exit after release"
+    );
+    assert!(
+        provider_wait < Duration::from_secs(3),
+        "reader drain exceeded the 2s operation deadline: {provider_wait:?}"
+    );
+    assert!(
+        matches!(&error, Err(BrokerOpError::AdmissionTimedOut { .. })),
+        "an inherited pipe held past the deadline must time out, got {error:?}"
+    );
+}
+
 /// The defect itself: preparation that outruns the budget must be killed
 /// and reported, not waited on. A wedged remote is what this stands in for.
 #[test]

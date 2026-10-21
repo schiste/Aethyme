@@ -4317,6 +4317,8 @@ impl Broker {
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            submission_plan_test_observer: None,
         })
     }
 
@@ -4356,6 +4358,8 @@ impl Broker {
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            submission_plan_test_observer: None,
         };
         // Opening an unbound v53 database is observational. In particular it
         // must not initialize a shared preparation-cache root or run startup
@@ -4411,6 +4415,8 @@ impl Broker {
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            submission_plan_test_observer: None,
         };
         // A fresh or legacy-unbound store remains available for non-root
         // operations, but startup maintenance waits for an explicit binding.

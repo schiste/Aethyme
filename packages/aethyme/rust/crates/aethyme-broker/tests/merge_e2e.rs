@@ -120,6 +120,179 @@ fn refresh_graph(root: &Path, repository: &str) {
 }
 
 #[test]
+fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", "--", ".aethyme/config.toml"]);
+    sh(tmp.path(), &["commit", "-qm", "use manual promotion"]);
+    // Submission-plan reuse requires the same canonical origin identity used
+    // by coordinated local Git writers. The URL is identity-only; no fetch runs.
+    sh(
+        tmp.path(),
+        &["remote", "add", "origin", "git@github.com:example/repo.git"],
+    );
+
+    // Finish fixture history before opening the broker: its default database
+    // lives in the repository and must not be staged by later branch commits.
+    // Main and integration each receive an independent commit from the same
+    // initial tree, so the session plan includes both nonempty patch streams.
+    sh(tmp.path(), &["switch", "-qc", "integration-only"]);
+    std::fs::write(
+        tmp.path().join("src/integration-only.py"),
+        "integration = 1\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", "--", "src/integration-only.py"]);
+    sh(tmp.path(), &["commit", "-qm", "edit integration"]);
+    let integration = resolve(tmp.path(), "HEAD");
+    sh(tmp.path(), &["switch", "main"]);
+    std::fs::write(tmp.path().join("src/main-only.py"), "main = 1\n").unwrap();
+    sh(tmp.path(), &["add", "--", "src/main-only.py"]);
+    sh(tmp.path(), &["commit", "-qm", "edit main"]);
+
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    // Broker startup may reconcile refs, so restore the intended divergent
+    // integration tip after open and before building the session plan.
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &integration],
+    );
+    assert_ne!(
+        resolve(tmp.path(), "refs/heads/aethyme/integration"),
+        resolve(tmp.path(), "HEAD"),
+        "fixture integration must remain distinct from main"
+    );
+    assert_eq!(
+        resolve(tmp.path(), "refs/heads/aethyme/integration^"),
+        resolve(tmp.path(), "HEAD^"),
+        "fixture integration and main must diverge from their shared initial commit"
+    );
+
+    let session_worktree = agent_worktree(tmp.path(), "trace-reuse");
+    let session = broker
+        .adopt(&session_worktree, Some("trace submit plan reuse"))
+        .unwrap();
+    std::fs::write(
+        session_worktree.join("src/session-only.py"),
+        "session = 1\n",
+    )
+    .unwrap();
+    sh(&session_worktree, &["add", "--", "src/session-only.py"]);
+    sh(&session_worktree, &["commit", "-qm", "edit session"]);
+
+    let database_path = broker.store().db_path().to_path_buf();
+    assert!(
+        database_path.is_file(),
+        "fixture broker database must still exist before child startup"
+    );
+    broker
+        .store()
+        .session(session.id)
+        .expect("the adopted session must be readable before child startup");
+    let tracked = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("list tracked fixture paths");
+    assert!(tracked.status.success(), "git ls-files failed");
+    let tracked_paths = String::from_utf8_lossy(&tracked.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut database_prefixes = vec![".aethyme/broker.db".to_owned()];
+    if let Ok(relative_database) = database_path.strip_prefix(tmp.path()) {
+        database_prefixes.push(relative_database.to_string_lossy().into_owned());
+    }
+    let tracked_database_paths = tracked_paths
+        .iter()
+        .filter(|path| {
+            database_prefixes.iter().any(|prefix| {
+                path.as_str() == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|suffix| suffix.starts_with('-'))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        tracked_database_paths.is_empty(),
+        "the live broker database and WAL files must remain untracked: {tracked_database_paths:?}"
+    );
+
+    let trace_path = tmp.path().parent().unwrap().join("submit-trace.json");
+    let session_id = session.id.to_string();
+    let mut command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["submit", "--session", &session_id, "--json"],
+    );
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_SYSTEM",
+            tmp.path().join("missing-system-gitconfig"),
+        )
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            tmp.path().join("missing-global-gitconfig"),
+        )
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1");
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    let output = command
+        .current_dir(tmp.path())
+        .env("GIT_TRACE2_EVENT", &trace_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "broker submit failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let patch_history_reads = trace
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("Git Trace2 event log contains valid JSON records")
+        })
+        .filter(|event| event["event"] == "start")
+        .filter(|event| {
+            event["argv"].as_array().is_some_and(|argv| {
+                argv.iter().any(|arg| arg == "log")
+                    && argv.iter().any(|arg| arg == "-p")
+                    && argv.iter().any(|arg| arg == "--format=commit %H")
+            })
+        })
+        .count();
+    assert_eq!(
+        patch_history_reads, 4,
+        "contract preflight and submit preflight each read session and integration patch histories once; JSON mode skips the separate human render, and simulation must reuse the submit preflight plan; trace:\n{trace}"
+    );
+}
+
+#[test]
 fn verify_only_submission_plan_and_submit_use_the_same_upstream_base() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());

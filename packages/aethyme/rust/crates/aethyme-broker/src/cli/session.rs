@@ -85,6 +85,9 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     /// Why this session's scope overlaps could not be determined.
     #[serde(skip_serializing_if = "Option::is_none")]
     scope_overlaps_warning: Option<&'a str>,
+    /// Cached, path-only advisory for explicit planned leases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planned_path_pr_overlaps: Option<&'a crate::PlannedPathPrOverlapCheck>,
 }
 
 /// One warning line per other session that looks like the same work.
@@ -140,6 +143,7 @@ fn session_action_json<T: serde::Serialize>(
     duplicate_work: &[crate::DuplicateWork],
     scope_overlaps: Option<&[crate::ScopeOverlap]>,
     scope_overlaps_warning: Option<&str>,
+    planned_path_pr_overlaps: Option<&crate::PlannedPathPrOverlapCheck>,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&SessionActionOutput {
         report,
@@ -150,7 +154,48 @@ fn session_action_json<T: serde::Serialize>(
         duplicate_work,
         scope_overlaps,
         scope_overlaps_warning,
+        planned_path_pr_overlaps,
     })
+}
+
+fn render_planned_path_pr_overlaps(check: &crate::PlannedPathPrOverlapCheck) {
+    if !check.cache_available {
+        out!(
+            "warning: planned-path open-PR overlap is unavailable: {}",
+            check
+                .warning
+                .as_deref()
+                .unwrap_or("the cached listing could not be checked")
+        );
+        return;
+    }
+    for overlap in &check.overlaps {
+        let shown = overlap.files.iter().take(5).cloned().collect::<Vec<_>>();
+        out!(
+            "Heads-up: open PR #{} also changes planned path(s) {} ({}); this is path-only, line conflicts are not evaluated",
+            overlap.pr,
+            shown.join(", "),
+            overlap.url,
+        );
+    }
+    if !check.unknown_prs.is_empty() {
+        let prs = check
+            .unknown_prs
+            .iter()
+            .take(5)
+            .map(|pr| format!("#{pr}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out!(
+            "note: planned-path overlap is unknown for open PR(s) {prs}; their cached changed paths are unavailable"
+        );
+    }
+    if check.listing_may_be_truncated {
+        out!(
+            "note: the cached open-PR listing reached its {}-PR limit; additional open PRs may be omitted",
+            check.checked_open_pr_limit
+        );
+    }
 }
 
 /// The working agreement, as a compact numbered block. A disabled agreement
@@ -1184,6 +1229,11 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     }
     let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
+    let planned_path_pr_overlaps = broker.cached_planned_path_pr_overlaps(
+        session,
+        &report.planned_explicit_leases,
+        crate::clock::epoch_ms(),
+    );
     if parsed.json {
         // Scope is recorded in both output modes: `--json` is the form
         // agents use, so skipping capture there drops it for most callers.
@@ -1204,6 +1254,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
                 &duplicates,
                 scope_overlaps.as_deref(),
                 scope_overlaps_warning.as_deref(),
+                planned_path_pr_overlaps.as_ref(),
             )?
         );
     } else {
@@ -1340,6 +1391,9 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         }
         render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
+        if let Some(check) = &planned_path_pr_overlaps {
+            render_planned_path_pr_overlaps(check);
+        }
         render_preparation_status(&report.preparation, false)?;
         if let Some(line) = broker.pr_overlap_heads_up(session) {
             out!("{line}");
@@ -1379,6 +1433,11 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     );
     let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
+    let planned_path_pr_overlaps = broker.cached_planned_path_pr_overlaps(
+        session,
+        &report.planned_explicit_leases,
+        crate::clock::epoch_ms(),
+    );
     if parsed.json {
         let (scope_overlaps, scope_overlaps_warning) = capture_declared_scopes(
             &mut broker,
@@ -1397,6 +1456,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
                 &duplicates,
                 scope_overlaps.as_deref(),
                 scope_overlaps_warning.as_deref(),
+                planned_path_pr_overlaps.as_ref(),
             )?
         );
     } else {
@@ -1418,6 +1478,9 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         render_worktree_placement(&report.worktree_placement);
         render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
+        if let Some(check) = &planned_path_pr_overlaps {
+            render_planned_path_pr_overlaps(check);
+        }
         render_preparation_status(&report.preparation, false)?;
         if let Some(line) = broker.pr_overlap_heads_up(session) {
             out!("{line}");
@@ -1461,7 +1524,7 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
         let duplicates = broker.duplicate_work_for(session);
         out!(
             "{}",
-            session_action_json(&report, &tab_rename, None, &duplicates, None, None)?
+            session_action_json(&report, &tab_rename, None, &duplicates, None, None, None)?
         );
     } else {
         out!(

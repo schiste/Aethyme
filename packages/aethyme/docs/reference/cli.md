@@ -1350,6 +1350,30 @@ against the default branch, excluding the session's own:
 never call GitHub, and ignore a listing older than a day. Nothing here blocks a
 command or writes to GitHub.
 
+When the start/adopt report has a nonempty `planned_explicit_leases` set, JSON
+also includes `planned_path_pr_overlaps`. This includes `start --reuse` and
+adopt/reuse forms when the reused report carries prior planned claims; presence
+is based on the effective report, not only on `--path` arguments in the current
+invocation. The field is omitted when that set is empty.
+`cache_available` says whether a fresh cached listing for the current local
+default branch was usable; `warning` explains a missing, stale, or mismatched
+listing, including a listing timestamp in the future. When the listing is available,
+`overlaps` names open PRs whose changed
+paths are present in cached ranges and equal or fall under a declared path.
+`unknown_prs` names listed PRs whose current changed paths are not in the
+cache. Range reuse requires both the PR head and local default-branch commit to
+match. Older entries without that base identity and provider-only diffs without
+a verified local base remain unknown until locally refreshed.
+`listed_at_ms` gives the listing time, and
+`checked_open_pr_limit` reports the 30-PR cache limit; `listing_may_be_truncated`
+is true if the listing reached that limit. Human output prints matching PRs and
+warns when the cache is unavailable, unknown PR paths remain, or the listing
+may be truncated.
+This is a path-only heads-up: it does not scan Git history, predict line
+conflicts, infer overlap from task text, or refresh GitHub data.
+Treat an unavailable cache or a nonempty `unknown_prs` as incomplete evidence,
+not as a clean result.
+
 ### Duplicate work and sessions stuck mid-merge
 
 Several live sessions repairing one pull request conflict with each other by
