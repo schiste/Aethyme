@@ -585,7 +585,7 @@ fn output_within(
     let stderr_reader =
         spawn_output_reader(stderr, stderr_state, "provider stderr", reader_done_tx);
 
-    let mut open_readers = 2;
+    let mut open_readers: usize = 2;
     let mut exited = None;
     let status = loop {
         if deadline.expired() {
