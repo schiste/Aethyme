@@ -136,9 +136,10 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     let job = block(&gates, "  gates:");
     assert!(job.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
     // An artifact uploaded by a fork's run never counts.
-    assert!(job
-        .iter()
-        .any(|line| line.contains(".workflow_run.head_repository_id == $repo_id")));
+    assert!(
+        job.iter()
+            .any(|line| line.contains(".workflow_run.head_repository_id == $repo_id"))
+    );
     assert!(job.contains(
         &"          COVERED_BY_PR_SUITE: \"cargo-test fast-guards workflow-contract gate-policy\""
     ));
@@ -240,12 +241,16 @@ fn product_proof_runs_on_main_and_falls_back_for_uncertain_or_full_prs() {
     let product = block(&oss, "  product-path-no-python:");
     assert!(product.contains(&"    needs: classify_changes"));
     assert!(product.contains(&"    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
-    assert!(product
-        .iter()
-        .any(|line| line.contains("aethyme deploy verify --repo .")));
-    assert!(product
-        .iter()
-        .any(|line| line.contains("aethyme verify-targets --repo .")));
+    assert!(
+        product
+            .iter()
+            .any(|line| line.contains("aethyme deploy verify --repo ."))
+    );
+    assert!(
+        product
+            .iter()
+            .any(|line| line.contains("aethyme verify-targets --repo ."))
+    );
 }
 
 #[test]
@@ -267,8 +272,10 @@ fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
     assert!(classifier.contains(&"              echo \"docs_fast=false\" >> \"$GITHUB_OUTPUT\""));
     assert!(classifier.contains(&"              exit 1"));
 
-    assert!(classifier
-        .contains(&"      performance_fast: ${{ steps.classify.outputs.performance_fast }}"));
+    assert!(
+        classifier
+            .contains(&"      performance_fast: ${{ steps.classify.outputs.performance_fast }}")
+    );
     // Both classifiers must come from the trusted PR base. A classifier change
     // in this PR cannot grant itself permission to skip product coverage.
     for script in ["docs-fast-lane.sh", "performance-fast-lane.sh"] {
@@ -420,7 +427,9 @@ fn ci_and_local_runs_share_one_test_command() {
     assert!(script.contains("--no-tests fail"));
     assert!(script.contains("--profile local"));
     assert!(script.contains("selection=(-p \"$package\" --lib)"));
-    assert!(script.contains("cargo build --locked --workspace --bins --jobs \"$local_build_jobs\""));
+    assert!(
+        script.contains("cargo build --locked --workspace --bins --jobs \"$local_build_jobs\"")
+    );
     assert!(script.contains("export CARGO_BUILD_JOBS=\"$local_build_jobs\""));
     assert!(script.contains("coverage=workspace"));
     assert!(script.contains("Cargo.toml|Cargo.lock|.cargo/*"));
