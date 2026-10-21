@@ -84,7 +84,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   clear inherited `GIT_*` variables; it only adds or overrides values. For
   isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
   preserve unrelated variables such as `PATH`, then set the fixture's intended
-  author/committer values. If a fixture PATH excludes real provider binaries,
+  author/committer values. For Git-backed fixtures that generate managed files
+  before staging, also set a fixture-owned `HOME`, an empty
+  `GIT_CONFIG_GLOBAL`, and `GIT_CONFIG_NOSYSTEM=1` on every CLI and Git child
+  before initial deployment and `git add`; a host `core.excludesFile` can hide
+  generated files from `git add -A`. Keep isolation on each child command and
+  do not compensate with fixture ignore rules or force-adds. If a fixture PATH
+  excludes real provider binaries,
   retain required CLI dependencies: install a prevalidated Git executable beside
   the fake provider instead of removing Git and failing before provider startup.
   Treat `core.sshCommand` as shell syntax: quote fixture executable paths for
