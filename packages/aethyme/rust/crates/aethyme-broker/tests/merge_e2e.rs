@@ -2907,6 +2907,47 @@ fn seed_terminal_queue_history(database: &rusqlite::Connection, session_id: i64)
 }
 
 #[test]
+fn broker_open_decodes_only_recoverable_queue_states() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let worktree = agent_worktree(tmp.path(), "recovery-query-scope");
+    let session = broker
+        .adopt(&worktree, Some("recovery query scope"))
+        .unwrap();
+    drop(broker);
+    let database = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    // A BLOB cannot be decoded as the expected head String. Ordinary history
+    // inspection must still report this corruption, but it is not a recovery
+    // candidate and must not be materialized by startup promotion recovery.
+    database
+        .execute(
+            "INSERT INTO merge_queue
+             (session_id, head_commit, base_commit, status, created_at, updated_at)
+         VALUES (?1, X'FF', 'old-base', 'rejected', 1, 1)",
+            [session.id],
+        )
+        .unwrap();
+    let mut reopened = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    assert!(reopened.store().merge_queue().is_err());
+    drop(reopened);
+    // The same malformed row in either eligible state must remain an error.
+    for status in ["verified", "promoted"] {
+        database
+            .execute("UPDATE merge_queue SET status = ?1", [status])
+            .unwrap();
+        assert!(
+            common::open_fixture_repository_broker(&tmp).is_err(),
+            "{status}"
+        );
+    }
+}
+
+#[test]
 fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
