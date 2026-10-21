@@ -345,7 +345,9 @@ impl Broker {
     /// The committed change of `branch_ref` against the default branch.
     fn ranges_for_head(&self, default: &TrackedDefault, head: &str) -> Option<FileRanges> {
         let repo = self.repo_handle();
-        let base = repo.merge_base(&default.tracking_ref, head).ok()?;
+        // Use the captured commit, not a tracking ref that a concurrent fetch
+        // can move before the result is stored under this base identity.
+        let base = repo.merge_base(&default.commit, head).ok()?;
         if base == head {
             return Some(FileRanges::new());
         }

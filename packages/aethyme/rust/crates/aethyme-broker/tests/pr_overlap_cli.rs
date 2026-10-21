@@ -1061,3 +1061,44 @@ fn recorded_status_warning_is_invalidated_when_push_inputs_move() {
         assert_eq!(fixture.gh_log(), "", "routine status must stay offline");
     }
 }
+
+#[test]
+fn push_refreshes_a_future_dated_pr_listing() {
+    let fixture = Fixture::new();
+    let other = fixture.publish_other("agent/other", &[(10, "theirs")], true);
+    fixture.open_prs(&[(12, "agent/other", &other, "OPEN")]);
+    let (session, _) = fixture.session_editing(&[(20, "ours")]);
+    fixture.push(session);
+    let mut broker = fixture.broker();
+    let mut listing: serde_json::Value = serde_json::from_str(
+        &broker
+            .store()
+            .meta_get("pr_overlap.open_prs")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    listing["fetched_at_ms"] = serde_json::json!(i64::MAX);
+    broker
+        .store()
+        .meta_set("pr_overlap.open_prs", &listing.to_string())
+        .unwrap();
+    drop(broker);
+    fixture.clear_gh_log();
+    fixture.push(session);
+    assert!(
+        fixture.gh_log().contains("pr list"),
+        "future listing must be refreshed: {}",
+        fixture.gh_log()
+    );
+    let mut broker = fixture.broker();
+    let refreshed: serde_json::Value = serde_json::from_str(
+        &broker
+            .store()
+            .meta_get("pr_overlap.open_prs")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(refreshed["fetched_at_ms"].as_i64().unwrap() < i64::MAX);
+}
