@@ -297,23 +297,87 @@ impl Broker {
     /// does not render them, and recording a delivery that never happened
     /// would corrupt the shown-to-action correlation.
     pub fn status_brief(&mut self, now_ms: i64) -> Result<StatusBrief, BrokerOpError> {
+        let total_started = std::time::Instant::now();
+        let agents_started = std::time::Instant::now();
         let agents = self.agents(now_ms)?;
-        self.build_status_brief(agents, now_ms)
+        let agents_ms = agents_started.elapsed().as_millis() as u64;
+        let overlaps_started = std::time::Instant::now();
+        let overlaps = self.lease_overlaps_after_agent_reconciliation(&agents)?;
+        let overlaps_ms = overlaps_started.elapsed().as_millis() as u64;
+        let mut brief = self.build_status_brief(agents, overlaps, now_ms)?;
+        brief.phase_timings_ms.insert("agents".into(), agents_ms);
+        brief
+            .phase_timings_ms
+            .insert("overlaps".into(), overlaps_ms);
+        brief
+            .phase_timings_ms
+            .insert("total".into(), total_started.elapsed().as_millis() as u64);
+        Ok(brief)
     }
 
     pub fn status_brief_snapshot(&self, now_ms: i64) -> Result<StatusBrief, BrokerOpError> {
-        self.build_status_brief(self.agents_snapshot(now_ms)?, now_ms)
+        let total_started = std::time::Instant::now();
+        let agents_started = std::time::Instant::now();
+        let agents = self.agents_snapshot(now_ms)?;
+        let agents_ms = agents_started.elapsed().as_millis() as u64;
+        let overlaps_started = std::time::Instant::now();
+        let overlaps = self.lease_overlaps_from_stored_status_views(&agents)?;
+        let overlaps_ms = overlaps_started.elapsed().as_millis() as u64;
+        let mut brief = self.build_status_brief(agents, overlaps, now_ms)?;
+        brief.phase_timings_ms.insert("agents".into(), agents_ms);
+        brief
+            .phase_timings_ms
+            .insert("overlaps".into(), overlaps_ms);
+        brief
+            .phase_timings_ms
+            .insert("total".into(), total_started.elapsed().as_millis() as u64);
+        Ok(brief)
+    }
+
+    /// Read coordination records for compact presentation without inspecting
+    /// retained checkouts, Git history, or submission recovery remedies.
+    pub(crate) fn routine_status_context(
+        &self,
+        now_ms: i64,
+    ) -> Result<RoutineStatusContext, BrokerOpError> {
+        let session_contexts = self
+            .store
+            .live_sessions()?
+            .into_iter()
+            .filter_map(|session| session.context_label().map(|context| (session.id, context)))
+            .collect();
+        let lease_release_requests = self
+            .lease_release_requests()?
+            .into_iter()
+            .filter(|request| request.state == crate::lease_requests::RequestState::Pending)
+            .collect();
+        let pending = self.store.pending_coordinated_operations()?;
+        Ok(RoutineStatusContext {
+            session_contexts,
+            collaboration_fence: self.collaboration_fence_state(FenceTrigger::Open),
+            lease_release_requests,
+            coordinated_operations: pending_operation_views(&pending, now_ms),
+        })
     }
 
     pub(super) fn build_status_brief(
         &self,
         agents: Vec<AgentView>,
+        overlaps: Vec<crate::Overlap>,
         now_ms: i64,
     ) -> Result<StatusBrief, BrokerOpError> {
         let started = std::time::Instant::now();
-        let overlaps = self.lease_overlaps_snapshot()?;
+        let mut phase_timings_ms = std::collections::BTreeMap::new();
+        let phase_started = std::time::Instant::now();
         let pairs = self.overlap_pairs_snapshot(&overlaps);
-        let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
+        phase_timings_ms.insert(
+            "overlap_pairs".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
+        let phase_started = std::time::Instant::now();
+        let (promote_config, promote_config_warning) =
+            PromoteConfig::load_with_warning(&self.main_root);
+        let promotes = promote_config.mode.promotes_at_all();
         let summary = status_summary(
             &agents,
             overlaps.len(),
@@ -327,7 +391,7 @@ impl Broker {
             0,
             0,
             &SummaryIntegration {
-                branch: PromoteConfig::load(&self.main_root).branch,
+                branch: promote_config.branch,
                 head: String::new(),
                 baseline_ref: "not inspected".into(),
                 baseline_head: String::new(),
@@ -339,21 +403,53 @@ impl Broker {
                 promotes,
             },
         );
+        phase_timings_ms.insert("summary".into(), phase_started.elapsed().as_millis() as u64);
         let ids = agents.iter().map(|a| a.session.id).collect::<Vec<_>>();
+        let phase_started = std::time::Instant::now();
         let latest = self.store.latest_merge_queue_for_sessions(&ids)?;
-        let mut advice = self.status_advice(&agents, &[], &latest, ("", ""), promotes, None);
-        let blockers = self.blockers();
-        if let Some(item) = crate::blockers::status_advice(&blockers.blockers) {
-            advice.push(item);
-        }
+        phase_timings_ms.insert(
+            "merge_queue".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
+        let phase_started = std::time::Instant::now();
+        let mut advice = self.status_advice(
+            &agents,
+            &[],
+            &latest,
+            ("", ""),
+            (promotes, promote_config_warning),
+            None,
+        );
+        phase_timings_ms.insert(
+            "status_advice".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
+        let phase_started = std::time::Instant::now();
+        advice.extend(self.blocker_status_advice_snapshot());
+        phase_timings_ms.insert(
+            "blockers".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
+        let phase_started = std::time::Instant::now();
         advice.extend(stalled_submit_advice(
             &crate::submit_progress::in_flight_submits(&self.main_root, now_ms),
         ));
+        phase_timings_ms.insert("submits".into(), phase_started.elapsed().as_millis() as u64);
+        let phase_started = std::time::Instant::now();
         advice.extend(overlap_pair_advice(&pairs));
+        phase_timings_ms.insert(
+            "overlap_advice".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
+        let phase_started = std::time::Instant::now();
         advice.extend(crate::ownership::ownership_claim_advice(
             &self.ownership_claim_views(&agents, now_ms)?,
             now_ms,
         ));
+        phase_timings_ms.insert(
+            "ownership".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         advice.push(StatusAdvice {
             id: "status.recorded-observations", severity: StatusAdviceSeverity::Notice,
             reason: "summary reads broker records without scanning Git history or retained checkouts",
@@ -361,11 +457,11 @@ impl Broker {
             session_id: None, queue_entry_id: None, evidence: Vec::new(),
             commands: vec!["aethyme broker status --refresh".into()],
         });
-        Ok(StatusBrief {
-            phase_timings_ms: std::collections::BTreeMap::from([(
-                "total".into(),
-                started.elapsed().as_millis() as u64,
-            )]),
+        let phase_started = std::time::Instant::now();
+        let waiters = crate::waiters::current_waiters(&self.main_root, now_ms);
+        phase_timings_ms.insert("waiters".into(), phase_started.elapsed().as_millis() as u64);
+        let mut brief = StatusBrief {
+            phase_timings_ms,
             deferred_checks: vec![
                 "git_refs",
                 "dirty_worktrees",
@@ -384,8 +480,12 @@ impl Broker {
             summary,
             advice,
             leases_refreshed: false,
-            waiters: crate::waiters::current_waiters(&self.main_root, now_ms),
-        })
+            waiters,
+        };
+        brief
+            .phase_timings_ms
+            .insert("build".into(), started.elapsed().as_millis() as u64);
+        Ok(brief)
     }
 
     /// Render the same status contract from persisted state and derived
@@ -485,11 +585,9 @@ impl Broker {
         // Read once and shared with the collaboration fence below, so the
         // fence costs status no extra Git calls.
         let repository_config = crate::merge::repository_config_with_source(&self.main_root);
-        let promotes =
-            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()))
-                .0
-                .mode
-                .promotes_at_all();
+        let (promote_config, promote_config_warning) =
+            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()));
+        let promotes = promote_config.mode.promotes_at_all();
         let collaboration_fence =
             self.collaboration_fence_state(FenceTrigger::Config(repository_config.as_ref()));
         // One deadline for every phase below whose cost grows with sessions
@@ -741,7 +839,7 @@ impl Broker {
             &promoted_conflicts,
             &latest_live_queue,
             (&integration_branch, &integration_head),
-            promotes,
+            (promotes, promote_config_warning),
             checkouts.as_ref(),
         );
         if collaboration_fence
@@ -1277,38 +1375,7 @@ impl Broker {
         // other unresolved row there is parked behind it. Naming that
         // relationship is the point -- a parked caller cannot say so itself.
         let pending_rows = self.store.pending_coordinated_operations()?;
-        let mut holder_by_repository: std::collections::HashMap<&str, i64> =
-            std::collections::HashMap::new();
-        for operation in &pending_rows {
-            if operation.status == crate::types::OperationStatus::Running {
-                holder_by_repository
-                    .entry(operation.repository.as_str())
-                    .or_insert(operation.id);
-            }
-        }
-        let coordinated_operations = pending_rows
-            .iter()
-            .map(|operation| {
-                let holder = holder_by_repository
-                    .get(operation.repository.as_str())
-                    .copied();
-                let holding_lock = holder == Some(operation.id);
-                PendingOperationView {
-                    id: operation.id,
-                    session_id: operation.session_id,
-                    provider: operation.provider.as_str().to_string(),
-                    repository: operation.repository.clone(),
-                    scope: operation.scope.clone(),
-                    status: operation.status.as_str().to_string(),
-                    pid: operation.pid,
-                    elapsed_seconds: now_ms.saturating_sub(operation.created_at).max(0) as u64
-                        / 1_000,
-                    holding_lock,
-                    blocked_by: if holding_lock { None } else { holder },
-                    liveness: crate::operations::operation_liveness_view(operation),
-                }
-            })
-            .collect::<Vec<_>>();
+        let coordinated_operations = pending_operation_views(&pending_rows, now_ms);
         if let Some(stalled) = self.stalled_coordinated_operation_advice(&pending_rows) {
             advice.push(stalled);
         }
@@ -1984,14 +2051,15 @@ impl Broker {
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
         integration: (&str, &str),
-        promotes: bool,
+        promotion: (bool, Option<String>),
         checkouts: Option<&std::collections::BTreeMap<i64, CheckoutInspection>>,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
+        let (promotes, promote_config_warning) = promotion;
         let (integration_branch, integration_head) = integration;
 
         let mut advice = Vec::new();
-        if let Some(warning) = PromoteConfig::load_with_warning(&self.main_root).1 {
+        if let Some(warning) = promote_config_warning {
             advice.push(StatusAdvice {
                 id: "promote.mode-invalid",
                 severity: StatusAdviceSeverity::Warning,
@@ -2657,4 +2725,41 @@ impl Broker {
             handoff,
         })
     }
+}
+
+fn pending_operation_views(
+    pending_rows: &[crate::types::CoordinatedOperation],
+    now_ms: i64,
+) -> Vec<PendingOperationView> {
+    let mut holder_by_repository: std::collections::HashMap<&str, i64> =
+        std::collections::HashMap::new();
+    for operation in pending_rows {
+        if operation.status == crate::types::OperationStatus::Running {
+            holder_by_repository
+                .entry(operation.repository.as_str())
+                .or_insert(operation.id);
+        }
+    }
+    pending_rows
+        .iter()
+        .map(|operation| {
+            let holder = holder_by_repository
+                .get(operation.repository.as_str())
+                .copied();
+            let holding_lock = holder == Some(operation.id);
+            PendingOperationView {
+                id: operation.id,
+                session_id: operation.session_id,
+                provider: operation.provider.as_str().to_string(),
+                repository: operation.repository.clone(),
+                scope: operation.scope.clone(),
+                status: operation.status.as_str().to_string(),
+                pid: operation.pid,
+                elapsed_seconds: now_ms.saturating_sub(operation.created_at).max(0) as u64 / 1_000,
+                holding_lock,
+                blocked_by: if holding_lock { None } else { holder },
+                liveness: crate::operations::operation_liveness_view(operation),
+            }
+        })
+        .collect::<Vec<_>>()
 }

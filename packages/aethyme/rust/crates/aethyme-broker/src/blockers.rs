@@ -259,6 +259,10 @@ pub enum UnblockOutcome {
 impl Broker {
     /// Every current blocker for this repository, read-only.
     pub fn blockers(&self) -> BlockerReport {
+        self.collect_blockers(true)
+    }
+
+    fn collect_blockers(&self, inspect_stale_worktrees: bool) -> BlockerReport {
         let mut report = BlockerReport::default();
         let mut linked_host_operations = Vec::new();
         match self.operation_blockers(&mut linked_host_operations) {
@@ -279,7 +283,7 @@ impl Broker {
                 .unavailable
                 .push(source_error("host-resources.db", error)),
         }
-        match self.path_lease_blockers() {
+        match self.path_lease_blockers(inspect_stale_worktrees) {
             Ok(found) => report.blockers.extend(found),
             Err(error) => report
                 .unavailable
@@ -303,6 +307,51 @@ impl Broker {
             name_the_other_half(&mut report.blockers);
         }
         report
+    }
+
+    /// Recorded blocker observations for routine status. Recovery commands need
+    /// fresh worktree inspection and are deliberately deferred to `broker unblock`.
+    pub(crate) fn blocker_status_advice_snapshot(&self) -> Vec<crate::StatusAdvice> {
+        let report = self.collect_blockers(false);
+        let mut advice = Vec::new();
+        if let Some(mut item) = status_advice(&report.blockers) {
+            item.reason = "recorded coordination blockers; worktree recovery remedies have not been inspected";
+            let count = report
+                .blockers
+                .iter()
+                .filter(|blocker| {
+                    !matches!(
+                        blocker.kind,
+                        BlockerKind::GateCache | BlockerKind::ActionRequired
+                    )
+                })
+                .count();
+            item.summary = format!(
+                "{count} blocker observations across broker stores; run `aethyme broker unblock` to inspect recovery remedies"
+            );
+            item.commands = vec!["aethyme broker unblock".into()];
+            advice.push(item);
+        }
+        if !report.unavailable.is_empty() {
+            advice.push(crate::StatusAdvice {
+                id: "blockers.sources-unavailable",
+                severity: crate::StatusAdviceSeverity::Warning,
+                reason: "some blocker sources could not be read; recorded counts are incomplete",
+                summary: format!(
+                    "{} blocker sources unavailable; inspect before recovery",
+                    report.unavailable.len()
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: report
+                    .unavailable
+                    .into_iter()
+                    .map(|error| format!("{}: {}", error.source, error.error))
+                    .collect(),
+                commands: vec!["aethyme broker unblock".into()],
+            });
+        }
+        advice
     }
 
     /// Clear one blocker through the recovery path its store already has.
@@ -455,24 +504,24 @@ impl Broker {
             .map_err(|error| BrokerOpError::InvalidCoordinatedOperation {
                 reason: error.to_string(),
             })?;
+        let leases = coordinator.quarantined_leases().map_err(|error| {
+            BrokerOpError::InvalidCoordinatedOperation {
+                reason: error.to_string(),
+            }
+        })?;
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let repository = self.origin_fingerprint();
         let sessions = self.sessions_by_worktree_fingerprint()?;
         let mut found = Vec::new();
-        for lease in
-            coordinator
-                .list(false)
-                .map_err(|error| BrokerOpError::InvalidCoordinatedOperation {
-                    reason: error.to_string(),
-                })?
-        {
+        for lease in leases {
             if lease.repository != repository
                 && !sessions
                     .iter()
                     .any(|(fp, _)| *fp == lease.worktree_fingerprint)
             {
-                continue;
-            }
-            if lease.state != crate::HostLeaseState::Quarantined {
                 continue;
             }
             let owner = sessions
@@ -532,7 +581,10 @@ impl Broker {
         Ok(found)
     }
 
-    fn path_lease_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
+    fn path_lease_blockers(
+        &self,
+        inspect_stale_worktrees: bool,
+    ) -> Result<Vec<Blocker>, BrokerOpError> {
         let mut found = Vec::new();
         // One remedy per session, not per lease: a stale session commonly
         // holds many leases, and each remedy reads its worktree and plans its
@@ -550,7 +602,7 @@ impl Broker {
                 continue;
             }
             let worktree_gone = !Path::new(&session.worktree_path).exists();
-            let remedy = (!worktree_gone).then(|| {
+            let remedy = (inspect_stale_worktrees && !worktree_gone).then(|| {
                 remedies
                     .entry(session.id)
                     .or_insert_with(|| {

@@ -1776,6 +1776,16 @@ pub(crate) enum FenceTrigger<'a> {
     Config(Option<&'a (String, &'static str)>),
 }
 
+/// Additional recorded data used only by compact presentation. Keeping this
+/// separate preserves the established full and summary JSON contracts.
+#[derive(Debug)]
+pub(crate) struct RoutineStatusContext {
+    pub session_contexts: Vec<(i64, String)>,
+    pub collaboration_fence: Option<crate::CollaborationFence>,
+    pub lease_release_requests: Vec<crate::lease_requests::LeaseReleaseRequest>,
+    pub coordinated_operations: Vec<PendingOperationView>,
+}
+
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {

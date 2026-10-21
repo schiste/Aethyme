@@ -2096,15 +2096,18 @@ impl Broker {
     /// first, so reopening the broker must checkpoint the accepted session
     /// HEAD before any follow-up submission is planned.
     pub(crate) fn recover_interrupted_promotion(&mut self) -> Result<(), BrokerOpError> {
+        let verified = self
+            .store()
+            .promotion_recovery_entries(MergeStatus::Verified)?;
+        if verified.is_empty() {
+            return Ok(());
+        }
         let config = PromoteConfig::load(&self.main_root_path());
         let Some(integration_head) = self.repo_handle().resolve_ref(&config.branch) else {
             return Ok(());
         };
         let mut candidate = None;
-        for entry in self.store().merge_queue()? {
-            if entry.status != MergeStatus::Verified {
-                continue;
-            }
+        for entry in verified {
             let Some(verification_candidate) = self.verification_candidate_for_entry(&entry)?
             else {
                 continue;
@@ -2141,10 +2144,7 @@ impl Broker {
     pub(crate) fn backfill_promoted_path_exposures(&mut self) -> Result<(), BrokerOpError> {
         let promoted_entries = self
             .store()
-            .merge_queue()?
-            .into_iter()
-            .filter(|entry| entry.status == MergeStatus::Promoted)
-            .collect::<Vec<_>>();
+            .promotion_recovery_entries(MergeStatus::Promoted)?;
         for entry in promoted_entries {
             if self.store().entry_path_exposure(entry.id)?.is_some() {
                 continue;
