@@ -3115,6 +3115,81 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FixedGraphImpactProvider(crate::graph_impact::GraphImpactLookup);
+
+    impl crate::graph_impact::GraphImpactProvider for FixedGraphImpactProvider {
+        fn name(&self) -> &str {
+            "context-test-provider"
+        }
+
+        fn lookup(
+            &self,
+            _query: &crate::graph_impact::GraphImpactQuery<'_>,
+        ) -> crate::graph_impact::GraphImpactLookup {
+            self.0.clone()
+        }
+    }
+
+    /// Build an envelope through the production GraphImpact report and AQ0
+    /// adapter path, with authentic report digests and revision provenance.
+    fn graph_impact_adapter_envelope(fixture: &Fixture, caller: &str) -> AnalysisEnvelope {
+        use aethyme_engine::store::redb::graph_store::{GraphStore, RepoMetadata};
+        use aethyme_graph_storage::{GraphCoverage, write_coverage_artifacts};
+
+        let root = tempfile::tempdir().unwrap();
+        let revision = fixture.base.as_str();
+        let mut coverage = GraphCoverage::unavailable(env!("CARGO_PKG_VERSION"));
+        coverage.available = true;
+        coverage.source_revision = Some(revision.into());
+        coverage.indexed_revision = Some(revision.into());
+        coverage.source_tree_sha256 = Some("fixture-tree".into());
+        coverage.indexed_tree_sha256 = Some("fixture-tree".into());
+        coverage.coverage_mode = "complete".into();
+        coverage.safe_to_use = true;
+        coverage.gaps.clear();
+        coverage.files.parsed = 1;
+        coverage
+            .by_language
+            .insert("rust".into(), Default::default());
+        coverage.edge_counts_by_kind.insert("calls".into(), 1);
+        coverage.edge_counts_by_kind.insert("tests".into(), 0);
+        write_coverage_artifacts(root.path(), &coverage, &[]).unwrap();
+
+        let graph = GraphStore::open(root.path()).unwrap();
+        graph
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.path().display().to_string(),
+                commit_hash: Some(revision.into()),
+                indexed_at_unix: 0,
+                file_count: 1,
+                languages: vec!["rust".into()],
+            })
+            .unwrap();
+        drop(graph);
+
+        let provider = FixedGraphImpactProvider(crate::graph_impact::GraphImpactLookup::ready(
+            vec![caller.into()],
+            false,
+            "fixture lookup",
+        ));
+        let report = crate::graph_impact::revision_bound_impact_report(
+            root.path(),
+            revision,
+            revision,
+            &["src/search.rs".into()],
+            crate::graph_impact::GraphImpactMode::Calls,
+            8,
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(
+            report.status,
+            crate::graph_impact::GraphImpactContractStatus::Complete
+        );
+        crate::impact_analysis_envelope(&report).unwrap()
+    }
+
     /// A contribution's base and result snapshots.
     fn snapshots(fixture: &Fixture, id: &RecordId) -> (SourceSnapshotId, SourceSnapshotId) {
         fixture
@@ -3263,6 +3338,33 @@ mod tests {
             "analysis_incompatible",
         );
 
+        let mut forged_fragment_claim =
+            pinned_references(&mut fixture, &snapshot, &["other/dep.rs"]);
+        let actual_fragment_digest = match forged_fragment_claim.provenance.as_ref() {
+            Some(Value::Object(provenance)) => match provenance.get("fragment_set_sha256") {
+                Some(Value::String(digest)) => digest.clone(),
+                other => panic!("unexpected fragment-set digest: {other:?}"),
+            },
+            other => panic!("unexpected pinned provenance: {other:?}"),
+        };
+        let forged_fragment_digest = if actual_fragment_digest == "0".repeat(64) {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        };
+        replace_provenance_member(
+            &mut forged_fragment_claim,
+            "fragment_set_sha256",
+            text(&forged_fragment_digest),
+        );
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            forged_fragment_claim,
+            "analysis_incompatible",
+        );
+
         let mut wrong_legacy_version = legacy_graph_impact(&["src/search.rs"], &["other/dep.rs"]);
         wrong_legacy_version.profile = ProfileRef::Legacy(format!(
             "aethyme-engine/{incompatible_version}/graph-impact-calls"
@@ -3356,6 +3458,94 @@ mod tests {
             missing_manifest,
             "analysis_unavailable",
         );
+    }
+
+    #[test]
+    fn a_supported_cached_answer_is_invalidated_when_its_view_manifest_disappears() {
+        let mut fixture = Fixture::new();
+        let candidate = fixture.contribute(&[("other/dep.rs", "fn dependent() {}\n")]);
+        let (snapshot, _) = snapshots(&fixture, &candidate);
+        let analysis = pinned_references(&mut fixture, &snapshot, &["other/dep.rs"]);
+        let supported = ask(
+            &mut fixture,
+            &["src/search.rs"],
+            vec![analysis.clone()],
+            Some(&snapshot),
+        );
+        assert_eq!(supported.contributions, ids(&[candidate.clone()]));
+        assert!(supported.selection.items.iter().any(|item| {
+            item.reasons
+                .iter()
+                .any(|reason| reason.kind == ReasonKind::ImpactEdge)
+        }));
+        assert!(!gaps(&supported).contains(&"analysis_unavailable"));
+
+        let (view, generation) = match analysis.provenance.as_ref() {
+            Some(Value::Object(provenance)) => {
+                match (provenance.get("view"), provenance.get("generation")) {
+                    (Some(Value::String(view)), Some(Value::Integer(generation))) => {
+                        (view.clone(), *generation)
+                    }
+                    other => panic!("unexpected pinned provenance: {other:?}"),
+                }
+            }
+            other => panic!("unexpected pinned provenance: {other:?}"),
+        };
+        let manifest = crate::analysis_view::views_root(&fixture.store)
+            .join(view)
+            .join(format!("gen-{generation}"))
+            .join("manifest.json");
+        std::fs::remove_file(manifest).unwrap();
+
+        let unavailable = ask(
+            &mut fixture,
+            &["src/search.rs"],
+            vec![analysis],
+            Some(&snapshot),
+        );
+        assert_ne!(
+            unavailable.cache_key, supported.cache_key,
+            "producer status must participate in the cache identity"
+        );
+        assert!(gaps(&unavailable).contains(&"analysis_unavailable"));
+        assert!(unavailable.selection.items.iter().all(|item| {
+            item.reasons
+                .iter()
+                .all(|reason| reason.kind != ReasonKind::ImpactEdge)
+        }));
+        assert!(
+            !unavailable
+                .contributions
+                .contains(&candidate.as_str().to_string())
+        );
+    }
+
+    #[test]
+    fn the_graph_impact_adapter_produces_a_supported_legacy_envelope() {
+        let mut fixture = Fixture::new();
+        let candidate = fixture.contribute(&[("other/dep.rs", "fn dependent() {}\n")]);
+        let (snapshot, _) = snapshots(&fixture, &candidate);
+        let analysis = graph_impact_adapter_envelope(&fixture, "other/dep.rs");
+
+        let (checked, producer) =
+            checked_analysis_envelope(&fixture.store, &analysis, Some(&snapshot));
+        assert_eq!(producer, ProducerStatus::Supported);
+        assert_eq!(checked.result, analysis.result);
+        assert!(analysis.provenance.is_some());
+
+        let context = ask(
+            &mut fixture,
+            &["src/search.rs"],
+            vec![analysis],
+            Some(&snapshot),
+        );
+        assert_eq!(context.contributions, ids(&[candidate]));
+        assert!(context.selection.items.iter().any(|item| {
+            item.reasons
+                .iter()
+                .any(|reason| reason.kind == ReasonKind::ImpactEdge)
+        }));
+        assert!(gaps(&context).contains(&"analysis_subject_unbound"));
     }
 
     #[test]
