@@ -20,6 +20,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Keep latency budgets in versioned machine-readable data. Validate the warning
+  policy with deterministic tests; assess elapsed time in dedicated performance
+  runs rather than wall-clock assertions in ordinary tests. Retain complete CLI
+  wall time, workload and binary identity, and raw samples. Do not equate an
+  internal phase or coordinated-operation interval with end-to-end or network
+  time. Use the existing non-gating performance workflow before adding builds.
+
 - For deadline-bounded cleanup, separate candidate discovery from the
   assertion that partial work completed. One short wall-clock budget may expire
   during discovery. Use a deterministic deadline seam to prove partial progress
