@@ -2850,7 +2850,7 @@ mod fresh_root_recovery_inventory_tests {
         );
         assert_eq!(after_link.file_identity.as_ref().unwrap().links, 2);
         assert_eq!(
-            std::fs::symlink_metadata(&paired_cargo.join("config.toml"))
+            std::fs::symlink_metadata(paired_cargo.join("config.toml"))
                 .unwrap()
                 .ino(),
             std::fs::symlink_metadata(&paired_temporary).unwrap().ino()
