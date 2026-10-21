@@ -2611,7 +2611,7 @@ fn retrieve_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collaboration_archive::{CommitOid, pin_commit};
+    use crate::collaboration_archive::{CommitOid, pin_commit, retain_snapshot};
     use crate::collaboration_capture::{
         CaptureOutcome, CapturePolicy, CaptureRequest, OperationId, RetentionBoundary, capture,
     };
@@ -3247,6 +3247,136 @@ mod tests {
 
     fn gaps(context: &ContributionContext) -> Vec<&str> {
         context.selection.gaps.iter().map(String::as_str).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_source_identity_matches_git_tree_digest_for_both_object_formats() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        fn assert_tree_identity(store: &mut CollaborationStore, repo: &Path, commit: &CommitOid) {
+            let retained = retain_snapshot(store, repo, commit).unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            let (snapshot, identity) =
+                crate::collaboration_archive::reconstruct_bounded_with_source_identity(
+                    store,
+                    &retained.snapshot_id,
+                    destination.path(),
+                    crate::execution_snapshot::RECONSTRUCTION_LIMITS,
+                )
+                .unwrap();
+            assert!(
+                snapshot
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path() == b".aethyme/config.toml")
+            );
+            assert!(
+                snapshot
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.path() == b".aethyme/graph/generated.json")
+            );
+            let expected =
+                aethyme_graph_storage::committed_source_tree_digest(repo, commit.as_str()).unwrap();
+            assert_eq!(identity.revision, commit.as_str());
+            assert_eq!(identity.source_tree_sha256, expected);
+        }
+
+        let mut fixture = Fixture::new();
+        let repo = fixture.repo.path();
+        write(repo, ".aethyme/config.toml", "index = false\n");
+        write(
+            repo,
+            ".aethyme/graph/generated.json",
+            "ignored graph output\n",
+        );
+        write(repo, "nested/child.py", "def child(): return 1\n");
+        write(repo, "nested.py", "def nested(): return 2\n");
+        write(repo, "tools/run.py", "def run(): return 3\n");
+        let executable = repo.join("tools/run.py");
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        std::fs::create_dir_all(repo.join("links")).unwrap();
+        symlink("../src/search.rs", repo.join("links/search.py")).unwrap();
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "add",
+                "-f",
+                ".aethyme/config.toml",
+                ".aethyme/graph/generated.json",
+            ],
+        );
+        git(repo, &["commit", "-qm", "tree identity fixture"]);
+        let sha1_commit = pin_commit(repo, "HEAD").unwrap();
+        assert_tree_identity(&mut fixture.store, repo, &sha1_commit);
+
+        let sha256_repo = tempfile::tempdir().unwrap();
+        git(
+            sha256_repo.path(),
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+        );
+        write(sha256_repo.path(), "src/main.py", "def main(): return 1\n");
+        write(sha256_repo.path(), ".aethyme/config.toml", "index = true\n");
+        write(
+            sha256_repo.path(),
+            ".aethyme/graph/generated.json",
+            "ignored graph output\n",
+        );
+        git(sha256_repo.path(), &["add", "-A"]);
+        git(
+            sha256_repo.path(),
+            &[
+                "add",
+                "-f",
+                ".aethyme/config.toml",
+                ".aethyme/graph/generated.json",
+            ],
+        );
+        git(
+            sha256_repo.path(),
+            &["commit", "-qm", "sha256 tree identity fixture"],
+        );
+        let sha256_commit = pin_commit(sha256_repo.path(), "HEAD").unwrap();
+        assert_tree_identity(&mut fixture.store, sha256_repo.path(), &sha256_commit);
+    }
+
+    #[test]
+    fn a_view_refuses_a_retained_row_that_disagrees_with_its_source_record() {
+        let mut fixture = Fixture::new();
+        let retained =
+            retain_snapshot(&mut fixture.store, fixture.repo.path(), &fixture.base).unwrap();
+        fixture
+            .store
+            .connection()
+            .execute(
+                "UPDATE retained_snapshots SET commit_oid = ?1 WHERE snapshot_id = ?2",
+                rusqlite::params!["a".repeat(40), retained.snapshot_id.as_str()],
+            )
+            .unwrap();
+
+        let options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("fixture"),
+        );
+        let result = crate::analysis_view::view_for_snapshot(
+            &fixture.store,
+            &retained.snapshot_id,
+            &options,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::analysis_view::ViewError::Source { .. })
+        ));
+        let view = crate::analysis_view::view_name(&retained.snapshot_id, &options.profile);
+        assert!(
+            !crate::analysis_view::views_root(&fixture.store)
+                .join(view)
+                .join("CURRENT")
+                .exists()
+        );
     }
 
     #[test]
