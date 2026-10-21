@@ -200,6 +200,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
+- Before a long run, verify the producer supplies every field the finalizer
+  uses to decide validation success, including an explicit validator exit code.
+  Add offline controls for missing and nonzero values; do not infer success from
+  a status string, log hashes, copied-output integrity, or the outer command
+  exit. Preserve the raw receipt and report a missing or mismatched field
+  instead of rewriting frozen evidence.
 - Before sealing a validation packet, require every input referenced by its
   plan, argv, or README to exist and match its pinned hash; hashing only the
   files that happen to be present can silently bless an incomplete packet.
