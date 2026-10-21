@@ -43,9 +43,30 @@ where
     publish(temporary.path())
 }
 
+/// Publish synced bytes only if the target directory entry is absent.
+/// A hard link is atomic and never replaces an entry that appears while the
+/// temporary is being written. Existing files, directories and symlinks are
+/// operator choices; return false without opening or changing them.
+/// On Unix, sync the containing directory after temporary cleanup. Other
+/// platforms retain no-replace publication without a directory durability claim.
+pub(crate) fn write_synced_if_absent(target: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let published = with_synced_temporary(target, bytes, |temporary| {
+        match fs::hard_link(temporary, target) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error),
+        }
+    })?;
+    #[cfg(unix)]
+    if published {
+        fs::File::open(target.parent().expect("temporary creation checked parent"))?.sync_all()?;
+    }
+    Ok(published)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::with_synced_temporary;
+    use super::{with_synced_temporary, write_synced_if_absent};
 
     #[test]
     fn a_failed_publication_leaves_no_temporary_file() {
@@ -73,5 +94,23 @@ mod tests {
 
         assert_eq!(std::fs::read(&target).unwrap(), b"payload");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+    #[test]
+    fn no_replace_publication_preserves_an_existing_operator_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        std::fs::write(&target, b"operator bytes").unwrap();
+        assert!(!write_synced_if_absent(&target, b"broker bytes").unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"operator bytes");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn no_replace_publication_writes_complete_bytes_and_cleans_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        assert!(write_synced_if_absent(&target, b"broker bytes").unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"broker bytes");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
