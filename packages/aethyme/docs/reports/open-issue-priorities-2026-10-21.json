@@ -45,7 +45,7 @@
       "evidence_refs": [],
       "dependencies": [],
       "related_prs": [],
-      "implementation_status": "New broker session 1328 investigating safe TTY ownership and termination; no fix or test pass claimed."
+      "implementation_status": "Broker session 1328 attempt reverted after automatic review identified signal/terminal restoration risks; clean worktree, no fix or test pass claimed. A safe protocol remains to design and qualify."
     },
     {
       "rank": 2,
@@ -196,11 +196,13 @@
       "title": "broker finish: partial finish leaves tracked files deleted; cleanup then refuses without --force",
       "url": "https://github.com/schiste/Aethyme/issues/909",
       "state_at_inventory": "OPEN",
-      "audit_status": "implementation_present_qualification_gap",
-      "current_gap_or_limit": "Finish records a pre-removal proof; retry cleanup narrowly accepts only tracked unstaged deletions for the exact owned checkout/head/branch.",
-      "next_action": "Add a focused real interrupted tracked-deletion regression before claiming the reported behavior resolved.",
+      "audit_status": "implementation_and_exact_regressions_present",
+      "current_gap_or_limit": "The reported tracked-deletion interruption has a recovery implementation and exact CLI positive/negative regressions already on main; fresh local execution remains to confirm before closing.",
+      "next_action": "Run existing positive and refusal CLI regressions at current source, then reconcile/close the issue with exact source evidence. No new implementation PR is justified without a failing reproduction.",
       "evidence": [
-        "finish.rs:248; cleanup.rs:1628; cleanup.rs:1843"
+        "finish.rs:248; cleanup.rs:1628; cleanup.rs:1843",
+        "tests/finish_cli.rs:667 finish_cli_reports_partial_cleanup_and_resumes_idempotently removes tracked README after a real durable cleanup intent, retries without force and proves checkout/branch removal; :709 refuses the same deletion without proof; further tests preserve staged, mixed, ignored/untracked, replaced and unrepresented checkouts.",
+        "tests/cleanup_cli.rs:an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused covers the orphan administrative-entry removal case."
       ],
       "evidence_refs": [],
       "dependencies": [],
@@ -247,7 +249,7 @@
       "related_prs": [
         924
       ],
-      "implementation_status": "Existing PR #924 synced and pushed at b69d1f93; fresh CI and independent review pending; no local Cargo pass claimed."
+      "implementation_status": "Existing PR #924 synced and pushed at 786a9d12; independent source review found no blocking diff defect and inherited-override assertion was corrected; focused native tests and fresh CI pending. A pre-existing pipe-EOF timeout bug is being fixed separately."
     },
     {
       "rank": 11,
@@ -331,7 +333,7 @@
       "related_prs": [
         931
       ],
-      "implementation_status": "Existing PR #931 recovered and synced at db708f6f; independent source review clear; focused local qualification pending."
+      "implementation_status": "Existing PR #931 recovered and synced at db708f6f; independent source review clear; 25 focused local tests passed; fresh CI pending."
     },
     {
       "rank": 15,
