@@ -1069,6 +1069,39 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Lease release request events, oldest first.
+    ///
+    /// This query is limited to the four event kinds interpreted by the
+    /// release-request consumer. Keep `events_after_filtered` for callers
+    /// that need arbitrary event-kind prefixes.
+    pub(crate) fn lease_release_events(&self) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events
+             WHERE kind IN (?1, ?2, ?3, ?4)
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                crate::events::LEASE_RELEASE_REQUESTED,
+                crate::events::LEASE_RELEASE_ACKED,
+                crate::events::LEASE_RELEASE_DECLINED,
+                crate::events::LEASE_RELEASE_GRANTED,
+            ],
+            |row| {
+                Ok(Event {
+                    id: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    ts: row.get(2)?,
+                    kind: row.get(3)?,
+                    session_id: row.get(4)?,
+                    payload_json: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Retention: delete events strictly older than `before_ts_ms`,
     /// returning the number removed. Event ids stay strictly increasing
     /// forever (AUTOINCREMENT never reuses rowids), so existing `--since`
@@ -1089,7 +1122,33 @@ impl BrokerStore {
         gate_cutoff: i64,
         queue_cutoff: i64,
     ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
-        Self::gc_row_candidates_on(&self.conn, event_cutoff, gate_cutoff, queue_cutoff, None)
+        Self::gc_row_candidates_on(
+            &self.conn,
+            event_cutoff,
+            gate_cutoff,
+            queue_cutoff,
+            None,
+            true,
+        )
+    }
+
+    /// The row inventory used by health summaries. Health reports counts and
+    /// estimates but cannot authorize deletion, so it does not read every
+    /// candidate row back in full merely to compute apply-time fingerprints.
+    pub(crate) fn gc_row_candidates_for_health(
+        &self,
+        event_cutoff: i64,
+        gate_cutoff: i64,
+        queue_cutoff: i64,
+    ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
+        Self::gc_row_candidates_on(
+            &self.conn,
+            event_cutoff,
+            gate_cutoff,
+            queue_cutoff,
+            None,
+            false,
+        )
     }
 
     fn gc_row_candidates_on(
@@ -1098,6 +1157,7 @@ impl BrokerStore {
         gate_cutoff: i64,
         queue_cutoff: i64,
         only: Option<&[crate::GcRowCandidate]>,
+        attach_fingerprints: bool,
     ) -> Result<Vec<crate::GcRowCandidate>, BrokerError> {
         use crate::{GcRowCandidate, GcRowKind};
 
@@ -1468,7 +1528,9 @@ impl BrokerStore {
             })
         })?;
         candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
-        attach_gc_row_content_fingerprints(conn, &mut candidates)?;
+        if attach_fingerprints {
+            attach_gc_row_content_fingerprints(conn, &mut candidates)?;
+        }
         Ok(candidates)
     }
 
@@ -1599,8 +1661,14 @@ impl BrokerStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let eligible =
-            Self::gc_row_candidates_on(&tx, event_cutoff, gate_cutoff, queue_cutoff, Some(&rows))?;
+        let eligible = Self::gc_row_candidates_on(
+            &tx,
+            event_cutoff,
+            gate_cutoff,
+            queue_cutoff,
+            Some(&rows),
+            true,
+        )?;
         let eligible_by_id = eligible
             .into_iter()
             .map(|candidate| ((candidate.kind, candidate.id), candidate))

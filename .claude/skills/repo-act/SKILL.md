@@ -20,6 +20,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Keep latency budgets in versioned machine-readable data. Validate the warning
+  policy with deterministic tests; assess elapsed time in dedicated performance
+  runs rather than wall-clock assertions in ordinary tests. Retain complete CLI
+  wall time, workload and binary identity, and raw samples. Do not equate an
+  internal phase or coordinated-operation interval with end-to-end or network
+  time. Use the existing non-gating performance workflow before adding builds.
+- For startup profiling, use Git Trace2 event logs to count actual Git
+  subprocess starts and group repeated argv. Stack-sample counts measure time in
+  sampled frames, not invocation counts; keep instrumented traces and timings
+  separate from uninstrumented benchmark samples.
+
 - For deadline-bounded cleanup, separate candidate discovery from the
   assertion that partial work completed. One short wall-clock budget may expire
   during discovery. Use a deterministic deadline seam to prove partial progress
@@ -29,6 +40,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - When a managed output is also an input to generated context or freshness
   digests, update it before deriving those artifacts. Verify first deployment
   and an unchanged repeat; a second-run rewrite can reveal incorrect ordering.
+- After `aethyme deploy`, review the full skill-file diff before committing:
+  deployment can replace repository-specific lessons while freshness checks
+  still pass. For files classified as customized by `aethyme upgrade plan`, use
+  an explicit `preserve` or `merge` resolution when available; otherwise restore
+  the intended content and inspect the resulting diff. Verify the deployed text
+  and mirrored-skill parity; never commit a template overwrite blindly.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
 - Choose focused local Cargo checks by compilation target as well as test name.
@@ -67,9 +84,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   clear inherited `GIT_*` variables; it only adds or overrides values. For
   isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
   preserve unrelated variables such as `PATH`, then set the fixture's intended
-  author/committer values. If a fixture PATH excludes real provider binaries,
+  author/committer values. For Git-backed fixtures that generate managed files
+  before staging, also set a fixture-owned `HOME`, an empty
+  `GIT_CONFIG_GLOBAL`, and `GIT_CONFIG_NOSYSTEM=1` on every CLI and Git child
+  before initial deployment and `git add`; a host `core.excludesFile` can hide
+  generated files from `git add -A`. Keep isolation on each child command and
+  do not compensate with fixture ignore rules or force-adds. If a fixture PATH
+  excludes real provider binaries,
   retain required CLI dependencies: install a prevalidated Git executable beside
   the fake provider instead of removing Git and failing before provider startup.
+  Treat `core.sshCommand` as shell syntax: quote fixture executable paths for
+  POSIX shell and exercise a temporary root containing spaces and apostrophes.
   For tests scoped to artifact caches or reclaim, set
   `[cleanup] auto_remove = false` explicitly and
   keep it enabled in whole-checkout cleanup tests. A real offline `origin` can
@@ -85,6 +110,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.
+- In shell shims that branch on a child process's working directory, inspect it
+  with `pwd -P` and compare it with an explicitly passed canonical fixture path.
+  Rust `Command::current_dir` changes the child's directory without rewriting
+  inherited `$PWD`, which can otherwise misclassify calls that operate on another
+  repository.
 - When exercising no-follow storage paths, canonicalize the fixture-owned
   temporary root before deriving its database and cache paths. Platform aliases
   such as macOS `/var` must not turn a valid fixture into a symlink traversal;
@@ -114,6 +144,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   producer encodings, and bind the exact observed bytes across plan/apply when
   an operator confirmation spans invocations; test re-encoding drift and
   rollback after the write-side recheck.
+- For recovery fixtures, exercise the production entry point that persists the
+  recovery intent, assert that the intent exists, and only then simulate the
+  interruption. An option that skips cleanup or a hand-seeded event does not
+  test the producer-to-consumer path.
 - For storage ownership and reclamation changes, test replacement of a root and
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
@@ -188,6 +222,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   does not freeze current eligibility; accept missing rows for crash replay only
   after confirming they are absent. Test resume after a public state mutation
   changes a row's protection.
+- For GC plans with age-based retention, bind a UTC-day floor anchor separately
+  from the exact evaluation timestamp and use it for every age-derived plan
+  field or cutoff included in the digest, including gate-cache candidate age
+  text and journaled cutoffs. Preserve exact-time behavior for legacy journals
+  and keep real current-time liveness and revalidation checks. If a plan can
+  rewrite telemetry history, exclude that plan's own metric even when output
+  measurement is opted in.
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove
@@ -216,7 +257,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   protect its split-index backing files.
   Use the same isolated-index probes for operator status checks during pinned
   validation; an ordinary Git status command can refresh the watched index.
-- When testing configurable duration or deadline selection, put selection behind a pure seam and assert defaults, provider classes and explicit overrides without sleeping. Test real timeout cleanup separately with a short test-only budget; never reduce a production budget just to speed up a test.
+- When testing configurable duration or deadline selection, put selection behind
+  a pure seam and assert defaults, provider classes and explicit overrides
+  without sleeping. Test real timeout cleanup separately with a short test-only
+  budget; never reduce a production budget just to speed up a test.
+- For repeated CI build-script runs, inspect the checkout action's local Git
+  config before attributing recompilation to profiles or cache keys. Persisted
+  credentials can add `includeIf.*.path` entries that a fail-closed source
+  identity probe treats as uncertain. If no authenticated Git operation follows
+  checkout, set `persist-credentials: false` and ratchet both every checkout
+  declaration and the resulting local config.
 - For routine Rust validation, reuse a matching warm target and run one Cargo
   process at a time with `--locked -j1`. Prefer a selected package/binary or
   focused test filter. On a resource-constrained target, use `debug=0` and
@@ -250,6 +300,25 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   matching tests does not validate the change. Automated focused-test runners
   should refuse a successful zero-test result; preserve the process exit
   separately from that validation refusal.
+- For changes to externally consumed CLI JSON, select the PR contract decision
+  that matches the new surface. Mark added fields as `introduce` and document
+  their presence, absence, and empty-value semantics with the serialized schema.
+  Derive fixture field paths from the actual serde producer, including
+  `flatten`, and verify the complete real CLI JSON response; do not infer wire
+  nesting from Rust struct nesting.
+- Before publishing a PR body, run the repository's contract checker against
+  that exact body and base. Use its literal checkbox syntax (for example,
+  `- [x] **none**`), not prose such as `Contract: none`, and verify the checker
+  accepts the prepared body.
+- Before changing CLI advice commands, trace the public resolver, aliases and
+  flag allowlist through to the handler. A handler alone may not describe the
+  accepted public spelling. Exercise the emitted command through the real CLI
+  entrypoint and run the deprecated-spelling caller ratchet before publication.
+- Before changing a default CLI display, find existing consumer assertions
+  as well as new feature tests. Include safety fences, session attribution,
+  waiter/holder relationships, pending operations and help snapshots in the
+  focused selection. Test bounded output with explicit omission counts; a
+  smaller display must still surface the coordination state callers need.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
   check child output on the intended stream separately. A report may retain
   the original command arguments, so searching its serialized text for a child
@@ -264,6 +333,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   restoration. Require positive, intended runtime failure, positive; a compile
   failure or a test that also fails without the break does not validate the
   guard. A passing adjacent suite cannot replace either positive run.
+  Freeze the intended review snapshot before running mutations, or build it
+  from the intended commit and selected patch. Exclude an in-flight deliberate
+  mutation from the review snapshot so it is not mistaken for proposed code.
 - Before reclaiming a completed worktree, inspect ignored paths for qualification
   records; a clean Git status does not cover them. Preserve irreplaceable
   reports outside the worktree and build target, verify copied file sizes and

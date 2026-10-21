@@ -495,6 +495,55 @@ impl Broker {
         ))
     }
 
+    /// Reuse the status call's liveness sample after `agents()` persisted its
+    /// derived statuses. The returned `AgentView` retains the original stored
+    /// status, so pairing must use `derived_status` to match the store state
+    /// that a second snapshot would observe.
+    pub(super) fn lease_overlaps_after_agent_reconciliation(
+        &self,
+        agents: &[AgentView],
+    ) -> Result<Vec<crate::Overlap>, BrokerOpError> {
+        self.lease_overlaps_for_agent_views(agents, true)
+    }
+
+    /// Reuse a read-only status sample while retaining its stored-status rule:
+    /// a dead PID with recent activity still holds its recorded lease until a
+    /// writable liveness pass persists an exit.
+    pub(super) fn lease_overlaps_from_stored_status_views(
+        &self,
+        agents: &[AgentView],
+    ) -> Result<Vec<crate::Overlap>, BrokerOpError> {
+        self.lease_overlaps_for_agent_views(agents, false)
+    }
+
+    fn lease_overlaps_for_agent_views(
+        &self,
+        agents: &[AgentView],
+        use_derived_status: bool,
+    ) -> Result<Vec<crate::Overlap>, BrokerOpError> {
+        // Match `coordinating_session_ids`: pairing uses current wall time,
+        // independently of the caller-supplied time used to derive agents.
+        let now = now_ms();
+        let coordinating = agents
+            .iter()
+            .filter(|agent| {
+                let status = if use_derived_status {
+                    agent.derived_status
+                } else {
+                    agent.session.status
+                };
+                matches!(
+                    status,
+                    SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
+                ) && now.saturating_sub(agent.activity_at) <= STALE_AFTER_MS
+            })
+            .map(|agent| agent.session.id)
+            .collect();
+        Ok(crate::detect_overlaps(
+            &self.coordinating_leases(&coordinating)?,
+        ))
+    }
+
     /// Collisions between what live sessions say they will work on.
     ///
     /// Read-only and independent of leases: a scope exists before any edit, so
@@ -602,13 +651,14 @@ impl Broker {
         &mut self,
         acting: Option<i64>,
     ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
-        self.refresh_leases_including_with_claim_preparation(acting, None)
+        self.refresh_leases_including_with_claim_preparation(acting, None, true)
     }
 
     fn refresh_leases_including_with_claim_preparation(
         &mut self,
         acting: Option<i64>,
         preparation: Option<&LeaseClaimPreparation>,
+        classify_overlaps: bool,
     ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, detect_overlaps};
 
@@ -671,7 +721,11 @@ impl Broker {
         if let Some(preparation) = preparation {
             preparation.check()?;
         }
-        self.classify_and_announce_overlaps(&after)?;
+        if classify_overlaps {
+            self.classify_and_announce_overlaps(&after)?;
+        } else {
+            self.defer_overlap_classification(&after)?;
+        }
         if let Some(preparation) = preparation {
             preparation.check()?;
         }
@@ -742,7 +796,11 @@ impl Broker {
         let path = normalize_lease_path(path)?;
         preparation.check()?;
         let _git_deadline = crate::git::limit_git_until(preparation.deadline);
-        self.refresh_leases_including_with_claim_preparation(Some(session_id), Some(&preparation))?;
+        self.refresh_leases_including_with_claim_preparation(
+            Some(session_id),
+            Some(&preparation),
+            true,
+        )?;
         preparation.check()?;
         let policy = self.lease_refusal_policy()?;
         preparation.check()?;
@@ -1874,20 +1932,24 @@ impl Broker {
             return Err(BrokerOpError::MissingExecCommand);
         }
         let session = self.store.session(session_id)?;
-        self.refresh_leases_including(Some(session_id))?;
+        // Guard ownership uses current explicit leases and holder policy, not
+        // speculative merge verdicts. Refresh lease records (including the
+        // acting session), but leave merge simulation and announcements to
+        // ordinary refresh/claim/submit. Keep both dirty-state snapshots and
+        // the post-command ownership audit below unchanged.
+        self.refresh_leases_including_with_claim_preparation(Some(session_id), None, false)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        let mut before_dirty = checkout.dirty_paths()?;
+        let (mut before_dirty, before_untracked) = checkout.dirty_and_untracked_paths()?;
         before_dirty.sort();
         before_dirty.dedup();
-        let before_untracked = checkout
-            .untracked_paths()?
+        let before_untracked = before_untracked
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
 
         let status = run(&session)?;
 
-        let mut after_dirty = checkout.dirty_paths()?;
+        let (mut after_dirty, after_untracked) = checkout.dirty_and_untracked_paths()?;
         after_dirty.sort();
         after_dirty.dedup();
         let before_set: std::collections::BTreeSet<String> = before_dirty.iter().cloned().collect();
@@ -1896,8 +1958,7 @@ impl Broker {
             .filter(|path| !before_set.contains(*path))
             .cloned()
             .collect();
-        let mut new_untracked_paths = checkout
-            .untracked_paths()?
+        let mut new_untracked_paths = after_untracked
             .into_iter()
             .filter(|path| !before_untracked.contains(path))
             .collect::<Vec<_>>();

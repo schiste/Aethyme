@@ -20,6 +20,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Require a green gates run on the tagged commit
         env:
@@ -68,9 +69,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Full history + tags so build.rs embeds the tag in
-          # `aethyme --version` via `git describe`.
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -94,6 +94,7 @@ jobs:
       - name: Verify release version contract
         env:
           AETHYME_RELEASE_TAG: ${{ github.ref_name }}
+          AETHYME_RELEASE_COMMIT: ${{ github.sha }}
         run: cargo test --locked -p aethyme-testkit --test release_contract
 
       - name: Build release binaries
@@ -166,6 +167,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -206,6 +208,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable

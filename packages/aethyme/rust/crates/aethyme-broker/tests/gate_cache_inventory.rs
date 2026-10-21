@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aethyme_broker::FinishOptions;
 
@@ -53,8 +53,7 @@ fn build_dir(dir: &Path, bytes: usize) {
 
 /// Backdate a directory and the two levels beneath it, deepest first, which
 /// is everything the inventory reads to decide when an entry was last used.
-fn age(dir: &Path, ago: Duration) {
-    let when = SystemTime::now() - ago;
+fn age(dir: &Path, when: SystemTime) {
     let mut paths = vec![dir.to_path_buf()];
     for child in std::fs::read_dir(dir).unwrap().flatten() {
         if child.path().is_dir() {
@@ -253,6 +252,11 @@ fn world() -> World {
     // The plan says where this repository's gate cache is, which is the same
     // derivation a gate uses; the fixture builds its tree there.
     let empty = world.plan();
+    let anchor_ms = empty["age_anchor_ms"]
+        .as_i64()
+        .expect("schema-4 gc plans carry an age anchor");
+    let age_anchor = UNIX_EPOCH
+        + Duration::from_millis(u64::try_from(anchor_ms).expect("UTC age anchor is nonnegative"));
     world.gates = PathBuf::from(empty["gate_cache"]["root"].as_str().unwrap());
     world.repository_key = empty["gate_cache"]["repository_key"]
         .as_str()
@@ -272,13 +276,13 @@ fn world() -> World {
         ("py-tools-v1", 800, 5),
     ] {
         filled(&world.gates.join(name), bytes);
-        age(&world.gates.join(name), DAY * days);
+        age(&world.gates.join(name), age_anchor - DAY * days);
     }
     world.retired = format!(".rust-workspace-v3.retired-1700000000000-{}", dead_pid());
     filled(&world.gates.join(&world.retired), 500);
     world.other_repository = world.cache.join("gates/another-repository/cold");
     filled(&world.other_repository, 3000);
-    age(&world.other_repository, DAY * 30);
+    age(&world.other_repository, age_anchor - DAY * 30);
     // A gate created the registry when it first took a cache lease; gc treats
     // a missing one as a registry it cannot see and holds everything.
     drop(world.registry());
@@ -327,7 +331,20 @@ fn plan_keeps_the_active_cache_of_each_kind_and_budgets_older_entries() {
         entry(&plan, "rust-workspace-v2")["disposition"],
         "reclaimable"
     );
-    assert_eq!(entry(&plan, "rust-workspace-v2")["age_days"], 10);
+    let age_anchor_ms = plan["age_anchor_ms"].as_i64().unwrap();
+    let last_used = std::fs::metadata(world.gates.join("rust-workspace-v2"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap();
+    let last_used_ms = i64::try_from(last_used.as_millis()).unwrap();
+    let expected_age_days = u64::try_from(age_anchor_ms.saturating_sub(last_used_ms)).unwrap()
+        / u64::try_from(DAY.as_millis()).unwrap();
+    assert_eq!(
+        entry(&plan, "rust-workspace-v2")["age_days"].as_u64(),
+        Some(expected_age_days)
+    );
     assert_eq!(entry(&plan, "rust-workspace-v2")["estimated_bytes"], 3000);
     assert_eq!(
         entry(&plan, "rust-workspace-v1")["disposition"],
@@ -697,6 +714,7 @@ fn a_resumed_journal_never_removes_a_gate_cache_unattended_or_changed() {
             "schema_version": plan["schema_version"],
             "digest": plan["digest"],
             "evaluated_at": plan["evaluated_at"],
+            "age_anchor_ms": plan["age_anchor_ms"],
             "policy": plan["policy"],
             "remaining_rows": [],
             "remaining_files": [],

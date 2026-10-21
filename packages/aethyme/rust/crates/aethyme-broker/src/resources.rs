@@ -1344,6 +1344,38 @@ pub struct HostResourceReapReport {
     pub leases: Vec<HostResourceReapLease>,
 }
 
+/// The legacy reap counters plus diagnostics for candidate leases that were
+/// kept because the holder's absence could not be proven.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceReapReportWithDiagnostics {
+    #[serde(flatten)]
+    pub report: HostResourceReapReport,
+    pub not_reaped: Vec<HostResourceNotReapedLease>,
+}
+
+/// A quarantined lease that the reaper safely left untouched.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceNotReapedLease {
+    pub lease_id: String,
+    pub reason: HostResourceNotReapedReason,
+}
+
+/// Why a quarantined lease candidate was not reclaimed.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostResourceNotReapedReason {
+    /// The holder process could not be proven absent.
+    NotProvenGone,
+}
+
+impl HostResourceNotReapedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotProvenGone => "not_proven_gone",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HostResourceReapLease {
     pub lease_id: String,
@@ -3066,11 +3098,20 @@ impl HostResourceCoordinator {
     /// operator can run it without waiting for another acquisition to arrive.
     /// Named allocations stay quarantined until exact cleanup is reviewed.
     pub fn reap_dead_holders(&mut self) -> Result<HostResourceReapReport, HostResourceError> {
+        self.reap_dead_holders_with_diagnostics()
+            .map(|report| report.report)
+    }
+
+    /// Reap dead holders and report quarantined candidates that were retained
+    /// because their holder process was not proven gone.
+    pub fn reap_dead_holders_with_diagnostics(
+        &mut self,
+    ) -> Result<HostResourceReapReportWithDiagnostics, HostResourceError> {
         let now = now_ms();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let report = quarantine_reclaimable(&tx, now)?;
+        let report = quarantine_reclaimable_with_diagnostics(&tx, now)?;
         tx.commit()?;
         Ok(report)
     }
@@ -3352,6 +3393,84 @@ impl HostResourceCoordinator {
             leases.push(lease);
         }
         Ok(leases)
+    }
+
+    /// Read only leases that are quarantined now, for blocker advice.
+    ///
+    /// The general inventory remains `list`; this narrower path uses the
+    /// state index instead of walking released history in generation order.
+    pub(crate) fn quarantined_leases(&self) -> Result<Vec<HostResourceLease>, HostResourceError> {
+        self.quarantined_leases_at(now_ms())
+    }
+
+    fn quarantined_leases_at(&self, now: i64) -> Result<Vec<HostResourceLease>, HostResourceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lease_id FROM resource_leases
+             WHERE state IN ('active','quarantined')
+             ORDER BY generation",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut leases = Vec::new();
+        for id in ids {
+            let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? else {
+                continue;
+            };
+            match lease.state {
+                HostLeaseState::Quarantined => leases.push(lease),
+                HostLeaseState::Active if lease.expires_at <= now => {
+                    lease.state = HostLeaseState::Quarantined;
+                    leases.push(lease);
+                }
+                HostLeaseState::Active | HostLeaseState::Released => {}
+            }
+        }
+        Ok(leases)
+    }
+
+    /// Read active leases with a caller-owned time and count bound. `None`
+    /// means the inventory is incomplete and must not be interpreted as an
+    /// empty or complete lease set.
+    pub(crate) fn list_until(
+        &self,
+        include_released: bool,
+        entry_budget: usize,
+        mut expired: impl FnMut() -> bool,
+    ) -> Result<Option<Vec<HostResourceLease>>, HostResourceError> {
+        let sql = if include_released {
+            "SELECT lease_id FROM resource_leases ORDER BY generation"
+        } else {
+            "SELECT lease_id FROM resource_leases WHERE state!='released' ORDER BY generation"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let mut leases = Vec::new();
+        let mut rows_seen = 0_usize;
+        loop {
+            if expired() {
+                return Ok(None);
+            }
+            let Some(row) = rows.next()? else {
+                break;
+            };
+            if rows_seen >= entry_budget {
+                return Ok(None);
+            }
+            rows_seen = rows_seen.saturating_add(1);
+            let id = row.get::<_, String>(0)?;
+            if let Some(mut lease) = load_lease(&self.conn, "lease_id", &id)? {
+                if lease.state == HostLeaseState::Active && lease.expires_at <= now_ms() {
+                    lease.state = HostLeaseState::Quarantined;
+                }
+                leases.push(lease);
+            }
+        }
+        if expired() {
+            Ok(None)
+        } else {
+            Ok(Some(leases))
+        }
     }
 }
 
@@ -4977,18 +5096,25 @@ fn quarantine_reclaimable(
     conn: &Connection,
     now: i64,
 ) -> Result<HostResourceReapReport, HostResourceError> {
+    quarantine_reclaimable_with_diagnostics(conn, now).map(|report| report.report)
+}
+
+fn quarantine_reclaimable_with_diagnostics(
+    conn: &Connection,
+    now: i64,
+) -> Result<HostResourceReapReportWithDiagnostics, HostResourceError> {
     quarantine_expired(conn, now)?;
     quarantine_dead_holders(conn, now)?;
-    reclaim_dead_capacity(conn, now)
+    reclaim_dead_capacity_with_diagnostics(conn, now)
 }
 
 /// Reclaim only the allocation that becomes meaningless with the holder's
 /// process: a capacity unit. Namespaces, ports, and exclusive keys remain on
 /// the quarantined lease because they can correspond to residue on the host.
-fn reclaim_dead_capacity(
+fn reclaim_dead_capacity_with_diagnostics(
     conn: &Connection,
     now: i64,
-) -> Result<HostResourceReapReport, HostResourceError> {
+) -> Result<HostResourceReapReportWithDiagnostics, HostResourceError> {
     let candidates = {
         let mut stmt = conn.prepare(
             "SELECT lease_id,generation,holder_pid FROM resource_leases \
@@ -5021,8 +5147,13 @@ fn reclaim_dead_capacity(
         retained_quarantined_leases: 0,
         leases: Vec::new(),
     };
+    let mut not_reaped = Vec::new();
     for (lease_id, generation, holder_pid) in candidates {
         if !holder_process_is_gone(holder_pid) {
+            not_reaped.push(HostResourceNotReapedLease {
+                lease_id,
+                reason: HostResourceNotReapedReason::NotProvenGone,
+            });
             continue;
         }
         let observed = conn.execute(
@@ -5078,7 +5209,7 @@ fn reclaim_dead_capacity(
             state,
         });
     }
-    Ok(report)
+    Ok(HostResourceReapReportWithDiagnostics { report, not_reaped })
 }
 
 fn verify_ownership(
@@ -8230,5 +8361,69 @@ mod tests {
         c.reconcile(&grant.lease.lease_id, grant.lease.generation)
             .unwrap();
         assert!(c.acquire(&req("three", vec![exclusive("shared")])).is_ok());
+    }
+
+    #[test]
+    fn resource_lease_candidates_include_expiry_boundary_and_skip_active_or_released() {
+        const NOW: i64 = 100;
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+
+        let boundary = c
+            .acquire(&req("boundary", vec![exclusive("boundary")]))
+            .unwrap();
+        let future = c
+            .acquire(&req("future", vec![exclusive("future")]))
+            .unwrap();
+        let quarantined = c
+            .acquire(&req("quarantined", vec![exclusive("quarantined")]))
+            .unwrap();
+        c.quarantine(
+            &quarantined.lease.lease_id,
+            quarantined.lease.generation,
+            &quarantined.ownership_token,
+        )
+        .unwrap();
+        let released = c
+            .acquire(&req("released", vec![exclusive("released")]))
+            .unwrap();
+        c.release(
+            &released.lease.lease_id,
+            released.lease.generation,
+            &released.ownership_token,
+        )
+        .unwrap();
+
+        c.conn
+            .execute(
+                "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+                rusqlite::params![NOW, boundary.lease.lease_id.as_str()],
+            )
+            .unwrap();
+        c.conn
+            .execute(
+                "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+                rusqlite::params![NOW + 1, future.lease.lease_id.as_str()],
+            )
+            .unwrap();
+
+        let leases = c.quarantined_leases_at(NOW).unwrap();
+        let ids = leases
+            .iter()
+            .map(|lease| lease.lease_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                boundary.lease.lease_id.clone(),
+                quarantined.lease.lease_id.clone()
+            ]
+        );
+        assert!(
+            leases
+                .iter()
+                .all(|lease| lease.state == HostLeaseState::Quarantined)
+        );
+        assert!(leases.iter().all(|lease| lease.allocations.len() == 1));
     }
 }

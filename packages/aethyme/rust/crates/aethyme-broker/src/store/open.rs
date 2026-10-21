@@ -736,6 +736,26 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Latest durable intent for an explicit finish cleanup. Older events
+    /// remain readable, but their missing recovery proof cannot authorize
+    /// resuming a worktree whose contents have already changed.
+    pub fn latest_session_finish_cleanup_started_event(
+        &self,
+        id: i64,
+    ) -> Result<Option<Event>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT id, schema_version, ts, kind, session_id, payload_json
+                 FROM events
+                 WHERE session_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![id, crate::events::SESSION_FINISH_CLEANUP_STARTED],
+                event_from_row,
+            )
+            .optional()
+            .map_err(BrokerError::from)
+    }
+
     pub fn record_finished_handoff(
         &mut self,
         id: i64,

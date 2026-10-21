@@ -1130,18 +1130,18 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         "reap" => {
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
-            let report = coordinator.reap_dead_holders()?;
+            let report = coordinator.reap_dead_holders_with_diagnostics()?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 out!(
                     "Reaped {} dead holder(s): {} capacity unit(s) reclaimed, {} lease(s) released, {} lease(s) retained for cleanup.",
-                    report.dead_holders_seen,
-                    report.reclaimed_capacity_units,
-                    report.released_leases,
-                    report.retained_quarantined_leases,
+                    report.report.dead_holders_seen,
+                    report.report.reclaimed_capacity_units,
+                    report.report.released_leases,
+                    report.report.retained_quarantined_leases,
                 );
-                for lease in &report.leases {
+                for lease in &report.report.leases {
                     out!(
                         "  lease {} generation {} pid {} — reclaimed {} capacity unit(s), {}",
                         lease.lease_id,
@@ -1149,6 +1149,13 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                         lease.holder_pid,
                         lease.capacity_units,
                         lease.state.as_str(),
+                    );
+                }
+                for lease in &report.not_reaped {
+                    out!(
+                        "  lease {} not reaped — {}",
+                        lease.lease_id,
+                        lease.reason.as_str(),
                     );
                 }
             }

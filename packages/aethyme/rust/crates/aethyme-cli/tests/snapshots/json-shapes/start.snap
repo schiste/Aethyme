@@ -47,6 +47,7 @@
     "repository_schema": "null"
   },
   "repository_name": "null",
+  "scope_overlaps_warning": "string",
   "short_name": "string",
   "start_base": {
     "ahead_default_commits": "null",

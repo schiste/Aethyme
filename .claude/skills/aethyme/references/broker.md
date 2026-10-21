@@ -20,9 +20,15 @@ blocked.
    isolated broker worktree, and work from that checkout:
 
    ```bash
-   aethyme broker status --json    # who is working on what
+   aethyme broker status --compact --json  # concise coordination summary
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
+
+   Routine status groups repeated advice categories, reports deferred checks
+   as unknown, and omits per-session evidence and lease paths. Use full
+   `aethyme broker status --json` when you need exact session, lease-path or
+   evidence detail before deciding what to edit. A deferred check is not a
+   clean result.
 
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
@@ -33,9 +39,9 @@ blocked.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
-   If `status` shows another session holding leases on the files you plan
-   to change, prefer working elsewhere first or say so in your report —
-   overlapping edits will conflict at merge time.
+   If detailed `status --json` shows another session holding leases on the
+   files you plan to change, prefer working elsewhere first or coordinate
+   with its holder — overlapping edits can conflict at merge time.
    Coordinate the exact shared hunk with its holder; a sibling session's PR
    or branch is not automatically your upstream. Sync against the configured
    upstream when required, and do not import or restack onto another session's
@@ -118,6 +124,13 @@ blocked.
    Read the pull-request body back and compare it with the approved file before
    handing the draft off for review.
 
+   For notes and other free-form broker text passed through a shell, prefer
+   literal argv via Python `subprocess.run([...])` or a quoted here-doc; do
+   not inline text containing shell substitutions or quote characters. For
+   PR descriptions, write the reviewed body to a file and pass
+   `--body-file`, then read it back. If shell parsing or expansion reports
+   an error, confirm whether the broker operation ran before retrying.
+
    `--pr` opens a draft PR, or reports the one already open. The policy is
    the authorization for exactly these two things -- pushing your own session
    branch and opening a draft PR -- and nothing more: it does not authorize
@@ -150,6 +163,12 @@ blocked.
    Gate commands that need a test database, cache namespace, or similar
    external state should suffix it with that value instead of sharing one
    fixed name.
+
+   Tests that run `git` against fixture repositories must clear inherited and
+   explicitly configured `GIT_*` variables from every subprocess, including
+   read-only probes. Preserve `PATH` and other test environment values. A
+   shared command builder keeps selectors from redirecting fixture operations
+   into a caller's repository.
 
    If this repository declares committed graph fragments authoritative in
    `.aethyme/config.toml`, graph freshness is an enforced deployment-integrity
