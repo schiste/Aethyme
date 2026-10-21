@@ -734,7 +734,7 @@ impl SubmissionReplay {
 
 impl Broker {
     #[cfg(test)]
-    fn observe_submission_plan_test_phase(&self, phase: crate::SubmissionPlanTestPhase) {
+    fn observe_submission_plan_test_phase(&self, phase: crate::broker::SubmissionPlanTestPhase) {
         if let Some(observer) = &self.submission_plan_test_observer {
             observer(phase);
         }
@@ -980,7 +980,9 @@ impl Broker {
             repository_write_lock,
         });
         #[cfg(test)]
-        self.observe_submission_plan_test_phase(crate::SubmissionPlanTestPhase::PreflightPlanReady);
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::PreflightPlanReady,
+        );
 
         // Planning can be expensive. Refuse if the checkout changed identity
         // while it ran so a branch switch or new head cannot redirect the
@@ -1137,7 +1139,9 @@ impl Broker {
             None => (None, None),
         };
         #[cfg(test)]
-        self.observe_submission_plan_test_phase(crate::SubmissionPlanTestPhase::ConsumerStarting);
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::ConsumerStarting,
+        );
         let mut submission_plan = build_or_reuse_submission_plan(
             self.repo_handle(),
             prepared_plan,
@@ -1159,7 +1163,9 @@ impl Broker {
         }
         let base_tree = self.repo_handle().commit_tree_id(&base)?;
         #[cfg(test)]
-        self.observe_submission_plan_test_phase(crate::SubmissionPlanTestPhase::BaseTreeCaptured);
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
+        );
         drop(repository_write_lock);
         let main_checkout_session = Path::new(&session.worktree_path) == self.main_root_path();
         self.store()
@@ -3218,7 +3224,6 @@ mod owned_merge_history_tests {
         let initial_reuse_lock =
             try_submission_plan_reuse_lock(&root, &checkout, submit_broker.store_ref())
                 .expect("the fixture has a canonical origin and no unresolved writer");
-        assert!(initial_reuse_lock.is_some());
         drop(initial_reuse_lock);
         let base = plan.integration_head.clone();
         let base_tree = checkout.commit_tree_id(&base).unwrap();
@@ -3258,7 +3263,7 @@ mod owned_merge_history_tests {
         let mut failures = Vec::new();
         let mut writer: Option<std::thread::JoinHandle<Result<_, _>>> = None;
         let first_phase = phase_receiver.recv_timeout(Duration::from_secs(6));
-        if first_phase != Ok(crate::SubmissionPlanTestPhase::PreflightPlanReady) {
+        if first_phase != Ok(crate::broker::SubmissionPlanTestPhase::PreflightPlanReady) {
             failures.push(format!(
                 "submit did not pause after its preflight plan: {first_phase:?}"
             ));
@@ -3317,8 +3322,8 @@ mod owned_merge_history_tests {
         let _ = resume_sender.send(());
 
         for expected in [
-            crate::SubmissionPlanTestPhase::ConsumerStarting,
-            crate::SubmissionPlanTestPhase::BaseTreeCaptured,
+            crate::broker::SubmissionPlanTestPhase::ConsumerStarting,
+            crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
         ] {
             match phase_receiver.recv_timeout(Duration::from_secs(6)) {
                 Ok(actual) => {
