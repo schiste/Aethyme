@@ -1152,11 +1152,19 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         // What the provider said, classified. Built for every call because the
         // failing branch below needs it in two places and the report needs it
         // whether or not a review row is attached to this call.
-        let refusal = crate::ReviewRefusal::from_provider_output(
-            &report.stdout,
-            &report.stderr,
-            &format!("the coordinated GitHub write failed: {}", call.purpose),
-        );
+        let refusal = if report.stdout_truncated || report.stderr_truncated {
+            crate::ReviewRefusal::from_provider_output(
+                "",
+                "",
+                "provider output was truncated; refusal evidence is incomplete",
+            )
+        } else {
+            crate::ReviewRefusal::from_provider_output(
+                &report.stdout,
+                &report.stderr,
+                &format!("the coordinated GitHub write failed: {}", call.purpose),
+            )
+        };
         performed.push(serde_json::json!({
             "purpose": call.purpose,
             "operation_id": report.operation.id,

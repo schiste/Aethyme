@@ -1298,8 +1298,10 @@ against the default branch, excluding the session's own:
   cached in broker `meta` keyed by each PR's head.
 - **Output:** `broker push --json` gains `pr_overlaps` (`pr`, `url`, `files`,
   `conflicting_hunks`) and `pr_overlaps_unknown` (PR numbers whose change could
-  not be read). `broker status` adds a `session.pr-overlap` advice row per live
-  session -- `warning` for conflicting hunks ("rebase after #N merges, or
+  not be read). When the full open-PR listing cannot be read, the report sets
+  `pr_overlap_listing_unavailable` and makes no overlap conclusion from a
+  partial listing. `broker status` adds a `session.pr-overlap` advice row per
+  live session -- `warning` for conflicting hunks ("rebase after #N merges, or
   coordinate with #N"), `info` for the same files on different lines -- and
   `broker start`/`adopt` print a one-line heads-up when a session that already
   has commits overlaps an open PR.
@@ -2136,7 +2138,15 @@ shared refs, GitHub repository/account state, or another session's surface.
 Writes take a cross-process repository lock and write prepared/running/terminal
 rows to the broker database. Command output is returned to the caller but never
 persisted; content- and secret-bearing argument values are redacted from the
-journal. If a process dies after starting, the next overlapping write marks the
+journal. The broker retains at most 16 MiB from each output stream while
+continuing to drain the child. If a stream exceeds that limit, its report sets
+`stdout_truncated` or `stderr_truncated` to `true` and carries only the retained
+prefix; both booleans are `false` when the corresponding stream is complete.
+Human output warns when either stream is incomplete. Consumers must not parse
+or treat a truncated stream as complete evidence. If the admission deadline
+expires while a descendant still holds a pipe, the broker clears both retained
+buffers before detaching the readers; it does not extend the caller's deadline
+or kill an unowned descendant. If a process dies after starting, the next overlapping write marks the
 operation `outcome_unknown` and refuses to run. Inspect external state, then use
 `operations reconcile` to attest `succeeded` or `failed`; never retry an unknown
 operation blindly. A non-zero remote-capable write is also `outcome_unknown`,
