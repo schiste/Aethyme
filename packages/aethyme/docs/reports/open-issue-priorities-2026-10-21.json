@@ -1,0 +1,1573 @@
+{
+  "schema_version": 1,
+  "last_updated": "2026-10-21",
+  "source_revision": "9cb14b76bb17bf7ab2027596ccc9e0903860659d",
+  "issue_count": 61,
+  "open_pr_count_at_inventory": 15,
+  "scope": {
+    "included": [
+      "Local",
+      "broker",
+      "engine",
+      "release"
+    ],
+    "excluded": [
+      "Coordination",
+      "Git Platform"
+    ],
+    "evaluations": "Synthetic Playground repositories only"
+  },
+  "ranking_method": "Order by supported safety/resource impact, frequency and downstream value. Separate potential impact from evidence of a current defect. Effort/dependencies determine execution order; a high-ranked qualification gap is not automatically a code change. External tool reports rank after repo-owned work.",
+  "qualification": "Read-only independent issue/source/PR audits; ranking does not close issues or certify all acceptance criteria. This is a point-in-time snapshot, not a live GitHub state mirror.",
+  "sequence": [
+    "Finish #713 foreground supervision invariant and regressions.",
+    "Qualify existing #924/#931 fixes on current main, then merge only with passing required checks.",
+    "Recover #930/#927/#933 performance and overlap slices without duplicating their PRs.",
+    "Resolve root-binding integration and signing/CI regressions before release metadata.",
+    "Close exact Local contract/qualification gaps in dependency order; retain failed and unsupported outcomes.",
+    "Test the combined source and measure matched CLI/engine binaries on fresh and aged Playground workloads before rollout."
+  ],
+  "issues": [
+    {
+      "rank": 1,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 713,
+      "title": "[Bug]: Brokered build survives terminal timeout without returning an outcome",
+      "url": "https://github.com/schiste/Aethyme/issues/713",
+      "state_at_inventory": "OPEN",
+      "audit_status": "confirmed_gap",
+      "current_gap_or_limit": "TTY mode selects the unsupervised legacy runner, allowing a child to outlive an externally terminated caller.",
+      "next_action": "Implement safe interactive supervision with a PTY parent-termination regression, retaining terminal semantics.",
+      "evidence": [
+        "inline_exec_supervisor.rs select_generic_exec_mode; leases.rs guarded_exec"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "New broker session 1328 investigating safe TTY ownership and termination; no fix or test pass claimed."
+    },
+    {
+      "rank": 2,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 765,
+      "title": "Broker: own and reap orphaned processes and per-worktree services; surface idle sessions under memory pressure",
+      "url": "https://github.com/schiste/Aethyme/issues/765",
+      "state_at_inventory": "OPEN",
+      "audit_status": "partially_implemented_umbrella",
+      "current_gap_or_limit": "Non-TTY supervision and managed resource/debris ownership exist; arbitrary process/service ownership and pressure-ranked idle-session guidance remain.",
+      "next_action": "Start with #713; separately define recorded process and container ownership, bounded settlement and memory-pressure advice.",
+      "evidence": [
+        "inline_exec_supervisor.rs; host resource leases; gate debris doctor"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 3,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 659,
+      "title": "[Local v3 / L2] Reclaim expired collaboration data with reference-safe GC",
+      "url": "https://github.com/schiste/Aethyme/issues/659",
+      "state_at_inventory": "OPEN",
+      "audit_status": "gc_safe_explicit_pressure_gap",
+      "current_gap_or_limit": "D25 reservation/reclamation coupling remains open; full disk does not trigger reclaim; host/daemon pressure not generally qualified.",
+      "next_action": "Define bounded capacity admission or explicit safe next action while preserving reviewed plan/apply, holds and unknown-file retention.",
+      "evidence": [
+        "GC doc has stale-plan, interrupted apply, concurrent-reader and T45/T46 evidence",
+        "APFS/Docker interleaving recorded."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l2-gc.md"
+      ],
+      "dependencies": [
+        "#656-#658",
+        "D20/D25/D29"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 4,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 673,
+      "title": "[Local v3 / L6] Bound verifier resources, cache keys, and cleanup",
+      "url": "https://github.com/schiste/Aethyme/issues/673",
+      "state_at_inventory": "OPEN",
+      "audit_status": "resource_controls_bounded_pressure_open",
+      "current_gap_or_limit": "D25 full host/daemon ENOSPC with concurrency remains; host admission is not global; resource recovery is not budget/acceptance receipt.",
+      "next_action": "Define receipt/retry handoff for infrastructure failure; qualify daemon/global-volume cases before broad resource claims.",
+      "evidence": [
+        "L6 resources and qualification ledger record APFS retained-source ENOSPC and Docker tmpfs/cgroup OOM with GC interleaving."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l6-resources.md"
+      ],
+      "dependencies": [
+        "#659",
+        "#670-#672",
+        "D25/D29"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 5,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 658,
+      "title": "[Local v3 / L2] Make capture intent, record, and receipt crash-safe",
+      "url": "https://github.com/schiste/Aethyme/issues/658",
+      "state_at_inventory": "OPEN",
+      "audit_status": "capture_protocol_implemented_qualification_open",
+      "current_gap_or_limit": "D09 Linux and native mid-journal ENOSPC unqualified; D26 is separate sync boundary; legacy verdict must stay independent.",
+      "next_action": "Prioritize Linux crash scheduling and mid-journal ENOSPC with retained byte witnesses; no cross-database atomicity claims.",
+      "evidence": [
+        "Capture doc plus T45/APFS/Docker pressure evidence in qualification ledger."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l2-capture.md"
+      ],
+      "dependencies": [
+        "#656",
+        "#657",
+        "D09/D18/D20/D26"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 6,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 656,
+      "title": "[Local v3 / L2] Isolate collaboration state from broker state and cleanup",
+      "url": "https://github.com/schiste/Aethyme/issues/656",
+      "state_at_inventory": "OPEN",
+      "audit_status": "store_implemented_durability_limits",
+      "current_gap_or_limit": "Power-loss and cross-resource atomicity are not claimed; Linux D09 and full old-client cleanup matrix incomplete.",
+      "next_action": "Complete Linux crash and paired-old-client qualification; retain stated local disk/backup boundary.",
+      "evidence": [
+        "State doc and qualification ledger document root permissions, schema floors, crash and old-binary controls."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l2-state.md"
+      ],
+      "dependencies": [
+        "#651",
+        "D09/D18/D20/D25",
+        "#681"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 7,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 335,
+      "title": "Worktree lifecycle: prevent persistent disk and branch debris across agent sessions",
+      "url": "https://github.com/schiste/Aethyme/issues/335",
+      "state_at_inventory": "OPEN",
+      "audit_status": "partially_implemented_umbrella",
+      "current_gap_or_limit": "Cleanup recovery, reclamation allowlists, storage inventory and GC exist. Remaining gaps need narrowly scoped child fixes.",
+      "next_action": "Qualify exact interruption/ownership paths rather than implement a second cleanup system.",
+      "evidence": [
+        "finish.rs; cleanup.rs; storage inventory; GC"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [
+        927,
+        928
+      ],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 8,
+      "priority": "P0",
+      "group": "Safety and resource retention",
+      "number": 909,
+      "title": "broker finish: partial finish leaves tracked files deleted; cleanup then refuses without --force",
+      "url": "https://github.com/schiste/Aethyme/issues/909",
+      "state_at_inventory": "OPEN",
+      "audit_status": "implementation_present_qualification_gap",
+      "current_gap_or_limit": "Finish records a pre-removal proof; retry cleanup narrowly accepts only tracked unstaged deletions for the exact owned checkout/head/branch.",
+      "next_action": "Add a focused real interrupted tracked-deletion regression before claiming the reported behavior resolved.",
+      "evidence": [
+        "finish.rs:248; cleanup.rs:1628; cleanup.rs:1843"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 9,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 892,
+      "title": "Avoid CPU-heavy full-patch git log during concurrent submits",
+      "url": "https://github.com/schiste/Aethyme/issues/892",
+      "state_at_inventory": "OPEN",
+      "audit_status": "confirmed_gap",
+      "current_gap_or_limit": "Submission still builds/replays complete patch history before queue admission and during replay. Existing PR930 guards same-invocation prepared-plan reuse.",
+      "next_action": "Recover #930, resolve current main conflicts, and validate writer-lock/concurrent-head fallback plus trace-count regression.",
+      "evidence": [
+        "build_submission_plan; replay_submission_plan; drain_merge_queue"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [
+        930
+      ],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 10,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 706,
+      "title": "Make broker GitHub admission timeouts bounded and observable",
+      "url": "https://github.com/schiste/Aethyme/issues/706",
+      "state_at_inventory": "OPEN",
+      "audit_status": "confirmed_gap",
+      "current_gap_or_limit": "GitHub reads still default to90seconds although reported caller terminates at45seconds. Intentional long reads need caller-selected bounds preserved.",
+      "next_action": "Qualify existing #924 30second GitHub default on current main with override and timeout cleanup tests.",
+      "evidence": [
+        "operations.rs READ_OPERATION_BUDGET; push_and_coordinated tests"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [
+        924
+      ],
+      "implementation_status": "Existing PR #924 synced and pushed at b69d1f93; fresh CI and independent review pending; no local Cargo pass claimed."
+    },
+    {
+      "rank": 11,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 460,
+      "title": "broker status (incl. --summary and doctor) never returns at scale: serial per-worktree git status + per-commit merge-base/diff --binary/patch-id chain with no cache or bound",
+      "url": "https://github.com/schiste/Aethyme/issues/460",
+      "state_at_inventory": "OPEN",
+      "audit_status": "implementation_present_qualification_gap",
+      "current_gap_or_limit": "Brief status avoids checkout/history Git; full status has one7second inspection deadline and budget-cut output. No current reproduction of original hang.",
+      "next_action": "Measure fresh and aged synthetic session histories; retain omissions/deadline diagnostics before closing.",
+      "evidence": [
+        "broker.rs:86; status_brief; CLI budget tests"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [
+        927
+      ],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 12,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 893,
+      "title": "Keep agent worktrees fresh against the integration branch",
+      "url": "https://github.com/schiste/Aethyme/issues/893",
+      "state_at_inventory": "OPEN",
+      "audit_status": "partially_implemented",
+      "current_gap_or_limit": "New starts select fresh integration/default; explicit reuse sync exists. Running worktrees lack a recorded freshness observation and pre-task stale check.",
+      "next_action": "Report observed/current SHA and behind count at a work boundary; never auto-rewrite dirty or diverged trees.",
+      "evidence": [
+        "lifecycle.rs:3329; lifecycle.rs:3820; adopt_cli tests"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 13,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 760,
+      "title": "Broker: surface default-branch breakage ownership and task overlap before duplicate work starts",
+      "url": "https://github.com/schiste/Aethyme/issues/760",
+      "state_at_inventory": "OPEN",
+      "audit_status": "partially_implemented",
+      "current_gap_or_limit": "Open-PR path/line overlap exists, but default-branch incident ownership and task-text overlap remain.",
+      "next_action": "Qualify #933 planned-path overlap; keep stale/unknown source warnings explicit, then design base-failure ownership separately.",
+      "evidence": [
+        "pr_overlap.rs; lifecycle start/push/status"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [
+        933
+      ],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 14,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 767,
+      "title": "[bug] Patch lint formats Rust files as the wrong edition",
+      "url": "https://github.com/schiste/Aethyme/issues/767",
+      "state_at_inventory": "OPEN",
+      "audit_status": "mixed_external_report_and_in_repo_analog",
+      "current_gap_or_limit": "Aethyme FormatFixer must honor the nearest/workspace Cargo edition and fail closed on invalid metadata. This does not establish that Hermes' patch tool routes through Aethyme, so closing the Hermes-specific report requires caller evidence.",
+      "next_action": "Recover existing PR #931, sync it to 9cb14b76, review the edition lookup and tests, then run focused quality tests and required fresh CI. Do not open a duplicate PR.",
+      "evidence": [
+        "Issue reproduction names Hermes' patch tool, so that exact caller is outside this repository's local/broker/engine/release scope.",
+        "At 9cb14b76, aethyme-quality/src/fix/fixers/format_fixer.rs invokes rustfmt --emit stdout without an edition argument; the analogous Aethyme bug is real.",
+        "PR #931 explicitly targets #767 and changes FormatFixer edition discovery; its branch is not merged."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [
+        931
+      ],
+      "implementation_status": "Existing PR #931 recovered and synced at db708f6f; independent source review clear; focused local qualification pending."
+    },
+    {
+      "rank": 15,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 887,
+      "title": "broker: repo-level defaults for ready PRs and PR watch, plus a built-in watch tick",
+      "url": "https://github.com/schiste/Aethyme/issues/887",
+      "state_at_inventory": "OPEN",
+      "audit_status": "confirmed_gap",
+      "current_gap_or_limit": "PR watch remains opt-in; push --pr is draft-only and no background poller runs.",
+      "next_action": "Split readiness/monitor-enrollment repo policy from scheduling and merge-state events. Never imply an enrolled watch is actively polled.",
+      "evidence": [
+        "cli/mod.rs watch help:509-525"
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 16,
+      "priority": "P1",
+      "group": "Frequent operational cost and correctness",
+      "number": 213,
+      "title": "graph: rebuild capability in vertical slices around the three stated uses — CI sizing, nightly doc impact, session bootstrap",
+      "url": "https://github.com/schiste/Aethyme/issues/213",
+      "state_at_inventory": "OPEN",
+      "audit_status": "in_repo_partial",
+      "current_gap_or_limit": "Tranche 0's per-language, per-use capability report is not present. Existing coverage is inventory/count-based, not a claim that CI sizing, doc impact, or session bootstrap is answerable. Tests and Documents producers are conservative/heuristic, so fixtures must establish precision/recall boundaries and graph health must surface unsupported cases. Surface-flow quality/fallback criteria also remain separate work.",
+      "next_action": "Implement the capability report first, tied to the three questions and languages; then select one vertical slice from measured gaps. Do not restart the already-present Imports mode or relationship producers.",
+      "evidence": [
+        "broker/src/graph_impact.rs defines Calls and Imports modes and separate caller/import frontier traversals.",
+        "graph-indexer/src/relationships.rs emits Tests from test-file/function/call patterns and Documents from explicit unique symbol references in Markdown sections.",
+        "graph-indexer/src/coverage.rs records per-language coverage and edge-kind counts, but not the three user questions' answerability by language.",
+        "graph-indexer has Calls producers in python.rs, rust_calls.rs and typescript_calls.rs."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 17,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 655,
+      "title": "[Local v3 / L1] Add the exact-source Analysis envelope and baseline adapter",
+      "url": "https://github.com/schiste/Aethyme/issues/655",
+      "state_at_inventory": "OPEN",
+      "audit_status": "implemented_envelope_with_read_gap",
+      "current_gap_or_limit": "L1 analysis doc explicitly records L0 follow-up 3: producer_version is not checked on the envelope read path; profile metadata is only useful when an actual consumer resolves the pinned profile.; D38/D39/D44/D47 and broad analysis coverage remain open; do not infer generic stale acceptance without resolving the profile reference.",
+      "next_action": "Trace L0 follow-up 3 through the ProfileRef resolution path; define the expected pinned profile and explicit mismatch result with T85/AQ0 tests. Keep this separate from the already-tested fresh-view T90 version fence. Submit a focused PR only if the current consumer actually drops/ignores the mismatch.",
+      "evidence": [
+        "L1 analysis doc defines exact/partial/unavailable states and source/profile pins",
+        "AQ0 is advisory.",
+        "Direct source check: contracts experimental_v0/analysis.rs stores ProfileRef and carries provenance; AnalysisEnvelope::from_record does not independently resolve/check producer version. Distinct analysis_view::open_view_for rejects a mismatched ViewProfile (T90), so do not conflate the two readers."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l1-analysis.md",
+        "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/analysis.rs",
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_context.rs",
+        "packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs"
+      ],
+      "dependencies": [
+        "#651",
+        "#652",
+        "#653"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 18,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 668,
+      "title": "[Local v3 / L5] Reserve execution budgets before dispatch and preserve retry lineage",
+      "url": "https://github.com/schiste/Aethyme/issues/668",
+      "state_at_inventory": "OPEN",
+      "audit_status": "reservation_ledger_live_coupling_open",
+      "current_gap_or_limit": "Resource receipt/cleanup coupling and live workers remain L6-dependent; D15/D25 and full T43/T44 open; no host-capacity guarantee.",
+      "next_action": "Close typed resource-receipt and interrupted retry/cleanup contract before enabling managed spending.",
+      "evidence": [
+        "L5 budgets doc documents reservation and retry lineage."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l5-budgets.md"
+      ],
+      "dependencies": [
+        "#666/#671",
+        "#673",
+        "D15/D25"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 19,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 669,
+      "title": "[Local v3 / L5] Fence stop, restore, revoke, and stale controller outcomes",
+      "url": "https://github.com/schiste/Aethyme/issues/669",
+      "state_at_inventory": "OPEN",
+      "audit_status": "restore_fencing_partial",
+      "current_gap_or_limit": "D16/D29 and external publisher/signing/reconciliation interleavings remain; restoring DB does not prove process death.",
+      "next_action": "Close exact restore/revoke interleavings and retain unknown work for explicit reconciliation.",
+      "evidence": [
+        "L5 authority and L8 handoff docs",
+        "18 native handoff schedules retain children/open descriptors."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l5-authority.md",
+        "packages/aethyme/docs/architecture/local-v3-l8-handoff.md"
+      ],
+      "dependencies": [
+        "#666/#668",
+        "#678",
+        "D16/D29"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 20,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 670,
+      "title": "[Local v3 / L6] Freeze exact source, build inputs, and materialized execution identity",
+      "url": "https://github.com/schiste/Aethyme/issues/670",
+      "state_at_inventory": "OPEN",
+      "audit_status": "exact_snapshot_identity_bounded",
+      "current_gap_or_limit": "T13 actual-executor and full toolchain/generated-input identity are bounded; unsupported filters/submodules must refuse.",
+      "next_action": "Close T13/profile-relevant generated-input cases, preserve explicit refusal for unsupported input.",
+      "evidence": [
+        "L6 snapshots and L2 archive docs plus local qualification inventory."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l6-snapshots.md"
+      ],
+      "dependencies": [
+        "#653/#657",
+        "#664",
+        "D08"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 21,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 672,
+      "title": "[Local v3 / L6] Produce independent, non-forgeable verification evidence",
+      "url": "https://github.com/schiste/Aethyme/issues/672",
+      "state_at_inventory": "OPEN",
+      "audit_status": "independent_verifier_bounded",
+      "current_gap_or_limit": "Full Q3/T24-T28 exact-candidate, stale/revoked, cleanup/resource coupling remains; verifier is not provider acceptance.",
+      "next_action": "Complete exact mutation/revocation/resource recovery schedules at one source; preserve acceptance separation.",
+      "evidence": [
+        "L6 verifier/native-gates docs and qualification ledger record source/profile binding and adversarial controls."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l6-verifier.md",
+        "packages/aethyme/docs/architecture/local-v3-native-gates.md"
+      ],
+      "dependencies": [
+        "#670/#671",
+        "#673",
+        "D07/D17"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 22,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 671,
+      "title": "[Local v3 / L6] Supervise and isolate candidate execution",
+      "url": "https://github.com/schiste/Aethyme/issues/671",
+      "state_at_inventory": "OPEN",
+      "audit_status": "trusted_host_supervisor",
+      "current_gap_or_limit": "No VM/root boundary or protection from host administrator; daemon resource scope and D07/D25/D29 remain limited.",
+      "next_action": "Make trust boundary explicit; qualify only declared process/credential/cancellation profile, not a broader sandbox.",
+      "evidence": [
+        "L6 supervisor and qualification ledger include tmpfs ENOSPC, cgroup OOM, concurrent workload, owned cleanup."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l6-supervisor.md"
+      ],
+      "dependencies": [
+        "#670",
+        "#673",
+        "D07/D25/D29"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 23,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 681,
+      "title": "[Local v3 / L9] Preserve old-binary, old-policy, and repository compatibility",
+      "url": "https://github.com/schiste/Aethyme/issues/681",
+      "state_at_inventory": "OPEN",
+      "audit_status": "finite_old_binary_compatibility",
+      "current_gap_or_limit": "Not a universal matrix for I01/I02/network denial/shared clone/migration; already-open old clients need quiescence.",
+      "next_action": "Complete supported paired-binary/denial cases; retain unchanged-state bytes and avoid blanket parity claims.",
+      "evidence": [
+        "L9 compatibility docs and compatibility-native ledger",
+        "state bytes checked on refusal."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l9-compatibility.md"
+      ],
+      "dependencies": [
+        "#656/#660",
+        "#674/#675",
+        "#679",
+        "D18/D32/D33/D36"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 24,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 660,
+      "title": "[Local v3 / L2] Integrate capture as explicit opt-in beside legacy submit",
+      "url": "https://github.com/schiste/Aethyme/issues/660",
+      "state_at_inventory": "OPEN",
+      "audit_status": "opt_in_capture_implemented_pairing_open",
+      "current_gap_or_limit": "Paired old/new binary and T64 public/native rehearsal remain; old open clients need quiescence before migration.",
+      "next_action": "No feature PR indicated; complete exact pair/policy rehearsal and preserve unchanged-state refusal evidence.",
+      "evidence": [
+        "L2 opt-in doc and T33-T35/T57 behavior",
+        "schema-floor checks retained."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l2-optin.md"
+      ],
+      "dependencies": [
+        "#653",
+        "#658",
+        "#681",
+        "D18/D32"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 25,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 666,
+      "title": "[Local v3 / L5] Define target revisions and one authoritative local controller",
+      "url": "https://github.com/schiste/Aethyme/issues/666",
+      "state_at_inventory": "OPEN",
+      "audit_status": "local_controller_finite",
+      "current_gap_or_limit": "Publisher/signing/restore and D16/D29 not closed; no general autonomy claim; old open clients beyond fresh-open floors.",
+      "next_action": "Qualify owner, movement and restore/revoke schedules without expanding Local authority.",
+      "evidence": [
+        "L5 targets/authority docs",
+        "actual two-wave and 20-change controller profile."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l5-targets.md",
+        "packages/aethyme/docs/architecture/local-v3-l5-authority.md"
+      ],
+      "dependencies": [
+        "#652/#653",
+        "#663/#664",
+        "L6"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 26,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 667,
+      "title": "[Local v3 / L5] Schedule finite candidate waves with starvation protection",
+      "url": "https://github.com/schiste/Aethyme/issues/667",
+      "state_at_inventory": "OPEN",
+      "audit_status": "fairness_finite_not_general",
+      "current_gap_or_limit": "All six FX17 model rows failed before candidates at provider schema boundary; D14 general fairness/indefinite arrivals remains open.",
+      "next_action": "Keep failed denominator and do not rerun consumed rows; make no general service/reliability claim.",
+      "evidence": [
+        "Waves and autonomous-controller docs preserve attempts and denominators."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l5-waves.md",
+        "packages/aethyme/docs/architecture/local-v3-autonomous-controller.md"
+      ],
+      "dependencies": [
+        "#666",
+        "#664",
+        "D14",
+        "#672"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 27,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 675,
+      "title": "[Local v3 / L7] Bind acceptance to configured GitHub/Mergify policy",
+      "url": "https://github.com/schiste/Aethyme/issues/675",
+      "state_at_inventory": "OPEN",
+      "audit_status": "local_acceptance_implemented_live_provider_unbound",
+      "current_gap_or_limit": "No designated Playground live qualification. This is Local observation only: no branch protection changes, queue policy or Mergify enablement; Coordination/Git Platform excluded.",
+      "next_action": "Only run finite read-only Local observer against an explicitly designated existing Playground repository/policy; keep refusal if authority unavailable.",
+      "evidence": [
+        "L7 acceptance docs: exact PR/head/base, landed content check, review identity, explicit Mergify route",
+        "14 acceptance tests and guard trials."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l7-acceptance.md"
+      ],
+      "dependencies": [
+        "#664/#672/#674",
+        "D17/D19",
+        "user scope exclusion"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 28,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 677,
+      "title": "[Local v3 / L8] Prepare an accepted candidate as a fresh workspace generation",
+      "url": "https://github.com/schiste/Aethyme/issues/677",
+      "state_at_inventory": "OPEN",
+      "audit_status": "generation_preparation_bounded",
+      "current_gap_or_limit": "Depends on #675 live acceptance; one joined path not general remote-source mapping; squash/rebase requires content revalidation.",
+      "next_action": "Retain old generations and require exact source revalidation; qualify joined path after #675.",
+      "evidence": [
+        "L8 generation and Local joined-path evidence",
+        "old worktrees stay unchanged until explicit handoff."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l8-generation.md"
+      ],
+      "dependencies": [
+        "#657",
+        "#665",
+        "#675",
+        "D21/D28"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 29,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 678,
+      "title": "[Local v3 / L8] Acknowledge generation handoff and fence stale agents",
+      "url": "https://github.com/schiste/Aethyme/issues/678",
+      "state_at_inventory": "OPEN",
+      "audit_status": "native_handoff_qualified_limited",
+      "current_gap_or_limit": "No VM/process-tree confinement; Native gate join is present; positive public handoff/T64 and descendant settlement remain to qualify; a pre-GO receipt does not prove workload ran.",
+      "next_action": "No duplicate library PR; finish CLI/T64 positive handoff and preserve unknown descendants for explicit reconciliation.",
+      "evidence": [
+        "L8 handoff doc",
+        "actual grandchild/open-descriptor case",
+        "independent review and restored tests."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l8-handoff.md"
+      ],
+      "dependencies": [
+        "#669/#676/#677",
+        "#650"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 30,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 682,
+      "title": "[Local v3 / QA] Qualify Local retention, composition, recovery, and progress claims",
+      "url": "https://github.com/schiste/Aethyme/issues/682",
+      "state_at_inventory": "OPEN",
+      "audit_status": "qualification_ledger_not_whole_qa",
+      "current_gap_or_limit": "T64 public rehearsal, live provider, host/daemon and mid-journal pressure, power-loss claims remain; FX17 six rows failed before candidates; no D30 or global reliability claim.",
+      "next_action": "Update issue/ledger with exact residuals and dependencies; keep failed/unrun denominators; no whole-plan Local success claim.",
+      "evidence": [
+        "Qualification doc inventories source/profile/commands/failures for E1, FX08, native gates, controller, pressure, CLI and restore."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-qualification.md"
+      ],
+      "dependencies": [
+        "All Local child gates",
+        "D30-D36"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 31,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 680,
+      "title": "[Local v3 / L9] Add explicit opt-in Local collaboration commands and policy",
+      "url": "https://github.com/schiste/Aethyme/issues/680",
+      "state_at_inventory": "OPEN",
+      "audit_status": "explicit_cli_profile_public_rehearsal_open",
+      "current_gap_or_limit": "Fresh T64 public/native rehearsal and two-contributor path remain; target run/remote sync/positive handoff refuse unbound profiles.",
+      "next_action": "Run exact public/native rehearsal with receipts; no feature PR unless it exposes a concrete contract gap.",
+      "evidence": [
+        "L9 CLI docs",
+        "101-pass T64 source selection and finite CLI profile in qualification ledger."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l9-command-surface.md",
+        "packages/aethyme/docs/architecture/local-v3-l9-commands.md"
+      ],
+      "dependencies": [
+        "#660",
+        "#661-#679",
+        "D18/D32"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 32,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 652,
+      "title": "[Local v3 / L1] Define project, contribution, and exact source identities",
+      "url": "https://github.com/schiste/Aethyme/issues/652",
+      "state_at_inventory": "OPEN",
+      "audit_status": "researched_decisions_open",
+      "current_gap_or_limit": "No ratified minting/canonical identity lifecycle; T03/T05 and actual consumer parity remain; shared schemas experimental.",
+      "next_action": "Close enrollment and identity decisions before freezing shared contracts; add the remaining clone/rename/copy/split vectors.",
+      "evidence": [
+        "Identity doc marks T03/T05 pending",
+        "AQ0 T66 has 4/4 clone tests and 3/3 symbol vectors, advisory only."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l1-identity.md"
+      ],
+      "dependencies": [
+        "#650",
+        "#651",
+        "#653"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 33,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 653,
+      "title": "[Local v3 / L1] Specify canonical, versioned contribution and receipt records",
+      "url": "https://github.com/schiste/Aethyme/issues/653",
+      "state_at_inventory": "OPEN",
+      "audit_status": "partial_canonical_envelope",
+      "current_gap_or_limit": "Concrete records and old/new compatibility schemas remain experimental; T85, D18/D32/D47 open.",
+      "next_action": "Specify minimal schemas after #652; add malformed/oversize/old-client fences before freezing fields.",
+      "evidence": [
+        "L1 records doc plus finite Rust/eval-side TypeScript vectors",
+        "unknown/partial states documented."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l1-records.md"
+      ],
+      "dependencies": [
+        "#651",
+        "#652",
+        "D18/D32/D47"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 34,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 657,
+      "title": "[Local v3 / L2] Retain exact source blobs and contribution lineage",
+      "url": "https://github.com/schiste/Aethyme/issues/657",
+      "state_at_inventory": "OPEN",
+      "audit_status": "source_archive_bounded",
+      "current_gap_or_limit": "Filters, submodules, LFS and disk/remote durability excluded; D20 retention/receipt boundary remains.",
+      "next_action": "Reconcile supported source profile and finish D20 receipt/retention semantics; add only missing explicit-refusal cases.",
+      "evidence": [
+        "Archive doc covers moved refs, missing/shallow/partial objects and reconstruction",
+        "native retained-source tests recorded."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l2-archive.md"
+      ],
+      "dependencies": [
+        "#652",
+        "#653",
+        "#656",
+        "D08/D20"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 35,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 663,
+      "title": "[Local v3 / L4] Extract a candidate boundary and keep the legacy Git adapter",
+      "url": "https://github.com/schiste/Aethyme/issues/663",
+      "state_at_inventory": "OPEN",
+      "audit_status": "candidate_boundary_provisional",
+      "current_gap_or_limit": "L4 docs contain pre-E1 historical statements; D04-D06/D12/D18 and Q3 whole-candidate gates remain incomplete.",
+      "next_action": "Reconcile stale docs; preserve candidate/verification/acceptance separation; fix only a demonstrated missing invariant.",
+      "evidence": [
+        "L4 boundary doc and qualification ledger's E1/native gate rows."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l4-boundary.md"
+      ],
+      "dependencies": [
+        "#650",
+        "#652/#653/#657",
+        "L6"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 36,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 665,
+      "title": "[Local v3 / L4] Return bounded resolution requests and exact candidate manifests",
+      "url": "https://github.com/schiste/Aethyme/issues/665",
+      "state_at_inventory": "OPEN",
+      "audit_status": "resolution_plumbing_present_gate_limited",
+      "current_gap_or_limit": "Pre-E1 text remains stale; generic exact-candidate manifest/re-analysis and Q3/T20-T23/T80/T87 are not all qualified.",
+      "next_action": "Reconcile status; add only missing current-source exact-manifest/mutation cases; never treat request/receipt as authority.",
+      "evidence": [
+        "L4 resolution doc, E1 synthesis evidence and separate native gate join."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l4-resolution.md"
+      ],
+      "dependencies": [
+        "#652/#653/#657",
+        "#664",
+        "#672"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 37,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 664,
+      "title": "[Local v3 / L4] Compose pinned contributions under one bounded profile",
+      "url": "https://github.com/schiste/Aethyme/issues/664",
+      "state_at_inventory": "OPEN",
+      "audit_status": "narrow_html_composition_qualified",
+      "current_gap_or_limit": "Original FX04 failed; held-outs not rerun; support only bounded HTML/task distribution and no universal composition.",
+      "next_action": "Reconcile the bounded profile; do not tune to failures or rerun frozen cases; add a new grammar only for a distinct frozen requirement.",
+      "evidence": [
+        "E1 original: structural 16/17/text 15/17",
+        "FX02 move/edit success",
+        "FX03 inherited cases accepted",
+        "synthesis and SH01 evidence separate."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-e1-profile.md",
+        "packages/aethyme/docs/architecture/local-v3-l4-composer.md"
+      ],
+      "dependencies": [
+        "#650",
+        "#652/#657",
+        "#663"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 38,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 650,
+      "title": "[Local v3 / E1] Qualify a bounded composition strategy on Playground fixtures",
+      "url": "https://github.com/schiste/Aethyme/issues/650",
+      "state_at_inventory": "OPEN",
+      "audit_status": "bounded_profile_qualified_with_record_gap",
+      "current_gap_or_limit": "Only bounded external HTML distribution; original FX04 semantic case failed; evidence is split rather than one Q1 JSON; frozen held-outs not rerun.",
+      "next_action": "Reconcile issue body and index existing immutable evidence; do not rerun held-outs or open a product PR for completed bounded work.",
+      "evidence": [
+        "Original structural 16/17, text 15/17",
+        "positive move/edit and inherited cases",
+        "browser 168 observations",
+        "synthetic semantic repair/consumer/subtraction",
+        "sealed SH01 4/4",
+        "license inventory."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-e1-profile.md",
+        "packages/aethyme/docs/architecture/local-v3-qualification.md",
+        "packages/aethyme-eval/e1/original-observations/completed.json",
+        "packages/aethyme-eval/e1/browser-observations/report.json",
+        "packages/aethyme-eval/e1/synthesis-observations/completed/report.json",
+        "packages/aethyme-eval/e1/sealed-observations/completed/report.json"
+      ],
+      "dependencies": [
+        "#651",
+        "D03-D06",
+        "#652"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 39,
+      "priority": "P1",
+      "group": "Local core contracts and qualification",
+      "number": 649,
+      "title": "[Plan v3 / Local] Track contextual contribution workflow and revision-bound analysis",
+      "url": "https://github.com/schiste/Aethyme/issues/649",
+      "state_at_inventory": "OPEN",
+      "audit_status": "umbrella_open",
+      "current_gap_or_limit": "Live GitHub/Mergify, T64, Linux/mid-journal pressure, identity/schema decisions and usefulness/reliability remain incomplete.",
+      "next_action": "Replace placeholder map with this evidence-backed inventory; make child changes only for verified gaps.",
+      "evidence": [
+        "Qualification ledger records bounded source-specific work and remaining gaps",
+        "prioritization plan stages #651 and #650 before dependent contracts."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-qualification.md"
+      ],
+      "dependencies": [
+        "#651, #650"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 40,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 661,
+      "title": "[Local v3 / L3] Retrieve a bounded, explainable contribution context",
+      "url": "https://github.com/schiste/Aethyme/issues/661",
+      "state_at_inventory": "OPEN",
+      "audit_status": "bounded_context_usefulness_unproven",
+      "current_gap_or_limit": "No reliable brief usefulness; dynamic dependencies stay partial/unknown; D27 hot-project scale unmeasured; no multi-member ACL claim.",
+      "next_action": "Keep claims bounded; do not rerun FX08 or tune to it; measure D27 only against predeclared need.",
+      "evidence": [
+        "L3 context doc",
+        "FX08 56 scheduled outcomes, 37 successful proposals and 19 failures/refusals."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l3-context.md",
+        "packages/aethyme/docs/architecture/local-v3-fx08-qualification.md"
+      ],
+      "dependencies": [
+        "#653/#655/#657",
+        "D27/D30",
+        "#709"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 41,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 662,
+      "title": "[Local v3 / L3] Invalidate context caches for new matches and visibility changes",
+      "url": "https://github.com/schiste/Aethyme/issues/662",
+      "state_at_inventory": "OPEN",
+      "audit_status": "invalidation_scoped_local_boundary",
+      "current_gap_or_limit": "Dynamic dependency/broad-risk bounds provisional; one Local reader class; external membership/ACL provider is excluded Coordination.",
+      "next_action": "Close Local revocation/epoch cases and explicitly mark provider-driven membership out of scope.",
+      "evidence": [
+        "L3 invalidation doc T14/T15/T82/T84/T85."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l3-invalidation.md"
+      ],
+      "dependencies": [
+        "#661",
+        "D23/D27",
+        "Coordination excluded"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 42,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 674,
+      "title": "[Local v3 / L7] Transport exact retained candidates over existing Git paths",
+      "url": "https://github.com/schiste/Aethyme/issues/674",
+      "state_at_inventory": "OPEN",
+      "audit_status": "git_transport_bounded",
+      "current_gap_or_limit": "No remote durability claim; absent/changed refs do not prove no prior write; ambiguity stays in broker journal; live provider is #675.",
+      "next_action": "No rewrite indicated; preserve precise profile limits and wrong-ref/lost-response refusal semantics.",
+      "evidence": [
+        "L7 transport docs and 16 disposable tests plus restored Local/Git regression evidence."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l7-transport.md"
+      ],
+      "dependencies": [
+        "#657",
+        "#663/#665",
+        "L6",
+        "D19/D20"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 43,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 676,
+      "title": "[Local v3 / L8] Add resumable Local inbox/outbox synchronization",
+      "url": "https://github.com/schiste/Aethyme/issues/676",
+      "state_at_inventory": "OPEN",
+      "audit_status": "local_exchange_coordination_boundary",
+      "current_gap_or_limit": "Receipt cannot claim remote source retention/verification; membership provider and real Coordination service out of scope.",
+      "next_action": "Qualify local replay/outbox behavior; do not implement Coordination integration or imply peer service.",
+      "evidence": [
+        "L8 exchange doc defines event identity/cursor/replay/receipt semantics and explicitly separates Coordination."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l8-exchange.md"
+      ],
+      "dependencies": [
+        "#653/#658/#661",
+        "#677",
+        "D23/D26/D27"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 44,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 903,
+      "title": "Measure end-to-end savings from worktree and dependency reuse",
+      "url": "https://github.com/schiste/Aethyme/issues/903",
+      "state_at_inventory": "OPEN",
+      "audit_status": "measurement_required",
+      "current_gap_or_limit": "Measure lifecycle reuse with existing preparation/cache contracts rather than adding mutable shared dependency trees.",
+      "next_action": "Compare fresh/continued/reused sessions on synthetic repos with separate cold/warm preparation and disk accounting.",
+      "evidence": [
+        "start --reuse and preparation/cache contracts already exist; end-to-end Rust and Node/Python evidence is missing."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 45,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 902,
+      "title": "Evaluate Git many-files defaults for broker repositories",
+      "url": "https://github.com/schiste/Aethyme/issues/902",
+      "state_at_inventory": "OPEN",
+      "audit_status": "compatibility_blocked",
+      "current_gap_or_limit": "Do not enable the manyFiles bundle at the declared Git 2.38 floor.",
+      "next_action": "Benchmark isolated profiles, including index.skipHash=false; verify minimum clients and index writes before any opt-in recommendation.",
+      "evidence": [
+        "manyFiles enables skipped index checksums; Git fsck before 2.40 reports an error. Current runtime requires only Git2.38."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 46,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 901,
+      "title": "Measure Git fsmonitor benefit across broker worktree workloads",
+      "url": "https://github.com/schiste/Aethyme/issues/901",
+      "state_at_inventory": "OPEN",
+      "audit_status": "measurement_required",
+      "current_gap_or_limit": "Leave fsmonitor opt-in until local and external clean/dirty/untracked/ignored-output broker workloads justify the daemon cost.",
+      "next_action": "Run bounded matched router+engine Playground samples; retain daemon CPU/RSS and cold/warm observations.",
+      "evidence": [
+        "Git built-in fsmonitor requires supported clients/filesystems; a preliminary clean-only sample is slower."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 47,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 907,
+      "title": "Prototype sparse checkout for broker-managed agent worktrees",
+      "url": "https://github.com/schiste/Aethyme/issues/907",
+      "state_at_inventory": "OPEN",
+      "audit_status": "prototype_required",
+      "current_gap_or_limit": "Keep full checkouts as the production default while sparse safety is unqualified.",
+      "next_action": "Inventory full-tree consumers, then measure cone profiles and assert missing tracked inputs fail clearly. Depend on #906 for safe isolation.",
+      "evidence": [
+        "Sparse checkout automatically needs per-worktree configuration; repository gates and context loaders read paths outside edited scopes."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 48,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 906,
+      "title": "Assess Git per-worktree config for broker session settings",
+      "url": "https://github.com/schiste/Aethyme/issues/906",
+      "state_at_inventory": "OPEN",
+      "audit_status": "design_and_qualification_required",
+      "current_gap_or_limit": "Defer automatic worktreeConfig migration until a concrete scoped setting needs it.",
+      "next_action": "Inventory config readers/writers and prototype interrupted migration on synthetic repos; preserve existing shared-config behavior.",
+      "evidence": [
+        "Per-worktree configuration is a control plane, not an established latency gain; core.worktree/core.bare migration and old-client behavior require proof."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 49,
+      "priority": "P2",
+      "group": "Bounded context and measured optimization",
+      "number": 904,
+      "title": "Evaluate reftable for broker-heavy Git repositories",
+      "url": "https://github.com/schiste/Aethyme/issues/904",
+      "state_at_inventory": "OPEN",
+      "audit_status": "migration_blocked",
+      "current_gap_or_limit": "Keep existing repositories on the files ref backend.",
+      "next_action": "Audit loose-ref assumptions; measure isolated high-ref synthetic repos and document client compatibility and reversible offline migration before reconsideration.",
+      "evidence": [
+        "Official git-refs documentation excludes migration with worktrees and provides no concurrent-write barrier."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 50,
+      "priority": "P3",
+      "group": "Narrower recovery and optional workflow",
+      "number": 654,
+      "title": "[Local v3 / L1] Pin the 150-token decision brief profile",
+      "url": "https://github.com/schiste/Aethyme/issues/654",
+      "state_at_inventory": "OPEN",
+      "audit_status": "bounded_token_profile_partial_value",
+      "current_gap_or_limit": "TS consumer and CLI validation remain; FX08 did not prove reliable usefulness or close D30.",
+      "next_action": "Close only exact validator/consumer gaps; preserve negative usefulness result without product tuning.",
+      "evidence": [
+        "Brief profile docs and #709 56-row campaign",
+        "briefs treated as untrusted data."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l1-brief.md"
+      ],
+      "dependencies": [
+        "#653",
+        "D11",
+        "#709"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 51,
+      "priority": "P3",
+      "group": "Narrower recovery and optional workflow",
+      "number": 709,
+      "title": "[Local v3 / FX08] Brief usefulness: frozen fixtures, brief variants, oracle and a pre-L3 pilot",
+      "url": "https://github.com/schiste/Aethyme/issues/709",
+      "state_at_inventory": "OPEN",
+      "audit_status": "fx08_complete_inconclusive",
+      "current_gap_or_limit": "D30 remains open; current report path differs from requested evidence filename; model/charges/retry details have unknowns; never rerun consumed rows.",
+      "next_action": "Link immutable report and state explicitly pilot does not close D30; no product tuning based on this sample.",
+      "evidence": [
+        "FX08 doc records 48 declared plus 8 sealed rows",
+        "37 passing proposals, 18 empty-source proposals, 1 API refusal",
+        "correct/misleading arms tied."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-fx08-qualification.md",
+        "packages/aethyme-eval/fx08/model-observations/report.json",
+        "packages/aethyme-eval/fx08/model-observations/freeze.json"
+      ],
+      "dependencies": [
+        "#654/#661",
+        "D30"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 52,
+      "priority": "P3",
+      "group": "Narrower recovery and optional workflow",
+      "number": 679,
+      "title": "[Local v3 / L8] Export and restore retained Local records safely",
+      "url": "https://github.com/schiste/Aethyme/issues/679",
+      "state_at_inventory": "OPEN",
+      "audit_status": "historical_restore_bounded",
+      "current_gap_or_limit": "Host config, credentials, active leases and current provider/agent authority excluded; imported evidence historical only.",
+      "next_action": "Reconcile supported record/source classes; treat as recovery aid, not core blocker; add only missing refusal/reconstruction case.",
+      "evidence": [
+        "L8 restore doc and restore regression/guard ledger."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l8-restore.md"
+      ],
+      "dependencies": [
+        "#653/#657",
+        "#669",
+        "D16/D20/D28"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 53,
+      "priority": "P3",
+      "group": "Narrower recovery and optional workflow",
+      "number": 813,
+      "title": "Add opt-in end-of-session skill evolution review",
+      "url": "https://github.com/schiste/Aethyme/issues/813",
+      "state_at_inventory": "OPEN",
+      "audit_status": "partly_in_repo_broker_handoff; reviewer_runtime_external",
+      "current_gap_or_limit": "No opt-in config, session-log export, idempotent skill-review job, configured model validation, close-triggered asynchronous adapter launch, or skill-change/result report exists in the reviewed broker contract. Full chronological transcripts are not present in the durable handoff.",
+      "next_action": "First define a privacy-safe adapter contract and opt-in/idempotency boundary with the Chau7 owner. The in-repo slice can add a close-event outbox/handoff only after the adapter can supply approved transcript access; do not put raw session logs into the redacted broker event.",
+      "evidence": [
+        "Broker has a durable session.finished event, but FinishHandoff is deliberately redacted and excludes task/command text, logs, diffs, and file contents (broker/events.rs and broker/broker.rs).",
+        "Broker review_execution.rs explicitly says Chau7 is adapter-owned; broker plans workspace/prompt handoffs but does not call Chau7.",
+        "Existing Chau7 review dispatch is for PR reviews, not a session-log skill-evolution job."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 54,
+      "priority": "P4",
+      "group": "Conditional experiments",
+      "number": 685,
+      "title": "[Local v3 / X3] Report advisory impact for exact combined candidates",
+      "url": "https://github.com/schiste/Aethyme/issues/685",
+      "state_at_inventory": "OPEN",
+      "audit_status": "optional_exact_candidate_analysis_unqualified",
+      "current_gap_or_limit": "Must analyze candidate C itself; graphs A/B cannot be stitched; no gate/lease/acceptance authority.",
+      "next_action": "Defer until L3/L4 exact candidate identity is stable, then run advisory-only evidence.",
+      "evidence": [
+        "L1 analysis remains conservative",
+        "fresh exact-snapshot views can support a future read-only report."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-l1-analysis.md",
+        "packages/aethyme/docs/architecture/local-v3-x2-private-views.md"
+      ],
+      "dependencies": [
+        "#661/#664",
+        "#670",
+        "AQ0/AQ2"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 55,
+      "priority": "P4",
+      "group": "Conditional experiments",
+      "number": 684,
+      "title": "[Local v3 / X2] Prototype isolated one-base private analysis views",
+      "url": "https://github.com/schiste/Aethyme/issues/684",
+      "state_at_inventory": "OPEN",
+      "audit_status": "measured_overlay_rejected",
+      "current_gap_or_limit": "Do not reimplement incremental overlays; D42/D49 only reopen on measured need.",
+      "next_action": "No implementation PR; record explicit exclusion and preserve fresh-view path.",
+      "evidence": [
+        "X2 doc reports five-mutation equivalence but nil gain",
+        "overlays refuse",
+        "fresh-view isolation/GC tests documented."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-x2-private-views.md",
+        "packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_gc.rs"
+      ],
+      "dependencies": [
+        "AQ0",
+        "#661/#662",
+        "D42/D49"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 56,
+      "priority": "P4",
+      "group": "Conditional experiments",
+      "number": 683,
+      "title": "[Local v3 / X1] Experiment with an optional pinned Rust SCIP import",
+      "url": "https://github.com/schiste/Aethyme/issues/683",
+      "state_at_inventory": "OPEN",
+      "audit_status": "optional_not_started",
+      "current_gap_or_limit": "No demonstrated need or approved producer profile; producer execution not authorized solely by issue scope.",
+      "next_action": "Defer and retain structural baseline until explicit AQ1 need/profile is frozen.",
+      "evidence": [
+        "Issue acceptance is conditional on pinned producer/license/source and malformed-index defenses."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-qualification.md"
+      ],
+      "dependencies": [
+        "AQ0",
+        "#651/#656/#657",
+        "AQ1"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 57,
+      "priority": "P4",
+      "group": "Conditional experiments",
+      "number": 686,
+      "title": "[Local v3 / X4] Evaluate SPARTA only for a demonstrated fixed-point need",
+      "url": "https://github.com/schiste/Aethyme/issues/686",
+      "state_at_inventory": "OPEN",
+      "audit_status": "conditional_solver_need_absent",
+      "current_gap_or_limit": "No need/benefit evidence; solver dependency would invert plan order.",
+      "next_action": "Defer and close as excluded unless X3 demonstrates concrete fixed-point need.",
+      "evidence": [
+        "Acceptance requires a local baseline before evaluating SPARTA and allows explicit exclusion."
+      ],
+      "evidence_refs": [
+        "packages/aethyme/docs/architecture/local-v3-qualification.md"
+      ],
+      "dependencies": [
+        "#685",
+        "D46/D50"
+      ],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 58,
+      "priority": "External",
+      "group": "Not owned by this repository",
+      "number": 766,
+      "title": "[Integration] Make Google Workspace setup runnable from Hermes runtime",
+      "url": "https://github.com/schiste/Aethyme/issues/766",
+      "state_at_inventory": "OPEN",
+      "audit_status": "out_of_repo_external_tool",
+      "current_gap_or_limit": "Hermes PM setup/runtime activation must expose a deterministic supported command or fail promptly with the required action.",
+      "next_action": "Route to Hermes Google Workspace / PM maintainers; do not edit this repository's skill templates because the failing skill/runtime is external.",
+      "evidence": [
+        "All repro steps use Hermes' bundled Google Workspace skill, PM runtime, PYTHONPATH and _hermes-python wrapper."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 59,
+      "priority": "External",
+      "group": "Not owned by this repository",
+      "number": 772,
+      "title": "[Bug] terminal returns exit -1 for long multi-argument commands without diagnostics",
+      "url": "https://github.com/schiste/Aethyme/issues/772",
+      "state_at_inventory": "OPEN",
+      "audit_status": "out_of_repo_external_tool",
+      "current_gap_or_limit": "The terminal wrapper must enforce/diagnose argument or command limits; Aethyme does not own the reported execution surface.",
+      "next_action": "Route the minimal harmless URL repro to Hermes terminal maintainers; use the reported batch/JSON workaround meanwhile.",
+      "evidence": [
+        "Reproduction is Hermes execute_code.terminal() argument/process handling, with exit_code=-1 and empty logs."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 60,
+      "priority": "External",
+      "group": "Not owned by this repository",
+      "number": 780,
+      "title": "[Tool friction] Browser Use CLI fails to start when its stdout file is missing",
+      "url": "https://github.com/schiste/Aethyme/issues/780",
+      "state_at_inventory": "OPEN",
+      "audit_status": "out_of_repo_external_tool",
+      "current_gap_or_limit": "Browser process startup and stale-tab recovery belong to the external browser tool.",
+      "next_action": "Route to Browser Use CLI maintainers with the missing-file repro; keep the existing retry workaround documented in the external tool context.",
+      "evidence": [
+        "Reported in browser_exec / Browser Use CLI; missing /tmp/agent-browser-<session>/_stdout_get is created/managed by that tool."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    },
+    {
+      "rank": 61,
+      "priority": "External",
+      "group": "Not owned by this repository",
+      "number": 770,
+      "title": "[Bug] web_extract returns 429 for public pages in a multi-URL batch",
+      "url": "https://github.com/schiste/Aethyme/issues/770",
+      "state_at_inventory": "OPEN",
+      "audit_status": "out_of_repo_external_tool",
+      "current_gap_or_limit": "External fetch backend needs per-URL retry/backoff honoring Retry-After or a clear retryable result/fallback. Avoid assuming the Aethyme repo can fix provider rate limits.",
+      "next_action": "Route to the web_extract/Firecrawl integration owner with the captured URLs and one-batch repro; do not introduce Aethyme-specific retry code without an owned integration path.",
+      "evidence": [
+        "Calls Hermes web_extract backed by keyless Firecrawl. The report does not establish whether throttling is from concurrency, the keyless backend, or target sites."
+      ],
+      "evidence_refs": [],
+      "dependencies": [],
+      "related_prs": [],
+      "implementation_status": "not_changed_in_this_sweep"
+    }
+  ],
+  "open_pr_audit": [
+    {
+      "number": 931,
+      "title": "fix(quality): honor Cargo edition in rustfmt",
+      "head": "a74b51f30c2e310772cd49f42564ea50510c42a3",
+      "state": "open_draft",
+      "owner": "schiste; no assignees; broker session 1294 stale",
+      "behind_main_commits": 62,
+      "checks": "All listed CI checks succeeded on the older head; not fresh against 9cb14b76.",
+      "readiness_risk": "Needs broker recovery/sync, source review, and complete CI rerun. It fixes the in-repo FormatFixer analog but may not own Hermes' exact patch path.",
+      "merge_recommendation": "Recover; do not duplicate; merge only after fresh-base review and gates."
+    },
+    {
+      "number": 941,
+      "title": "build(ci): add exact performance-reporting fast lane",
+      "head": "4331bb32c356ca76611553d87ee2b5c3bb6340b8",
+      "state": "open_draft",
+      "owner": "schiste; no assignees",
+      "behind_main_commits": 30,
+      "checks": "Cross-process contract check and Rust workspace tests failed; product/lint/doctest checks passed; record-tested-tree was skipped.",
+      "readiness_risk": "Static CI assertions still encode previous workflow `if:` expressions. PR body has no checked contract decision. It is not mergeable until expectations/body are corrected and all gates pass on the current base.",
+      "merge_recommendation": "Hold; sync and fix both failing checks before reconsidering."
+    },
+    {
+      "number": 945,
+      "title": "perf(eval): add optional aged broker history workload",
+      "head": "32f64f745fcedfdafff49ef1390aab93e4e937e3",
+      "state": "open_draft",
+      "owner": "schiste; no assignees; broker session 1311 stale",
+      "behind_main_commits": 22,
+      "checks": "All listed CI checks succeeded on the older head.",
+      "readiness_risk": "PR test plan says 3-sample fresh and aged baselines are still being captured. Do not merge a measurement feature before its promised measurement and update its body with evidence.",
+      "merge_recommendation": "Hold for performance evidence, then sync and rerun required gates."
+    },
+    {
+      "number": 955,
+      "title": "fix(release): make Rekor conflicts retry-safe",
+      "head": "5b8dbeadf5bbba96b9f71476127aef7b20c4c9ab",
+      "state": "open_draft",
+      "owner": "schiste; no assignees; session likely release workflow owner",
+      "behind_main_commits": 8,
+      "checks": "Rust workspace tests failed; other listed release, Homebrew, product, lint, doctest and Windows checks passed on the older head.",
+      "readiness_risk": "Release contract test reports the detached Windows zip signing/verification step missing after workflow changes. Resolve the mismatch without weakening identity, issuer, Rekor or bundle verification, then run focused native release contract and all required CI on current main.",
+      "merge_recommendation": "High priority but blocked; fix failing release contract and qualify on current base before #954 release prep."
+    },
+    {
+      "number": 954,
+      "title": "chore(release): prepare v0.8.29",
+      "head": "d7558cd5b01fcdf9f3326e3542f461edc342aee2",
+      "state": "open_draft",
+      "owner": "schiste; no assignees; broker session 1321 stale",
+      "behind_main_commits": 8,
+      "checks": "All listed CI checks succeeded on the older head.",
+      "readiness_risk": "Release metadata is based on 83a8261 and does not include the sibling #955 commits. Reconcile it onto current main after the signing fix is integrated; confirm exact release version/changelog/rollback content and release authorization then.",
+      "merge_recommendation": "Sequence after #955 and current-main sync; do not use green old-base checks as release qualification."
+    },
+    {
+      "number": 958,
+      "title": "chore(deps): bump the cargo-patch group in /packages/aethyme/rust with 2 updates",
+      "head": "d0df29da5ebce33d90c76037245e2ebe0f312975",
+      "state": "open",
+      "owner": "Dependabot; no assignees",
+      "behind_main_commits": 8,
+      "checks": "All listed CI checks succeeded on the older head.",
+      "readiness_risk": "Lockfile-only update; low conflict risk, but sync/refresh checks on current main before merge. Confirm lockfile changes do not conflict with new direct dependency changes in main.",
+      "merge_recommendation": "Low-risk candidate after current-base sync and fresh green gates."
+    },
+    {
+      "number": 959,
+      "title": "chore(deps): bump taiki-e/install-action from 2.87.27 to 2.87.29 in the actions group",
+      "head": "6f84c9298d480dcdb96c09c1f5ff12c13341cce9",
+      "state": "open",
+      "owner": "Dependabot; no assignees",
+      "behind_main_commits": 8,
+      "checks": "All listed CI checks succeeded on the older head.",
+      "readiness_risk": "Workflow action update in three workflows; sync and refresh checks on current main. Review final pinned action/version and fresh workflow execution.",
+      "merge_recommendation": "Low-risk candidate after current-base sync and fresh green gates."
+    }
+  ],
+  "git_references": [
+    "https://git-scm.com/docs/git-config",
+    "https://git-scm.com/docs/git-refs",
+    "https://git-scm.com/docs/git-sparse-checkout"
+  ]
+}
