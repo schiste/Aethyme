@@ -102,6 +102,14 @@ not migrated remains on its current schema.
 
 ### Before upgrading
 
+Cleanup plans and new pending cleanup journals use schema 4 with a stable
+retention anchor. Existing schema-3 journals remain resumable. Before rolling
+back to an older development binary that reads broker schema 52, finish any
+pending schema-4 cleanup with v0.8.28, or use its `broker gc abandon --confirm
+<pending-digest>` command to archive the journal without deleting retained data.
+Then review a fresh cleanup plan with the selected binary; do not reuse an old
+plan digest across versions.
+
 For each repository whose broker database must remain rollback-safe, stop
 broker processes that can access it and make a separate, WAL-aware SQLite
 backup. The SQLite `.backup` command includes committed WAL content:

@@ -34,6 +34,9 @@ repair and the changes listed below.
 
 ### Fixed
 
+- Cleanup plans use a stable daily retention anchor and exclude their own
+  telemetry, so inspection does not immediately invalidate the reviewed plan.
+  Existing schema-3 cleanup journals retain their original resume semantics.
 - Release identity checks validate the exact tagged commit in the current version
   output, and release checkouts do not persist credentials that mark builds dirty.
 
