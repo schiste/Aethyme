@@ -268,7 +268,7 @@ fn inherited_workspace_edition(
             } else {
                 package_manifest_path.parent()?.join(workspace_root)
             };
-            absolute_path(&workspace_root)?.join("Cargo.toml")
+            workspace_root.join("Cargo.toml")
         }
         Some(_) => return None,
         None => nearest_workspace_manifest(package_manifest_path, package_manifest)?,
