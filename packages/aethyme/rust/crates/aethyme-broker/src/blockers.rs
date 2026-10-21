@@ -316,9 +316,18 @@ impl Broker {
         let mut advice = Vec::new();
         if let Some(mut item) = status_advice(&report.blockers) {
             item.reason = "recorded coordination blockers; worktree recovery remedies have not been inspected";
-            item.summary = item.summary.replace(
-                "`aethyme broker unblock` lists",
-                "`aethyme broker blockers` lists",
+            let count = report
+                .blockers
+                .iter()
+                .filter(|blocker| {
+                    !matches!(
+                        blocker.kind,
+                        BlockerKind::GateCache | BlockerKind::ActionRequired
+                    )
+                })
+                .count();
+            item.summary = format!(
+                "{count} blocker observations across broker stores; run `aethyme broker blockers` to inspect recovery remedies"
             );
             item.commands = vec!["aethyme broker blockers".into()];
             advice.push(item);
