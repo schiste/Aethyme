@@ -50,6 +50,19 @@ and one query, and an older cursor is refused (`stale_cursor`, T78).
 A reader that passes a result on forwards the original record bytes. Re-encoding would
 drop values it did not recognize but a newer reader would understand.
 
+The broker's contribution and revision context readers resolve producer claims before
+using an envelope's result paths. For a pinned profile, they open the named persisted
+analysis-view manifest and require the exact profile record ID, the current supported
+`ViewProfile`, the requested source snapshot, view generation, fragment-set digest and
+`fresh` mode to agree. A missing manifest is unavailable; a mismatch is incompatible.
+For the legacy GraphImpact adapter, the reader accepts only the current engine version,
+the `calls` or `imports` mode and provenance whose engine version matches the profile
+and whose digest fields have the expected form. These checks do not recompute the
+adapter's report digests or authenticate envelope bytes. Unknown or incompatible
+profiles produce an explicit analysis gap and contribute no result paths.
+This is a narrow consumer check, not a generic profile catalog or a proof that arbitrary
+envelope bytes were emitted by a particular process. AQ0 remains advisory.
+
 ## Baseline adapter: `GraphImpactReport` → envelope
 
 AQ0 asks that existing analysis be exposed "without stronger claims than its actual
@@ -71,8 +84,10 @@ coverage". The adapter's choices:
 ## Not decided here
 
 - **D38 closes** only when real consumers (L3, Explore, the composer) show that the same
-  source under different configurations cannot share a result. That needs a pinned
-  profile from an actual producer. Today's engine has only legacy profiles.
+  source under different configurations cannot share a result. The broker's local
+  context readers now resolve the structural-indexer's pinned profile through its
+  persisted view manifest; this narrow path does not establish generic profile
+  resolution or broader producer interoperability.
 - **D39** (symbol references across clones, overloads, package versions) now has
   experimental scoped records and a two-clone synthetic Playground fixture through the
   broker's exact-binding resolver (T66). It still has no `resolve_symbol` or
@@ -81,8 +96,9 @@ coverage". The adapter's choices:
 - **D44 closes** with Local, Explore, compositor and service fixtures reading one
   envelope. Only the broker's impact report is adapted so far.
 - **D47:** the engine's "forever 1" fragment and overlay formats are wrapped, not
-  bumped. `producer_version` is still never checked on read (L0 follow-up 3); a pinned
-  profile is where that check will live.
+  bumped. The local context readers check `producer_version` for pinned structural
+  views, but the analysis record parser and other consumers do not resolve pinned
+  profiles. Broader schema and producer compatibility remains open (L0 follow-up 3).
 
 ## Tests
 

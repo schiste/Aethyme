@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aethyme_contracts::experimental_v0::analysis::{
-    AnalysisEnvelope, Operation, Outcome, Status, Subject,
+    AnalysisEnvelope, Coverage, Operation, Outcome, ProfileRef, Status, Subject,
 };
 use aethyme_contracts::experimental_v0::brief::{Brief, MAX_SCOPE_REF_BYTES};
 use aethyme_contracts::experimental_v0::canonical_json::{self, Object, Value};
@@ -194,7 +194,7 @@ pub struct AnalysisSummary {
 }
 
 /// The impact result sets an `explain_impact` envelope can carry.
-const EDGE_KINDS: [&str; 7] = [
+const EDGE_KINDS: [&str; 8] = [
     "direct",
     "transitive",
     "callers",
@@ -202,7 +202,242 @@ const EDGE_KINDS: [&str; 7] = [
     "tests",
     "configs",
     "manifests",
+    "impacted",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProducerStatus {
+    Supported,
+    Unavailable,
+    Incompatible,
+}
+
+impl ProducerStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unavailable => "unavailable",
+            Self::Incompatible => "incompatible",
+        }
+    }
+}
+
+/// Check a producer claim against the evidence available to this reader.
+/// Pinned IDs are resolved through the published local view manifest; parsing
+/// a syntactically valid ID is not producer evidence. Legacy support is
+/// limited to the current GraphImpact adapter's version and provenance shape.
+fn producer_status(
+    store: &CollaborationStore,
+    envelope: &AnalysisEnvelope,
+    source: Option<&SourceSnapshotId>,
+) -> ProducerStatus {
+    match &envelope.profile {
+        ProfileRef::Pinned(profile_id) => pinned_view_status(store, envelope, source, profile_id),
+        ProfileRef::Legacy(profile) => legacy_graph_impact_status(envelope, profile),
+    }
+}
+
+fn pinned_view_status(
+    store: &CollaborationStore,
+    envelope: &AnalysisEnvelope,
+    source: Option<&SourceSnapshotId>,
+    profile_id: &RecordId,
+) -> ProducerStatus {
+    use crate::analysis_view::{VIEW_SCHEMA, ViewProfile, open_view, view_name};
+
+    let Some(Value::Object(provenance)) = envelope.provenance.as_ref() else {
+        return ProducerStatus::Unavailable;
+    };
+    let (
+        Some(Value::String(view)),
+        Some(Value::Integer(generation)),
+        Some(Value::String(fragment_digest)),
+        Some(Value::String(mode)),
+    ) = (
+        provenance.get("view"),
+        provenance.get("generation"),
+        provenance.get("fragment_set_sha256"),
+        provenance.get("mode"),
+    )
+    else {
+        return ProducerStatus::Unavailable;
+    };
+    if !safe_view_name(view) || *generation <= 0 || !lower_hex(fragment_digest, 64) {
+        return ProducerStatus::Unavailable;
+    }
+    if mode != "fresh" {
+        return ProducerStatus::Incompatible;
+    }
+    let Ok(reader) = open_view(store, view) else {
+        return ProducerStatus::Unavailable;
+    };
+    let manifest = reader.manifest();
+    let Ok(snapshot) = SourceSnapshotId::parse(&manifest.snapshot) else {
+        return ProducerStatus::Incompatible;
+    };
+    let current_profile = ViewProfile::current(&manifest.profile.repo_name);
+    let subject_matches = match envelope.operation {
+        Operation::FindReferences => {
+            matches!(&envelope.subject, Subject::Snapshot(id) if id == &snapshot)
+                && envelope.base_subject.is_none()
+        }
+        Operation::ExplainImpact => {
+            matches!(&envelope.subject, Subject::ChangedPaths(digest) if lower_hex(digest, 64))
+                && matches!(
+                    &envelope.base_subject,
+                    Some(Subject::Snapshot(id)) if id == &snapshot
+                )
+        }
+        Operation::ResolveSymbol | Operation::DescribeChange => false,
+    };
+    let source_matches = source.is_some_and(|source| source == &snapshot);
+    let pinned_id_matches = manifest.profile.reference() == ProfileRef::Pinned(profile_id.clone());
+    let manifest_is_ready = manifest.safe_to_use && manifest.coverage_mode == "complete";
+    let manifest_state_matches = match manifest.state {
+        crate::analysis_view::ViewState::Ready => manifest_is_ready,
+        crate::analysis_view::ViewState::Partial => !manifest_is_ready,
+    };
+    if manifest.schema != VIEW_SCHEMA
+        || manifest.profile_digest != manifest.profile.digest()
+        || manifest.profile != current_profile
+        || manifest.generation != *generation as u64
+        || manifest.view != *view
+        || view_name(&snapshot, &manifest.profile) != *view
+        || manifest.fragment_set_sha256 != *fragment_digest
+        || !lower_hex(&manifest.fragment_set_sha256, 64)
+        || !source_matches
+        || !subject_matches
+        || !manifest_state_matches
+        || (manifest.state == crate::analysis_view::ViewState::Partial
+            && envelope.coverage == Coverage::CompleteWithinProfile)
+    {
+        return ProducerStatus::Incompatible;
+    }
+    if !pinned_id_matches {
+        return ProducerStatus::Incompatible;
+    }
+    ProducerStatus::Supported
+}
+
+fn legacy_graph_impact_status(envelope: &AnalysisEnvelope, profile: &str) -> ProducerStatus {
+    use crate::graph_impact::GraphImpactMode;
+
+    let Some(rest) = profile.strip_prefix("aethyme-engine/") else {
+        return ProducerStatus::Unavailable;
+    };
+    let Some((version, mode)) = rest.split_once("/graph-impact-") else {
+        return ProducerStatus::Unavailable;
+    };
+    let Some(mode) = GraphImpactMode::parse(mode) else {
+        return ProducerStatus::Unavailable;
+    };
+    if version != env!("CARGO_PKG_VERSION") || envelope.operation != Operation::ExplainImpact {
+        return ProducerStatus::Incompatible;
+    }
+    let Some(Value::Object(provenance)) = envelope.provenance.as_ref() else {
+        return ProducerStatus::Unavailable;
+    };
+    let provenance_version = provenance.get("engine_version");
+    let request_digest = provenance.get("request_digest");
+    let result_digest = provenance.get("result_digest");
+    let (
+        Some(Value::String(provenance_version)),
+        Some(Value::String(request_digest)),
+        Some(Value::String(result_digest)),
+    ) = (provenance_version, request_digest, result_digest)
+    else {
+        return ProducerStatus::Unavailable;
+    };
+    if provenance_version != version
+        || !lower_hex(request_digest, 64)
+        || !lower_hex(result_digest, 64)
+    {
+        return ProducerStatus::Incompatible;
+    }
+    if !matches!(&envelope.subject, Subject::ChangedPaths(digest) if lower_hex(digest, 64)) {
+        return ProducerStatus::Incompatible;
+    }
+    let Some(Subject::LegacyGitRevision(base_revision)) = envelope.base_subject.as_ref() else {
+        return ProducerStatus::Incompatible;
+    };
+    if !lower_hex(base_revision, 40) && !lower_hex(base_revision, 64) {
+        return ProducerStatus::Incompatible;
+    }
+    let Some(Value::String(graph_revision)) = provenance.get("graph_revision") else {
+        return ProducerStatus::Unavailable;
+    };
+    if (!lower_hex(graph_revision, 40) && !lower_hex(graph_revision, 64))
+        || graph_revision != base_revision
+    {
+        return ProducerStatus::Incompatible;
+    }
+    if let Some(result) = envelope.result.as_ref() {
+        let Value::Object(result) = result else {
+            return ProducerStatus::Incompatible;
+        };
+        let (active_edge, inactive_edge) = match mode {
+            GraphImpactMode::Calls => ("callers", "importers"),
+            GraphImpactMode::Imports => ("importers", "callers"),
+        };
+        if !matches!(
+            result.get(active_edge),
+            Some(Value::Array(paths)) if paths.iter().all(|path| matches!(path, Value::String(_)))
+        ) {
+            return ProducerStatus::Incompatible;
+        }
+        if let Some(value) = result.get(inactive_edge) {
+            let Value::Array(paths) = value else {
+                return ProducerStatus::Incompatible;
+            };
+            if !paths.is_empty() {
+                return ProducerStatus::Incompatible;
+            }
+        }
+    }
+    ProducerStatus::Supported
+}
+
+fn safe_view_name(view: &str) -> bool {
+    let Some(rest) = view.strip_prefix("view-") else {
+        return false;
+    };
+    let Some((snapshot, profile)) = rest.split_once('-') else {
+        return false;
+    };
+    lower_hex(snapshot, 16) && lower_hex(profile, 16)
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Remove paths from an envelope whose producer is unknown or incompatible.
+/// This remains AQ0 advisory data; it never grants authority to the analysis.
+fn checked_analysis_envelope(
+    store: &CollaborationStore,
+    envelope: &AnalysisEnvelope,
+    source: Option<&SourceSnapshotId>,
+) -> (AnalysisEnvelope, ProducerStatus) {
+    let status = producer_status(store, envelope, source);
+    let mut checked = envelope.clone();
+    match status {
+        ProducerStatus::Supported => {}
+        ProducerStatus::Unavailable => {
+            checked.outcome = Outcome::Unavailable;
+            checked.reason = Some("analysis_profile_unavailable".into());
+            checked.result = None;
+        }
+        ProducerStatus::Incompatible => {
+            checked.outcome = Outcome::Incompatible;
+            checked.reason = Some("analysis_profile_incompatible".into());
+            checked.result = None;
+        }
+    }
+    (checked, status)
+}
 
 impl AnalysisSummary {
     /// Summarize `envelope` for a reader working on `source`. Whether it is
@@ -1848,10 +2083,14 @@ fn retrieve_with(
         .collect();
     let mut analysis = Vec::new();
     let mut scoped = Vec::with_capacity(query.analysis.len());
+    let mut producer_statuses = Vec::with_capacity(query.analysis.len());
     for envelope in &query.analysis {
-        let bit = envelope_is_scoped(store, envelope, &scope)?;
+        let (checked, producer_status) =
+            checked_analysis_envelope(store, envelope, query.source.as_ref());
+        let bit = envelope_is_scoped(store, &checked, &scope)?;
         scoped.push(bit);
-        analysis.push(AnalysisSummary::of(envelope, query.source.as_ref(), bit));
+        producer_statuses.push(text(producer_status.as_str()));
+        analysis.push(AnalysisSummary::of(&checked, query.source.as_ref(), bit));
     }
     let mut related_seen = 0;
     let mut related_truncated = false;
@@ -1889,6 +2128,7 @@ fn retrieve_with(
                         .collect(),
                 ),
             )),
+            Some(("analysis_producer_status", Value::Array(producer_statuses))),
             Some((
                 "budget",
                 object(vec![
@@ -2768,6 +3008,113 @@ mod tests {
         }
     }
 
+    fn current_view(
+        fixture: &mut Fixture,
+        snapshot: &SourceSnapshotId,
+    ) -> crate::analysis_view::ViewReader {
+        let options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("fixture"),
+        );
+        crate::analysis_view::view_for_snapshot(&mut fixture.store, snapshot, &options).unwrap()
+    }
+
+    fn pinned_references(
+        fixture: &mut Fixture,
+        snapshot: &SourceSnapshotId,
+        callers: &[&str],
+    ) -> AnalysisEnvelope {
+        let reader = current_view(fixture, snapshot);
+        let mut envelope = reader.find_references("search", 64).unwrap();
+        envelope.result = Some(object(vec![(
+            "callers",
+            Value::Array(callers.iter().map(|path| text(path)).collect()),
+        )]));
+        envelope
+    }
+
+    fn replace_provenance_member(envelope: &mut AnalysisEnvelope, key: &str, value: Value) {
+        let Some(Value::Object(provenance)) = envelope.provenance.as_ref() else {
+            panic!("test envelope must have provenance");
+        };
+        let mut members = provenance
+            .iter()
+            .map(|(name, existing)| {
+                (
+                    name.to_string(),
+                    if name == key {
+                        value.clone()
+                    } else {
+                        existing.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if provenance.get(key).is_none() {
+            members.push((key.to_string(), value));
+        }
+        envelope.provenance = Some(Value::Object(Object::new(members).unwrap()));
+    }
+
+    fn assert_analysis_paths_rejected(
+        fixture: &mut Fixture,
+        candidate: &RecordId,
+        snapshot: &SourceSnapshotId,
+        envelope: AnalysisEnvelope,
+        expected_gap: &str,
+    ) {
+        let context = ask(fixture, &["src/search.rs"], vec![envelope], Some(snapshot));
+        assert!(
+            gaps(&context).contains(&expected_gap),
+            "{:?}",
+            gaps(&context)
+        );
+        assert!(
+            !context
+                .contributions
+                .iter()
+                .any(|id| id == candidate.as_str())
+        );
+        assert!(!context.selection.items.iter().any(|item| {
+            item.reasons
+                .iter()
+                .any(|reason| reason.kind == ReasonKind::ImpactEdge)
+        }));
+    }
+
+    fn legacy_graph_impact(changed_paths: &[&str], callers: &[&str]) -> AnalysisEnvelope {
+        let version = env!("CARGO_PKG_VERSION");
+        let digest = crate::graph_impact::diff_digest(
+            &changed_paths
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<Vec<_>>(),
+        );
+        AnalysisEnvelope {
+            operation: Operation::ExplainImpact,
+            subject: Subject::ChangedPaths(digest),
+            base_subject: Some(Subject::LegacyGitRevision("a".repeat(40))),
+            profile: ProfileRef::Legacy(format!("aethyme-engine/{version}/graph-impact-calls")),
+            outcome: Outcome::Available,
+            freshness: Freshness::Exact,
+            coverage: Coverage::CompleteWithinProfile,
+            limits: Limits::WithinLimits,
+            reason: None,
+            gaps: Vec::new(),
+            heuristic_confidence: None,
+            provenance: Some(object(vec![
+                ("engine_version", text(version)),
+                ("graph_revision", text(&"a".repeat(40))),
+                ("request_digest", text(&"b".repeat(64))),
+                ("result_digest", text(&"c".repeat(64))),
+            ])),
+            limit_detail: None,
+            result: Some(object(vec![(
+                "callers",
+                Value::Array(callers.iter().map(|path| text(path)).collect()),
+            )])),
+        }
+    }
+
     /// A contribution's base and result snapshots.
     fn snapshots(fixture: &Fixture, id: &RecordId) -> (SourceSnapshotId, SourceSnapshotId) {
         fixture
@@ -2828,38 +3175,205 @@ mod tests {
     }
 
     #[test]
+    fn a_persisted_current_view_resolves_as_a_supported_producer() {
+        let mut fixture = Fixture::new();
+        let candidate = fixture.contribute(&[("other/dep.rs", "fn dependent() {}\n")]);
+        let (snapshot, _) = snapshots(&fixture, &candidate);
+        let analysis = pinned_references(&mut fixture, &snapshot, &["other/dep.rs"]);
+
+        let (checked, producer) =
+            checked_analysis_envelope(&fixture.store, &analysis, Some(&snapshot));
+        assert_eq!(producer, ProducerStatus::Supported);
+        assert_eq!(checked.outcome, Outcome::Available);
+        assert_eq!(checked.result, analysis.result);
+
+        let context = ask(
+            &mut fixture,
+            &["src/search.rs"],
+            vec![analysis],
+            Some(&snapshot),
+        );
+        assert_eq!(context.contributions, ids(&[candidate]));
+        assert_eq!(
+            context.selection.items[0].reasons[0].kind,
+            ReasonKind::ImpactEdge
+        );
+        assert_eq!(gaps(&context), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn unsupported_analysis_producers_cannot_contribute_result_paths() {
+        let mut fixture = Fixture::new();
+        let candidate = fixture.contribute(&[("other/dep.rs", "fn dependent() {}\n")]);
+        let (snapshot, _) = snapshots(&fixture, &candidate);
+
+        let incompatible_version = format!("{}-incompatible", env!("CARGO_PKG_VERSION"));
+        let old_profile =
+            crate::analysis_view::ViewProfile::with_version("fixture", &incompatible_version);
+        let old_options = crate::analysis_view::ViewOptions::new(old_profile);
+        let old_reader =
+            crate::analysis_view::view_for_snapshot(&mut fixture.store, &snapshot, &old_options)
+                .unwrap();
+        let mut wrong_version = old_reader.find_references("search", 64).unwrap();
+        wrong_version.result = Some(object(vec![(
+            "callers",
+            Value::Array(vec![text("other/dep.rs")]),
+        )]));
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            wrong_version,
+            "analysis_incompatible",
+        );
+
+        let mut forged_pin = pinned_references(&mut fixture, &snapshot, &["other/dep.rs"]);
+        forged_pin.profile =
+            ProfileRef::Pinned(RecordId::parse(&format!("sha256:{}", "f".repeat(64))).unwrap());
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            forged_pin,
+            "analysis_incompatible",
+        );
+
+        let mut wrong_generation = pinned_references(&mut fixture, &snapshot, &["other/dep.rs"]);
+        let current_generation =
+            match wrong_generation
+                .provenance
+                .as_ref()
+                .and_then(|value| match value {
+                    Value::Object(object) => object.get("generation"),
+                    _ => None,
+                }) {
+                Some(Value::Integer(generation)) => *generation,
+                other => panic!("unexpected view generation: {other:?}"),
+            };
+        replace_provenance_member(
+            &mut wrong_generation,
+            "generation",
+            Value::Integer(current_generation + 1),
+        );
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            wrong_generation,
+            "analysis_incompatible",
+        );
+
+        let mut wrong_legacy_version = legacy_graph_impact(&["src/search.rs"], &["other/dep.rs"]);
+        wrong_legacy_version.profile = ProfileRef::Legacy(format!(
+            "aethyme-engine/{incompatible_version}/graph-impact-calls"
+        ));
+        replace_provenance_member(
+            &mut wrong_legacy_version,
+            "engine_version",
+            text(&incompatible_version),
+        );
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            wrong_legacy_version,
+            "analysis_incompatible",
+        );
+
+        let mut mismatched_provenance = legacy_graph_impact(&["src/search.rs"], &["other/dep.rs"]);
+        replace_provenance_member(
+            &mut mismatched_provenance,
+            "engine_version",
+            text(&incompatible_version),
+        );
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            mismatched_provenance,
+            "analysis_incompatible",
+        );
+
+        let mut mismatched_graph_revision =
+            legacy_graph_impact(&["src/search.rs"], &["other/dep.rs"]);
+        replace_provenance_member(
+            &mut mismatched_graph_revision,
+            "graph_revision",
+            text(&"d".repeat(40)),
+        );
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            mismatched_graph_revision,
+            "analysis_incompatible",
+        );
+
+        let mut mismatched_legacy_mode = legacy_graph_impact(&["src/search.rs"], &["other/dep.rs"]);
+        mismatched_legacy_mode.profile = ProfileRef::Legacy(format!(
+            "aethyme-engine/{}/graph-impact-imports",
+            env!("CARGO_PKG_VERSION")
+        ));
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            mismatched_legacy_mode,
+            "analysis_incompatible",
+        );
+
+        let mut unknown_legacy = legacy_graph_impact(&["src/search.rs"], &["other/dep.rs"]);
+        unknown_legacy.profile = ProfileRef::Legacy("unknown-producer/1".into());
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            unknown_legacy,
+            "analysis_unavailable",
+        );
+
+        let missing_manifest = pinned_references(&mut fixture, &snapshot, &["other/dep.rs"]);
+        let (view, generation) = match missing_manifest.provenance.as_ref() {
+            Some(Value::Object(provenance)) => {
+                match (provenance.get("view"), provenance.get("generation")) {
+                    (Some(Value::String(view)), Some(Value::Integer(generation))) => {
+                        (view.clone(), *generation)
+                    }
+                    other => panic!("unexpected pinned provenance: {other:?}"),
+                }
+            }
+            other => panic!("unexpected pinned provenance: {other:?}"),
+        };
+        let manifest = crate::analysis_view::views_root(&fixture.store)
+            .join(view)
+            .join(format!("gen-{generation}"))
+            .join("manifest.json");
+        std::fs::remove_file(manifest).unwrap();
+        assert_analysis_paths_rejected(
+            &mut fixture,
+            &candidate,
+            &snapshot,
+            missing_manifest,
+            "analysis_unavailable",
+        );
+    }
+
+    #[test]
     fn a_complete_scoped_bound_analysis_makes_an_empty_answer_evidence() {
         let mut fixture = Fixture::new();
         let keys = fixture.contribute(&[("docs/guide.md", "v2\n"), ("README.md", "v2\n")]);
         let (base, _) = snapshots(&fixture, &keys);
-        let refs = |callers: &[&str], coverage| {
-            envelope(
-                Operation::FindReferences,
-                Subject::Snapshot(base.clone()),
-                None,
-                callers,
-                coverage,
-            )
-        };
         let scope = ["src/search.rs"];
         // Complete, bound to the reader's source, about the scope, nothing
         // related changed: empty is evidence.
-        let empty = ask(
-            &mut fixture,
-            &scope,
-            vec![refs(&["src/keys.rs"], Coverage::CompleteWithinProfile)],
-            Some(&base),
-        );
+        let empty_analysis = pinned_references(&mut fixture, &base, &[]);
+        let empty = ask(&mut fixture, &scope, vec![empty_analysis], Some(&base));
         assert!(empty.contributions.is_empty());
         assert_eq!(gaps(&empty), Vec::<&str>::new());
         assert!(empty.selection.absence_is_evidence());
         // The analysis relates a path this contribution changed.
-        let related = ask(
-            &mut fixture,
-            &scope,
-            vec![refs(&["docs/guide.md"], Coverage::CompleteWithinProfile)],
-            Some(&base),
-        );
+        let related_analysis = pinned_references(&mut fixture, &base, &["docs/guide.md"]);
+        let related = ask(&mut fixture, &scope, vec![related_analysis], Some(&base));
         assert_eq!(related.contributions, ids(std::slice::from_ref(&keys)));
         assert_eq!(
             related.selection.items[0].reasons[0].kind,
@@ -2873,49 +3387,51 @@ mod tests {
         // Never evidence: partial, legacy-bound, not about the scope, about
         // another source, or no reader source.
         let other = SourceSnapshotId::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap();
+        let mut partial = pinned_references(&mut fixture, &base, &[]);
+        partial.coverage = Coverage::Partial;
+        let mut legacy_subject = pinned_references(&mut fixture, &base, &[]);
+        legacy_subject.subject = Subject::LegacyGitRevision("a".repeat(40));
+        let mut wrong_operation = pinned_references(&mut fixture, &base, &[]);
+        wrong_operation.operation = Operation::ResolveSymbol;
+        wrong_operation.subject = Subject::ChangedPaths(crate::graph_impact::diff_digest(&[
+            "src/search.rs".to_string(),
+        ]));
+        let mut other_source = pinned_references(&mut fixture, &base, &[]);
+        other_source.subject = Subject::Snapshot(other.clone());
+        let unsourced_analysis = pinned_references(&mut fixture, &base, &[]);
         let cases = [
+            (partial, Some(&base), vec!["analysis_partial"]),
             (
-                refs(&[], Coverage::Partial),
+                legacy_subject,
                 Some(&base),
-                vec!["analysis_partial"],
+                vec![
+                    "analysis_incompatible",
+                    "analysis_not_scoped",
+                    "analysis_subject_unbound",
+                ],
             ),
             (
-                envelope(
-                    Operation::FindReferences,
-                    Subject::LegacyGitRevision("a".repeat(40)),
-                    None,
-                    &[],
-                    Coverage::CompleteWithinProfile,
-                ),
+                wrong_operation,
                 Some(&base),
-                vec!["analysis_not_scoped", "analysis_subject_unbound"],
+                vec![
+                    "analysis_incompatible",
+                    "analysis_not_scoped",
+                    "analysis_subject_unbound",
+                ],
             ),
             (
-                envelope(
-                    Operation::ResolveSymbol,
-                    Subject::Snapshot(base.clone()),
-                    None,
-                    &[],
-                    Coverage::CompleteWithinProfile,
-                ),
+                other_source,
                 Some(&base),
-                vec!["analysis_not_scoped"],
+                vec![
+                    "analysis_incompatible",
+                    "analysis_not_scoped",
+                    "analysis_other_source",
+                ],
             ),
             (
-                envelope(
-                    Operation::FindReferences,
-                    Subject::Snapshot(other.clone()),
-                    None,
-                    &[],
-                    Coverage::CompleteWithinProfile,
-                ),
-                Some(&base),
-                vec!["analysis_not_scoped", "analysis_other_source"],
-            ),
-            (
-                refs(&[], Coverage::CompleteWithinProfile),
+                unsourced_analysis,
                 None,
-                vec!["no_reader_source"],
+                vec!["analysis_incompatible", "no_reader_source"],
             ),
         ];
         for (envelope, source, expected) in cases {
@@ -2927,63 +3443,51 @@ mod tests {
         // exact changed-path digest, and references in a snapshot that lacks
         // a scope path are not about it either.
         let digest = crate::graph_impact::diff_digest(&["src/search.rs".to_string()]);
-        let symbol = ask(
-            &mut fixture,
-            &scope,
-            vec![envelope(
-                Operation::ResolveSymbol,
-                Subject::ChangedPaths(digest),
-                None,
-                &[],
-                Coverage::CompleteWithinProfile,
-            )],
-            Some(&base),
-        );
+        let mut symbol_envelope = pinned_references(&mut fixture, &base, &[]);
+        symbol_envelope.operation = Operation::ResolveSymbol;
+        symbol_envelope.subject = Subject::ChangedPaths(digest);
+        let symbol = ask(&mut fixture, &scope, vec![symbol_envelope], Some(&base));
         assert_eq!(
             gaps(&symbol),
-            vec!["analysis_not_scoped", "analysis_subject_unbound"]
+            vec![
+                "analysis_incompatible",
+                "analysis_not_scoped",
+                "analysis_subject_unbound"
+            ]
         );
+        let missing_analysis = pinned_references(&mut fixture, &base, &[]);
         let missing = ask(
             &mut fixture,
             &["src/new.rs"],
-            vec![refs(&[], Coverage::CompleteWithinProfile)],
+            vec![missing_analysis],
             Some(&base),
         );
         assert_eq!(gaps(&missing), vec!["analysis_not_scoped"]);
-        let unsourced = ask(
-            &mut fixture,
-            &scope,
-            vec![refs(&[], Coverage::CompleteWithinProfile)],
-            None,
-        );
+        let unsourced_envelope = pinned_references(&mut fixture, &base, &[]);
+        let unsourced = ask(&mut fixture, &scope, vec![unsourced_envelope], None);
         assert_eq!(unsourced.selection.freshness(), None);
         let value = decoded(&unsourced);
         assert!(matches!(&value, Value::Object(o) if o.get("freshness").is_none()));
     }
 
-    /// An impact between two retained snapshots is about the scope only if
-    /// its change touched every scope path.
+    /// A pinned view impact is scoped only to the changed-path set it names.
     #[test]
-    fn an_impact_between_retained_snapshots_is_scoped_by_its_change() {
+    fn a_pinned_view_impact_is_scoped_by_its_changed_paths() {
         let mut fixture = Fixture::new();
         let change = fixture.contribute(&[("src/search.rs", "v2\n")]);
-        let (base, result) = snapshots(&fixture, &change);
-        let impact = envelope(
-            Operation::ExplainImpact,
-            Subject::Snapshot(result),
-            Some(Subject::Snapshot(base.clone())),
-            &[],
-            Coverage::CompleteWithinProfile,
-        );
+        let (_, result) = snapshots(&fixture, &change);
+        let impact = current_view(&mut fixture, &result)
+            .explain_impact(&["src/search.rs"], 64)
+            .unwrap();
         let scoped = ask(
             &mut fixture,
             &["src/search.rs"],
             vec![impact.clone()],
-            Some(&base),
+            Some(&result),
         );
         assert_eq!(gaps(&scoped), Vec::<&str>::new());
         assert_eq!(scoped.selection.coverage(), "complete_within_profile");
-        let elsewhere = ask(&mut fixture, &["src/keys.rs"], vec![impact], Some(&base));
+        let elsewhere = ask(&mut fixture, &["src/keys.rs"], vec![impact], Some(&result));
         assert_eq!(gaps(&elsewhere), vec!["analysis_not_scoped"]);
     }
 
@@ -3245,13 +3749,7 @@ mod tests {
         let wide = ask(
             &mut fixture,
             &["src/search.rs"],
-            vec![envelope(
-                Operation::FindReferences,
-                Subject::Snapshot(base.clone()),
-                None,
-                &callers,
-                Coverage::CompleteWithinProfile,
-            )],
+            vec![legacy_graph_impact(&["src/search.rs"], &callers)],
             Some(&base),
         );
         assert!(wide.selection.truncated_by.contains("related_paths"));
@@ -3529,7 +4027,7 @@ mod tests {
         // part-way through.
         let docs_only = fixture.contribute(&[("docs/guide.md", "analysis base\n")]);
         let (_, analysed) = snapshots(&fixture, &docs_only);
-        let analysis_query = scoped_query(&analysed);
+        let analysis_query = scoped_query(&mut fixture, &analysed);
         let mut live: Vec<RecordId> = Vec::new();
         let mut state: u64 = 0x5eed;
         let mut next = |bound: u64| {
@@ -3730,13 +4228,7 @@ mod tests {
         let reader = Reader::all("all");
         let seed = fixture.contribute(&[("docs/guide.md", "v2\n")]);
         let (base, _) = snapshots(&fixture, &seed);
-        let refs = envelope(
-            Operation::FindReferences,
-            Subject::Snapshot(base.clone()),
-            None,
-            &["lib/dep.rs"],
-            Coverage::CompleteWithinProfile,
-        );
+        let refs = legacy_graph_impact(&["src/search.rs"], &["lib/dep.rs"]);
         let ask = |fixture: &mut Fixture| {
             retrieve_cached(
                 &mut fixture.store,
@@ -3992,17 +4484,11 @@ mod tests {
 
     /// A query whose analysis is scoped through a retained snapshot.
     /// `snapshot` holds the scope path; `docs_only` changed nothing under it.
-    fn scoped_query(snapshot: &SourceSnapshotId) -> ContextQuery {
+    fn scoped_query(fixture: &mut Fixture, snapshot: &SourceSnapshotId) -> ContextQuery {
         query(
             &["src/search.rs"],
             Some(snapshot.clone()),
-            vec![envelope(
-                Operation::FindReferences,
-                Subject::Snapshot(snapshot.clone()),
-                None,
-                &[],
-                Coverage::CompleteWithinProfile,
-            )],
+            vec![pinned_references(fixture, snapshot, &[])],
         )
     }
 
@@ -4016,8 +4502,9 @@ mod tests {
         let reader = Reader::all("all");
         let docs_only = fixture.contribute(&[("docs/guide.md", "v2\n")]);
         let (_, snapshot) = snapshots(&fixture, &docs_only);
+        let analysis_query = scoped_query(&mut fixture, &snapshot);
         let ask = |fixture: &mut Fixture| {
-            retrieve_cached(&mut fixture.store, &scoped_query(&snapshot), &reader).unwrap()
+            retrieve_cached(&mut fixture.store, &analysis_query, &reader).unwrap()
         };
         let complete = ask(&mut fixture);
         assert!(complete.absence_is_evidence(), "the setup must be complete");

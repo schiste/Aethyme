@@ -143,8 +143,10 @@ pub fn retrieve_revisions(
     let mut related_count = 0;
     let mut related_truncated = false;
     for envelope in &query.analysis {
-        let scoped = envelope_is_scoped(store, envelope, &scope)?;
-        let mut summary = AnalysisSummary::of(envelope, query.source.as_ref(), scoped);
+        let (checked, _producer_status) =
+            super::checked_analysis_envelope(store, envelope, query.source.as_ref());
+        let scoped = envelope_is_scoped(store, &checked, &scope)?;
+        let mut summary = AnalysisSummary::of(&checked, query.source.as_ref(), scoped);
         let remaining = MAX_RELATED_PATHS.saturating_sub(related_count);
         related_truncated |= summary.related.len() > remaining;
         summary.related.truncate(remaining);
@@ -626,6 +628,45 @@ mod tests {
             analysis: Vec::new(),
             budget: Budget::default(),
         }
+    }
+
+    #[test]
+    fn an_unresolved_profile_is_a_gap_and_its_paths_do_not_rank_revisions() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let revision = first_revision(&mut fixture);
+        let view_options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("fixture"),
+        );
+        let view = crate::analysis_view::view_for_snapshot(
+            &mut fixture.store,
+            revision.revision().base(),
+            &view_options,
+        )
+        .unwrap();
+        let mut analysis = view.find_references("a", 64).unwrap();
+        analysis.provenance = None;
+        analysis.result = Some(super::super::object(vec![(
+            "callers",
+            super::super::Value::Array(vec![super::super::text("a.txt")]),
+        )]));
+
+        let mut request = query(&revision);
+        request.analysis.push(analysis);
+        let result =
+            retrieve_revisions(&fixture.store, &request, &[pin(&revision)], &LocalProject).unwrap();
+
+        assert!(
+            result
+                .selection
+                .gaps
+                .iter()
+                .any(|gap| gap == "analysis_unavailable")
+        );
+        assert!(result.selection.items.iter().all(|item| {
+            item.reasons
+                .iter()
+                .all(|reason| reason.kind != ReasonKind::ImpactEdge)
+        }));
     }
 
     #[test]
