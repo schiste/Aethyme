@@ -307,3 +307,21 @@ updates and repository upgrades are intentionally independent.
 
 Aethyme is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
 for attribution information.
+
+<!-- AETHYME:BEGIN skill-learning -->
+
+## Skill learning and maintenance
+
+Skills are editable procedures. After meaningful work, review confirmed fixes,
+user corrections, pitfalls, and repeatable techniques for a reusable lesson.
+
+- Read the relevant existing skill before changing it; prefer the skill used
+  for the work. Correct inaccurate guidance and add missing durable steps.
+- Keep skills focused on reusable procedures. Exclude session transcripts,
+  secrets, one-off details, and unconfirmed guesses.
+- Create a new skill only for a reusable class of work with no suitable home.
+- Follow this repository's skill conventions in `.codex/skills/` and
+  `.claude/skills/`; keep matching mirrors aligned where the repository
+  requires it. Respect ownership and do not edit system or plugin caches.
+
+<!-- AETHYME:END skill-learning -->
