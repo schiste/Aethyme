@@ -602,13 +602,14 @@ impl Broker {
         &mut self,
         acting: Option<i64>,
     ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
-        self.refresh_leases_including_with_claim_preparation(acting, None)
+        self.refresh_leases_including_with_claim_preparation(acting, None, true)
     }
 
     fn refresh_leases_including_with_claim_preparation(
         &mut self,
         acting: Option<i64>,
         preparation: Option<&LeaseClaimPreparation>,
+        classify_overlaps: bool,
     ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, detect_overlaps};
 
@@ -671,7 +672,9 @@ impl Broker {
         if let Some(preparation) = preparation {
             preparation.check()?;
         }
-        self.classify_and_announce_overlaps(&after)?;
+        if classify_overlaps {
+            self.classify_and_announce_overlaps(&after)?;
+        }
         if let Some(preparation) = preparation {
             preparation.check()?;
         }
@@ -742,7 +745,11 @@ impl Broker {
         let path = normalize_lease_path(path)?;
         preparation.check()?;
         let _git_deadline = crate::git::limit_git_until(preparation.deadline);
-        self.refresh_leases_including_with_claim_preparation(Some(session_id), Some(&preparation))?;
+        self.refresh_leases_including_with_claim_preparation(
+            Some(session_id),
+            Some(&preparation),
+            true,
+        )?;
         preparation.check()?;
         let policy = self.lease_refusal_policy()?;
         preparation.check()?;
@@ -1874,7 +1881,12 @@ impl Broker {
             return Err(BrokerOpError::MissingExecCommand);
         }
         let session = self.store.session(session_id)?;
-        self.refresh_leases_including(Some(session_id))?;
+        // Guard ownership uses current explicit leases and holder policy, not
+        // speculative merge verdicts. Refresh lease records (including the
+        // acting session), but leave merge simulation and announcements to
+        // ordinary refresh/claim/submit. Keep both dirty-state snapshots and
+        // the post-command ownership audit below unchanged.
+        self.refresh_leases_including_with_claim_preparation(Some(session_id), None, false)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let (mut before_dirty, before_untracked) = checkout.dirty_and_untracked_paths()?;
         before_dirty.sort();
