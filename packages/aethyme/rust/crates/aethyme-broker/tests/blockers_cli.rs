@@ -724,6 +724,86 @@ fn a_resource_lease_owned_by_a_closed_session_is_cleared() {
 }
 
 #[test]
+fn resource_lease_blockers_keep_quarantined_and_expired_owned_rows_only() {
+    let fixture = Fixture::new();
+    let worktree_path = fixture
+        .broker()
+        .store()
+        .session(fixture.session_id)
+        .unwrap()
+        .worktree_path;
+    let fingerprint = format!("{:x}", Sha256::digest(worktree_path.as_bytes()));
+    let mut coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    let acquire = |coordinator: &mut HostResourceCoordinator, request_id: &str| {
+        coordinator
+            .acquire(&HostResourceRequest {
+                schema_version: aethyme_broker::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+                request_id: request_id.into(),
+                repository: "unrelated-origin".into(),
+                worktree_fingerprint: fingerprint.clone(),
+                run_id: format!("run-{request_id}"),
+                ttl_seconds: 600,
+                holder_pid: Some(dead_pid()),
+                resources: vec![HostResourceRequirement {
+                    key: "db".into(),
+                    resource: HostResourceKind::Namespace {
+                        prefix: format!("{request_id}-"),
+                    },
+                }],
+            })
+            .unwrap()
+    };
+
+    let explicit = acquire(&mut coordinator, "explicit");
+    coordinator
+        .quarantine(
+            &explicit.lease.lease_id,
+            explicit.lease.generation,
+            &explicit.ownership_token,
+        )
+        .unwrap();
+    let expired = acquire(&mut coordinator, "expired");
+    let active = acquire(&mut coordinator, "active");
+    let released = acquire(&mut coordinator, "released");
+    coordinator
+        .release(
+            &released.lease.lease_id,
+            released.lease.generation,
+            &released.ownership_token,
+        )
+        .unwrap();
+    drop(coordinator);
+
+    let host_db = fixture.state.join("host-resources.db");
+    let connection = Connection::open(&host_db).unwrap();
+    connection
+        .execute(
+            "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+            rusqlite::params![0_i64, expired.lease.lease_id.as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE resource_leases SET expires_at=?1 WHERE lease_id=?2",
+            rusqlite::params![i64::MAX, active.lease.lease_id.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let blockers = fixture.blockers();
+    let has_lease = |lease_id: &str| {
+        blockers
+            .iter()
+            .any(|blocker| blocker["id"] == format!("resource:{lease_id}"))
+    };
+    assert!(has_lease(&explicit.lease.lease_id));
+    assert!(has_lease(&expired.lease.lease_id));
+    assert!(!has_lease(&active.lease.lease_id));
+    assert!(!has_lease(&released.lease.lease_id));
+}
+
+#[test]
 fn no_quarantined_resource_leases_skip_cleaned_session_decoding() {
     let fixture = Fixture::new();
     let broker = Broker::open_with_options(

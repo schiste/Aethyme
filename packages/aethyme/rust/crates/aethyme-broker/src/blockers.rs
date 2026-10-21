@@ -504,14 +504,11 @@ impl Broker {
             .map_err(|error| BrokerOpError::InvalidCoordinatedOperation {
                 reason: error.to_string(),
             })?;
-        let leases = coordinator
-            .list(false)
-            .map_err(|error| BrokerOpError::InvalidCoordinatedOperation {
+        let leases = coordinator.quarantined_leases().map_err(|error| {
+            BrokerOpError::InvalidCoordinatedOperation {
                 reason: error.to_string(),
-            })?
-            .into_iter()
-            .filter(|lease| lease.state == crate::HostLeaseState::Quarantined)
-            .collect::<Vec<_>>();
+            }
+        })?;
         if leases.is_empty() {
             return Ok(Vec::new());
         }
