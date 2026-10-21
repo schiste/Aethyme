@@ -1,5 +1,7 @@
 # Broker latency budgets
 
+Last Updated: 2026-10-21
+
 The machine-readable source is
 [`broker-budgets.json`](../../../aethyme-eval/benchmarks/performance/broker-budgets.json).
 Budgets are **warnings only** while the broker is being optimized. Crossing a
