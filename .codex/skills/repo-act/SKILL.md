@@ -238,6 +238,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   protect its split-index backing files.
   Use the same isolated-index probes for operator status checks during pinned
   validation; an ordinary Git status command can refresh the watched index.
+- For repeated CI build-script runs, inspect the checkout action's local Git
+  config before attributing recompilation to profiles or cache keys. Persisted
+  credentials can add `includeIf.*.path` entries that a fail-closed source
+  identity probe treats as uncertain. If no authenticated Git operation follows
+  checkout, set `persist-credentials: false` and ratchet both every checkout
+  declaration and the resulting local config.
 - For routine Rust validation, reuse a matching warm target and run one Cargo
   process at a time with `--locked -j1`. Prefer a selected package/binary or
   focused test filter. On a resource-constrained target, use `debug=0` and
