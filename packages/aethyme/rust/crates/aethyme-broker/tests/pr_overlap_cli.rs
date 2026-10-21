@@ -927,6 +927,23 @@ fn gh_diff_is_the_fallback_and_status_stays_offline() {
     fixture.clear_gh_log();
     assert_eq!(overlap_advice(&fixture.status()).len(), 1);
     assert_eq!(fixture.gh_log(), "", "status must not call gh");
+    let start = json(&fixture.run(&[
+        "start",
+        "--task",
+        "plan shared path",
+        "--path",
+        "shared.txt",
+        "--json",
+    ]));
+    assert_eq!(
+        start["planned_path_pr_overlaps"]["unknown_prs"],
+        serde_json::json!([12])
+    );
+    assert_eq!(
+        fixture.gh_log(),
+        "",
+        "start must not fetch provider-only ranges"
+    );
 }
 
 /// A long listing is cut to the open-PR limit, and a push fetches at most a
@@ -963,6 +980,7 @@ fn recorded_status_warning_is_invalidated_when_push_inputs_move() {
         "baseline-ref",
         "listing",
         "expired",
+        "future",
     ] {
         let fixture = Fixture::new();
         let other = fixture.publish_other("agent/other", &[(2, "theirs")], true);
@@ -997,7 +1015,7 @@ fn recorded_status_warning_is_invalidated_when_push_inputs_move() {
                     ],
                 );
             }
-            "listing" | "expired" => {
+            "listing" | "expired" | "future" => {
                 let mut listing: serde_json::Value = serde_json::from_str(
                     &broker
                         .store()
@@ -1008,6 +1026,8 @@ fn recorded_status_warning_is_invalidated_when_push_inputs_move() {
                 .unwrap();
                 if changed == "expired" {
                     listing["fetched_at_ms"] = serde_json::json!(0);
+                } else if changed == "future" {
+                    listing["fetched_at_ms"] = serde_json::json!(i64::MAX);
                 } else {
                     listing["prs"][0]["head_oid"] = serde_json::json!("f".repeat(40));
                 }
@@ -1016,7 +1036,7 @@ fn recorded_status_warning_is_invalidated_when_push_inputs_move() {
                     .store()
                     .meta_set("pr_overlap.open_prs", &raw)
                     .unwrap();
-                if changed == "expired" {
+                if changed == "expired" || changed == "future" {
                     // Keep the listing binding matching: this case must fail
                     // freshness, not merely the listing-identity check.
                     let key = format!("pr_overlap.checked.{id}");
