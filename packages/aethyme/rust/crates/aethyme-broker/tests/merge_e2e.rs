@@ -244,8 +244,14 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
     }
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env(
+            "GIT_CONFIG_SYSTEM",
+            tmp.path().join("missing-system-gitconfig"),
+        )
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            tmp.path().join("missing-global-gitconfig"),
+        )
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1");
