@@ -70,6 +70,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   author/committer values. If a fixture PATH excludes real provider binaries,
   retain required CLI dependencies: install a prevalidated Git executable beside
   the fake provider instead of removing Git and failing before provider startup.
+  Treat `core.sshCommand` as shell syntax: quote fixture executable paths for
+  POSIX shell and exercise a temporary root containing spaces and apostrophes.
   For tests scoped to artifact caches or reclaim, set
   `[cleanup] auto_remove = false` explicitly and
   keep it enabled in whole-checkout cleanup tests. A real offline `origin` can
