@@ -82,6 +82,35 @@ pub struct PrOverlapCheck {
     pub listed_at_ms: Option<i64>,
 }
 
+/// Cached changed paths that intersect a session's explicit planned leases.
+/// This is intentionally path-only; it does not estimate line conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PlannedPathPrOverlap {
+    pub(crate) pr: i64,
+    pub(crate) url: String,
+    /// Changed PR paths that equal or fall under an explicit planned path.
+    pub(crate) files: Vec<String>,
+}
+
+/// Availability and path-only overlap results for explicit `start --path`
+/// declarations. Missing or stale data is represented as a warning rather
+/// than an empty result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PlannedPathPrOverlapCheck {
+    /// Whether the cached PR listing is fresh and matches the local default.
+    pub(crate) cache_available: bool,
+    pub(crate) overlaps: Vec<PlannedPathPrOverlap>,
+    /// PRs in a usable listing whose current changed paths could not be read.
+    pub(crate) unknown_prs: Vec<i64>,
+    pub(crate) listed_at_ms: Option<i64>,
+    /// The listing is capped at this many PRs when it is refreshed by push.
+    pub(crate) checked_open_pr_limit: usize,
+    /// True when the cached listing reached its cap and more PRs may exist.
+    pub(crate) listing_may_be_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) warning: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct OpenPr {
     number: i64,
@@ -95,6 +124,16 @@ struct OpenPrListing {
     fetched_at_ms: i64,
     base: String,
     prs: Vec<OpenPr>,
+}
+
+fn other_open_prs<'a>(
+    listing: &'a OpenPrListing,
+    session_branch: &'a str,
+) -> impl Iterator<Item = &'a OpenPr> + 'a {
+    listing
+        .prs
+        .iter()
+        .filter(move |pr| pr.head != session_branch)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -336,6 +375,98 @@ impl Broker {
         (cached.head_oid == head_oid).then_some(cached.ranges)
     }
 
+    /// Compare explicit planned paths with cached open-PR changed paths.
+    /// Reads only the broker cache and local refs; it never calls GitHub.
+    pub(crate) fn cached_planned_path_pr_overlaps(
+        &self,
+        session: &crate::Session,
+        planned_leases: &[crate::Lease],
+        now_ms: i64,
+    ) -> Option<PlannedPathPrOverlapCheck> {
+        let paths = planned_leases
+            .iter()
+            .map(|lease| lease.path.as_str())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return None;
+        }
+
+        let unavailable = |warning: String, listed_at_ms| PlannedPathPrOverlapCheck {
+            cache_available: false,
+            overlaps: Vec::new(),
+            unknown_prs: Vec::new(),
+            listed_at_ms,
+            checked_open_pr_limit: MAX_OPEN_PRS,
+            listing_may_be_truncated: false,
+            warning: Some(warning),
+        };
+        let Some(default) = tracked_default(self.repo_handle()) else {
+            return Some(unavailable(
+                "the current default branch is unavailable from local tracking refs".into(),
+                None,
+            ));
+        };
+        let Some(listing) = self.cached_listing() else {
+            return Some(unavailable(
+                "no readable cached open-PR listing is available; refresh it with broker push"
+                    .into(),
+                None,
+            ));
+        };
+        if listing.base != default.branch {
+            return Some(unavailable(
+                format!(
+                    "the cached PR listing is for base {}, but the local default is {}",
+                    listing.base, default.branch
+                ),
+                Some(listing.fetched_at_ms),
+            ));
+        }
+        if now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS {
+            return Some(unavailable(
+                "the cached open-PR listing is older than 24 hours; refresh it with broker push"
+                    .into(),
+                Some(listing.fetched_at_ms),
+            ));
+        }
+
+        let mut check = PlannedPathPrOverlapCheck {
+            cache_available: true,
+            overlaps: Vec::new(),
+            unknown_prs: Vec::new(),
+            listed_at_ms: Some(listing.fetched_at_ms),
+            checked_open_pr_limit: MAX_OPEN_PRS,
+            listing_may_be_truncated: listing.prs.len() == MAX_OPEN_PRS,
+            warning: None,
+        };
+        for pr in other_open_prs(&listing, &session.branch) {
+            let Some(ranges) = self
+                .cached_ranges(pr)
+                .or_else(|| self.local_pr_ranges(&default, pr))
+            else {
+                check.unknown_prs.push(pr.number);
+                continue;
+            };
+            let files = ranges
+                .keys()
+                .filter(|file| {
+                    paths
+                        .iter()
+                        .any(|path| crate::leases::paths_overlap(path, file))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !files.is_empty() {
+                check.overlaps.push(PlannedPathPrOverlap {
+                    pr: pr.number,
+                    url: pr.url.clone(),
+                    files,
+                });
+            }
+        }
+        Some(check)
+    }
+
     /// A PR's ranges from its local remote-tracking ref, when that ref is at
     /// the head GitHub reported (or GitHub reported none).
     fn local_pr_ranges(&self, default: &TrackedDefault, pr: &OpenPr) -> Option<FileRanges> {
@@ -540,7 +671,7 @@ impl Broker {
             listed_at_ms: Some(listing.fetched_at_ms),
             ..Default::default()
         };
-        for pr in listing.prs.iter().filter(|pr| pr.head != session.branch) {
+        for pr in other_open_prs(&listing, &session.branch) {
             let ranges = self
                 .cached_ranges(pr)
                 .or_else(|| self.local_pr_ranges(&default, pr));

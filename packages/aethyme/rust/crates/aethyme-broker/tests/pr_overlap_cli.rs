@@ -229,8 +229,12 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_from(&self.repo, args)
+    }
+
+    fn run_from(&self, cwd: &Path, args: &[&str]) -> Output {
         common::broker_cli(CLI, args)
-            .current_dir(&self.repo)
+            .current_dir(cwd)
             .env(
                 "PATH",
                 format!(
@@ -295,6 +299,13 @@ fn inherited_worktree_root_cannot_redirect_fixture_direct_and_cli_worktrees() {
         let direct_path = PathBuf::from(direct.worktree_path);
 
         let cli = json(&fixture.run(&["start", "--task", "CLI fixture worktree", "--json"]));
+        assert!(cli.get("planned_path_pr_overlaps").is_none());
+        assert_eq!(fixture.gh_log(), "", "a start without --path stays offline");
+        assert_eq!(
+            broker.store().meta_get("pr_overlap.open_prs").unwrap(),
+            None,
+            "a start without --path must not create or refresh the PR cache"
+        );
         let cli_path = PathBuf::from(cli["worktree_path"].as_str().unwrap());
         assert!(
             !poison_root.exists(),
@@ -364,6 +375,282 @@ fn overlap_advice(status: &serde_json::Value) -> Vec<serde_json::Value> {
         .filter(|row| row["id"] == "session.pr-overlap")
         .cloned()
         .collect()
+}
+
+fn cache_one_open_pr(fixture: &Fixture) {
+    let other = fixture.publish_other("agent/other", &[(10, "theirs")], true);
+    fixture.open_prs(&[(12, "agent/other", &other, "OPEN")]);
+    let (session, _) = fixture.session_editing(&[(20, "ours")]);
+    fixture.push(session);
+    fixture.clear_gh_log();
+}
+
+#[test]
+fn start_path_reports_cached_pr_path_overlap_without_network_or_graph() {
+    let fixture = Fixture::new();
+    cache_one_open_pr(&fixture);
+
+    let output = fixture.run(&[
+        "start",
+        "--task",
+        "work on a planned path",
+        "--path",
+        "shared.txt",
+        "--json",
+    ]);
+    let report = json(&output);
+    let check = &report["planned_path_pr_overlaps"];
+    assert_eq!(check["cache_available"], true, "{report}");
+    assert_eq!(check["checked_open_pr_limit"], 30, "{report}");
+    assert_eq!(check["overlaps"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(check["overlaps"][0]["pr"], 12, "{report}");
+    assert_eq!(
+        check["overlaps"][0]["files"],
+        serde_json::json!(["shared.txt"])
+    );
+    assert_eq!(check["unknown_prs"], serde_json::json!([]));
+    assert!(check["listed_at_ms"].is_number(), "{report}");
+    assert!(
+        report["scope_overlaps_warning"].is_string(),
+        "fixture has no graph"
+    );
+    assert_eq!(
+        fixture.gh_log(),
+        "",
+        "start must only read the local PR cache"
+    );
+
+    let human_fixture = Fixture::new();
+    cache_one_open_pr(&human_fixture);
+    let output = human_fixture.run(&[
+        "start",
+        "--task",
+        "another planned path task",
+        "--path",
+        "shared.txt",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Heads-up: open PR #12"), "{stdout}");
+    assert!(stdout.contains("path-only"), "{stdout}");
+    assert_eq!(
+        human_fixture.gh_log(),
+        "",
+        "human start must stay offline too"
+    );
+
+    // A recursive lease for `src/` includes a nested changed file, but not a
+    // neighboring path whose name merely starts with the same letters.
+    let prefix_fixture = Fixture::new();
+    cache_one_open_pr(&prefix_fixture);
+    let broker = prefix_fixture.broker();
+    let listing: serde_json::Value = serde_json::from_str(
+        &broker
+            .store()
+            .meta_get("pr_overlap.open_prs")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let head_oid = listing["prs"][0]["head_oid"].as_str().unwrap();
+    broker
+        .store()
+        .meta_set(
+            "pr_overlap.ranges.12",
+            &serde_json::json!({
+                "head_oid": head_oid,
+                "ranges": {
+                    "src/child.rs": [[1, 1]],
+                    "src-neighbor/child.rs": [[1, 1]],
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    drop(broker);
+    prefix_fixture.clear_gh_log();
+    let report = json(&prefix_fixture.run(&[
+        "start",
+        "--task",
+        "work on the source subtree",
+        "--path",
+        "src/",
+        "--json",
+    ]));
+    let check = &report["planned_path_pr_overlaps"];
+    assert_eq!(check["overlaps"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(
+        check["overlaps"][0]["files"],
+        serde_json::json!(["src/child.rs"]),
+        "a directory prefix must not match src-neighbor"
+    );
+    assert_eq!(
+        prefix_fixture.gh_log(),
+        "",
+        "path matching must stay offline"
+    );
+
+    // Reuse an existing session and list its own branch as an open PR with a
+    // deliberately overlapping cached range. The start-time advisor must
+    // exclude that branch just as the push-time line advisor does.
+    let own_fixture = Fixture::new();
+    cache_one_open_pr(&own_fixture);
+    let started = json(&own_fixture.run(&["start", "--task", "own branch", "--json"]));
+    let branch = started["branch"].as_str().unwrap().to_string();
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    let head_oid = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let broker = own_fixture.broker();
+    let mut listing: serde_json::Value = serde_json::from_str(
+        &broker
+            .store()
+            .meta_get("pr_overlap.open_prs")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    listing["prs"][0]["head"] = serde_json::json!(branch);
+    listing["prs"][0]["head_oid"] = serde_json::json!(head_oid);
+    broker
+        .store()
+        .meta_set("pr_overlap.open_prs", &listing.to_string())
+        .unwrap();
+    broker
+        .store()
+        .meta_set(
+            "pr_overlap.ranges.12",
+            &serde_json::json!({
+                "head_oid": head_oid,
+                "ranges": {"shared.txt": [[1, 1]]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+    drop(broker);
+    own_fixture.clear_gh_log();
+    let report = json(&own_fixture.run_from(
+        &worktree,
+        &[
+            "start",
+            "--adopt",
+            "--reuse",
+            "--take-over",
+            "--task",
+            "reuse own branch",
+            "--path",
+            "shared.txt",
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        report["branch"], branch,
+        "the reused session keeps its branch"
+    );
+    assert_eq!(report["planned_path_pr_overlaps"]["cache_available"], true);
+    assert_eq!(
+        report["planned_path_pr_overlaps"]["overlaps"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        report["planned_path_pr_overlaps"]["unknown_prs"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        own_fixture.gh_log(),
+        "",
+        "own-PR filtering must stay offline"
+    );
+}
+
+#[test]
+fn start_path_discloses_missing_cached_pr_listing_without_network() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&[
+        "start",
+        "--task",
+        "work on a planned path",
+        "--path",
+        "shared.txt",
+        "--json",
+    ]);
+    let report = json(&output);
+    let check = &report["planned_path_pr_overlaps"];
+    assert_eq!(check["cache_available"], false, "{report}");
+    assert!(
+        check["warning"]
+            .as_str()
+            .unwrap()
+            .contains("no readable cached")
+    );
+    assert_eq!(check["overlaps"], serde_json::json!([]));
+    assert_eq!(fixture.gh_log(), "", "start must not refresh the listing");
+}
+
+#[test]
+fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
+    for changed in ["stale-listing", "wrong-base", "unknown-pr-paths"] {
+        let fixture = Fixture::new();
+        cache_one_open_pr(&fixture);
+        let broker = fixture.broker();
+        let mut listing: serde_json::Value = serde_json::from_str(
+            &broker
+                .store()
+                .meta_get("pr_overlap.open_prs")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        if changed == "stale-listing" {
+            listing["fetched_at_ms"] = serde_json::json!(0);
+        } else if changed == "wrong-base" {
+            listing["base"] = serde_json::json!("develop");
+        } else {
+            listing["prs"][0]["head_oid"] = serde_json::json!("f".repeat(40));
+        }
+        broker
+            .store()
+            .meta_set("pr_overlap.open_prs", &listing.to_string())
+            .unwrap();
+        drop(broker);
+        fixture.clear_gh_log();
+
+        let output = fixture.run(&[
+            "start",
+            "--task",
+            "work on a planned path",
+            "--path",
+            "shared.txt",
+            "--json",
+        ]);
+        let report = json(&output);
+        let check = &report["planned_path_pr_overlaps"];
+        if changed == "stale-listing" {
+            assert_eq!(check["cache_available"], false, "{report}");
+            assert!(
+                check["warning"]
+                    .as_str()
+                    .unwrap()
+                    .contains("older than 24 hours")
+            );
+        } else if changed == "wrong-base" {
+            assert_eq!(check["cache_available"], false, "{report}");
+            assert!(
+                check["warning"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cached PR listing is for base develop"),
+                "{report}"
+            );
+        } else {
+            assert_eq!(check["cache_available"], true, "{report}");
+            assert_eq!(check["unknown_prs"], serde_json::json!([12]), "{report}");
+            assert_eq!(check["overlaps"], serde_json::json!([]), "{report}");
+        }
+        assert_eq!(fixture.gh_log(), "", "start must not fetch missing PR data");
+    }
 }
 
 /// Changed lines two apart from an open PR's: Git would conflict on them.
