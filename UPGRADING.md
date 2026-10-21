@@ -75,28 +75,42 @@ the non-breaking ones, remain in Git history under
 
 ## v0.8.27
 
-v0.8.27 migrates the machine-wide broker database from schema 49 to schema 52.
-After that migration, v0.8.26 and earlier cannot open the database.
+v0.8.27 migrates each repository's broker database from schema 49 to schema 52
+on its first writable open. By default, this is
+`<repo>/.aethyme/broker.db`; linked worktrees use their primary checkout's
+database. A configured `AETHYME_BROKER_DB` may redirect it, including to a
+path shared by multiple repositories. Each distinct database path migrates
+independently; the host operation and resource ledgers are separate and are
+not changed by this migration.
 
 ### Compatibility
 
-The migration adds typed verification-candidate storage and a gate execution
-profile digest, and establishes schema 52 as the minimum compatible version.
-The first writable v0.8.27 broker open applies it. Every installed Aethyme copy
-that accesses this database must be upgraded before any one copy opens it;
-install the router and engine pair together.
+The migration adds typed verification-candidate storage, establishes the
+required collaboration-capture fence, and adds a gate execution-profile
+digest. The minimum compatible schema is 52. After one database has migrated,
+v0.8.26 and earlier cannot open that database. Upgrade every installed Aethyme
+copy that can access the same database before any one of those copies opens it;
+install the router and engine pair together. A repository whose database has
+not migrated remains on its current schema.
 
 ### Before upgrading
 
-Stop active broker operations, make a consistent backup of the machine-wide
-broker database, and record the installed router and engine versions. Upgrade
-every installed copy that can access this database to the matching v0.8.27
-pair before resuming broker work.
+For each repository whose broker database must remain rollback-safe, stop
+broker processes that can access it and make a separate, WAL-aware SQLite
+backup. The SQLite `.backup` command includes committed WAL content:
+
+```bash
+sqlite3 "/path/to/repo/.aethyme/broker.db" ".backup /safe/backups/repo-broker.db.pre-0.8.27"
+```
+
+If `AETHYME_BROKER_DB` redirects that repository's database, back up the
+configured file instead. Record the installed router and engine versions.
+Upgrade every installed copy that can access the same database to the matching
+v0.8.27 pair before resuming broker work against it.
 
 ### Migrate and verify
 
-The migration runs when the broker next opens the database. Confirm the pair
-and the broker state:
+From each repository that has migrated, confirm the pair and broker state:
 
 ```bash
 aethyme --version && aethyme-engine-cli --version
@@ -106,11 +120,13 @@ aethyme broker advanced quick-test
 
 ### Rollback
 
-Before a v0.8.27 broker has opened the database, reinstall the v0.8.26 pair.
-After the schema 52 migration, v0.8.26 refuses that database. To roll back,
-stop every broker process, reinstall the router and engine pair together, and
-restore the backup made before upgrading. Broker state recorded after that
-backup is lost; Git commits and worktrees are unaffected.
+Before a repository's database has migrated, reinstalling the v0.8.26 pair
+needs no database restore. After that database reaches schema 52, v0.8.26
+refuses it. To roll back that repository, stop every broker process that can
+access its database, reinstall the router and engine pair together, and restore
+that repository's own pre-upgrade backup. Broker state recorded after the
+backup is lost; Git commits and worktrees are unaffected. Repeat independently
+for each migrated repository database.
 
 ## v0.8.26
 

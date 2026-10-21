@@ -8,9 +8,10 @@ artifacts and their exact source revision are recorded in each signed
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0827).
 
-The broker database advances from schema 49 to 52. Broker status and guarded
-coordination paths do less repeated inspection, and verification and gate
-records retain the identity needed to avoid reusing stale state.
+By default, each repository's broker database advances from schema 49 to 52 on
+its first writable open. Broker status and guarded coordination paths do less
+repeated inspection, and verification and gate records retain the identity
+needed to avoid reusing stale state.
 
 ### Changed
 
