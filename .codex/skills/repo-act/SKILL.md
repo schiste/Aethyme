@@ -277,7 +277,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unmodified source, with the deliberate break, and after byte-for-byte
   restoration. Require positive, intended runtime failure, positive; a compile
   failure or a test that also fails without the break does not validate the
-  guard. A passing adjacent suite cannot replace either positive run.
+  guard. Classify a negative control by the exact selected test, exit status,
+  and expected failure message; a custom Rust panic need not contain the
+  literal word `assertion`. A passing adjacent suite cannot replace either
+  positive run.
 - Before reclaiming a completed worktree, inspect ignored paths for qualification
   records; a clean Git status does not cover them. Preserve irreplaceable
   reports outside the worktree and build target, verify copied file sizes and

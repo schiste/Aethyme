@@ -120,6 +120,80 @@ fn refresh_graph(root: &Path, repository: &str) {
 }
 
 #[test]
+fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", ".aethyme/config.toml"]);
+    sh(tmp.path(), &["commit", "-qm", "use manual promotion"]);
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+
+    // The session starts from a newer main than integration, so its provenance
+    // contains both a nonempty session patch stream and a nonempty integration
+    // comparison stream.
+    sh(tmp.path(), &["switch", "-qc", "integration-only"]);
+    commit_edit(tmp.path(), "src/integration-only.py", "integration = 1\n");
+    let integration = resolve(tmp.path(), "HEAD");
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &integration],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+    commit_edit(tmp.path(), "src/main-only.py", "main = 1\n");
+
+    let session_worktree = agent_worktree(tmp.path(), "trace-reuse");
+    let session = broker
+        .adopt(&session_worktree, Some("trace submit plan reuse"))
+        .unwrap();
+    commit_edit(&session_worktree, "src/session-only.py", "session = 1\n");
+
+    let trace_path = tmp.path().parent().unwrap().join("submit-trace.json");
+    let session_id = session.id.to_string();
+    let mut command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["submit", "--session", &session_id],
+    );
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    let output = command
+        .current_dir(tmp.path())
+        .env("GIT_TRACE2_EVENT", &trace_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "broker submit failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let trace = std::fs::read_to_string(&trace_path).unwrap();
+    let patch_history_reads = trace
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == "start")
+        .filter(|event| {
+            event["argv"].as_array().is_some_and(|argv| {
+                argv.iter().any(|arg| arg == "log")
+                    && argv.iter().any(|arg| arg == "-p")
+                    && argv.iter().any(|arg| arg == "--format=commit %H")
+            })
+        })
+        .count();
+    assert_eq!(
+        patch_history_reads, 2,
+        "one plan reads session and integration patch histories once each; trace:\n{trace}"
+    );
+}
+
+#[test]
 fn verify_only_submission_plan_and_submit_use_the_same_upstream_base() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());

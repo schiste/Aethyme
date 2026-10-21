@@ -496,6 +496,88 @@ pub struct SubmissionPlan {
     pub warnings: Vec<String>,
 }
 
+/// Inputs that determine commit provenance in `build_submission_plan`.
+/// Kept beside, rather than inside, the public plan so reusing one within a
+/// single submit does not change the serialized plan contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubmissionPlanInputs {
+    session_id: i64,
+    session_head: String,
+    integration_head: String,
+    accepted_session_head: Option<String>,
+    diff_base: Option<String>,
+    adoption_base: Option<String>,
+}
+
+impl SubmissionPlanInputs {
+    fn new(session: &crate::types::Session, session_head: &str, integration_head: &str) -> Self {
+        Self {
+            session_id: session.id,
+            session_head: session_head.to_string(),
+            integration_head: integration_head.to_string(),
+            accepted_session_head: session.accepted_session_head.clone(),
+            diff_base: session.diff_base.clone(),
+            adoption_base: session.adoption_base.clone(),
+        }
+    }
+}
+
+/// A preflight plan that may be reused only by the submit invocation that
+/// produced it, and only after all of its inputs are reread unchanged.
+#[derive(Debug)]
+struct PreparedSubmissionPlan {
+    inputs: SubmissionPlanInputs,
+    plan: SubmissionPlan,
+}
+
+impl PreparedSubmissionPlan {
+    fn new(
+        session: &crate::types::Session,
+        session_head: &str,
+        integration_head: &str,
+        plan: SubmissionPlan,
+    ) -> Self {
+        Self {
+            inputs: SubmissionPlanInputs::new(session, session_head, integration_head),
+            plan,
+        }
+    }
+
+    fn matches(
+        &self,
+        entry: &MergeQueueEntry,
+        session: &crate::types::Session,
+        session_head: &str,
+        integration_head: &str,
+    ) -> bool {
+        entry.session_id == self.inputs.session_id
+            && entry.head_commit == self.inputs.session_head
+            && entry.base_commit == self.inputs.integration_head
+            && self.inputs == SubmissionPlanInputs::new(session, session_head, integration_head)
+    }
+}
+
+fn build_or_reuse_submission_plan(
+    repo: &GitRepo,
+    prepared: Option<PreparedSubmissionPlan>,
+    entry: &MergeQueueEntry,
+    session: &crate::types::Session,
+    session_head: &str,
+    integration_head: &str,
+    build: impl FnOnce() -> Result<SubmissionPlan, BrokerOpError>,
+) -> Result<SubmissionPlan, BrokerOpError> {
+    if let Some(prepared) = prepared
+        && prepared.matches(entry, session, session_head, integration_head)
+        // An incomplete or overridden Git history can change the graph view
+        // without changing these object IDs. Reuse only in the ordinary,
+        // complete history view, checked again after the preflight pass.
+        && repo.has_complete_unmodified_history().unwrap_or(false)
+    {
+        return Ok(prepared.plan);
+    }
+    build()
+}
+
 impl SubmissionPlan {
     pub(crate) fn pending_owned_commit_ids(&self) -> Vec<String> {
         self.commits
@@ -801,21 +883,33 @@ impl Broker {
         // decision cannot leave behind misleading `submitted` residue. The
         // persisted entry is still planned again against the then-current
         // integration tip below, because another process may move that ref.
+        // Record whether this repository has an ordinary complete history
+        // view; a shallow boundary, replacement ref, or graft can change
+        // provenance without changing the captured commit IDs.
         progress.phase("planning the submission");
-        let planning = self
+        let history_view_allows_reuse = self
+            .repo_handle()
+            .has_complete_unmodified_history()
+            .unwrap_or(false);
+        let plan = self
             .build_submission_plan(&session, &head, &base)
-            .and_then(|plan| self.replay_submission_plan(&plan).map(|_| ()));
-        if let Err(error) = planning {
-            self.store().append_event(
-                crate::events::MERGE_SUBMISSION_PLANNING_FAILED,
-                Some(session_id),
-                Some(&crate::events::merge_submission_planning_failed_payload(
-                    &head,
-                    submission_planning_failure_class(&error),
-                )),
-            )?;
-            return Err(error);
-        }
+            .and_then(|plan| self.replay_submission_plan(&plan).map(|_| plan));
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.store().append_event(
+                    crate::events::MERGE_SUBMISSION_PLANNING_FAILED,
+                    Some(session_id),
+                    Some(&crate::events::merge_submission_planning_failed_payload(
+                        &head,
+                        submission_planning_failure_class(&error),
+                    )),
+                )?;
+                return Err(error);
+            }
+        };
+        let prepared_plan = history_view_allows_reuse
+            .then(|| PreparedSubmissionPlan::new(&session, &head, &base, plan));
 
         // Planning can be expensive. Refuse if the checkout changed identity
         // while it ran so a branch switch or new head cannot redirect the
@@ -848,8 +942,13 @@ impl Broker {
             self.store()
                 .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
         }
-        let mut outcome =
-            self.simulate_and_gate_with_policy(entry.id, cache_policy, intent, Some(&progress))?;
+        let mut outcome = self.simulate_and_gate_with_policy(
+            entry.id,
+            cache_policy,
+            intent,
+            Some(&progress),
+            prepared_plan,
+        )?;
         outcome.lease_warnings = ownership.warned_leases;
         Ok(outcome)
     }
@@ -897,6 +996,7 @@ impl Broker {
             crate::gates::CachePolicy::Use,
             PromotionIntent::Configured,
             None,
+            None,
         )
     }
 
@@ -906,6 +1006,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
         progress: Option<&crate::submit_progress::SubmitProgress>,
+        prepared_plan: Option<PreparedSubmissionPlan>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // #42: remember where the integration branch stood BEFORE the
         // follows-main refresh. Gate selection must diff against this —
@@ -934,6 +1035,7 @@ impl Broker {
             base,
             pre_refresh,
             progress,
+            prepared_plan,
         )?;
         outcome.verified_against = Some(verification);
         Ok(outcome)
@@ -947,6 +1049,7 @@ impl Broker {
         base: String,
         pre_refresh: Option<String>,
         progress: Option<&crate::submit_progress::SubmitProgress>,
+        prepared_plan: Option<PreparedSubmissionPlan>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         let entry = self
             .store()
@@ -959,8 +1062,15 @@ impl Broker {
         // promotion), and the base may have moved onto a new policy. Checked
         // before the entry changes state, so a refusal leaves it as it was.
         self.require_trusted_policy_at_commit(&base, Some(entry.session_id))?;
-        let mut submission_plan =
-            self.build_submission_plan(&session, &entry.head_commit, &base)?;
+        let mut submission_plan = build_or_reuse_submission_plan(
+            self.repo_handle(),
+            prepared_plan,
+            &entry,
+            &session,
+            &entry.head_commit,
+            &base,
+            || self.build_submission_plan(&session, &entry.head_commit, &base),
+        )?;
 
         if let Some(progress) = progress {
             progress.phase("simulating the merge");
@@ -2705,6 +2815,155 @@ mod owned_merge_history_tests {
             .unwrap();
         assert!(broker.can_preserve_owned_merge_history(&plan).unwrap());
         (tmp, broker, plan)
+    }
+
+    #[test]
+    fn prepared_submission_plan_rebuilds_after_base_or_session_inputs_move() {
+        let (tmp, broker, original) = fixture();
+        let root = tmp.path();
+        let session = broker.store().session(original.session_id).unwrap();
+        let entry = broker
+            .store()
+            .submit(
+                session.id,
+                &original.session_head,
+                &original.integration_head,
+            )
+            .unwrap();
+        let base = original.integration_head.clone();
+
+        let unchanged = build_or_reuse_submission_plan(
+            broker.repo_handle(),
+            Some(PreparedSubmissionPlan::new(
+                &session,
+                &original.session_head,
+                &base,
+                original.clone(),
+            )),
+            &entry,
+            &session,
+            &original.session_head,
+            &base,
+            || panic!("unchanged inputs must reuse the preflight plan"),
+        )
+        .unwrap();
+        assert_eq!(unchanged, original);
+
+        for (label, changed_session, changed_head, changed_base) in [
+            (
+                "session id",
+                {
+                    let mut changed = session.clone();
+                    changed.id += 1;
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "accepted checkpoint",
+                {
+                    let mut changed = session.clone();
+                    changed.accepted_session_head = Some("new accepted checkpoint".into());
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "diff base",
+                {
+                    let mut changed = session.clone();
+                    changed.diff_base = Some("new diff base".into());
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "adoption base",
+                {
+                    let mut changed = session.clone();
+                    changed.adoption_base = Some("new adoption base".into());
+                    changed
+                },
+                original.session_head.clone(),
+                base.clone(),
+            ),
+            (
+                "session head",
+                session.clone(),
+                format!("{}-moved", original.session_head),
+                base.clone(),
+            ),
+            (
+                "integration base",
+                session.clone(),
+                original.session_head.clone(),
+                format!("{}-moved", base),
+            ),
+        ] {
+            let build_calls = std::cell::Cell::new(0);
+            let rebuilt = build_or_reuse_submission_plan(
+                broker.repo_handle(),
+                Some(PreparedSubmissionPlan::new(
+                    &session,
+                    &original.session_head,
+                    &base,
+                    original.clone(),
+                )),
+                &entry,
+                &changed_session,
+                &changed_head,
+                &changed_base,
+                || {
+                    build_calls.set(build_calls.get() + 1);
+                    Ok(original.clone())
+                },
+            )
+            .unwrap();
+            assert_eq!(build_calls.get(), 1, "{label} changes require a fresh plan");
+            assert_eq!(rebuilt, original);
+        }
+
+        // Move the actual integration ref after the cached plan was prepared.
+        // The caller's freshly resolved base must therefore take the builder
+        // path and produce provenance bound to that new commit.
+        git(root, &["switch", "-q", "main"]);
+        edit(root, "fresh-integration-base.txt", "fresh base\n");
+        let moved_base = git(root, &["rev-parse", "HEAD"]);
+        git(
+            root,
+            &["update-ref", "refs/heads/aethyme/integration", &moved_base],
+        );
+        assert_eq!(
+            broker
+                .repo_handle()
+                .resolve_ref("refs/heads/aethyme/integration")
+                .as_deref(),
+            Some(moved_base.as_str())
+        );
+        let build_calls = std::cell::Cell::new(0);
+        let rebuilt = build_or_reuse_submission_plan(
+            broker.repo_handle(),
+            Some(PreparedSubmissionPlan::new(
+                &session,
+                &original.session_head,
+                &base,
+                original,
+            )),
+            &entry,
+            &session,
+            &entry.head_commit,
+            &moved_base,
+            || {
+                build_calls.set(build_calls.get() + 1);
+                broker.build_submission_plan(&session, &entry.head_commit, &moved_base)
+            },
+        )
+        .unwrap();
+        assert_eq!(build_calls.get(), 1);
+        assert_eq!(rebuilt.integration_head, moved_base);
     }
 
     #[test]
