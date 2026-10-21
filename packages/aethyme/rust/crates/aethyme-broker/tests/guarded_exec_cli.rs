@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, BrokerOpenOptions};
+use aethyme_broker::{Broker, BrokerOpenOptions, GitRepo};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -39,7 +39,26 @@ impl Fixture {
         let preparation = root.join("preparation-cache");
         std::fs::create_dir(&repository).unwrap();
         std::fs::create_dir(&preparation).unwrap();
-        git(&repository, &["init", "-q", "-b", "main"]);
+        let empty_hooks = root.join("empty-hooks");
+        std::fs::create_dir(&empty_hooks).unwrap();
+        git(&repository, &["init", "-q", "--template=", "-b", "main"]);
+        let hooks_path = empty_hooks.to_str().unwrap();
+        git(
+            &repository,
+            &["config", "--local", "core.hooksPath", hooks_path],
+        );
+        git(
+            &repository,
+            &["config", "--local", "commit.gpgsign", "false"],
+        );
+        git(
+            &repository,
+            &["config", "--local", "core.fsmonitor", "false"],
+        );
+        git(
+            &repository,
+            &["config", "--local", "core.untrackedCache", "false"],
+        );
         std::fs::write(repository.join("tracked.txt"), "original\n").unwrap();
         git(&repository, &["add", "tracked.txt"]);
         git(&repository, &["commit", "-qm", "fixture"]);
@@ -66,6 +85,18 @@ impl Fixture {
             worktree,
             session: session.id,
         }
+    }
+
+    fn broker(&self) -> Broker {
+        let root = self._owner.path().canonicalize().unwrap();
+        let options = BrokerOpenOptions::default()
+            .with_host_state_dir(&self.state)
+            .with_host_cache_dir(root.join("host-cache"))
+            .with_host_operation_database(self.state.join("host-operations.db"))
+            .with_worktree_root(&self.worktree_root)
+            .with_collaboration_state(root.join("collaboration"))
+            .with_preparation_cache_root(root.join("preparation-cache"));
+        Broker::open_with_options(&root.join("repository"), options).unwrap()
     }
 
     fn run(&self, script: &str, json: bool) -> Output {
@@ -252,4 +283,107 @@ fn ownership_report_preserves_literal_quotes_arrows_tabs_and_newlines() {
         std::fs::read(fixture.worktree.join(path)).unwrap(),
         b"generated"
     );
+}
+
+#[test]
+fn guard_status_snapshots_match_existing_queries_for_renames_and_named_untracked_files() {
+    let fixture = Fixture::new(None);
+    git(
+        &fixture.worktree,
+        &["mv", "tracked.txt", "renamed -> tracked.txt"],
+    );
+    let preexisting_untracked = "preexisting untracked name.txt";
+    std::fs::write(fixture.worktree.join(preexisting_untracked), "before\\n").unwrap();
+
+    let repo = GitRepo::discover(&fixture.worktree).unwrap();
+    let mut before_dirty = repo.dirty_paths().unwrap();
+    before_dirty.sort();
+    before_dirty.dedup();
+    let mut before_untracked = repo.untracked_paths().unwrap();
+    before_untracked.sort();
+    before_untracked.dedup();
+    assert_eq!(
+        before_dirty,
+        vec!["preexisting untracked name.txt", "renamed -> tracked.txt"]
+    );
+    assert_eq!(before_untracked, vec![preexisting_untracked]);
+
+    let output = fixture.run(
+        "printf changed >> 'renamed -> tracked.txt'; printf generated > 'new generated name.txt'",
+        true,
+    );
+    let value = report(&output);
+
+    let mut after_dirty = repo.dirty_paths().unwrap();
+    after_dirty.sort();
+    after_dirty.dedup();
+    let mut after_untracked = repo.untracked_paths().unwrap();
+    after_untracked.sort();
+    after_untracked.dedup();
+    let new_untracked: Vec<_> = after_untracked
+        .iter()
+        .filter(|path| !before_untracked.contains(path))
+        .cloned()
+        .collect();
+
+    assert_eq!(value["before_dirty_paths"], serde_json::json!(before_dirty));
+    assert_eq!(value["after_dirty_paths"], serde_json::json!(after_dirty));
+    assert_eq!(
+        value["new_untracked_paths"],
+        serde_json::json!(new_untracked)
+    );
+    assert_eq!(
+        value["modified_preexisting_dirty_paths"],
+        serde_json::json!(["renamed -> tracked.txt"])
+    );
+}
+
+#[test]
+fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
+    let fixture = Fixture::new(Some("tracked.txt"));
+    let mut broker = fixture.broker();
+    let other = broker.start_worktree("overlapping owner", None).unwrap();
+    // Fixture setup records both owners without pre-classifying their pair.
+    broker
+        .store()
+        .claim_lease(other.id, "tracked.txt", None)
+        .unwrap();
+    std::fs::write(fixture.worktree.join("tracked.txt"), "acting edit\n").unwrap();
+    std::fs::write(
+        Path::new(&other.worktree_path).join("tracked.txt"),
+        "other edit\n",
+    )
+    .unwrap();
+    let overlaps = broker.refresh_leases().unwrap();
+    let pairs = broker.overlap_pairs_snapshot(&overlaps);
+    assert_eq!(pairs.len(), 1);
+    assert!(
+        pairs[0].classified,
+        "fixture must start with a cached diagnosis"
+    );
+    drop(broker);
+
+    let output = fixture.run("true", true);
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ownership_ok"], true);
+    let mut broker = fixture.broker();
+    let pairs = broker.overlap_pairs_snapshot(&overlaps);
+    assert_eq!(pairs.len(), 1);
+    assert!(
+        !pairs[0].classified,
+        "deferred diagnostics must not appear current"
+    );
+    assert!(pairs[0].reason.contains("guarded exec deferred"));
+    // The performance change must retain the acting session's refreshed
+    // implicit lease, even though its dirty file was not changed by the child.
+    assert!(broker.store().active_leases().unwrap().iter().any(|lease| {
+        lease.session_id == fixture.session
+            && lease.path == "tracked.txt"
+            && lease.kind == aethyme_broker::LeaseKind::Implicit
+    }));
+    // Explicit refresh still performs the deferred diagnosis. This is also a
+    // positive control proving the fixture really has an analyzable overlap.
+    let overlaps = broker.refresh_leases().unwrap();
+    assert!(broker.overlap_pairs_snapshot(&overlaps)[0].classified);
 }

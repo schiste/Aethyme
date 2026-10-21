@@ -30,9 +30,10 @@ jobs:
       - name: Checkout PR (full history for diff)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Need both branches to compute the diff. Default
-          # actions/checkout fetches only the head — we need the
-          # base ref present locally to `git diff base..HEAD`.
+          # Check the PR head itself, then compare it with the merge base
+          # against the target branch. This keeps main-only commits out of
+          # the PR's contract diff when the branch is behind.
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Set up Rust
@@ -59,7 +60,7 @@ jobs:
           echo "PR body captured ($(wc -c < /tmp/pr-body.md) bytes)"
 
       - name: Run cross-process contract check
-        # `BASE_REF` is read from env, not interpolated into the run
+        # PR head and `BASE_REF` are read from env, not interpolated into the run
         # script — this is the safe pattern for untrusted-ish
         # context fields. github.base_ref is set by GitHub from the
         # branch protection target and isn't directly user-supplied,
@@ -75,15 +76,21 @@ jobs:
         # accepted again on the merge commit.
         env:
           BASE_REF: ${{ github.base_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # The checker is built from the PR tree. Keep any broker access by
           # its startup path or dependencies away from a runner's repository
           # state; an unreviewed schema migration must be disposable (#232).
           AETHYME_BROKER_DB: ${{ runner.temp }}/aethyme-broker-contract-check.db
         run: |
+          if ! CONTRACT_BASE="$(git merge-base "origin/${BASE_REF}" "${PR_HEAD_SHA}")"; then
+            echo "ERROR: could not find a common ancestor for the PR head and base." >&2
+            exit 2
+          fi
+          printf 'PR comparison base: %s\n' "$CONTRACT_BASE"
           cargo run --locked --quiet \
             --manifest-path packages/aethyme/rust/Cargo.toml \
             -p aethyme-cli --bin aethyme -- \
             broker check-contract \
-            --base "origin/${BASE_REF}" \
+            --base "$CONTRACT_BASE" \
             --pr-body /tmp/pr-body.md \
             --commit-messages

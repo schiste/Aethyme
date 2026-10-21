@@ -20,9 +20,15 @@ blocked.
    isolated broker worktree, and work from that checkout:
 
    ```bash
-   aethyme broker status --json    # who is working on what
+   aethyme broker status --compact --json  # concise coordination summary
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
+
+   Routine status groups repeated advice categories, reports deferred checks
+   as unknown, and omits per-session evidence and lease paths. Use full
+   `aethyme broker status --json` when you need exact session, lease-path or
+   evidence detail before deciding what to edit. A deferred check is not a
+   clean result.
 
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
@@ -33,9 +39,9 @@ blocked.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
-   If `status` shows another session holding leases on the files you plan
-   to change, prefer working elsewhere first or say so in your report —
-   overlapping edits will conflict at merge time.
+   If detailed `status --json` shows another session holding leases on the
+   files you plan to change, prefer working elsewhere first or coordinate
+   with its holder — overlapping edits can conflict at merge time.
    Coordinate the exact shared hunk with its holder; a sibling session's PR
    or branch is not automatically your upstream. Sync against the configured
    upstream when required, and do not import or restack onto another session's

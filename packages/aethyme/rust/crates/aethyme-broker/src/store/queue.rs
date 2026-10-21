@@ -956,6 +956,19 @@ impl BrokerStore {
         Ok(entries)
     }
 
+    /// Startup recovery only needs these states. Keep terminal history out of
+    /// row decoding while preserving queue order and errors in eligible rows.
+    pub(crate) fn promotion_recovery_entries(
+        &self,
+        status: MergeStatus,
+    ) -> Result<Vec<MergeQueueEntry>, BrokerError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{MERGE_SELECT} WHERE status = ?1 ORDER BY id"))?;
+        let rows = stmt.query_map([status.as_str()], merge_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
     /// One exact merge queue entry for read-only projections.
     pub fn merge_queue_entry(&self, entry_id: i64) -> Result<MergeQueueEntry, BrokerError> {
         self.conn
