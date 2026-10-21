@@ -123,6 +123,7 @@ fn brief_defers_git_remedies_but_full_blockers_preserves_them() {
 #[test]
 fn brief_reports_unavailable_blocker_sources() {
     let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.operation_db.parent().unwrap()).unwrap();
     if fixture.operation_db.exists() {
         std::fs::remove_file(&fixture.operation_db).unwrap();
     }
