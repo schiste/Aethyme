@@ -1698,6 +1698,8 @@ enum FreshRootRecoveryCargoState {
     EmptyDirectory,
     ExactConfig,
     ExactWriterTemporary { name: String },
+    ExactAtomicTemporary { name: String },
+    ExactAtomicConfigAndTemporary { name: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -1787,18 +1789,28 @@ fn fresh_root_recovery_marker_bytes(marker: &WorktreeRootMarker) -> Result<Vec<u
 fn recovery_path_file_bytes(
     path: &Path,
 ) -> Result<(Vec<u8>, crate::worktree_registry::RecoveryArtifactIdentity), String> {
+    recovery_path_file_bytes_with_links(path, 1)
+}
+
+#[cfg(unix)]
+fn recovery_path_file_bytes_with_links(
+    path: &Path,
+    expected_links: u64,
+) -> Result<(Vec<u8>, crate::worktree_registry::RecoveryArtifactIdentity), String> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let before = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    // SAFETY: geteuid has no pointer arguments or caller-side memory preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
     if before.file_type().is_symlink()
         || !before.is_file()
-        || before.nlink() != 1
-        || before.uid() != unsafe { libc::geteuid() }
+        || before.nlink() != expected_links
+        || before.uid() != effective_uid
         || before.len() > crate::worktree_registry::MAX_RECORD_BYTES as u64
     {
         return Err(format!(
-            "{} is not a bounded regular recovery file",
+            "{} is not a bounded regular recovery file with {expected_links} link(s)",
             path.display()
         ));
     }
@@ -1878,9 +1890,11 @@ fn fresh_root_recovery_inventory(
         }
         Err(error) => return Err(error.to_string()),
     };
+    // SAFETY: geteuid has no pointer arguments or caller-side memory preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
     if root_metadata.file_type().is_symlink()
         || !root_metadata.is_dir()
-        || root_metadata.uid() != unsafe { libc::geteuid() }
+        || root_metadata.uid() != effective_uid
     {
         return Err("reserved root is not a real directory owned by the current user".into());
     }
@@ -1966,45 +1980,79 @@ fn fresh_root_recovery_inventory(
 }
 
 #[cfg(unix)]
-fn fresh_root_recovery_cargo_inventory(
-    directory: &Path,
-) -> Result<FreshRootRecoveryCargoInventory, String> {
+fn fresh_root_recovery_cargo_temporary_name(name: &str) -> bool {
+    // tempfile 3.27.0 uses six random ASCII alphanumeric characters by default.
+    name.strip_prefix(".config.toml-").is_some_and(|suffix| {
+        suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+#[cfg(unix)]
+fn recovery_directory_artifact_identity(
+    metadata: &std::fs::Metadata,
+) -> crate::worktree_registry::RecoveryArtifactIdentity {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err("reserved root .cargo is not a private real directory".into());
-    }
-    let directory_identity = crate::worktree_registry::RecoveryArtifactIdentity {
+    crate::worktree_registry::RecoveryArtifactIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
         owner: metadata.uid(),
         mode: metadata.mode() & 0o7777,
         links: metadata.nlink(),
         bytes: metadata.len(),
-    };
-    let mut entries = Vec::new();
+    }
+}
+
+#[cfg(unix)]
+fn same_recovery_directory_object(
+    left: &crate::worktree_registry::RecoveryArtifactIdentity,
+    right: &crate::worktree_registry::RecoveryArtifactIdentity,
+) -> bool {
+    left.device == right.device
+        && left.inode == right.inode
+        && left.owner == right.owner
+        && left.mode == right.mode
+        && left.links == right.links
+}
+
+#[cfg(unix)]
+fn fresh_root_recovery_cargo_inventory(
+    directory: &Path,
+) -> Result<FreshRootRecoveryCargoInventory, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    // SAFETY: geteuid has no pointer arguments or caller-side memory preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err("reserved root .cargo is not a private real directory".into());
+    }
+    let directory_identity = recovery_directory_artifact_identity(&metadata);
+    let mut entries = Vec::<(String, PathBuf)>::new();
     for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
         if entries.len() >= 2 {
             return Err("reserved root .cargo exceeds the recovery entry limit".into());
         }
-        entries.push(entry.map_err(|error| error.to_string())?);
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "reserved root .cargo contains a non-UTF-8 entry".to_owned())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err("reserved root .cargo config is not a regular file".into());
+        }
+        entries.push((name, entry.path()));
     }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
     if entries.is_empty() {
         let directory_after =
             std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
-        let identity_after = crate::worktree_registry::RecoveryArtifactIdentity {
-            device: directory_after.dev(),
-            inode: directory_after.ino(),
-            owner: directory_after.uid(),
-            mode: directory_after.mode() & 0o7777,
-            links: directory_after.nlink(),
-            bytes: directory_after.len(),
-        };
+        let identity_after = recovery_directory_artifact_identity(&directory_after);
         if identity_after != directory_identity {
             return Err("reserved root .cargo changed during inspection".into());
         }
@@ -2015,77 +2063,91 @@ fn fresh_root_recovery_cargo_inventory(
             bytes_sha256: None,
         });
     }
-    if entries.len() != 1 {
-        return Err("reserved root .cargo has multiple recovery artifacts".into());
-    }
-    let entry = entries
-        .pop()
-        .ok_or_else(|| "reserved root .cargo entry disappeared".to_owned())?;
-    let name = entry
-        .file_name()
-        .into_string()
-        .map_err(|_| "reserved root .cargo contains a non-UTF-8 entry".to_owned())?;
-    let state = if name == "config.toml" {
-        FreshRootRecoveryCargoState::ExactConfig
-    } else if let Some(suffix) = name
-        .strip_prefix(".config.")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    {
-        let mut parts = suffix.split('.');
-        let pid = parts.next().unwrap_or_default();
-        let timestamp = parts.next().unwrap_or_default();
-        if parts.next().is_some()
-            || pid.is_empty()
-            || !pid.bytes().all(|byte| byte.is_ascii_digit())
-            || timestamp.is_empty()
-            || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err("reserved root .cargo temporary name is not the exact writer form".into());
+
+    let expected_bytes = crate::broker::WORKTREE_CARGO_CONFIG.as_bytes();
+    let (state, file_identity, bytes) = if entries.len() == 1 {
+        let (name, path) = &entries[0];
+        let (bytes, identity) = recovery_path_file_bytes(path)?;
+        if bytes != expected_bytes {
+            return Err("reserved root .cargo bytes differ from the exact broker defaults".into());
         }
-        let pid_value = pid
-            .parse::<u32>()
-            .map_err(|_| "reserved root .cargo temporary PID is outside its writer range")?;
-        let timestamp_value = timestamp
-            .parse::<u64>()
-            .map_err(|_| "reserved root .cargo temporary time is outside its writer range")?;
-        if pid_value == 0
-            || timestamp_value == 0
-            || pid != pid_value.to_string()
-            || timestamp != timestamp_value.to_string()
+        let state = if name == "config.toml" {
+            FreshRootRecoveryCargoState::ExactConfig
+        } else if fresh_root_recovery_cargo_temporary_name(name) {
+            if identity.mode != 0o600 {
+                return Err("reserved root .cargo atomic temporary is not mode 0600".into());
+            }
+            FreshRootRecoveryCargoState::ExactAtomicTemporary { name: name.clone() }
+        } else if let Some(suffix) = name
+            .strip_prefix(".config.")
+            .and_then(|name| name.strip_suffix(".tmp"))
+        {
+            let mut parts = suffix.split('.');
+            let pid = parts.next().unwrap_or_default();
+            let timestamp = parts.next().unwrap_or_default();
+            if parts.next().is_some()
+                || pid.is_empty()
+                || !pid.bytes().all(|byte| byte.is_ascii_digit())
+                || timestamp.is_empty()
+                || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(
+                    "reserved root .cargo temporary name is not the exact writer form".into(),
+                );
+            }
+            let pid_value = pid
+                .parse::<u32>()
+                .map_err(|_| "reserved root .cargo temporary PID is outside its writer range")?;
+            let timestamp_value = timestamp
+                .parse::<u64>()
+                .map_err(|_| "reserved root .cargo temporary time is outside its writer range")?;
+            if pid_value == 0
+                || timestamp_value == 0
+                || pid != pid_value.to_string()
+                || timestamp != timestamp_value.to_string()
+            {
+                return Err(
+                    "reserved root .cargo temporary name is not canonical writer output".into(),
+                );
+            }
+            FreshRootRecoveryCargoState::ExactWriterTemporary { name: name.clone() }
+        } else {
+            return Err(format!("unexpected reserved root .cargo entry {name:?}"));
+        };
+        (state, identity, bytes)
+    } else {
+        let config = entries
+            .iter()
+            .find(|(name, _)| name == "config.toml")
+            .ok_or_else(|| "reserved root .cargo has an unsupported two-file prefix".to_owned())?;
+        let (temporary_name, temporary_path) = entries
+            .iter()
+            .find(|(name, _)| fresh_root_recovery_cargo_temporary_name(name))
+            .ok_or_else(|| "reserved root .cargo has an unsupported two-file prefix".to_owned())?;
+        let (config_bytes, config_identity) = recovery_path_file_bytes_with_links(&config.1, 2)?;
+        let (temporary_bytes, temporary_identity) =
+            recovery_path_file_bytes_with_links(temporary_path, 2)?;
+        if config_bytes != expected_bytes
+            || temporary_bytes != expected_bytes
+            || config_identity != temporary_identity
+            || config_identity.mode != 0o600
         {
             return Err(
-                "reserved root .cargo temporary name is not canonical writer output".into(),
+                "reserved root .cargo publication pair is not the exact same private inode".into(),
             );
         }
-        FreshRootRecoveryCargoState::ExactWriterTemporary { name: name.clone() }
-    } else {
-        return Err(format!("unexpected reserved root .cargo entry {name:?}"));
+        (
+            FreshRootRecoveryCargoState::ExactAtomicConfigAndTemporary {
+                name: temporary_name.clone(),
+            },
+            config_identity,
+            config_bytes,
+        )
     };
-    if entry
-        .file_type()
-        .map_err(|error| error.to_string())?
-        .is_symlink()
-        || !entry
-            .file_type()
-            .map_err(|error| error.to_string())?
-            .is_file()
-    {
-        return Err("reserved root .cargo config is not a regular file".into());
-    }
-    let (bytes, file_identity) = recovery_path_file_bytes(&directory.join(&name))?;
-    if bytes != crate::broker::WORKTREE_CARGO_CONFIG.as_bytes() {
-        return Err("reserved root .cargo bytes differ from the exact broker defaults".into());
-    }
+
     let directory_after =
         std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
-    let directory_identity_after = crate::worktree_registry::RecoveryArtifactIdentity {
-        device: directory_after.dev(),
-        inode: directory_after.ino(),
-        owner: directory_after.uid(),
-        mode: directory_after.mode() & 0o7777,
-        links: directory_after.nlink(),
-        bytes: directory_after.len(),
-    };
+    let directory_identity_after = recovery_directory_artifact_identity(&directory_after);
     if directory_identity_after != directory_identity {
         return Err("reserved root .cargo changed during inspection".into());
     }
@@ -2098,125 +2160,147 @@ fn fresh_root_recovery_cargo_inventory(
 }
 
 #[cfg(unix)]
-fn create_fresh_root_recovery_marker(
-    root: &Path,
-    marker: &WorktreeRootMarker,
-    expected_root: &BoundDirectoryIdentity,
-) -> Result<crate::worktree_registry::RecoveryArtifactIdentity, String> {
-    use std::io::Write;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-
-    if &bound_directory_identity(root)? != expected_root {
-        return Err("reserved root identity changed before marker creation".into());
-    }
-    let path = root.join(crate::broker::WORKTREE_ROOT_MARKER);
-    let bytes = fresh_root_recovery_marker_bytes(marker)?;
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    let mut file = options
-        .open(&path)
-        .map_err(|error| format!("cannot create marker without replacement: {error}"))?;
-    let metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err("new recovery marker is not a single-link file owned by this user".into());
-    }
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("cannot protect fresh recovery marker: {error}"))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("cannot durably write fresh recovery marker: {error}"))?;
-    let opened = file.metadata().map_err(|error| error.to_string())?;
-    let opened_identity = crate::worktree_registry::RecoveryArtifactIdentity {
-        device: opened.dev(),
-        inode: opened.ino(),
-        owner: opened.uid(),
-        mode: opened.mode() & 0o7777,
-        links: opened.nlink(),
-        bytes: opened.len(),
-    };
-    let (actual, named_identity) = recovery_path_file_bytes(&path)?;
-    if actual != bytes
-        || named_identity != opened_identity
-        || &bound_directory_identity(root)? != expected_root
-    {
-        return Err("fresh recovery marker or root changed during publication".into());
-    }
-    Ok(opened_identity)
-}
-
-#[cfg(unix)]
-fn sync_fresh_root_recovery_marker_file(
-    root: &Path,
-    marker: &WorktreeRootMarker,
-    expected_root: &BoundDirectoryIdentity,
-    expected_file: &crate::worktree_registry::RecoveryArtifactIdentity,
+fn sync_fresh_root_recovery_cargo_directory(
+    directory: &Path,
+    expected: &crate::worktree_registry::RecoveryArtifactIdentity,
 ) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
-    if &bound_directory_identity(root)? != expected_root {
-        return Err("reserved root identity changed before marker file sync".into());
+    let before = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if before.file_type().is_symlink()
+        || !before.is_dir()
+        || &recovery_directory_artifact_identity(&before) != expected
+    {
+        return Err("reserved root .cargo changed before syncing its entries".into());
     }
-    let path = root.join(crate::broker::WORKTREE_ROOT_MARKER);
-    let expected_bytes = fresh_root_recovery_marker_bytes(marker)?;
-    let (bytes, named_identity) = recovery_path_file_bytes(&path)?;
-    if bytes != expected_bytes || &named_identity != expected_file {
-        return Err("recovery marker bytes or file identity changed before file sync".into());
-    }
-
     let mut options = std::fs::OpenOptions::new();
     options
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    let file = options
-        .open(&path)
-        .map_err(|error| format!("cannot open recovery marker without following links: {error}"))?;
-    let opened = file.metadata().map_err(|error| error.to_string())?;
-    let opened_identity = crate::worktree_registry::RecoveryArtifactIdentity {
-        device: opened.dev(),
-        inode: opened.ino(),
-        owner: opened.uid(),
-        mode: opened.mode() & 0o7777,
-        links: opened.nlink(),
-        bytes: opened.len(),
-    };
-    if !opened.is_file() || &opened_identity != expected_file {
-        return Err("recovery marker file identity changed while opening for sync".into());
-    }
-    file.sync_all()
-        .map_err(|error| format!("cannot durably sync recovery marker contents: {error}"))?;
-
-    let (bytes_after, identity_after) = recovery_path_file_bytes(&path)?;
-    if bytes_after != expected_bytes
-        || &identity_after != expected_file
-        || &bound_directory_identity(root)? != expected_root
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let handle = options.open(directory).map_err(|error| error.to_string())?;
+    if !handle
+        .metadata()
+        .map(|metadata| recovery_directory_artifact_identity(&metadata) == *expected)
+        .unwrap_or(false)
     {
-        return Err("recovery marker or root changed during marker file sync".into());
+        return Err("opened .cargo directory identity differs from the reviewed identity".into());
+    }
+    handle.sync_all().map_err(|error| error.to_string())?;
+    let after = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if after.file_type().is_symlink()
+        || !after.is_dir()
+        || &recovery_directory_artifact_identity(&after) != expected
+    {
+        return Err("reserved root .cargo changed while syncing its entries".into());
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn create_fresh_root_recovery_marker(
-    _root: &Path,
-    _marker: &WorktreeRootMarker,
-    _expected_root: &BoundDirectoryIdentity,
-) -> Result<crate::worktree_registry::RecoveryArtifactIdentity, String> {
-    Err("fresh-root recovery requires Unix no-follow marker creation".into())
+#[cfg(unix)]
+fn normalize_fresh_root_recovery_cargo(
+    root: &Path,
+    expected_root: &BoundDirectoryIdentity,
+    expected: &FreshRootRecoveryCargoInventory,
+) -> Result<(), String> {
+    require_bound_directory_identity(root, expected_root)?;
+    let directory = root.join(".cargo");
+    let current = fresh_root_recovery_cargo_inventory(&directory)?;
+    if &current != expected {
+        return Err("reserved root .cargo changed after recovery-plan review".into());
+    }
+
+    match &current.state {
+        FreshRootRecoveryCargoState::EmptyDirectory
+        | FreshRootRecoveryCargoState::ExactWriterTemporary { .. } => return Ok(()),
+        FreshRootRecoveryCargoState::ExactConfig => {
+            sync_fresh_root_recovery_cargo_directory(&directory, &current.directory_identity)?;
+            if fresh_root_recovery_cargo_inventory(&directory)? != current {
+                return Err("reserved root .cargo changed after its directory sync".into());
+            }
+            require_bound_directory_identity(root, expected_root)?;
+            return Ok(());
+        }
+        FreshRootRecoveryCargoState::ExactAtomicTemporary { name } => {
+            let temporary = directory.join(name);
+            let config = directory.join("config.toml");
+            std::fs::hard_link(&temporary, &config).map_err(|error| {
+                format!("cannot publish exact recovery config without replacement: {error}")
+            })?;
+            require_bound_directory_identity(root, expected_root)?;
+            let linked = fresh_root_recovery_cargo_inventory(&directory)?;
+            let mut linked_file = current
+                .file_identity
+                .clone()
+                .ok_or_else(|| "reviewed atomic temporary has no file identity".to_owned())?;
+            linked_file.links = 2;
+            if linked.state
+                != (FreshRootRecoveryCargoState::ExactAtomicConfigAndTemporary {
+                    name: name.clone(),
+                })
+                || linked.file_identity.as_ref() != Some(&linked_file)
+                || linked.bytes_sha256 != current.bytes_sha256
+                || !same_recovery_directory_object(
+                    &linked.directory_identity,
+                    &current.directory_identity,
+                )
+            {
+                return Err("atomic config changed while recovering its publication link".into());
+            }
+        }
+        FreshRootRecoveryCargoState::ExactAtomicConfigAndTemporary { .. } => {}
+    }
+
+    let temporary_name = match &current.state {
+        FreshRootRecoveryCargoState::ExactAtomicTemporary { name }
+        | FreshRootRecoveryCargoState::ExactAtomicConfigAndTemporary { name } => name,
+        _ => unreachable!("non-atomic states returned above"),
+    };
+    let linked = fresh_root_recovery_cargo_inventory(&directory)?;
+    let mut linked_file = current
+        .file_identity
+        .clone()
+        .ok_or_else(|| "reviewed atomic config has no file identity".to_owned())?;
+    linked_file.links = 2;
+    if linked.state
+        != (FreshRootRecoveryCargoState::ExactAtomicConfigAndTemporary {
+            name: temporary_name.clone(),
+        })
+        || linked.file_identity.as_ref() != Some(&linked_file)
+        || linked.bytes_sha256 != current.bytes_sha256
+    {
+        return Err("atomic config publication pair changed before cleanup".into());
+    }
+    std::fs::remove_file(directory.join(temporary_name))
+        .map_err(|error| format!("cannot remove exact recovery temporary link: {error}"))?;
+    require_bound_directory_identity(root, expected_root)?;
+    let final_inventory = fresh_root_recovery_cargo_inventory(&directory)?;
+    let mut final_file = linked_file;
+    final_file.links = 1;
+    if final_inventory.state != FreshRootRecoveryCargoState::ExactConfig
+        || final_inventory.file_identity.as_ref() != Some(&final_file)
+        || final_inventory.bytes_sha256 != current.bytes_sha256
+        || !same_recovery_directory_object(
+            &final_inventory.directory_identity,
+            &linked.directory_identity,
+        )
+    {
+        return Err("recovered Cargo defaults do not match the reviewed config inode".into());
+    }
+    sync_fresh_root_recovery_cargo_directory(&directory, &final_inventory.directory_identity)?;
+    if fresh_root_recovery_cargo_inventory(&directory)? != final_inventory {
+        return Err("recovered Cargo defaults changed after directory sync".into());
+    }
+    require_bound_directory_identity(root, expected_root)?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_fresh_root_recovery_marker_file(
+fn normalize_fresh_root_recovery_cargo(
     _root: &Path,
-    _marker: &WorktreeRootMarker,
     _expected_root: &BoundDirectoryIdentity,
-    _expected_file: &crate::worktree_registry::RecoveryArtifactIdentity,
+    _expected: &FreshRootRecoveryCargoInventory,
 ) -> Result<(), String> {
-    Err("fresh-root recovery requires Unix no-follow marker sync".into())
+    Err("fresh-root recovery requires Unix .cargo publication checks".into())
 }
 
 #[cfg(not(unix))]
@@ -2493,6 +2577,144 @@ mod fresh_root_recovery_inventory_tests {
         std::fs::remove_file(&config).unwrap();
         std::fs::write(&temporary_config, b"arbitrary cargo configuration").unwrap();
         assert!(fresh_root_recovery_inventory(&root, &expected_marker).is_err());
+    }
+
+    fn write_atomic_cargo_temporary(directory: &Path, bytes: &[u8], mode: u32) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".config.toml-")
+            .tempfile_in(directory)
+            .unwrap();
+        temporary.write_all(bytes).unwrap();
+        temporary.as_file().sync_all().unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let (_, path) = temporary.keep().unwrap();
+        path
+    }
+
+    #[test]
+    fn cargo_inventory_recovers_only_exact_atomic_publication_prefixes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let expected_bytes = crate::broker::WORKTREE_CARGO_CONFIG.as_bytes();
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("root");
+        create_private_directory(&root);
+        let cargo = root.join(".cargo");
+        create_private_directory(&cargo);
+        let root_identity = bound_directory_identity(&root).unwrap();
+
+        let temporary = write_atomic_cargo_temporary(&cargo, expected_bytes, 0o600);
+        let temporary_name = temporary.file_name().unwrap().to_str().unwrap().to_owned();
+        let before_link = fresh_root_recovery_cargo_inventory(&cargo).unwrap();
+        assert_eq!(
+            before_link.state,
+            FreshRootRecoveryCargoState::ExactAtomicTemporary {
+                name: temporary_name.clone()
+            }
+        );
+        assert_eq!(before_link.file_identity.as_ref().unwrap().links, 1);
+        assert_eq!(before_link.file_identity.as_ref().unwrap().mode, 0o600);
+        normalize_fresh_root_recovery_cargo(&root, &root_identity, &before_link).unwrap();
+        let after_link_recovery = fresh_root_recovery_cargo_inventory(&cargo).unwrap();
+        assert_eq!(
+            after_link_recovery.state,
+            FreshRootRecoveryCargoState::ExactConfig
+        );
+        assert_eq!(after_link_recovery.file_identity.as_ref().unwrap().links, 1);
+        assert_eq!(
+            std::fs::read(cargo.join("config.toml")).unwrap(),
+            expected_bytes
+        );
+        assert_eq!(std::fs::read_dir(&cargo).unwrap().count(), 1);
+
+        // Config-only is an idempotent recovery prefix and still syncs the
+        // directory before binding is finalized.
+        normalize_fresh_root_recovery_cargo(&root, &root_identity, &after_link_recovery).unwrap();
+
+        let paired_root = owner.path().join("paired-root");
+        create_private_directory(&paired_root);
+        let paired_cargo = paired_root.join(".cargo");
+        create_private_directory(&paired_cargo);
+        let paired_root_identity = bound_directory_identity(&paired_root).unwrap();
+        let paired_temporary = write_atomic_cargo_temporary(&paired_cargo, expected_bytes, 0o600);
+        let paired_name = paired_temporary
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        std::fs::hard_link(&paired_temporary, paired_cargo.join("config.toml")).unwrap();
+        let after_link = fresh_root_recovery_cargo_inventory(&paired_cargo).unwrap();
+        assert_eq!(
+            after_link.state,
+            FreshRootRecoveryCargoState::ExactAtomicConfigAndTemporary { name: paired_name }
+        );
+        assert_eq!(after_link.file_identity.as_ref().unwrap().links, 2);
+        assert_eq!(
+            std::fs::symlink_metadata(&paired_cargo.join("config.toml"))
+                .unwrap()
+                .ino(),
+            std::fs::symlink_metadata(&paired_temporary).unwrap().ino()
+        );
+        normalize_fresh_root_recovery_cargo(&paired_root, &paired_root_identity, &after_link)
+            .unwrap();
+        let normalized_pair = fresh_root_recovery_cargo_inventory(&paired_cargo).unwrap();
+        assert_eq!(
+            normalized_pair.state,
+            FreshRootRecoveryCargoState::ExactConfig
+        );
+        assert_eq!(normalized_pair.file_identity.as_ref().unwrap().links, 1);
+        assert_eq!(std::fs::read_dir(&paired_cargo).unwrap().count(), 1);
+
+        let drift_root = owner.path().join("drift-root");
+        create_private_directory(&drift_root);
+        let drift_cargo = drift_root.join(".cargo");
+        create_private_directory(&drift_cargo);
+        let drift_root_identity = bound_directory_identity(&drift_root).unwrap();
+        let drift_temporary = write_atomic_cargo_temporary(&drift_cargo, expected_bytes, 0o600);
+        let reviewed = fresh_root_recovery_cargo_inventory(&drift_cargo).unwrap();
+        std::fs::write(&drift_temporary, b"partial config").unwrap();
+        assert!(
+            normalize_fresh_root_recovery_cargo(&drift_root, &drift_root_identity, &reviewed)
+                .is_err()
+        );
+        assert!(!drift_cargo.join("config.toml").exists());
+
+        let invalid_root = owner.path().join("invalid-root");
+        create_private_directory(&invalid_root);
+        let invalid_cargo = invalid_root.join(".cargo");
+        create_private_directory(&invalid_cargo);
+        let wrong_mode = write_atomic_cargo_temporary(&invalid_cargo, expected_bytes, 0o640);
+        assert!(fresh_root_recovery_cargo_inventory(&invalid_cargo).is_err());
+        std::fs::remove_file(wrong_mode).unwrap();
+        let wrong_suffix = invalid_cargo.join(".config.toml-not-random");
+        std::fs::write(&wrong_suffix, expected_bytes).unwrap();
+        std::fs::set_permissions(&wrong_suffix, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(fresh_root_recovery_cargo_inventory(&invalid_cargo).is_err());
+        std::fs::remove_file(wrong_suffix).unwrap();
+
+        let mismatch_temporary =
+            write_atomic_cargo_temporary(&invalid_cargo, expected_bytes, 0o600);
+        let mismatch_config = invalid_cargo.join("config.toml");
+        std::fs::write(&mismatch_config, expected_bytes).unwrap();
+        std::fs::set_permissions(&mismatch_config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(fresh_root_recovery_cargo_inventory(&invalid_cargo).is_err());
+        std::fs::remove_file(mismatch_config).unwrap();
+        std::fs::remove_file(mismatch_temporary).unwrap();
+
+        let partial_temporary =
+            write_atomic_cargo_temporary(&invalid_cargo, b"partial config", 0o600);
+        assert!(fresh_root_recovery_cargo_inventory(&invalid_cargo).is_err());
+        std::fs::remove_file(partial_temporary).unwrap();
+
+        let multiple_first = write_atomic_cargo_temporary(&invalid_cargo, expected_bytes, 0o600);
+        let multiple_second = write_atomic_cargo_temporary(&invalid_cargo, expected_bytes, 0o600);
+        assert!(fresh_root_recovery_cargo_inventory(&invalid_cargo).is_err());
+        std::fs::remove_file(multiple_first).unwrap();
+        std::fs::remove_file(multiple_second).unwrap();
     }
 
     #[test]
@@ -5951,7 +6173,7 @@ impl Broker {
         self.apply_fresh_worktree_root_recovery_with_checkpoint_and_sync(
             confirmed_digest,
             checkpoint,
-            |path, expected| sync_bound_directory(path, expected),
+            sync_bound_directory,
         )
     }
 
@@ -6215,6 +6437,20 @@ impl Broker {
                 path: plan.worktree_root.clone(),
                 reason: "unmarked root identity or inventory changed before marker creation".into(),
             });
+        }
+
+        if plan.root_inventory.state == FreshRootRecoveryPathState::ExactMarker
+            && let Some(cargo_inventory) = &plan.root_inventory.cargo
+        {
+            normalize_fresh_root_recovery_cargo(
+                &plan.worktree_root,
+                &root_identity,
+                cargo_inventory,
+            )
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.worktree_root.join(".cargo"),
+                reason: format!("cannot finalize reviewed Cargo defaults before binding: {reason}"),
+            })?;
         }
 
         let marker_file_identity =
@@ -7235,7 +7471,7 @@ impl Broker {
             reservation,
             expected_parent,
             checkpoint,
-            |path, expected| sync_bound_directory(path, expected),
+            sync_bound_directory,
         )
     }
 

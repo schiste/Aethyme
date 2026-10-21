@@ -1062,9 +1062,11 @@ fn recovery_artifact_identity(metadata: &Metadata) -> RecoveryArtifactIdentity {
 #[cfg(unix)]
 fn validate_recovery_registry_directory(path: &Path, metadata: &Metadata) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no pointer arguments or caller-side memory preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != effective_uid
         || metadata.mode() & 0o022 != 0
     {
         return Err(invalid(format!(
@@ -1093,7 +1095,9 @@ fn validate_recovery_regular_file(path: &Path, metadata: &Metadata, lock: bool) 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() } {
+        // SAFETY: geteuid has no pointer arguments or caller-side memory preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.nlink() != 1 || metadata.uid() != effective_uid {
             return Err(invalid(format!(
                 "registry artifact {} is not a single-link file owned by the current user",
                 path.display()

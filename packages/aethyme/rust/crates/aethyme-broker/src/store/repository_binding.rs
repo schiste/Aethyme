@@ -176,16 +176,20 @@ fn with_durable_binding_transaction<T>(
             }
             Ok(value)
         }
-        Err(error) => {
-            drop(tx);
-            if raised_synchronous {
-                crate::warn_unrecorded(
-                    "restore SQLite synchronous mode after rolled-back binding transaction",
-                    conn.pragma_update(None, "synchronous", previous_synchronous),
-                );
+        Err(operation_error) => match tx.rollback() {
+            Ok(()) => {
+                if raised_synchronous {
+                    crate::warn_unrecorded(
+                        "restore SQLite synchronous mode after rolled-back binding transaction",
+                        conn.pragma_update(None, "synchronous", previous_synchronous),
+                    );
+                }
+                Err(operation_error)
             }
-            Err(error)
-        }
+            Err(rollback_error) => Err(BrokerError::InvalidRepositoryWorktreeBinding(format!(
+                "binding operation failed ({operation_error}); explicit rollback also failed ({rollback_error}); SQLite synchronous mode remains FULL or stronger"
+            ))),
+        },
     }
 }
 
@@ -1199,6 +1203,47 @@ mod tests {
                 .unwrap(),
             3,
             "successful binding work must not downgrade EXTRA"
+        );
+    }
+
+    #[test]
+    fn binding_transaction_keeps_full_when_explicit_rollback_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open(directory.path().join("state.db")).unwrap();
+        conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+        conn.execute_batch("CREATE TABLE binding_test_rows (value TEXT PRIMARY KEY);")
+            .unwrap();
+
+        let error = with_durable_binding_transaction(&mut conn, |tx| {
+            tx.execute(
+                "INSERT INTO binding_test_rows(value) VALUES('rolled-back-before-error')",
+                [],
+            )?;
+            // Simulate an operation that has already ended the transaction so
+            // the helper's explicit rollback receives a real SQLite error.
+            tx.execute_batch("ROLLBACK")?;
+            Err::<(), BrokerError>(invalid_binding("test operation failure".to_owned()))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BrokerError::InvalidRepositoryWorktreeBinding(message)
+                if message.contains("test operation failure")
+                    && message.contains("explicit rollback also failed")
+        ));
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "an uncertain rollback must leave the connection at FULL"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM binding_test_rows", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "the synthetic operation rolled its inserted row back"
         );
     }
 

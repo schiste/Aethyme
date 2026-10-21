@@ -207,11 +207,12 @@ fn start_worktree_creates_broker_managed_session_without_process() {
 #[test]
 fn two_session_worktrees_are_distinct_and_registered() {
     let tmp = common::FixtureRepository::new();
-    let external_root = tempfile::tempdir().unwrap();
+    let external_parent = tempfile::tempdir().unwrap();
+    let external_root = external_parent.path().join("worktrees");
     init_repo(tmp.path());
     let mut broker = open_fixture_broker(tmp.path())
         .unwrap()
-        .with_worktree_root(external_root.path());
+        .with_worktree_root(&external_root);
 
     let first = broker
         .start_worktree("first isolated session", None)
