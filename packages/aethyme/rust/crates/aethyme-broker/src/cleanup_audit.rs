@@ -29,6 +29,19 @@ use crate::{Broker, BrokerOpError, CleanupPlan, CleanupWorktreePlan, Session, Se
 
 pub const CLEANUP_AUDIT_SCHEMA_VERSION: u32 = 1;
 
+/// The refs a cleanup plan records in its digest and the subset used to prove
+/// whether each spawned worktree is represented. Both are captured together
+/// so one plan cannot judge a worktree against refs newer than its digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CleanupTargetSnapshot {
+    pub(crate) refs: Vec<String>,
+    /// `None` means the primary HEAD could not be resolved. Plan items whose
+    /// eligibility depends on delivery targets must then remain uninspected;
+    /// they cannot fall back to later targets that are absent from this digest.
+    /// Direct cleanup inspections still resolve their own fresh target set.
+    pub(crate) delivery_targets: Option<Vec<String>>,
+}
+
 /// The refs the audit judged against, resolved once so every item is compared
 /// to the same commits.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -250,18 +263,25 @@ fn path_key(path: &Path) -> PathBuf {
 impl Broker {
     /// `ref=commit` for every ref cleanup provenance is judged against, sorted.
     /// The cleanup plan hashes this, so its digest pins the targets.
-    pub(crate) fn cleanup_target_snapshot(&self) -> Vec<String> {
+    pub(crate) fn cleanup_target_snapshot(&self) -> CleanupTargetSnapshot {
         let repo = self.repo_handle();
         let mut refs = BTreeSet::new();
-        if let Ok(head) = repo.head_commit() {
+        let mut delivery_targets = repo.head_commit().ok().map(|head| {
             refs.insert(format!("HEAD={head}"));
-        }
+            vec![head]
+        });
         let integration = crate::merge::PromoteConfig::load(&self.main_root_path()).branch;
         if let Some(commit) = self.integration_tip() {
             refs.insert(format!("refs/heads/{integration}={commit}"));
+            if let Some(targets) = &mut delivery_targets {
+                targets.push(commit);
+            }
         }
         if let Some((upstream, commit)) = repo.tracking_upstream() {
             refs.insert(format!("{upstream}={commit}"));
+            if let Some(targets) = &mut delivery_targets {
+                targets.push(commit);
+            }
         }
         if let Some(branch) = self.origin_default_branch() {
             for name in [
@@ -273,7 +293,14 @@ impl Broker {
                 }
             }
         }
-        refs.into_iter().collect()
+        if let Some(targets) = &mut delivery_targets {
+            targets.sort();
+            targets.dedup();
+        }
+        CleanupTargetSnapshot {
+            refs: refs.into_iter().collect(),
+            delivery_targets,
+        }
     }
 
     fn origin_default_branch(&self) -> Option<String> {
