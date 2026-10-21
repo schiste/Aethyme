@@ -744,7 +744,7 @@ fn resource_lease_blockers_keep_quarantined_and_expired_owned_rows_only() {
                 worktree_fingerprint: fingerprint.clone(),
                 run_id: format!("run-{request_id}"),
                 ttl_seconds: 600,
-                holder_pid: Some(dead_pid()),
+                holder_pid: Some(std::process::id()),
                 resources: vec![HostResourceRequirement {
                     key: "db".into(),
                     resource: HostResourceKind::Namespace {
@@ -801,6 +801,59 @@ fn resource_lease_blockers_keep_quarantined_and_expired_owned_rows_only() {
     assert!(has_lease(&expired.lease.lease_id));
     assert!(!has_lease(&active.lease.lease_id));
     assert!(!has_lease(&released.lease.lease_id));
+}
+
+#[test]
+fn blocker_collection_decodes_unexpired_resource_leases() {
+    let fixture = Fixture::new();
+    let mut coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    let grant = coordinator
+        .acquire(&HostResourceRequest {
+            schema_version: aethyme_broker::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: "malformed-active".into(),
+            repository: "unrelated-origin".into(),
+            worktree_fingerprint: "unrelated-worktree".into(),
+            run_id: "run-malformed-active".into(),
+            ttl_seconds: 600,
+            holder_pid: Some(std::process::id()),
+            resources: vec![HostResourceRequirement {
+                key: "db".into(),
+                resource: HostResourceKind::Namespace {
+                    prefix: "malformed-active-".into(),
+                },
+            }],
+        })
+        .unwrap();
+    drop(coordinator);
+
+    // The old non-released inventory decoded unexpired active rows too. Keep
+    // blocker diagnostics surfacing malformed active-row data after indexing.
+    Connection::open(fixture.state.join("host-resources.db"))
+        .unwrap()
+        .execute(
+            "UPDATE resource_leases SET repository=?1 WHERE lease_id=?2",
+            rusqlite::params![
+                rusqlite::types::Value::Blob(vec![0xff]),
+                grant.lease.lease_id.as_str()
+            ],
+        )
+        .unwrap();
+
+    let broker = Broker::open_with_options(
+        &fixture.repo,
+        BrokerOpenOptions::default().with_host_state_dir(fixture.state.clone()),
+    )
+    .unwrap();
+    let report = broker.blockers();
+    assert!(
+        report
+            .unavailable
+            .iter()
+            .any(|source| source.source == "host-resources.db"),
+        "blocker collection must surface malformed unexpired active lease rows: {:?}",
+        report.unavailable
+    );
 }
 
 #[test]
