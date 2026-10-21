@@ -1308,8 +1308,11 @@ against the default branch, excluding the session's own:
 never call GitHub, and ignore a listing older than a day. Nothing here blocks a
 command or writes to GitHub.
 
-When `start` or `adopt` (including `start --adopt`) includes explicit
-`--path` declarations, JSON also includes `planned_path_pr_overlaps`.
+When the start/adopt report has a nonempty `planned_explicit_leases` set, JSON
+also includes `planned_path_pr_overlaps`. This includes `start --reuse` and
+adopt/reuse forms when the reused report carries prior planned claims; presence
+is based on the effective report, not only on `--path` arguments in the current
+invocation. The field is omitted when that set is empty.
 `cache_available` says whether a fresh cached listing for the current local
 default branch was usable; `warning` explains a missing, stale, or mismatched
 listing. When the listing is available, `overlaps` names open PRs whose changed
@@ -1317,9 +1320,9 @@ paths are present in cached ranges and equal or fall under a declared path.
 `unknown_prs` names listed PRs whose current changed paths are not in the
 cache. `listed_at_ms` gives the listing time, and
 `checked_open_pr_limit` reports the 30-PR cache limit; `listing_may_be_truncated`
-is true if the listing reached that limit. The field is omitted when no
-explicit path was planned. Human output prints matching PRs and warns when the
-cache is unavailable, unknown PR paths remain, or the listing may be truncated.
+is true if the listing reached that limit. Human output prints matching PRs and
+warns when the cache is unavailable, unknown PR paths remain, or the listing
+may be truncated.
 This is a path-only heads-up: it does not scan Git history, predict line
 conflicts, infer overlap from task text, or refresh GitHub data.
 Treat an unavailable cache or a nonempty `unknown_prs` as incomplete evidence,
