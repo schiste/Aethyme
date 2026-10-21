@@ -151,6 +151,144 @@ fn write_resolutions(root: &Path, name: &str, resolutions: Value) -> PathBuf {
 }
 
 #[test]
+fn upgrade_proposal_fetches_only_the_pinned_commit_without_changing_the_plan() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    fs::write(repo.join("removed-history.txt"), "historical content\n").unwrap();
+    commit_all(&repo, "add historical content");
+    let historical_head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    fs::remove_file(repo.join("removed-history.txt")).unwrap();
+    commit_all(&repo, "remove historical content");
+    old_canonical_deployment(&repo);
+    fs::write(repo.join("private-notes.txt"), "uncommitted user content\n").unwrap();
+    let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    let before = json(&run(&repo, &["upgrade", "plan", "--json"]));
+
+    git(&repo, &["branch", "unrelated-history", &historical_head]);
+    git(&repo, &["tag", "historical-tag", &historical_head]);
+    let refs_before = git_stdout(&repo, &["show-ref"]);
+    let dirty_before = git_stdout(&repo, &["status", "--porcelain=v1"]);
+    let trace = temp.path().join("proposal-git-trace.jsonl");
+    let output = command(&repo)
+        .args(["upgrade", "plan", "--json"])
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    let after = json(&output);
+    assert_eq!(before, after, "unrelated history must not change the plan");
+    assert_eq!(git_stdout(&repo, &["show-ref"]), refs_before);
+    assert_eq!(
+        git_stdout(&repo, &["status", "--porcelain=v1"]),
+        dirty_before
+    );
+    assert_eq!(git_stdout(&repo, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        fs::read_to_string(repo.join("private-notes.txt")).unwrap(),
+        "uncommitted user content\n"
+    );
+    let starts = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event"] == "start")
+        .map(|event| event["argv"].as_array().unwrap().clone())
+        .collect::<Vec<_>>();
+    let fetches = starts
+        .iter()
+        .filter(|argv| argv.get(3).is_some_and(|arg| arg == "fetch"))
+        .collect::<Vec<_>>();
+    assert_eq!(fetches.len(), 1, "materialize the proposal with one fetch");
+    assert_eq!(
+        fetches[0][1..],
+        vec![
+            serde_json::json!("-c"),
+            serde_json::json!("core.hooksPath=/dev/null"),
+            serde_json::json!("fetch"),
+            serde_json::json!("--quiet"),
+            serde_json::json!("--depth=1"),
+            serde_json::json!("--no-tags"),
+            serde_json::json!("--no-recurse-submodules"),
+            serde_json::json!("--"),
+            serde_json::json!(repo),
+            serde_json::json!(head),
+        ]
+    );
+    assert!(
+        starts
+            .iter()
+            .all(|argv| argv.get(1).is_none_or(|arg| arg != "clone")),
+        "proposal must not import all refs and historical objects"
+    );
+}
+
+#[test]
+fn upgrade_proposal_accepts_a_shallow_source() {
+    let temp = tmp_dir();
+    let repo = repository(temp.path());
+    old_canonical_deployment(&repo);
+    let shallow = temp.path().join("shallow source with spaces");
+    let cloned = Command::new("git")
+        .args(["clone", "--quiet", "--no-local", "--depth=1"])
+        .arg(&repo)
+        .arg(&shallow)
+        .output()
+        .unwrap();
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    assert_eq!(
+        git_stdout(&shallow, &["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+    git(&shallow, &["checkout", "--quiet", "--detach", "HEAD"]);
+    assert!(git_stdout(&shallow, &["branch", "--show-current"]).is_empty());
+    let before = git_stdout(&shallow, &["status", "--porcelain=v1"]);
+    let plan = json(&run(&shallow, &["upgrade", "plan", "--json"]));
+    assert_eq!(
+        plan["repository_head"],
+        git_stdout(&repo, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(plan["safe"], true);
+    assert_eq!(plan["from_schema"], 0);
+    assert_eq!(plan["to_schema"], 1);
+    assert_eq!(git_stdout(&shallow, &["status", "--porcelain=v1"]), before);
+}
+
+#[test]
+fn upgrade_proposal_preserves_sha256_object_format() {
+    let temp = tmp_dir();
+    let repo = temp.path().join("sha256");
+    let initialized = Command::new("git")
+        .args(["init", "--quiet", "--object-format=sha256", "-b", "main"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    fs::create_dir(repo.join(".aethyme")).unwrap();
+    fs::write(
+        repo.join(".aethyme/repository.json"),
+        r#"{"schema_version":1,"applied_migrations":["repository-deployment-v1"]}"#,
+    )
+    .unwrap();
+    commit_all(&repo, "seed sha256 repository");
+    let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    assert_eq!(head.len(), 64);
+    let plan = json(&run(&repo, &["upgrade", "plan", "--json"]));
+    assert_eq!(plan["repository_head"], head);
+    assert_eq!(plan["safe"], true);
+    assert_eq!(
+        git_stdout(&repo, &["rev-parse", "--show-object-format"]),
+        "sha256"
+    );
+}
+
+#[test]
 fn canonical_upgrade_is_read_only_then_digest_bound_and_verifiable() {
     let temp = tmp_dir();
     let repo = repository(temp.path());

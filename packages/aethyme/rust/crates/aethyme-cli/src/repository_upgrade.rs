@@ -812,20 +812,48 @@ impl ProposedRepository {
             .tempdir()
             .map_err(|error| format!("create disposable upgrade directory: {error}"))?;
         let root = temporary.path().join("repository");
-        let cloned = Command::new("git")
-            .arg("clone")
-            // --no-local: take objects through git's pack transport rather than copying
-            // loose object files. A file copy races any repack of the source (such as
-            // `git gc --auto` after a commit) and fails with "failed to copy file".
-            .args(["--quiet", "--no-checkout", "--no-local"])
-            .arg(repo)
+        // A plan needs the pinned tree, not the source's history or unrelated
+        // refs. Fetch that commit through pack transport: copying loose objects
+        // (clone --local/--shared) can race source repacking or later pruning.
+        let object_format = match head.len() {
+            40 => "sha1",
+            64 => "sha256",
+            _ => return Err("unsupported repository commit hash format".into()),
+        };
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            // Older SHA-1-only Git ignores this variable; newer Git honors it
+            // over the user's default, including for SHA-256 repositories.
+            .env("GIT_DEFAULT_HASH", object_format)
             .arg(&root)
             .output()
+            .map_err(|error| format!("initialize committed repository: {error}"))?;
+        if !initialized.status.success() {
+            return Err(format!(
+                "initialize committed repository: {}",
+                String::from_utf8_lossy(&initialized.stderr).trim()
+            ));
+        }
+        let fetched = Command::new("git")
+            .current_dir(&root)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--",
+            ])
+            .arg(repo)
+            .arg(head)
+            .output()
             .map_err(|error| format!("materialize committed repository: {error}"))?;
-        if !cloned.status.success() {
+        if !fetched.status.success() {
             return Err(format!(
                 "materialize committed repository: {}",
-                String::from_utf8_lossy(&cloned.stderr).trim()
+                String::from_utf8_lossy(&fetched.stderr).trim()
             ));
         }
         git(
@@ -840,14 +868,13 @@ impl ProposedRepository {
             ],
         )?;
 
-        // A local clone rewrites origin to the source checkout path. Preserve
-        // the source repository's configured origin so generators derive the
-        // same canonical repository identity without reading worktree files.
-        if let Ok(origin) = git(repo, &["remote", "get-url", "origin"])
-            && !origin.is_empty()
-        {
-            git(&root, &["remote", "set-url", "origin", &origin])?;
-        }
+        // Preserve the same origin as the former clone-based snapshot: use
+        // the source's configured origin, or its checkout path if absent.
+        let origin = git(repo, &["remote", "get-url", "origin"])
+            .ok()
+            .filter(|origin| !origin.is_empty())
+            .unwrap_or_else(|| repo.to_string_lossy().into_owned());
+        git(&root, &["remote", "add", "origin", &origin])?;
         Ok(Self {
             _temporary: temporary,
             root,
