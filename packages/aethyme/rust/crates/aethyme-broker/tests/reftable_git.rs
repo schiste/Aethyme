@@ -104,6 +104,19 @@ fn run_git(root: &Path, args: &[&str]) {
     );
 }
 
+fn git_text(root: &Path, args: &[&str]) -> String {
+    let output = git_output(root, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Git output must be UTF-8")
+        .trim()
+        .to_owned()
+}
+
 fn init_reftable_repo(root: &Path) {
     let template = root
         .parent()
@@ -168,23 +181,29 @@ fn reftable_repo() -> (tempfile::TempDir, GitRepo, String, String) {
     std::fs::write(root.join("README.md"), "first\n").expect("write first commit");
     run_git(&root, &["add", "README.md"]);
     run_git(&root, &["commit", "-qm", "first"]);
+    let first = git_text(&root, &["rev-parse", "refs/heads/main"]);
     let repo = GitRepo::discover(&root).expect("discover reftable repo");
     assert_eq!(
         repo.root().canonicalize().expect("canonical GitRepo root"),
         root.canonicalize().expect("canonical fixture root"),
         "GitRepo discovery must stay inside the explicit fixture"
     );
-    let first = repo
-        .resolve_ref("refs/heads/main")
-        .expect("first commit ref");
+    assert_eq!(
+        repo.resolve_ref("refs/heads/main").as_deref(),
+        Some(first.as_str()),
+        "the Git boundary should agree with fixture Git for the initial tip"
+    );
     run_git(&root, &["branch", "agent/kept"]);
 
     std::fs::write(root.join("README.md"), "second\n").expect("write second commit");
     run_git(&root, &["commit", "-qam", "second"]);
+    let second = git_text(&root, &["rev-parse", "refs/heads/main"]);
     run_git(&root, &["branch", "agent/moved"]);
-    let second = repo
-        .resolve_ref("refs/heads/main")
-        .expect("second commit ref");
+    assert_eq!(
+        repo.resolve_ref("refs/heads/main").as_deref(),
+        Some(second.as_str()),
+        "the Git boundary should agree with fixture Git for the advanced tip"
+    );
 
     (tmp, repo, first, second)
 }
