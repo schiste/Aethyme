@@ -269,6 +269,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
   target is a setup failure; stop before Cargo instead of treating it as a
   product failure or zero-test result.
+- Treat release-signing failures as workflow failures, not automatically as
+  transient. Inspect the exact failed step and the tag/release asset state
+  before retrying. For a Rekor conflict, confirm the pinned signer's released
+  conflict handling and security status; exercise signer, bundle conversion,
+  and verification commands with fail-closed fakes while preserving identity,
+  issuer, and transparency-log checks. Keep intermediate signature files out
+  of the published asset directory.
 - Bound compilation and test execution separately. With `cargo nextest run`,
   use `--build-jobs 1` for Cargo and `--test-threads 1` or `2` for nextest;
   nextest's `-j` aliases test parallelism, so never use it as the Cargo worker
