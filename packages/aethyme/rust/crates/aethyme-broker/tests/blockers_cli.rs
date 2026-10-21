@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use aethyme_broker::{
-    Broker, GateFailureClass, GateStatus, HostOperationGuard, HostResourceCoordinator,
-    HostResourceKind, HostResourceRequest, HostResourceRequirement, NewCoordinatedOperation,
-    NewGateResult, OperationEffect, OperationIdentityProvenance, OperationProvider,
-    OperationStatus, SessionStatus,
+    Broker, BrokerOpenOptions, GateFailureClass, GateStatus, HostOperationGuard,
+    HostResourceCoordinator, HostResourceKind, HostResourceRequest, HostResourceRequirement,
+    NewCoordinatedOperation, NewGateResult, OperationEffect, OperationIdentityProvenance,
+    OperationProvider, OperationStatus, SessionStatus,
 };
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -721,6 +721,49 @@ fn a_resource_lease_owned_by_a_closed_session_is_cleared() {
     assert_eq!(cleared.status.code(), Some(0), "{}", stderr(&cleared));
     assert!(fixture.blocker(&id).is_none());
     let _ = &fixture.worktree;
+}
+
+#[test]
+fn no_quarantined_resource_leases_skip_cleaned_session_decoding() {
+    let fixture = Fixture::new();
+    let broker = Broker::open_with_options(
+        &fixture.repo,
+        BrokerOpenOptions::default().with_host_state_dir(fixture.state.clone()),
+    )
+    .unwrap();
+    let coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    assert!(coordinator.list(false).unwrap().is_empty());
+    drop(coordinator);
+
+    // A BLOB bypasses SQLite's TEXT affinity and makes decoding this archived
+    // session's worktree path fail if blocker collection reads all history.
+    Connection::open(aethyme_broker::broker_db_path(&fixture.repo).unwrap())
+        .unwrap()
+        .execute(
+            "UPDATE sessions
+             SET status = 'cleaned', cleanup_state = 'cleaned', worktree_path = ?1
+             WHERE id = ?2",
+            rusqlite::params![rusqlite::types::Value::Blob(vec![0xff]), fixture.session_id],
+        )
+        .unwrap();
+
+    let report = broker.blockers();
+    assert!(
+        !report
+            .unavailable
+            .iter()
+            .any(|source| source.source == "host-resources.db"),
+        "an empty quarantined-lease inventory should not decode archived sessions: {:?}",
+        report.unavailable
+    );
+    assert!(
+        !report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.id.starts_with("resource:")),
+        "an empty resource inventory has no resource blockers"
+    );
 }
 
 #[test]
