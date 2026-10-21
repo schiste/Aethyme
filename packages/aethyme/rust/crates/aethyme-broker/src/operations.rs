@@ -556,11 +556,13 @@ impl AdmissionDeadline {
     }
 }
 
-/// Run a child to completion, or kill it when the admission budget is gone.
+/// Run a child and drain its output, or time out at the admission deadline.
 ///
 /// The output readers run concurrently with the child. Apart from avoiding a
 /// pipe-capacity deadlock, that gives the operation heartbeat a meaningful
-/// progress signal while a provider is still working.
+/// progress signal while a provider is still working. A child that is still
+/// running is killed and reaped on timeout; readers held by its descendants are
+/// detached rather than allowed to extend the caller's deadline.
 fn output_within(
     mut command: Command,
     deadline: AdmissionDeadline,
@@ -592,20 +594,29 @@ fn output_within(
         })?;
     let stdout_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
     let stderr_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
-    let stdout_reader = spawn_output_reader(stdout, stdout_state, "provider stdout");
-    let stderr_reader = spawn_output_reader(stderr, stderr_state, "provider stderr");
+    let (reader_done_tx, reader_done_rx) = mpsc::channel();
+    let stdout_reader = spawn_output_reader(
+        stdout,
+        stdout_state,
+        "provider stdout",
+        reader_done_tx.clone(),
+    );
+    let stderr_reader =
+        spawn_output_reader(stderr, stderr_state, "provider stderr", reader_done_tx);
 
+    let mut open_readers: usize = 2;
+    let mut exited = None;
     let status = loop {
         if deadline.expired() {
-            // Killing is the point: leaving it behind would keep contacting the
-            // remote after the caller was told nothing happened.
-            let _ = child.kill();
-            let _ = child.wait();
-            // A provider may have grandchildren that inherited the pipes.
-            // Joining here would make a bounded operation wait for those
-            // grandchildren even after the provider itself was killed. Drop
-            // the handles and let those readers end when their inherited
-            // descriptors close.
+            // Reap the provider if it is still alive. If it has already exited,
+            // a descendant may still hold an inherited output pipe; stop waiting
+            // for that pipe at the same deadline without killing an unowned
+            // process tree.
+            if exited.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Detached readers end when their inherited descriptors close.
             drop(stdout_reader);
             drop(stderr_reader);
             return Err(BrokerOpError::AdmissionTimedOut {
@@ -614,21 +625,41 @@ fn output_within(
                 budget: deadline.budget_label(),
             });
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(source) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(stdout_reader);
-                drop(stderr_reader);
-                return Err(BrokerOpError::OperationIo {
-                    path: PathBuf::from("git"),
-                    source,
-                });
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some(status),
+                Ok(None) => {}
+                Err(source) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    drop(stdout_reader);
+                    drop(stderr_reader);
+                    return Err(BrokerOpError::OperationIo {
+                        path: PathBuf::from("git"),
+                        source,
+                    });
+                }
             }
         }
-        std::thread::sleep(ADMISSION_POLL_INTERVAL);
+        if open_readers == 0
+            && let Some(status) = exited.as_ref()
+        {
+            break *status;
+        }
+        let poll = deadline
+            .remaining()
+            .map_or(ADMISSION_POLL_INTERVAL, |remaining| {
+                remaining.min(ADMISSION_POLL_INTERVAL)
+            });
+        if open_readers == 0 {
+            std::thread::sleep(poll);
+            continue;
+        }
+        match reader_done_rx.recv_timeout(poll) {
+            Ok(()) => open_readers = open_readers.saturating_sub(1),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => open_readers = 0,
+        }
     };
     let stdout = join_output_reader(stdout_reader)?;
     let stderr = join_output_reader(stderr_reader)?;
@@ -643,28 +674,35 @@ fn spawn_output_reader<R>(
     mut reader: R,
     state: Option<Arc<Mutex<OperationHeartbeatState>>>,
     stream: &'static str,
+    done: mpsc::Sender<()>,
 ) -> JoinHandle<std::io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 8 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let result = (|| -> std::io::Result<Vec<u8>> {
+            let mut output = Vec::new();
+            let mut buffer = [0u8; 8 * 1024];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buffer[..read]);
+                if let Some(state) = &state
+                    && let Ok(mut state) = state.lock()
+                {
+                    state.progress = format!("{stream} output received");
+                    state.last_progress_at = unix_now_ms();
+                    state.output_bytes = state.output_bytes.saturating_add(read as u64);
+                }
             }
-            output.extend_from_slice(&buffer[..read]);
-            if let Some(state) = &state
-                && let Ok(mut state) = state.lock()
-            {
-                state.progress = format!("{stream} output received");
-                state.last_progress_at = unix_now_ms();
-                state.output_bytes = state.output_bytes.saturating_add(read as u64);
-            }
-        }
-        Ok(output)
+            Ok(output)
+        })();
+        // A timeout or another reader error drops the receiver; this notification
+        // is only needed while the caller is waiting for pipe EOF.
+        let _completion = done.send(());
+        result
     })
 }
 
