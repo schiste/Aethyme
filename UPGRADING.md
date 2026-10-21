@@ -44,11 +44,14 @@ aethyme plugin status                                  # engine pair: matched
 aethyme upgrade plan --repo . --diff
 ```
 
-The broker database is machine-wide. After a release that migrates it, every
-older `aethyme` on the machine, including the copies agent plugin hooks run,
-refuses with `broker db schema version N is newer than this binary supports`.
-Upgrade every installed copy (`which -a aethyme`) before the next session
-touches the broker.
+Broker state is scoped to a repository: by default its database is
+`<repo>/.aethyme/broker.db`, shared by linked worktrees. `AETHYME_BROKER_DB`
+can redirect that path, and repositories pointed at the same path share one
+database. A schema migration affects only the database it opens. After that
+database's compatibility floor rises, older binaries refuse that database.
+Before its first writable open, upgrade every installed Aethyme copy that can
+access the same database. Databases at other paths are unaffected until they
+migrate. Host operation and resource ledgers are separate.
 
 ## Writing a section (maintainers)
 
