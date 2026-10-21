@@ -84,13 +84,17 @@ class AgedHistoryTests(unittest.TestCase):
             'state': 'released', 'allocations': [{'kind': 'capacity'}],
         }
         self.assertEqual(validate_resource_inventory([lease], repo), [lease])
-        for invalid in (
-                {**lease, 'repository': 'outside-playground'},
-                {**lease, 'worktree_fingerprint': '/outside/repository'},
-                {**lease, 'ownership_token': 'secret'},
-                {**lease, 'state': 'released'},
+        active = {**lease, 'state': 'active'}
+        self.assertEqual(validate_resource_inventory([active], repo, allow_released=False),
+                         [active])
+        for invalid, message in (
+                ({**active, 'repository': 'outside-playground'}, 'non-fixture repository'),
+                ({**active, 'worktree_fingerprint': '/outside/repository'},
+                 'non-fixture worktree fingerprint'),
+                ({**active, 'ownership_token': 'secret'}, 'secret-bearing lease'),
+                ({**active, 'state': 'released'}, 'released host-resource lease'),
         ):
-            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(RuntimeError, message):
                 validate_resource_inventory([invalid], repo, allow_released=False)
 
     def test_aged_history_samples_are_unbudgeted_diagnostics(self):
