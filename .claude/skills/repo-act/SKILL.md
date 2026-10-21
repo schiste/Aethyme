@@ -26,6 +26,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- For startup profiling, use Git Trace2 event logs to count actual Git
+  subprocess starts and group repeated argv. Stack-sample counts measure time in
+  sampled frames, not invocation counts; keep instrumented traces and timings
+  separate from uninstrumented benchmark samples.
 
 - For deadline-bounded cleanup, separate candidate discovery from the
   assertion that partial work completed. One short wall-clock budget may expire

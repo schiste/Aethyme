@@ -375,7 +375,9 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
-        let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
+        let (promote_config, promote_config_warning) =
+            PromoteConfig::load_with_warning(&self.main_root);
+        let promotes = promote_config.mode.promotes_at_all();
         let summary = status_summary(
             &agents,
             overlaps.len(),
@@ -389,7 +391,7 @@ impl Broker {
             0,
             0,
             &SummaryIntegration {
-                branch: PromoteConfig::load(&self.main_root).branch,
+                branch: promote_config.branch,
                 head: String::new(),
                 baseline_ref: "not inspected".into(),
                 baseline_head: String::new(),
@@ -410,7 +412,14 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
-        let mut advice = self.status_advice(&agents, &[], &latest, ("", ""), promotes, None);
+        let mut advice = self.status_advice(
+            &agents,
+            &[],
+            &latest,
+            ("", ""),
+            (promotes, promote_config_warning),
+            None,
+        );
         phase_timings_ms.insert(
             "status_advice".into(),
             phase_started.elapsed().as_millis() as u64,
@@ -576,11 +585,9 @@ impl Broker {
         // Read once and shared with the collaboration fence below, so the
         // fence costs status no extra Git calls.
         let repository_config = crate::merge::repository_config_with_source(&self.main_root);
-        let promotes =
-            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()))
-                .0
-                .mode
-                .promotes_at_all();
+        let (promote_config, promote_config_warning) =
+            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()));
+        let promotes = promote_config.mode.promotes_at_all();
         let collaboration_fence =
             self.collaboration_fence_state(FenceTrigger::Config(repository_config.as_ref()));
         // One deadline for every phase below whose cost grows with sessions
@@ -832,7 +839,7 @@ impl Broker {
             &promoted_conflicts,
             &latest_live_queue,
             (&integration_branch, &integration_head),
-            promotes,
+            (promotes, promote_config_warning),
             checkouts.as_ref(),
         );
         if collaboration_fence
@@ -2044,14 +2051,15 @@ impl Broker {
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
         integration: (&str, &str),
-        promotes: bool,
+        promotion: (bool, Option<String>),
         checkouts: Option<&std::collections::BTreeMap<i64, CheckoutInspection>>,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
+        let (promotes, promote_config_warning) = promotion;
         let (integration_branch, integration_head) = integration;
 
         let mut advice = Vec::new();
-        if let Some(warning) = PromoteConfig::load_with_warning(&self.main_root).1 {
+        if let Some(warning) = promote_config_warning {
             advice.push(StatusAdvice {
                 id: "promote.mode-invalid",
                 severity: StatusAdviceSeverity::Warning,
