@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, OverlapSeverity};
+use aethyme_broker::OverlapSeverity;
 
 mod common;
 
