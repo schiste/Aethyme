@@ -172,6 +172,12 @@ impl CompactStatus {
                 self.data_freshness.deferred_checks.join(", ")
             );
         }
+        if !self.summary.commands.is_empty() {
+            let _ = writeln!(output, "Next:");
+            for command in &self.summary.commands {
+                let _ = writeln!(output, "  run: {command}");
+            }
+        }
         let _ = writeln!(
             output,
             "Advice: {} categories, {} observations.",

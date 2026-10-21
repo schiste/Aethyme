@@ -159,6 +159,14 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     assert!(text.contains("count 3, 2 duplicates"));
     assert!(text.contains("Deferred checks (unknown, not clean)"));
     assert!(text.contains("aethyme broker status --json"));
+    if let Some(command) = compact["summary"]["commands"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(serde_json::Value::as_str)
+    {
+        assert!(text.contains("Next:"));
+        assert!(text.contains(command));
+    }
 }
 
 #[test]
