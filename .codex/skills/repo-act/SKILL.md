@@ -40,6 +40,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - When a managed output is also an input to generated context or freshness
   digests, update it before deriving those artifacts. Verify first deployment
   and an unchanged repeat; a second-run rewrite can reveal incorrect ordering.
+- After `aethyme deploy`, review the full skill-file diff before committing:
+  deployment can replace repository-specific lessons while freshness checks
+  still pass. For files classified as customized by `aethyme upgrade plan`, use
+  an explicit `preserve` or `merge` resolution when available; otherwise restore
+  the intended content and inspect the resulting diff. Verify the deployed text
+  and mirrored-skill parity; never commit a template overwrite blindly.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
 - Choose focused local Cargo checks by compilation target as well as test name.
