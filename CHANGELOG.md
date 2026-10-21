@@ -4,6 +4,39 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.28] - 2026-10-21
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0828).
+
+By default, each repository's broker database advances from schema 49 to 52 on
+its first writable open. Broker status and guarded coordination paths do less
+repeated inspection, and verification and gate records retain the identity
+needed to avoid reusing stale state.
+
+The v0.8.27 tag did not produce published release artifacts because its release-only
+version check expected the previous identity format. This release includes the
+repair and the changes listed below.
+
+### Changed
+
+- Verification candidates are stored as typed queue records, and cached gate
+  results are bound to the execution-profile digest. A result without a
+  captured profile is not reused.
+- Routine broker status, resource-blocker, and guarded-execution paths reduce
+  repeated liveness and historical-owner work while retaining lease ownership
+  and conflict decisions.
+- Broker recovery and local coordination workflows keep revision-bound
+  evidence, check recorded ownership before acting, and report incomplete
+  inspection as unknown.
+- Submission planning skips integration patch-history scans when session
+  commits have no patch identities, while preserving ancestry and ownership
+  classification.
+
+### Fixed
+
+- Release identity checks validate the exact tagged commit in the current version
+  output, and release checkouts do not persist credentials that mark builds dirty.
+
 ## [0.8.27] - 2026-10-21
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0827).
