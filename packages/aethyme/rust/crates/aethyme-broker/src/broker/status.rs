@@ -417,8 +417,7 @@ impl Broker {
             &[],
             &latest,
             ("", ""),
-            promotes,
-            promote_config_warning,
+            (promotes, promote_config_warning),
             None,
         );
         phase_timings_ms.insert(
@@ -840,8 +839,7 @@ impl Broker {
             &promoted_conflicts,
             &latest_live_queue,
             (&integration_branch, &integration_head),
-            promotes,
-            promote_config_warning,
+            (promotes, promote_config_warning),
             checkouts.as_ref(),
         );
         if collaboration_fence
@@ -2053,11 +2051,11 @@ impl Broker {
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
         integration: (&str, &str),
-        promotes: bool,
-        promote_config_warning: Option<String>,
+        promotion: (bool, Option<String>),
         checkouts: Option<&std::collections::BTreeMap<i64, CheckoutInspection>>,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
+        let (promotes, promote_config_warning) = promotion;
         let (integration_branch, integration_head) = integration;
 
         let mut advice = Vec::new();
