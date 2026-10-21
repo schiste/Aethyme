@@ -651,6 +651,55 @@ fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
         }
         assert_eq!(fixture.gh_log(), "", "start must not fetch missing PR data");
     }
+
+    // The PR ref exists locally and its listing head is current, but no
+    // changed-path ranges have been cached. Start must report unknown instead
+    // of deriving those paths with a potentially expensive Git diff.
+    let fixture = Fixture::new();
+    let head = fixture.publish_other("agent/other", &[(10, "theirs")], true);
+    let fetched_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let listing = serde_json::json!({
+        "fetched_at_ms": fetched_at_ms,
+        "base": "main",
+        "prs": [{
+            "number": 12,
+            "url": "https://github.com/acme/project/pull/12",
+            "head": "agent/other",
+            "head_oid": head,
+        }],
+    });
+    let broker = fixture.broker();
+    broker
+        .store()
+        .meta_set("pr_overlap.open_prs", &listing.to_string())
+        .unwrap();
+    assert_eq!(
+        broker.store().meta_get("pr_overlap.ranges.12").unwrap(),
+        None,
+        "fixture keeps a valid local PR ref but no cached changed paths"
+    );
+    drop(broker);
+    fixture.clear_gh_log();
+    let report = json(&fixture.run(&[
+        "start",
+        "--task",
+        "work on a planned path",
+        "--path",
+        "shared.txt",
+        "--json",
+    ]));
+    let check = &report["planned_path_pr_overlaps"];
+    assert_eq!(check["cache_available"], true, "{report}");
+    assert_eq!(check["unknown_prs"], serde_json::json!([12]), "{report}");
+    assert_eq!(check["overlaps"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        fixture.gh_log(),
+        "",
+        "uncached paths must remain unknown without GitHub fallback"
+    );
 }
 
 /// Changed lines two apart from an open PR's: Git would conflict on them.

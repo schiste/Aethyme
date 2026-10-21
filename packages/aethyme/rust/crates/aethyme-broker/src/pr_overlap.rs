@@ -376,7 +376,7 @@ impl Broker {
     }
 
     /// Compare explicit planned paths with cached open-PR changed paths.
-    /// Reads only the broker cache and local refs; it never calls GitHub.
+    /// Reads only the broker cache; it never inspects Git history or calls GitHub.
     pub(crate) fn cached_planned_path_pr_overlaps(
         &self,
         session: &crate::Session,
@@ -440,10 +440,7 @@ impl Broker {
             warning: None,
         };
         for pr in other_open_prs(&listing, &session.branch) {
-            let Some(ranges) = self
-                .cached_ranges(pr)
-                .or_else(|| self.local_pr_ranges(&default, pr))
-            else {
+            let Some(ranges) = self.cached_ranges(pr) else {
                 check.unknown_prs.push(pr.number);
                 continue;
             };
