@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.29] - 2026-10-21
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0829).
+
+This patch includes the broker inspection, verification-identity and cleanup
+repairs described in v0.8.28. Upgrades from v0.8.26 migrate each repository's
+broker database from schema 49 to 52; databases already at schema 52 need no
+additional migration.
+
+### Fixed
+
+- Successful deployment no longer repeats the full readiness scan after
+  verification. It prints the explicit `aethyme broker status readiness`
+  follow-up for the deployed repository.
+
 ## [0.8.28] - 2026-10-21
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0828).

@@ -16,7 +16,7 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
@@ -75,6 +75,73 @@ sections below keep the Compatibility, Before upgrading, Migrate and verify,
 and Rollback parts of the breaking ones. The full per-release guides, including
 the non-breaking ones, remain in Git history under
 `packages/aethyme/docs/guides/`.
+
+## v0.8.29
+
+These notes cover upgrading from v0.8.26. An earlier patch or development
+installation whose broker database is already at schema 52 needs no additional
+migration.
+
+v0.8.29 migrates each repository's broker database from schema 49 to schema 52
+on its first writable open. By default, this is
+`<repo>/.aethyme/broker.db`; linked worktrees use their primary checkout's
+database. A configured `AETHYME_BROKER_DB` may redirect it, including to a
+path shared by multiple repositories. Each distinct database path migrates
+independently; the host operation and resource ledgers are separate and are
+not changed by this migration.
+
+### Compatibility
+
+The migration adds typed verification-candidate storage, establishes the
+required collaboration-capture fence, and adds a gate execution-profile
+digest. The minimum compatible schema is 52. After one database has migrated,
+v0.8.26 and earlier cannot open that database. Upgrade every installed Aethyme
+copy that can access the same database before any one of those copies opens it;
+install the router and engine pair together. A repository whose database has
+not migrated remains on its current schema.
+
+### Before upgrading
+
+Cleanup plans and new pending cleanup journals use schema 4 with a stable
+retention anchor. Existing schema-3 journals remain resumable. Before rolling
+back to an older development binary that reads broker schema 52, finish any
+pending schema-4 cleanup with v0.8.29, or use its `broker gc abandon --confirm
+<pending-digest>` command to archive the journal without deleting retained data.
+Then review a fresh cleanup plan with the selected binary; do not reuse an old
+plan digest across versions.
+
+For each repository whose broker database must remain rollback-safe, stop
+broker processes that can access it and make a separate, WAL-aware SQLite
+backup. The SQLite `.backup` command includes committed WAL content:
+
+```bash
+sqlite3 "/path/to/repo/.aethyme/broker.db" ".backup /safe/backups/repo-broker.db.pre-0.8.28"
+```
+
+If `AETHYME_BROKER_DB` redirects that repository's database, back up the
+configured file instead. Record the installed router and engine versions.
+Upgrade every installed copy that can access the same database to the matching
+v0.8.29 pair before resuming broker work against it.
+
+### Migrate and verify
+
+From each repository that has migrated, confirm the pair and broker state:
+
+```bash
+aethyme --version && aethyme-engine-cli --version
+aethyme broker status --json
+aethyme broker advanced quick-test
+```
+
+### Rollback
+
+Before a repository's database has migrated, reinstalling the v0.8.26 pair
+needs no database restore. After that database reaches schema 52, v0.8.26
+refuses it. To roll back that repository, stop every broker process that can
+access its database, reinstall the router and engine pair together, and restore
+that repository's own pre-upgrade backup. Broker state recorded after the
+backup is lost; Git commits and worktrees are unaffected. Repeat independently
+for each migrated repository database.
 
 ## v0.8.28
 
