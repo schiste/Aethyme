@@ -64,6 +64,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Retain complete stdout and stderr before parsing exact session IDs and
   structured advice fields such as severity and commands. Never infer absence
   from truncated output or suppressed stderr.
+- Before writing a broker PR body, prepare the exact body file and run the
+  pinned CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`.
+  Review each refusal; use a `Contract justification:` of at least 24 characters
+  only for a verified false-positive, while preserving the actual retirement
+  label. Confirm the actual verdict is `none` or every reported symbol has an
+  accurate contract decision; exit status or help output alone is not evidence.
+  Retain the local result before the public body write.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
