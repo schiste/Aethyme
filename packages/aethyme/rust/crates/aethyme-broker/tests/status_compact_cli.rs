@@ -184,6 +184,7 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     assert!(text.status.success());
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(text.contains("Broker status (compact)"));
+    assert!(text.contains("recorded lease-overlap observations"));
     assert!(text.contains("lease.overlap-conflict"));
     assert!(text.contains("count 3, 2 duplicates"));
     assert!(text.contains("Deferred checks (unknown, not clean)"));
