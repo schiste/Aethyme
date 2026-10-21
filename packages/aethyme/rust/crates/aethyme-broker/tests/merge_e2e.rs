@@ -130,6 +130,12 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
     .unwrap();
     sh(tmp.path(), &["add", "--", ".aethyme/config.toml"]);
     sh(tmp.path(), &["commit", "-qm", "use manual promotion"]);
+    // Submission-plan reuse requires the same canonical origin identity used
+    // by coordinated local Git writers. The URL is identity-only; no fetch runs.
+    sh(
+        tmp.path(),
+        &["remote", "add", "origin", "git@github.com:example/repo.git"],
+    );
 
     // Finish fixture history before opening the broker: its default database
     // lives in the repository and must not be staged by later branch commits.
@@ -225,7 +231,7 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
     let session_id = session.id.to_string();
     let mut command = common::broker_cli(
         env!("CARGO_BIN_EXE_broker-cli-shim"),
-        &["submit", "--session", &session_id],
+        &["submit", "--session", &session_id, "--json"],
     );
     for (key, _) in std::env::vars_os() {
         if key
@@ -275,8 +281,8 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
         })
         .count();
     assert_eq!(
-        patch_history_reads, 2,
-        "one plan reads session and integration patch histories once each; trace:\n{trace}"
+        patch_history_reads, 4,
+        "contract preflight and submit preflight each read session and integration patch histories once; JSON mode skips the separate human render, and simulation must reuse the submit preflight plan; trace:\n{trace}"
     );
 }
 

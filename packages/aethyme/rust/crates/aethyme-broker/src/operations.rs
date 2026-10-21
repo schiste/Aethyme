@@ -1088,7 +1088,7 @@ impl OperationShowReport {
 const OPERATION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OPERATION_LOCK_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
-struct RepositoryWriteLock {
+pub(crate) struct RepositoryWriteLock {
     file: File,
     acquired_at: Instant,
     acquired_at_ms: i64,
@@ -1096,6 +1096,39 @@ struct RepositoryWriteLock {
 }
 
 impl RepositoryWriteLock {
+    /// Try the same repository-wide lock used by coordinated Git writes,
+    /// without waiting or registering a coordinated-operation row.
+    ///
+    /// A caller that gets `None` must proceed without assumptions protected by
+    /// this lock. The guard is only for internal work that can safely fall back
+    /// when a writer is already active.
+    fn try_acquire_nonblocking(
+        main_root: &Path,
+        repository: &str,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        let path = repository_write_lock_path(main_root, repository);
+        let file = open_repository_write_lock_file(main_root, &path)?;
+        // SAFETY: `file` is a live descriptor opened above and remains owned by
+        // this guard. `flock` only applies an advisory lock to that descriptor.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(Self {
+                file,
+                acquired_at: Instant::now(),
+                acquired_at_ms: unix_now_ms(),
+                queue_wait_ms: 0,
+            }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        Err(BrokerOpError::OperationIo {
+            path,
+            source: error,
+        })
+    }
+
     fn acquire(
         main_root: &Path,
         repository: &str,
@@ -1126,22 +1159,8 @@ impl RepositoryWriteLock {
         mut report_progress: impl FnMut(&str, Duration),
     ) -> Result<Self, BrokerOpError> {
         debug_assert!(!progress_interval.is_zero());
-        let dir = main_root.join(".aethyme/locks/operations");
-        std::fs::create_dir_all(&dir).map_err(|source| BrokerOpError::OperationIo {
-            path: dir.clone(),
-            source,
-        })?;
-        let path = dir.join(format!("{:016x}.lock", stable_hash(repository.as_bytes())));
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| BrokerOpError::OperationIo {
-                path: path.clone(),
-                source,
-            })?;
+        let path = repository_write_lock_path(main_root, repository);
+        let file = open_repository_write_lock_file(main_root, &path)?;
         // Try without blocking first, so the uncontended path stays a single
         // syscall and the holder lookup only runs when it can actually help.
         // SAFETY: `file` is a live `File` opened above and still owned here, so
@@ -1253,6 +1272,63 @@ impl RepositoryWriteLock {
     fn hold_duration_ms(&self) -> i64 {
         self.acquired_at.elapsed().as_millis() as i64
     }
+}
+
+fn repository_write_lock_path(main_root: &Path, repository: &str) -> PathBuf {
+    main_root
+        .join(".aethyme/locks/operations")
+        .join(format!("{:016x}.lock", stable_hash(repository.as_bytes())))
+}
+
+fn open_repository_write_lock_file(main_root: &Path, path: &Path) -> Result<File, BrokerOpError> {
+    let dir = main_root.join(".aethyme/locks/operations");
+    std::fs::create_dir_all(&dir)
+        .map_err(|source| BrokerOpError::OperationIo { path: dir, source })?;
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|source| BrokerOpError::OperationIo {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Acquire the write lock that coordinated local Git writes use for this
+/// checkout. Reusable submit planning is allowed only when `origin` identifies
+/// the repository, so this key is the same canonical one used by those writes.
+pub(crate) fn try_acquire_local_repository_write_lock(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+) -> Result<Option<(String, RepositoryWriteLock)>, BrokerOpError> {
+    let Some(repository) = local_repository_coordination_key(checkout, None)? else {
+        return Ok(None);
+    };
+    Ok(
+        RepositoryWriteLock::try_acquire_nonblocking(main_root, &repository)?
+            .map(|lock| (repository, lock)),
+    )
+}
+
+/// Whether a repo-wide mutating operation has an outcome that may still affect
+/// the repository after its writer process lost the shared flock. Prepared
+/// records can be queued before taking the lock, so they do not prove that a
+/// child may have escaped; Running and OutcomeUnknown do.
+pub(crate) fn has_unresolved_repository_wide_mutation(
+    store: &crate::BrokerStore,
+    repository: &str,
+) -> Result<bool, crate::BrokerError> {
+    Ok(store
+        .unresolved_coordinated_operations(repository)?
+        .iter()
+        .any(|operation| {
+            matches!(
+                operation.status,
+                OperationStatus::Running | OperationStatus::OutcomeUnknown
+            ) && stored_resource_scope(operation).is_none()
+        }))
 }
 
 /// Probe with signal 0: reports whether a process can be signalled without
@@ -2877,6 +2953,13 @@ fn canonical_local_repository(
     let Ok(repo) = crate::GitRepo::discover(cwd) else {
         return Ok(None);
     };
+    local_repository_coordination_key(&repo, assertion)
+}
+
+fn local_repository_coordination_key(
+    repo: &crate::GitRepo,
+    assertion: Option<&str>,
+) -> Result<Option<String>, BrokerOpError> {
     match repo.resolve_remote_target("origin", assertion) {
         Ok(target) => Ok(Some(target.coordination_key)),
         Err(crate::RemoteTargetError::AssertionMismatch {

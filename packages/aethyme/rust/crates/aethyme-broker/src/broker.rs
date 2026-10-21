@@ -3220,6 +3220,18 @@ pub(crate) enum ArtifactSweepNamespaceRegistration {
     InvalidRegistry,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubmissionPlanTestPhase {
+    PreflightPlanReady,
+    ConsumerStarting,
+    BaseTreeCaptured,
+}
+
+#[cfg(test)]
+pub(crate) type SubmissionPlanTestObserver =
+    std::sync::Arc<dyn Fn(SubmissionPlanTestPhase) + Send + Sync>;
+
 /// One broker instance per repository: git handle on the main checkout +
 /// the shared store. Open from ANY path inside the repo (including a
 /// linked worktree) — state always resolves to the main checkout.
@@ -3246,6 +3258,9 @@ pub struct Broker {
     /// Registered durable namespace for artifact-sweep state, derived from
     /// the exact storage context captured by this broker.
     pub(crate) artifact_sweep_namespace: std::cell::OnceCell<String>,
+    /// Per-instance synchronization seam for the submit-plan reuse tests.
+    #[cfg(test)]
+    pub(crate) submission_plan_test_observer: Option<SubmissionPlanTestObserver>,
 }
 
 mod cleanup;

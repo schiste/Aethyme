@@ -273,6 +273,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   check child output on the intended stream separately. A report may retain
   the original command arguments, so searching its serialized text for a child
   marker cannot establish output isolation. Assert command metadata separately.
+- For CLI subprocess-count regressions, trace the complete invoked path,
+  including contract preflight, human-only rendering, and the operation itself.
+  Derive expectations from the exact argv and fixture preconditions; use JSON
+  mode when human rendering is outside the behavior under test, and retain an
+  intended guard-removal failure plus a restored positive to prove the count
+  detects the removed optimization.
 - For a production guard that must prevent side effects, test the real entrypoint
   with a fixture command that writes a unique sentinel. Assert the typed refusal
   and sentinel absence, then remove only the call-site guard in a mutation run
