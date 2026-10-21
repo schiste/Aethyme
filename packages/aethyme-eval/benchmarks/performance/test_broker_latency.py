@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 import unittest
 
-from broker_latency import assess
+from broker_latency import (
+    assess,
+    summarize_diagnostic,
+    validate_aged_released_resource_lease_count,
+    validate_resource_inventory,
+)
 
 
 class BudgetPolicyTests(unittest.TestCase):
@@ -60,6 +65,47 @@ class BudgetPolicyTests(unittest.TestCase):
                              ('statistic', 'minimum'), ('unit', 'seconds')):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 assess({**self.budgets, field: value}, self.samples)
+
+
+class AgedHistoryTests(unittest.TestCase):
+    def test_released_lease_count_is_bounded_and_zero_is_default(self):
+        for count in (0, 1, 30_000, 50_000):
+            with self.subTest(count=count):
+                self.assertEqual(validate_aged_released_resource_lease_count(count), count)
+        for count in (-1, 50_001, True, 1.5):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                validate_aged_released_resource_lease_count(count)
+
+    def test_fixture_resource_inventory_requires_fixture_identity_and_no_tokens(self):
+        repo = 'a' * 64
+        lease = {
+            'lease_id': 'fixture-lease', 'repository': repo,
+            'worktree_fingerprint': 'b' * 64, 'generation': 2,
+            'state': 'released', 'allocations': [{'kind': 'capacity'}],
+        }
+        self.assertEqual(validate_resource_inventory([lease], repo), [lease])
+        active = {**lease, 'state': 'active'}
+        self.assertEqual(validate_resource_inventory([active], repo, allow_released=False),
+                         [active])
+        for invalid, message in (
+                ({**active, 'repository': 'outside-playground'}, 'non-fixture repository'),
+                ({**active, 'worktree_fingerprint': '/outside/repository'},
+                 'non-fixture worktree fingerprint'),
+                ({**active, 'ownership_token': 'secret'}, 'secret-bearing lease'),
+                ({**active, 'state': 'released'}, 'released host-resource lease'),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(RuntimeError, message):
+                validate_resource_inventory([invalid], repo, allow_released=False)
+
+    def test_aged_history_samples_are_unbudgeted_diagnostics(self):
+        result = summarize_diagnostic([4.0, 2.0, 12.0])
+        self.assertEqual(result['samples_ms'], [4.0, 2.0, 12.0])
+        self.assertEqual(result['median_ms'], 4.0)
+        self.assertIsNone(result['budget_ms'])
+        self.assertEqual(result['verdict'], 'diagnostic_only')
+        for samples in ([], [-1], [True], [float('nan')]):
+            with self.subTest(samples=samples), self.assertRaises(ValueError):
+                summarize_diagnostic(samples)
 
 
 if __name__ == '__main__':
