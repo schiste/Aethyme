@@ -13,16 +13,23 @@ use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
+fn clear_git_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+    {
+        command.env_remove(key);
+    }
+}
+
 fn git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    clear_git_environment(&mut command);
+    command
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .unwrap();
+        .env("GIT_COMMITTER_EMAIL", "t@t");
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "git {args:?}: {}",
@@ -88,7 +95,8 @@ impl Fixture {
             self.bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new(CLI)
+        let mut command = Command::new(CLI);
+        command
             .args([
                 "check-contract",
                 "--base",
@@ -99,10 +107,99 @@ impl Fixture {
                 "consumers.md",
             ])
             .current_dir(&self.repo)
-            .env("PATH", path)
-            .output()
-            .unwrap()
+            .env("PATH", path);
+        clear_git_environment(&mut command);
+        command.output().unwrap()
     }
+}
+
+/// A PR diff must start at the common ancestor, so commits added to the base
+/// branch after the PR fork do not appear as removals from the PR.
+fn stale_base_fixture(pr_removes_symbol: bool, decision: bool) -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("consumers.md"), "- `tracked-entry-point`\n").unwrap();
+    std::fs::write(repo.join("cli.rs"), "\"tracked-entry-point\" => run(),\n").unwrap();
+    git(&repo, &["add", "consumers.md", "cli.rs"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    git(&repo, &["switch", "-qc", "agent/pr"]);
+    if pr_removes_symbol {
+        std::fs::write(repo.join("cli.rs"), "\n").unwrap();
+    } else {
+        std::fs::write(repo.join("pr-change.rs"), "fn change() {}\n").unwrap();
+    }
+    if decision {
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &[
+                "commit",
+                "-qm",
+                "fix(cli): remove old entry point",
+                "-m",
+                "Contract decision: hard-delete",
+            ],
+        );
+    } else {
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "chore: update PR"]);
+    }
+    git(&repo, &["switch", "-q", "main"]);
+    std::fs::write(
+        repo.join("main-only.rs"),
+        "// tracked-entry-point was added on main after the PR fork\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "main-only.rs"]);
+    git(&repo, &["commit", "-qm", "feat: add main-only reference"]);
+    git(&repo, &["switch", "-q", "agent/pr"]);
+    Fixture {
+        _tmp: tmp,
+        repo,
+        bin,
+    }
+}
+
+fn merge_base(fixture: &Fixture) -> String {
+    let mut command = Command::new("git");
+    command
+        .args(["merge-base", "main", "HEAD"])
+        .current_dir(&fixture.repo);
+    clear_git_environment(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "git merge-base failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn check_pr(fixture: &Fixture, base: &str) -> Output {
+    let mut command = Command::new(CLI);
+    command
+        .args([
+            "check-contract",
+            "--base",
+            base,
+            "--consumers-doc",
+            "consumers.md",
+        ])
+        .current_dir(&fixture.repo)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    clear_git_environment(&mut command);
+    command.output().unwrap()
 }
 
 fn text(output: &Output) -> String {
@@ -171,7 +268,8 @@ fn a_decision_in_a_commit_message_never_asks_github() {
         ],
     );
     fixture.gh("echo 'gh must not be called' >&2; exit 1");
-    let output = Command::new(CLI)
+    let mut command = Command::new(CLI);
+    command
         .args([
             "check-contract",
             "--base",
@@ -189,10 +287,73 @@ fn a_decision_in_a_commit_message_never_asks_github() {
                 fixture.bin.display(),
                 std::env::var("PATH").unwrap_or_default()
             ),
-        )
-        .output()
-        .unwrap();
+        );
+    clear_git_environment(&mut command);
+    let output = command.output().unwrap();
     let text = text(&output);
     assert_eq!(output.status.code(), Some(0), "{text}");
     assert!(!text.contains("gh must not be called"), "{text}");
+}
+
+#[test]
+fn pr_contract_diff_ignores_symbol_added_only_to_stale_base() {
+    let fixture = stale_base_fixture(false, false);
+    let base = merge_base(&fixture);
+
+    // The checker's explicit --base semantics remain a direct tree diff: a
+    // current-main base includes its unrelated new symbol and reports the
+    // PR's unchanged copy as a removal.
+    let stale = check_pr(&fixture, "main");
+    assert_eq!(stale.status.code(), Some(1), "{}", text(&stale));
+    assert!(
+        text(&stale).contains("tracked-entry-point"),
+        "{}",
+        text(&stale)
+    );
+
+    let scoped = check_pr(&fixture, &base);
+    assert_eq!(scoped.status.code(), Some(0), "{}", text(&scoped));
+}
+
+#[test]
+fn pr_contract_diff_still_rejects_a_real_removal_from_merge_base() {
+    let fixture = stale_base_fixture(true, false);
+    let base = merge_base(&fixture);
+    let output = check_pr(&fixture, &base);
+    let text = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("tracked-entry-point"), "{text}");
+}
+
+#[test]
+fn pr_contract_commit_decision_uses_the_merge_base_range() {
+    let fixture = stale_base_fixture(true, true);
+    let base = merge_base(&fixture);
+    let mut command = Command::new(CLI);
+    command
+        .args([
+            "check-contract",
+            "--base",
+            base.as_str(),
+            "--commit-messages",
+            "--consumers-doc",
+            "consumers.md",
+        ])
+        .current_dir(&fixture.repo)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    clear_git_environment(&mut command);
+    let output = command.output().unwrap();
+    let text = text(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("Contract decision in commit message"),
+        "{text}"
+    );
 }
