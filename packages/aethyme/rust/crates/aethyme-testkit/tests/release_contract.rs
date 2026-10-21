@@ -51,7 +51,10 @@ fn workflow_step_script(workflow: &str, name: &str) -> String {
             break;
         }
     }
-    assert!(!script.is_empty(), "workflow step {name:?} has an empty run block");
+    assert!(
+        !script.is_empty(),
+        "workflow step {name:?} has an empty run block"
+    );
     script
 }
 
@@ -653,14 +656,28 @@ fn release_signing_uses_retry_safe_legacy_cosign_and_preserves_standard_bundle()
     assert!(homebrew_verify.contains("--certificate-oidc-issuer"));
     assert!(!homebrew_verify.contains("--ignore-tlog"));
 
-    let sign_script =
-        workflow_step_script(&release, "Sign release assets with retry-safe legacy Cosign");
-    let convert_script =
-        workflow_step_script(&release, "Create standard bundles and verify release assets");
-    assert!(workflow_step_block(&release, "Sign release assets with retry-safe legacy Cosign")
-        .contains("COSIGN_V2: ${{ runner.temp }}/cosign-v2.6.5/cosign"));
-    assert!(workflow_step_block(&release, "Create standard bundles and verify release assets")
-        .contains("COSIGN_V3: ${{ runner.temp }}/cosign-v3.1.3/cosign"));
+    let sign_script = workflow_step_script(
+        &release,
+        "Sign release assets with retry-safe legacy Cosign",
+    );
+    let convert_script = workflow_step_script(
+        &release,
+        "Create standard bundles and verify release assets",
+    );
+    assert!(
+        workflow_step_block(
+            &release,
+            "Sign release assets with retry-safe legacy Cosign"
+        )
+        .contains("COSIGN_V2: ${{ runner.temp }}/cosign-v2.6.5/cosign")
+    );
+    assert!(
+        workflow_step_block(
+            &release,
+            "Create standard bundles and verify release assets"
+        )
+        .contains("COSIGN_V3: ${{ runner.temp }}/cosign-v3.1.3/cosign")
+    );
     for forbidden in ["--ignore-tlog", "--tlog-upload=false", "--offline"] {
         assert!(!sign_script.contains(forbidden));
         assert!(!convert_script.contains(forbidden));
@@ -783,9 +800,17 @@ esac
 
     let signature_dir = runner_temp.join("aethyme-release-signatures");
     assert!(signature_dir.join("release-manifest.legacy.json").exists());
-    assert!(signature_dir.join("aethyme-v0.8.29-x86_64-pc-windows-msvc.legacy.json").exists());
+    assert!(
+        signature_dir
+            .join("aethyme-v0.8.29-x86_64-pc-windows-msvc.legacy.json")
+            .exists()
+    );
     assert!(dist.join("release-manifest.sigstore.json").exists());
-    assert!(fixture_root.join(format!("{zip_relative}.sigstore.json")).exists());
+    assert!(
+        fixture_root
+            .join(format!("{zip_relative}.sigstore.json"))
+            .exists()
+    );
     assert!(!dist.join("release-manifest.legacy.json").exists());
 
     let expected_trace = [
