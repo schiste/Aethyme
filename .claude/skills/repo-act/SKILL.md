@@ -16,6 +16,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Run Aethyme Explore on the user task before broad manual search.
 - Verify answer candidates before concluding when trust_policy is not answer-safe.
 - Identify the nearest fast test or validation command before editing.
+- Before declaring a regression missing during issue triage, inspect likely
+  test bodies and their assertions, not only test names. An interruption or
+  recovery test may already exercise the exact state under a broader name.
 - Inspect caution zones before changing generated or vendored areas.
 
 ## Validation Checklist
