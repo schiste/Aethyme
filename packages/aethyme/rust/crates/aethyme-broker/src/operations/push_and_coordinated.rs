@@ -682,11 +682,18 @@ fn github_list_within(
     if !output.status.success() {
         return Ok(None);
     }
-    let parsed: serde_json::Value = match serde_json::from_slice(&output.stdout) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(None),
-    };
-    Ok(parsed.as_array().cloned())
+    Ok(parse_github_listing(
+        &output.stdout,
+        output.stdout_truncated,
+    ))
+}
+
+fn parse_github_listing(stdout: &[u8], stdout_truncated: bool) -> Option<Vec<serde_json::Value>> {
+    if stdout_truncated {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    parsed.as_array().cloned()
 }
 
 /// Record the number the repository stands at before a create runs.
@@ -746,6 +753,16 @@ fn created_resource_url(stdout: &str, repository: &str) -> Option<String> {
                 })
         })
         .map(str::to_string)
+}
+
+fn created_resource_url_if_complete(
+    stdout: &str,
+    repository: &str,
+    stdout_truncated: bool,
+) -> Option<String> {
+    (!stdout_truncated)
+        .then(|| created_resource_url(stdout, repository))
+        .flatten()
 }
 
 /// HTTP statuses with which GitHub rejects a request outright: the request was
@@ -905,6 +922,18 @@ fn classify_github_refusal(
         })
 }
 
+fn classify_github_refusal_if_complete(
+    args: &[String],
+    exit_code: Option<i32>,
+    stderr: &[u8],
+    stderr_truncated: bool,
+) -> Option<serde_json::Value> {
+    if stderr_truncated {
+        return None;
+    }
+    classify_github_refusal(args, exit_code, stderr)
+}
+
 /// Decide whether a failed `gh` create nevertheless created something.
 ///
 /// The same shape as [`reconcile_failed_push`]: observe external state, then
@@ -930,6 +959,7 @@ fn reconcile_failed_github_create(
         repository,
         planning,
         stdout,
+        false,
         AdmissionDeadline::start(QueueWait::Forever),
     )
     .ok()
@@ -941,6 +971,7 @@ fn reconcile_failed_github_create_with_deadline(
     repository: &str,
     planning: &CreatePlanning,
     stdout: &[u8],
+    stdout_truncated: bool,
     deadline: AdmissionDeadline,
 ) -> Result<Option<(OperationStatus, serde_json::Value)>, BrokerOpError> {
     let CreatePlanning::Planned(plan) = planning else {
@@ -953,7 +984,11 @@ fn reconcile_failed_github_create_with_deadline(
         }));
     };
     let mut value = planning.journal_value().expect("planned create");
-    if let Some(created) = created_resource_url(&String::from_utf8_lossy(stdout), repository) {
+    if let Some(created) = created_resource_url_if_complete(
+        &String::from_utf8_lossy(stdout),
+        repository,
+        stdout_truncated,
+    ) {
         value["evidence"] = json!({
             "classification": "succeeded",
             "source": "command_output",
@@ -1974,7 +2009,7 @@ impl Broker {
     ) -> Result<CoordinatedOperationReport, BrokerOpError>
     where
         P: FnOnce() -> Result<(), String>,
-        F: FnOnce(&[u8], i64) -> Result<Option<serde_json::Value>, String>,
+        F: FnOnce(&CapturedOutput, i64) -> Result<Option<serde_json::Value>, String>,
     {
         // Starts before any preparation, so what preparation spends is taken
         // out of what the lock may wait (#219).
@@ -2300,8 +2335,18 @@ impl Broker {
                     // session waited on a gate that was going to refuse anyway.
                     let mut details = json!({ "reason": "pre_push_refused" });
                     add_failure_stderr(&mut details, &output.stderr);
+                    if output.stdout_truncated || output.stderr_truncated {
+                        details["output_truncated"] = json!({
+                            "stdout": output.stdout_truncated,
+                            "stderr": output.stderr_truncated,
+                        });
+                    }
                     self.resolve_unstarted_operation_with_details(queued_operation_id, details);
-                    let safe_stderr = redacted_failure_stderr(&output.stderr);
+                    let safe_stderr = if output.stderr_truncated {
+                        "provider stderr exceeded the broker capture limit; captured diagnostic is incomplete".into()
+                    } else {
+                        redacted_failure_stderr(&output.stderr)
+                    };
                     return Err(BrokerOpError::InvalidCoordinatedOperation {
                         reason: format!(
                             "the repository's pre-push hook refused this push before the lock was taken: {}",
@@ -2718,7 +2763,7 @@ impl Broker {
             .and_then(GitTransferTrace::remote_contact);
         let exit_code = output.status.code().map(i64::from);
         let (status, mut details) = if output.status.success() {
-            match on_success(&output.stdout, operation.id) {
+            match on_success(&output, operation.id) {
                 Ok(Some(result)) => (
                     OperationStatus::Succeeded,
                     journal_details(
@@ -2802,6 +2847,7 @@ impl Broker {
                 &target.display_slug,
                 &create_planning,
                 &output.stdout,
+                output.stdout_truncated,
                 admission,
             )
             .ok()
@@ -2818,7 +2864,14 @@ impl Broker {
                 ),
             )
         } else if let Some(refusal) = (request.provider == OperationProvider::Github)
-            .then(|| classify_github_refusal(&request.args, output.status.code(), &output.stderr))
+            .then(|| {
+                classify_github_refusal_if_complete(
+                    &request.args,
+                    output.status.code(),
+                    &output.stderr,
+                    output.stderr_truncated,
+                )
+            })
             .flatten()
         {
             // GitHub said no to the command's only mutation, so nothing was
@@ -2862,6 +2915,12 @@ impl Broker {
         if request.provider == OperationProvider::Git && !output.status.success() {
             add_failure_stderr(&mut details, &output.stderr);
         }
+        if output.stdout_truncated || output.stderr_truncated {
+            details["output_truncated"] = json!({
+                "stdout": output.stdout_truncated,
+                "stderr": output.stderr_truncated,
+            });
+        }
         // The row leaves `running` on the next statement, after which liveness
         // is no longer consulted, so this is the first moment the heartbeat is
         // redundant rather than load-bearing.
@@ -2887,6 +2946,7 @@ impl Broker {
         }
         let created_pull_request_number = (output.status.success()
             && request.provider == OperationProvider::Github
+            && !output.stdout_truncated
             && crate::creates_pull_request(&request.args))
         .then(|| crate::pull_request_number_from_output(&String::from_utf8_lossy(&output.stdout)))
         .flatten();
@@ -2898,6 +2958,8 @@ impl Broker {
             command_success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout_truncated: output.stdout_truncated,
+            stderr_truncated: output.stderr_truncated,
             post_merge_cleanup: None,
             representing_commit: None,
             created_pull_request: created_pull_request_number,

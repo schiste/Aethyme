@@ -216,8 +216,14 @@ pub fn file_reviewed_report(
             }
             Ok(())
         },
-        |stdout, operation_id| {
-            let identity = parse_issue_identity(stdout, repository)?;
+        |output, operation_id| {
+            if output.stdout_truncated {
+                return Err(
+                    "provider stdout exceeded the capture limit; issue identity is incomplete"
+                        .into(),
+                );
+            }
+            let identity = parse_issue_identity(&output.stdout, repository)?;
             persist_filing_record(
                 &reports_root,
                 &artifact.report_digest,

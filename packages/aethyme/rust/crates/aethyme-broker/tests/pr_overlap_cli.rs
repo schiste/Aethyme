@@ -479,6 +479,32 @@ fn an_unreadable_pull_request_is_unknown_not_an_error() {
     );
 }
 
+/// The overlap check must not treat a valid JSON prefix as the whole listing
+/// once the broker's per-stream capture bound was exceeded.
+#[test]
+fn a_truncated_open_pr_listing_is_reported_as_unavailable() {
+    const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
+    let fixture = Fixture::new();
+    let valid_listing = r#"[{"number":12,"url":"https://github.com/acme/project/pull/12","state":"OPEN","headRefName":"agent/other","headRefOid":"0123abcd"}]"#;
+    let mut listing = Vec::with_capacity(CAPTURE_LIMIT + 1);
+    listing.extend_from_slice(valid_listing.as_bytes());
+    listing.resize(CAPTURE_LIMIT + 1, b' ');
+    std::fs::write(fixture.tmp.path().join("open-prs.json"), listing).unwrap();
+    let (session, _) = fixture.session_editing(&[(10, "ours")]);
+
+    let report = fixture.push(session);
+    assert_eq!(report["pr_overlaps"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        report["pr_overlaps_unknown"],
+        serde_json::json!([]),
+        "{report}"
+    );
+    assert_eq!(
+        report["pr_overlap_listing_unavailable"], true,
+        "the valid JSON prefix is not a complete listing: {report}"
+    );
+}
+
 /// Without a current local ref, a push reads the PR's diff through `gh`, and
 /// `status` afterwards answers from the cache without calling `gh` at all.
 #[test]

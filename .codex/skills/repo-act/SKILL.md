@@ -77,6 +77,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Retain complete stdout and stderr before parsing exact session IDs and
   structured advice fields such as severity and commands. Never infer absence
   from truncated output or suppressed stderr.
+- When bounding subprocess output, audit every consumer for parsing or evidence
+  use. Keep draining after the cap, expose an explicit truncation signal, and
+  refuse to treat a valid-looking prefix as a complete listing or proof.
+  Preserve the provider exit status and test both the cap boundary and a
+  syntactically valid truncated prefix.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
