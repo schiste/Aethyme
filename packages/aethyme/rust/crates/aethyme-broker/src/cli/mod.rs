@@ -26,6 +26,7 @@ mod review;
 mod session;
 mod ship;
 mod status;
+mod status_compact;
 mod submit;
 mod surface;
 mod telemetry;
@@ -704,16 +705,14 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json] [--summary] [--refresh]
-      Sessions, recorded overlaps, merge queue and ref tips.
-      Session records are reported under the
-      `agents` key; the id every `--session <id>` flag expects is
-      `agents[].id`. There is no `sessions` key.
-      Routine status reads recorded leases/overlaps and size observations;
-      it does not audit cleanup eligibility or promoted conflicts. The JSON
-      and text explicitly identify unrefreshed data. --summary renders only
-      summary, advice and phase timings. --refresh explicitly performs the
-      expensive full lease, conflict and cleanup audit; use it when needed.
+  aethyme broker status [--json] [--compact] [--summary] [--refresh]
+      Default text is compact. --compact --json returns a versioned summary
+      that groups advice and marks omitted details and deferred checks; those
+      checks are unknown, not clean. Full --json retains per-session detail;
+      session records use `agents[].id` for every --session flag. The legacy
+      --summary --json shape is unchanged; --summary text remains brief.
+      --refresh explicitly performs the expensive full lease, conflict and
+      cleanup audit; use it when needed.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
@@ -1410,6 +1409,8 @@ struct Parsed {
     verify_only: bool,
     /// `status --summary`: skip the per-session lease refresh (#182).
     summary: bool,
+    /// `status --compact`: emit a compact routine response.
+    compact: bool,
     refresh: bool,
     positional: Vec<String>,
     task: Option<String>,
@@ -1564,6 +1565,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         read_only_compatibility: None,
         verify_only: false,
         summary: false,
+        compact: false,
         refresh: false,
         positional: Vec::new(),
         task: None,
@@ -1699,6 +1701,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             }
             "--json" | "--json-output" => parsed.json = true,
             "--summary" => parsed.summary = true,
+            "--compact" => parsed.compact = true,
             "--refresh" => parsed.refresh = true,
             "--follow" => parsed.follow = true,
             "--since" => {
