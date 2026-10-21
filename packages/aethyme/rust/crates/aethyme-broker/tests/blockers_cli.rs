@@ -962,11 +962,20 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
     let sibling_id = format!("lease:{}", lease_id_for("docs/"));
     let finish = format!("aethyme broker finish --session {id}");
 
-    // Nothing to deliver: `finish` closes the session and releases the lease.
-    let blocker = fixture
-        .blocker(&blocker_id)
-        .expect("stale lease is a blocker");
-    assert_eq!(blocker["clear"], finish.as_str(), "{blocker:#}");
+    // A stale path lease is not a repository-wide blocker. Its targeted
+    // recovery still refuses while the worktree exists and names `finish`.
+    assert!(fixture.blocker(&blocker_id).is_none());
+    assert!(fixture.blocker(&sibling_id).is_none());
+    let output = fixture.run(&["unblock", &blocker_id, "--json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let refusal: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("json refusal: {}", stderr(&output)));
+    assert_eq!(refusal["cleared"], false, "{refusal:#}");
+    let reason = refusal["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("worktree may hold uncommitted work") && reason.contains(&finish),
+        "the targeted refusal names the safe recovery step: {reason}"
+    );
 
     std::fs::create_dir_all(fixture.worktree.join("src")).unwrap();
     std::fs::write(fixture.worktree.join("src/lib.rs"), "fn main() {}\n").unwrap();
@@ -976,21 +985,9 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
         &["commit", "-qm", "work awaiting delivery"],
     );
 
-    let blocker = fixture
-        .blocker(&blocker_id)
-        .expect("stale lease is a blocker");
     let submit = format!("aethyme broker submit --session {id}");
-    assert_eq!(blocker["clear"], submit.as_str(), "{blocker:#}");
-    let cause = blocker["cause"].as_str().unwrap();
-    assert!(
-        cause.contains("1 committed change not yet delivered") && cause.contains(&finish),
-        "the cause says why finish is not the remedy: {cause}"
-    );
-    // The remedy is derived once per session; every lease it holds names it.
-    let sibling = fixture
-        .blocker(&sibling_id)
-        .expect("the sibling lease is a blocker");
-    assert_eq!(sibling["clear"], submit.as_str(), "{sibling:#}");
+    assert!(fixture.blocker(&blocker_id).is_none());
+    assert!(fixture.blocker(&sibling_id).is_none());
 
     let output = fixture.run(&["unblock", &blocker_id, "--json"]);
     let refusal: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -998,24 +995,43 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
     assert_eq!(refusal["cleared"], false, "{refusal:#}");
     let reason = refusal["reason"].as_str().unwrap();
     assert!(
-        reason.ends_with(&submit) && !reason.contains("finish close"),
+        reason.contains("1 committed change not yet delivered")
+            && reason.contains(&finish)
+            && reason.ends_with(&submit)
+            && !reason.contains("finish close"),
         "the refusal names submit, not a finish that would refuse: {reason}"
+    );
+
+    let sibling_output = fixture.run(&["unblock", &sibling_id, "--json"]);
+    assert_eq!(
+        sibling_output.status.code(),
+        Some(3),
+        "{}",
+        stderr(&sibling_output)
+    );
+    let sibling_refusal: serde_json::Value = serde_json::from_slice(&sibling_output.stdout)
+        .unwrap_or_else(|_| panic!("json refusal: {}", stderr(&sibling_output)));
+    assert_eq!(sibling_refusal["cleared"], false, "{sibling_refusal:#}");
+    assert!(
+        sibling_refusal["reason"]
+            .as_str()
+            .unwrap()
+            .ends_with(&submit),
+        "every targeted lease refusal names the delivery step: {sibling_refusal:#}"
     );
 
     // Uncommitted work refuses `finish` too, and is checked first, as
     // `finish` checks it.
     std::fs::write(fixture.worktree.join("src/lib.rs"), "fn main() { }\n").unwrap();
-    let blocker = fixture
-        .blocker(&blocker_id)
-        .expect("stale lease is a blocker");
-    let clear = blocker["clear"].as_str().unwrap();
-    assert!(clear.ends_with("status --short"), "{blocker:#}");
+    assert!(fixture.blocker(&blocker_id).is_none());
+    let output = fixture.run(&["unblock", &blocker_id, "--json"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let refusal: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("json refusal: {}", stderr(&output)));
+    let reason = refusal["reason"].as_str().unwrap();
     assert!(
-        blocker["cause"]
-            .as_str()
-            .unwrap()
-            .contains("uncommitted changes"),
-        "{blocker:#}"
+        reason.contains("uncommitted changes") && reason.ends_with("status --short"),
+        "the targeted refusal surfaces the dirty-worktree check: {reason}"
     );
 }
 

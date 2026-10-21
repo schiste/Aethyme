@@ -67,6 +67,14 @@ blocked.
    back as a warning naming the holder, with the `note send` command to
    coordinate.
 
+   Status and blocker listings are repository-wide; stale leases remain in the
+   lease/liveness views but do not become global path-lease blockers. These
+   listings do not decide whether a particular path claim would be refused.
+   Use `leases plan <paths...>
+   --session <your-session-id> --json` for that decision. Read
+   `would_conflict`; on a claim result, `accepted: true` with no blockers means
+   the claim was recorded, while warnings are informational.
+
    Orchestration with no path -- a release, a merge chain -- is claimed by
    name instead: `aethyme broker advanced ownership claim "release v1.2.0"
    --session <your-session-id> --reason "<why>"`. `status` shows every claim,
