@@ -67,6 +67,10 @@ fn git(cwd: &Path, args: &[&str]) {
     git_output(cwd, args);
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Thirty numbered lines, with `edits` replacing some of them.
 fn numbered(edits: &[(usize, &str)]) -> String {
     (1..=30)
@@ -90,7 +94,18 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        Self::with_tempdir(tempfile::tempdir().unwrap())
+    }
+
+    fn new_with_shell_special_path() -> Self {
+        let tmp = tempfile::Builder::new()
+            .prefix("aethyme pr overlap ' fixture ")
+            .tempdir()
+            .unwrap();
+        Self::with_tempdir(tmp)
+    }
+
+    fn with_tempdir(tmp: tempfile::TempDir) -> Self {
         let repo = tmp.path().join("repo");
         let remote = tmp.path().join("remote.git");
         let bin = tmp.path().join("bin");
@@ -125,14 +140,8 @@ impl Fixture {
             &repo,
             &["remote", "add", "origin", "git@github.com:acme/project.git"],
         );
-        git(
-            &repo,
-            &[
-                "config",
-                "core.sshCommand",
-                bin.join("ssh").to_str().unwrap(),
-            ],
-        );
+        let ssh_command = shell_quote(bin.join("ssh").to_str().unwrap());
+        git(&repo, &["config", "core.sshCommand", &ssh_command]);
         let fixture = Self {
             tmp,
             repo,
@@ -270,6 +279,27 @@ impl Fixture {
     fn clear_gh_log(&self) {
         let _ = std::fs::remove_file(self.tmp.path().join("gh-log"));
     }
+}
+
+#[test]
+fn fixture_ssh_command_quotes_temp_paths_with_spaces_and_apostrophes() {
+    let fixture = Fixture::new_with_shell_special_path();
+    let path = fixture.tmp.path().to_string_lossy();
+    assert!(
+        path.contains(' '),
+        "fixture path must contain a space: {path}"
+    );
+    assert!(
+        path.contains('\''),
+        "fixture path must contain an apostrophe: {path}"
+    );
+
+    let local_head = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
+    let remote_head = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(
+        remote_head, local_head,
+        "the initial push must reach the fixture remote"
+    );
 }
 
 fn json(output: &Output) -> serde_json::Value {
