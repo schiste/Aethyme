@@ -23,6 +23,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Before standalone `rustfmt` or `rustc` validation, resolve the owning
+  crate's Cargo edition, including workspace inheritance, and pass that edition.
+  Formatting rules vary by edition even when the source compiles in both; a
+  successful check with a guessed edition can fail workspace CI.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
   runs rather than wall-clock assertions in ordinary tests. Retain complete CLI

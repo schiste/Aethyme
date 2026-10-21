@@ -21,13 +21,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Classify from the PR merge tree. Workflow-level path filters leave required
-  # checks pending; job-level conditions below preserve their check names.
+  # Classify the PR diff with trusted classifier files from its base commit.
+  # Workflow-level path filters leave required checks pending; job conditions
+  # below preserve their check names and send uncertain diffs to full validation.
   classify_changes:
     name: Classify PR changes
     runs-on: ubuntu-latest
     outputs:
       docs_fast: ${{ steps.classify.outputs.docs_fast }}
+      performance_fast: ${{ steps.classify.outputs.performance_fast }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,7 +41,10 @@ jobs:
         run: bash .github/scripts/test-oss-checkout-credentials.sh
 
       - name: Verify classifier controls
-        run: bash .github/scripts/test-docs-fast-lane.sh
+        run: |
+          set -euo pipefail
+          bash .github/scripts/test-docs-fast-lane.sh
+          bash .github/scripts/test-performance-fast-lane.sh
 
       - name: Classify changed paths
         id: classify
@@ -51,23 +56,50 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" != "pull_request" ]]; then
             echo "docs_fast=false" >> "$GITHUB_OUTPUT"
+            echo "performance_fast=false" >> "$GITHUB_OUTPUT"
             echo "Full suite selected for a non-PR event."
             exit 0
           fi
 
-          docs_fast="$(.github/scripts/docs-fast-lane.sh "$PR_BASE_SHA" "$EVENT_SHA")"
-          case "$docs_fast" in
-            true|false)
+          trusted_classifiers="$(mktemp -d "$RUNNER_TEMP/fast-lane-classifiers.XXXXXX")"
+          trap 'rm -rf "$trusted_classifiers"' EXIT
+
+          if git show "$PR_BASE_SHA:.github/scripts/docs-fast-lane.sh" \
+            >"$trusted_classifiers/docs-fast-lane.sh" 2>/dev/null; then
+            docs_fast="$(bash "$trusted_classifiers/docs-fast-lane.sh" "$PR_BASE_SHA" "$EVENT_SHA")"
+          else
+            docs_fast=false
+            echo "Trusted docs classifier is unavailable; selecting the full suite."
+          fi
+          if git show "$PR_BASE_SHA:.github/scripts/performance-fast-lane.sh" \
+            >"$trusted_classifiers/performance-fast-lane.sh" 2>/dev/null; then
+            performance_fast="$(bash "$trusted_classifiers/performance-fast-lane.sh" "$PR_BASE_SHA" "$EVENT_SHA")"
+          else
+            performance_fast=false
+            echo "Trusted performance classifier is unavailable; selecting the full suite."
+          fi
+          case "$docs_fast:$performance_fast" in
+            true:true)
+              echo "Both fast-lane classifiers selected the same diff; selecting full validation." >&2
+              echo "docs_fast=false" >> "$GITHUB_OUTPUT"
+              echo "performance_fast=false" >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+            true:false|false:true|false:false)
               printf 'docs_fast=%s\n' "$docs_fast" >> "$GITHUB_OUTPUT"
+              printf 'performance_fast=%s\n' "$performance_fast" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "Classifier returned an invalid result; selecting the full suite." >&2
               echo "docs_fast=false" >> "$GITHUB_OUTPUT"
+              echo "performance_fast=false" >> "$GITHUB_OUTPUT"
               exit 1
               ;;
           esac
           if [[ "$docs_fast" == "true" ]]; then
             echo "Docs-only path: run the mirrored skill parity tests; skip product builds."
+          elif [[ "$performance_fast" == "true" ]]; then
+            echo "Performance-reporting path: run skill parity and bounded Python/workflow validation; skip product builds."
           else
             echo "Full validation path selected."
           fi
@@ -82,7 +114,7 @@ jobs:
   product-path-no-python:
     name: Product path (no Python on PATH)
     needs: classify_changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -213,16 +245,17 @@ jobs:
   # The pytest harness that used to live here retired on 2026-08-06
   # (python-retirement Phase 7). Its implementation-blind suites are now
   # `aethyme-cli/tests/` and `aethyme-testkit/tests/`, so `cargo test
-  # --workspace` is the whole test story for packages/aethyme and this
-  # workflow installs no Python at all. `packages/aethyme-eval` keeps its
-  # own Python by design and its own gate.
+  # --workspace` is the whole Rust test story for packages/aethyme. The normal
+  # product lane remains Python-free; `packages/aethyme-eval` keeps its Python
+  # tooling by design and has a narrow reporting-only fast lane below.
   rust-tests:
     name: Rust workspace tests
     needs: classify_changes
     # Main receives the same full workspace coverage through Aethyme Gates;
     # `warm-rust-cache` below compiles main's tests so this job starts warm.
-    # On mirrored Markdown-only PRs, this required check runs the exact skill
-    # parity tests with rustc directly; all uncertain diffs run the full suite.
+    # Mirrored Markdown-only PRs run the exact skill parity tests with rustc
+    # directly. Exact performance-reporting PRs also run parity plus bounded
+    # Python/workflow checks; all uncertain diffs run the full Rust suite.
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     defaults:
@@ -245,7 +278,7 @@ jobs:
       # not save: a cache written by a pull request is visible only to that
       # pull request, and would evict main's.
       - name: Cache Rust build
-        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: packages/aethyme/rust
@@ -253,7 +286,7 @@ jobs:
           save-if: false
 
       - name: Run mirrored skill parity tests without Cargo
-        if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast == 'true' }}
+        if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
@@ -261,8 +294,13 @@ jobs:
             -o "$RUNNER_TEMP/skill-parity-tests"
           "$RUNNER_TEMP/skill-parity-tests" --test-threads=1
 
+      - name: Validate non-Rust performance reporting
+        if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.performance_fast == 'true' }}
+        working-directory: ${{ github.workspace }}
+        run: bash .github/scripts/validate-performance-fast-lane.sh
+
       - name: Install cargo-nextest
-        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest@0.9.146
@@ -273,7 +311,7 @@ jobs:
       # lock for minutes each. Build once here; the test step sets
       # AETHYME_TESTKIT_PREBUILT_BINS=1 to use these binaries directly.
       - name: Build the product binaries
-        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
         run: cargo build --locked --workspace --bins
 
       # Compiling and running are separate steps so the job's log shows which
@@ -281,11 +319,11 @@ jobs:
       # download the `cargo-timings` artifact for the HTML report. nextest then
       # reuses these test binaries instead of building them.
       - name: Compile the workspace tests
-        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
         run: cargo test --locked --workspace --no-run --timings
 
       - name: Upload the compile timings
-        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cargo-timings
@@ -299,7 +337,7 @@ jobs:
       # The same command a workstation runs (#598): it sets the CI
       # environment, uses `--profile ci`, and prints the slowest tests.
       - name: Run workspace tests
-        if: ${{ needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true' }}
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
         run: ../scripts/test-like-ci.sh --full
 
   # nextest runs neither example targets nor doctests. The release-manifest
@@ -308,7 +346,7 @@ jobs:
   rust-examples-doctests:
     name: Rust examples and doctests
     needs: classify_changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -345,9 +383,9 @@ jobs:
   # the trees differ and every gate runs.
   record-tested-tree:
     name: Record the tested tree
-    # A docs-fast tree did not run the workspace/examples suites; never emit
+    # Fast-lane trees did not run the workspace/examples suites; never emit
     # the artifact that tells Aethyme Gates those suites covered this tree.
-    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' }}
+    if: ${{ github.event_name == 'pull_request' && needs.classify_changes.result == 'success' && needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true' }}
     needs: [classify_changes, rust-tests, rust-examples-doctests]
     runs-on: ubuntu-latest
     steps:
@@ -423,7 +461,7 @@ jobs:
   lint:
     name: Rust lint (fmt, clippy)
     needs: classify_changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || needs.classify_changes.outputs.docs_fast != 'true') }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
     runs-on: ubuntu-latest
     defaults:
       run:
