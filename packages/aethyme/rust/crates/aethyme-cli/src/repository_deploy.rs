@@ -131,7 +131,7 @@ pub fn run(args: &[String]) -> u8 {
     let verified = verify_repository(&repo);
     if verified == 0 {
         print_artifact_ownership();
-        print_readiness(&repo);
+        print_readiness_followup();
     }
     warn_broken_hooks_path(&repo);
     verified
@@ -366,7 +366,7 @@ fn deploy_local_repository(repo: &Path, force: bool) -> u8 {
     if verified == 0 {
         println!("Local-only Aethyme activation verified; Git tracks no activation artifacts.");
         println!("Other clones remain inactive unless they create .aethyme/local/enabled.");
-        print_readiness(repo);
+        print_readiness_followup();
     }
     verified
 }
@@ -408,9 +408,10 @@ fn print_checks(report: &aethyme_broker::init::InitReport) {
     }
 }
 
-fn print_readiness(repo: &Path) {
-    let report = aethyme_broker::inspect_repository_readiness(repo);
-    print!("\n{}", aethyme_broker::render_readiness_text(&report));
+fn print_readiness_followup() {
+    println!(
+        "For the full operational readiness report, run `aethyme broker status readiness` from the deployed repository."
+    );
 }
 
 fn print_artifact_ownership() {
