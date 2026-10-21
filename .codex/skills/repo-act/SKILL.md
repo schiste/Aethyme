@@ -206,6 +206,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   does not freeze current eligibility; accept missing rows for crash replay only
   after confirming they are absent. Test resume after a public state mutation
   changes a row's protection.
+- For GC plans with age-based retention, bind a UTC-day floor anchor separately
+  from the exact evaluation timestamp and use it for every age-derived plan
+  field or cutoff included in the digest, including gate-cache candidate age
+  text and journaled cutoffs. Preserve exact-time behavior for legacy journals
+  and keep real current-time liveness and revalidation checks. If a plan can
+  rewrite telemetry history, exclude that plan's own metric even when output
+  measurement is opted in.
 - For runtime rollout and dogfooding, resolve the executable actually selected
   by PATH and compare its version with the repository runtime pointer. Pin the
   verified executable for subsequent commands; the pointer alone does not prove
@@ -279,6 +286,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Derive fixture field paths from the actual serde producer, including
   `flatten`, and verify the complete real CLI JSON response; do not infer wire
   nesting from Rust struct nesting.
+- Before publishing a PR body, run the repository's contract checker against
+  that exact body and base. Use its literal checkbox syntax (for example,
+  `- [x] **none**`), not prose such as `Contract: none`, and verify the checker
+  accepts the prepared body.
 - Before changing CLI advice commands, trace the public resolver, aliases and
   flag allowlist through to the handler. A handler alone may not describe the
   accepted public spelling. Exercise the emitted command through the real CLI

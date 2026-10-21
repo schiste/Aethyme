@@ -28,7 +28,9 @@ pub(crate) use tree_removal::{
     remove_condemned_tree_with_progress, remove_condemned_tree_with_progress_and_guard,
 };
 
-pub const GC_PLAN_SCHEMA_VERSION: u32 = 3;
+pub const GC_PLAN_SCHEMA_VERSION: u32 = 4;
+const GC_LEGACY_PLAN_SCHEMA_VERSION: u32 = 3;
+const MILLIS_PER_DAY: i64 = 86_400_000;
 const GC_JOURNAL_ARCHIVE_DIRECTORY: &str = "gc-journal-archives";
 const GC_JOURNAL_ARCHIVE_PREFIX: &str = "gc-journal-abandoned-";
 const GC_JOURNAL_ARCHIVE_SUFFIX: &str = ".json";
@@ -41,7 +43,17 @@ fn gc_journal_archive_directory_scan_has_budget(entries_seen: usize) -> bool {
 }
 
 fn gc_journal_schema_is_revocable(version: u32) -> bool {
-    matches!(version, 2 | GC_PLAN_SCHEMA_VERSION)
+    matches!(
+        version,
+        2 | GC_LEGACY_PLAN_SCHEMA_VERSION | GC_PLAN_SCHEMA_VERSION
+    )
+}
+
+fn gc_journal_schema_is_resumable(version: u32) -> bool {
+    matches!(
+        version,
+        GC_LEGACY_PLAN_SCHEMA_VERSION | GC_PLAN_SCHEMA_VERSION
+    )
 }
 
 fn is_sha256_digest(value: &str) -> bool {
@@ -514,7 +526,7 @@ fn is_real_directory(path: &Path) -> bool {
 }
 
 fn days_between(now: i64, earlier: i64) -> u32 {
-    u32::try_from(now.saturating_sub(earlier) / 86_400_000).unwrap_or(u32::MAX)
+    u32::try_from(now.saturating_sub(earlier) / MILLIS_PER_DAY).unwrap_or(u32::MAX)
 }
 
 /// Classify a build directory found beneath `root`, if it is one.
@@ -813,7 +825,16 @@ fn now_ms() -> i64 {
 }
 
 fn cutoff(now: i64, days: u32) -> i64 {
-    now.saturating_sub(i64::from(days).saturating_mul(86_400_000))
+    now.saturating_sub(i64::from(days).saturating_mul(MILLIS_PER_DAY))
+}
+
+/// Floor an exact timestamp to midnight UTC, so every age-based decision in a
+/// new plan remains stable for the rest of that UTC day. This is deliberately
+/// separate from `evaluated_at`, which remains the actual observation time.
+fn utc_day_floor_ms(timestamp_ms: i64) -> i64 {
+    timestamp_ms
+        .div_euclid(MILLIS_PER_DAY)
+        .saturating_mul(MILLIS_PER_DAY)
 }
 
 fn sum_inode_estimates(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
@@ -1121,6 +1142,8 @@ struct GcJournal {
     schema_version: u32,
     digest: String,
     evaluated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    age_anchor_ms: Option<i64>,
     policy: RetentionPolicy,
     remaining_rows: Vec<GcRowCandidate>,
     remaining_files: Vec<GcFileCandidate>,
@@ -1155,6 +1178,34 @@ struct GcJournal {
     reclaimed_bytes: u64,
 }
 
+/// Resolve the age reference used to resume a reviewed journal. Schema 3 did
+/// not carry an anchor, so it must keep using its exact evaluation timestamp.
+/// Schema 4 binds the UTC-day floor into the plan digest and must carry that
+/// exact floor in the journal.
+fn gc_journal_age_reference_ms(journal: &GcJournal) -> Result<i64, BrokerOpError> {
+    match journal.schema_version {
+        GC_LEGACY_PLAN_SCHEMA_VERSION => Ok(journal.evaluated_at),
+        GC_PLAN_SCHEMA_VERSION => {
+            let Some(age_anchor_ms) = journal.age_anchor_ms else {
+                return Err(BrokerOpError::InvalidGcJournal {
+                    reason: "schema 4 journal is missing its digest-bound UTC-day age anchor"
+                        .into(),
+                });
+            };
+            if age_anchor_ms != utc_day_floor_ms(journal.evaluated_at) {
+                return Err(BrokerOpError::InvalidGcJournal {
+                    reason: "schema 4 journal age anchor is not the UTC-day floor of evaluated_at"
+                        .into(),
+                });
+            }
+            Ok(age_anchor_ms)
+        }
+        version => Err(BrokerOpError::InvalidGcJournal {
+            reason: format!("schema {version} has no resumable GC age reference"),
+        }),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct GcJournalAbandonReport {
     pub(crate) digest: String,
@@ -1174,6 +1225,7 @@ impl From<GcPlan> for GcJournal {
             schema_version: plan.schema_version,
             digest: plan.digest,
             evaluated_at: plan.evaluated_at,
+            age_anchor_ms: plan.age_anchor_ms,
             policy: plan.policy,
             remaining_rows: plan.rows,
             remaining_files: plan.files,
@@ -2676,7 +2728,7 @@ impl Broker {
     /// candidate sets never double-count the same bytes.
     fn artifact_candidates(
         &self,
-        evaluated_at: i64,
+        age_anchor_ms: i64,
         policy: &RetentionPolicy,
         cleanup: &[crate::CleanupWorktreePlan],
         sessions: &BTreeMap<i64, crate::Session>,
@@ -2685,7 +2737,7 @@ impl Broker {
     ) -> ArtifactCandidates {
         let budget = (!size_scan.measures()).then_some(HEALTH_CHECK_ARTIFACT_SCAN_BUDGET);
         self.artifact_candidates_within(
-            evaluated_at,
+            age_anchor_ms,
             policy,
             cleanup,
             sessions,
@@ -2701,7 +2753,7 @@ impl Broker {
     #[allow(clippy::too_many_arguments)]
     fn artifact_candidates_within(
         &self,
-        evaluated_at: i64,
+        age_anchor_ms: i64,
         policy: &RetentionPolicy,
         cleanup: &[crate::CleanupWorktreePlan],
         sessions: &BTreeMap<i64, crate::Session>,
@@ -2726,7 +2778,7 @@ impl Broker {
                 continue;
             };
             let closed_at = session.closed_at.unwrap_or(session.updated_at);
-            let idle_days = days_between(evaluated_at, closed_at);
+            let idle_days = days_between(age_anchor_ms, closed_at);
             if idle_days < policy.artifact_reclaim_days {
                 continue;
             }
@@ -2846,7 +2898,7 @@ impl Broker {
     /// `recovery_archive_days`. `0` keeps every archive and proposes none.
     fn recovery_archive_candidates(
         &self,
-        evaluated_at: i64,
+        age_anchor_ms: i64,
         policy: &RetentionPolicy,
         scan: crate::SizeScan,
         deadline: Option<std::time::Instant>,
@@ -2901,7 +2953,7 @@ impl Broker {
                     }),
             );
             if let Some((landed, reason)) =
-                recovery_archive_disposition(self, archive, policy, evaluated_at)
+                recovery_archive_disposition(self, archive, policy, age_anchor_ms)
             {
                 candidates.push(GcRecoveryArchiveCandidate {
                     path: archive.path.to_string_lossy().into_owned(),
@@ -2936,7 +2988,7 @@ impl Broker {
     /// host-level sweep will reclaim it.
     fn orphan_candidates(
         &self,
-        evaluated_at: i64,
+        age_anchor_ms: i64,
         policy: &RetentionPolicy,
         blockers: &mut Vec<GcBlocker>,
         scan: crate::SizeScan,
@@ -3090,7 +3142,7 @@ impl Broker {
                 .and_then(|metadata| metadata.modified())
                 .ok()
                 .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|since| days_between(evaluated_at, since.as_millis() as i64))
+                .map(|since| days_between(age_anchor_ms, since.as_millis() as i64))
                 .unwrap_or(0);
             if age_days < policy.orphan_worktree_roots_days {
                 blockers.push(GcBlocker {
@@ -3174,8 +3226,8 @@ impl Broker {
         if !gc_journal_schema_is_revocable(journal.schema_version) {
             return Err(BrokerOpError::InvalidGcJournal {
                 reason: format!(
-                    "schema {} is unknown and cannot be safely abandoned (supported schemas: 2 and {})",
-                    journal.schema_version, GC_PLAN_SCHEMA_VERSION,
+                    "schema {} is unknown and cannot be safely abandoned (supported schemas: 2, {} and {})",
+                    journal.schema_version, GC_LEGACY_PLAN_SCHEMA_VERSION, GC_PLAN_SCHEMA_VERSION,
                 ),
             });
         }
@@ -3415,11 +3467,12 @@ impl Broker {
         // an in-flight SQLite query or filesystem syscall cannot be cancelled
         // by this deadline and may finish after it.
         let evaluated_at = now_ms();
+        let age_anchor_ms = utc_day_floor_ms(evaluated_at);
         let main_root = self.main_root().to_path_buf();
         let retention_config = load_retention_policy_report(&main_root)?;
         let policy = retention_config.policy;
         let retention_config_warnings = retention_config.warnings;
-        let exposure_cutoff = cutoff(evaluated_at, policy.publication_exposure_days);
+        let exposure_cutoff = cutoff(age_anchor_ms, policy.publication_exposure_days);
         let cleanup = match deadline.filter(|_| !scan.measures()) {
             Some(deadline) => self.cleanup_plan_scanned_within(
                 scan,
@@ -3446,15 +3499,15 @@ impl Broker {
             Vec::new()
         } else if deadline.is_some() {
             self.store().gc_row_candidates_for_health(
-                cutoff(evaluated_at, policy.terminal_events_days),
-                cutoff(evaluated_at, policy.gate_results_days),
-                cutoff(evaluated_at, policy.terminal_merge_queue_days),
+                cutoff(age_anchor_ms, policy.terminal_events_days),
+                cutoff(age_anchor_ms, policy.gate_results_days),
+                cutoff(age_anchor_ms, policy.terminal_merge_queue_days),
             )?
         } else {
             self.store().gc_row_candidates(
-                cutoff(evaluated_at, policy.terminal_events_days),
-                cutoff(evaluated_at, policy.gate_results_days),
-                cutoff(evaluated_at, policy.terminal_merge_queue_days),
+                cutoff(age_anchor_ms, policy.terminal_events_days),
+                cutoff(age_anchor_ms, policy.gate_results_days),
+                cutoff(age_anchor_ms, policy.terminal_merge_queue_days),
             )?
         };
         let checkpoint_pin_releases = if deadline_expired(deadline) {
@@ -3494,7 +3547,7 @@ impl Broker {
                 exposure_id: exposure.id,
                 queue_entry_id: exposure.queue_entry_id,
                 created_at: exposure.created_at,
-                age_days: days_between(evaluated_at, exposure.created_at),
+                age_days: days_between(age_anchor_ms, exposure.created_at),
                 reason: format!(
                     "publication exposure exceeded the {} day retention policy; explicit expiry does not claim publication was verified",
                     policy.publication_exposure_days
@@ -3668,7 +3721,7 @@ impl Broker {
 
         match metrics_rewrite(
             &main_root,
-            cutoff(evaluated_at, policy.command_metrics_days),
+            cutoff(age_anchor_ms, policy.command_metrics_days),
             &mut blockers,
             deadline,
         )? {
@@ -3679,7 +3732,7 @@ impl Broker {
             MetricsRewrite::Deferred => deferred_checks.push("command_metrics".into()),
         }
 
-        let worktree_cutoff = cutoff(evaluated_at, policy.closed_worktrees_days);
+        let worktree_cutoff = cutoff(age_anchor_ms, policy.closed_worktrees_days);
         let live_worktrees = live_sessions
             .iter()
             .map(|session| PathBuf::from(&session.worktree_path))
@@ -3812,7 +3865,7 @@ impl Broker {
             not_scanned: artifact_worktrees_not_scanned,
         } = match artifact_budget {
             Some(budget) => self.artifact_candidates_within(
-                evaluated_at,
+                age_anchor_ms,
                 &policy,
                 &cleanup.worktrees,
                 &sessions,
@@ -3824,7 +3877,7 @@ impl Broker {
                 Some(budget),
             ),
             None => self.artifact_candidates(
-                evaluated_at,
+                age_anchor_ms,
                 &policy,
                 &cleanup.worktrees,
                 &sessions,
@@ -3839,12 +3892,12 @@ impl Broker {
             deferred_checks.push("artifact_scan".into());
         }
         let (mut orphans, orphans_complete) =
-            self.orphan_candidates(evaluated_at, &policy, &mut blockers, scan, deadline)?;
+            self.orphan_candidates(age_anchor_ms, &policy, &mut blockers, scan, deadline)?;
         if !orphans_complete {
             deferred_checks.push("orphan_scan".into());
         }
         let (recovery_archives, recovery_archive_inventory, archives_complete) =
-            self.recovery_archive_candidates(evaluated_at, &policy, scan, deadline)?;
+            self.recovery_archive_candidates(age_anchor_ms, &policy, scan, deadline)?;
         if !archives_complete {
             deferred_checks.push("recovery_archives".into());
         }
@@ -3886,6 +3939,7 @@ impl Broker {
                                 configured_keys: &configured_keys,
                             },
                             evaluated_at,
+                            age_anchor_ms,
                             scan,
                             &mut size_records,
                             deadline,
@@ -3906,6 +3960,7 @@ impl Broker {
                                 configured_keys: &configured_keys,
                             },
                             evaluated_at,
+                            age_anchor_ms,
                             scan,
                             &mut size_records,
                         );
@@ -4025,7 +4080,7 @@ impl Broker {
                 let oldest_id = oldest.and_then(|(_, id)| id);
                 let oldest_recorded_at = oldest.map(|(recorded_at, _)| recorded_at);
                 let oldest_age_days =
-                    oldest_recorded_at.map(|recorded_at| days_between(evaluated_at, recorded_at));
+                    oldest_recorded_at.map(|recorded_at| days_between(age_anchor_ms, recorded_at));
                 let age_exceeded = age_policy_days
                     .zip(oldest_age_days)
                     .is_some_and(|(policy_days, age_days)| age_days >= policy_days);
@@ -4191,7 +4246,7 @@ impl Broker {
                 // it back to an instant keeps one comparison rule for every
                 // kind of reclamation instead of a second rule for this one.
                 retained_since_ms: evaluated_at
-                    .saturating_sub(i64::from(artifact.idle_days).saturating_mul(86_400_000)),
+                    .saturating_sub(i64::from(artifact.idle_days).saturating_mul(MILLIS_PER_DAY)),
                 estimated_bytes: artifact.estimated_bytes,
             }
         });
@@ -4231,6 +4286,7 @@ impl Broker {
             schema_version: GC_PLAN_SCHEMA_VERSION,
             digest: String::new(),
             evaluated_at,
+            age_anchor_ms: Some(age_anchor_ms),
             policy,
             retention_config_warnings,
             rows,
@@ -5707,16 +5763,18 @@ impl Broker {
         let journal_path = main_root.join(".aethyme/gc-journal.json");
         let mut journal = match load_journal(&journal_path)? {
             Some(journal) => {
-                if journal.schema_version != GC_PLAN_SCHEMA_VERSION {
+                if !gc_journal_schema_is_resumable(journal.schema_version) {
                     let reason = if journal.schema_version == 2 {
                         format!(
-                            "schema 2 is no longer resumable because schema {} adds required authorization fields; abandon this journal with `aethyme broker gc abandon --confirm {}` to archive it without removing retained data, then review a fresh `aethyme broker gc plan`",
-                            GC_PLAN_SCHEMA_VERSION, journal.digest
+                            "schema 2 is no longer resumable (supported resumable schemas: {} and {}); abandon this journal with `aethyme broker gc abandon --confirm {}` to archive it without removing retained data, then review a fresh `aethyme broker gc plan`",
+                            GC_LEGACY_PLAN_SCHEMA_VERSION, GC_PLAN_SCHEMA_VERSION, journal.digest
                         )
                     } else {
                         format!(
-                            "schema {} is unsupported (expected {}); this unknown journal version cannot be safely resumed or abandoned",
-                            journal.schema_version, GC_PLAN_SCHEMA_VERSION
+                            "schema {} is unsupported (expected {} or {}); this unknown journal version cannot be safely resumed or abandoned",
+                            journal.schema_version,
+                            GC_LEGACY_PLAN_SCHEMA_VERSION,
+                            GC_PLAN_SCHEMA_VERSION
                         )
                     };
                     return Err(BrokerOpError::InvalidGcJournal { reason });
@@ -5742,6 +5800,7 @@ impl Broker {
                 journal
             }
         };
+        let age_reference_ms = gc_journal_age_reference_ms(&journal)?;
         let deadline = budget_ms.map(|budget| Instant::now() + Duration::from_millis(budget));
         let mut failures = Vec::new();
 
@@ -5815,12 +5874,9 @@ impl Broker {
             let batch = journal.remaining_rows[..count].to_vec();
             self.store().delete_gc_rows(
                 &batch,
-                cutoff(journal.evaluated_at, journal.policy.terminal_events_days),
-                cutoff(journal.evaluated_at, journal.policy.gate_results_days),
-                cutoff(
-                    journal.evaluated_at,
-                    journal.policy.terminal_merge_queue_days,
-                ),
+                cutoff(age_reference_ms, journal.policy.terminal_events_days),
+                cutoff(age_reference_ms, journal.policy.gate_results_days),
+                cutoff(age_reference_ms, journal.policy.terminal_merge_queue_days),
             )?;
             journal.rows_removed = journal.rows_removed.saturating_add(batch.len());
             journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(
@@ -5885,7 +5941,7 @@ impl Broker {
                     } else if observed == candidate.before_sha256 {
                         let after = retained_metric_bytes(
                             &bytes,
-                            cutoff(journal.evaluated_at, journal.policy.command_metrics_days),
+                            cutoff(age_reference_ms, journal.policy.command_metrics_days),
                         );
                         let actual_after = sha256(&after);
                         if actual_after != expected_after {
@@ -7180,6 +7236,90 @@ mod tests {
             2,
             "full GC retains its historical per-line blocker count"
         );
+    }
+
+    #[test]
+    fn gc_age_anchor_stabilizes_near_cutoff_metrics_and_is_in_the_plan_digest() {
+        let days = 30;
+        let day_start = 40 * MILLIS_PER_DAY;
+        let evaluated_first = day_start + MILLIS_PER_DAY / 4;
+        let evaluated_later = day_start + 3 * MILLIS_PER_DAY / 4;
+        let age_anchor_ms = utc_day_floor_ms(evaluated_first);
+        assert_eq!(utc_day_floor_ms(evaluated_later), age_anchor_ms);
+        assert_ne!(cutoff(evaluated_first, days), cutoff(evaluated_later, days));
+
+        let stable_cutoff = cutoff(age_anchor_ms, days);
+        let within_day = stable_cutoff + MILLIS_PER_DAY / 2;
+        let boundary_line = format!("{{\"ts\":{stable_cutoff},\"command\":\"boundary\"}}\n");
+        let within_day_line = format!("{{\"ts\":{within_day},\"command\":\"within-day\"}}\n");
+        let old_line = format!("{{\"ts\":{},\"command\":\"old\"}}\n", stable_cutoff - 1);
+        let before = format!("{old_line}{within_day_line}{boundary_line}").into_bytes();
+
+        let legacy_first = retained_metric_bytes(&before, cutoff(evaluated_first, days));
+        let legacy_later = retained_metric_bytes(&before, cutoff(evaluated_later, days));
+        assert_ne!(
+            legacy_first, legacy_later,
+            "the exact-time cutoff moves within the day"
+        );
+
+        let retained_first = retained_metric_bytes(&before, stable_cutoff);
+        let retained_later =
+            retained_metric_bytes(&before, cutoff(utc_day_floor_ms(evaluated_later), days));
+        assert_eq!(retained_first, retained_later);
+        assert_eq!(
+            retained_first,
+            format!("{within_day_line}{boundary_line}").as_bytes()
+        );
+
+        let next_day_anchor = age_anchor_ms + MILLIS_PER_DAY;
+        let retained_next_day = retained_metric_bytes(&before, cutoff(next_day_anchor, days));
+        assert!(
+            retained_next_day.is_empty(),
+            "the boundary row ages out only after the UTC-day cutoff advances"
+        );
+
+        let metric_candidate = |after: &[u8]| GcFileCandidate {
+            path: ".aethyme/logs/command-metrics.jsonl".into(),
+            action: GcFileAction::Rewrite,
+            before_sha256: sha256(&before),
+            after_sha256: Some(sha256(after)),
+            bytes_before: before.len() as u64,
+            bytes_after: after.len() as u64,
+            source_row_ids: Vec::new(),
+        };
+        let make_plan = |evaluated_at: i64, anchor: i64, after: &[u8]| -> GcPlan {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": GC_PLAN_SCHEMA_VERSION,
+                "digest": "",
+                "evaluated_at": evaluated_at,
+                "age_anchor_ms": anchor,
+                "policy": RetentionPolicy::default(),
+                "rows": [],
+                "files": [metric_candidate(after)],
+                "worktrees": [],
+                "artifacts": [],
+                "orphans": [],
+                "blockers": [],
+                "estimated_reclaimable_bytes": 0,
+                "estimated_retained_bytes": 0,
+                "estimated_blocked_bytes": 0
+            }))
+            .unwrap()
+        };
+        let mut first_plan = make_plan(evaluated_first, age_anchor_ms, &retained_first);
+        first_plan.finish_digest().unwrap();
+        let mut later_plan = make_plan(evaluated_later, age_anchor_ms, &retained_later);
+        later_plan.finish_digest().unwrap();
+        assert_eq!(first_plan.digest, later_plan.digest);
+
+        let mut changed_anchor = first_plan.clone();
+        changed_anchor.age_anchor_ms = Some(next_day_anchor);
+        changed_anchor.finish_digest().unwrap();
+        assert_ne!(first_plan.digest, changed_anchor.digest);
+
+        let mut next_day_plan = make_plan(evaluated_later, next_day_anchor, &retained_next_day);
+        next_day_plan.finish_digest().unwrap();
+        assert_ne!(first_plan.digest, next_day_plan.digest);
     }
 
     #[cfg(unix)]
@@ -8769,7 +8909,7 @@ mod tests {
             .unwrap()
             .remove("publication_exposure_days");
         let journal = serde_json::json!({
-            "schema_version": GC_PLAN_SCHEMA_VERSION,
+            "schema_version": GC_LEGACY_PLAN_SCHEMA_VERSION,
             "digest": "a".repeat(64),
             "evaluated_at": 1,
             "policy": policy,
@@ -8788,6 +8928,47 @@ mod tests {
         );
         assert!(parsed.remaining_checkpoint_pin_releases.is_empty());
         assert!(parsed.remaining_publication_exposure_expiries.is_empty());
+        assert_eq!(parsed.age_anchor_ms, None);
+        assert_eq!(
+            gc_journal_age_reference_ms(&parsed).unwrap(),
+            parsed.evaluated_at
+        );
+        assert!(gc_journal_schema_is_resumable(parsed.schema_version));
+    }
+
+    #[test]
+    fn schema_four_gc_journals_require_the_bound_utc_day_anchor() {
+        let evaluated_at = 42 * MILLIS_PER_DAY + 12_345;
+        let mut plan: GcPlan = serde_json::from_value(serde_json::json!({
+            "schema_version": GC_PLAN_SCHEMA_VERSION,
+            "digest": "a".repeat(64),
+            "evaluated_at": evaluated_at,
+            "age_anchor_ms": utc_day_floor_ms(evaluated_at),
+            "policy": RetentionPolicy::default(),
+            "rows": [],
+            "files": [],
+            "worktrees": [],
+            "artifacts": [],
+            "orphans": [],
+            "blockers": [],
+            "estimated_reclaimable_bytes": 0,
+            "estimated_retained_bytes": 0,
+            "estimated_blocked_bytes": 0
+        }))
+        .unwrap();
+        let journal = GcJournal::from(plan.clone());
+        assert_eq!(
+            gc_journal_age_reference_ms(&journal).unwrap(),
+            utc_day_floor_ms(evaluated_at)
+        );
+
+        plan.age_anchor_ms = None;
+        let missing = GcJournal::from(plan.clone());
+        assert!(gc_journal_age_reference_ms(&missing).is_err());
+
+        plan.age_anchor_ms = Some(utc_day_floor_ms(evaluated_at) - MILLIS_PER_DAY);
+        let invalid = GcJournal::from(plan);
+        assert!(gc_journal_age_reference_ms(&invalid).is_err());
     }
 
     #[test]
@@ -8871,6 +9052,7 @@ mod tests {
         let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
         let mut old_plan = broker.gc_plan().unwrap();
         old_plan.schema_version = 2;
+        old_plan.age_anchor_ms = None;
         old_plan.finish_digest().unwrap();
         let old_digest = old_plan.digest.clone();
         let mut old_journal = GcJournal::from(old_plan);
@@ -8897,8 +9079,32 @@ mod tests {
         );
         assert!(root.join("retained.txt").is_file());
         let fresh_plan = broker.gc_plan().unwrap();
-        assert_eq!(fresh_plan.schema_version, 3);
+        assert_eq!(fresh_plan.schema_version, 4);
         assert_ne!(fresh_plan.digest, old_digest);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn gc_apply_resumes_legacy_schema_three_journal_without_age_anchor() {
+        let (_fixture, mut broker, root, _initial_digest) = registered_orphan_fixture();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        std::fs::remove_file(&journal_path).unwrap();
+
+        let mut legacy_plan = broker.gc_plan().unwrap();
+        legacy_plan.schema_version = GC_LEGACY_PLAN_SCHEMA_VERSION;
+        legacy_plan.age_anchor_ms = None;
+        legacy_plan.finish_digest().unwrap();
+        let digest = legacy_plan.digest.clone();
+        write_journal(&journal_path, &GcJournal::from(legacy_plan)).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(saved["schema_version"], GC_LEGACY_PLAN_SCHEMA_VERSION);
+        assert!(saved.get("age_anchor_ms").is_none());
+
+        let report = broker.gc_apply(&digest).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(!root.exists());
+        assert!(!journal_path.exists());
     }
 
     #[test]
@@ -9098,7 +9304,7 @@ mod tests {
         let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
-        value["schema_version"] = serde_json::json!(4);
+        value["schema_version"] = serde_json::json!(5);
         let mut unknown_bytes = serde_json::to_vec_pretty(&value).unwrap();
         unknown_bytes.push(b'\n');
         std::fs::write(&journal_path, &unknown_bytes).unwrap();
