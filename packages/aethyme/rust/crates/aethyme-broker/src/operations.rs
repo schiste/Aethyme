@@ -556,6 +556,52 @@ impl AdmissionDeadline {
     }
 }
 
+const MAX_COORDINATED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+struct OutputCaptureState {
+    bytes: Vec<u8>,
+    truncated: bool,
+    enabled: bool,
+    limit: usize,
+}
+
+impl OutputCaptureState {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            truncated: false,
+            enabled: true,
+            limit,
+        }
+    }
+
+    fn append(&mut self, chunk: &[u8]) {
+        if !self.enabled {
+            return;
+        }
+        let retained = self.limit.saturating_sub(self.bytes.len()).min(chunk.len());
+        self.bytes.extend_from_slice(&chunk[..retained]);
+        self.truncated |= retained < chunk.len();
+    }
+
+    fn discard(&mut self) {
+        self.enabled = false;
+        // Release the allocation too: a timed-out descendant may keep this
+        // state alive for an arbitrary time while its inherited pipe stays open.
+        self.bytes = Vec::new();
+        self.truncated = false;
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CapturedOutput {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
+}
+
 /// Run a child and drain its output, or time out at the admission deadline.
 ///
 /// The output readers run concurrently with the child. Apart from avoiding a
@@ -564,12 +610,30 @@ impl AdmissionDeadline {
 /// running is killed and reaped on timeout; readers held by its descendants are
 /// detached rather than allowed to extend the caller's deadline.
 fn output_within(
+    command: Command,
+    deadline: AdmissionDeadline,
+    repository: &str,
+    stage: &str,
+    heartbeat: Option<&OperationHeartbeat>,
+) -> Result<CapturedOutput, BrokerOpError> {
+    output_within_capture_limit(
+        command,
+        deadline,
+        repository,
+        stage,
+        heartbeat,
+        MAX_COORDINATED_OUTPUT_BYTES,
+    )
+}
+
+fn output_within_capture_limit(
     mut command: Command,
     deadline: AdmissionDeadline,
     repository: &str,
     stage: &str,
     heartbeat: Option<&OperationHeartbeat>,
-) -> Result<std::process::Output, BrokerOpError> {
+    capture_limit: usize,
+) -> Result<CapturedOutput, BrokerOpError> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -594,20 +658,30 @@ fn output_within(
         })?;
     let stdout_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
     let stderr_state = heartbeat.map(|heartbeat| Arc::clone(&heartbeat.state));
+    let stdout_capture = Arc::new(Mutex::new(OutputCaptureState::new(capture_limit)));
+    let stderr_capture = Arc::new(Mutex::new(OutputCaptureState::new(capture_limit)));
     let (reader_done_tx, reader_done_rx) = mpsc::channel();
     let stdout_reader = spawn_output_reader(
         stdout,
+        Arc::clone(&stdout_capture),
         stdout_state,
         "provider stdout",
         reader_done_tx.clone(),
     );
-    let stderr_reader =
-        spawn_output_reader(stderr, stderr_state, "provider stderr", reader_done_tx);
+    let stderr_reader = spawn_output_reader(
+        stderr,
+        Arc::clone(&stderr_capture),
+        stderr_state,
+        "provider stderr",
+        reader_done_tx,
+    );
 
     let mut open_readers: usize = 2;
     let mut exited = None;
     let status = loop {
         if deadline.expired() {
+            discard_output_capture(&stdout_capture);
+            discard_output_capture(&stderr_capture);
             // Reap the provider if it is still alive. If it has already exited,
             // a descendant may still hold an inherited output pipe; stop waiting
             // for that pipe at the same deadline without killing an unowned
@@ -630,6 +704,8 @@ fn output_within(
                 Ok(Some(status)) => exited = Some(status),
                 Ok(None) => {}
                 Err(source) => {
+                    discard_output_capture(&stdout_capture);
+                    discard_output_capture(&stderr_capture);
                     let _ = child.kill();
                     let _ = child.wait();
                     drop(stdout_reader);
@@ -661,34 +737,51 @@ fn output_within(
             Err(mpsc::RecvTimeoutError::Disconnected) => open_readers = 0,
         }
     };
-    let stdout = join_output_reader(stdout_reader)?;
-    let stderr = join_output_reader(stderr_reader)?;
-    Ok(std::process::Output {
+    if let Err(error) = join_output_reader(stdout_reader) {
+        discard_output_capture(&stdout_capture);
+        discard_output_capture(&stderr_capture);
+        return Err(error);
+    }
+    if let Err(error) = join_output_reader(stderr_reader) {
+        discard_output_capture(&stdout_capture);
+        discard_output_capture(&stderr_capture);
+        return Err(error);
+    }
+    let (stdout, stdout_truncated) = finish_output_capture(&stdout_capture);
+    let (stderr, stderr_truncated) = finish_output_capture(&stderr_capture);
+    Ok(CapturedOutput {
         status,
         stdout,
         stderr,
+        stdout_truncated,
+        stderr_truncated,
     })
 }
 
 fn spawn_output_reader<R>(
     mut reader: R,
+    capture: Arc<Mutex<OutputCaptureState>>,
     state: Option<Arc<Mutex<OperationHeartbeatState>>>,
     stream: &'static str,
     done: mpsc::Sender<()>,
-) -> JoinHandle<std::io::Result<Vec<u8>>>
+) -> JoinHandle<std::io::Result<()>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let result = (|| -> std::io::Result<Vec<u8>> {
-            let mut output = Vec::new();
+        let result = (|| -> std::io::Result<()> {
             let mut buffer = [0u8; 8 * 1024];
             loop {
                 let read = reader.read(&mut buffer)?;
                 if read == 0 {
                     break;
                 }
-                output.extend_from_slice(&buffer[..read]);
+                {
+                    let mut capture = capture
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    capture.append(&buffer[..read]);
+                }
                 if let Some(state) = &state
                     && let Ok(mut state) = state.lock()
                 {
@@ -697,7 +790,7 @@ where
                     state.output_bytes = state.output_bytes.saturating_add(read as u64);
                 }
             }
-            Ok(output)
+            Ok(())
         })();
         // A timeout or another reader error drops the receiver; this notification
         // is only needed while the caller is waiting for pipe EOF.
@@ -706,11 +799,24 @@ where
     })
 }
 
-fn join_output_reader(
-    reader: JoinHandle<std::io::Result<Vec<u8>>>,
-) -> Result<Vec<u8>, BrokerOpError> {
+fn discard_output_capture(capture: &Arc<Mutex<OutputCaptureState>>) {
+    let mut capture = capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    capture.discard();
+}
+
+fn finish_output_capture(capture: &Arc<Mutex<OutputCaptureState>>) -> (Vec<u8>, bool) {
+    let mut capture = capture
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let truncated = capture.truncated;
+    (std::mem::take(&mut capture.bytes), truncated)
+}
+
+fn join_output_reader(reader: JoinHandle<std::io::Result<()>>) -> Result<(), BrokerOpError> {
     match reader.join() {
-        Ok(Ok(output)) => Ok(output),
+        Ok(Ok(())) => Ok(()),
         Ok(Err(source)) => Err(BrokerOpError::OperationIo {
             path: PathBuf::from("git"),
             source,
@@ -758,6 +864,10 @@ pub struct CoordinatedOperationReport {
     pub command_success: bool,
     pub stdout: String,
     pub stderr: String,
+    /// True when the command wrote more stdout than the broker retained.
+    pub stdout_truncated: bool,
+    /// True when the command wrote more stderr than the broker retained.
+    pub stderr_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_merge_cleanup: Option<PostMergeCleanupReport>,
     /// Exactly what a successful push sent. Empty for anything that was not a
