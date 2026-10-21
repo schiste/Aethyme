@@ -625,7 +625,7 @@ fn output_within(
         if open_readers == 0
             && let Some(status) = exited.as_ref()
         {
-            break status.clone();
+            break *status;
         }
         let poll = deadline
             .remaining()
