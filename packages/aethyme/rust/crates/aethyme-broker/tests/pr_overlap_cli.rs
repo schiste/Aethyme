@@ -447,7 +447,7 @@ fn start_path_reports_cached_pr_path_overlap_without_network_or_graph() {
     // neighboring path whose name merely starts with the same letters.
     let prefix_fixture = Fixture::new();
     cache_one_open_pr(&prefix_fixture);
-    let broker = prefix_fixture.broker();
+    let mut broker = prefix_fixture.broker();
     let listing: serde_json::Value = serde_json::from_str(
         &broker
             .store()
@@ -503,7 +503,7 @@ fn start_path_reports_cached_pr_path_overlap_without_network_or_graph() {
     let branch = started["branch"].as_str().unwrap().to_string();
     let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
     let head_oid = git_output(&worktree, &["rev-parse", "HEAD"]);
-    let broker = own_fixture.broker();
+    let mut broker = own_fixture.broker();
     let mut listing: serde_json::Value = serde_json::from_str(
         &broker
             .store()
@@ -594,7 +594,7 @@ fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
     for changed in ["stale-listing", "wrong-base", "unknown-pr-paths"] {
         let fixture = Fixture::new();
         cache_one_open_pr(&fixture);
-        let broker = fixture.broker();
+        let mut broker = fixture.broker();
         let mut listing: serde_json::Value = serde_json::from_str(
             &broker
                 .store()
@@ -671,7 +671,7 @@ fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
             "head_oid": head,
         }],
     });
-    let broker = fixture.broker();
+    let mut broker = fixture.broker();
     broker
         .store()
         .meta_set("pr_overlap.open_prs", &listing.to_string())
@@ -724,7 +724,7 @@ fn start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths() {
         "base": "main",
         "prs": prs,
     });
-    let broker = fixture.broker();
+    let mut broker = fixture.broker();
     broker
         .store()
         .meta_set("pr_overlap.open_prs", &listing.to_string())
