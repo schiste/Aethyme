@@ -64,7 +64,7 @@ fn fixture() -> (
 /// blame ownership, because the guard rejected nothing.
 #[test]
 fn a_command_that_fails_on_its_own_is_not_reported_as_an_ownership_failure() {
-    let (_repository, mut broker, session_id, worktree) = fixture();
+    let (_repository, broker, session_id, worktree) = fixture();
     let id = session_id.to_string();
     let out = run_at(
         &broker,
@@ -107,7 +107,7 @@ fn a_command_that_fails_on_its_own_is_not_reported_as_an_ownership_failure() {
 /// genuine guard refusal and must say so.
 #[test]
 fn a_write_outside_ownership_is_reported_as_a_refusal() {
-    let (_repository, broker, session_id, worktree) = fixture();
+    let (_repository, mut broker, session_id, worktree) = fixture();
     let id = session_id.to_string();
     let out = run_at(
         &broker,
