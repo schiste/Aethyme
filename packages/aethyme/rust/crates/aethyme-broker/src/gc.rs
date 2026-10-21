@@ -3938,8 +3938,10 @@ impl Broker {
                                 include_active: include_active_gate_cache,
                                 configured_keys: &configured_keys,
                             },
-                            evaluated_at,
-                            age_anchor_ms,
+                            crate::gate_cache_gc::AgeReference {
+                                evaluated_at,
+                                age_anchor_ms,
+                            },
                             scan,
                             &mut size_records,
                             deadline,
@@ -3959,8 +3961,10 @@ impl Broker {
                                 include_active: include_active_gate_cache,
                                 configured_keys: &configured_keys,
                             },
-                            evaluated_at,
-                            age_anchor_ms,
+                            crate::gate_cache_gc::AgeReference {
+                                evaluated_at,
+                                age_anchor_ms,
+                            },
                             scan,
                             &mut size_records,
                         );

@@ -322,12 +322,15 @@ fn cache_leases_until(
     Ok((!expired()).then_some(held))
 }
 
-/// Inventory this repository's gate cache and choose what to propose.
-///
-/// `scan` decides whether entries are walked for their size or read from the
-/// size records the last full audit left; an entry with no size is reported
-/// as unmeasured and never proposed, because a budget cannot be applied to a
-/// size nobody knows.
+/// Exact observation time and stable age basis for a gate-cache plan.
+#[derive(Clone, Copy)]
+pub(crate) struct AgeReference {
+    /// Exact observation time used when recording current usage.
+    pub(crate) evaluated_at: i64,
+    /// Stable UTC-day value used for digest-included age fields.
+    pub(crate) age_anchor_ms: i64,
+}
+
 /// What decides which gate cache entries a plan keeps.
 pub(crate) struct KeepRule<'a> {
     /// `gate_cache_bytes_budget`: bytes of older, idle entries to keep.
@@ -338,12 +341,17 @@ pub(crate) struct KeepRule<'a> {
     pub(crate) configured_keys: &'a std::collections::BTreeSet<String>,
 }
 
+/// Inventory this repository's gate cache and choose what to propose.
+///
+/// `scan` decides whether entries are walked for their size or read from the
+/// size records the last full audit left; an entry with no size is reported
+/// as unmeasured and never proposed, because a budget cannot be applied to a
+/// size nobody knows.
 pub(crate) fn inspect(
     main_root: &Path,
     location: &GateCacheLocation,
     rule: KeepRule<'_>,
-    evaluated_at: i64,
-    age_anchor_ms: i64,
+    age: AgeReference,
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
 ) -> (GcGateCacheInventory, Vec<GcGateCacheCandidate>) {
@@ -352,8 +360,7 @@ pub(crate) fn inspect(
         location,
         InspectParameters {
             rule,
-            evaluated_at,
-            age_anchor_ms,
+            age,
             scan,
             records,
             entry_budget: None,
@@ -371,8 +378,7 @@ pub(crate) fn inspect_until(
     main_root: &Path,
     location: &GateCacheLocation,
     rule: KeepRule<'_>,
-    evaluated_at: i64,
-    age_anchor_ms: i64,
+    age: AgeReference,
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
     deadline: Instant,
@@ -386,8 +392,7 @@ pub(crate) fn inspect_until(
         location,
         InspectParameters {
             rule,
-            evaluated_at,
-            age_anchor_ms,
+            age,
             scan,
             records,
             entry_budget: Some(HEALTH_GATE_CACHE_ENTRY_BUDGET),
@@ -398,8 +403,7 @@ pub(crate) fn inspect_until(
 
 struct InspectParameters<'a> {
     rule: KeepRule<'a>,
-    evaluated_at: i64,
-    age_anchor_ms: i64,
+    age: AgeReference,
     scan: crate::SizeScan,
     records: &'a mut crate::measurement::SizeRecords,
     entry_budget: Option<usize>,
@@ -417,8 +421,7 @@ fn inspect_with_expiration(
 ) {
     let InspectParameters {
         rule,
-        evaluated_at,
-        age_anchor_ms,
+        age,
         scan,
         records,
         entry_budget,
@@ -504,7 +507,12 @@ fn inspect_with_expiration(
                     let measured =
                         crate::disk_headroom::directory_usage_without_following_links(&path).ok();
                     if let Some(usage) = measured {
-                        records.record_usage(&key, usage.bytes, Some(usage.inodes), evaluated_at);
+                        records.record_usage(
+                            &key,
+                            usage.bytes,
+                            Some(usage.inodes),
+                            age.evaluated_at,
+                        );
                     }
                     measured
                         .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
@@ -561,7 +569,7 @@ fn inspect_with_expiration(
                     last_used_at_ms,
                     // This age and its reason enter the reviewed GC digest;
                     // exact evaluation time stays on size records only.
-                    age_days: last_used_at_ms.map(|at| days_between(age_anchor_ms, at)),
+                    age_days: last_used_at_ms.map(|at| days_between(age.age_anchor_ms, at)),
                     disposition,
                     reason,
                 });
@@ -1021,8 +1029,10 @@ mod tests {
                 include_active: false,
                 configured_keys: &configured.iter().map(|key| key.to_string()).collect(),
             },
-            evaluated_at,
-            evaluated_at.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY,
+            AgeReference {
+                evaluated_at,
+                age_anchor_ms: evaluated_at.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY,
+            },
             crate::SizeScan::Measure,
             &mut records,
         )
@@ -1066,8 +1076,10 @@ mod tests {
                     include_active: true,
                     configured_keys: &std::collections::BTreeSet::new(),
                 },
-                evaluated_at,
-                day_start,
+                AgeReference {
+                    evaluated_at,
+                    age_anchor_ms: day_start,
+                },
                 crate::SizeScan::Measure,
                 &mut records,
             )
@@ -1102,8 +1114,10 @@ mod tests {
                 include_active: false,
                 configured_keys: &std::collections::BTreeSet::new(),
             },
-            evaluated_at,
-            evaluated_at.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY,
+            AgeReference {
+                evaluated_at,
+                age_anchor_ms: evaluated_at.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY,
+            },
             crate::SizeScan::Recorded,
             &mut records,
             Instant::now() - std::time::Duration::from_millis(1),
@@ -1128,8 +1142,10 @@ mod tests {
                 include_active: false,
                 configured_keys: &std::collections::BTreeSet::new(),
             },
-            evaluated_at,
-            evaluated_at.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY,
+            AgeReference {
+                evaluated_at,
+                age_anchor_ms: evaluated_at.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY,
+            },
             crate::SizeScan::Recorded,
             &mut records,
             Instant::now() + std::time::Duration::from_secs(1),
@@ -1546,6 +1562,7 @@ mod tests {
         let mut fixture = fixture("rust-workspace-v3", 10);
         fixture.location.registry = None;
         let mut records = crate::measurement::SizeRecords::default();
+        let evaluated_at = crate::clock::epoch_ms();
         let (inventory, candidates) = inspect(
             &fixture.main_root,
             &fixture.location,
@@ -1554,7 +1571,10 @@ mod tests {
                 include_active: false,
                 configured_keys: &Default::default(),
             },
-            crate::clock::epoch_ms(),
+            AgeReference {
+                evaluated_at,
+                age_anchor_ms: evaluated_at.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY,
+            },
             crate::SizeScan::Measure,
             &mut records,
         );
