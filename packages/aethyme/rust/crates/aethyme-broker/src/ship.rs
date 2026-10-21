@@ -1205,6 +1205,11 @@ impl Broker {
         if !verify.ok() {
             return Err(ship_operation_failure("verification", &verify));
         }
+        if verify.stdout_truncated {
+            return Err(BrokerOpError::ShipDeliveryUnavailable {
+                reason: "remote reference verification stdout was truncated; refusing incomplete evidence".into(),
+            });
+        }
         let verified_remote_sha = ls_remote_sha(&verify.stdout, &plan.remote_default_branch_ref)
             .unwrap_or_else(|| "<missing>".into());
         if verified_remote_sha != confirm {
@@ -3117,6 +3122,14 @@ fn delivery_github_read(
             "GitHub delivery observation",
             &report,
         ));
+    }
+    if report.stdout_truncated {
+        return Err(BrokerOpError::ShipDeliveryUnavailable {
+            reason: format!(
+                "GitHub delivery observation operation {} exceeded the broker output limit; refusing incomplete PR identity evidence",
+                report.operation.id
+            ),
+        });
     }
     Ok(report)
 }

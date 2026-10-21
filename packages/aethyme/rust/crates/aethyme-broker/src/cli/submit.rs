@@ -1060,6 +1060,11 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             report.pr_overlaps_unknown.len()
         );
     }
+    if report.pr_overlap_listing_unavailable {
+        out!(
+            "  Warning: open-PR overlap check unavailable; the listing could not be read completely"
+        );
+    }
     match &report.pr {
         Some(pr) if pr.created => {
             out!("  Opened draft pull request #{} {}", pr.number, pr.url);
@@ -1628,6 +1633,7 @@ mod review_on_push_tests {
             }),
             pr_overlaps: Vec::new(),
             pr_overlaps_unknown: Vec::new(),
+            pr_overlap_listing_unavailable: false,
             duplicate_work: Vec::new(),
             default_branch: None,
             default_branch_note: None,
@@ -1635,6 +1641,14 @@ mod review_on_push_tests {
             review_run: None,
             repository: "acme/product".into(),
         }
+    }
+
+    #[test]
+    fn push_report_exposes_an_unavailable_overlap_listing() {
+        let mut report = report(false);
+        report.pr_overlap_listing_unavailable = true;
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["pr_overlap_listing_unavailable"], true);
     }
 
     /// A repository with `[review]` set as given, and a stand-in for
