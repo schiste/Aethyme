@@ -82,7 +82,7 @@ pub fn requests(
     store: &BrokerStore,
     holds: impl Fn(i64, &str) -> bool,
 ) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
-    let events = store.events_after_filtered(0, i64::MAX, Some("lease.release_"))?;
+    let events = store.lease_release_events()?;
     let mut requests: Vec<LeaseReleaseRequest> = Vec::new();
     for event in &events {
         let Some(payload) = event.payload_json.as_deref() else {
@@ -225,6 +225,60 @@ mod tests {
             .resolution_reason
             .clone();
         assert_eq!(reason.as_deref(), Some("busy"));
+    }
+
+    #[test]
+    fn release_request_scan_keeps_known_events_in_order_and_ignores_unknown_kinds() {
+        let (_dir, mut store) = store();
+        let first = request(&mut store, "a.rs");
+        store
+            .append_event(
+                "lease.release_future",
+                Some(1),
+                Some(&outcome_payload(first, "a.rs", Some("ignored"))),
+            )
+            .unwrap();
+        store
+            .append_event("note.created", Some(2), Some("{}"))
+            .unwrap();
+        let acked = store
+            .append_event(ACKED, Some(1), Some(&outcome_payload(first, "a.rs", None)))
+            .unwrap();
+        let malformed = store
+            .append_event(REQUESTED, Some(2), Some("not-json"))
+            .unwrap();
+        let second = request(&mut store, "b.rs");
+
+        let events = store.lease_release_events().unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![first, acked, malformed, second]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![REQUESTED, ACKED, REQUESTED, REQUESTED]
+        );
+        assert!(
+            store
+                .events_after_filtered(0, i64::MAX, Some("lease.release_"))
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "lease.release_future")
+        );
+
+        let requests = requests(&store, |_, _| true).unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.request_id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(requests[0].state, RequestState::Acked);
+        assert_eq!(requests[1].state, RequestState::Pending);
     }
 
     #[test]
