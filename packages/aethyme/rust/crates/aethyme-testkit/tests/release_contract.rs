@@ -38,6 +38,65 @@ fn version_output(binary: &Path) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
+fn is_full_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn release_metadata_error(
+    tag: &str,
+    expected_version: &str,
+    source_commit: &str,
+    binary: &str,
+    output: &str,
+) -> Option<String> {
+    if tag != format!("v{expected_version}") {
+        return Some(format!(
+            "tag {tag:?} does not match expected version {expected_version}"
+        ));
+    }
+    if !is_full_git_sha(source_commit) {
+        return Some(format!(
+            "release source commit is not a full Git SHA: {source_commit:?}"
+        ));
+    }
+    if output.contains('\n') {
+        return Some("version output must be a single line".to_owned());
+    }
+
+    let prefix = format!("{binary} {expected_version} (build_revision=");
+    let Some(metadata) = output.strip_prefix(&prefix) else {
+        return Some(format!(
+            "version output must begin with {prefix:?}; got {output:?}"
+        ));
+    };
+    let Some((revision, metadata)) = metadata.split_once(" build_commit=") else {
+        return Some(format!(
+            "version output has no build_commit field: {output:?}"
+        ));
+    };
+    let Some((commit, build_date)) = metadata.split_once(") build_date=") else {
+        return Some(format!(
+            "version output has no build_date field: {output:?}"
+        ));
+    };
+    if revision != source_commit {
+        return Some(format!(
+            "build_revision must equal the clean source SHA {source_commit}, got {revision}"
+        ));
+    }
+    if commit != source_commit {
+        return Some(format!(
+            "build_commit must equal the tagged source SHA {source_commit}, got {commit}"
+        ));
+    }
+    if build_date.is_empty() || !build_date.ends_with('Z') {
+        return Some(format!(
+            "build_date must be a UTC timestamp, got {build_date:?}"
+        ));
+    }
+    None
+}
+
 #[test]
 fn production_crates_and_binaries_share_the_release_version() {
     let root = rust_workspace_root();
@@ -57,15 +116,68 @@ fn production_crates_and_binaries_share_the_release_version() {
     assert_eq!(router.split_whitespace().nth(1), Some(expected.as_str()));
     assert_eq!(engine.split_whitespace().nth(1), Some(expected.as_str()));
 
-    if let Ok(tag) = std::env::var("AETHYME_RELEASE_TAG") {
-        assert_eq!(tag, format!("v{expected}"));
-        for output in [router.as_str(), engine.as_str()] {
-            let embedded_tag = output
-                .split_once('(')
-                .and_then(|(_, details)| details.split_whitespace().next());
-            assert_eq!(embedded_tag, Some(tag.as_str()), "{output}");
+    match (
+        std::env::var("AETHYME_RELEASE_TAG"),
+        std::env::var("AETHYME_RELEASE_COMMIT"),
+    ) {
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {}
+        (Ok(tag), Ok(source_commit)) => {
+            for (binary, output) in [
+                ("aethyme", router.as_str()),
+                ("aethyme-engine-cli", engine.as_str()),
+            ] {
+                if let Some(error) =
+                    release_metadata_error(&tag, &expected, &source_commit, binary, output)
+                {
+                    panic!("{binary} release metadata is invalid: {error}; output: {output}");
+                }
+            }
         }
+        _ => panic!("AETHYME_RELEASE_TAG and AETHYME_RELEASE_COMMIT must be set together"),
     }
+}
+
+#[test]
+fn release_tag_metadata_fixture_requires_exact_clean_source_identity() {
+    let version = "0.8.27";
+    let tag = "v0.8.27";
+    let source_commit = "0123456789abcdef0123456789abcdef01234567";
+    let router = format!(
+        "aethyme {version} (build_revision={source_commit} build_commit={source_commit}) build_date=2026-10-21T12:34:56Z"
+    );
+    let engine = format!(
+        "aethyme-engine-cli {version} (build_revision={source_commit} build_commit={source_commit}) build_date=2026-10-21T12:34:56Z"
+    );
+
+    for (binary, output) in [
+        ("aethyme", router.as_str()),
+        ("aethyme-engine-cli", engine.as_str()),
+    ] {
+        assert_eq!(
+            release_metadata_error(tag, version, source_commit, binary, output),
+            None,
+            "{output}"
+        );
+    }
+
+    let dirty = router.replace(
+        &format!("build_revision={source_commit}"),
+        &format!("build_revision={source_commit}-dirty"),
+    );
+    assert!(release_metadata_error(tag, version, source_commit, "aethyme", &dirty).is_some());
+
+    let other_commit = "fedcba9876543210fedcba9876543210fedcba98";
+    let mismatched = router.replace(
+        &format!("build_commit={source_commit}"),
+        &format!("build_commit={other_commit}"),
+    );
+    assert!(release_metadata_error(tag, version, source_commit, "aethyme", &mismatched).is_some());
+    assert!(
+        release_metadata_error("v0.8.26", version, source_commit, "aethyme", &router).is_some()
+    );
+    assert!(
+        release_metadata_error("v0.8.28", "0.8.28", source_commit, "aethyme", &router).is_some()
+    );
 }
 
 /// A version bump must carry the committed graph engine pin with it.
@@ -149,6 +261,37 @@ fn release_targets_exercises_native_linux_arm64_runtime_contract() {
             "native Linux arm64 job is missing {command}"
         );
     }
+}
+
+#[test]
+fn release_workflow_uses_ephemeral_checkouts_and_source_sha_contract() {
+    let workflow = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
+    )
+    .unwrap();
+    let checkout_steps: Vec<_> = workflow
+        .split("\n      - ")
+        .filter(|step| step.contains("uses: actions/checkout@"))
+        .collect();
+    assert_eq!(
+        checkout_steps.len(),
+        4,
+        "review checkout coverage when it changes"
+    );
+    for step in checkout_steps {
+        assert!(
+            step.contains("persist-credentials: false"),
+            "checkout must not persist the release token into Git config: {step}"
+        );
+    }
+
+    let contract_step = workflow
+        .split("- name: Verify release version contract")
+        .nth(1)
+        .and_then(|tail| tail.split("\n      - ").next())
+        .expect("release workflow must run the release version contract");
+    assert!(contract_step.contains("AETHYME_RELEASE_TAG: ${{ github.ref_name }}"));
+    assert!(contract_step.contains("AETHYME_RELEASE_COMMIT: ${{ github.sha }}"));
 }
 
 #[test]
