@@ -1056,7 +1056,8 @@ fn windows_release_builds_and_smokes_the_native_zip() {
         "needs: [build, build-windows]",
         "windows_count",
         "test \"$windows_count\" = \"1\"",
-        "Sign and verify the detached Windows zip",
+        "Sign release assets with retry-safe legacy Cosign",
+        "Create standard bundles and verify release assets",
     ] {
         assert!(
             release.contains(fragment),
