@@ -23,6 +23,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Before standalone `rustfmt` or `rustc` validation, resolve the owning
+  crate's Cargo edition, including workspace inheritance, and pass that edition.
+  Formatting rules vary by edition even when the source compiles in both; a
+  successful check with a guessed edition can fail workspace CI.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
   runs rather than wall-clock assertions in ordinary tests. Retain complete CLI
@@ -82,6 +86,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   refuse to treat a valid-looking prefix as a complete listing or proof.
   Preserve the provider exit status and test both the cap boundary and a
   syntactically valid truncated prefix.
+- Before writing a broker PR body, prepare the exact body file and run the
+  pinned CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`.
+  Review each refusal; use a `Contract justification:` of at least 24 characters
+  only for a verified false-positive, while preserving the actual retirement
+  label. Confirm the actual verdict is `none` or every reported symbol has an
+  accurate contract decision; exit status or help output alone is not evidence.
+  Retain the local result before the public body write.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
@@ -118,6 +129,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
   directory separately.
+  Complete fixture branch/ref setup before opening the broker whenever
+  possible: its live default database may be .aethyme/broker.db, and a later
+  git add -A can commit it. Before any post-open branch switch, assert the
+  database and WAL paths are absent from git ls-files; stage exact fixture
+  paths so a checkout cannot unlink a live SQLite database.
 - In shell shims that branch on a child process's working directory, inspect it
   with `pwd -P` and compare it with an explicitly passed canonical fixture path.
   Rust `Command::current_dir` changes the child's directory without rewriting
@@ -295,6 +311,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
   target is a setup failure; stop before Cargo instead of treating it as a
   product failure or zero-test result.
+- Treat release-signing failures as workflow failures, not automatically as
+  transient. Inspect the exact failed step and the tag/release asset state
+  before retrying. For a Rekor conflict, confirm the pinned signer's released
+  conflict handling and security status; exercise signer, bundle conversion,
+  and verification commands with fail-closed fakes while preserving identity,
+  issuer, and transparency-log checks. Keep intermediate signature files out
+  of the published asset directory.
 - Bound compilation and test execution separately. With `cargo nextest run`,
   use `--build-jobs 1` for Cargo and `--test-threads 1` or `2` for nextest;
   nextest's `-j` aliases test parallelism, so never use it as the Cargo worker
@@ -339,6 +362,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   check child output on the intended stream separately. A report may retain
   the original command arguments, so searching its serialized text for a child
   marker cannot establish output isolation. Assert command metadata separately.
+- For CLI subprocess-count regressions, trace the complete invoked path,
+  including contract preflight, human-only rendering, and the operation itself.
+  Derive expectations from the exact argv and fixture preconditions; use JSON
+  mode when human rendering is outside the behavior under test, and retain an
+  intended guard-removal failure plus a restored positive to prove the count
+  detects the removed optimization.
 - For a production guard that must prevent side effects, test the real entrypoint
   with a fixture command that writes a unique sentinel. Assert the typed refusal
   and sentinel absence, then remove only the call-site guard in a mutation run
@@ -348,7 +377,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unmodified source, with the deliberate break, and after byte-for-byte
   restoration. Require positive, intended runtime failure, positive; a compile
   failure or a test that also fails without the break does not validate the
-  guard. A passing adjacent suite cannot replace either positive run.
+  guard. Classify a negative control by the exact selected test, exit status,
+  and expected failure message; a custom Rust panic need not contain the
+  literal word `assertion`. A passing adjacent suite cannot replace either
+  positive run.
   Freeze the intended review snapshot before running mutations, or build it
   from the intended commit and selected patch. Exclude an in-flight deliberate
   mutation from the review snapshot so it is not mistaken for proposed code.

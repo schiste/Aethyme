@@ -258,31 +258,59 @@ jobs:
           cd dist
           sha256sum --check SHA256SUMS
 
-      - name: Install Cosign
+      - name: Install retry-safe legacy Cosign signer
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v2.6.5
+          install-dir: ${{ runner.temp }}/cosign-v2.6.5
 
-      - name: Sign and verify release manifest
+      - name: Sign release assets with retry-safe legacy Cosign
         env:
           REF_NAME: ${{ github.ref_name }}
+          COSIGN_V2: ${{ runner.temp }}/cosign-v2.6.5/cosign
         run: |
-          cosign sign-blob --yes \
-            --bundle dist/release-manifest.sigstore.json \
+          set -euo pipefail
+          signature_dir="$RUNNER_TEMP/aethyme-release-signatures"
+          mkdir -p "$signature_dir"
+          "$COSIGN_V2" sign-blob --yes --new-bundle-format=false --use-signing-config=false \
+            --bundle "$signature_dir/release-manifest.legacy.json" \
             dist/release-manifest.json
-          cosign verify-blob \
+          zip="dist/aethyme-${REF_NAME}-x86_64-pc-windows-msvc.zip"
+          "$COSIGN_V2" sign-blob --yes --new-bundle-format=false --use-signing-config=false \
+            --bundle "$signature_dir/aethyme-${REF_NAME}-x86_64-pc-windows-msvc.legacy.json" \
+            "$zip"
+
+      - name: Install standard-bundle converter and verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+          install-dir: ${{ runner.temp }}/cosign-v3.1.3
+
+      - name: Create standard bundles and verify release assets
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          COSIGN_V3: ${{ runner.temp }}/cosign-v3.1.3/cosign
+        run: |
+          set -euo pipefail
+          signature_dir="$RUNNER_TEMP/aethyme-release-signatures"
+          "$COSIGN_V3" bundle create \
+            --artifact dist/release-manifest.json \
+            --bundle "$signature_dir/release-manifest.legacy.json" \
+            --out dist/release-manifest.sigstore.json
+          "$COSIGN_V3" verify-blob \
             --bundle dist/release-manifest.sigstore.json \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             dist/release-manifest.json
 
-      - name: Sign and verify the detached Windows zip
-        # The Windows zip is not listed in release-manifest.json (released
-        # updaters reject a non-tarball entry), so it carries its own bundle.
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
+          # The Windows zip is not listed in release-manifest.json (released
+          # updaters reject a non-tarball entry), so it carries its own bundle.
           zip="dist/aethyme-${REF_NAME}-x86_64-pc-windows-msvc.zip"
-          cosign sign-blob --yes --bundle "$zip.sigstore.json" "$zip"
-          cosign verify-blob \
+          "$COSIGN_V3" bundle create \
+            --artifact "$zip" \
+            --bundle "$signature_dir/aethyme-${REF_NAME}-x86_64-pc-windows-msvc.legacy.json" \
+            --out "$zip.sigstore.json"
+          "$COSIGN_V3" verify-blob \
             --bundle "$zip.sigstore.json" \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
