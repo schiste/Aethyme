@@ -564,3 +564,34 @@ fn ci_and_local_runs_share_one_test_command() {
     assert!(nextest.contains("[profile.ci]"));
     assert!(nextest.contains("[profile.ci.junit]"));
 }
+
+#[test]
+fn local_nextest_profile_kills_hung_tests_after_a_finite_deadline() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let source =
+        std::fs::read_to_string(root.join("packages/aethyme/rust/.config/nextest.toml")).unwrap();
+    let config: toml::Value = toml::from_str(&source).unwrap();
+    let profiles = config["profile"].as_table().unwrap();
+
+    let local = &profiles["local"];
+    assert_eq!(local["test-threads"].as_integer(), Some(2));
+    assert_eq!(local["retries"].as_integer(), Some(0));
+    assert_eq!(local["fail-fast"].as_bool(), Some(true));
+    assert_eq!(local["success-output"].as_str(), Some("never"));
+    assert_eq!(local["failure-output"].as_str(), Some("final"));
+    assert_eq!(local["slow-timeout"]["period"].as_str(), Some("60s"));
+    assert_eq!(
+        local["slow-timeout"]["terminate-after"].as_integer(),
+        Some(5)
+    );
+
+    // Keep the CI profile's existing per-test bound while fixing the local
+    // profile selected by the main gate.
+    let ci = &profiles["ci"];
+    assert_eq!(ci["retries"].as_integer(), Some(1));
+    assert_eq!(ci["slow-timeout"]["period"].as_str(), Some("60s"));
+    assert_eq!(ci["slow-timeout"]["terminate-after"].as_integer(), Some(5));
+}
