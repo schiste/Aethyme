@@ -617,7 +617,7 @@ fn worktree_volume_cache_bindings_for_context(
 ) -> Result<Vec<crate::broker::PreparationCacheRootBinding>, StorageError> {
     let repository = GitRepo::discover(main_root)?;
     let git_common_dir = repository.git_common_dir()?;
-    crate::broker::lifecycle::capture_worktree_volume_preparation_cache_roots(
+    crate::Broker::capture_worktree_volume_preparation_cache_roots(
         main_root,
         &git_common_dir,
         context,

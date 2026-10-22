@@ -2217,7 +2217,7 @@ impl Broker {
                     reason: format!("cannot inspect repository Git common directory: {error}")
                         .into_boxed_str(),
                 })?;
-        capture_worktree_volume_preparation_cache_roots(
+        Self::capture_worktree_volume_preparation_cache_roots(
             &self.main_root,
             &git_common_dir,
             &self.storage_context,
@@ -2257,7 +2257,7 @@ impl Broker {
                 .ok_or_else(|| BrokerOpError::InvalidStorageContext {
                     reason: "worktree path has no placement root".into(),
                 })?;
-        let resource_db_path = self
+        let _resource_db_path = self
             .storage_context
             .host_resource_db_path
             .as_deref()
@@ -5335,12 +5335,13 @@ mod artifact_sweep_namespace_tests {
             &placement_identity,
         )
         .unwrap();
-        let (canonical, identity, _state, handle) =
+        let canonical = cache_root.canonicalize().unwrap();
+        let cache_root_capture =
             crate::preparation::rotation_debt::capture_preparation_cache_root(&cache_root).unwrap();
         crate::preparation::rotation_debt::initialize_preparation_cache_root(
             &canonical,
-            &identity,
-            &handle,
+            &cache_root_capture.identity,
+            &cache_root_capture.directory,
             &resource_db,
             || Ok(false),
         )
