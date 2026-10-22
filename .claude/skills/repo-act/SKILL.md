@@ -194,6 +194,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
+- For bounded native builds that use shared host resources, invoke the exact
+  frozen request through `aethyme broker advanced resources run`. Require the
+  runner itself to reject missing or malformed lease ID/generation before any
+  resource probe or Cargo command; record the granted lease ID/generation in
+  its receipt and exercise the no-lease refusal in offline validation.
 - Before sealing a validation packet, require every input referenced by its
   plan, argv, or README to exist and match its pinned hash; hashing only the
   files that happen to be present can silently bless an incomplete packet.
