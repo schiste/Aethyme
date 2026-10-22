@@ -199,6 +199,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- For session-worktree cleanup, treat creation provenance separately from current
+  adoption records. Require a retained `Spawned` session as owner, exclude rows
+  marked `Cleaned` because the path may have been reused, and recheck that row
+  plus Git/root ownership at apply. A path, branch, root marker, or common Git
+  directory can be recreated in the same repository; persist a creator-time
+  worktree/admin-directory identity with the spawned row and compare it at
+  selection and apply. Never infer missing identity for legacy or adopted
+  rows. Cover spawn→close→adopt→close, adopted-only history, and same-path,
+  same-branch replacements both within the same repository and from another
+  repository.
 - Carry the selected worktree-root layout through planning, attribution, and
   apply. A `LibraryOverride` with no `root_container` is a direct repository
   root: inventory that root itself, not its children as keyed repositories.
@@ -235,6 +245,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unique log and manifest paths. Check which filenames the delegated monitor
   owns; store caller summaries under distinct names instead of overwriting or
   exclusively creating those monitor outputs. Preserve earlier outputs before retrying.
+  If the helper exclusively creates its output root, preflight its parent with a
+  removable canary and leave the output root absent; do not precreate it.
   Freeze source for each invocation and record the exact head and dirty-state
   hashes before and after it. If relevant source changes during a run, retain
   that run as diagnostic evidence and rerun the committed source.

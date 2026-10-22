@@ -3024,6 +3024,7 @@ impl Broker {
         let (_slug, branch, start_base, worktree, worktree_placement, _lifecycle_claim) =
             self.create_session_worktree(task, explicit_base, &planned_paths)?;
         let base = start_base.commit.clone();
+        let worktree_instance_witness = worktree.spawned_worktree_instance_witness();
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
             worktree_path: worktree.root().to_string_lossy().into_owned(),
@@ -3039,11 +3040,12 @@ impl Broker {
             log_path: None,
             agent_identity: agent_identity.map(str::to_string),
         };
-        let session = match self.store.register_session_with_context_and_leases(
+        let session = match self.store.register_spawned_session_with_context_and_leases(
             LeaseRefusalPolicy::verify_only_at(&self.main_root),
             &new_session,
             &context,
             &planned_paths,
+            worktree_instance_witness.as_ref(),
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -3140,6 +3142,7 @@ impl Broker {
             self.create_session_worktree(task, explicit_base, &[])?;
         let base = start_base.commit.clone();
         let worktree_path = worktree.root().to_path_buf();
+        let worktree_instance_witness = worktree.spawned_worktree_instance_witness();
         let repository_contract = match self.capture_repository_contract(&worktree_path, false) {
             Ok(contract) => contract,
             Err(error) => {
@@ -3204,7 +3207,7 @@ impl Broker {
         let pid = agent.pid();
         let worktree_path_string = worktree_path.to_string_lossy().into_owned();
         let log_path_string = log_path.to_string_lossy().into_owned();
-        let registration = self.store.register_session_with_context_and_leases(
+        let registration = self.store.register_spawned_session_with_context_and_leases(
             LeaseRefusalPolicy::verify_only_at(&self.main_root),
             &NewSession {
                 worktree_path: worktree_path_string.clone(),
@@ -3222,6 +3225,7 @@ impl Broker {
             },
             &context,
             &[],
+            worktree_instance_witness.as_ref(),
         );
         let session = match registration {
             Ok(session) => session,

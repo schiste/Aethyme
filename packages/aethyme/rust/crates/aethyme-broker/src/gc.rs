@@ -5761,7 +5761,16 @@ impl Broker {
         // close is about one session's build output (#588). Its failure must
         // not stop the sweep any more than the sweep's may stop a command.
         let auto_cleanup = if closed_session_id.is_none() && scope_runs_checkout_cleanup(scope) {
-            self.auto_remove_disposable_checkouts(Some(deadline)).ok()
+            match self.auto_remove_disposable_checkouts(Some(deadline)) {
+                Ok(report) => Some(report),
+                Err(error) => {
+                    crate::warn_unrecorded(
+                        "run bounded automatic checkout cleanup",
+                        Err::<(), _>(error),
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
