@@ -526,6 +526,9 @@ impl AutoCleanupCandidate {
     }
 }
 
+/// A complete closed-checkout discovery result and its kept rows.
+type AutoCleanupCandidateScan = (Vec<AutoCleanupCandidate>, Vec<AutoKeptCheckout>);
+
 /// Checkouts selected for removal, not yet removed.
 #[derive(Debug, Clone)]
 pub struct AutoCleanupPlan {
@@ -952,7 +955,7 @@ impl Broker {
     pub(crate) fn auto_cleanup_candidates(
         &mut self,
         deadline: Option<Instant>,
-    ) -> Result<Option<(Vec<AutoCleanupCandidate>, Vec<AutoKeptCheckout>)>, BrokerOpError> {
+    ) -> Result<Option<AutoCleanupCandidateScan>, BrokerOpError> {
         if deadline_expired(deadline) {
             return Ok(None);
         }
