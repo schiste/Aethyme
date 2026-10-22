@@ -47,6 +47,9 @@ additional migration.
 
 ### Changed
 
+- Repository owners can configure `[broker.pr] open_as = "draft" | "ready"`
+  on the trusted default branch for newly created session pull requests. Draft
+  remains the default; existing pull requests keep their current state.
 - Start and adopt can report offline PR overlap advice for explicit planned
   paths. Missing, stale, unknown or truncated evidence remains incomplete;
   this advice does not claim a fresh network inspection.
