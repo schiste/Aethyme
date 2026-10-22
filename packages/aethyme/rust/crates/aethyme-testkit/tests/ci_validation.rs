@@ -116,7 +116,119 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
             .filter(|line| line.trim_start().starts_with("if:"))
             .copied()
             .collect::<Vec<_>>(),
-        ["        if: github.event_name == 'push'"]
+        [
+            "        if: github.event_name == 'push'",
+            "        if: failure()"
+        ]
+    );
+}
+
+/// Failed nextest output must survive later passing doc/example output. The
+/// failure-only step adds diagnostics; it never changes gate selection/results.
+#[test]
+fn main_prints_complete_bounded_failure_logs_without_quiet_success_noise() {
+    let gates = workflow("aethyme-gates.yml");
+    let run = gates.find("      - name: Run all gates").unwrap();
+    let diagnostic = gates
+        .find("      - name: Show complete failed gate logs")
+        .unwrap();
+    let cleanup = gates
+        .find("      - name: Keep only third-party artifacts")
+        .unwrap();
+    assert!(run < diagnostic && diagnostic < cleanup);
+    let diagnostic = &gates[diagnostic..cleanup];
+    assert!(diagnostic.contains("        if: failure()"));
+    assert!(diagnostic.contains("        shell: bash"));
+    assert!(diagnostic.contains("log_dir=.aethyme/logs/gates"));
+    assert!(diagnostic.contains("-type f -name '*.fail-*.log' -print0"));
+    assert!(diagnostic.contains("while IFS= read -r -d '' log; do"));
+    assert!(diagnostic.contains("cat -- \"$log\""));
+    assert!(diagnostic.contains("::stop-commands::$token"));
+    assert!(diagnostic.contains("trap 'printf"));
+    assert!(diagnostic.contains("-N16 -tx1 /dev/urandom"));
+    assert!(!diagnostic.contains("tail ") && !diagnostic.contains("head "));
+    assert!(!diagnostic.contains("continue-on-error"));
+}
+
+#[cfg(unix)]
+fn failed_gate_log_script() -> String {
+    let gates = workflow("aethyme-gates.yml");
+    let diagnostic = gates
+        .split("      - name: Show complete failed gate logs")
+        .nth(1)
+        .unwrap();
+    block(diagnostic, "        run: |")
+        .into_iter()
+        .map(|line| line.strip_prefix("          ").unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_gate_diagnostics_keep_an_early_failure_and_literal_log_filenames() {
+    let root = tempfile::tempdir().unwrap();
+    let logs = root.path().join(".aethyme/logs/gates");
+    std::fs::create_dir_all(&logs).unwrap();
+    let marker = "EARLY_WORKSPACE_FAILURE_MUST_SURVIVE";
+    let contents = format!(
+        "{marker}\n::error::untrusted annotation\n::stop-commands::attacker\n{}",
+        "later doctest passed\n".repeat(100)
+    );
+    // Exercise NUL-delimited names and quoting, rather than a whitespace loop.
+    std::fs::write(
+        logs.join("cargo test\n::warning::quoted 'name'.fail-1.log"),
+        &contents,
+    )
+    .unwrap();
+    std::fs::write(
+        logs.join("successful-gate.log"),
+        "SUCCESS_LOG_MUST_STAY_QUIET",
+    )
+    .unwrap();
+    let output = std::process::Command::new("bash")
+        .args(["-c", &failed_gate_log_script()])
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&contents),
+        "early failure or later context was omitted"
+    );
+    let mut lines = stdout.lines();
+    let first = lines.next().unwrap();
+    let token = first.strip_prefix("::stop-commands::").unwrap();
+    assert!(token.starts_with("aethyme-"));
+    assert_eq!(token.len(), "aethyme-".len() + 32);
+    assert!(
+        token["aethyme-".len()..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    );
+    assert_eq!(lines.next_back().unwrap(), format!("::{token}::"));
+    let payload_start = stdout.find(marker).unwrap();
+    let payload_end = stdout.rfind(&format!("::{token}::")).unwrap();
+    assert!(payload_start > first.len() && payload_start < payload_end);
+    assert!(stdout.contains("\n::warning::quoted 'name'.fail-1.log"));
+    assert!(!stdout.contains("SUCCESS_LOG_MUST_STAY_QUIET"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_gate_diagnostics_report_failure_before_log_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("bash")
+        .args(["-c", &failed_gate_log_script()])
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("No broker gate logs")
     );
 }
 

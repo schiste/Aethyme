@@ -1,6 +1,6 @@
 # Releasing Aethyme
 
-Last Updated: 2026-09-24
+Last Updated: 2026-10-22
 
 This is the maintainer contract for choosing and publishing Aethyme versions.
 
@@ -37,10 +37,14 @@ the requested version change.
 3. Stage every new file, then redeploy the enhancement from a binary built at
    the new version:
 
+   Use `--generated-only` in the release worktree. It refreshes the generated
+   guidance without starting the canonical enrollment plan for an already
+   enrolled repository.
+
    ```bash
    git add -A
-   (cd packages/aethyme/rust && cargo build -p aethyme-cli -p aethyme-engine)
-   ./packages/aethyme/rust/target/debug/aethyme deploy --repo "$PWD"
+   (cd packages/aethyme/rust && cargo build --locked -j1 -p aethyme-cli -p aethyme-engine)
+   ./packages/aethyme/rust/target/debug/aethyme deploy --generated-only --repo "$PWD"
    git add -A
    ```
 
