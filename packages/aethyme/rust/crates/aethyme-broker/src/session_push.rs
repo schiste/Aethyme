@@ -867,7 +867,7 @@ impl Broker {
             self.store().record_pull_request_opened(
                 repository,
                 created.number,
-                Some(session_id),
+                Some(session.id),
                 crate::clock::epoch_ms(),
             ),
         );
