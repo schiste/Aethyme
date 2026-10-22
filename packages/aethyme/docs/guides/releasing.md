@@ -1,6 +1,6 @@
 # Releasing Aethyme
 
-Last Updated: 2026-09-24
+Last Updated: 2026-10-22
 
 This is the maintainer contract for choosing and publishing Aethyme versions.
 
@@ -43,7 +43,7 @@ the requested version change.
 
    ```bash
    git add -A
-   (cd packages/aethyme/rust && cargo build -p aethyme-cli -p aethyme-engine)
+   (cd packages/aethyme/rust && cargo build --locked -j1 -p aethyme-cli -p aethyme-engine)
    ./packages/aethyme/rust/target/debug/aethyme deploy --generated-only --repo "$PWD"
    git add -A
    ```

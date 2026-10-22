@@ -7,6 +7,7 @@
 //! byte shapes survive the port, including override-injected content.
 
 use std::collections::{BTreeSet, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -3357,16 +3358,32 @@ fn generated_artifact_matches(repo_path: &Path, relative_path: &str, expected: &
     if crate::deploy::ensure_no_symlink_in_path(repo_path, &path).is_err() {
         return false;
     }
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(&path) else {
         return false;
     };
-    if !metadata.file_type().is_file() || metadata.len() != expected.len() as u64 {
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != expected.len() as u64 {
         return false;
     }
-    match std::fs::read_to_string(path) {
-        Ok(actual) => actual == expected,
-        Err(_) => false,
+    let mut actual = Vec::new();
+    if file
+        .take(expected.len() as u64 + 1)
+        .read_to_end(&mut actual)
+        .is_err()
+    {
+        return false;
     }
+    crate::deploy::ensure_no_symlink_in_path(repo_path, &path).is_ok()
+        && actual.as_slice() == expected.as_bytes()
 }
 
 /// Whether generated onboarding artifacts are fresh relative to overrides.
@@ -4703,7 +4720,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_act_artifact_is_fresh_after_valid_override_regeneration() {
+    fn override_freshness_accepts_unchanged_act_after_valid_regeneration() {
         let repo = committed_git_repo("freshness-unchanged-act");
         crate::deploy::deploy_supporting_artifacts(&repo, false).unwrap();
 
@@ -4767,7 +4784,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_override_does_not_get_a_content_based_freshness_waiver() {
+    fn override_freshness_rejects_content_waiver_for_invalid_override() {
         let repo = committed_git_repo("freshness-invalid-override");
         crate::deploy::deploy_supporting_artifacts(&repo, false).unwrap();
 
