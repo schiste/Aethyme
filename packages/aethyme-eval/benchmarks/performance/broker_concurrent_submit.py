@@ -89,10 +89,14 @@ def validate_output_path(path, source_root):
     return output.resolve(strict=True)
 
 
+def fail_walk(error):
+    raise RuntimeError(f'could not inspect directory tree: {error}') from error
+
+
 def tree_size(root, max_files=20_000):
     total = 0
     count = 0
-    for directory, names, files in os.walk(root, followlinks=False):
+    for directory, names, files in os.walk(root, followlinks=False, onerror=fail_walk):
         for name in names:
             item = Path(directory) / name
             if item.is_symlink():
@@ -114,7 +118,7 @@ def tree_size(root, max_files=20_000):
 def output_tree_size(root):
     total = 0
     count = 0
-    for directory, names, files in os.walk(root, followlinks=False):
+    for directory, names, files in os.walk(root, followlinks=False, onerror=fail_walk):
         for name in names:
             if (Path(directory) / name).is_symlink():
                 raise RuntimeError('output contains an unexpected symlink')
@@ -513,7 +517,8 @@ def validate_submit_outcome(payload, session_id, baseline, integration_head, ses
     gate = payload.get('gate_verification')
     if (not isinstance(entry, dict) or entry.get('status') != 'verified'
             or not isinstance(gate, dict) or gate.get('status') != 'no_configuration'
-            or gate.get('configured_gates') != 0 or gate.get('executed_gates') != 0):
+            or gate.get('configured_gates') != 0 or gate.get('selected_gates') != 0
+            or gate.get('executed_gates') != 0 or gate.get('cached_gates') != 0):
         raise RuntimeError('submit did not follow the no-gates conflict-only policy')
     return plan
 
@@ -758,6 +763,30 @@ def audit_patch_stream(runner, git, repo, label, commits):
             'argv': row['argv']}
 
 
+def command_overlap_ns(rows):
+    if len(rows) != 2:
+        return None
+    starts = [row.get('start_monotonic_ns') for row in rows]
+    ends = [row.get('end_monotonic_ns') for row in rows]
+    if any(type(value) is not int for value in starts + ends):
+        raise RuntimeError('concurrent submit receipt omitted monotonic command bounds')
+    if any(end < start for start, end in zip(starts, ends)):
+        raise RuntimeError('concurrent submit receipt has reversed monotonic bounds')
+    return max(0, min(ends) - max(starts))
+
+
+def concurrent_pair_claim(overlap_observed):
+    if overlap_observed:
+        return (
+            'two submit runner-call windows overlapped (including spawn, output drain, and owned-group cleanup); '
+            'this does not demonstrate overlapping broker-side execution; no speedup claim'
+        )
+    return (
+        'concurrent pair invocation attempted but runner-call window overlap was not observed; '
+        'comparison is inconclusive and makes no speedup claim'
+    )
+
+
 def _measure_submit_scenario(name, binary, git, output, receipts, mode, setup):
     runner, root, repo, sessions, baseline, integration, shared_commits, worker_commits, workload = setup
     if mode == 'single_control':
@@ -810,16 +839,18 @@ def _measure_submit_scenario(name, binary, git, output, receipts, mode, setup):
                  if commit['ownership'] == 'session_owned']
         result['session_patch_stream'] = audit_patch_stream(
             runner, git, repo, f"{name}:audit-{result['role']}-patch-stream", owned)
-    overlap_ns = None
-    if len(results) == 2:
-        overlap_ns = max(0, min(row['end_monotonic_ns'] for row in results)
-                         - max(row['start_monotonic_ns'] for row in results))
+    overlap_ns = command_overlap_ns(results)
+    overlap_observed = overlap_ns is not None and overlap_ns > 0
     workload.update({
         'measured_submits': results,
         'measured_submit_count': len(results),
         'manual_mode_kept_integration_fixed': True,
         'shared_integration_patch_stream': history_audit,
         'pair_command_overlap_ms': overlap_ns / 1_000_000 if overlap_ns is not None else None,
+        'pair_command_overlap_observed': overlap_observed,
+        'pair_command_overlap_basis': (
+            'bounded runner call from before spawn through output drain and owned-group cleanup; not exact child execution time'
+        ),
         'fixture_storage_after_measurement': tree_size(root),
     })
     (output / 'provenance' / f'{name}.json').write_bytes(canonical_json_bytes(workload))
@@ -873,7 +904,10 @@ def run(binary, output):
         'schema_version': 1,
         'profile': 'synthetic_shared_binary_history_single_control_and_concurrent_pair',
         'enforcement': 'diagnostic_only',
-        'claim': 'one synthetic single-submit control and one synthetic concurrent pair; no speedup claim',
+        'claim': (
+            'one synthetic single-submit control and ' +
+            concurrent_pair_claim(scenarios['concurrent_pair']['pair_command_overlap_observed'])
+        ),
         'binary': binary_row,
         'git': {'path': git, 'version': scenarios['single_control']['git_version']},
         'harness': {
@@ -895,6 +929,9 @@ def run(binary, output):
             'concurrent_submit_wall_ms': [item['duration_ms'] for item in
                                           scenarios['concurrent_pair']['measured_submits']],
             'concurrent_pair_overlap_ms': scenarios['concurrent_pair']['pair_command_overlap_ms'],
+            'concurrent_pair_overlap_observed': scenarios['concurrent_pair']['pair_command_overlap_observed'],
+            'concurrent_pair_overlap_basis': scenarios['concurrent_pair']['pair_command_overlap_basis'],
+            'concurrent_broker_execution_qualified': False,
             'concurrent_git_process_starts': [
                 item['trace2']['git_process_start_count']
                 for item in scenarios['concurrent_pair']['measured_submits']],
@@ -926,6 +963,7 @@ def run(binary, output):
             'synthetic local workload only; not an evaluation or a production latency estimate',
             'Trace2 instrumentation is retained for process attribution; no timed trace-off comparison is made',
             'one control and one pair are diagnostic samples, not a statistical benchmark',
+            'overlap is measured across runner calls, including spawn, pipe drain, and cleanup; it is not exact child execution time',
             'the local SSH shim does not provide OS-level network isolation',
         ],
     }
@@ -941,7 +979,13 @@ def run(binary, output):
         'shared_history_patch_bytes': report['comparison']['shared_patch_stream_bytes'],
         'concurrent_full_patch_log_starts': report['comparison']['concurrent_full_patch_log_starts'],
         'report_sha256': sha256_bytes(report_bytes),
-        'summary': 'Synthetic fixture only; no speedup claim; full plans and raw Trace2 retained.',
+        'summary': (
+            'Synthetic fixture only; runner-call window overlap observed, not broker-side execution proof; '
+            'no speedup claim; full plans and raw Trace2 retained.'
+            if report['comparison']['concurrent_pair_overlap_observed'] else
+            'Synthetic fixture only; runner-call overlap not observed, comparison inconclusive; '
+            'full plans and raw Trace2 retained.'
+        ),
     }
     (output / 'summary.json').write_bytes(canonical_json_bytes(summary))
     output_tree_size(output)

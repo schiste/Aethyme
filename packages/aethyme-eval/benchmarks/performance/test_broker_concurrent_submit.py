@@ -17,11 +17,15 @@ from broker_concurrent_submit import (
     MAX_STDOUT_BYTES,
     POLICY_TEXT,
     ReceiptLog,
+    command_overlap_ns,
+    concurrent_pair_claim,
     deterministic_payload,
     make_env,
+    output_tree_size,
     parse_trace2,
     scenario_fixture,
     terminate_owned_group,
+    tree_size,
     validate_output_path,
     validate_submit_outcome,
 )
@@ -39,6 +43,45 @@ class SyntheticWorkloadTests(unittest.TestCase):
         for length in (0, BINARY_BYTES_PER_COMMIT - 1, BINARY_BYTES_PER_COMMIT + 1, True):
             with self.subTest(length=length), self.assertRaises(ValueError):
                 deterministic_payload(0, length)
+
+    def test_positive_runner_overlap_is_required_for_concurrent_claim(self):
+        self.assertEqual(command_overlap_ns([
+            {'start_monotonic_ns': 10, 'end_monotonic_ns': 30},
+            {'start_monotonic_ns': 20, 'end_monotonic_ns': 40},
+        ]), 10)
+        self.assertEqual(command_overlap_ns([
+            {'start_monotonic_ns': 10, 'end_monotonic_ns': 20},
+            {'start_monotonic_ns': 20, 'end_monotonic_ns': 40},
+        ]), 0)
+        self.assertIsNone(command_overlap_ns([{'start_monotonic_ns': 10, 'end_monotonic_ns': 20}]))
+        with self.assertRaisesRegex(RuntimeError, 'reversed monotonic bounds'):
+            command_overlap_ns([
+                {'start_monotonic_ns': 20, 'end_monotonic_ns': 10},
+                {'start_monotonic_ns': 5, 'end_monotonic_ns': 30},
+            ])
+
+    def test_concurrent_claim_never_proves_broker_side_overlap(self):
+        positive = concurrent_pair_claim(True)
+        self.assertIn('runner-call windows overlapped', positive)
+        self.assertIn('including spawn, output drain, and owned-group cleanup', positive)
+        self.assertIn('does not demonstrate overlapping broker-side execution', positive)
+        negative = concurrent_pair_claim(False)
+        self.assertIn('runner-call window overlap was not observed', negative)
+        self.assertIn('comparison is inconclusive', negative)
+        self.assertNotIn('broker-side execution', negative)
+
+    def test_tree_walk_errors_fail_closed(self):
+        def denied_walk(root, *, followlinks, onerror):
+            onerror(PermissionError('fixture traversal denied'))
+            yield root, [], []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for tree_function in (tree_size, output_tree_size):
+                with self.subTest(tree_function=tree_function.__name__), mock.patch(
+                        'broker_concurrent_submit.os.walk', side_effect=denied_walk):
+                    with self.assertRaisesRegex(RuntimeError, 'fixture traversal denied'):
+                        tree_function(root)
 
     def test_policy_is_manual_without_gate_configuration(self):
         self.assertIn('[promote]\nmode = "manual"', POLICY_TEXT)
@@ -128,6 +171,12 @@ class ProvenanceValidationTests(unittest.TestCase):
                  'no-gates conflict-only policy'),
                 ({**self.payload, 'gate_verification': {
                     **self.payload['gate_verification'], 'executed_gates': 1}},
+                 'no-gates conflict-only policy'),
+                ({**self.payload, 'gate_verification': {
+                    **self.payload['gate_verification'], 'selected_gates': 1}},
+                 'no-gates conflict-only policy'),
+                ({**self.payload, 'gate_verification': {
+                    **self.payload['gate_verification'], 'cached_gates': 1}},
                  'no-gates conflict-only policy'),
         ):
             with self.subTest(payload=payload), self.assertRaisesRegex(RuntimeError, message):
