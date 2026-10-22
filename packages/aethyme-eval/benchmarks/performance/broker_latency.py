@@ -107,6 +107,22 @@ def parse_status_diagnostics(stdout, expected_sessions, require_open_timing=True
     return counts, open_ms
 
 
+def parse_doctor_diagnostics(stdout):
+    try:
+        report = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError('doctor command did not return JSON') from error
+    if (not isinstance(report, dict)
+            or not isinstance(report.get('integrity'), str)
+            or not isinstance(report.get('missing_worktrees'), list)
+            or not isinstance(report.get('orphaned_pidfiles'), list)
+            or not isinstance(report.get('blockers'), list)
+            or not isinstance(report.get('phase_timings_ms'), dict)
+            or not isinstance(report.get('retention'), dict)):
+        raise RuntimeError('doctor output has no valid health-check inventory')
+    return report
+
+
 def fixture_path(path, root, label, must_exist=False):
     path = Path(path)
     if not path.is_absolute() or path.is_symlink():
@@ -599,13 +615,7 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
                     diagnostic_samples['status_full'].append(elapsed)
                     diagnostic_samples['status_open_phase_full'].append(open_ms)
                 elif name == 'doctor':
-                    try:
-                        report = json.loads(stdout)
-                    except json.JSONDecodeError as error:
-                        raise RuntimeError('doctor command did not return JSON') from error
-                    if (not isinstance(report, dict)
-                            or not isinstance(report.get('deferred_checks'), list)):
-                        raise RuntimeError('doctor output has no deferred-check inventory')
+                    parse_doctor_diagnostics(stdout)
                     diagnostic_samples[name].append(elapsed)
                 elif name == 'guard_overhead':
                     if not json.loads(stdout).get('ok'):

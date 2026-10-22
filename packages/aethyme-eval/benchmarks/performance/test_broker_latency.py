@@ -6,6 +6,7 @@ import unittest
 
 from broker_latency import (
     assess,
+    parse_doctor_diagnostics,
     parse_status_diagnostics,
     summarize_diagnostic,
     status_diagnostics_enabled,
@@ -167,6 +168,20 @@ class SessionScaleTests(unittest.TestCase):
                 parse_status_diagnostics(json.dumps(payload), 3)
         with self.assertRaises(RuntimeError):
             parse_status_diagnostics('not json', 3)
+
+    def test_current_doctor_report_shape_is_accepted_and_malformed_output_refused(self):
+        report = {
+            'integrity': 'ok', 'missing_worktrees': [], 'orphaned_pidfiles': [],
+            'blockers': [], 'phase_timings_ms': {'total': 123}, 'retention': {},
+        }
+        self.assertEqual(parse_doctor_diagnostics(json.dumps(report)), report)
+        for invalid in (
+                'not json',
+                json.dumps({**report, 'missing_worktrees': None}),
+                json.dumps({key: value for key, value in report.items() if key != 'retention'}),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                parse_doctor_diagnostics(invalid)
 
 
 if __name__ == '__main__':
