@@ -556,7 +556,6 @@ impl Broker {
 
         let pr = if let Some(open_as) = pr_open_as {
             Some(self.open_session_pull_request(
-                session_id,
                 &session,
                 &default,
                 &target.display_slug,
@@ -760,7 +759,6 @@ impl Broker {
     /// trusted configured mode. Existing pull requests are never changed.
     fn open_session_pull_request(
         &mut self,
-        session_id: i64,
         session: &crate::Session,
         default: &TrackedDefault,
         repository: &str,
@@ -769,7 +767,7 @@ impl Broker {
         cwd: &Path,
     ) -> Result<SessionPullRequest, BrokerOpError> {
         if let Some(existing) =
-            self.find_session_pull_request(session_id, repository, &session.branch, cwd)?
+            self.find_session_pull_request(session.id, repository, &session.branch, cwd)?
         {
             return Ok(existing);
         }
@@ -824,7 +822,7 @@ impl Broker {
         ]);
         let create = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
-                session_id,
+                session_id: session.id,
                 provider: OperationProvider::Github,
                 repository: Some(repository.to_string()),
                 resolved_target: None,
@@ -844,7 +842,7 @@ impl Broker {
         }
         // The provider, not gh's output text, is the evidence the PR exists.
         let mut created = self
-            .find_session_pull_request(session_id, repository, &session.branch, cwd)?
+            .find_session_pull_request(session.id, repository, &session.branch, cwd)?
             .ok_or_else(|| BrokerOpError::SessionPushFailed {
                 phase: "pull request lookup after creation",
                 operation_id: create.operation.id,
