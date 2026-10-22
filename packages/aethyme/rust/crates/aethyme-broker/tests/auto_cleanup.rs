@@ -137,6 +137,81 @@ fn kept_reason<'a>(report: &'a AutoCleanupReport, worktree: &Path) -> &'a str {
         .unwrap_or_else(|| panic!("{} not kept: {report:#?}", worktree.display()))
 }
 
+/// Match repositories that explicitly keep pnpm's store inside each checkout.
+fn pnpm_store_fixture(ignored: bool) -> Fixture {
+    let fx = fixture();
+    if ignored {
+        let ignore = fx.repo.join(".gitignore");
+        let mut text = std::fs::read_to_string(&ignore).unwrap();
+        text.push_str(".pnpm-store/\n");
+        std::fs::write(ignore, text).unwrap();
+        git(&fx.repo, &["add", ".gitignore"]);
+    }
+    commit(
+        &fx.repo,
+        ".npmrc",
+        "store-dir=.pnpm-store\n",
+        "local pnpm store",
+    );
+    git(&fx.repo, &["push", "-q", "origin", "main"]);
+    fx
+}
+
+#[test]
+fn an_ignored_pnpm_store_does_not_keep_a_merged_closed_checkout() {
+    let fx = pnpm_store_fixture(true);
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (session_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::create_dir_all(worktree.join(".pnpm-store/v10/files/00")).unwrap();
+    std::fs::write(worktree.join(".pnpm-store/v10/files/00/content"), "package").unwrap();
+    let report = run(&mut broker);
+    assert!(
+        report
+            .removed
+            .iter()
+            .any(|entry| entry.sessions.contains(&session_id)),
+        "{report:#?}"
+    );
+    assert!(
+        !worktree.exists(),
+        "the safe ignored package store must not retain the checkout"
+    );
+}
+
+#[test]
+fn sensitive_content_in_an_ignored_pnpm_store_keeps_the_checkout() {
+    let fx = pnpm_store_fixture(true);
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::create_dir_all(worktree.join(".pnpm-store")).unwrap();
+    let secret = worktree.join(".pnpm-store/.env");
+    std::fs::write(&secret, "private").unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree).contains("secret"),
+        "{report:#?}"
+    );
+    assert_eq!(std::fs::read_to_string(secret).unwrap(), "private");
+}
+
+#[test]
+fn an_untracked_pnpm_store_keeps_the_checkout() {
+    let fx = pnpm_store_fixture(false);
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::create_dir_all(worktree.join(".pnpm-store")).unwrap();
+    let file = worktree.join(".pnpm-store/content");
+    std::fs::write(&file, "untracked").unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree).contains("untracked"),
+        "{report:#?}"
+    );
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "untracked");
+}
+
 #[test]
 fn a_merged_closed_checkout_is_removed_by_ancestry_and_journaled() {
     let fx = fixture();
