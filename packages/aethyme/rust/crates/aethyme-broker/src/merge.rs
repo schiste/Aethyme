@@ -3917,7 +3917,7 @@ mod submission_plan_empty_patch_tests {
                     child.env_remove(key);
                 }
             }
-            let output = child
+            child
                 .env(ROOT, &root)
                 .env(MODE, mode)
                 .env(SESSION_HEAD, &session_head)
