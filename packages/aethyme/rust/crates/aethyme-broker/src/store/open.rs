@@ -217,9 +217,24 @@ impl BrokerStore {
     pub fn open_current_in_repo(repo_root: &Path) -> Result<Option<Self>, BrokerError> {
         let repository_root = canonical_main_root(repo_root)?;
         let path = crate::broker_db_path(&repository_root)?;
+        Self::open_current_repository_path(&repository_root, &path)
+    }
+
+    fn open_current_repository_path(
+        repo_root: &Path,
+        path: &Path,
+    ) -> Result<Option<Self>, BrokerError> {
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = path.to_path_buf();
         if !path.is_file() {
             return Ok(None);
         }
+        // Validate the read-only repository identity before graph-fence
+        // enrollment or SQLite opens the database. A malformed/incomplete
+        // UUID publication prefix must not leave repository or DB side effects
+        // when this observational open refuses.
+        let binding_scope =
+            super::repository_identity::RepositoryBindingScope::capture(&repository_root, &path)?;
         enroll_repository_graph_fence(&repository_root)?;
         // No `SQLITE_OPEN_CREATE`: an absent database stays absent even if it
         // is deleted between the check above and this open.
@@ -234,10 +249,7 @@ impl BrokerStore {
         }
         Ok(Some(Self {
             conn,
-            binding_scope: Some(super::repository_identity::RepositoryBindingScope::capture(
-                &repository_root,
-                &path,
-            )?),
+            binding_scope: Some(binding_scope),
             path,
             _snapshot_dir: None,
         }))
@@ -1442,7 +1454,7 @@ fn enroll_repository_graph_fence(repo_root: &Path) -> Result<(), BrokerError> {
 mod graph_fence_tests {
     use super::*;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     fn init_git_root(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
@@ -1475,6 +1487,81 @@ mod graph_fence_tests {
         assert!(aethyme_graph_storage::write_index_shard(&root, "fixture", &[]).is_err());
         assert!(!root.join(".aethyme").exists());
         drop(store);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_uuid_marker_refusal_precedes_graph_fence_and_sqlite_sidecars() {
+        use std::io::Write as _;
+
+        fn entries(directory: &Path) -> Vec<String> {
+            let mut names: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("repo");
+        init_git_root(&root);
+        let database = root.join(crate::BROKER_DB_RELPATH);
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        drop(BrokerStore::open(&database).unwrap());
+
+        let git_dir = root.join(".git");
+        let graph_marker =
+            git_dir.join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER);
+        let uuid_temp =
+            git_dir.join(".aethyme-repository-uuid.0123456789abcdef0123456789abcdef.tmp");
+        let uuid_bytes = b"AETHYME-REPO-UUID-V1\nf47ac10b-58cc-4372-a567-0e02b2c3d479\n";
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&uuid_temp)
+            .unwrap();
+        marker.write_all(uuid_bytes).unwrap();
+        marker.sync_all().unwrap();
+        drop(marker);
+
+        let git_entries_before = entries(&git_dir);
+        let db_entries_before = entries(database.parent().unwrap());
+        let database_before = std::fs::read(&database).unwrap();
+        assert!(!graph_marker.exists());
+        assert!(database_before.len() > 0);
+
+        let error = match BrokerStore::open_current_repository_path(&root, &database) {
+            Err(error) => error,
+            Ok(_) => panic!("incomplete repository UUID marker must refuse current open"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("repository UUID marker publication is incomplete"),
+            "unexpected refusal: {error}"
+        );
+
+        assert!(
+            !graph_marker.exists(),
+            "refusal must not enroll a graph fence"
+        );
+        assert_eq!(entries(&git_dir), git_entries_before);
+        assert_eq!(entries(database.parent().unwrap()), db_entries_before);
+        assert_eq!(std::fs::read(&database).unwrap(), database_before);
+        assert_eq!(std::fs::read(&uuid_temp).unwrap(), uuid_bytes);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = database.with_file_name(format!(
+                "{}{suffix}",
+                database.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                !sidecar.exists(),
+                "refusal created SQLite sidecar {}",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]
