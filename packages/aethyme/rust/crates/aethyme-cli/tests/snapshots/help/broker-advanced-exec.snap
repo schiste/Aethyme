@@ -1,7 +1,13 @@
 exit: 0
 --- stdout
-  aethyme broker advanced exec --session <id> -- <command> [--json]
+  aethyme broker advanced exec --session <id> [--non-interactive] [--json] -- <command>
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
       foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
+      --non-interactive selects supervised process-group execution even when
+      a terminal is available. This is a caller assertion, not TTY isolation:
+      stdio routing stays the same as the default, and the child may still open
+      the terminal. Use it only for commands that do not need terminal
+      interaction; terminal reads or job-control operations may stop or fail.
+      If the supervised helper cannot start, the child is not dispatched.
 --- stderr
