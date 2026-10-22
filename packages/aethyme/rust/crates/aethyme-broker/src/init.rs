@@ -614,6 +614,7 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("promote", &["mode", "branch"]),
     ("delivery", &["default", "push_session_branches"]),
+    ("broker", &["pr"]),
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
@@ -833,6 +834,30 @@ fn unknown_config_keys(value: &toml::Value) -> Vec<String> {
         }
         match CONFIG_KNOWN_KEYS.iter().find(|(section, _)| section == key) {
             None => unknown.push(key.clone()),
+            Some((_, known)) if key == "broker" => {
+                let Some(section) = entry.as_table() else {
+                    unknown.push("broker".into());
+                    continue;
+                };
+                for (inner, value) in section {
+                    if !known.contains(&inner.as_str()) {
+                        unknown.push(format!("broker.{inner}"));
+                        continue;
+                    }
+                    if inner != "pr" {
+                        continue;
+                    }
+                    let Some(pr) = value.as_table() else {
+                        unknown.push("broker.pr".into());
+                        continue;
+                    };
+                    for leaf in pr.keys() {
+                        if leaf != "open_as" {
+                            unknown.push(format!("broker.pr.{leaf}"));
+                        }
+                    }
+                }
+            }
             Some((_, known)) => {
                 if let Some(section) = entry.as_table() {
                     for inner in section.keys() {
@@ -1187,12 +1212,14 @@ const CONFIG_TEMPLATE: &str = "\
 #   [promote] branch  integration branch name
 #   [delivery] default \"pull_request\" | \"local_main_merge\"
 #   [delivery] push_session_branches  true | false (default false; authorizes `broker push`)
+#   [broker.pr] open_as  \"draft\" | \"ready\" (default draft for new PRs)
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
 #   [worktrees] root  absolute directory for session worktrees (default: per-user host state)
 #   [worktrees] min_free_bytes  free space the root must keep (default: gate headroom)
 #   [session] guidance  working agreement `broker start` shows (default built in; [] disables)
-# Unknown keys are ignored at runtime; `aethyme certify` warns on them.
+# Unknown keys are generally ignored; typed policy sections refuse invalid
+# values before acting. Certify warns on unknown keys.
 
 schema = 1
 
@@ -1214,13 +1241,18 @@ mode = \"auto\"
 # default = \"pull_request\"
 #
 # `push_session_branches = true` authorizes agents to push their own session
-# branch (`aethyme broker push`) and open a draft pull request
+# branch (`aethyme broker push`) and open a pull request
 # (`aethyme broker push --pr`) while they work, so no work exists only in a
 # worktree. It authorizes nothing else: no merging and no other refs. For a
 # repository that delivers through pull requests, pair it with
 # `[promote] mode = \"verify-only\"` so verified work does not accumulate,
 # unpublished, on the local integration branch.
 # push_session_branches = true
+
+# How broker push --pr opens a new pull request. Read from the trusted default
+# branch; changing it never edits an existing pull request.
+# [broker.pr]
+# open_as = \"draft\" # default; use \"ready\" to open new PRs ready for review
 
 # Where session worktrees are created. The default is the per-user host-state
 # directory. A root set here supersedes it only while it already exists (it is
@@ -1837,6 +1869,17 @@ mod config_key_tests {
             unknown("[delivery]\npush_everything = true\n"),
             ["delivery.push_everything"]
         );
+    }
+
+    #[test]
+    fn broker_pr_open_as_is_a_known_nested_key() {
+        assert!(unknown("[broker.pr]\nopen_as = \"ready\"\n").is_empty());
+        assert_eq!(unknown("[broker.pr]\nopen = true\n"), ["broker.pr.open"]);
+        assert_eq!(
+            unknown("[broker]\nopen_as = \"ready\"\n"),
+            ["broker.open_as"]
+        );
+        assert_eq!(unknown("broker = false\n"), ["broker"]);
     }
 
     #[test]
