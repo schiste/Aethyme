@@ -1383,6 +1383,7 @@ fn report_main_checkout_unchanged(reason: &str, command: &str) {
     eprintln!("warning: left the main checkout unchanged: {reason}. Run: {command}");
 }
 
+#[derive(Debug)]
 enum UsageError {
     Help,
     Message(String),

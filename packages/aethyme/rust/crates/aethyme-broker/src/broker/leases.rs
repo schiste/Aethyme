@@ -50,6 +50,11 @@ impl LeaseClaimPreparation {
     }
 }
 
+struct GuardedExecOutput {
+    stdout: std::process::Stdio,
+    supervised_timeout: std::time::Duration,
+}
+
 impl Broker {
     // ── agents (liveness) ─────────────────────────────────────────────
 
@@ -1677,14 +1682,16 @@ impl Broker {
         } else {
             std::process::Stdio::inherit()
         };
-        self.guarded_exec_with_env_heartbeat_mode_and_stdout(
+        self.guarded_exec_with_env_heartbeat_mode_and_output(
             session_id,
             command,
             &[],
             || Ok(()),
             move || mode,
-            stdout,
-            supervised_timeout,
+            GuardedExecOutput {
+                stdout,
+                supervised_timeout,
+            },
         )
     }
 
@@ -1728,31 +1735,36 @@ impl Broker {
         F: FnMut() -> Result<(), BrokerOpError>,
         M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
     {
-        self.guarded_exec_with_env_heartbeat_mode_and_stdout(
+        self.guarded_exec_with_env_heartbeat_mode_and_output(
             session_id,
             command,
             environment,
             heartbeat,
             select_mode,
-            std::process::Stdio::inherit(),
-            crate::inline_exec_supervisor::DEFAULT_GUARDED_EXEC_TIMEOUT,
+            GuardedExecOutput {
+                stdout: std::process::Stdio::inherit(),
+                supervised_timeout: crate::inline_exec_supervisor::DEFAULT_GUARDED_EXEC_TIMEOUT,
+            },
         )
     }
 
-    fn guarded_exec_with_env_heartbeat_mode_and_stdout<F, M>(
+    fn guarded_exec_with_env_heartbeat_mode_and_output<F, M>(
         &mut self,
         session_id: i64,
         command: &[String],
         environment: &[(String, String)],
         mut heartbeat: F,
         select_mode: M,
-        stdout: std::process::Stdio,
-        supervised_timeout: std::time::Duration,
+        output: GuardedExecOutput,
     ) -> Result<GuardedExecReport, BrokerOpError>
     where
         F: FnMut() -> Result<(), BrokerOpError>,
         M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
     {
+        let GuardedExecOutput {
+            stdout,
+            supervised_timeout,
+        } = output;
         let supervisor_executable = self.agent_supervisor_executable.clone();
         self.guarded_exec_with_runner(session_id, command, move |session| {
             let mut execution_environment = vec![
