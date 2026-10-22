@@ -33,7 +33,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   successful check with a guessed edition can fail workspace CI.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
-  runs rather than wall-clock assertions in ordinary tests. Retain complete CLI
+  runs rather than wall-clock assertions in ordinary tests. Match the recorded
+  workload to the claimed scaling dimension: released lease history does not
+  establish behavior with many sessions or worktrees. Retain complete CLI
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
@@ -41,6 +43,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   subprocess starts and group repeated argv. Stack-sample counts measure time in
   sampled frames, not invocation counts; keep instrumented traces and timings
   separate from uninstrumented benchmark samples.
+- In nonblocking readiness readers, distinguish available bytes from
+  `WouldBlock`: wait only after `WouldBlock`, and drain buffered input without
+  a polling sleep after every byte. Assert injected wait-callback counts for
+  buffered reads, retries and expired deadlines; measure elapsed gains with a
+  rebuilt pair in a separate uninstrumented Playground run.
 
 - For deadline-bounded cleanup, separate candidate discovery from the
   assertion that partial work completed. One short wall-clock budget may expire
@@ -203,6 +210,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   to make it writable. After a reboot, mark missing evidence interrupted or
   unavailable. Recorded hashes do not recover missing bytes or recreate a trust
   record.
+- Preserve the complete outer `broker advanced resources run <request> -- ...`
+  invocation for supervised native checks, bound to the frozen resource request.
+  The helper must refuse before resource probes or Cargo when the host lease ID
+  or generation is absent or malformed, and record both
+  in its result. A local Cargo lock and headroom monitor do not prove host
+  admission. Exercise the missing-lease refusal without starting Cargo.
 - Before an expensive run, invoke the exact frozen helper entrypoint in its
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
