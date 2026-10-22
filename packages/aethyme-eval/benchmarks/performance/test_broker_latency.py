@@ -6,8 +6,10 @@ import unittest
 
 from broker_latency import (
     assess,
+    parse_status_diagnostics,
     summarize_diagnostic,
     validate_aged_released_resource_lease_count,
+    validate_session_count,
     validate_resource_inventory,
 )
 
@@ -106,6 +108,46 @@ class AgedHistoryTests(unittest.TestCase):
         for samples in ([], [-1], [True], [float('nan')]):
             with self.subTest(samples=samples), self.assertRaises(ValueError):
                 summarize_diagnostic(samples)
+
+
+class SessionScaleTests(unittest.TestCase):
+    def test_session_count_is_bounded_with_one_as_the_default(self):
+        for count in (1, 2, 32, 64):
+            with self.subTest(count=count):
+                self.assertEqual(validate_session_count(count), count)
+        for count in (0, 65, True, 1.5, '2'):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                validate_session_count(count)
+
+    def test_status_counts_and_open_phase_match_the_requested_fixture(self):
+        payload = {
+            'summary': {'live_sessions': 3, 'active_sessions': 1,
+                        'idle_sessions': 1, 'stale_sessions': 1},
+            'phase_timings_ms': {'open': 117, 'command_total': 216},
+        }
+        counts, open_ms = parse_status_diagnostics(json.dumps(payload), 3)
+        self.assertEqual(counts, {'live_sessions': 3, 'active_sessions': 1,
+                                  'idle_sessions': 1, 'stale_sessions': 1})
+        self.assertEqual(open_ms, 117)
+
+    def test_status_scale_controls_refuse_missing_or_wrong_counts(self):
+        invalid_payloads = (
+            {},
+            {'summary': {'live_sessions': 2, 'active_sessions': 1,
+                         'idle_sessions': 0, 'stale_sessions': 1},
+             'phase_timings_ms': {'open': 100}},
+            {'summary': {'live_sessions': True, 'active_sessions': 1,
+                         'idle_sessions': 0, 'stale_sessions': 0},
+             'phase_timings_ms': {'open': 100}},
+            {'summary': {'live_sessions': 3, 'active_sessions': 1,
+                         'idle_sessions': 1, 'stale_sessions': 1},
+             'phase_timings_ms': {}},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(RuntimeError):
+                parse_status_diagnostics(json.dumps(payload), 3)
+        with self.assertRaises(RuntimeError):
+            parse_status_diagnostics('not json', 3)
 
 
 if __name__ == '__main__':

@@ -17,6 +17,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 MAX_AGED_RELEASED_RESOURCE_LEASES = 50_000
+MAX_BROKER_LATENCY_SESSIONS = 64
 HOST_RESOURCE_STORE_SCHEMA_VERSION = 2
 
 
@@ -59,6 +60,40 @@ def summarize_diagnostic(samples):
         raise ValueError('invalid or empty diagnostic timing samples')
     return {'samples_ms': samples, 'median_ms': statistics.median(samples),
             'budget_ms': None, 'verdict': 'diagnostic_only'}
+
+
+def validate_session_count(value):
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 1 or value > MAX_BROKER_LATENCY_SESSIONS):
+        raise ValueError(
+            f'broker session count must be between 1 and {MAX_BROKER_LATENCY_SESSIONS}')
+    return value
+
+
+def parse_status_diagnostics(stdout, expected_sessions):
+    expected_sessions = validate_session_count(expected_sessions)
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError('status command did not return JSON') from error
+    if not isinstance(payload, dict) or not isinstance(payload.get('summary'), dict):
+        raise RuntimeError('status output has no summary object')
+    summary = payload['summary']
+    counts = {}
+    for field in ('live_sessions', 'active_sessions', 'idle_sessions', 'stale_sessions'):
+        value = summary.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f'status summary has an invalid {field} count')
+        counts[field] = value
+    if counts['live_sessions'] != expected_sessions:
+        raise RuntimeError(
+            f"status reports {counts['live_sessions']} live sessions; "
+            f'expected {expected_sessions}')
+    timings = payload.get('phase_timings_ms')
+    open_ms = timings.get('open') if isinstance(timings, dict) else None
+    if isinstance(open_ms, bool) or not isinstance(open_ms, int) or open_ms < 0:
+        raise RuntimeError('status output has no valid Broker::open timing')
+    return counts, open_ms
 
 
 def fixture_path(path, root, label, must_exist=False):
@@ -323,9 +358,11 @@ def seed_released_resource_history(binary, command, root, cwd, repo, count):
     }
 
 
-def run_playground(binary, samples, output, aged_released_resource_leases=0):
+def run_playground(binary, samples, output, aged_released_resource_leases=0,
+                   session_count=1):
     aged_released_resource_leases = validate_aged_released_resource_lease_count(
         aged_released_resource_leases)
+    session_count = validate_session_count(session_count)
     receipts = []
     with tempfile.TemporaryDirectory(prefix='aethyme-broker-latency-') as temporary:
         root = Path(temporary).resolve()
@@ -352,7 +389,16 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0):
                    GIT_TERMINAL_PROMPT='0')
         fixture_environment = validate_fixture_environment(env, root)
         workload = {
+            'session_count_requested': session_count,
+            'created_broker_sessions': 0,
+            'created_worktrees': 0,
+            'created_session_ids': [],
+            'open_broker_sessions': 0,
             'active_broker_sessions': 0,
+            'live_broker_sessions': 0,
+            'idle_broker_sessions': 0,
+            'stale_broker_sessions': 0,
+            'observed_status_session_counts': None,
             'closed_broker_sessions': 0,
             'terminal_queue_entries': 0,
             'aged_released_host_resource_leases_requested': aged_released_resource_leases,
@@ -427,18 +473,38 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0):
         command([git, 'commit', '-qm', 'chore(perf): seed Playground'])
         command([git, 'remote', 'add', 'origin', 'git@github.com:playground/latency.git'])
         command([git, 'push', '-qu', 'origin', 'main'])
-        started, _ = command([str(binary), 'broker', 'start', '--task', 'latency Playground',
-                              '--short-name', 'latency', '--agent',
-                              'Latency <latency@example.invalid>', '--json'])
-        session = json.loads(started)
-        worktree = fixture_path(
-            Path(session['worktree_path']), root, 'broker-reported worktree', must_exist=True)
-        worktree_root = fixture_path(root / 'worktrees', root, 'fixture worktree root',
-                                     must_exist=True)
-        if not worktree.is_relative_to(worktree_root):
-            raise RuntimeError('broker escaped fixture worktree root')
+        sessions = []
+        worktrees = []
+        for index in range(1, session_count + 1):
+            label = f'{index:02d}'
+            started, _ = command(
+                [str(binary), 'broker', 'start', '--task',
+                 f'latency Playground worker {label}', '--short-name', f'latency-{label}',
+                 '--agent', f'Latency worker {label} <latency-{label}@example.invalid>',
+                 '--json'],
+                label=f'fixture_session_{label}')
+            session = json.loads(started)
+            candidate = fixture_path(
+                Path(session['worktree_path']), root, 'broker-reported worktree',
+                must_exist=True)
+            worktree_root = fixture_path(root / 'worktrees', root,
+                                         'fixture worktree root', must_exist=True)
+            if not candidate.is_relative_to(worktree_root):
+                raise RuntimeError('broker escaped fixture worktree root')
+            sessions.append(session)
+            worktrees.append(candidate)
+
+        # Keep one session for the existing guard/sync/push measurements. All
+        # sessions remain in the same isolated broker database for status scaling.
+        session = sessions[0]
+        worktree = worktrees[0]
         sid = str(session['id'])
-        workload['active_broker_sessions'] = 1
+        workload.update({
+            'created_broker_sessions': len(sessions),
+            'created_worktrees': len(worktrees),
+            'created_session_ids': [str(item['id']) for item in sessions],
+            'open_broker_sessions': len(sessions),
+        })
         (output / 'workload.json').write_text(json.dumps(workload, indent=2) + '\n')
         # Publish once outside measurement; timed pushes are unchanged, with local transport.
         command([str(binary), 'broker', 'push', '--session', sid], worktree)
@@ -463,6 +529,8 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0):
         (output / 'workload.json').write_text(json.dumps(workload, indent=2) + '\n')
         commands = {
             'routine_status': [str(binary), 'broker', 'status', '--summary', '--json'],
+            'status_full': [str(binary), 'broker', 'status', '--json'],
+            'doctor': [str(binary), 'broker', 'doctor', '--json'],
             'guard_overhead': [str(binary), 'broker', 'advanced', 'exec', '--session', sid,
                                '--json', '--', '/usr/bin/true'],
             'unchanged_sync': [str(binary), 'broker', 'sync', '--session', sid, '--json'],
@@ -471,19 +539,49 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0):
         if aged_released_resource_leases:
             commands['resource_history_list'] = [
                 str(binary), 'broker', 'advanced', 'resources', 'list', '--json']
+        diagnostic_names = {'status_full', 'doctor'}
         measured = {name: [] for name in commands
-                    if name != 'resource_history_list'}
+                    if name not in diagnostic_names | {'resource_history_list'}}
+        diagnostic_samples = {
+            'status_full': [],
+            'doctor': [],
+            'status_open_phase_summary': [],
+            'status_open_phase_full': [],
+        }
         history_samples = []
         for sample_index in range(samples):
             for name, argv in commands.items():
                 stdout, elapsed = command(
                     argv, worktree, label=f'sample_{sample_index + 1}:{name}')
                 if name == 'routine_status':
-                    if not isinstance(json.loads(stdout)['summary'], dict):
-                        raise RuntimeError('missing status summary')
-                if name == 'guard_overhead' and not json.loads(stdout).get('ok'):
-                    raise RuntimeError('guard audit did not pass')
-                if name == 'resource_history_list':
+                    counts, open_ms = parse_status_diagnostics(stdout, session_count)
+                    workload['observed_status_session_counts'] = counts
+                    workload['active_broker_sessions'] = counts['active_sessions']
+                    workload['live_broker_sessions'] = counts['live_sessions']
+                    workload['idle_broker_sessions'] = counts['idle_sessions']
+                    workload['stale_broker_sessions'] = counts['stale_sessions']
+                    (output / 'workload.json').write_text(
+                        json.dumps(workload, indent=2) + '\n')
+                    diagnostic_samples['status_open_phase_summary'].append(open_ms)
+                    measured[name].append(elapsed)
+                elif name == 'status_full':
+                    _, open_ms = parse_status_diagnostics(stdout, session_count)
+                    diagnostic_samples['status_full'].append(elapsed)
+                    diagnostic_samples['status_open_phase_full'].append(open_ms)
+                elif name == 'doctor':
+                    try:
+                        report = json.loads(stdout)
+                    except json.JSONDecodeError as error:
+                        raise RuntimeError('doctor command did not return JSON') from error
+                    if (not isinstance(report, dict)
+                            or not isinstance(report.get('deferred_checks'), list)):
+                        raise RuntimeError('doctor output has no deferred-check inventory')
+                    diagnostic_samples[name].append(elapsed)
+                elif name == 'guard_overhead':
+                    if not json.loads(stdout).get('ok'):
+                        raise RuntimeError('guard audit did not pass')
+                    measured[name].append(elapsed)
+                elif name == 'resource_history_list':
                     inventory = validate_resource_inventory(
                         json.loads(stdout),
                         history['fixture_repository_sha256'],
@@ -494,7 +592,7 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0):
                     history_samples.append(elapsed)
                 else:
                     measured[name].append(elapsed)
-        return measured, history_samples, workload, binary_version_raw
+        return measured, diagnostic_samples, history_samples, workload, binary_version_raw
 
 
 def main():
@@ -503,6 +601,10 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--samples', type=int, choices=range(1, 11), default=3)
     parser.add_argument(
+        '--sessions', type=int, default=1, metavar='N',
+        help=('create N isolated broker sessions/worktrees for status diagnostics '
+              f'(1..{MAX_BROKER_LATENCY_SESSIONS}; default: 1)'))
+    parser.add_argument(
         '--aged-released-resource-leases', type=int, default=0, metavar='N',
         help=('opt in to seed N old released host-resource lease records in the isolated '
               f'Playground fixture (0..{MAX_AGED_RELEASED_RESOURCE_LEASES}; default: 0)'))
@@ -510,6 +612,7 @@ def main():
     try:
         aged_released_resource_leases = validate_aged_released_resource_lease_count(
             args.aged_released_resource_leases)
+        session_count = validate_session_count(args.sessions)
     except ValueError as error:
         parser.error(str(error))
     binary_argument = str(args.binary)
@@ -517,17 +620,21 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     budget_bytes = (HERE / 'broker-budgets.json').read_bytes()
     budgets = json.loads(budget_bytes)
-    measured, history_samples, workload, binary_version_raw = run_playground(
-        binary, args.samples, args.output, aged_released_resource_leases)
+    measured, diagnostic_samples, history_samples, workload, binary_version_raw = run_playground(
+        binary, args.samples, args.output, aged_released_resource_leases, session_count)
     results = assess(budgets, measured)
-    diagnostics = ({'resource_history_list': summarize_diagnostic(history_samples)}
-                   if history_samples else {})
+    diagnostics = {name: summarize_diagnostic(values)
+                   for name, values in diagnostic_samples.items()}
+    if history_samples:
+        diagnostics['resource_history_list'] = summarize_diagnostic(history_samples)
+    profile = ('parcel_playground_one_session_unchanged_push' if session_count == 1
+               else f'parcel_playground_{session_count}_sessions_status_scale')
     report = {'schema_version': 2, 'enforcement': 'warning',
               'binary_argument': binary_argument,
               'binary': str(binary), 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
               'binary_version_raw': binary_version_raw,
               'budget_sha256': hashlib.sha256(budget_bytes).hexdigest(),
-              'profile': 'parcel_playground_one_session_unchanged_push',
+              'profile': profile,
               'transport': 'local_bare_remote_via_ssh_shim',
               'network_duration': 'not_instrumented', 'workload': workload,
               'results': results, 'diagnostics': diagnostics}
@@ -539,20 +646,31 @@ def main():
         if item['verdict'] == 'warning':
             print(f"::warning title=Broker latency budget::{name}: "
                   f"{item['median_ms']:.1f} ms exceeds {item['limit_ms']} ms")
-    lines += ['', 'Local Git transport; complete CLI wall time, including Git/transport work.',
-              'No network time is subtracted; no OS network sandbox. One-session results do not prove loaded-repository latency.']
+    lines += ['', 'Budgeted values are complete CLI wall times, including Git work.',
+              'Supplementary status-open-phase values are internal phase times. No network time is subtracted; the synthetic local transport is not an OS network sandbox.']
     summary = '\n'.join(lines) + '\n'
     if diagnostics:
-        diagnostic = diagnostics['resource_history_list']
         summary += (
-            '\n### Opt-in aged host-resource history diagnostic (unbudgeted)\n\n'
+            '\n### Supplementary diagnostics (unbudgeted)\n\n'
             '| Action | Median ms | Raw samples ms | Enforcement |\n'
             '|---|---:|---|---|\n'
-            f"| resource_history_list | {diagnostic['median_ms']:.1f} | "
-            f"{', '.join(f'{value:.1f}' for value in diagnostic['samples_ms'])} | "
-            'diagnostic only |\n\n'
-            f"Seeded {workload['aged_released_host_resource_leases']} aged released "
-            'host-resource lease records in the isolated Playground; existing budgets are unchanged.\n'
+        )
+        for name, diagnostic in diagnostics.items():
+            summary += (
+                f"| {name} | {diagnostic['median_ms']:.1f} | "
+                f"{', '.join(f'{value:.1f}' for value in diagnostic['samples_ms'])} | "
+                'diagnostic only |\n'
+            )
+        if history_samples:
+            summary += (
+                f"\nSeeded {workload['aged_released_host_resource_leases']} aged released "
+                'host-resource lease records in the isolated Playground; budgets are unchanged.\n'
+            )
+        summary += (
+            f"\nSession-scale profile requested {workload['session_count_requested']} sessions and created "
+            f"{workload['created_worktrees']} worktrees; observed status states are "
+            f"{json.dumps(workload['observed_status_session_counts'], sort_keys=True)}.\n"
+            'These synthetic fixture measurements do not establish production latency.\n'
         )
     (args.output / 'summary.md').write_text(summary)
     print(summary)
