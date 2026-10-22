@@ -420,7 +420,7 @@ mod unix {
         let lock_path = sibling_path(&parent_path, filename, ".bootstrap.lock");
         Ok(DbPaths {
             logical_path,
-            final_path,
+            final_path: final_path.clone(),
             stage_path,
             lock_path,
             parent_path,

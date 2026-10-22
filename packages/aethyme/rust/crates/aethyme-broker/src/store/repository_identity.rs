@@ -172,7 +172,7 @@ pub(crate) fn ensure_repository_uuid_marker(
         match (inventory.target, inventory.temporaries.as_slice()) {
             (Some(target), []) => {
                 require_expected_uuid(&target.uuid, expected_uuid)?;
-                sync_marker_file(git_common_dir, &directory, directory_identity, &target)?;
+                unix::sync_marker_file(git_common_dir, &directory, directory_identity, &target)?;
                 sync_directory(&directory, git_common_dir, directory_identity)?;
                 Ok(target.uuid)
             }
@@ -184,7 +184,7 @@ pub(crate) fn ensure_repository_uuid_marker(
                     && target.uuid == temporary.uuid =>
             {
                 require_expected_uuid(&target.uuid, expected_uuid)?;
-                sync_marker_file(git_common_dir, &directory, directory_identity, &target)?;
+                unix::sync_marker_file(git_common_dir, &directory, directory_identity, &target)?;
                 sync_directory(&directory, git_common_dir, directory_identity)?;
                 unlink_temporary(&directory, git_common_dir, directory_identity, temporary)?;
                 Ok(read_repository_uuid_marker(git_common_dir)?
@@ -195,7 +195,7 @@ pub(crate) fn ensure_repository_uuid_marker(
             )),
             (None, [temporary]) => {
                 require_expected_uuid(&temporary.uuid, expected_uuid)?;
-                publish_temporary(git_common_dir, directory, directory_identity, temporary)?;
+                unix::publish_temporary(git_common_dir, directory, directory_identity, temporary)?;
                 Ok(read_repository_uuid_marker(git_common_dir)?
                     .ok_or_else(|| refusal("repository UUID marker disappeared after recovery"))?)
             }
@@ -205,10 +205,14 @@ pub(crate) fn ensure_repository_uuid_marker(
                         "bound repository UUID marker is missing; automatic marker repair is refused",
                     ));
                 }
-                let uuid = new_uuid_v4(git_common_dir)?;
-                let temporary =
-                    create_temporary_marker(git_common_dir, &directory, directory_identity, &uuid)?;
-                publish_temporary(git_common_dir, directory, directory_identity, &temporary)?;
+                let uuid = unix::new_uuid_v4(git_common_dir)?;
+                let temporary = unix::create_temporary_marker(
+                    git_common_dir,
+                    &directory,
+                    directory_identity,
+                    &uuid,
+                )?;
+                unix::publish_temporary(git_common_dir, directory, directory_identity, &temporary)?;
                 Ok(read_repository_uuid_marker(git_common_dir)?.ok_or_else(|| {
                     refusal("repository UUID marker disappeared after publication")
                 })?)
@@ -602,7 +606,7 @@ mod unix {
         verify_directory_name(path, identity)
     }
 
-    fn sync_marker_file(
+    pub(super) fn sync_marker_file(
         path: &Path,
         directory: &File,
         directory_identity: DirectoryIdentity,
@@ -691,7 +695,7 @@ mod unix {
         sync_directory(directory, path, identity)
     }
 
-    fn publish_temporary(
+    pub(super) fn publish_temporary(
         path: &Path,
         directory: File,
         directory_identity: DirectoryIdentity,
@@ -767,7 +771,7 @@ mod unix {
         }
     }
 
-    fn create_temporary_marker(
+    pub(super) fn create_temporary_marker(
         path: &Path,
         directory: &File,
         directory_identity: DirectoryIdentity,
@@ -835,7 +839,7 @@ mod unix {
         ))
     }
 
-    fn new_uuid_v4(path: &Path) -> Result<String, BrokerError> {
+    pub(super) fn new_uuid_v4(path: &Path) -> Result<String, BrokerError> {
         let bytes = random_bytes(path, 16)?;
         let mut bytes: [u8; 16] = bytes
             .try_into()

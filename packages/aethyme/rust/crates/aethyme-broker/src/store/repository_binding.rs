@@ -506,7 +506,7 @@ impl BrokerStore {
         self.binding_scope = Some(binding_scope.clone());
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
-            let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
+            let current = read_repository_worktree_binding(tx, Some(&binding_scope))?;
             if !matches!(
                 current.state,
                 RepositoryWorktreeBindingState::FreshReserved
@@ -599,7 +599,7 @@ impl BrokerStore {
         self.binding_scope = Some(binding_scope.clone());
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
-            let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
+            let current = read_repository_worktree_binding(tx, Some(&binding_scope))?;
             ensure_state(
                 current.state,
                 RepositoryWorktreeBindingState::LegacyUnbound,
@@ -1312,8 +1312,8 @@ fn decode_optional_path(
     }
 }
 
-fn invalid_binding(message: String) -> BrokerError {
-    BrokerError::InvalidRepositoryWorktreeBinding(message)
+fn invalid_binding(message: impl Into<String>) -> BrokerError {
+    BrokerError::InvalidRepositoryWorktreeBinding(message.into())
 }
 
 #[cfg(test)]
