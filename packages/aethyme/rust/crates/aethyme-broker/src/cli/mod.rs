@@ -333,7 +333,7 @@ Usage:
       AETHYME_CONSOLE_MARKER and AETHYME_CONSOLE_MARKER_DIGEST; the marker is
       removed after clean shutdown. Configure with [console] in
       .aethyme/config.toml: mode, port, port_end, pool_limit, ttl_seconds.
-  aethyme broker exec --session <id> [--non-interactive] -- <command> [--json]
+  aethyme broker exec --session <id> [--non-interactive] [--json] -- <command>
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
       foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
@@ -341,8 +341,8 @@ Usage:
       a terminal is available. This is a caller assertion, not TTY isolation:
       stdio routing stays the same as the default, and the child may still open
       the terminal. Use it only for commands that do not need terminal
-      interaction. If the supervised helper cannot start, the child is not
-      dispatched.
+      interaction; terminal reads or job-control operations may stop or fail.
+      If the supervised helper cannot start, the child is not dispatched.
   aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
       require an exact --repo. Repository writes are serialized, journaled,

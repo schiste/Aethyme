@@ -2108,6 +2108,28 @@ mod guarded_exec_mode_selection_tests {
     }
 }
 
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
+mod guarded_exec_unsupported_platform_tests {
+    use crate::inline_exec_supervisor::{InlineExecError, InlineExecSupervisor};
+    use std::path::Path;
+
+    #[test]
+    fn supervised_runner_refuses_unsupported_platform_before_dispatch() {
+        let error = match InlineExecSupervisor::start_inheriting_stdin(
+            Path::new("unused-supervisor-path"),
+            std::process::Stdio::inherit(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported platform started the supervisor"),
+        };
+        assert!(matches!(
+            error,
+            InlineExecError::Setup(ref source)
+                if source.kind() == std::io::ErrorKind::Unsupported
+        ));
+    }
+}
+
 fn map_guarded_exec_supervisor_error(
     session_id: i64,
     command: &[String],
@@ -2565,7 +2587,7 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
-    fn wrong_helper_refuses_before_the_guarded_command_can_write() {
+    fn non_interactive_exec_refuses_wrong_helper_before_command_dispatch() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let (_repository, _storage, mut broker) = fixture();
@@ -2582,20 +2604,23 @@ mod generic_guarded_exec_tests {
         let marker = Path::new(&session.worktree_path).join("must-not-exist");
 
         let error = broker
-            .guarded_exec_with_env_heartbeat_and_mode(
+            .guarded_exec_for_cli(
                 session.id,
                 &[
                     "/bin/sh".into(),
                     "-c".into(),
                     "printf launched > must-not-exist".into(),
                 ],
-                &[],
-                || Ok(()),
-                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+                true,
+                false,
             )
             .unwrap_err();
 
         assert!(matches!(error, BrokerOpError::Spawn { .. }), "{error}");
+        assert!(
+            error.to_string().contains("helper did not become ready"),
+            "wrong helper was not refused during readiness: {error}"
+        );
         assert!(
             !marker.exists(),
             "guarded command ran without a ready helper"

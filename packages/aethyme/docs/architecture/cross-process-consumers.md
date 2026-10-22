@@ -745,10 +745,11 @@ the supervised process-group runner even when the caller has a controlling
 terminal. It is a caller assertion that the command does not need terminal
 interaction, not TTY isolation: stdin/stdout/stderr routing stays the same as
 the default invocation (JSON mode still routes child stdout to stderr), and a
-child may still open the controlling terminal. The flag belongs before `--`;
-after the separator it is a child argument. If the supervised helper cannot
-start, the user command is not dispatched and there is no unsupervised fallback.
-This option does not change the JSON report schema.
+child may still open the controlling terminal; terminal reads or job-control
+operations may stop or fail. The flag belongs before `--`; after the separator
+it is a child argument. If the supervised helper cannot start, the user command
+is not dispatched and there is no unsupervised fallback. This option does not
+change the JSON report schema.
 
 ### Push size accounting
 

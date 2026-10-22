@@ -100,8 +100,15 @@ impl Fixture {
     }
 
     fn run(&self, script: &str, json: bool) -> Output {
+        self.run_with_options(script, json, false)
+    }
+
+    fn run_with_options(&self, script: &str, json: bool, non_interactive: bool) -> Output {
         let mut command = Command::new(CLI);
         command.args(["advanced", "exec", "--session", &self.session.to_string()]);
+        if non_interactive {
+            command.arg("--non-interactive");
+        }
         if json {
             command.arg("--json");
         }
@@ -230,6 +237,27 @@ fn json_success_routes_child_output_to_stderr_and_keeps_one_report() {
             .any(|arg| arg.as_str().is_some_and(|arg| arg.contains("CHILD_STDOUT"))),
         "the report intentionally retains the original command arguments"
     );
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn non_interactive_json_success_keeps_complete_report_and_routes_both_child_streams_to_stderr() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with_options(
+        "printf OPT_IN_CHILD_STDOUT; printf OPT_IN_CHILD_STDERR >&2",
+        true,
+        true,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON report without child output");
+    assert_eq!(value["outcome"], "passed");
+    assert_eq!(value["exit_code"], 0);
+    assert_eq!(value["ownership_ok"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("OPT_IN_CHILD_STDOUT"), "{stderr}");
+    assert!(stderr.contains("OPT_IN_CHILD_STDERR"), "{stderr}");
+    assert!(value["command_ran"].as_bool().unwrap_or(false));
 }
 
 #[test]
