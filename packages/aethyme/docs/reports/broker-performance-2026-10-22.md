@@ -27,7 +27,8 @@ Milliseconds; budgets remain warnings, as defined in
 | Unchanged sync | 1000 | 629.3 | 632.3 | 621.8 | 624.1 |
 | Unchanged push | 500 | 1349.6 | 839.4 | 1325.7 | 769.5 |
 
-Status and sync meet their budgets in these samples. Guard and push miss theirs.
+Status and sync medians are within budget; individual aged status samples
+exceeded 500 ms. Guard and push medians exceed theirs.
 Push is lower in both workloads, but this is not a release-profile speedup claim.
 Three samples are diagnostic evidence, not a tail-latency qualification.
 
@@ -55,8 +56,8 @@ observer overhead makes those timings unsuitable for the benchmark table.
 
 The existing `broker_latency.py` harness produced complete commands, outputs,
 raw samples, workload descriptions and binary identities. All four benchmark
-runs succeeded. The retained measurement archive contains 22 files (186,416
-bytes); its copy manifest verifies the evidence independently of build output.
+runs succeeded. The retained measurement archive has 22 payload files (186,416
+bytes), plus a 3,199-byte copy manifest listing their hashes and sizes.
 
 Router SHA-256 identities:
 
