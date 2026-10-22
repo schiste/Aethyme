@@ -164,6 +164,9 @@ pub enum BrokerError {
     #[error("a session already exists for worktree {0}")]
     WorktreeAlreadyRegistered(String),
 
+    #[error("invalid spawned worktree instance witness: {0}")]
+    InvalidSpawnedWorktreeInstanceWitness(String),
+
     #[error("{0}")]
     PlannedLeaseConflict(Box<PlannedLeaseConflict>),
 

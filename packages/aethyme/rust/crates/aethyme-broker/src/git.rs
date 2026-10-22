@@ -2121,18 +2121,17 @@ impl GitRepo {
         common_dir.canonicalize().unwrap_or(common_dir)
     }
 
-    /// Capture the exact linked-worktree and Git-admin identities needed to
-    /// recognize a finish removal that stopped after deleting tracked files.
-    /// Unsupported platforms and ambiguous filesystem state return `None`,
-    /// which leaves ordinary cleanup available but disables interrupted
-    /// cleanup recovery.
-    pub(crate) fn finish_cleanup_recovery_proof(
+    /// Capture the filesystem identity tuple for this linked-worktree instance. It is
+    /// suitable as spawn-time cleanup provenance only when captured from the
+    /// `GitRepo` returned by worktree creation and stored with that session.
+    /// Unsupported platforms and ambiguous filesystem state return `None`;
+    /// callers must then leave automatic removal disabled for that session.
+    pub(crate) fn spawned_worktree_instance_witness(
         &self,
-        _branch_ref: &str,
-    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+    ) -> Option<crate::events::SpawnedWorktreeInstanceWitness> {
         #[cfg(unix)]
         {
-            self.finish_cleanup_recovery_proof_unix(_branch_ref)
+            self.spawned_worktree_instance_witness_unix()
         }
         #[cfg(not(unix))]
         {
@@ -2141,10 +2140,9 @@ impl GitRepo {
     }
 
     #[cfg(unix)]
-    fn finish_cleanup_recovery_proof_unix(
+    fn spawned_worktree_instance_witness_unix(
         &self,
-        branch_ref: &str,
-    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+    ) -> Option<crate::events::SpawnedWorktreeInstanceWitness> {
         use std::os::unix::fs::MetadataExt;
 
         fn directory_identity(path: &Path) -> Option<(u64, u64)> {
@@ -2159,16 +2157,6 @@ impl GitRepo {
 
         let root = self.root.canonicalize().ok()?;
         let (worktree_device, worktree_inode) = directory_identity(&root)?;
-        let branch = branch_ref.strip_prefix("refs/heads/")?;
-        if self.current_branch().ok()?.trim() != branch {
-            return None;
-        }
-        let head = self.head_commit().ok()?;
-        let branch_tip = self.resolve_ref(branch_ref)?;
-        if head != branch_tip {
-            return None;
-        }
-
         let pointer_path = root.join(".git");
         let mut pointer_options = fs::OpenOptions::new();
         pointer_options.read(true);
@@ -2220,7 +2208,7 @@ impl GitRepo {
             return None;
         }
 
-        Some(crate::events::FinishCleanupRecoveryProof {
+        Some(crate::events::SpawnedWorktreeInstanceWitness {
             schema_version: 1,
             worktree_path: root.to_str()?.to_string(),
             worktree_device,
@@ -2233,6 +2221,56 @@ impl GitRepo {
             git_common_path: git_common.to_str()?.to_string(),
             git_common_device,
             git_common_inode,
+        })
+    }
+
+    /// Capture the exact linked-worktree and Git-admin identities needed to
+    /// recognize a finish removal that stopped after deleting tracked files.
+    /// Unsupported platforms and ambiguous filesystem state return `None`,
+    /// which disables interrupted cleanup recovery.
+    pub(crate) fn finish_cleanup_recovery_proof(
+        &self,
+        _branch_ref: &str,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        #[cfg(unix)]
+        {
+            self.finish_cleanup_recovery_proof_unix(_branch_ref)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    fn finish_cleanup_recovery_proof_unix(
+        &self,
+        branch_ref: &str,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        let branch = branch_ref.strip_prefix("refs/heads/")?;
+        if self.current_branch().ok()?.trim() != branch {
+            return None;
+        }
+        let head = self.head_commit().ok()?;
+        let branch_tip = self.resolve_ref(branch_ref)?;
+        if head != branch_tip {
+            return None;
+        }
+        let witness = self.spawned_worktree_instance_witness()?;
+
+        Some(crate::events::FinishCleanupRecoveryProof {
+            schema_version: 1,
+            worktree_path: witness.worktree_path,
+            worktree_device: witness.worktree_device,
+            worktree_inode: witness.worktree_inode,
+            git_pointer_device: witness.git_pointer_device,
+            git_pointer_inode: witness.git_pointer_inode,
+            git_admin_path: witness.git_admin_path,
+            git_admin_device: witness.git_admin_device,
+            git_admin_inode: witness.git_admin_inode,
+            git_common_path: witness.git_common_path,
+            git_common_device: witness.git_common_device,
+            git_common_inode: witness.git_common_inode,
             branch_ref: branch_ref.to_string(),
             head,
             branch_tip,
