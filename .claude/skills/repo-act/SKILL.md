@@ -158,7 +158,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   leave the test itself writing indefinitely after an assertion fails.
 - Before mutating source or spawning children, freeze and verify the complete
   helper closure against its pins and preflight required process-control
-  capabilities in the actual interpreter at every spawn entrypoint. For owned
+  capabilities in the actual interpreter at every spawn entrypoint. Before
+  consuming a one-shot resource request, check the frozen runner's exact
+  interpreter version and capabilities; `python3` on PATH may resolve to an
+  older system interpreter than Homebrew `python3`. For owned
   groups, retain the leader unreaped through bounded TERM/KILL cleanup, probe
   non-zombie members, reap once, then probe final group absence; never signal
   the group after reaping. A TERM/KILL error can be discharged only after the
