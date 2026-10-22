@@ -519,6 +519,7 @@ fn a_process_in_the_checkout_keeps_it() {
         .current_dir(&worktree)
         .spawn()
         .unwrap();
+    #[cfg(unix)]
     let child_pid = child.id();
     let report = run(&mut broker);
     let _ = child.kill();
