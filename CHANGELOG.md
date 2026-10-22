@@ -9,6 +9,8 @@ artifacts and their exact source revision are recorded in each signed
 ### Fixed
 
 - Git batch queries use bounded streaming, enforce active deadlines, and reject incomplete or truncated results.
+- Exact ancestry checks skip integration patch-ID generation when all submitted commits are already integrated.
+- Cross-process contract CI matches the trusted Rust cache inputs while keeping pull-request cache use read-only.
 
 ### Changed
 
