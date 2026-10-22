@@ -3006,7 +3006,7 @@ mod fresh_root_recovery_inventory_tests {
 
     #[test]
     fn recovery_apply_rejects_wrong_digest_without_creating_the_reserved_root() {
-        let mut fixture = fresh_root_fixture(false);
+        let fixture = fresh_root_fixture(false);
         let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
         assert!(plan.can_apply);
         assert!(

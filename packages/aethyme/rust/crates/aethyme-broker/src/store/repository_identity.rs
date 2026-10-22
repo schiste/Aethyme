@@ -86,11 +86,6 @@ impl RepositoryBindingScope {
             repository_uuid,
         })
     }
-
-    pub(crate) fn refresh_repository_uuid(&mut self) -> Result<(), BrokerError> {
-        self.repository_uuid = read_repository_uuid_marker(&self.git_common_dir)?;
-        Ok(())
-    }
 }
 
 /// Read the UUID without repairing, creating, or removing any marker entry.
@@ -333,10 +328,9 @@ mod unix {
             inode: metadata.ino(),
             uid: metadata.uid(),
         };
-        if !metadata.is_dir()
-            || identity.uid != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o022 != 0
-        {
+        // SAFETY: `geteuid` takes no pointers and has no caller-side safety preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || identity.uid != effective_uid || metadata.mode() & 0o022 != 0 {
             return Err(refusal(format!(
                 "Git common directory has unsafe type, owner, or permissions: {}",
                 path.display()
@@ -396,15 +390,26 @@ mod unix {
         }
         // SAFETY: fstatat returned success and initialized the stat.
         let stat = unsafe { stat.assume_init() };
+        let file_type_mode = u32::try_from(stat.st_mode)
+            .map_err(|_| refusal("repository UUID marker has an invalid file mode"))?;
         let identity = FileIdentity {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
-            uid: stat.st_uid as u32,
-            mode: stat.st_mode as u32 & 0o777,
-            links: stat.st_nlink as u64,
-            size: stat.st_size as u64,
+            device: u64::try_from(stat.st_dev)
+                .map_err(|_| refusal("repository UUID marker has an invalid device identity"))?,
+            inode: u64::try_from(stat.st_ino)
+                .map_err(|_| refusal("repository UUID marker has an invalid inode identity"))?,
+            uid: u32::try_from(stat.st_uid)
+                .map_err(|_| refusal("repository UUID marker has an invalid owner identity"))?,
+            mode: file_type_mode & 0o777,
+            links: u64::try_from(stat.st_nlink)
+                .map_err(|_| refusal("repository UUID marker has an invalid link count"))?,
+            size: u64::try_from(stat.st_size)
+                .map_err(|_| refusal("repository UUID marker has an invalid size"))?,
         };
-        if stat.st_mode as u32 & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+        let file_type_mask = u32::try_from(libc::S_IFMT)
+            .map_err(|_| refusal("repository UUID marker has an invalid file type mask"))?;
+        let regular_file_type = u32::try_from(libc::S_IFREG)
+            .map_err(|_| refusal("repository UUID marker has an invalid regular-file type"))?;
+        if file_type_mode & file_type_mask != regular_file_type {
             return Err(refusal(format!(
                 "repository UUID marker entry {name:?} is not a regular file"
             )));
@@ -450,8 +455,10 @@ mod unix {
             links: opened.nlink(),
             size: opened.size(),
         };
+        // SAFETY: `geteuid` takes no pointers and has no caller-side safety preconditions.
+        let effective_uid = unsafe { libc::geteuid() };
         if !opened.is_file()
-            || identity.uid != unsafe { libc::geteuid() }
+            || identity.uid != effective_uid
             || identity.mode != 0o600
             || identity.links != expected_links
             || identity.size as usize > MAX_MARKER_BYTES
@@ -896,9 +903,8 @@ mod unix {
 
 #[cfg(unix)]
 use unix::{
-    DirectoryIdentity, FileIdentity, MarkerFile, MarkerInventory, inspect_marker_inventory,
-    marker_temporary_names, open_verified_directory, read_marker_file, sync_directory,
-    unlink_temporary, verify_directory_name,
+    inspect_marker_inventory, marker_temporary_names, open_verified_directory, read_marker_file,
+    sync_directory, unlink_temporary, verify_directory_name,
 };
 
 #[cfg(test)]
@@ -935,7 +941,7 @@ mod tests {
     #[test]
     fn explicit_marker_recovers_only_exact_temporary_prefix() {
         use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
         let directory = tempfile::tempdir().unwrap();
         let uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
@@ -972,6 +978,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn explicit_recovery_inspects_link_pair_without_settling_it() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         let directory = tempfile::tempdir().unwrap();
         let uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
         let target = directory.path().join(MARKER_NAME);
