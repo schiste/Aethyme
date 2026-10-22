@@ -7,6 +7,7 @@
 //! bound to that lane's error type and heartbeat; it can move onto this helper
 //! in a follow-up.
 
+use std::fs::File;
 use std::io::{self, Read};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
@@ -125,6 +126,258 @@ pub(crate) fn output_limited(
     }
 }
 
+/// Run one child with a finite file-backed stdin and bounded captured output.
+///
+/// Unlike the reader-thread helpers above, this polls the owned pipe handles
+/// directly. That keeps a descendant which inherited a pipe from leaving a
+/// detached reader thread blocked after the deadline.
+pub(crate) fn output_with_input_limited(
+    command: &mut Command,
+    input: File,
+    budget: Duration,
+    max_stream_bytes: usize,
+) -> io::Result<LimitedOutput> {
+    let deadline = checked_deadline(budget)?;
+    checked_stream_limit(max_stream_bytes)?;
+    if Instant::now() >= deadline {
+        return Ok(LimitedOutput::Deadline);
+    }
+
+    let mut child = LimitedChild(
+        command
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let mut stdout_reader = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout"))?;
+    let mut stderr_reader = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr"))?;
+    set_probe_nonblocking(&stdout_reader)?;
+    set_probe_nonblocking(&stderr_reader)?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut status = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(LimitedOutput::Deadline);
+        }
+
+        if !stdout_closed {
+            stdout_closed = matches!(
+                read_probe_stream(&mut stdout_reader, &mut stdout, max_stream_bytes, deadline)?,
+                ProbeStreamRead::Closed
+            );
+            if stdout.len() > max_stream_bytes {
+                return Ok(LimitedOutput::OutputLimit);
+            }
+        }
+        if !stderr_closed {
+            stderr_closed = matches!(
+                read_probe_stream(&mut stderr_reader, &mut stderr, max_stream_bytes, deadline)?,
+                ProbeStreamRead::Closed
+            );
+            if stderr.len() > max_stream_bytes {
+                return Ok(LimitedOutput::OutputLimit);
+            }
+        }
+        if status.is_none() {
+            status = child.0.try_wait()?;
+        }
+        if stdout_closed && stderr_closed {
+            if let Some(status) = status.as_ref() {
+                if Instant::now() >= deadline {
+                    return Ok(LimitedOutput::Deadline);
+                }
+                return Ok(LimitedOutput::Completed(Output {
+                    status: status.clone(),
+                    stdout,
+                    stderr,
+                }));
+            }
+        }
+        sleep_until_poll(deadline);
+    }
+}
+
+/// Run two children as a streaming pipeline with finite stdin for the first
+/// child and bounded output capture from both children. The first child's
+/// stdout remains a pipe into the second; patch data is never buffered here.
+pub(crate) fn pipeline_with_input_limited(
+    first: &mut Command,
+    input: File,
+    second: &mut Command,
+    budget: Duration,
+    max_stream_bytes: usize,
+) -> io::Result<LimitedPipelineOutput> {
+    let deadline = checked_deadline(budget)?;
+    checked_stream_limit(max_stream_bytes)?;
+    if Instant::now() >= deadline {
+        return Ok(LimitedPipelineOutput::Deadline);
+    }
+
+    let mut first = LimitedChild(
+        first
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let first_stdout = first
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing first-child stdout"))?;
+    let mut first_stderr = first
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing first-child stderr"))?;
+    let mut second = LimitedChild(
+        second
+            .stdin(Stdio::from(first_stdout))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let mut second_stdout = second
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing second-child stdout"))?;
+    let mut second_stderr = second
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing second-child stderr"))?;
+    set_probe_nonblocking(&first_stderr)?;
+    set_probe_nonblocking(&second_stdout)?;
+    set_probe_nonblocking(&second_stderr)?;
+
+    let mut first_stderr_bytes = Vec::new();
+    let mut second_stdout_bytes = Vec::new();
+    let mut second_stderr_bytes = Vec::new();
+    let mut first_stderr_closed = false;
+    let mut second_stdout_closed = false;
+    let mut second_stderr_closed = false;
+    let mut first_status = None;
+    let mut second_status = None;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(LimitedPipelineOutput::Deadline);
+        }
+
+        if !first_stderr_closed {
+            first_stderr_closed = matches!(
+                read_probe_stream(
+                    &mut first_stderr,
+                    &mut first_stderr_bytes,
+                    max_stream_bytes,
+                    deadline,
+                )?,
+                ProbeStreamRead::Closed
+            );
+            if first_stderr_bytes.len() > max_stream_bytes {
+                return Ok(LimitedPipelineOutput::OutputLimit);
+            }
+        }
+        if !second_stdout_closed {
+            second_stdout_closed = matches!(
+                read_probe_stream(
+                    &mut second_stdout,
+                    &mut second_stdout_bytes,
+                    max_stream_bytes,
+                    deadline
+                )?,
+                ProbeStreamRead::Closed
+            );
+            if second_stdout_bytes.len() > max_stream_bytes {
+                return Ok(LimitedPipelineOutput::OutputLimit);
+            }
+        }
+        if !second_stderr_closed {
+            second_stderr_closed = matches!(
+                read_probe_stream(
+                    &mut second_stderr,
+                    &mut second_stderr_bytes,
+                    max_stream_bytes,
+                    deadline
+                )?,
+                ProbeStreamRead::Closed
+            );
+            if second_stderr_bytes.len() > max_stream_bytes {
+                return Ok(LimitedPipelineOutput::OutputLimit);
+            }
+        }
+        if first_status.is_none() {
+            first_status = first.0.try_wait()?;
+        }
+        if second_status.is_none() {
+            second_status = second.0.try_wait()?;
+        }
+        if first_stderr_closed && second_stdout_closed && second_stderr_closed {
+            if let (Some(first_status), Some(second_status)) =
+                (first_status.as_ref(), second_status.as_ref())
+            {
+                if Instant::now() >= deadline {
+                    return Ok(LimitedPipelineOutput::Deadline);
+                }
+                return Ok(LimitedPipelineOutput::Completed {
+                    first_status: first_status.clone(),
+                    first_stderr: first_stderr_bytes,
+                    second: Output {
+                        status: second_status.clone(),
+                        stdout: second_stdout_bytes,
+                        stderr: second_stderr_bytes,
+                    },
+                });
+            }
+        }
+        sleep_until_poll(deadline);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum LimitedPipelineOutput {
+    Completed {
+        first_status: ExitStatus,
+        first_stderr: Vec<u8>,
+        second: Output,
+    },
+    Deadline,
+    OutputLimit,
+}
+
+fn checked_deadline(budget: Duration) -> io::Result<Instant> {
+    Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| io::Error::other("process deadline overflow"))
+}
+
+fn checked_stream_limit(max_stream_bytes: usize) -> io::Result<()> {
+    max_stream_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("process output limit overflow"))?;
+    Ok(())
+}
+
+fn sleep_until_poll(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        std::thread::sleep(remaining.min(Duration::from_millis(2)));
+    }
+}
+
 /// Run a short-lived profile probe in a process group owned by this call.
 ///
 /// Unlike [`output_limited`], this path also stops cooperative descendants
@@ -181,7 +434,7 @@ pub(crate) fn output_limited_in_owned_group(
 
         if !stdout_closed {
             stdout_closed = matches!(
-                read_probe_stream(&mut stdout_reader, &mut stdout, max_stream_bytes)?,
+                read_probe_stream(&mut stdout_reader, &mut stdout, max_stream_bytes, deadline)?,
                 ProbeStreamRead::Closed
             );
             if stdout.len() > max_stream_bytes {
@@ -191,7 +444,7 @@ pub(crate) fn output_limited_in_owned_group(
         }
         if !stderr_closed {
             stderr_closed = matches!(
-                read_probe_stream(&mut stderr_reader, &mut stderr, max_stream_bytes)?,
+                read_probe_stream(&mut stderr_reader, &mut stderr, max_stream_bytes, deadline)?,
                 ProbeStreamRead::Closed
             );
             if stderr.len() > max_stream_bytes {
@@ -209,13 +462,23 @@ pub(crate) fn output_limited_in_owned_group(
             while !stdout_closed || !stderr_closed {
                 if !stdout_closed {
                     stdout_closed = matches!(
-                        read_probe_stream(&mut stdout_reader, &mut stdout, max_stream_bytes)?,
+                        read_probe_stream(
+                            &mut stdout_reader,
+                            &mut stdout,
+                            max_stream_bytes,
+                            drain_deadline,
+                        )?,
                         ProbeStreamRead::Closed
                     );
                 }
                 if !stderr_closed {
                     stderr_closed = matches!(
-                        read_probe_stream(&mut stderr_reader, &mut stderr, max_stream_bytes)?,
+                        read_probe_stream(
+                            &mut stderr_reader,
+                            &mut stderr,
+                            max_stream_bytes,
+                            drain_deadline,
+                        )?,
                         ProbeStreamRead::Closed
                     );
                 }
@@ -254,7 +517,7 @@ pub(crate) fn output_limited_in_owned_group(
     ))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum ProbeStreamRead {
     Open,
     Closed,
@@ -280,12 +543,16 @@ fn read_probe_stream<R: Read>(
     stream: &mut R,
     bytes: &mut Vec<u8>,
     max_stream_bytes: usize,
+    deadline: Instant,
 ) -> io::Result<ProbeStreamRead> {
     let read_limit = max_stream_bytes
         .checked_add(1)
         .ok_or_else(|| io::Error::other("process output limit overflow"))?;
     let mut chunk = [0_u8; 4096];
     loop {
+        if Instant::now() >= deadline {
+            return Ok(ProbeStreamRead::Open);
+        }
         let remaining = read_limit.saturating_sub(bytes.len());
         if remaining == 0 {
             return Ok(ProbeStreamRead::Open);
@@ -301,6 +568,109 @@ fn read_probe_stream<R: Read>(
             Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(windows)]
+fn set_probe_nonblocking<R>(_stream: &R) -> io::Result<()> {
+    // Windows anonymous pipes are polled with PeekNamedPipe before each read,
+    // so the subsequent synchronous read is limited to bytes already ready.
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_probe_stream<R: Read + std::os::windows::io::AsRawHandle>(
+    stream: &mut R,
+    bytes: &mut Vec<u8>,
+    max_stream_bytes: usize,
+    deadline: Instant,
+) -> io::Result<ProbeStreamRead> {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn PeekNamedPipe(
+            pipe: *mut c_void,
+            buffer: *mut c_void,
+            buffer_size: u32,
+            bytes_read: *mut u32,
+            total_bytes_available: *mut u32,
+            bytes_left_this_message: *mut u32,
+        ) -> i32;
+    }
+
+    let read_limit = max_stream_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("process output limit overflow"))?;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(ProbeStreamRead::Open);
+        }
+        let remaining = read_limit.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Ok(ProbeStreamRead::Open);
+        }
+        let mut available = 0_u32;
+        // SAFETY: the handle is an owned child pipe, and the zero-length
+        // buffer asks only for the number of bytes currently available.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                stream.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if peeked == 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(109 | 232)) {
+                return Ok(ProbeStreamRead::Closed);
+            }
+            return Err(error);
+        }
+        if available == 0 {
+            return Ok(ProbeStreamRead::Open);
+        }
+        let read_len = chunk
+            .len()
+            .min(remaining)
+            .min(usize::try_from(available).unwrap_or(usize::MAX));
+        match stream.read(&mut chunk[..read_len]) {
+            Ok(0) => return Ok(ProbeStreamRead::Closed),
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+enum ProbeStreamRead {
+    Open,
+    Closed,
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_probe_nonblocking<R>(_stream: &R) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "bounded child pipes are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_probe_stream<R: Read>(
+    _stream: &mut R,
+    _bytes: &mut Vec<u8>,
+    _max_stream_bytes: usize,
+    _deadline: Instant,
+) -> io::Result<ProbeStreamRead> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "bounded child pipes are unavailable on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -577,6 +947,14 @@ fn join_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    fn file_input(bytes: &[u8]) -> File {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file
+    }
 
     #[test]
     fn limited_output_retains_status_and_both_streams() {
@@ -634,6 +1012,181 @@ mod tests {
             LimitedOutput::Deadline
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_input_returns_output_and_status() {
+        let expected = vec![b'x'; 128 * 1024];
+        let LimitedOutput::Completed(output) = output_with_input_limited(
+            Command::new("cat"),
+            file_input(&expected),
+            Duration::from_secs(5),
+            expected.len(),
+        )
+        .unwrap() else {
+            panic!("finite file-backed input must complete");
+        };
+        assert!(output.status.success());
+        assert_eq!(output.stdout, expected);
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_input_refuses_zero_budget_without_spawning() {
+        assert!(matches!(
+            output_with_input_limited(
+                &mut Command::new("bounded-input-must-not-spawn"),
+                file_input(b""),
+                Duration::ZERO,
+                64,
+            )
+            .unwrap(),
+            LimitedOutput::Deadline
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_input_kills_its_direct_child_at_deadline() {
+        let started = Instant::now();
+        assert!(matches!(
+            output_with_input_limited(
+                Command::new("sh").args(["-c", "exec sleep 30"]),
+                file_input(b""),
+                Duration::from_millis(80),
+                64,
+            )
+            .unwrap(),
+            LimitedOutput::Deadline
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_input_returns_on_deadline_when_a_descendant_holds_a_pipe() {
+        let started = Instant::now();
+        assert!(matches!(
+            output_with_input_limited(
+                Command::new("sh").args(["-c", "(sleep 0.4) & exit 0"]),
+                file_input(b""),
+                Duration::from_millis(80),
+                64,
+            )
+            .unwrap(),
+            LimitedOutput::Deadline
+        ));
+        assert!(started.elapsed() < Duration::from_millis(350));
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_pipeline_streams_file_input_through_large_intermediate_output() {
+        let expected = vec![b'x'; 128 * 1024];
+        let mut first = Command::new("cat");
+        let mut second = Command::new("cat");
+        let LimitedPipelineOutput::Completed {
+            first_status,
+            first_stderr,
+            second,
+        } = pipeline_with_input_limited(
+            &mut first,
+            file_input(&expected),
+            &mut second,
+            Duration::from_secs(5),
+            expected.len(),
+        )
+        .unwrap()
+        else {
+            panic!("finite pipeline must complete");
+        };
+        assert!(first_status.success());
+        assert!(second.status.success());
+        assert!(first_stderr.is_empty());
+        assert!(second.stderr.is_empty());
+        assert_eq!(second.stdout, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_pipeline_output_limit_kills_both_owned_children() {
+        let mut first = Command::new("cat");
+        let mut second = Command::new("sh");
+        second.args(["-c", "printf overflow"]);
+        assert!(matches!(
+            pipeline_with_input_limited(
+                &mut first,
+                file_input(b""),
+                &mut second,
+                Duration::from_secs(5),
+                3,
+            )
+            .unwrap(),
+            LimitedPipelineOutput::OutputLimit
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_pipeline_deadline_does_not_wait_for_an_inherited_pipe() {
+        let started = Instant::now();
+        let mut first = Command::new("sh");
+        first.args(["-c", "(sleep 0.4) & exit 0"]);
+        let mut second = Command::new("cat");
+        assert!(matches!(
+            pipeline_with_input_limited(
+                &mut first,
+                file_input(b""),
+                &mut second,
+                Duration::from_millis(80),
+                64,
+            )
+            .unwrap(),
+            LimitedPipelineOutput::Deadline
+        ));
+        assert!(started.elapsed() < Duration::from_millis(350));
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_pipeline_reports_first_spawn_failure_without_starting_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("second-started");
+        let mut first = Command::new(dir.path().join("missing-first-command"));
+        let mut second = Command::new("sh");
+        second.args(["-c", "touch \"$1\"", "sh"]);
+        second.arg(&marker);
+        let error = pipeline_with_input_limited(
+            &mut first,
+            file_input(b""),
+            &mut second,
+            Duration::from_secs(5),
+            64,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!marker.exists(), "the second child must not start");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_polling_collects_output_and_observes_eof() {
+        let LimitedOutput::Completed(output) = output_with_input_limited(
+            Command::new("cmd").args(["/C", "echo bounded-pipe"]),
+            file_input(b""),
+            Duration::from_secs(5),
+            128,
+        )
+        .unwrap() else {
+            panic!("finite Windows child must close its captured pipes");
+        };
+        assert!(output.status.success());
+        assert!(output.stdout.starts_with(b"bounded-pipe"));
+        assert!(output.stderr.is_empty());
     }
 
     #[cfg(unix)]
