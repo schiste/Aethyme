@@ -1530,7 +1530,7 @@ mod graph_fence_tests {
         let db_entries_before = entries(database.parent().unwrap());
         let database_before = std::fs::read(&database).unwrap();
         assert!(!graph_marker.exists());
-        assert!(database_before.len() > 0);
+        assert!(!database_before.is_empty());
 
         let error = match BrokerStore::open_current_repository_path(&root, &database) {
             Err(error) => error,
@@ -1575,11 +1575,10 @@ mod graph_fence_tests {
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&nested, &database).unwrap();
         assert!(database.is_file());
-        assert!(
-            root.join(".git")
-                .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER)
-                .is_file()
-        );
+        assert!(root
+            .join(".git")
+            .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER)
+            .is_file());
         assert!(aethyme_graph_storage::write_index_shard(&nested, "fixture", &[]).is_err());
         assert!(!nested.join(".aethyme").exists());
         drop(store);
