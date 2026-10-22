@@ -224,6 +224,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and environment allowlist; do not pass defaults already fixed by the runner as
   caller overrides. Successful plan or intent generation alone does not prove
   that execution accepts the same argv.
+- When pinning source provenance, copy the full commit and tree IDs directly
+  from `git rev-parse` or a structured GitHub response. Never expand an
+  abbreviated hash by hand; verify both IDs against the current owned worktree.
+- When a focused Cargo command selects a whole test module or integration-test
+  binary, derive the expected count from every test that target will run,
+  including pre-existing tests, rather than counting only tests added by the PR.
 - Give each validation attempt, including failed setup and guard-removal runs,
   unique log and manifest paths. Check which filenames the delegated monitor
   owns; store caller summaries under distinct names instead of overwriting or
