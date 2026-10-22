@@ -8,6 +8,7 @@ from broker_latency import (
     assess,
     parse_status_diagnostics,
     summarize_diagnostic,
+    status_diagnostics_enabled,
     validate_aged_released_resource_lease_count,
     validate_session_count,
     validate_resource_inventory,
@@ -119,6 +120,13 @@ class SessionScaleTests(unittest.TestCase):
             with self.subTest(count=count), self.assertRaises(ValueError):
                 validate_session_count(count)
 
+    def test_status_diagnostics_leave_single_session_default_light(self):
+        self.assertFalse(status_diagnostics_enabled(1))
+        self.assertTrue(status_diagnostics_enabled(1, requested=True))
+        self.assertTrue(status_diagnostics_enabled(2))
+        with self.assertRaises(ValueError):
+            status_diagnostics_enabled(1, requested=1)
+
     def test_status_counts_and_open_phase_match_the_requested_fixture(self):
         payload = {
             'summary': {'live_sessions': 3, 'active_sessions': 1,
@@ -129,6 +137,14 @@ class SessionScaleTests(unittest.TestCase):
         self.assertEqual(counts, {'live_sessions': 3, 'active_sessions': 1,
                                   'idle_sessions': 1, 'stale_sessions': 1})
         self.assertEqual(open_ms, 117)
+
+    def test_open_phase_is_optional_for_default_status_measurement(self):
+        payload = {'summary': {'live_sessions': 1, 'active_sessions': 1,
+                               'idle_sessions': 0, 'stale_sessions': 0}}
+        counts, open_ms = parse_status_diagnostics(
+            json.dumps(payload), 1, require_open_timing=False)
+        self.assertEqual(counts['live_sessions'], 1)
+        self.assertIsNone(open_ms)
 
     def test_status_scale_controls_refuse_missing_or_wrong_counts(self):
         invalid_payloads = (
@@ -142,6 +158,9 @@ class SessionScaleTests(unittest.TestCase):
             {'summary': {'live_sessions': 3, 'active_sessions': 1,
                          'idle_sessions': 1, 'stale_sessions': 1},
              'phase_timings_ms': {}},
+            {'summary': {'live_sessions': 3, 'active_sessions': 2,
+                         'idle_sessions': 1, 'stale_sessions': 1},
+             'phase_timings_ms': {'open': 100}},
         )
         for payload in invalid_payloads:
             with self.subTest(payload=payload), self.assertRaises(RuntimeError):

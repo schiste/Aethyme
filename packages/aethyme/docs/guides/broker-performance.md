@@ -28,13 +28,18 @@ The job summary displays all four medians, limits and verdicts; artifacts retain
 raw command arguments, outputs, exit codes, individual timings, the budget digest
 and executable digest for 14 days. The committed budget remains versioned in Git.
 
-The runner creates a disposable, one-session synthetic Parcel Playground (the checked-in multi-language fixture), isolated home,
-host state, worktree root and local bare remote. Fake SSH serves that remote and
-fake `gh` answers only PR listings. The environment allowlist excludes inherited
-credentials, proxies and provider settings. Expected Git/GitHub paths use local
-shims; this is not an OS network sandbox, and unrelated egress is not instrumented. Fixture
-setup and initial publication are outside timed samples. Every command has a
-60-second timeout. Complete CLI time uses a monotonic clock through process exit.
+By default, the runner creates a disposable, one-session synthetic Parcel
+Playground (the checked-in multi-language fixture), isolated home, host state,
+worktree root and local bare remote. This preserves the original four-command
+timed workload. Pass `--sessions N` (1 through 64) to create a bounded
+multi-session fixture; values above one automatically add full-status and doctor
+diagnostics. Use `--status-diagnostics` to collect those diagnostics with one
+session. Fake SSH serves the local remote and fake `gh` answers only PR listings.
+The environment allowlist excludes inherited credentials, proxies and provider
+settings. Expected Git/GitHub paths use local shims; this is not an OS network
+sandbox, and unrelated egress is not instrumented. Fixture setup and initial
+publication are outside timed samples. Every command has a 60-second timeout.
+Complete CLI time uses a monotonic clock through process exit.
 
 The Git transport is local; the runner does not claim an instrumented network
 duration. Git transport, process startup and all
@@ -42,7 +47,12 @@ broker preflight/reporting remain charged to the budget: these conservative
 numbers are **not pure broker CPU time**. The guarded child is `/usr/bin/true`;
 its startup is retained rather than estimated and subtracted. No-op pushes do not
 represent pushes with substantial new content. One-session timings do not prove
-performance with many sessions or a large repository.
+performance with many sessions or a large repository. Full status, doctor and
+`Broker::open` phase timings are supplementary diagnostics without budgets; they
+do not alter the four warning-budget actions. The runner retains complete command
+stdout, stderr, exit codes and wall times, and records requested and successfully
+created session/worktree counts in `workload.json`. Partial fixture setup remains
+visible there if a later session creation fails.
 
 For real network measurements, retain complete wall time and separately observed
 network durations. Never subtract the whole coordinated-operation interval as
@@ -83,14 +93,19 @@ seeding are outside the timing samples.
 ### Report schema 2
 
 `report.json` now declares `schema_version: 2`. Existing `results` retain the
-four warning-budget measurements. The added `diagnostics` object is empty when
-history seeding is disabled; otherwise `diagnostics.resource_history_list`
-contains `samples_ms`, `median_ms`, `budget_ms: null` and
-`verdict: "diagnostic_only"`. A schema-1-only consumer must recognize schema 2
-before reading the report.
+four warning-budget measurements. The `diagnostics` object is empty by default.
+With `--status-diagnostics` or `--sessions > 1`, it also contains
+`status_full`, `doctor`, `status_open_phase_summary` and
+`status_open_phase_full`; each entry has `samples_ms`, `median_ms`,
+`budget_ms: null` and `verdict: "diagnostic_only"`. With nonzero
+`--aged-released-resource-leases`, `diagnostics.resource_history_list` contains
+the same fields. A schema-1-only consumer must recognize schema 2 before reading
+the report.
 
 The report embeds the same workload object saved as `workload.json`. It records
-requested and actual aged released counts, seeding status and, when enabled,
+the requested session count, successful session/worktree creations and observed
+active, idle and stale session states. It also records requested and actual aged
+released counts, seeding status and, when enabled,
 `aged_host_resource_history` with actual fixture lease counts and the seeding
 method. `commands.json` retains setup and sample receipts, with the release
 grant token redacted. These fields describe synthetic fixture state, not the

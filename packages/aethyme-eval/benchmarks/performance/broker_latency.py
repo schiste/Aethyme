@@ -70,7 +70,14 @@ def validate_session_count(value):
     return value
 
 
-def parse_status_diagnostics(stdout, expected_sessions):
+def status_diagnostics_enabled(session_count, requested=False):
+    session_count = validate_session_count(session_count)
+    if not isinstance(requested, bool):
+        raise ValueError('status diagnostics selection must be boolean')
+    return requested or session_count > 1
+
+
+def parse_status_diagnostics(stdout, expected_sessions, require_open_timing=True):
     expected_sessions = validate_session_count(expected_sessions)
     try:
         payload = json.loads(stdout)
@@ -89,9 +96,13 @@ def parse_status_diagnostics(stdout, expected_sessions):
         raise RuntimeError(
             f"status reports {counts['live_sessions']} live sessions; "
             f'expected {expected_sessions}')
+    if sum(counts[name] for name in ('active_sessions', 'idle_sessions', 'stale_sessions')) \
+            != counts['live_sessions']:
+        raise RuntimeError('status session-state counts do not sum to the live-session count')
     timings = payload.get('phase_timings_ms')
     open_ms = timings.get('open') if isinstance(timings, dict) else None
-    if isinstance(open_ms, bool) or not isinstance(open_ms, int) or open_ms < 0:
+    if (require_open_timing and
+            (isinstance(open_ms, bool) or not isinstance(open_ms, int) or open_ms < 0)):
         raise RuntimeError('status output has no valid Broker::open timing')
     return counts, open_ms
 
@@ -359,10 +370,12 @@ def seed_released_resource_history(binary, command, root, cwd, repo, count):
 
 
 def run_playground(binary, samples, output, aged_released_resource_leases=0,
-                   session_count=1):
+                   session_count=1, request_status_diagnostics=False):
     aged_released_resource_leases = validate_aged_released_resource_lease_count(
         aged_released_resource_leases)
     session_count = validate_session_count(session_count)
+    collect_status_diagnostics = status_diagnostics_enabled(
+        session_count, request_status_diagnostics)
     receipts = []
     with tempfile.TemporaryDirectory(prefix='aethyme-broker-latency-') as temporary:
         root = Path(temporary).resolve()
@@ -390,6 +403,7 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
         fixture_environment = validate_fixture_environment(env, root)
         workload = {
             'session_count_requested': session_count,
+            'status_diagnostics_enabled': collect_status_diagnostics,
             'created_broker_sessions': 0,
             'created_worktrees': 0,
             'created_session_ids': [],
@@ -484,6 +498,18 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
                  '--json'],
                 label=f'fixture_session_{label}')
             session = json.loads(started)
+            if not isinstance(session, dict) or not isinstance(session.get('id'), (str, int)):
+                raise RuntimeError('broker start did not return a session identity')
+            sessions.append(session)
+            if isinstance(session.get('worktree_path'), str):
+                worktrees.append(Path(session['worktree_path']))
+            workload.update({
+                'created_broker_sessions': len(sessions),
+                'created_worktrees': len(worktrees),
+                'created_session_ids': [str(item['id']) for item in sessions],
+                'open_broker_sessions': len(sessions),
+            })
+            (output / 'workload.json').write_text(json.dumps(workload, indent=2) + '\n')
             candidate = fixture_path(
                 Path(session['worktree_path']), root, 'broker-reported worktree',
                 must_exist=True)
@@ -491,8 +517,7 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
                                          'fixture worktree root', must_exist=True)
             if not candidate.is_relative_to(worktree_root):
                 raise RuntimeError('broker escaped fixture worktree root')
-            sessions.append(session)
-            worktrees.append(candidate)
+            worktrees[-1] = candidate
 
         # Keep one session for the existing guard/sync/push measurements. All
         # sessions remain in the same isolated broker database for status scaling.
@@ -529,32 +554,36 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
         (output / 'workload.json').write_text(json.dumps(workload, indent=2) + '\n')
         commands = {
             'routine_status': [str(binary), 'broker', 'status', '--summary', '--json'],
-            'status_full': [str(binary), 'broker', 'status', '--json'],
-            'doctor': [str(binary), 'broker', 'doctor', '--json'],
             'guard_overhead': [str(binary), 'broker', 'advanced', 'exec', '--session', sid,
                                '--json', '--', '/usr/bin/true'],
             'unchanged_sync': [str(binary), 'broker', 'sync', '--session', sid, '--json'],
             'push': [str(binary), 'broker', 'push', '--session', sid],
         }
+        if collect_status_diagnostics:
+            commands.update({
+                'status_full': [str(binary), 'broker', 'status', '--json'],
+                'doctor': [str(binary), 'broker', 'doctor', '--json'],
+            })
         if aged_released_resource_leases:
             commands['resource_history_list'] = [
                 str(binary), 'broker', 'advanced', 'resources', 'list', '--json']
         diagnostic_names = {'status_full', 'doctor'}
         measured = {name: [] for name in commands
                     if name not in diagnostic_names | {'resource_history_list'}}
-        diagnostic_samples = {
+        diagnostic_samples = ({
             'status_full': [],
             'doctor': [],
             'status_open_phase_summary': [],
             'status_open_phase_full': [],
-        }
+        } if collect_status_diagnostics else {})
         history_samples = []
         for sample_index in range(samples):
             for name, argv in commands.items():
                 stdout, elapsed = command(
                     argv, worktree, label=f'sample_{sample_index + 1}:{name}')
                 if name == 'routine_status':
-                    counts, open_ms = parse_status_diagnostics(stdout, session_count)
+                    counts, open_ms = parse_status_diagnostics(
+                        stdout, session_count, require_open_timing=collect_status_diagnostics)
                     workload['observed_status_session_counts'] = counts
                     workload['active_broker_sessions'] = counts['active_sessions']
                     workload['live_broker_sessions'] = counts['live_sessions']
@@ -562,7 +591,8 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
                     workload['stale_broker_sessions'] = counts['stale_sessions']
                     (output / 'workload.json').write_text(
                         json.dumps(workload, indent=2) + '\n')
-                    diagnostic_samples['status_open_phase_summary'].append(open_ms)
+                    if collect_status_diagnostics:
+                        diagnostic_samples['status_open_phase_summary'].append(open_ms)
                     measured[name].append(elapsed)
                 elif name == 'status_full':
                     _, open_ms = parse_status_diagnostics(stdout, session_count)
@@ -602,8 +632,11 @@ def main():
     parser.add_argument('--samples', type=int, choices=range(1, 11), default=3)
     parser.add_argument(
         '--sessions', type=int, default=1, metavar='N',
-        help=('create N isolated broker sessions/worktrees for status diagnostics '
-              f'(1..{MAX_BROKER_LATENCY_SESSIONS}; default: 1)'))
+        help=('create N isolated broker sessions/worktrees '
+              f'(1..{MAX_BROKER_LATENCY_SESSIONS}; default: 1; values above 1 enable status diagnostics)'))
+    parser.add_argument(
+        '--status-diagnostics', action='store_true',
+        help='also measure full status, doctor and status-open phases (automatically enabled with --sessions > 1)')
     parser.add_argument(
         '--aged-released-resource-leases', type=int, default=0, metavar='N',
         help=('opt in to seed N old released host-resource lease records in the isolated '
@@ -621,13 +654,15 @@ def main():
     budget_bytes = (HERE / 'broker-budgets.json').read_bytes()
     budgets = json.loads(budget_bytes)
     measured, diagnostic_samples, history_samples, workload, binary_version_raw = run_playground(
-        binary, args.samples, args.output, aged_released_resource_leases, session_count)
+        binary, args.samples, args.output, aged_released_resource_leases, session_count,
+        args.status_diagnostics)
     results = assess(budgets, measured)
     diagnostics = {name: summarize_diagnostic(values)
                    for name, values in diagnostic_samples.items()}
     if history_samples:
         diagnostics['resource_history_list'] = summarize_diagnostic(history_samples)
-    profile = ('parcel_playground_one_session_unchanged_push' if session_count == 1
+    profile = ('parcel_playground_one_session_unchanged_push'
+               if session_count == 1 and not args.status_diagnostics
                else f'parcel_playground_{session_count}_sessions_status_scale')
     report = {'schema_version': 2, 'enforcement': 'warning',
               'binary_argument': binary_argument,
@@ -666,12 +701,13 @@ def main():
                 f"\nSeeded {workload['aged_released_host_resource_leases']} aged released "
                 'host-resource lease records in the isolated Playground; budgets are unchanged.\n'
             )
-        summary += (
-            f"\nSession-scale profile requested {workload['session_count_requested']} sessions and created "
-            f"{workload['created_worktrees']} worktrees; observed status states are "
-            f"{json.dumps(workload['observed_status_session_counts'], sort_keys=True)}.\n"
-            'These synthetic fixture measurements do not establish production latency.\n'
-        )
+        if workload['status_diagnostics_enabled']:
+            summary += (
+                f"\nSession-scale profile requested {workload['session_count_requested']} sessions and created "
+                f"{workload['created_worktrees']} worktrees; observed status states are "
+                f"{json.dumps(workload['observed_status_session_counts'], sort_keys=True)}.\n"
+                'These synthetic fixture measurements do not establish production latency.\n'
+            )
     (args.output / 'summary.md').write_text(summary)
     print(summary)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
