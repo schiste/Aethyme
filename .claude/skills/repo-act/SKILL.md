@@ -247,6 +247,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unique log and manifest paths. Check which filenames the delegated monitor
   owns; store caller summaries under distinct names instead of overwriting or
   exclusively creating those monitor outputs. Preserve earlier outputs before retrying.
+  If the helper exclusively creates its output root, preflight its parent with a
+  removable canary and leave the output root absent; do not precreate it.
   Freeze source for each invocation and record the exact head and dirty-state
   hashes before and after it. If relevant source changes during a run, retain
   that run as diagnostic evidence and rerun the committed source.

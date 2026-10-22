@@ -789,21 +789,31 @@ pub(crate) fn containment(
 }
 
 impl Broker {
-    fn auto_cleanup_cursor(&self) -> Result<AutoCleanupCursor, BrokerOpError> {
-        let value = self.store().meta_get(AUTO_CLEANUP_CURSOR_KEY)?;
-        Ok(decode_auto_cleanup_cursor(value.as_deref()))
+    fn auto_cleanup_cursor(
+        &mut self,
+    ) -> Result<(AutoCleanupCursor, Option<String>), BrokerOpError> {
+        let raw = self.store().meta_get(AUTO_CLEANUP_CURSOR_KEY)?;
+        Ok((decode_auto_cleanup_cursor(raw.as_deref()), raw))
     }
 
     fn persist_auto_cleanup_cursor(
         &mut self,
         cursor: &AutoCleanupCursor,
+        expected_raw: &mut Option<String>,
     ) -> Result<(), BrokerOpError> {
         // This structure contains only integer fields, so JSON serialization
-        // cannot fail. A storage write failure must stop planning before any
-        // selected checkout can be applied.
+        // cannot fail. A storage write failure or stale checkpoint must stop
+        // planning before any selected checkout can be applied.
         let value = serde_json::to_string(cursor)
             .expect("serializing the cleanup cursor is infallible");
-        self.store().meta_set(AUTO_CLEANUP_CURSOR_KEY, &value)?;
+        if !self.store().meta_compare_and_set(
+            AUTO_CLEANUP_CURSOR_KEY,
+            expected_raw.as_deref(),
+            &value,
+        )? {
+            return Err(BrokerOpError::AutoCleanupCursorChanged);
+        }
+        *expected_raw = Some(value);
         Ok(())
     }
 
@@ -1182,7 +1192,7 @@ impl Broker {
         // a spent deadline never skips an unvisited candidate. This deadline
         // may already be exhausted by the caller's artifact sweep; the cursor
         // guarantees fairness only among candidates this pass can inspect.
-        let mut cursor = self.auto_cleanup_cursor()?;
+        let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
         let lap =
             auto_cleanup_lap_range(&mut candidates, &mut cursor, candidate_cursor_session_id);
         let deferred_after_lap = candidates.len().saturating_sub(lap.end);
@@ -1225,7 +1235,7 @@ impl Broker {
                 }),
             }
             cursor.after_session_id = session_id;
-            self.persist_auto_cleanup_cursor(&cursor)?;
+            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
         }
         Ok(AutoCleanupPlan {
             report,
@@ -1437,10 +1447,14 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoCleanupCursor, AutoCleanupPolicy, auto_cleanup_lap_range, classify_ignored,
-        decode_auto_cleanup_cursor,
+        AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupPolicy, auto_cleanup_lap_range,
+        classify_ignored, decode_auto_cleanup_cursor,
     };
     use std::path::Path;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::process::Command;
 
     fn classify(root: &Path, relative: &str, policy: &AutoCleanupPolicy) -> Result<(), String> {
         let mut budget = super::CLASSIFY_ENTRY_CAP;
@@ -1451,6 +1465,135 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "x").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn git(root: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        let git_keys = std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+            .collect::<Vec<_>>();
+        for key in git_keys {
+            command.env_remove(key);
+        }
+        let output = command.args(args).current_dir(root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn closed_dirty_checkout(broker: &mut crate::Broker, label: &str) -> (i64, PathBuf) {
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        broker
+            .close_abandoning_unpushed(session.id, "cursor test backlog owner")
+            .unwrap();
+        std::fs::write(worktree.join("cursor-dirty.txt"), "retain this checkout\n").unwrap();
+        (session.id, worktree)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planner_resumes_wraps_and_rechecks_changed_checkout_eligibility() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "Auto cleanup test"]);
+        git(&root, &["config", "user.email", "auto-cleanup@example.invalid"]);
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".gitignore", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        git(&root, &["remote", "add", "origin", "."]);
+        git(
+            &root,
+            &["fetch", "-q", "origin", "main:refs/remotes/origin/main"],
+        );
+        git(&root, &["remote", "set-head", "origin", "main"]);
+
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let (first_id, first_path) = closed_dirty_checkout(&mut broker, "cursor first candidate");
+        let (second_id, second_path) = closed_dirty_checkout(&mut broker, "cursor second candidate");
+        assert!(first_id < second_id);
+        assert!(first_path.is_dir());
+        assert!(second_path.is_dir());
+        for session_id in [first_id, second_id] {
+            assert!(
+                broker
+                    .store()
+                    .spawned_worktree_instance_witness(session_id)
+                    .unwrap()
+                    .is_some(),
+                "Unix fixture sessions must carry valid spawn-time worktree witnesses"
+            );
+        }
+
+        let seed = AutoCleanupCursor {
+            version: super::AUTO_CLEANUP_CURSOR_VERSION,
+            after_session_id: first_id,
+            high_water_session_id: second_id,
+        };
+        broker
+            .store()
+            .meta_set(AUTO_CLEANUP_CURSOR_KEY, &serde_json::to_string(&seed).unwrap())
+            .unwrap();
+
+        let first_pass = broker.auto_cleanup_plan(None).unwrap();
+        assert_eq!(
+            first_pass
+                .report
+                .kept
+                .iter()
+                .map(|kept| kept.sessions.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![second_id]],
+            "the persisted cursor resumes after the first candidate"
+        );
+
+        let wrapped_pass = broker.auto_cleanup_plan(None).unwrap();
+        let mut wrapped_ids = wrapped_pass
+            .report
+            .kept
+            .iter()
+            .flat_map(|kept| kept.sessions.iter().copied())
+            .collect::<Vec<_>>();
+        wrapped_ids.sort_unstable();
+        assert_eq!(
+            wrapped_ids,
+            vec![first_id, second_id],
+            "finishing a lap wraps around and revisits earlier candidates"
+        );
+
+        std::fs::remove_file(first_path.join("cursor-dirty.txt")).unwrap();
+        let changed_eligibility_pass = broker.auto_cleanup_plan(None).unwrap();
+        let selected = changed_eligibility_pass.selected_worktrees();
+        assert!(
+            selected.contains(&first_path.to_string_lossy().into_owned()),
+            "a candidate that becomes clean is checked again on a later lap"
+        );
+        assert!(
+            !selected.contains(&second_path.to_string_lossy().into_owned()),
+            "the still-dirty candidate remains protected"
+        );
     }
 
     #[test]
