@@ -55,6 +55,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   during discovery. Use a deterministic deadline seam to prove partial progress
   and a seeded persisted marker to test fresh-process resume; assert the marker
   before invoking the resume path.
+- For whole-checkout cleanup, finish canonical grouping of every retained row
+  and build complete live-path evidence before scheduling. Rotate a durable
+  cursor across complete cohorts before per-cohort Git, witness and ownership
+  proofs; never let a partial cohort authorize removal. Keep exact closed-set
+  and fresh apply-time proofs. State that grouping remains O(history), and that
+  one database or filesystem operation can exceed a wall-clock budget.
 
 - When bounding cleanup over session history, page candidate records before
   decoding them and check the deadline before fetching another page. Keep live
@@ -345,9 +351,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For routine Rust validation, reuse a matching warm target and run one Cargo
   process at a time with `--locked -j1`. Prefer a selected package/binary or
   focused test filter. On a resource-constrained target, use `debug=0` and
-  `incremental=0` from the outset; avoid changing profile settings on a warm
-  target. Expand to verbose or workspace-wide runs only when explicitly needed
-  or after a focused failure.
+  `incremental=0` from the outset; when setting Cargo profile environment
+  variables, use booleans such as `CARGO_PROFILE_DEV_INCREMENTAL=false` and
+  `CARGO_PROFILE_TEST_INCREMENTAL=false` (`CARGO_INCREMENTAL=0` accepts a
+  numeric value). Avoid changing profile settings on a warm target. Expand to
+  verbose or workspace-wide runs only when explicitly needed or after a
+  focused failure.
 - Before a long or frozen Rust inventory, verify each selected
   `--package`/`--test` pair against the owning package's effective Cargo
   targets: the `tests/` defaults and any `[[test]]` or `autotests` settings

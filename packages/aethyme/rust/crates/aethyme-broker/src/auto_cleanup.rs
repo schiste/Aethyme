@@ -126,8 +126,8 @@ fn decode_auto_cleanup_cursor(value: Option<&str>) -> AutoCleanupCursor {
         .unwrap_or_default()
 }
 
-fn candidate_cursor_session_id(candidate: &AutoCleanupCandidate) -> i64 {
-    candidate
+fn checkout_group_cursor_session_id(group: &AutoCleanupCheckoutGroup) -> i64 {
+    group
         .sessions
         .iter()
         .map(|session| session.id)
@@ -516,6 +516,27 @@ pub(crate) struct AutoCleanupCandidate {
     pub sessions: Vec<Session>,
 }
 
+/// A complete canonical checkout cohort, before any deletion proof is made.
+/// Grouping all retained rows is required so aliases and colocated sessions
+/// cannot be split into independent cleanup candidates.
+#[derive(Debug, Clone)]
+struct AutoCleanupCheckoutGroup {
+    worktree: PathBuf,
+    sessions: Vec<Session>,
+}
+
+struct AutoCleanupGroupScan {
+    groups: Vec<AutoCleanupCheckoutGroup>,
+    live: Vec<Session>,
+    live_worktrees: Vec<ResolvedWorktreePath>,
+}
+
+enum AutoCleanupGroupInspection {
+    Candidate(AutoCleanupCandidate),
+    Kept(AutoKeptCheckout),
+    Deferred,
+}
+
 impl AutoCleanupCandidate {
     fn session_ids(&self) -> Vec<i64> {
         self.sessions.iter().map(|session| session.id).collect()
@@ -526,8 +547,46 @@ impl AutoCleanupCandidate {
     }
 }
 
-/// A complete closed-checkout discovery result and its kept rows.
-type AutoCleanupCandidateScan = (Vec<AutoCleanupCandidate>, Vec<AutoKeptCheckout>);
+/// Group all extant retained rows by canonical checkout path. This pass is
+/// intentionally complete: a partial cohort is never deletion authority.
+fn group_closed_checkout_sessions(
+    closed: Vec<Session>,
+    deadline: Option<Instant>,
+) -> Option<Vec<AutoCleanupCheckoutGroup>> {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut by_path: std::collections::BTreeMap<PathBuf, Vec<Session>> =
+        std::collections::BTreeMap::new();
+    for session in closed {
+        if deadline_expired(deadline) {
+            return None;
+        }
+        if session.cleanup_state == SessionCleanupState::Cleaned {
+            continue;
+        }
+        let path = PathBuf::from(&session.worktree_path);
+        if !path.is_dir() {
+            if deadline_expired(deadline) {
+                return None;
+            }
+            continue;
+        }
+        let canonical_path = canonical(&path);
+        if deadline_expired(deadline) {
+            return None;
+        }
+        by_path.entry(canonical_path).or_default().push(session);
+    }
+    if deadline_expired(deadline) {
+        return None;
+    }
+    Some(
+        by_path
+            .into_iter()
+            .map(|(worktree, sessions)| AutoCleanupCheckoutGroup { worktree, sessions })
+            .collect(),
+    )
+}
 
 /// Checkouts selected for removal, not yet removed.
 #[derive(Debug, Clone)]
@@ -951,16 +1010,16 @@ impl Broker {
         Ok(())
     }
 
-    /// Closed, broker-owned checkouts that still exist, grouped by worktree.
-    pub(crate) fn auto_cleanup_candidates(
+    /// Collect complete canonical cohorts and a complete live-path index.
+    /// This pass does no per-cohort Git or ownership proof: the durable cursor
+    /// must choose a fair tranche before that work begins.
+    fn auto_cleanup_checkout_groups(
         &mut self,
         deadline: Option<Instant>,
-    ) -> Result<Option<AutoCleanupCandidateScan>, BrokerOpError> {
+    ) -> Result<Option<AutoCleanupGroupScan>, BrokerOpError> {
         if deadline_expired(deadline) {
             return Ok(None);
         }
-        let canonical =
-            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let live = self.store().live_sessions()?;
         if deadline_expired(deadline) {
             return Ok(None);
@@ -972,194 +1031,176 @@ impl Broker {
         if deadline_expired(deadline) {
             return Ok(None);
         }
-        let main_root = canonical(self.main_root());
-        if deadline_expired(deadline) {
+        let Some(groups) = group_closed_checkout_sessions(closed, deadline) else {
             return Ok(None);
-        }
-        let mut by_path: std::collections::BTreeMap<PathBuf, Vec<Session>> =
-            std::collections::BTreeMap::new();
-        for session in closed {
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            if session.cleanup_state == SessionCleanupState::Cleaned {
-                continue;
-            }
-            let path = PathBuf::from(&session.worktree_path);
-            if !path.is_dir() {
-                if deadline_expired(deadline) {
-                    return Ok(None);
-                }
-                continue;
-            }
-            let canonical_path = canonical(&path);
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            by_path.entry(canonical_path).or_default().push(session);
-        }
-        let mut candidates = Vec::new();
-        let mut kept = Vec::new();
-        for (path, sessions) in by_path {
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            let ids = sessions
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>();
-            let keep = |reason: String| AutoKeptCheckout {
+        };
+        Ok(Some(AutoCleanupGroupScan {
+            groups,
+            live,
+            live_worktrees,
+        }))
+    }
+
+    /// Make the existing ownership and live-session proofs for one complete
+    /// cohort. A raw group returned by auto_cleanup_checkout_groups never
+    /// authorizes deletion by itself.
+    fn auto_cleanup_candidate_for_group(
+        &mut self,
+        group: &AutoCleanupCheckoutGroup,
+        live: &[Session],
+        live_worktrees: &[ResolvedWorktreePath],
+        deadline: Option<Instant>,
+    ) -> Result<AutoCleanupGroupInspection, BrokerOpError> {
+        let path = &group.worktree;
+        let sessions = &group.sessions;
+        let ids = sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        let keep = |reason: String| {
+            AutoCleanupGroupInspection::Kept(AutoKeptCheckout {
                 worktree: path.to_string_lossy().into_owned(),
                 sessions: ids.clone(),
                 reason,
-            };
-            if path == main_root {
-                kept.push(keep("the primary checkout is never removed".into()));
-                continue;
-            }
-            let spawned_sessions = sessions
-                .iter()
-                .rev()
-                .filter(|session| {
-                    session.origin == SessionOrigin::Spawned
-                        && session.cleanup_state == SessionCleanupState::Closed
-                })
-                .collect::<Vec<_>>();
-            if spawned_sessions.is_empty() {
-                kept.push(keep(
-                    "no matching spawn-time worktree instance witness".into(),
-                ));
-                continue;
-            }
-            // Only a still-retained spawned row with a persisted witness for
-            // this exact Git worktree instance proves broker creation.
-            // Adopted rows and legacy spawned rows without a witness cannot
-            // authorize cleanup, even when the path and repository match.
-            let checkout_result = {
-                let _git_deadline = deadline.map(crate::git::limit_git_until);
-                GitRepo::discover(&path)
-            };
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            let checkout = match checkout_result {
-                Ok(checkout) => checkout,
-                Err(_) => {
-                    kept.push(keep("not a readable broker-owned worktree".into()));
-                    continue;
-                }
-            };
-            let current_witness = {
-                let _git_deadline = deadline.map(crate::git::limit_git_until);
-                checkout.spawned_worktree_instance_witness()
-            };
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            let mut matched_owner = None;
-            let mut diagnostic_owner = None;
-            let mut unreadable_witness = None;
-            for session in spawned_sessions {
-                if deadline_expired(deadline) {
-                    return Ok(None);
-                }
-                let witness = match self.store().spawned_worktree_instance_witness(session.id) {
-                    Ok(Some(witness)) => Some(witness),
-                    Ok(None) => None,
-                    Err(error) => {
-                        unreadable_witness = Some(error.to_string());
-                        continue;
-                    }
-                };
-                if deadline_expired(deadline) {
-                    return Ok(None);
-                }
-                if witness
-                    .as_ref()
-                    .is_some_and(|witness| witness.worktree_path != path.to_string_lossy().as_ref())
-                {
-                    continue;
-                }
-                if current_witness.as_ref().is_some_and(|current| {
-                    witness.as_ref().is_some_and(|witness| witness == current)
-                }) {
-                    matched_owner = Some((session.clone(), witness));
-                    break;
-                }
-                // Keep an unproven spawn row only as a diagnostic candidate.
-                // The plan can still report live-session, lease, dirty-tree,
-                // or gate protections on platforms without a stable identity
-                // primitive; auto_cleanup_verdict refuses it before running
-                // containment or removing anything.
-                if diagnostic_owner.is_none() {
-                    diagnostic_owner = Some((session.clone(), witness));
-                }
-            }
-            let owner = matched_owner.or(diagnostic_owner);
-            let Some((spawned_owner, spawned_instance_witness)) = owner else {
-                let reason = unreadable_witness
-                    .map(|error| format!("spawn-time worktree identity is unreadable: {error}"))
-                    .unwrap_or_else(|| "no matching spawn-time worktree instance witness".into());
-                kept.push(keep(reason));
-                continue;
-            };
-            let is_owned = {
-                let _git_deadline = deadline.map(crate::git::limit_git_until);
-                self.is_broker_owned_worktree(
-                    &spawned_owner,
-                    Path::new(&spawned_owner.worktree_path),
-                )
-            };
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            if !is_owned {
-                kept.push(keep("not a broker-owned worktree".into()));
-                continue;
-            }
-            // Proof 1: a session still open anywhere in this tree keeps it,
-            // whatever state it reports -- an exited or stale session is not
-            // a closed one.
-            let candidate_worktree = ResolvedWorktreePath::resolve(&path);
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            if let Some((index, evidence)) =
-                first_live_worktree_overlap(&candidate_worktree, &live_worktrees)
-            {
-                let open = &live[index];
-                let reason = match evidence {
-                    LiveOverlapEvidence::Overlap => format!(
-                        "session {} is still open ({}) in this worktree",
-                        open.id,
-                        open.status.as_str()
-                    ),
-                    LiveOverlapEvidence::Unknown => format!(
-                        "session {} worktree overlap could not be resolved: {}",
-                        open.id,
-                        overlap_resolution_error(&candidate_worktree, &live_worktrees[index])
-                    ),
-                    LiveOverlapEvidence::Disjoint => {
-                        unreachable!("only possible overlaps are returned")
-                    }
-                };
-                kept.push(keep(reason));
-                continue;
-            }
-            candidates.push(AutoCleanupCandidate {
-                worktree: path,
-                spawned_owner,
-                spawned_instance_witness,
-                sessions,
-            });
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-        }
+            })
+        };
         if deadline_expired(deadline) {
-            return Ok(None);
+            return Ok(AutoCleanupGroupInspection::Deferred);
         }
-        Ok(Some((candidates, kept)))
+        let canonical =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let main_root = canonical(self.main_root());
+        if deadline_expired(deadline) {
+            return Ok(AutoCleanupGroupInspection::Deferred);
+        }
+        if *path == main_root {
+            return Ok(keep("the primary checkout is never removed".into()));
+        }
+        let spawned_sessions = sessions
+            .iter()
+            .rev()
+            .filter(|session| {
+                session.origin == SessionOrigin::Spawned
+                    && session.cleanup_state == SessionCleanupState::Closed
+            })
+            .collect::<Vec<_>>();
+        if spawned_sessions.is_empty() {
+            return Ok(keep(
+                "no matching spawn-time worktree instance witness".into(),
+            ));
+        }
+        // Only a still-retained spawned row with a persisted witness for this
+        // exact Git worktree instance proves broker creation. Adopted rows and
+        // legacy spawned rows without a witness cannot authorize cleanup.
+        let checkout_result = {
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            GitRepo::discover(path)
+        };
+        if deadline_expired(deadline) {
+            return Ok(AutoCleanupGroupInspection::Deferred);
+        }
+        let checkout = match checkout_result {
+            Ok(checkout) => checkout,
+            Err(_) => return Ok(keep("not a readable broker-owned worktree".into())),
+        };
+        let current_witness = {
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            checkout.spawned_worktree_instance_witness()
+        };
+        if deadline_expired(deadline) {
+            return Ok(AutoCleanupGroupInspection::Deferred);
+        }
+        let mut matched_owner = None;
+        let mut diagnostic_owner = None;
+        let mut unreadable_witness = None;
+        for session in spawned_sessions {
+            if deadline_expired(deadline) {
+                return Ok(AutoCleanupGroupInspection::Deferred);
+            }
+            let witness = match self.store().spawned_worktree_instance_witness(session.id) {
+                Ok(Some(witness)) => Some(witness),
+                Ok(None) => None,
+                Err(error) => {
+                    unreadable_witness = Some(error.to_string());
+                    continue;
+                }
+            };
+            if deadline_expired(deadline) {
+                return Ok(AutoCleanupGroupInspection::Deferred);
+            }
+            if witness
+                .as_ref()
+                .is_some_and(|witness| witness.worktree_path != path.to_string_lossy().as_ref())
+            {
+                continue;
+            }
+            if current_witness
+                .as_ref()
+                .is_some_and(|current| witness.as_ref().is_some_and(|witness| witness == current))
+            {
+                matched_owner = Some((session.clone(), witness));
+                break;
+            }
+            // Keep an unproven spawn row only as a diagnostic candidate. The
+            // planner still refuses it before containment or removal.
+            if diagnostic_owner.is_none() {
+                diagnostic_owner = Some((session.clone(), witness));
+            }
+        }
+        let owner = matched_owner.or(diagnostic_owner);
+        let Some((spawned_owner, spawned_instance_witness)) = owner else {
+            let reason = unreadable_witness
+                .map(|error| format!("spawn-time worktree identity is unreadable: {error}"))
+                .unwrap_or_else(|| "no matching spawn-time worktree instance witness".into());
+            return Ok(keep(reason));
+        };
+        let is_owned = {
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            self.is_broker_owned_worktree(&spawned_owner, Path::new(&spawned_owner.worktree_path))
+        };
+        if deadline_expired(deadline) {
+            return Ok(AutoCleanupGroupInspection::Deferred);
+        }
+        if !is_owned {
+            return Ok(keep("not a broker-owned worktree".into()));
+        }
+        // A session still open anywhere in this tree keeps it, whatever state
+        // it reports. The full live index was resolved before any groups.
+        let candidate_worktree = ResolvedWorktreePath::resolve(path);
+        if deadline_expired(deadline) {
+            return Ok(AutoCleanupGroupInspection::Deferred);
+        }
+        if let Some((index, evidence)) =
+            first_live_worktree_overlap(&candidate_worktree, live_worktrees)
+        {
+            let open = &live[index];
+            let reason = match evidence {
+                LiveOverlapEvidence::Overlap => format!(
+                    "session {} is still open ({}) in this worktree",
+                    open.id,
+                    open.status.as_str()
+                ),
+                LiveOverlapEvidence::Unknown => format!(
+                    "session {} worktree overlap could not be resolved: {}",
+                    open.id,
+                    overlap_resolution_error(&candidate_worktree, &live_worktrees[index])
+                ),
+                LiveOverlapEvidence::Disjoint => {
+                    unreachable!("only possible overlaps are returned")
+                }
+            };
+            return Ok(keep(reason));
+        }
+        let candidate = AutoCleanupCandidate {
+            worktree: path.clone(),
+            spawned_owner,
+            spawned_instance_witness,
+            sessions: sessions.clone(),
+        };
+        if deadline_expired(deadline) {
+            return Ok(AutoCleanupGroupInspection::Deferred);
+        }
+        Ok(AutoCleanupGroupInspection::Candidate(candidate))
     }
 
     /// Proofs 1-4 for one candidate, against the live state right now.
@@ -1384,6 +1425,30 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<AutoCleanupPlan, BrokerOpError> {
+        self.auto_cleanup_plan_with_group_inspector(
+            deadline,
+            |broker, group, live, live_worktrees, deadline| {
+                broker.auto_cleanup_candidate_for_group(group, live, live_worktrees, deadline)
+            },
+        )
+    }
+
+    /// Planner seam used to verify that cursor rotation happens before
+    /// per-group Git and ownership work.
+    fn auto_cleanup_plan_with_group_inspector<F>(
+        &mut self,
+        deadline: Option<Instant>,
+        mut inspect_group: F,
+    ) -> Result<AutoCleanupPlan, BrokerOpError>
+    where
+        F: FnMut(
+            &mut Self,
+            &AutoCleanupCheckoutGroup,
+            &[Session],
+            &[ResolvedWorktreePath],
+            Option<Instant>,
+        ) -> Result<AutoCleanupGroupInspection, BrokerOpError>,
+    {
         let mut report = AutoCleanupReport {
             evaluated_at_ms: now_ms(),
             ..AutoCleanupReport::default()
@@ -1399,70 +1464,108 @@ impl Broker {
         if !policy.auto_remove {
             return Ok(AutoCleanupPlan::nothing(report));
         }
-        let Some((mut candidates, mut kept)) = self.auto_cleanup_candidates(deadline)? else {
+        let Some(mut scan) = self.auto_cleanup_checkout_groups(deadline)? else {
             report.deferred += 1;
             return Ok(AutoCleanupPlan::nothing(report));
         };
-        report.kept.append(&mut kept);
-        let Some(upstream) = self.remote_default_ref_and_tip() else {
-            for candidate in &candidates {
-                report.kept.push(AutoKeptCheckout {
-                    worktree: candidate.worktree.to_string_lossy().into_owned(),
-                    sessions: candidate.session_ids(),
-                    reason: "no fetched remote default branch (origin/HEAD) to prove containment against".into(),
-                });
-            }
-            return Ok(AutoCleanupPlan::nothing(report));
-        };
 
-        // A persisted high-water mark bounds each lap. The cursor advances
-        // only after one candidate's cheap/deep proof has been attempted, so
-        // a spent deadline never skips an unvisited candidate. This deadline
-        // may already be exhausted by the caller's artifact sweep; the cursor
-        // guarantees fairness only among candidates this pass can inspect.
+        // The complete canonical groups and full live index are available
+        // before the cursor selects a tranche. Grouping still scans history;
+        // the cursor prevents per-group Git and ownership checks from
+        // restarting at the beginning when a selected proof uses the budget.
         let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
-        let lap = auto_cleanup_lap_range(&mut candidates, &mut cursor, candidate_cursor_session_id);
-        let deferred_after_lap = candidates.len().saturating_sub(lap.end);
-        let candidates = candidates.drain(lap).collect::<Vec<_>>();
+        let lap = auto_cleanup_lap_range(
+            &mut scan.groups,
+            &mut cursor,
+            checkout_group_cursor_session_id,
+        );
+        let deferred_after_lap = scan.groups.len().saturating_sub(lap.end);
+        let groups = scan.groups.drain(lap).collect::<Vec<_>>();
         report.deferred += deferred_after_lap;
 
-        let candidate_count = candidates.len();
+        let mut upstream_checked = false;
+        let mut upstream = None;
         let mut selected = Vec::new();
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                report.deferred += candidate_count - index;
+        let group_count = groups.len();
+        for (index, group) in groups.into_iter().enumerate() {
+            if deadline_expired(deadline) {
+                report.deferred += group_count - index;
                 break;
             }
-            let session_id = candidate_cursor_session_id(&candidate);
-            let verdict =
-                self.auto_cleanup_verdict(&candidate, &policy, &upstream, false, deadline, None);
-            let verdict = match verdict {
-                Err(NotRemoved::Defer)
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
-                {
-                    Err(NotRemoved::Defer)
-                }
-                Err(NotRemoved::Defer) => {
-                    self.auto_cleanup_verdict(&candidate, &policy, &upstream, true, deadline, None)
-                }
-                verdict => verdict,
+            let cursor_session_id = checkout_group_cursor_session_id(&group);
+            let inspection =
+                inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
+            let mut stop_for_deadline = false;
+            let inspection = if deadline_expired(deadline) {
+                stop_for_deadline = true;
+                AutoCleanupGroupInspection::Deferred
+            } else {
+                inspection
             };
-            match verdict {
-                Ok(proof) => selected.push((candidate, proof)),
-                Err(NotRemoved::Defer) => report.deferred += 1,
-                Err(NotRemoved::Keep(reason)) => report.kept.push(AutoKeptCheckout {
-                    worktree: candidate.worktree.to_string_lossy().into_owned(),
-                    sessions: candidate.session_ids(),
-                    reason,
-                }),
+            match inspection {
+                AutoCleanupGroupInspection::Candidate(candidate) => {
+                    if !upstream_checked {
+                        upstream_checked = true;
+                        upstream = {
+                            let _git_deadline = deadline.map(crate::git::limit_git_until);
+                            self.remote_default_ref_and_tip()
+                        };
+                    }
+                    if deadline_expired(deadline) {
+                        report.deferred += 1;
+                        stop_for_deadline = true;
+                    } else if let Some(upstream) = upstream.as_ref() {
+                        let verdict = self.auto_cleanup_verdict(
+                            &candidate, &policy, upstream, false, deadline, None,
+                        );
+                        let verdict = match verdict {
+                            Err(NotRemoved::Defer) if !deadline_expired(deadline) => self
+                                .auto_cleanup_verdict(
+                                    &candidate, &policy, upstream, true, deadline, None,
+                                ),
+                            verdict => verdict,
+                        };
+                        if deadline_expired(deadline) {
+                            report.deferred += 1;
+                            stop_for_deadline = true;
+                        } else {
+                            match verdict {
+                                Ok(proof) => selected.push((candidate, proof)),
+                                Err(NotRemoved::Defer) => report.deferred += 1,
+                                Err(NotRemoved::Keep(reason)) => {
+                                    report.kept.push(AutoKeptCheckout {
+                                        worktree: candidate.worktree.to_string_lossy().into_owned(),
+                                        sessions: candidate.session_ids(),
+                                        reason,
+                                    })
+                                }
+                            }
+                        }
+                    } else {
+                        report.kept.push(AutoKeptCheckout {
+                            worktree: candidate.worktree.to_string_lossy().into_owned(),
+                            sessions: candidate.session_ids(),
+                            reason: "no fetched remote default branch (origin/HEAD) to prove containment against".into(),
+                        });
+                    }
+                }
+                AutoCleanupGroupInspection::Kept(kept) => report.kept.push(kept),
+                AutoCleanupGroupInspection::Deferred => {
+                    report.deferred += 1;
+                    stop_for_deadline = deadline_expired(deadline);
+                }
             }
-            cursor.after_session_id = session_id;
+            cursor.after_session_id = cursor_session_id;
             self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+            if stop_for_deadline {
+                report.deferred += group_count - index - 1;
+                break;
+            }
         }
         Ok(AutoCleanupPlan {
             report,
             policy,
-            upstream: Some(upstream),
+            upstream,
             selected,
             deadline,
         })
@@ -1669,9 +1772,10 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupPolicy, LiveOverlapEvidence,
-        ResolvedWorktreePath, auto_cleanup_lap_range, classify_ignored, decode_auto_cleanup_cursor,
-        first_live_worktree_overlap, resolve_worktree_paths_until,
+        AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupGroupInspection, AutoCleanupPolicy,
+        LiveOverlapEvidence, ResolvedWorktreePath, auto_cleanup_lap_range, classify_ignored,
+        decode_auto_cleanup_cursor, first_live_worktree_overlap, group_closed_checkout_sessions,
+        resolve_worktree_paths_until,
     };
     use std::path::Path;
     #[cfg(unix)]
@@ -1894,6 +1998,27 @@ mod tests {
             );
         }
 
+        let alias_path = root.join("first-checkout-alias");
+        std::os::unix::fs::symlink(&first_path, &alias_path).unwrap();
+        let first_record = broker.store().session(first_id).unwrap();
+        let mut aliased_second_record = broker.store().session(second_id).unwrap();
+        aliased_second_record.worktree_path = alias_path.to_string_lossy().into_owned();
+        let groups =
+            group_closed_checkout_sessions(vec![first_record, aliased_second_record], None)
+                .unwrap();
+        assert_eq!(groups.len(), 1, "canonical aliases share a complete group");
+        let mut grouped_ids = groups[0]
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        grouped_ids.sort_unstable();
+        assert_eq!(
+            grouped_ids,
+            vec![first_id, second_id],
+            "all retained rows in a canonical alias cohort stay together"
+        );
+
         let seed = AutoCleanupCursor {
             version: super::AUTO_CLEANUP_CURSOR_VERSION,
             after_session_id: first_id,
@@ -1919,6 +2044,44 @@ mod tests {
             Some(seed_json.as_str()),
             "an incomplete discovery pass does not advance the cursor"
         );
+
+        let mut inspected_groups = Vec::new();
+        let inspected_pass = broker
+            .auto_cleanup_plan_with_group_inspector(None, |_, group, _, _, _| {
+                inspected_groups.push(
+                    group
+                        .sessions
+                        .iter()
+                        .map(|session| session.id)
+                        .collect::<Vec<_>>(),
+                );
+                Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                    worktree: group.worktree.to_string_lossy().into_owned(),
+                    sessions: group.sessions.iter().map(|session| session.id).collect(),
+                    reason: "injected planner inspection".into(),
+                }))
+            })
+            .unwrap();
+        assert_eq!(
+            inspected_groups,
+            vec![vec![second_id]],
+            "only the cursor-selected group receives per-group proof work"
+        );
+        assert_eq!(inspected_pass.report.deferred, 0);
+        let persisted = broker
+            .store()
+            .meta_get(AUTO_CLEANUP_CURSOR_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_auto_cleanup_cursor(Some(&persisted)).after_session_id,
+            second_id,
+            "the selected group is checkpointed after its inspection"
+        );
+        broker
+            .store()
+            .meta_set(AUTO_CLEANUP_CURSOR_KEY, &seed_json)
+            .unwrap();
 
         let first_pass = broker.auto_cleanup_plan(None).unwrap();
         assert_eq!(
