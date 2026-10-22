@@ -331,6 +331,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and verification commands with fail-closed fakes while preserving identity,
   issuer, and transparency-log checks. Keep intermediate signature files out
   of the published asset directory.
+- Before running `shasum -a 256 -c SHA256SUMS`, download every file named
+  by that manifest and verify the complete set. A partial set is not a complete
+  release check; checksum consistency does not authenticate the manifest or
+  signer, so verify the signed manifest and signer identity separately.
 - Bound compilation and test execution separately. With `cargo nextest run`,
   use `--build-jobs 1` for Cargo and `--test-threads 1` or `2` for nextest;
   nextest's `-j` aliases test parallelism, so never use it as the Cargo worker
