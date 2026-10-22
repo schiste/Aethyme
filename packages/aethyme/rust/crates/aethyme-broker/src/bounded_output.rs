@@ -243,13 +243,7 @@ pub(crate) fn pipeline_with_input_limited(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("missing first-child stderr"))?;
-    let mut second = LimitedChild(
-        second
-            .stdin(Stdio::from(first_stdout))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+    let (mut first, mut second) = spawn_pipeline_second(first, first_stdout, second)?;
     let mut second_stdout = second
         .0
         .stdout
@@ -345,6 +339,21 @@ pub(crate) fn pipeline_with_input_limited(
         }
         sleep_until_poll(deadline);
     }
+}
+
+fn spawn_pipeline_second(
+    first: LimitedChild,
+    first_stdout: std::process::ChildStdout,
+    second: &mut Command,
+) -> io::Result<(LimitedChild, LimitedChild)> {
+    let second = LimitedChild(
+        second
+            .stdin(Stdio::from(first_stdout))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    Ok((first, second))
 }
 
 #[derive(Debug)]
@@ -949,6 +958,18 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
 
+    #[cfg(unix)]
+    fn assert_process_absent(pid: u32) {
+        // SAFETY: signal zero only checks whether the child PID still exists.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(result, -1, "child process {pid} must have been reaped");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "child process {pid} must be absent, not merely inaccessible"
+        );
+    }
+
     fn file_input(bytes: &[u8]) -> File {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(bytes).unwrap();
@@ -1070,7 +1091,7 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(
             output_with_input_limited(
-                Command::new("sh").args(["-c", "(sleep 0.4) & exit 0"]),
+                Command::new("sh").args(["-c", "(sleep 1.5) & exit 0"]),
                 file_input(b""),
                 Duration::from_millis(80),
                 64,
@@ -1078,8 +1099,8 @@ mod tests {
             .unwrap(),
             LimitedOutput::Deadline
         ));
-        assert!(started.elapsed() < Duration::from_millis(350));
-        std::thread::sleep(Duration::from_millis(400));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1600));
     }
 
     #[cfg(unix)]
@@ -1112,10 +1133,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bounded_pipeline_output_limit_kills_both_owned_children() {
-        let mut first = Command::new("cat");
+    fn bounded_pipeline_output_limit_reaps_both_owned_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_pid_path = dir.path().join("first-pid");
+        let second_pid_path = dir.path().join("second-pid");
+        let mut first = Command::new("sh");
+        first.args([
+            "-c",
+            "echo $$ > \"$1\"; printf 'go\\n'; exec sleep 30",
+            "sh",
+        ]);
+        first.arg(&first_pid_path);
         let mut second = Command::new("sh");
-        second.args(["-c", "printf overflow"]);
+        second.args([
+            "-c",
+            "IFS= read -r _; echo $$ > \"$1\"; printf overflow; exec sleep 30",
+            "sh",
+        ]);
+        second.arg(&second_pid_path);
         assert!(matches!(
             pipeline_with_input_limited(
                 &mut first,
@@ -1127,6 +1162,18 @@ mod tests {
             .unwrap(),
             LimitedPipelineOutput::OutputLimit
         ));
+        let first_pid = std::fs::read_to_string(first_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let second_pid = std::fs::read_to_string(second_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_process_absent(first_pid);
+        assert_process_absent(second_pid);
     }
 
     #[cfg(unix)]
@@ -1134,7 +1181,7 @@ mod tests {
     fn bounded_pipeline_deadline_does_not_wait_for_an_inherited_pipe() {
         let started = Instant::now();
         let mut first = Command::new("sh");
-        first.args(["-c", "(sleep 0.4) & exit 0"]);
+        first.args(["-c", "(sleep 1.5) & exit 0"]);
         let mut second = Command::new("cat");
         assert!(matches!(
             pipeline_with_input_limited(
@@ -1147,8 +1194,28 @@ mod tests {
             .unwrap(),
             LimitedPipelineOutput::Deadline
         ));
-        assert!(started.elapsed() < Duration::from_millis(350));
-        std::thread::sleep(Duration::from_millis(400));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_pipeline_reaps_first_child_when_second_spawn_fails() {
+        let first = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let first_pid = first.id();
+        let mut first = LimitedChild(first);
+        let first_stdout = first.0.stdout.take().unwrap();
+        let missing = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .join("missing-second-command");
+        let mut second = Command::new(missing);
+        assert!(spawn_pipeline_second(first, first_stdout, &mut second).is_err());
+        assert_process_absent(first_pid);
     }
 
     #[cfg(unix)]
@@ -1170,6 +1237,77 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(!marker.exists(), "the second child must not start");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipeline_streams_output_and_observes_eof() {
+        let mut first = Command::new("cmd");
+        first.args(["/D", "/C", "echo bounded-pipeline"]);
+        let mut second = Command::new("cmd");
+        second.args(["/D", "/C", "more"]);
+        let LimitedPipelineOutput::Completed {
+            first_status,
+            first_stderr,
+            second,
+        } = pipeline_with_input_limited(
+            &mut first,
+            file_input(b""),
+            &mut second,
+            Duration::from_secs(5),
+            128,
+        )
+        .unwrap()
+        else {
+            panic!("finite Windows pipeline must close its captured pipes");
+        };
+        assert!(first_status.success());
+        assert!(second.status.success());
+        assert!(first_stderr.is_empty());
+        assert!(second.stderr.is_empty());
+        assert!(String::from_utf8_lossy(&second.stdout).contains("bounded-pipeline"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipeline_deadline_bounds_a_blocked_reader() {
+        let started = Instant::now();
+        let mut first = Command::new("cmd");
+        first.args(["/D", "/C", "for /L %i in (1,1,2147483647) do @rem"]);
+        let mut second = Command::new("cmd");
+        second.args(["/D", "/C", "more"]);
+        assert!(matches!(
+            pipeline_with_input_limited(
+                &mut first,
+                file_input(b""),
+                &mut second,
+                Duration::from_millis(100),
+                128,
+            )
+            .unwrap(),
+            LimitedPipelineOutput::Deadline
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipeline_enforces_captured_output_limit() {
+        let mut first = Command::new("cmd");
+        first.args(["/D", "/C", "echo overflow"]);
+        let mut second = Command::new("cmd");
+        second.args(["/D", "/C", "more"]);
+        assert!(matches!(
+            pipeline_with_input_limited(
+                &mut first,
+                file_input(b""),
+                &mut second,
+                Duration::from_secs(5),
+                3,
+            )
+            .unwrap(),
+            LimitedPipelineOutput::OutputLimit
+        ));
     }
 
     #[cfg(windows)]
