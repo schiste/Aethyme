@@ -3145,6 +3145,18 @@ where
 }
 
 fn preparation_live_root_children(root: &Path) -> Result<Vec<PathBuf>, StorageError> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|source| StorageError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StorageError::Unavailable {
+            reason: format!(
+                "live-root inventory path {} is not a real directory; cache liveness is incomplete",
+                root.display()
+            ),
+        });
+    }
     let children = std::fs::read_dir(root).map_err(|source| StorageError::Io {
         path: root.to_path_buf(),
         source,
@@ -5547,6 +5559,28 @@ mod tests {
                 "an incomplete liveness inventory must preserve cache entries"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_root_enumeration_refuses_symlink_roots_and_unknown_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let real_root = temporary.path().join("real-root");
+        std::fs::create_dir(&real_root).unwrap();
+        let symlink_root = temporary.path().join("symlink-root");
+        std::os::unix::fs::symlink(&real_root, &symlink_root).unwrap();
+        assert!(matches!(
+            preparation_live_root_children(&symlink_root),
+            Err(StorageError::Unavailable { .. })
+        ));
+
+        std::fs::write(real_root.join(WORKTREE_ROOT_MARKER), b"marker").unwrap();
+        assert!(preparation_live_root_children(&real_root).is_ok());
+        std::fs::write(real_root.join("unknown-file"), b"ambiguous").unwrap();
+        assert!(matches!(
+            preparation_live_root_children(&real_root),
+            Err(StorageError::Unavailable { .. })
+        ));
     }
 
     #[test]
