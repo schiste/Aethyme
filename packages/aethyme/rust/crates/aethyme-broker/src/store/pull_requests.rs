@@ -2089,20 +2089,28 @@ mod artifact_sweep_namespace_tests {
         assert_eq!(first_read, None);
         assert_eq!(second_read, first_read);
 
-        assert!(first
-            .meta_compare_and_set(key, first_read.as_deref(), "first")
-            .unwrap());
-        assert!(!second
-            .meta_compare_and_set(key, second_read.as_deref(), "stale-second")
-            .unwrap());
+        assert!(
+            first
+                .meta_compare_and_set(key, first_read.as_deref(), "first")
+                .unwrap()
+        );
+        assert!(
+            !second
+                .meta_compare_and_set(key, second_read.as_deref(), "stale-second")
+                .unwrap()
+        );
         assert_eq!(first.meta_get(key).unwrap().as_deref(), Some("first"));
 
-        assert!(second
-            .meta_compare_and_set(key, Some("first"), "second")
-            .unwrap());
-        assert!(!first
-            .meta_compare_and_set(key, Some("first"), "stale-third")
-            .unwrap());
+        assert!(
+            second
+                .meta_compare_and_set(key, Some("first"), "second")
+                .unwrap()
+        );
+        assert!(
+            !first
+                .meta_compare_and_set(key, Some("first"), "stale-third")
+                .unwrap()
+        );
         assert_eq!(second.meta_get(key).unwrap().as_deref(), Some("second"));
     }
 
