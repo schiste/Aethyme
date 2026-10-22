@@ -5349,6 +5349,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct LiveRootFailureFixture {
         _temporary: tempfile::TempDir,
         main_root: PathBuf,
@@ -5358,6 +5359,7 @@ mod tests {
         bindings: Vec<crate::broker::PreparationCacheRootBinding>,
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl LiveRootFailureFixture {
         fn new(placement_root_count: usize) -> Self {
             let temporary = tempfile::tempdir().unwrap();
@@ -5380,9 +5382,9 @@ mod tests {
             let mut bindings = Vec::new();
             for index in 0..placement_root_count {
                 let placement_root = temporary.path().join(format!("placement-{index}"));
+                std::fs::create_dir_all(&placement_root).unwrap();
                 let cache_root = placement_root
                     .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
-                std::fs::create_dir_all(&cache_root).unwrap();
                 let marker = WorktreeRootMarker {
                     schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
                     repository_key: format!("fixture-{index}"),
@@ -5390,27 +5392,29 @@ mod tests {
                 };
                 let marker_path = placement_root.join(WORKTREE_ROOT_MARKER);
                 std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-                let placement_root_handle = std::fs::File::open(&marker_path).unwrap();
-                let host_resource_db_path = temporary.path().join("host-resources.db");
-                bindings.push(crate::broker::PreparationCacheRootBinding {
-                    path: cache_root
-                        .join(TEST_PREPARATION_REPOSITORY)
-                        .join("fixture-cache-key"),
-                    identity: None,
-                    instance_nonce: None,
-                    root_guard: Some(crate::broker::PreparationCacheRootGuard {
-                        root_path: cache_root,
-                        root_identity: Vec::new(),
-                        state: crate::broker::PreparationCacheRootState::Uninitialized,
-                        captured_resource_db_path: host_resource_db_path,
-                        root_handle: std::sync::Arc::new(placement_root_handle),
-                        placement_root: Some(crate::broker::PreparationCachePlacementRootGuard {
-                            path: placement_root,
-                            identity: Vec::new(),
-                            marker,
-                        }),
-                    }),
-                });
+                let resource_db_path = test_host_resource_db(temporary.path());
+                let placement_identity =
+                    crate::preparation::rotation_debt::DirectoryIdentity::capture(&placement_root)
+                        .unwrap()
+                        .encode()
+                        .unwrap();
+                crate::preparation::rotation_debt::ensure_preparation_cache_root_child(
+                    &placement_root,
+                    crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT,
+                    &placement_identity,
+                )
+                .unwrap();
+                let _initialized =
+                    initialized_storage_cache_root_binding(&cache_root, &resource_db_path);
+                let binding =
+                    crate::broker::lifecycle::capture_worktree_volume_preparation_cache_root(
+                        &placement_root,
+                        &marker,
+                        &resource_db_path,
+                    )
+                    .unwrap()
+                    .unwrap();
+                bindings.push(binding);
             }
 
             Self {
@@ -5463,6 +5467,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn storage_plan_and_apply_refuse_an_unreadable_placement_root() {
         let fixture = LiveRootFailureFixture::new(1);
@@ -5496,6 +5501,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn storage_plan_and_apply_refuse_a_later_placement_iterator_error() {
         let fixture = LiveRootFailureFixture::new(2);
