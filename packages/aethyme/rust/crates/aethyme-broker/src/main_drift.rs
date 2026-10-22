@@ -11,7 +11,7 @@
 //! branch would conflict (`git merge-tree --write-tree`). It is advisory: it
 //! never blocks a push, a submit or a status.
 
-use crate::git::GitRepo;
+use crate::git::{GitError, GitRepo};
 
 /// `meta` key prefix for the last measured drift of one session.
 const DRIFT_CACHE_PREFIX: &str = "main_drift.";
@@ -79,28 +79,28 @@ impl CatchUp {
     }
 }
 
-/// Compare `head` with the default branch at `commit`. `None` when Git cannot
-/// answer, which callers report as unknown rather than as clean.
+/// Compare `head` with the default branch at `commit`. Preserve Git failures
+/// so refusing callers can explain why the comparison is unknown.
 pub(crate) fn measure(
     repo: &GitRepo,
     reference: &str,
     commit: &str,
     head: &str,
     catch_up: CatchUp,
-) -> Option<DefaultBranchDrift> {
-    let behind = repo.commit_count_between(head, commit).ok()?;
-    let ahead = repo.commit_count_between(commit, head).ok()?;
+) -> Result<DefaultBranchDrift, GitError> {
+    let behind = repo.commit_count_between(head, commit)?;
+    let ahead = repo.commit_count_between(commit, head)?;
     // Nothing merged since the branch left the default branch: it cannot
     // conflict with it, so skip the simulation.
     let conflicts = if behind == 0 {
         Vec::new()
     } else {
-        repo.merge_tree_simulate(commit, head).ok()?.conflicts
+        repo.merge_tree_simulate(commit, head)?.conflicts
     };
     let remote = reference
         .split_once('/')
         .map_or("origin", |(remote, _)| remote);
-    Some(DefaultBranchDrift {
+    Ok(DefaultBranchDrift {
         reference: reference.to_string(),
         commit: commit.to_string(),
         head: head.to_string(),
@@ -157,7 +157,7 @@ impl crate::Broker {
                 None if budget > 0 => {
                     budget -= 1;
                     let catch_up = CatchUp::for_branch(repo, &default.remote, &session.branch);
-                    let Some(drift) = measure(repo, &reference, &default.commit, &head, catch_up)
+                    let Ok(drift) = measure(repo, &reference, &default.commit, &head, catch_up)
                     else {
                         continue;
                     };

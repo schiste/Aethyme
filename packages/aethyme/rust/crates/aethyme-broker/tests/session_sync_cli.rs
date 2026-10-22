@@ -508,3 +508,59 @@ fn sync_refuses_while_a_rebase_is_in_progress() {
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[test]
+fn sync_reports_the_git_error_when_merge_simulation_cannot_write_objects() {
+    let fixture = Fixture::new();
+    let (id, worktree) = fixture.session_changing("tracked.txt", "session\n");
+    fixture.land_on_remote_only("other.txt", "upstream\n");
+    let before = head(&worktree);
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .expect("Git is on the fixture PATH")
+        .canonicalize()
+        .unwrap();
+    std::os::unix::fs::symlink(real_git, fixture.bin.join("passthrough-git")).unwrap();
+    let wrapper = fixture.bin.join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+if [ "$1" = "merge-tree" ]; then
+  printf '%s\n' 'fixture-object-write-denied' >&2
+  exit 128
+fi
+exec "$(dirname "$0")/passthrough-git" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = fixture.sync(id);
+    assert!(
+        !output.status.success(),
+        "sync must refuse an unknown merge result"
+    );
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("could not compare the session"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("merge-tree --write-tree"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("fixture-object-write-denied"),
+        "{diagnostic}"
+    );
+    assert_eq!(
+        head(&worktree),
+        before,
+        "a failed comparison must not move HEAD"
+    );
+}
