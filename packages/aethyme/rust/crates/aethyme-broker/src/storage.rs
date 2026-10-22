@@ -545,6 +545,8 @@ pub(crate) fn storage_plan_with_context(
             .map_err(|error| StorageError::Unavailable {
                 reason: format!("captured preparation-cache root is unavailable: {error}"),
             })?;
+    let worktree_volume_cache_bindings =
+        worktree_volume_cache_bindings_for_context(&main_root, context)?;
     let preparation_cache_root = preparation_cache_root_binding
         .as_ref()
         .map(|binding| binding.path.as_path());
@@ -564,6 +566,7 @@ pub(crate) fn storage_plan_with_context(
         warnings.clone(),
         crate::SizeScan::Recorded,
         &mut records,
+        &worktree_volume_cache_bindings,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
         binding
@@ -608,6 +611,22 @@ fn validate_storage_context(
     Ok(())
 }
 
+fn worktree_volume_cache_bindings_for_context(
+    main_root: &Path,
+    context: &crate::broker::BrokerStorageContext,
+) -> Result<Vec<crate::broker::PreparationCacheRootBinding>, StorageError> {
+    let repository = GitRepo::discover(main_root)?;
+    let git_common_dir = repository.git_common_dir()?;
+    crate::broker::lifecycle::capture_worktree_volume_preparation_cache_roots(
+        main_root,
+        &git_common_dir,
+        context,
+    )
+    .map_err(|error| StorageError::Unavailable {
+        reason: format!("worktree-volume preparation-cache inventory is incomplete: {error}"),
+    })
+}
+
 /// Apply exactly one reviewed host storage plan. The digest is checked against
 /// a fresh, read-only inventory before any candidate is touched.
 pub fn storage_apply(
@@ -638,6 +657,8 @@ pub(crate) fn storage_apply_with_context(
             .map_err(|error| StorageError::Unavailable {
                 reason: format!("captured preparation-cache root is unavailable: {error}"),
             })?;
+    let worktree_volume_cache_bindings =
+        worktree_volume_cache_bindings_for_context(&main_root, context)?;
     let preparation_cache_root = preparation_cache_root_binding
         .as_ref()
         .map(|binding| binding.path.clone());
@@ -654,6 +675,7 @@ pub(crate) fn storage_apply_with_context(
         policy.orphan_worktree_roots_days,
         warnings,
         &mut records,
+        &worktree_volume_cache_bindings,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
         binding
@@ -684,29 +706,40 @@ pub(crate) fn storage_apply_with_context(
             }),
         }
     }
+    let mut cache_bindings = preparation_cache_root_binding
+        .into_iter()
+        .collect::<Vec<_>>();
+    cache_bindings.extend(worktree_volume_cache_bindings);
+    let worktree_volume_cache_paths = worktree_volume_cache_paths(&cache_bindings);
+    let live_roots = preparation_live_roots(
+        &main_root,
+        &plan.primary_checkouts,
+        &plan.roots,
+        &worktree_volume_cache_paths,
+    );
     for candidate in &plan.preparation_candidates {
-        if let Some(binding) = preparation_cache_root_binding.as_ref()
-            && let Err(error) = binding.validate()
-        {
-            failures.push(StorageApplyFailure {
-                kind: StorageCandidateKind::PreparationEntry,
-                path: candidate.path.clone(),
-                reason: format!("captured preparation-cache root changed before removal: {error}"),
-            });
-            continue;
-        }
-        let live_roots = preparation_live_roots(&main_root, &plan.primary_checkouts, &plan.roots);
-        let result = match (
-            preparation_cache_root.as_deref(),
-            context.host_resource_db_path.as_deref(),
-        ) {
-            (Some(_cache_root), Some(resource_db_path)) => apply_preparation_candidate_with_binding(
-                candidate,
-                &live_roots,
-                resource_db_path,
-                preparation_cache_root_binding.as_ref().expect("cache root was matched"),
+        let binding = cache_bindings
+            .iter()
+            .filter(|binding| candidate.path.starts_with(&binding.path))
+            .max_by_key(|binding| binding.path.components().count());
+        let result = match (binding, context.host_resource_db_path.as_deref()) {
+            (Some(binding), Some(resource_db_path)) => {
+                match binding.validate() {
+                    Ok(()) => apply_preparation_candidate_with_binding(
+                        candidate,
+                        &live_roots,
+                        resource_db_path,
+                        binding,
+                    ),
+                    Err(error) => Err(format!(
+                        "captured preparation-cache root changed before removal: {error}"
+                    )),
+                }
+            }
+            (None, _) => Err(
+                "no captured preparation-cache root authorizes this entry; it was retained".into(),
             ),
-            _ => Err(
+            (_, None) => Err(
                 "the captured host resource database path is unavailable; the cache entry was retained"
                     .into(),
             ),
@@ -766,6 +799,7 @@ fn build_apply_plan(
     orphan_worktree_roots_days: u32,
     warnings: Vec<String>,
     records: &mut crate::measurement::SizeRecords,
+    worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
 ) -> Result<StoragePlan, StorageError> {
     build_plan(
         main_root,
@@ -777,6 +811,7 @@ fn build_apply_plan(
         warnings,
         crate::SizeScan::Recorded,
         records,
+        worktree_volume_cache_bindings,
     )
 }
 
@@ -793,10 +828,12 @@ fn build_plan(
     mut warnings: Vec<String>,
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
+    worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
 ) -> Result<StoragePlan, StorageError> {
     let storage_root = normalise(&absolute_path(main_root, storage_layout.path()));
     let evaluated_at = now_ms();
     let paths = storage_root_entries(&storage_root, storage_layout)?;
+    let worktree_volume_cache_paths = worktree_volume_cache_paths(worktree_volume_cache_bindings);
 
     let mut roots = Vec::with_capacity(paths.len());
     let mut candidates = Vec::new();
@@ -810,6 +847,7 @@ fn build_plan(
             orphan_worktree_roots_days,
             scan,
             records,
+            &worktree_volume_cache_paths,
         );
         if root.marker_status == StorageMarkerStatus::Missing
             && let Some(this_repository) = &this_repository
@@ -836,23 +874,43 @@ fn build_plan(
     // Live roots come from the worktree container, but the cache itself is
     // resolved beside the host resource database by preparation.rs. These
     // locations can differ when the repository overrides worktree placement.
-    let live_roots = preparation_live_roots(main_root, &primary_checkouts, &roots);
-    let (preparation_entries, preparation_candidates) = match preparation_cache_root {
-        Some(cache_root) => inspect_preparation_cache(cache_root, &live_roots, scan, records),
-        None => {
-            warnings.push(
-                "the captured host resource database path is unavailable, so preparation cache entries were retained"
-                    .into(),
-            );
-            (Vec::new(), Vec::new())
-        }
-    };
+    let live_roots = preparation_live_roots(
+        main_root,
+        &primary_checkouts,
+        &roots,
+        &worktree_volume_cache_paths,
+    );
+    let mut preparation_entries = Vec::new();
+    let mut preparation_candidates = Vec::new();
+    if let Some(cache_root) = preparation_cache_root {
+        let (entries, candidates) =
+            inspect_preparation_cache(cache_root, &live_roots, scan, records);
+        preparation_entries.extend(entries);
+        preparation_candidates.extend(candidates);
+    } else {
+        warnings.push(
+            "the captured host resource database path is unavailable, so preparation cache entries were retained"
+                .into(),
+        );
+    }
+    for binding in worktree_volume_cache_bindings {
+        binding
+            .validate()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!("captured worktree-volume preparation-cache root changed: {error}"),
+            })?;
+        let (entries, candidates) =
+            inspect_preparation_cache(&binding.path, &live_roots, scan, records);
+        preparation_entries.extend(entries);
+        preparation_candidates.extend(candidates);
+    }
     let digest = decision_digest(
         &storage_root,
         DecisionRootMetadata {
             storage_root_layout: storage_layout.digest_tag(),
             preparation_cache_root_identity,
             preparation_cache_root_nonce,
+            worktree_volume_cache_bindings,
         },
         orphan_worktree_roots_days,
         &candidates,
@@ -964,6 +1022,7 @@ fn inspect_root(
     orphan_worktree_roots_days: u32,
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
+    verified_worktree_cache_paths: &BTreeSet<PathBuf>,
 ) -> StorageRoot {
     let filesystem_kind = filesystem_kind(raw_path);
     let path = if filesystem_kind == StorageFilesystemKind::Directory {
@@ -1070,6 +1129,18 @@ fn inspect_root(
                 };
                 let child = entry.path();
                 if is_infrastructure(entry.file_name().as_ref()) {
+                    if entry.file_name()
+                        == crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT
+                    {
+                        bookkeeping_only = false;
+                        if !verified_worktree_cache_paths.contains(&child) {
+                            blockers.push(format!(
+                                "{} is a reserved worktree-volume preparation-cache root without a valid repository-bound marker; it is retained",
+                                child.display()
+                            ));
+                        }
+                        continue;
+                    }
                     bookkeeping_only &= is_broker_bookkeeping(&child);
                     continue;
                 }
@@ -1544,7 +1615,9 @@ pub(crate) fn sweep_preparation_cache_for_roots_with_status(
         None,
         resource_db_path,
         deadline,
-        |deadline| discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline),
+        |deadline| {
+            discover_preparation_live_roots_from_roots(main_root, worktree_roots, &[], deadline)
+        },
     )
 }
 
@@ -1557,22 +1630,67 @@ pub(crate) fn sweep_preparation_cache_for_roots_with_binding(
     resource_db_path: &Path,
     deadline: std::time::Instant,
 ) -> PreparationCacheSweepReport {
-    let cache_root = &binding.path;
-    let expected_root_identity = binding.identity.as_deref();
-    if check_preparation_sweep_deadline(deadline).is_err() || worktree_roots.is_empty() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    if binding.validate().is_err() {
-        return PreparationCacheSweepReport::incomplete_empty();
-    }
-    sweep_preparation_cache_with_discovery(
-        cache_root,
-        expected_root_identity,
-        Some(binding),
+    sweep_preparation_caches_for_roots_with_bindings(
+        main_root,
+        worktree_roots,
+        std::slice::from_ref(binding),
         resource_db_path,
         deadline,
-        |deadline| discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline),
     )
+}
+
+/// Sweep every captured preparation-cache namespace while proving liveness
+/// against the same complete set of marker-bound worktree-volume roots.
+pub(crate) fn sweep_preparation_caches_for_roots_with_bindings(
+    main_root: &Path,
+    worktree_roots: &[PathBuf],
+    bindings: &[crate::broker::PreparationCacheRootBinding],
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+) -> PreparationCacheSweepReport {
+    if check_preparation_sweep_deadline(deadline).is_err()
+        || worktree_roots.is_empty()
+        || bindings.is_empty()
+    {
+        return PreparationCacheSweepReport::incomplete_empty();
+    }
+    let mut total = PreparationCacheSweepReport {
+        entries_removed: 0,
+        bytes_reclaimed: 0,
+        filesystem_entries_reclaimed: 0,
+        complete: true,
+    };
+    for binding in bindings {
+        if check_preparation_sweep_deadline(deadline).is_err() || binding.validate().is_err() {
+            total.complete = false;
+            break;
+        }
+        let report = sweep_preparation_cache_with_discovery(
+            &binding.path,
+            binding.identity.as_deref(),
+            Some(binding),
+            resource_db_path,
+            deadline,
+            |deadline| {
+                discover_preparation_live_roots_from_roots(
+                    main_root,
+                    worktree_roots,
+                    bindings,
+                    deadline,
+                )
+            },
+        );
+        total.entries_removed = total.entries_removed.saturating_add(report.entries_removed);
+        total.bytes_reclaimed = total.bytes_reclaimed.saturating_add(report.bytes_reclaimed);
+        total.filesystem_entries_reclaimed = total
+            .filesystem_entries_reclaimed
+            .saturating_add(report.filesystem_entries_reclaimed);
+        total.complete &= report.complete;
+        if !total.complete {
+            break;
+        }
+    }
+    total
 }
 
 fn sweep_preparation_cache_with_discovery(
@@ -2768,6 +2886,16 @@ fn discover_preparation_live_roots(
                 });
             }
             if child_type.is_dir() {
+                if child.file_name()
+                    == crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT
+                {
+                    return Err(StorageError::Unavailable {
+                        reason: format!(
+                            "worktree root contains an unverified reserved preparation-cache child at {}; cache liveness is incomplete",
+                            child.path().display()
+                        ),
+                    });
+                }
                 roots.insert(child.path());
             }
         }
@@ -2783,9 +2911,18 @@ fn discover_preparation_live_roots(
 fn discover_preparation_live_roots_from_roots(
     main_root: &Path,
     worktree_roots: &[PathBuf],
+    cache_bindings: &[crate::broker::PreparationCacheRootBinding],
     deadline: std::time::Instant,
 ) -> Result<Vec<PathBuf>, StorageError> {
     check_preparation_sweep_deadline(deadline)?;
+    for binding in cache_bindings {
+        binding
+            .validate()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!("captured preparation-cache root changed: {error}"),
+            })?;
+    }
+    let verified_cache_paths = worktree_volume_cache_paths(cache_bindings);
     let main_metadata =
         std::fs::symlink_metadata(main_root).map_err(|source| StorageError::Io {
             path: main_root.to_path_buf(),
@@ -2869,7 +3006,21 @@ fn discover_preparation_live_roots_from_roots(
                 });
             }
             if file_type.is_dir() {
-                roots.insert(child.path());
+                let child_path = child.path();
+                if child.file_name()
+                    == crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT
+                {
+                    if verified_cache_paths.contains(&child_path) {
+                        continue;
+                    }
+                    return Err(StorageError::Unavailable {
+                        reason: format!(
+                            "worktree root contains an unverified reserved preparation-cache child at {}; cache liveness is incomplete",
+                            child_path.display()
+                        ),
+                    });
+                }
+                roots.insert(child_path);
             }
         }
     }
@@ -2924,6 +3075,7 @@ fn preparation_live_roots(
     main_root: &Path,
     primary_checkouts: &[StoragePrimaryCheckout],
     roots: &[StorageRoot],
+    verified_worktree_cache_paths: &BTreeSet<PathBuf>,
 ) -> Vec<PathBuf> {
     let mut live_roots = primary_checkouts
         .iter()
@@ -2935,8 +3087,27 @@ fn preparation_live_roots(
     for root in roots {
         if let Ok(children) = std::fs::read_dir(&root.path) {
             for child in children.flatten() {
-                if is_real_directory(&child.path()) {
-                    live_roots.push(normalise(&child.path()));
+                let child_path = child.path();
+                if is_real_directory(&child_path)
+                    && !verified_worktree_cache_paths.contains(&child_path)
+                {
+                    live_roots.push(normalise(&child_path));
+                }
+            }
+        }
+    }
+    // Include sessions from every exact captured placement root that carries
+    // a valid cache. A fallback root may not be in the currently selected
+    // storage layout, but its live worktrees still protect shared cache keys.
+    for cache_path in verified_worktree_cache_paths {
+        let Some(placement_root) = cache_path.parent() else {
+            continue;
+        };
+        if let Ok(children) = std::fs::read_dir(placement_root) {
+            for child in children.flatten() {
+                let child_path = child.path();
+                if child_path != *cache_path && is_real_directory(&child_path) {
+                    live_roots.push(normalise(&child_path));
                 }
             }
         }
@@ -2944,6 +3115,26 @@ fn preparation_live_roots(
     live_roots.sort();
     live_roots.dedup();
     live_roots
+}
+
+fn worktree_volume_cache_paths(
+    bindings: &[crate::broker::PreparationCacheRootBinding],
+) -> BTreeSet<PathBuf> {
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            binding
+                .root_guard
+                .as_ref()?
+                .placement_root
+                .as_ref()
+                .map(|placement_root| {
+                    placement_root
+                        .path
+                        .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT)
+                })
+        })
+        .collect()
 }
 
 fn inspect_preparation_cache(
@@ -4822,6 +5013,7 @@ struct DecisionRootMetadata<'a> {
     storage_root_layout: Option<&'static str>,
     preparation_cache_root_identity: Option<&'a [u8]>,
     preparation_cache_root_nonce: Option<&'a str>,
+    worktree_volume_cache_bindings: &'a [crate::broker::PreparationCacheRootBinding],
 }
 
 fn decision_digest(
@@ -4851,6 +5043,8 @@ fn decision_digest(
         preparation_cache_root_identity: Option<&'a [u8]>,
         #[serde(skip_serializing_if = "Option::is_none")]
         preparation_cache_root_nonce: Option<&'a str>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        worktree_volume_cache_roots: Vec<DecisionWorktreeVolumeCacheRoot<'a>>,
         orphan_worktree_roots_days: u32,
         candidates: Vec<DecisionCandidate<'a>>,
         primary_candidates: Vec<DecisionPrimaryCandidate<'a>>,
@@ -4869,11 +5063,43 @@ fn decision_digest(
         repository_key: &'a str,
         name: &'a str,
     }
+    #[derive(serde::Serialize)]
+    struct DecisionWorktreeVolumeCacheRoot<'a> {
+        placement_root: &'a Path,
+        placement_identity: &'a [u8],
+        repository_key: &'a str,
+        repository_root: &'a Path,
+        cache_root: &'a Path,
+        cache_root_identity: &'a [u8],
+        cache_namespace: &'a Path,
+        cache_namespace_identity: Option<&'a [u8]>,
+        cache_namespace_nonce: Option<&'a str>,
+    }
+    let worktree_volume_cache_roots = root_metadata
+        .worktree_volume_cache_bindings
+        .iter()
+        .filter_map(|binding| {
+            let guard = binding.root_guard.as_ref()?;
+            let placement = guard.placement_root.as_ref()?;
+            Some(DecisionWorktreeVolumeCacheRoot {
+                placement_root: &placement.path,
+                placement_identity: &placement.identity,
+                repository_key: &placement.marker.repository_key,
+                repository_root: &placement.marker.repository_root,
+                cache_root: &guard.root_path,
+                cache_root_identity: &guard.root_identity,
+                cache_namespace: &binding.path,
+                cache_namespace_identity: binding.identity.as_deref(),
+                cache_namespace_nonce: binding.instance_nonce.as_deref(),
+            })
+        })
+        .collect();
     let bytes = serde_json::to_vec(&Decision {
         storage_root,
         storage_root_layout: root_metadata.storage_root_layout,
         preparation_cache_root_identity: root_metadata.preparation_cache_root_identity,
         preparation_cache_root_nonce: root_metadata.preparation_cache_root_nonce,
+        worktree_volume_cache_roots,
         orphan_worktree_roots_days,
         candidates: candidates
             .iter()
@@ -5330,6 +5556,7 @@ mod tests {
                 state,
                 captured_resource_db_path: resource_db_path,
                 root_handle: std::sync::Arc::new(captured.directory),
+                placement_root: None,
             }),
         }
     }
@@ -5801,7 +6028,7 @@ mod tests {
             estimated_inodes: None,
             reason: "previously dead".into(),
         };
-        let roots = preparation_live_roots(&repo, &[], &[]);
+        let roots = preparation_live_roots(&repo, &[], &[], &BTreeSet::new());
         let resource_db_path = test_host_resource_db(tmp.path());
         assert!(
             apply_preparation_candidate_with_lease_at(
@@ -6438,6 +6665,74 @@ mod tests {
     }
 
     #[test]
+    fn worktree_volume_cache_child_is_infrastructure_only_when_marker_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository = init_storage_root_test_repository(&tmp.path().join("repository"));
+        let owner_root = repository.root().canonicalize().unwrap();
+        let storage_root = tmp.path().join("worktrees").join("repository-key");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "repository-key".into(),
+            repository_root: owner_root,
+        };
+        std::fs::write(
+            storage_root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let cache_child =
+            storage_root.join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+        std::fs::create_dir(&cache_child).unwrap();
+
+        let mut records = crate::measurement::SizeRecords::default();
+        let unknown = inspect_root(
+            &storage_root,
+            now_ms(),
+            7,
+            crate::SizeScan::Recorded,
+            &mut records,
+            &BTreeSet::new(),
+        );
+        assert!(
+            unknown.blockers.iter().any(|blocker| blocker.contains(
+                "reserved worktree-volume preparation-cache root without a valid repository-bound marker"
+            )),
+            "an unknown reserved child must block storage inventory: {:?}",
+            unknown.blockers
+        );
+        assert!(unknown.reconciliation.entries.is_empty());
+        assert!(!unknown.empty, "the child cannot make a root look empty");
+
+        let verified_paths = BTreeSet::from([cache_child.clone()]);
+        let verified = inspect_root(
+            &storage_root,
+            now_ms(),
+            7,
+            crate::SizeScan::Recorded,
+            &mut records,
+            &verified_paths,
+        );
+        assert!(
+            !verified
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("reserved worktree-volume preparation-cache root")),
+            "a valid cache child is infrastructure, not a checkout: {:?}",
+            verified.blockers
+        );
+        assert!(
+            verified
+                .reconciliation
+                .entries
+                .iter()
+                .all(|entry| entry.path != cache_child),
+            "the cache child must not enter checkout reconciliation"
+        );
+        assert!(!verified.empty, "a cache child keeps the root nonempty");
+    }
+
+    #[test]
     fn an_unknown_worktree_root_protects_every_inline_cache_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let main_root = tmp.path().join("main");
@@ -6747,6 +7042,7 @@ mod tests {
             0,
             Vec::new(),
             &mut records,
+            &[],
         )
         .unwrap();
 

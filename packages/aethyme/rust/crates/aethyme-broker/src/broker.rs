@@ -1151,6 +1151,14 @@ pub(crate) struct PreparationCacheRootGuard {
     pub(crate) state: PreparationCacheRootState,
     pub(crate) captured_resource_db_path: PathBuf,
     pub(crate) root_handle: Arc<File>,
+    pub(crate) placement_root: Option<PreparationCachePlacementRootGuard>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparationCachePlacementRootGuard {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: Vec<u8>,
+    pub(crate) marker: WorktreeRootMarker,
 }
 
 #[derive(Debug, Clone)]

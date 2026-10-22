@@ -83,6 +83,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - When reusing a CI build cache, compare the producer and consumer fingerprints,
   including toolchain, lockfiles and environment variables, then confirm the log
   shows a cache restore. A matching shared key alone does not prove reuse.
+- For package-manager cache growth, inspect the effective store path from the
+  package manager's install metadata and compare its filesystem with the
+  worktree's. A shared configured path can still cause per-worktree copies when
+  the store is on another filesystem; pnpm documents this for `storeDir` and
+  `packageImportMethod` in its [v10 settings](https://github.com/pnpm/pnpm.io/blob/main/versioned_docs/version-10.x/settings.md).
 - When substituting a prebuilt Rust test binary for Cargo, inspect the effective
   Cargo `[env]` configuration: Cargo injects those values into test child
   processes, while direct execution does not. Replay and record relevant values
