@@ -63,8 +63,9 @@ before applying a plan.
 
 The same private worker can process a separate whole-checkout request after an
 enabled automatic cleanup pass in `Inline` or `Drain` scope defers work.
-Artifact backlog, cache-only requests and `FinishDrain` do not create that
-request. Its requested generation, completed generation and retry-after value
+Artifact backlog or a cache-only request alone does not create checkout work;
+only the qualifying pass's own checkout deferral does. `FinishDrain` never creates
+that request. Its requested generation, completed generation and retry-after value
 are separate from cache-lap completion and use the captured storage-context
 namespace. The worker does not read, resume or rewrite an operator's
 `.aethyme/gc-journal.json`.
@@ -75,8 +76,10 @@ the ordinary automatic-removal proofs. A request is scheduling state, not
 deletion authority: the complete colocated closed-session set, persisted spawn
 witness, fresh instance identity, clean state, remote containment and current
 process-use protection remain required. A stale worker cannot complete a newer
-generation. Cache-lane errors do not suppress an independently due checkout
-lane; store errors remain fatal.
+generation. Non-store cache-lane failures are deferred and do not suppress an
+independently due checkout lane; cache-lane store errors remain fatal. Completion
+means that the pass reported no deferred work, or cleanup became disabled. Kept
+or protected checkouts can remain after a generation completes.
 
 The worker reserves time for checkout work and stops after bounded passes or
 repeated no-progress, retaining incomplete work with retry backoff. Scheduling
