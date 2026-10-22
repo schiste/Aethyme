@@ -9717,6 +9717,89 @@ mod tests {
     }
 
     #[test]
+    fn session_history_expired_sweep_retains_off_page_recovery_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let mut conn = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        let remembered_root = root.join("remembered-closed-worktree");
+        let remembered = remembered_root.join("target");
+        std::fs::create_dir_all(&remembered).unwrap();
+        std::fs::write(remembered.join("preserve"), b"recovery evidence").unwrap();
+        let tx = conn.transaction().unwrap();
+        for id in 1..=1799 {
+            let path = if id == 1500 {
+                remembered_root.clone()
+            } else {
+                root.join(format!("absent-{id}"))
+            };
+            tx.execute(
+                "INSERT INTO sessions (id, worktree_path, branch, origin, status,
+                 cleanup_state, created_at, updated_at, last_activity_at)
+                 VALUES (?1, ?2, 'fixture', 'spawned', 'cleaned', 'closed', 1, 1, 1)",
+                rusqlite::params![id, path.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "UPDATE sessions SET origin = 'invalid-future-origin' WHERE id = 33",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let remembered_key = remembered.to_string_lossy().into_owned();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &remembered_key)
+            .unwrap();
+        let policy = RetentionPolicy {
+            artifact_sweep_budget_ms: 5000,
+            ..Default::default()
+        };
+        let expired = Instant::now() - Duration::from_millis(1);
+        let (outcome, _) = broker
+            .sweep_artifacts_autonomously_with_test_deadlines(
+                &policy,
+                ArtifactSweepScope::AutomaticContinuation,
+                expired,
+                expired,
+            )
+            .expect("expired sweep must not decode the second history page");
+        assert!(!outcome.complete);
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            decode_interrupted_paths(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap(),
+            vec![remembered_key]
+        );
+        assert_eq!(
+            std::fs::read(remembered.join("preserve")).unwrap(),
+            b"recovery evidence"
+        );
+    }
+
+    #[test]
     fn session_history_first_page_does_not_decode_later_rows() {
         let (_temp, store) = session_history_fixture(1799);
         let conn = rusqlite::Connection::open(store.db_path()).unwrap();
