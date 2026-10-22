@@ -145,10 +145,7 @@ fn auto_cleanup_lap_range<T>(
     session_id: impl Fn(&T) -> i64,
 ) -> std::ops::Range<usize> {
     candidates.sort_by_key(|candidate| session_id(candidate));
-    let current_high_water = candidates
-        .last()
-        .map(|candidate| session_id(candidate))
-        .unwrap_or(0);
+    let current_high_water = candidates.last().map(&session_id).unwrap_or(0);
     let current_lap_has_work = cursor.high_water_session_id > cursor.after_session_id
         && candidates.iter().any(|candidate| {
             let id = session_id(candidate);
