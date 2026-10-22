@@ -1198,7 +1198,8 @@ fn parse_lsof_output(
 }
 
 /// Parse NUL-delimited `lsof -F0pcfn` records. PID and command context is
-/// required for every pathname. A malformed or truncated suffix is rejected;
+/// required for every pathname. lsof may append one linefeed after the final
+/// NUL field delimiter. Other malformed or truncated suffixes are rejected;
 /// paths from preceding complete records remain useful positive evidence but
 /// never make the snapshot complete.
 fn parse_lsof_records(
@@ -1209,6 +1210,11 @@ fn parse_lsof_records(
         return Err((Vec::new(), "lsof returned an empty listing".into()));
     }
 
+    let listing = if listing.ends_with(b"\0\n") {
+        &listing[..listing.len() - 1]
+    } else {
+        listing
+    };
     let terminated = listing.ends_with(&[0]);
     let fields_bytes = if terminated {
         &listing[..listing.len() - 1]
@@ -1872,7 +1878,7 @@ mod scan_tests {
 
     #[test]
     fn lsof_records_retain_process_identity_and_are_narrowed_to_the_root() {
-        let listing = b"p123\0cnode\0\nfcwd\0n/w/root/web/vite.log\0\nf3\0n/w/root/path\nwith-newline\0\np9\0csh\0\nf4\0n/w/other/file\0";
+        let listing = b"p123\0cnode\0\nfcwd\0n/w/root/web/vite.log\0\nf3\0n/w/root/path\nwith-newline\0\np9\0csh\0\nf4\0n/w/other/file\0\n";
         let OpenFileSnapshot::Complete(open_files) =
             parse_lsof_output(true, listing, &[], Path::new("/w/root"))
         else {
@@ -1884,6 +1890,12 @@ mod scan_tests {
         assert_eq!(open_files[0].path, p("/w/root/web/vite.log"));
         assert_eq!(open_files[1].pid, 123);
         assert_eq!(open_files[1].path, p("/w/root/path\nwith-newline"));
+
+        let without_final_linefeed = &listing[..listing.len() - 1];
+        assert!(matches!(
+            parse_lsof_output(true, without_final_linefeed, &[], Path::new("/w/root")),
+            OpenFileSnapshot::Complete(_)
+        ));
     }
 
     #[test]
@@ -1895,6 +1907,12 @@ mod scan_tests {
             parse_lsof_output(true, partial, b"permission warning", root),
             parse_lsof_output(true, &[], &[], root),
             parse_lsof_output(true, b"p123\0cnode\0n/w/root/target/file", &[], root),
+            parse_lsof_output(
+                true,
+                b"p123\0cnode\0\nf3\0n/w/root/target/file\0\n\n",
+                &[],
+                root,
+            ),
             parse_lsof_output(true, b"p123\0n/w/root/target/file\0", &[], root),
             parse_lsof_output(true, b"cnode\0\nf3\0n/w/root/target/file\0", &[], root),
         ] {
