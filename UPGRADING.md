@@ -122,6 +122,29 @@ pending schema-4 cleanup with v0.8.29, or use its `broker gc abandon --confirm
 Then review a fresh cleanup plan with the selected binary; do not reuse an old
 plan digest across versions.
 
+A database last used by v0.8.28 migrates to schema 53 on writable open but
+keeps its existing worktree root in `legacy_unbound` state at compatibility
+floor 52. Migration does not select or move that root. Before using `start` or
+`adopt`, inspect the database and exact retained root, then apply a reviewed,
+digest-bound migration:
+
+```bash
+aethyme broker status --read-only-snapshot --json
+aethyme broker advanced worktree-root --json
+aethyme broker advanced worktree-root binding plan "/exact/existing/worktree-root" keyed_container --json
+# Review the repository, exact root, layout, retained registration, and digest.
+aethyme broker advanced worktree-root binding apply "/exact/existing/worktree-root" keyed_container --confirm <plan-digest> --json
+```
+
+Use `direct_root` only when the existing marker and registration show that the
+root has that layout. Do not point the plan at a new or empty directory to
+bypass the old root. Read-only snapshot status and the plan do not bind the
+root or initialize the preparation cache. After applying the reviewed plan,
+the first `start` initializes its cache; existing sessions and checkouts remain
+in place. Binding raises the compatibility floor to 53, so v0.8.28 can no
+longer open that repository database. Fresh databases use the first explicit
+`start` path instead of legacy binding.
+
 For each repository whose broker database must remain rollback-safe, stop
 broker processes that can access it and make a separate, WAL-aware SQLite
 backup. The SQLite `.backup` command includes committed WAL content:

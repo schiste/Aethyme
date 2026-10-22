@@ -163,15 +163,30 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
             env.get(OsStr::new("AETHYME_PREPARATION_CACHE_ROOT")),
             Some(&Some(fixture_preparation_cache.into_os_string()))
         );
+        let fixture_worktree_root = fixture_state.join("worktrees");
+        assert_eq!(
+            env.get(OsStr::new("AETHYME_BROKER_OPEN_WORKTREE_ROOT")),
+            Some(&Some(fixture_worktree_root.into_os_string()))
+        );
+        assert_eq!(
+            env.get(OsStr::new("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")),
+            Some(&Some(
+                fixture_state.join("host-operations.db").into_os_string()
+            ))
+        );
+        assert_eq!(
+            env.get(OsStr::new("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")),
+            Some(&Some(OsString::from("true")))
+        );
+        assert_eq!(
+            env.get(OsStr::new("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")),
+            Some(&Some(fixture_state.join("collaboration").into_os_string()))
+        );
         for removed in [
             "AETHYME_BROKER_DB",
             "AETHYME_GATE_BROKER_DATABASES",
             "AETHYME_WORKTREE_ROOT",
             "AETHYME_BROKER_STORAGE_CONTEXT_V1",
-            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
-            "AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT",
-            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
-            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
         ] {
             assert_eq!(env.get(OsStr::new(removed)), Some(&None), "{removed}");
         }

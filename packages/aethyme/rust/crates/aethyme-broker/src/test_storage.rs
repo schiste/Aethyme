@@ -68,6 +68,25 @@ impl TestStorage {
     pub(crate) fn open(&self, repository: &Path) -> Result<Broker, BrokerOpError> {
         Broker::open_with_options(repository, self.options())
     }
+
+    pub(crate) fn open_and_initialize_worktree_root(
+        &self,
+        repository: &Path,
+    ) -> Result<Broker, BrokerOpError> {
+        self.open_and_initialize_worktree_root_with_options(repository, self.options())
+    }
+
+    pub(crate) fn open_and_initialize_worktree_root_with_options(
+        &self,
+        repository: &Path,
+        options: BrokerOpenOptions,
+    ) -> Result<Broker, BrokerOpError> {
+        let mut broker = Broker::open_with_options(repository, options)?;
+        let session = broker.start_worktree("test fixture root initialization", None)?;
+        broker.close(session.id)?;
+        broker.cleanup(session.id, false)?;
+        Ok(broker)
+    }
 }
 
 #[cfg(test)]

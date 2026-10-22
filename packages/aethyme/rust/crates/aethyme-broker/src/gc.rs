@@ -6890,7 +6890,7 @@ mod tests {
         );
 
         let storage_a = crate::test_storage::TestStorage::new();
-        let mut root_broker = storage_a.open(&root).unwrap();
+        let mut root_broker = storage_a.open_and_initialize_worktree_root(&root).unwrap();
         let root_namespace = root_broker.ensure_artifact_sweep_namespace().unwrap();
         let interrupted_a = root.join("target").to_string_lossy().into_owned();
         root_broker
@@ -6969,7 +6969,13 @@ mod tests {
         drop(linked_broker);
 
         let storage_b = crate::test_storage::TestStorage::new();
-        let mut broker_b = storage_b.open(&root).unwrap();
+        let mut broker_b = Broker::open_with_options(
+            &root,
+            storage_b
+                .options()
+                .with_worktree_root(storage_a.worktree_root()),
+        )
+        .unwrap();
         let namespace_b = broker_b.ensure_artifact_sweep_namespace().unwrap();
         assert_ne!(root_namespace, namespace_b);
         broker_b
@@ -7260,7 +7266,7 @@ mod tests {
         git(root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         let storage = crate::test_storage::TestStorage::new();
-        let mut broker = storage.open(root).unwrap();
+        let mut broker = storage.open_and_initialize_worktree_root(root).unwrap();
         broker
             .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
@@ -7350,7 +7356,7 @@ mod tests {
         git(root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         let storage = crate::test_storage::TestStorage::new();
-        let mut broker = storage.open(root).unwrap();
+        let mut broker = storage.open_and_initialize_worktree_root(root).unwrap();
         broker
             .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
@@ -7448,7 +7454,7 @@ mod tests {
         git(root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         let storage = crate::test_storage::TestStorage::new();
-        let mut broker = storage.open(root).unwrap();
+        let mut broker = storage.open_and_initialize_worktree_root(root).unwrap();
         broker
             .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
             .unwrap();
@@ -7793,7 +7799,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
 
         let storage = crate::test_storage::TestStorage::new();
-        let mut broker = storage.open(&root).unwrap();
+        let mut broker = storage.open_and_initialize_worktree_root(&root).unwrap();
         let plan = broker
             .gc_plan_scanned_until(
                 crate::SizeScan::Recorded,
@@ -7833,7 +7839,7 @@ mod tests {
         .unwrap();
 
         let storage = crate::test_storage::TestStorage::new();
-        let broker = storage.open(&root).unwrap();
+        let broker = storage.open_and_initialize_worktree_root(&root).unwrap();
         let cache_root = broker
             .storage_context()
             .preparation_cache_root()
@@ -7928,7 +7934,9 @@ mod tests {
         let options = storage
             .options()
             .with_preparation_cache_root(cache_root_override.clone());
-        let mut first = Broker::open_with_options(&root, options).unwrap();
+        let mut first = storage
+            .open_and_initialize_worktree_root_with_options(&root, options)
+            .unwrap();
         let cache_namespace = first
             .storage_context()
             .preparation_cache_root()
@@ -8498,7 +8506,9 @@ mod tests {
         git(tmp.path(), &["add", "README.md"]);
         git(tmp.path(), &["commit", "-qm", "init"]);
         let storage = crate::test_storage::TestStorage::new();
-        let mut broker = storage.open(tmp.path()).unwrap();
+        let mut broker = storage
+            .open_and_initialize_worktree_root(tmp.path())
+            .unwrap();
 
         let prior_generation = broker
             .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
@@ -9782,6 +9792,11 @@ mod tests {
             .unwrap()
             .with_host_operation_database(&database)
             .with_worktree_root(fixture.path().join("current-root"));
+        let bootstrap = broker
+            .start_worktree("registered orphan fixture root", None)
+            .unwrap();
+        broker.close(bootstrap.id).unwrap();
+        broker.cleanup(bootstrap.id, false).unwrap();
         let origin = fixture.path().join("disappearing-origin");
         let root = fixture.path().join("historical-placement/exact-root");
         std::fs::create_dir(&origin).unwrap();

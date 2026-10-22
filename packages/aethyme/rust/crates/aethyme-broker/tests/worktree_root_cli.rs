@@ -48,6 +48,157 @@ fn run_with_root(repo: &Path, root: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_with_storage_paths(
+    repo: &Path,
+    host_state: &Path,
+    preparation_cache: &Path,
+    args: &[&str],
+) -> Output {
+    common::broker_cli(CLI, args)
+        .current_dir(repo)
+        .env("AETHYME_HOST_STATE_DIR", host_state)
+        .env(
+            "AETHYME_HOST_CACHE_DIR",
+            host_state.with_file_name("host-cache"),
+        )
+        .env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache)
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        )
+        .output()
+        .unwrap()
+}
+
+struct LegacyRootFixture {
+    repository: PathBuf,
+    host_state: PathBuf,
+    preparation_cache: PathBuf,
+    worktree_root: PathBuf,
+    worktree: PathBuf,
+    database: PathBuf,
+    repository_uuid_marker: PathBuf,
+    root_marker: PathBuf,
+}
+
+fn legacy_root_fixture(owner: &Path) -> LegacyRootFixture {
+    let repository = owner.join("project");
+    let host_state = owner.join("host-state");
+    let preparation_cache = owner.join("preparation-cache");
+    fixture_at(&repository);
+    let started = json(run_with_storage_paths(
+        &repository,
+        &host_state,
+        &preparation_cache,
+        &["start", "--task", "existing legacy root", "--json"],
+    ));
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    let worktree_root = PathBuf::from(started["worktree_placement"]["root"].as_str().unwrap());
+    let database = repository.join(".aethyme/broker.db");
+    let root_marker = worktree_root.join(".aethyme-worktree-root.json");
+    let repository_uuid_marker = repository.join(".git/aethyme-repository-uuid");
+    assert!(worktree.is_dir());
+    assert!(root_marker.is_file());
+    assert!(repository_uuid_marker.is_file());
+    std::fs::write(worktree.join("legacy-retained.txt"), "keep this checkout\n").unwrap();
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('fixture.legacy-retained', 'kept')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE repository_worktree_binding;
+             UPDATE meta SET value = '52' WHERE key = 'schema_version';
+             UPDATE meta SET value = '52' WHERE key = 'min_compatible_schema';
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(connection);
+    std::fs::remove_file(&repository_uuid_marker).unwrap();
+    std::fs::remove_dir_all(&preparation_cache).unwrap();
+
+    LegacyRootFixture {
+        repository,
+        host_state,
+        preparation_cache,
+        worktree_root,
+        worktree,
+        database,
+        repository_uuid_marker,
+        root_marker,
+    }
+}
+
+fn read_meta(database: &Path, key: &str) -> String {
+    rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap()
+    .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn has_table(database: &Path, table: &str) -> bool {
+    rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap()
+}
+
+fn session_count_for_worktree(database: &Path, worktree: &Path) -> i64 {
+    rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT count(*) FROM sessions WHERE worktree_path = ?1",
+        [worktree.to_string_lossy().as_ref()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn session_rows(database: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    let mut statement = connection
+        .prepare("SELECT * FROM sessions ORDER BY id")
+        .unwrap();
+    let column_count = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..column_count)
+                .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
 fn json(output: Output) -> serde_json::Value {
     assert!(
         output.status.success(),
@@ -705,6 +856,279 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             assert!(branches.stdout.is_empty(), "unadmitted branch was created");
         }
     }
+}
+
+#[test]
+fn legacy_schema_snapshot_status_leaves_database_root_and_cache_unchanged() {
+    let owner = tempfile::tempdir().unwrap();
+    let fixture = legacy_root_fixture(owner.path());
+    assert_eq!(read_meta(&fixture.database, "schema_version"), "52");
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    assert!(!has_table(&fixture.database, "repository_worktree_binding"));
+    assert!(!fixture.repository_uuid_marker.exists());
+    assert!(!fixture.preparation_cache.exists());
+
+    let database_before = std::fs::read(&fixture.database).unwrap();
+    let root_entries_before = std::fs::read_dir(&fixture.worktree_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let root_marker_before = std::fs::read(&fixture.root_marker).unwrap();
+    let retained_worktree_file = fixture.worktree.join("legacy-retained.txt");
+    let retained_worktree_before = std::fs::read(&retained_worktree_file).unwrap();
+    let session_rows_before = session_rows(&fixture.database);
+
+    let output = run_with_storage_paths(
+        &fixture.repository,
+        &fixture.host_state,
+        &fixture.preparation_cache,
+        &["status", "--read-only-snapshot", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(std::fs::read(&fixture.database).unwrap(), database_before);
+    assert_eq!(read_meta(&fixture.database, "schema_version"), "52");
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    assert_eq!(
+        read_meta(&fixture.database, "fixture.legacy-retained"),
+        "kept"
+    );
+    assert!(!has_table(&fixture.database, "repository_worktree_binding"));
+    assert!(!fixture.repository_uuid_marker.exists());
+    assert!(!fixture.preparation_cache.exists());
+    assert_eq!(
+        std::fs::read(&fixture.root_marker).unwrap(),
+        root_marker_before
+    );
+    assert_eq!(
+        std::fs::read_dir(&fixture.worktree_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        root_entries_before
+    );
+    assert_eq!(
+        std::fs::read(retained_worktree_file).unwrap(),
+        retained_worktree_before
+    );
+    assert_eq!(
+        session_rows(&fixture.database),
+        session_rows_before,
+        "read-only status must not change any retained session row"
+    );
+    assert_eq!(
+        session_count_for_worktree(&fixture.database, &fixture.worktree),
+        1
+    );
+}
+
+#[test]
+fn legacy_root_plan_apply_preserves_existing_sessions_and_allows_start_and_adopt() {
+    let owner = tempfile::tempdir().unwrap();
+    let fixture = legacy_root_fixture(owner.path());
+    let root_marker_before = std::fs::read(&fixture.root_marker).unwrap();
+    let root_entries_before = std::fs::read_dir(&fixture.worktree_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let retained_worktree_file = fixture.worktree.join("legacy-retained.txt");
+    let session_rows_before = session_rows(&fixture.database);
+
+    let refused_start = run_with_storage_paths(
+        &fixture.repository,
+        &fixture.host_state,
+        &fixture.preparation_cache,
+        &["start", "--task", "must review legacy root", "--json"],
+    );
+    let refusal_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused_start.stdout),
+        String::from_utf8_lossy(&refused_start.stderr)
+    );
+    assert!(!refused_start.status.success(), "{refusal_text}");
+    assert!(refusal_text.contains("legacy"), "{refusal_text}");
+    assert_eq!(read_meta(&fixture.database, "schema_version"), "53");
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    assert_eq!(
+        read_meta(&fixture.database, "fixture.legacy-retained"),
+        "kept"
+    );
+    assert!(has_table(&fixture.database, "repository_worktree_binding"));
+    assert!(!fixture.repository_uuid_marker.exists());
+    assert!(!fixture.preparation_cache.exists());
+    assert_eq!(
+        std::fs::read(&fixture.root_marker).unwrap(),
+        root_marker_before
+    );
+    assert_eq!(
+        std::fs::read(&retained_worktree_file).unwrap(),
+        b"keep this checkout\n"
+    );
+    assert_eq!(
+        session_rows(&fixture.database),
+        session_rows_before,
+        "refused start preserves legacy session records"
+    );
+    assert_eq!(
+        session_count_for_worktree(&fixture.database, &fixture.worktree),
+        1
+    );
+
+    let root_arg = fixture.worktree_root.to_string_lossy().into_owned();
+    let plan_args = [
+        "advanced",
+        "worktree-root",
+        "binding",
+        "plan",
+        root_arg.as_str(),
+        "keyed_container",
+        "--json",
+    ];
+    let plan = json(run_with_storage_paths(
+        &fixture.repository,
+        &fixture.host_state,
+        &fixture.preparation_cache,
+        &plan_args,
+    ));
+    assert_eq!(plan["worktree_root"], root_arg);
+    assert_eq!(plan["layout"], "keyed_container");
+    let digest = plan["digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(!fixture.repository_uuid_marker.exists());
+    assert!(!fixture.preparation_cache.exists());
+    assert_eq!(
+        std::fs::read(&fixture.root_marker).unwrap(),
+        root_marker_before
+    );
+    assert_eq!(
+        std::fs::read_dir(&fixture.worktree_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        root_entries_before
+    );
+    assert_eq!(read_meta(&fixture.database, "schema_version"), "53");
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    assert_eq!(session_rows(&fixture.database), session_rows_before);
+
+    let apply_args = [
+        "advanced",
+        "worktree-root",
+        "binding",
+        "apply",
+        root_arg.as_str(),
+        "keyed_container",
+        "--confirm",
+        digest,
+        "--json",
+    ];
+    let binding = json(run_with_storage_paths(
+        &fixture.repository,
+        &fixture.host_state,
+        &fixture.preparation_cache,
+        &apply_args,
+    ));
+    assert_eq!(binding["state"], "bound");
+    assert_eq!(read_meta(&fixture.database, "schema_version"), "53");
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "53");
+    assert_eq!(
+        read_meta(&fixture.database, "fixture.legacy-retained"),
+        "kept"
+    );
+    assert!(fixture.repository_uuid_marker.is_file());
+    assert_eq!(
+        std::fs::read(&fixture.root_marker).unwrap(),
+        root_marker_before
+    );
+    assert!(!fixture.preparation_cache.exists());
+    assert_eq!(
+        std::fs::read(&retained_worktree_file).unwrap(),
+        b"keep this checkout\n"
+    );
+    assert_eq!(session_rows(&fixture.database), session_rows_before);
+    assert_eq!(
+        session_count_for_worktree(&fixture.database, &fixture.worktree),
+        1
+    );
+
+    let started = json(run_with_storage_paths(
+        &fixture.repository,
+        &fixture.host_state,
+        &fixture.preparation_cache,
+        &["start", "--task", "start after reviewed binding", "--json"],
+    ));
+    assert_eq!(
+        started["worktree_placement"]["root"], root_arg,
+        "start keeps using the reviewed legacy root"
+    );
+    assert!(fixture.preparation_cache.is_dir());
+    assert_eq!(
+        std::fs::read(&retained_worktree_file).unwrap(),
+        b"keep this checkout\n"
+    );
+    assert!(session_rows(&fixture.database).starts_with(&session_rows_before));
+    assert_eq!(
+        session_count_for_worktree(&fixture.database, &fixture.worktree),
+        1
+    );
+
+    let checkout_owner = tempfile::tempdir().unwrap();
+    let checkout = checkout_owner.path().join("adopted");
+    git(
+        &fixture.repository,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/adopt-after-binding",
+            checkout.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let checkout_arg = checkout.to_string_lossy().into_owned();
+    let adopted = json(run_with_storage_paths(
+        &fixture.repository,
+        &fixture.host_state,
+        &fixture.preparation_cache,
+        &[
+            "adopt",
+            checkout_arg.as_str(),
+            "--task",
+            "adopt after reviewed binding",
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        PathBuf::from(adopted["worktree_path"].as_str().unwrap()),
+        checkout
+    );
+    assert_eq!(
+        std::fs::read(&retained_worktree_file).unwrap(),
+        b"keep this checkout\n"
+    );
+    assert!(session_rows(&fixture.database).starts_with(&session_rows_before));
+    assert_eq!(
+        session_count_for_worktree(&fixture.database, &fixture.worktree),
+        1
+    );
+    let total_sessions: i64 = rusqlite::Connection::open_with_flags(
+        &fixture.database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap()
+    .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+    .unwrap();
+    assert!(
+        total_sessions >= 3,
+        "legacy and new session rows must be retained"
+    );
 }
 
 #[path = "common/json_error.rs"]

@@ -171,9 +171,8 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 /// Discover the namespace from the same CLI environment used by every test
-/// command. The empty fixture has no sweep candidates, so this bootstrap only
-/// registers its captured storage context; its per-context state is then
-/// removed to leave the fixture as an otherwise fresh sweep database.
+/// command. Root-dependent GC requires an explicitly initialized root, so the
+/// fixture starts one empty session before registering its sweep context.
 fn discover_artifact_sweep_namespace(repo: &Path, container: &Path) {
     let config = repo.join(".aethyme/broker.toml");
     let original = std::fs::read_to_string(&config).unwrap();
@@ -182,6 +181,17 @@ fn discover_artifact_sweep_namespace(repo: &Path, container: &Path) {
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
     )
     .unwrap();
+    let started = run(
+        repo,
+        container,
+        &["start", "--task", "fixture root initialization", "--json"],
+    );
+    assert!(
+        started.status.success(),
+        "fixture root initialization: stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
     let output = run(repo, container, &["gc", "sweep", "--json"]);
     assert!(
         output.status.success(),

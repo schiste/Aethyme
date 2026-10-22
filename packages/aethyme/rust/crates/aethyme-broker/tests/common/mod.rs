@@ -102,6 +102,47 @@ pub fn fixture_preparation_cache_root(fixture_root: &Path) -> PathBuf {
         .unwrap_or_else(|| fixture_root.join("preparation-cache"))
 }
 
+const FIXTURE_WORKTREE_ROOT_FILE: &str = "aethyme-test-worktree-root";
+
+fn fixture_worktree_root_marker(fixture_root: &Path) -> Option<PathBuf> {
+    fixture_git_common_dir(fixture_root).map(|git_dir| {
+        git_dir
+            .join("aethyme-test-state")
+            .join(FIXTURE_WORKTREE_ROOT_FILE)
+    })
+}
+
+fn record_fixture_worktree_root(fixture_root: &Path, root: &Path) {
+    let Some(marker) = fixture_worktree_root_marker(fixture_root) else {
+        return;
+    };
+    std::fs::create_dir_all(marker.parent().expect("fixture marker parent"))
+        .expect("create fixture worktree-root marker parent");
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    std::fs::write(marker, root.to_string_lossy().as_bytes())
+        .expect("record fixture worktree root");
+}
+
+fn selected_fixture_worktree_root(fixture_root: &Path) -> PathBuf {
+    if let Some(marker) = fixture_worktree_root_marker(fixture_root)
+        && let Ok(bytes) = std::fs::read(marker)
+    {
+        let encoded = std::str::from_utf8(&bytes).expect("fixture worktree-root marker is UTF-8");
+        let path = PathBuf::from(encoded);
+        if path.is_absolute() {
+            return path;
+        }
+        panic!("fixture worktree-root marker must contain an absolute path");
+    }
+    match fixture_git_common_dir(fixture_root) {
+        Some(_) => fixture_host_state_dir(fixture_root).join("worktrees"),
+        None => fixture_root
+            .canonicalize()
+            .expect("canonicalize fixture root")
+            .join("worktrees"),
+    }
+}
+
 fn prepare_fixture_cache(fixture_root: &Path) -> PathBuf {
     let root = fixture_preparation_cache_root(fixture_root);
     std::fs::create_dir_all(&root).expect("create fixture preparation cache");
@@ -114,24 +155,29 @@ fn prepare_fixture_cache(fixture_root: &Path) -> PathBuf {
 #[allow(dead_code)]
 pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
     let preparation_cache = prepare_fixture_cache(fixture_root);
+    let host_state = fixture_host_state_dir(fixture_root);
+    let worktree_root = selected_fixture_worktree_root(fixture_root);
     command
         .env_remove("AETHYME_BROKER_DB")
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
         .env_remove("AETHYME_WORKTREE_ROOT")
         .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
-        .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
-        .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
-        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
-        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
-        .env(
-            "AETHYME_HOST_STATE_DIR",
-            fixture_host_state_dir(fixture_root),
-        )
+        .env("AETHYME_HOST_STATE_DIR", host_state.clone())
         .env(
             "AETHYME_HOST_CACHE_DIR",
             fixture_host_cache_dir(fixture_root),
         )
-        .env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache);
+        .env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache)
+        .env(
+            "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+            host_state.join("host-operations.db"),
+        )
+        .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", &worktree_root)
+        .env(
+            "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+            host_state.join("collaboration"),
+        );
 }
 
 #[allow(dead_code)]
@@ -200,6 +246,7 @@ impl FixtureRepository {
 pub struct FixtureBroker {
     broker: Broker,
     worktree_root: PathBuf,
+    worktree_root_marker: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -222,6 +269,11 @@ impl FixtureBroker {
     pub fn with_worktree_root(mut self, root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         self.broker = self.broker.with_worktree_root(root.clone());
+        if let Some(marker) = &self.worktree_root_marker {
+            let recorded_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            std::fs::write(marker, recorded_root.to_string_lossy().as_bytes())
+                .expect("update fixture worktree-root marker");
+        }
         self.worktree_root = root;
         self
     }
@@ -261,9 +313,12 @@ pub fn open_fixture_broker(
     let broker = Broker::open_with_options(repository, options)?;
     #[cfg(unix)]
     let broker = broker.with_agent_supervisor_executable(env!("CARGO_BIN_EXE_broker-cli-shim"))?;
+    let worktree_root_marker = fixture_worktree_root_marker(repository);
+    record_fixture_worktree_root(repository, &worktree_root_path);
     Ok(FixtureBroker {
         broker,
         worktree_root: worktree_root_path,
+        worktree_root_marker,
     })
 }
 
