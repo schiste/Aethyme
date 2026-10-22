@@ -3559,10 +3559,16 @@ pub fn override_freshness(repo_path: &Path) -> Value {
                             onboarding_stale = false;
                         }
                     }
-                    ACT_STARTER_JSON_PATH if act_stale && act_exists => {
-                        if generated_artifact_matches(&repo_path, &relative_path, &expected) {
-                            act_stale = false;
-                        }
+                    ACT_STARTER_JSON_PATH
+                        if act_stale
+                            && act_exists
+                            && generated_artifact_matches(
+                                &repo_path,
+                                &relative_path,
+                                &expected,
+                            ) =>
+                    {
+                        act_stale = false;
                     }
                     _ => {}
                 }
