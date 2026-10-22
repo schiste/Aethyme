@@ -29,12 +29,6 @@ pub const BLOCKER_CLEARED: &str = "broker.blocker.cleared";
 /// How many cached failing verdicts one listing carries.
 const GATE_CACHE_LIMIT: i64 = 50;
 
-/// Wall-clock budget for deriving stale-lease remedies in one listing.
-/// `broker status` lists blockers on every call, and a remedy runs the same
-/// submission plan `finish` does. Past the budget a lease names `finish`,
-/// whose own refusal names the delivering step (#637).
-const STALE_LEASE_REMEDY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockerKind {
@@ -45,7 +39,7 @@ pub enum BlockerKind {
     HostOperation,
     /// A quarantined host resource lease for this repository.
     ResourceLease,
-    /// An explicit path lease held by a stale session.
+    /// A path-lease recovery refusal from `broker unblock`.
     PathLease,
     /// A conclusive failing gate verdict the cache will reuse.
     GateCache,
@@ -259,10 +253,10 @@ pub enum UnblockOutcome {
 impl Broker {
     /// Every current blocker for this repository, read-only.
     pub fn blockers(&self) -> BlockerReport {
-        self.collect_blockers(true)
+        self.collect_blockers()
     }
 
-    fn collect_blockers(&self, inspect_stale_worktrees: bool) -> BlockerReport {
+    fn collect_blockers(&self) -> BlockerReport {
         let mut report = BlockerReport::default();
         let mut linked_host_operations = Vec::new();
         match self.operation_blockers(&mut linked_host_operations) {
@@ -283,12 +277,10 @@ impl Broker {
                 .unavailable
                 .push(source_error("host-resources.db", error)),
         }
-        match self.path_lease_blockers(inspect_stale_worktrees) {
-            Ok(found) => report.blockers.extend(found),
-            Err(error) => report
-                .unavailable
-                .push(source_error("broker.db leases", error)),
-        }
+        // Path leases are claim-specific: only the shared LeaseRefusalPolicy
+        // can say whether a particular requested path is refused. Listing a
+        // stale claim as a repository-wide blocker is wrong; the full lease
+        // and liveness views already expose it for information.
         match self.gate_cache_blockers() {
             Ok(found) => report.blockers.extend(found),
             Err(error) => report
@@ -312,7 +304,7 @@ impl Broker {
     /// Recorded blocker observations for routine status. Recovery commands need
     /// fresh worktree inspection and are deliberately deferred to `broker unblock`.
     pub(crate) fn blocker_status_advice_snapshot(&self) -> Vec<crate::StatusAdvice> {
-        let report = self.collect_blockers(false);
+        let report = self.collect_blockers();
         let mut advice = Vec::new();
         if let Some(mut item) = status_advice(&report.blockers) {
             item.reason = "recorded coordination blockers; worktree recovery remedies have not been inspected";
@@ -575,77 +567,6 @@ impl Broker {
                     )
                 },
                 safe_to_clear_automatically: safe,
-                inspect: None,
-            });
-        }
-        Ok(found)
-    }
-
-    fn path_lease_blockers(
-        &self,
-        inspect_stale_worktrees: bool,
-    ) -> Result<Vec<Blocker>, BrokerOpError> {
-        let mut found = Vec::new();
-        // One remedy per session, not per lease: a stale session commonly
-        // holds many leases, and each remedy reads its worktree and plans its
-        // submission. The queue is read once for all of them.
-        let mut remedies: std::collections::HashMap<i64, StaleLeaseRemedy> =
-            std::collections::HashMap::new();
-        let mut queue: Option<Option<Vec<crate::MergeQueueEntry>>> = None;
-        let deadline = std::time::Instant::now() + STALE_LEASE_REMEDY_BUDGET;
-        for lease in self.store_ref().active_leases()? {
-            if lease.kind != crate::LeaseKind::Explicit {
-                continue;
-            }
-            let session = self.store_ref().session(lease.session_id)?;
-            if session.status != SessionStatus::Stale {
-                continue;
-            }
-            let worktree_gone = !Path::new(&session.worktree_path).exists();
-            let remedy = (inspect_stale_worktrees && !worktree_gone).then(|| {
-                remedies
-                    .entry(session.id)
-                    .or_insert_with(|| {
-                        if std::time::Instant::now() >= deadline {
-                            return Self::finish_remedy(session.id);
-                        }
-                        let queue = queue
-                            .get_or_insert_with(|| self.store_ref().merge_queue().ok())
-                            .as_deref();
-                        self.stale_lease_remedy(&session, queue)
-                    })
-                    .clone()
-            });
-            found.push(Blocker {
-                id: format!("lease:{}", lease.id),
-                kind: BlockerKind::PathLease,
-                scope: BlockerScope::Repo,
-                cause: format!(
-                    "explicit lease on {} is held by stale session {}{}; no other session can \
-                     claim it{}",
-                    lease.path,
-                    session.id,
-                    if worktree_gone {
-                        " whose worktree no longer exists"
-                    } else {
-                        ""
-                    },
-                    remedy
-                        .as_ref()
-                        .and_then(|remedy| remedy.pending.as_deref())
-                        .map(|pending| format!(
-                            "; {pending}, so `aethyme broker finish --session {}` refuses until \
-                             that work is delivered",
-                            session.id
-                        ))
-                        .unwrap_or_default(),
-                ),
-                session_id: Some(session.id),
-                clear: match remedy {
-                    None => format!("{UNBLOCK} lease:{}", lease.id),
-                    Some(remedy) => remedy.clear,
-                },
-                safe_to_clear_automatically: worktree_gone,
                 inspect: None,
             });
         }
