@@ -1072,7 +1072,7 @@ pub(crate) fn open_file_snapshot_under(root: &Path) -> OpenFileSnapshot {
     // another binary and never becomes a successful empty snapshot.
     for program in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof"] {
         let mut command = std::process::Command::new(program);
-        command.args(["-w", "-n", "-P", "-F0pcfn"]);
+        command.args(["-w", "-n", "-P", "-F0pcfnt"]);
         match crate::bounded_output::output_limited(
             &mut command,
             OPEN_FILE_SNAPSHOT_BUDGET,
@@ -1149,7 +1149,7 @@ fn parse_lsof_output(
     }
 }
 
-/// Parse NUL-delimited `lsof -F0pcfn` records. PID and command context is
+/// Parse NUL-delimited `lsof -F0pcfnt` records. PID and command context is
 /// required for every pathname. lsof may append one linefeed after the final
 /// NUL field delimiter. Other malformed or truncated suffixes are rejected;
 /// paths from preceding complete records remain useful positive evidence but
@@ -1187,6 +1187,7 @@ fn parse_lsof_records(
     let mut saw_name = false;
     let mut saw_file_for_process = false;
     let mut awaiting_name = false;
+    let mut file_type: Option<String> = None;
     let mut open_files = Vec::new();
 
     for field in fields.into_iter().take(complete_field_count) {
@@ -1194,7 +1195,7 @@ fn parse_lsof_records(
         let Some((&kind, value)) = field.split_first() else {
             return Err((open_files, "lsof listing contained an empty field".into()));
         };
-        if value.is_empty() {
+        if value.is_empty() && kind != b'n' {
             return Err((
                 open_files,
                 "lsof listing contained an empty field value".into(),
@@ -1222,6 +1223,7 @@ fn parse_lsof_records(
                 command = None;
                 saw_process = true;
                 saw_file_for_process = false;
+                file_type = None;
             }
             b'c' => {
                 if pid.is_none() {
@@ -1262,6 +1264,31 @@ fn parse_lsof_records(
                 }
                 awaiting_name = true;
                 saw_file_for_process = true;
+                file_type = None;
+            }
+            b't' => {
+                if pid.is_none() || command.is_none() || !awaiting_name {
+                    return Err((
+                        open_files,
+                        "lsof file type preceded its file descriptor".into(),
+                    ));
+                }
+                if file_type.is_some() {
+                    return Err((
+                        open_files,
+                        "lsof file descriptor had conflicting file types".into(),
+                    ));
+                }
+                let Some(parsed_type) = std::str::from_utf8(value)
+                    .ok()
+                    .filter(|file_type| !file_type.is_empty())
+                else {
+                    return Err((
+                        open_files,
+                        "lsof file descriptor had an invalid type".into(),
+                    ));
+                };
+                file_type = Some(parsed_type.to_string());
             }
             b'n' => {
                 let Some(pid) = pid else {
@@ -1281,6 +1308,20 @@ fn parse_lsof_records(
                 }
                 saw_name = true;
                 awaiting_name = false;
+                if value.is_empty() {
+                    // macOS reports these named descriptor kinds with an
+                    // empty `n` field. They do not refer to filesystem paths;
+                    // keep other empty or unknown names incomplete so a
+                    // missing path cannot authorize deletion.
+                    if matches!(file_type.as_deref(), Some("NPOLICY" | "NEXUS" | "PIPE")) {
+                        file_type = None;
+                        continue;
+                    }
+                    return Err((
+                        open_files,
+                        "lsof listing contained an empty field value".into(),
+                    ));
+                }
                 let Some(path) = path_from_lsof_bytes(value) else {
                     return Err((
                         open_files,
@@ -1302,6 +1343,7 @@ fn parse_lsof_records(
                         path,
                     });
                 }
+                file_type = None;
             }
             _ => {
                 return Err((
@@ -1864,6 +1906,42 @@ mod scan_tests {
             parse_lsof_output(true, without_final_linefeed, &[], Path::new("/w/root")),
             OpenFileSnapshot::Complete(_)
         ));
+    }
+
+    #[test]
+    fn native_empty_names_are_accepted_only_for_known_pathless_descriptor_types() {
+        // macOS lsof emits these exact `f`, `t`, and empty `n` fields for
+        // NPOLICY descriptors; NEXUS and PIPE use the same pathless shape.
+        let listing = b"p123\0cfixture\0\nfcwd\0tDIR\0n/w/root\0\nf10\0tNPOLICY\0n\0\nf11\0tNEXUS\0n\0\nf12\0tPIPE\0n\0\nf13\0tREG\0n/w/root/target/file\0\n";
+        let open_files = match parse_lsof_output(true, listing, &[], Path::new("/w/root")) {
+            OpenFileSnapshot::Complete(open_files) => open_files,
+            other => panic!("known pathless descriptors should not invalidate lsof: {other:?}"),
+        };
+        assert_eq!(open_files.len(), 2);
+        assert_eq!(open_files[0].path, p("/w/root"));
+        assert_eq!(open_files[1].path, p("/w/root/target/file"));
+    }
+
+    #[test]
+    fn unknown_or_filesystem_empty_names_remain_incomplete() {
+        let root = Path::new("/w/root");
+        let prefix = b"p123\0cfixture\0\nfcwd\0tDIR\0n/w/root\0\n";
+        for suffix in [
+            &b"f10\0tREG\0n\0\n"[..],
+            &b"f10\0n\0\n"[..],
+            &b"f10\0tFUTURETYPE\0n\0\n"[..],
+        ] {
+            let mut listing = prefix.to_vec();
+            listing.extend_from_slice(suffix);
+            let OpenFileSnapshot::Incomplete { reason, observed } =
+                parse_lsof_output(true, &listing, &[], root)
+            else {
+                panic!("an unclassifiable empty name must remain incomplete");
+            };
+            assert!(reason.contains("empty field value"), "{reason}");
+            assert_eq!(observed.len(), 1, "the complete earlier path is retained");
+            assert_eq!(observed[0].path, p("/w/root"));
+        }
     }
 
     #[test]
