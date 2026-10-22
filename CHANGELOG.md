@@ -10,8 +10,15 @@ artifacts and their exact source revision are recorded in each signed
 
 This patch includes the broker inspection, verification-identity and cleanup
 repairs described in v0.8.28. Upgrades from v0.8.26 migrate each repository's
-broker database from schema 49 to 52; databases already at schema 52 need no
-additional migration.
+broker database from schema 49 to 53; databases already at schema 53 need no
+additional migration. Legacy-unbound databases keep compatibility floor 52;
+explicitly bound and freshly published databases use floor 53.
+
+### Added
+
+- Per-repository worktree-root binding records use stable UUIDs stored in each
+  repository's Git common directory, including when repositories share
+  `AETHYME_BROKER_DB`.
 
 ### Fixed
 
@@ -44,6 +51,9 @@ additional migration.
   Playground workload with aged, released resource-lease history. These are
   measurement and validation tools; no end-to-end latency gain is asserted
   before combined-runtime measurements.
+- Non-Unix builds can still open existing legacy-unbound databases, but refuse
+  absent repository database creation and identity-bound schema-53 databases.
+  Explicit binding and recovery require Unix no-follow filesystem checks.
 
 ## [0.8.28] - 2026-10-21
 

@@ -79,10 +79,10 @@ the non-breaking ones, remain in Git history under
 ## v0.8.29
 
 These notes cover upgrading from v0.8.26. An earlier patch or development
-installation whose broker database is already at schema 52 needs no additional
+installation whose broker database is already at schema 53 needs no additional
 migration.
 
-v0.8.29 migrates each repository's broker database from schema 49 to schema 52
+v0.8.29 migrates each repository's broker database from schema 49 to schema 53
 on its first writable open. By default, this is
 `<repo>/.aethyme/broker.db`; linked worktrees use their primary checkout's
 database. A configured `AETHYME_BROKER_DB` may redirect it, including to a
@@ -94,11 +94,23 @@ not changed by this migration.
 
 The migration adds typed verification-candidate storage, establishes the
 required collaboration-capture fence, and adds a gate execution-profile
-digest. The minimum compatible schema is 52. After one database has migrated,
-v0.8.26 and earlier cannot open that database. Upgrade every installed Aethyme
-copy that can access the same database before any one of those copies opens it;
-install the router and engine pair together. A repository whose database has
-not migrated remains on its current schema.
+digest, then adds per-repository worktree-root binding records. The minimum
+compatible schema remains 52 while a repository is unbound. The v53 table is
+additive, so v0.8.28 can continue using an unbound database at floor 52. An
+explicit binding raises that database's floor to 53; a freshly published
+database starts at floor 53. v0.8.28 and earlier refuse databases at floor 53,
+and v0.8.26 and earlier also refuse the schema-52 floor. Each repository has
+its own binding record, including when multiple repositories share
+`AETHYME_BROKER_DB`; linked worktrees use their primary repository identity.
+
+On non-Unix platforms, existing legacy-unbound databases can be opened and
+migrated. Creating an absent repository database, opening an identity-bound
+schema-53 database, and performing explicit binding or recovery require Unix
+no-follow filesystem checks and fail closed elsewhere. This release does not
+claim Windows support for those operations. Upgrade every installed Aethyme
+copy that can access the same database before any one of those copies binds it
+or publishes a fresh database; install the router and engine pair together. A
+repository whose database has not migrated remains on its current schema.
 
 ### Before upgrading
 
@@ -121,7 +133,9 @@ sqlite3 "/path/to/repo/.aethyme/broker.db" ".backup /safe/backups/repo-broker.db
 If `AETHYME_BROKER_DB` redirects that repository's database, back up the
 configured file instead. Record the installed router and engine versions.
 Upgrade every installed copy that can access the same database to the matching
-v0.8.29 pair before resuming broker work against it.
+v0.8.29 pair before resuming broker work against it. On non-Unix platforms,
+use an existing legacy-unbound database; fresh repository database creation,
+binding, and recovery are not supported.
 
 ### Migrate and verify
 
@@ -136,12 +150,14 @@ aethyme broker advanced quick-test
 ### Rollback
 
 Before a repository's database has migrated, reinstalling the v0.8.26 pair
-needs no database restore. After that database reaches schema 52, v0.8.26
-refuses it. To roll back that repository, stop every broker process that can
-access its database, reinstall the router and engine pair together, and restore
-that repository's own pre-upgrade backup. Broker state recorded after the
-backup is lost; Git commits and worktrees are unaffected. Repeat independently
-for each migrated repository database.
+needs no database restore. After migration, v0.8.26 refuses the database at
+floor 52 or higher. While it remains unbound at floor 52, v0.8.28 can still
+open it. After explicit binding or fresh-database publication raises the floor
+to 53, v0.8.28 also refuses it. To roll back past the applicable floor, stop
+every broker process that can access the database, reinstall the router and
+engine pair together, and restore that repository's own pre-upgrade backup.
+Broker state recorded after the backup is lost; Git commits and worktrees are
+unaffected. Repeat independently for each migrated repository database.
 
 ## v0.8.28
 
