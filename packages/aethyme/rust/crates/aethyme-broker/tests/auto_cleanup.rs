@@ -137,6 +137,28 @@ fn kept_reason<'a>(report: &'a AutoCleanupReport, worktree: &Path) -> &'a str {
         .unwrap_or_else(|| panic!("{} not kept: {report:#?}", worktree.display()))
 }
 
+fn persisted_spawn_witness_count(broker: &Broker, session_id: i64) -> i64 {
+    rusqlite::Connection::open_with_flags(
+        broker.store().db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM spawned_worktree_instances WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn unix_file_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    (metadata.dev(), metadata.ino())
+}
+
 /// Match repositories that explicitly keep pnpm's store inside each checkout.
 fn pnpm_store_fixture(ignored: bool) -> Fixture {
     let fx = fixture();
@@ -157,6 +179,7 @@ fn pnpm_store_fixture(ignored: bool) -> Fixture {
     fx
 }
 
+#[cfg(unix)]
 #[test]
 fn an_ignored_pnpm_store_does_not_keep_a_merged_closed_checkout() {
     let fx = pnpm_store_fixture(true);
@@ -212,6 +235,7 @@ fn an_untracked_pnpm_store_keeps_the_checkout() {
     assert_eq!(std::fs::read_to_string(file).unwrap(), "untracked");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_merged_closed_checkout_is_removed_by_ancestry_and_journaled() {
     let fx = fixture();
@@ -257,6 +281,7 @@ fn a_merged_closed_checkout_is_removed_by_ancestry_and_journaled() {
     assert_eq!(plan.auto_cleanup.as_ref().unwrap().removed.len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_squash_landing_is_removed_through_the_deep_proof() {
     let fx = fixture();
@@ -452,8 +477,14 @@ fn a_process_in_the_checkout_keeps_it() {
     let _ = child.kill();
     let _ = child.wait();
     let reason = kept_reason(&report, &worktree);
+    #[cfg(unix)]
     assert!(
         reason.starts_with("a process has") && reason.ends_with("open"),
+        "{report:#?}"
+    );
+    #[cfg(not(unix))]
+    assert!(
+        reason.contains("spawn-time worktree instance identity is unavailable"),
         "{report:#?}"
     );
     assert!(worktree.exists());
@@ -477,8 +508,21 @@ fn closing_releases_leases_so_none_can_hold_a_closed_checkout() {
             .is_empty()
     );
     let report = run(&mut broker);
-    assert_eq!(report.removed.len(), 1, "{report:#?}");
-    assert!(!worktree.exists());
+    #[cfg(unix)]
+    {
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!worktree.exists());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(
+            kept_reason(&report, &worktree)
+                .contains("spawn-time worktree instance identity is unavailable"),
+            "{report:#?}"
+        );
+        assert!(worktree.exists());
+    }
 }
 
 #[test]
@@ -496,12 +540,42 @@ fn a_live_session_that_adopted_the_closed_checkout_keeps_it() {
     assert!(worktree.exists());
 }
 
+#[cfg(not(unix))]
+#[test]
+fn unsupported_platform_spawn_identity_keeps_the_checkout() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    assert_eq!(persisted_spawn_witness_count(&broker, spawned_id), 0);
+
+    let report = run(&mut broker);
+
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("spawn-time worktree instance identity is unavailable"),
+        "{report:#?}"
+    );
+    assert!(worktree.exists());
+}
+
+#[cfg(unix)]
 #[test]
 fn a_retained_spawned_session_owns_a_closed_re_adoption() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (spawned_id, worktree, head) = merged_closed_session(&fx, &mut broker, true);
+    assert_eq!(
+        persisted_spawn_witness_count(&broker, spawned_id),
+        1,
+        "the spawned session stores its identity in the registration path"
+    );
     let adopted = broker.adopt(&worktree, Some("picked up again")).unwrap();
+    assert_eq!(
+        persisted_spawn_witness_count(&broker, adopted.id),
+        0,
+        "adoption does not create spawn authority"
+    );
     broker.close(adopted.id).unwrap();
 
     let report = run(&mut broker);
@@ -511,6 +585,17 @@ fn a_retained_spawned_session_owns_a_closed_re_adoption() {
     assert!(removed.sessions.contains(&spawned_id));
     assert!(removed.sessions.contains(&adopted.id));
     assert!(!worktree.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_agent_spawn_registration_persists_instance_witness() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+
+    let report = broker.start_agent_report("witness", "true", None).unwrap();
+
+    assert_eq!(persisted_spawn_witness_count(&broker, report.session.id), 1);
 }
 
 #[test]
@@ -529,8 +614,39 @@ fn a_cleaned_spawn_record_does_not_authorize_a_closed_adoption() {
 
     let report = run(&mut broker);
     assert!(report.removed.is_empty(), "{report:#?}");
-    assert!(kept_reason(&report, &worktree).contains("not a broker-owned worktree"));
+    assert!(kept_reason(&report, &worktree).contains("spawn-time worktree instance witness"));
     assert!(worktree.exists());
+}
+
+#[test]
+fn a_spawned_session_without_a_persisted_witness_is_not_backfilled() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let db_path = broker.store().db_path().to_path_buf();
+    let legacy_writer = rusqlite::Connection::open(db_path).unwrap();
+    legacy_writer
+        .execute(
+            "DELETE FROM spawned_worktree_instances WHERE session_id = ?1",
+            [spawned_id],
+        )
+        .unwrap();
+    drop(legacy_writer);
+
+    let report = run(&mut broker);
+
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("spawn-time worktree instance identity is unavailable")
+            || kept_reason(&report, &worktree)
+                .contains("no matching spawn-time worktree instance witness"),
+        "{report:#?}"
+    );
+    assert!(
+        worktree.exists(),
+        "missing historical proof must not be inferred"
+    );
 }
 
 #[test]
@@ -539,7 +655,10 @@ fn a_closed_re_adoption_after_selection_keeps_the_checkout_for_that_pass() {
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    #[cfg(unix)]
     assert_eq!(plan.selected_worktrees().len(), 1);
+    #[cfg(not(unix))]
+    assert!(plan.selected_worktrees().is_empty());
 
     let adopted = broker
         .adopt(&worktree, Some("adopted after selection"))
@@ -548,10 +667,18 @@ fn a_closed_re_adoption_after_selection_keeps_the_checkout_for_that_pass() {
     let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
 
     assert!(report.removed.is_empty(), "{report:#?}");
+    #[cfg(unix)]
     assert!(kept_reason(&report, &worktree).contains("closed session set changed"));
+    #[cfg(not(unix))]
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("spawn-time worktree instance identity is unavailable"),
+        "{report:#?}"
+    );
     assert!(worktree.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_retained_spawn_record_does_not_own_a_foreign_checkout_replacement() {
     let fx = fixture();
@@ -602,7 +729,10 @@ fn a_retained_spawn_record_does_not_own_a_foreign_checkout_replacement() {
 
     assert!(report.removed.is_empty(), "{report:#?}");
     assert!(kept_reason(&report, &worktree).contains("changed before removal"));
-    assert!(kept_reason(&report, &worktree).contains("not a broker-owned worktree"));
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("worktree instance no longer matches its spawn record")
+    );
     assert!(worktree.join("shared.txt").exists());
     assert!(worktree.exists());
     assert_eq!(
@@ -612,17 +742,86 @@ fn a_retained_spawn_record_does_not_own_a_foreign_checkout_replacement() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_retained_spawn_record_does_not_own_a_same_repo_checkout_replacement() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    assert_eq!(plan.selected_worktrees().len(), 1);
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    let branch = broker.store().session(spawned_id).unwrap().branch;
+    let old_admin_dir = git_out(&worktree, &["rev-parse", "--absolute-git-dir"]);
+    let old_instance_parts = [
+        unix_file_identity(&worktree),
+        unix_file_identity(&worktree.join(".git")),
+        unix_file_identity(Path::new(&old_admin_dir)),
+    ];
+    git(&fx.repo, &["worktree", "remove", "--force", &worktree_text]);
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", &worktree_text, &branch],
+    );
+
+    let main_common_dir = git_out(
+        &fx.repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    let replacement_common_dir = git_out(
+        &worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    assert_eq!(main_common_dir, replacement_common_dir);
+    assert_eq!(git_out(&worktree, &["branch", "--show-current"]), branch);
+    let new_admin_dir = git_out(&worktree, &["rev-parse", "--absolute-git-dir"]);
+    let new_instance_parts = [
+        unix_file_identity(&worktree),
+        unix_file_identity(&worktree.join(".git")),
+        unix_file_identity(Path::new(&new_admin_dir)),
+    ];
+    assert_ne!(
+        old_instance_parts, new_instance_parts,
+        "recreation changes a filesystem identity captured by the spawn witness"
+    );
+
+    let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("worktree instance no longer matches its spawn record")
+    );
+    assert!(worktree.join("shared.txt").exists());
+    assert!(worktree.exists());
+    assert_eq!(
+        broker.store().session(spawned_id).unwrap().cleanup_state,
+        aethyme_broker::SessionCleanupState::Closed,
+        "the retained spawn row must not authorize a replacement instance"
+    );
+}
+
 #[test]
 fn a_change_between_selection_and_removal_keeps_the_checkout() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    #[cfg(unix)]
     assert_eq!(plan.selected_worktrees().len(), 1);
+    #[cfg(not(unix))]
+    assert!(plan.selected_worktrees().is_empty());
     std::fs::write(worktree.join("late.txt"), "written after selection\n").unwrap();
     let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
     assert!(report.removed.is_empty(), "{report:#?}");
+    #[cfg(unix)]
     assert!(kept_reason(&report, &worktree).contains("changed before removal"));
+    #[cfg(not(unix))]
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("spawn-time worktree instance identity is unavailable"),
+        "{report:#?}"
+    );
     assert!(worktree.exists());
 }
 
@@ -632,16 +831,27 @@ fn a_head_moved_after_selection_is_proved_again_not_reused() {
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    #[cfg(unix)]
     assert_eq!(plan.selected_worktrees().len(), 1);
+    #[cfg(not(unix))]
+    assert!(plan.selected_worktrees().is_empty());
     // A commit no remote has: the selection's proof names the old HEAD and
     // must not vouch for this one.
     commit(&worktree, "late.txt", "committed after selection\n", "late");
     let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
     assert!(report.removed.is_empty(), "{report:#?}");
+    #[cfg(unix)]
     assert!(kept_reason(&report, &worktree).contains("changed before removal"));
+    #[cfg(not(unix))]
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("spawn-time worktree instance identity is unavailable"),
+        "{report:#?}"
+    );
     assert!(worktree.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn removal_past_the_selection_deadline_defers_all_but_the_first() {
     let fx = fixture();
@@ -701,14 +911,21 @@ fn auto_remove_false_disables_it_and_keep_pins_and_regenerable_globs_apply() {
     std::fs::write(&config, "[cleanup]\n").unwrap();
     let report = run(&mut broker);
     assert!(kept_reason(&report, &worktree).contains(".gradle-cache"));
-    std::fs::write(
-        &config,
-        "[cleanup]\nregenerable = [\".gradle-cache/**\", \".gradle-cache\"]\n",
-    )
-    .unwrap();
-    let report = run(&mut broker);
-    assert_eq!(report.removed.len(), 1, "{report:#?}");
-    assert!(!worktree.exists());
+    #[cfg(unix)]
+    {
+        std::fs::write(
+            &config,
+            "[cleanup]\nregenerable = [\".gradle-cache/**\", \".gradle-cache\"]\n",
+        )
+        .unwrap();
+        let report = run(&mut broker);
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!worktree.exists());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(worktree.exists());
+    }
 }
 
 #[test]
@@ -738,7 +955,13 @@ fn the_primary_checkout_and_non_broker_worktrees_are_never_removed() {
     assert!(report.removed.is_empty(), "{report:#?}");
     assert!(foreign.exists());
     assert!(fx.repo.exists());
-    assert!(kept_reason(&report, &foreign).contains("not a broker-owned worktree"));
+    assert!(
+        kept_reason(&report, &foreign).contains("no matching spawn-time worktree instance witness")
+            || kept_reason(&report, &foreign).contains("not a broker-owned worktree")
+            || kept_reason(&report, &foreign)
+                .contains("spawn-time worktree instance identity is unavailable"),
+        "{report:#?}"
+    );
 }
 
 /// Ignore `pattern` in every checkout of the fixture's repository.

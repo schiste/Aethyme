@@ -251,16 +251,102 @@ impl BrokerStore {
         context: &SessionContext,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
+        self.register_session_with_optional_spawn_witness(
+            verify_only,
+            new,
+            context,
+            planned_paths,
+            None,
+        )
+    }
+
+    /// Register a freshly spawned session and its optional, spawn-time
+    /// worktree identity witness in the same transaction as the session row.
+    /// `None` is valid on unsupported platforms and deliberately leaves the
+    /// session ineligible for automatic checkout removal.
+    pub(crate) fn register_spawned_session_with_context_and_leases(
+        &mut self,
+        verify_only: bool,
+        new: &NewSession,
+        context: &SessionContext,
+        planned_paths: &[String],
+        witness: Option<&crate::events::SpawnedWorktreeInstanceWitness>,
+    ) -> Result<Session, BrokerError> {
+        if new.origin != SessionOrigin::Spawned {
+            return Err(BrokerError::InvalidSpawnedWorktreeInstanceWitness(
+                "spawn registration requires a spawned session".into(),
+            ));
+        }
+        if let Some(witness) = witness
+            && (witness.schema_version != 1 || witness.worktree_path != new.worktree_path)
+        {
+            return Err(BrokerError::InvalidSpawnedWorktreeInstanceWitness(
+                "captured identity does not match the spawned worktree path".into(),
+            ));
+        }
+        self.register_session_with_optional_spawn_witness(
+            verify_only,
+            new,
+            context,
+            planned_paths,
+            witness,
+        )
+    }
+
+    fn register_session_with_optional_spawn_witness(
+        &mut self,
+        verify_only: bool,
+        new: &NewSession,
+        context: &SessionContext,
+        planned_paths: &[String],
+        witness: Option<&crate::events::SpawnedWorktreeInstanceWitness>,
+    ) -> Result<Session, BrokerError> {
         let now = now_ms();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_planned_lease_conflicts(&tx, None, planned_paths, now, verify_only)?;
         let id = insert_session(&tx, new, context, now)?;
+        if let Some(witness) = witness {
+            let witness_json = serde_json::to_string(witness).map_err(|error| {
+                BrokerError::InvalidSpawnedWorktreeInstanceWitness(format!("session {id}: {error}"))
+            })?;
+            tx.execute(
+                "INSERT INTO spawned_worktree_instances (session_id, witness_json)
+                 VALUES (?1, ?2)",
+                params![id, witness_json],
+            )?;
+        }
         insert_session_context_event(&tx, id, context, now)?;
         insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
         tx.commit()?;
         self.session(id)
+    }
+
+    /// Read only a persisted spawn-time identity. Missing rows mean that the
+    /// broker has no durable instance proof; callers must not infer one from
+    /// the worktree currently at the recorded path.
+    pub(crate) fn spawned_worktree_instance_witness(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<crate::events::SpawnedWorktreeInstanceWitness>, BrokerError> {
+        let witness_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT witness_json FROM spawned_worktree_instances WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(witness_json) = witness_json else {
+            return Ok(None);
+        };
+        let witness = serde_json::from_str(&witness_json).map_err(|error| {
+            BrokerError::InvalidSpawnedWorktreeInstanceWitness(format!(
+                "session {session_id}: {error}"
+            ))
+        })?;
+        Ok(Some(witness))
     }
 
     pub fn session(&self, id: i64) -> Result<Session, BrokerError> {
