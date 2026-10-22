@@ -92,6 +92,86 @@ git -C "$repo" add -- "$path"
 commit_changes
 expect_result 'Markdown path containing whitespace and newline' true
 
+# Each report is a committed synthetic blob; no report content is executed.
+report_case() {
+  local label=$1 expected=$2 content=$3
+  init_case "$label"
+  mkdir -p "$repo/packages/aethyme/docs/reports"
+  printf '%s' "$content" >"$repo/packages/aethyme/docs/reports/example.md"
+  git -C "$repo" add -- packages/aethyme/docs/reports/example.md
+  commit_changes
+  expect_result "$label" "$expected"
+}
+report_case prose-report true $'# Diagnostic report\n\nMeasured wall time: 12 ms.\n'
+report_case backtick-code false $'# Report\n```rust\nfn main() {}\n```\n'
+report_case tilde-code false $'# Report\n~~~json\n{}\n~~~\n'
+report_case indented-code false $'# Report\n  ```bash\ntrue\n  ```\n'
+report_case quoted-code false $'> ```rust\n> fn main() {}\n> ```\n'
+report_case list-code false $'- ~~~json\n  {}\n  ~~~\n'
+report_case inline-fence-marker false 'Mentioning ``` selects full validation conservatively.'
+report_case legacy-blob-link false '[source](https://github.com/aeptus/aethyme/blob/main/file.rs)'
+report_case invalid-utf8 false $'Invalid: \377\n'
+
+init_case modified-prose-report
+mkdir -p "$repo/packages/aethyme/docs/reports" "$repo/.codex/skills/aethyme"
+printf 'before\n' >"$repo/packages/aethyme/docs/reports/example.md"
+git -C "$repo" add -- packages/aethyme/docs/reports/example.md
+commit_changes
+base=$(git -C "$repo" rev-parse HEAD)
+printf 'after\n' >"$repo/packages/aethyme/docs/reports/example.md"
+printf 'skill\n' >"$repo/.codex/skills/aethyme/SKILL.md"
+git -C "$repo" add -- packages/aethyme/docs/reports/example.md .codex/skills/aethyme/SKILL.md
+commit_changes
+expect_result 'modified prose report mixed with skill' true
+
+init_case binary-report
+mkdir -p "$repo/packages/aethyme/docs/reports"
+printf 'prose\0hidden' >"$repo/packages/aethyme/docs/reports/example.md"
+git -C "$repo" add -- packages/aethyme/docs/reports/example.md
+commit_changes
+expect_result 'NUL report' false
+
+init_case oversized-report
+mkdir -p "$repo/packages/aethyme/docs/reports"
+# Bound the test fixture too: exactly one byte over the accepted limit.
+python3 - "$repo/packages/aethyme/docs/reports/example.md" <<'OVERSIZE'
+import pathlib
+import sys
+pathlib.Path(sys.argv[1]).write_bytes(b"a" * 1048577)
+OVERSIZE
+git -C "$repo" add -- packages/aethyme/docs/reports/example.md
+commit_changes
+expect_result 'oversized report' false
+
+init_case too-many-reports
+mkdir -p "$repo/packages/aethyme/docs/reports"
+for report_index in {1..33}; do
+  printf 'prose\n' >"$repo/packages/aethyme/docs/reports/$report_index.md"
+done
+git -C "$repo" add -- packages/aethyme/docs/reports
+commit_changes
+expect_result 'aggregate report count ceiling' false
+
+init_case aggregate-report-bytes
+mkdir -p "$repo/packages/aethyme/docs/reports"
+python3 - "$repo/packages/aethyme/docs/reports" <<'TOTAL_BYTES'
+import pathlib
+import sys
+for index in range(5):
+    (pathlib.Path(sys.argv[1]) / f"{index}.md").write_bytes(b"a" * 1048576)
+TOTAL_BYTES
+git -C "$repo" add -- packages/aethyme/docs/reports
+commit_changes
+expect_result 'aggregate report byte ceiling' false
+
+init_case report-with-rust
+mkdir -p "$repo/packages/aethyme/docs/reports"
+printf 'prose\n' >"$repo/packages/aethyme/docs/reports/example.md"
+printf 'fn main() {}\n' >"$repo/main.rs"
+git -C "$repo" add -- packages/aethyme/docs/reports/example.md main.rs
+commit_changes
+expect_result 'report mixed with Rust' false
+
 init_case mixed-rust-path
 mkdir -p "$repo/.claude/skills/aethyme" "$repo/packages/aethyme/rust/crates/example/src"
 printf 'guidance\n' >"$repo/.claude/skills/aethyme/SKILL.md"
