@@ -69,3 +69,53 @@ command-local work without weakening lease, compatibility, ownership or
 post-command checks. Repeat the same fresh and aged workloads with matched
 release-profile binaries after the combined fixes are qualified. No new timing
 budget, cleanup exemption or safety bypass is introduced by this report.
+
+## Follow-up: combined candidate and readiness repair
+
+The combined candidate at `0e0a9b2025594d5e647518c6ad4feeeb1acd165e`
+includes the readiness-loop repair and the qualified Local fixes through #972
+and #973. Its router and engine built successfully together; 17 release-contract
+and 10 gate-cache tests passed locally. It is a development candidate, with no
+installed-runtime change at measurement time.
+
+This comparison uses two development pairs with debug information and
+incremental compilation disabled: the earlier `4acd3cec` candidate above and
+the combined `0e0a9b20` candidate. The same harness and local Git transport were
+used for both. Fresh measurements ran the combined candidate first, with three
+samples per action. Aged measurements used 1,000 released host-resource leases
+and both binary orders, with six pooled samples per action. Each fixture had
+one broker session. The host was shared with other work; these are diagnostic
+CLI timings, not isolated-host or production tail-latency qualification.
+
+| Action | Fresh earlier | Fresh combined | Aged earlier | Aged combined | Aged change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Summary status | 447.6 | 450.8 | 484.7 | 420.3 | -13.3% |
+| Guarded no-op | 1736.0 | 899.5 | 1550.3 | 816.9 | -47.3% |
+| Unchanged sync | 830.5 | 741.4 | 694.5 | 786.2 | +13.2% |
+| Unchanged push | 1387.0 | 1123.7 | 1089.8 | 1144.5 | +5.0% |
+
+All values are milliseconds. Guarded execution improved in both workloads,
+consistent with removing a wait after every already-available readiness byte.
+A deterministic regression control restored that wait and failed with 33 waits
+instead of zero; after exact restoration, the same test passed. This isolates
+the readiness defect without attributing every timing difference to that fix.
+
+The aged sync median regressed and must remain visible. Its combined samples
+ranged from 531.6 to 1054.7 ms; push ranged from 757.3 to 1380.8 ms. Guard and
+push remain above their 500 ms warning budgets. No budget was relaxed.
+The six benchmark runs completed successfully: 22 commands per fresh run and
+28 per aged run. Raw samples, command outputs, workload checks, and router and
+engine hashes before and after execution are retained with the measurements.
+The counterbalanced summary SHA-256 is
+`cd0cce2acf46ee0a518dd8fde8af740f6b2f88d2ae744e0a7764573a06989a63`.
+
+Combined pair SHA-256 identities:
+
+- Router: `70eba47ebccbe9c2fa463b9df306cbdcaf818bc1eb1fc8b1ae8d03f21e8c9ab9`.
+- Engine: `9146e8c7eca98f0cb18d9c687d8a296eb4dd622af21fbab028be6188c59fff93`.
+
+Next measurements should cover many sessions and worktrees separately from
+released resource-lease history, and repeat the published release pair before
+claiming installed-version performance. Reducing command-local Git discovery
+and config reads remains a candidate improvement; the sync result needs
+investigation rather than a timing exemption.
