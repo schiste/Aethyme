@@ -83,40 +83,36 @@ impl Fixture {
 }
 
 #[test]
-fn brief_defers_git_remedies_but_full_blockers_preserves_them() {
+fn stale_lease_and_undelivered_commit_remain_visible_without_global_blocker_advice() {
     let fixture = Fixture::new();
     std::fs::write(fixture.worktree.join("README.md"), "unrepresented change\n").unwrap();
     git(&fixture.worktree, &["add", "README.md"]);
     git(&fixture.worktree, &["commit", "-qm", "undelivered"]);
+
+    let session = fixture.broker.store().session(fixture.id).unwrap();
+    assert_eq!(session.status, SessionStatus::Stale);
+    assert!(Path::new(&session.worktree_path).exists());
+    let leases = fixture.broker.store().session_leases(fixture.id).unwrap();
+    assert!(
+        leases.iter().any(|lease| lease.path == "README.md"),
+        "the stale session's explicit lease remains visible: {leases:?}"
+    );
+
     let full = fixture.broker.blockers();
-    let lease = full
-        .blockers
-        .iter()
-        .find(|item| item.session_id == Some(fixture.id) && item.id.starts_with("lease:"))
-        .unwrap();
     assert!(
-        lease.cause.contains("committed change not yet delivered"),
-        "{lease:?}"
-    );
-    assert_eq!(
-        lease.clear,
-        format!("aethyme broker submit --session {}", fixture.id)
-    );
-    let brief = fixture.broker.status_brief_snapshot(0).unwrap();
-    let item = brief
-        .advice
-        .iter()
-        .find(|item| item.id == "blockers.present")
-        .unwrap();
-    assert!(item.summary.starts_with("1 blocker"), "{item:?}");
-    assert_eq!(item.commands, ["aethyme broker unblock"]);
-    assert!(item.reason.contains("not been inspected"));
-    assert!(item.evidence.iter().any(|line| line.starts_with(&lease.id)));
-    assert!(
-        item.evidence
+        full.blockers
             .iter()
-            .all(|line| !line.contains("committed change not yet delivered")),
-        "{item:?}"
+            .all(|item| item.kind != aethyme_broker::BlockerKind::PathLease),
+        "a claim-specific stale lease is not a repository-wide blocker: {full:?}"
+    );
+
+    let brief = fixture.broker.status_brief_snapshot(0).unwrap();
+    assert!(
+        brief
+            .advice
+            .iter()
+            .all(|item| item.id != "blockers.present"),
+        "routine status must not invent blocker advice from a stale path claim: {brief:?}"
     );
 }
 
