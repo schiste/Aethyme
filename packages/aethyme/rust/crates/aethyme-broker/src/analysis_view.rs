@@ -576,12 +576,14 @@ fn build_view_with_limits(
     // The retained snapshot, materialised privately. Its own `.aethyme/`
     // is not source: the walker skips it and the indexer writes there.
     let source = building.join("source");
-    crate::collaboration_archive::reconstruct_bounded(store, snapshot, &source, limits).map_err(
-        |source| ViewError::Source {
+    let (_, source_identity) =
+        crate::collaboration_archive::reconstruct_bounded_with_source_identity(
+            store, snapshot, &source, limits,
+        )
+        .map_err(|source| ViewError::Source {
             snapshot: snapshot.to_string(),
             source,
-        },
-    )?;
+        })?;
     let materialize_us = started.elapsed().as_micros();
     let committed_graph = source.join(".aethyme");
     if committed_graph.exists() {
@@ -589,7 +591,12 @@ fn build_view_with_limits(
     }
 
     let index_started = Instant::now();
+    // Bind coverage to the exact archived commit and Git tree. The archive
+    // verifies both the retained-snapshot record and every blob before it
+    // provides this identity.
     let ctx = IndexerContext::new(&profile.repo_name, &source, &profile.producer_version)
+        .and_then(|ctx| ctx.with_source_revision(&source_identity.revision))
+        .and_then(|ctx| ctx.with_source_tree_digest(&source_identity.source_tree_sha256))
         .map_err(|error| ViewError::Index(error.to_string()))?;
     let summary = index_repo_to_disk_with(&ctx, &WalkOptions::default(), &default_registry())
         .map_err(|error| ViewError::Index(error.to_string()))?;
@@ -1015,18 +1022,15 @@ impl ViewReader {
                 queue.push_back(source.clone());
             }
         }
-        let mut digest = Sha256::new();
-        for path in &paths {
-            digest.update((path.len() as u64).to_le_bytes());
-            digest.update(path.as_bytes());
-        }
+        let changed_paths: Vec<String> = paths.iter().map(|path| (*path).to_string()).collect();
+        let changed_paths_digest = crate::graph_impact::diff_digest(&changed_paths);
         let result = object([(
             "impacted",
             Value::Array(impacted.iter().map(|file| text(file)).collect()),
         )]);
         Ok(self.envelope(
             Operation::ExplainImpact,
-            Subject::ChangedPaths(hex(&digest.finalize())),
+            Subject::ChangedPaths(changed_paths_digest),
             Some(Subject::Snapshot(self.snapshot()?)),
             Answer {
                 complete: self.manifest.state == ViewState::Ready,
