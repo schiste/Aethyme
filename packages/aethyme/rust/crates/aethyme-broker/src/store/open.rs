@@ -529,6 +529,14 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    pub(crate) fn cleaned_session_max_id(&self) -> Result<i64, BrokerError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM sessions WHERE status = 'cleaned'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Read one bounded keyset page without decoding the rest of the history.
     pub(crate) fn cleaned_session_page(
         &self,

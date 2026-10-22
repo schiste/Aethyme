@@ -229,6 +229,7 @@ struct ClosedSessionPages {
     after: i64,
     wrapped: bool,
     only: Option<i64>,
+    high_water: Option<i64>,
     done: bool,
 }
 
@@ -240,6 +241,7 @@ impl ClosedSessionPages {
             after: only.map_or(start, |id| id.saturating_sub(1)),
             wrapped: only.is_some(),
             only,
+            high_water: None,
             done: false,
         }
     }
@@ -251,9 +253,24 @@ impl ClosedSessionPages {
         if self.done {
             return Ok(Vec::new());
         }
+        let high_water = match self.high_water {
+            Some(id) => id,
+            None => {
+                let id = match self.only {
+                    Some(id) => id,
+                    None => store.cleaned_session_max_id()?,
+                };
+                self.high_water = Some(id);
+                id
+            }
+        };
         loop {
-            let through = self.only.or(self.wrapped.then_some(self.start));
-            let page = store.cleaned_session_page(self.after, through, 32)?;
+            let through = self.only.unwrap_or(if self.wrapped {
+                self.start.min(high_water)
+            } else {
+                high_water
+            });
+            let page = store.cleaned_session_page(self.after, Some(through), 32)?;
             if let Some(last) = page.last() {
                 self.after = last.id;
                 return Ok(page);
@@ -9791,6 +9808,42 @@ mod tests {
         assert_eq!(
             std::fs::read(remembered.join("preserve")).unwrap(),
             b"recovery evidence"
+        );
+    }
+
+    #[test]
+    fn session_history_lap_does_not_chase_newly_closed_tail_rows() {
+        let (_temp, store) = session_history_fixture(64);
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let mut pages = ClosedSessionPages::new(3, None);
+        let mut actual = pages
+            .next_page(&store)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, (4..=35).collect::<Vec<_>>());
+        conn.execute(
+            "INSERT INTO sessions (id, worktree_path, branch, origin, status,
+             cleanup_state, created_at, updated_at, last_activity_at)
+             VALUES (65, '/synthetic/history/65', 'fixture', 'spawned', 'cleaned', 'closed', 1, 1, 1)", [],
+        ).unwrap();
+        loop {
+            let page = pages.next_page(&store).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            actual.extend(page.into_iter().map(|s| s.id));
+        }
+        assert_eq!(actual, (4..=64).chain(1..=3).collect::<Vec<_>>());
+        assert_eq!(
+            ClosedSessionPages::new(64, None)
+                .next_page(&store)
+                .unwrap()
+                .first()
+                .unwrap()
+                .id,
+            65
         );
     }
 
