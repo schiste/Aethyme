@@ -134,7 +134,8 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::GatePolicyUntrusted { .. }
         | E::SessionPushRefused { .. }
         | E::LeaseRequestRefused { .. }
-        | E::SessionSyncRefused { .. } => REFUSED,
+        | E::SessionSyncRefused { .. }
+        | E::GuardedExecTimeoutRequiresSupervision { .. } => REFUSED,
         _ => FAILED,
     }
 }
@@ -212,6 +213,15 @@ mod tests {
             for_broker_error(&BrokerOpError::LeaseClaimPreparationTimedOut { budget_ms: 30_000 }),
             ENVIRONMENT
         );
+    }
+
+    #[test]
+    fn guarded_exec_timeout_refusal_is_a_policy_refusal() {
+        let error = BrokerOpError::GuardedExecTimeoutRequiresSupervision {
+            session_id: 42,
+            reason: "terminal mode".into(),
+        };
+        assert_eq!(for_broker_error(&error), REFUSED);
     }
 
     #[test]

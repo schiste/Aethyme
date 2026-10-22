@@ -502,6 +502,13 @@ pub enum BrokerOpError {
     },
     #[error("guarded exec requires a command after --")]
     MissingExecCommand,
+    /// A requested execution deadline is enforceable only by the supervised
+    /// process-group runner; legacy terminal execution is intentionally left
+    /// unchanged and cannot promise descendant cleanup.
+    #[error(
+        "guarded exec timeout requires supervised execution for session {session_id}: {reason}"
+    )]
+    GuardedExecTimeoutRequiresSupervision { session_id: i64, reason: String },
     /// The command was dispatched to the supervised helper, but its final
     /// result could not be recovered. Cleanup was verified, but ownership audit
     /// was skipped because the command result is uncertain.
@@ -2333,6 +2340,10 @@ pub struct GuardedExecReport {
     pub command: Vec<String>,
     pub exit_code: Option<i32>,
     pub command_success: bool,
+    /// Always serialized. True only when supervised execution had no completed
+    /// result before its deadline and process-group cleanup was verified;
+    /// normal child exits and legacy execution report false.
+    pub command_timed_out: bool,
     /// The post-execution ownership audit, independent of the child exit status.
     pub ownership_ok: bool,
     pub conflicting_leases: Vec<LeaseBlocker>,
