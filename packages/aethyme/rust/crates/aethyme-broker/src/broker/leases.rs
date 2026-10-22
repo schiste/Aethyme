@@ -2286,6 +2286,59 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
+    fn stale_path_lease_is_informational_but_live_claim_still_refuses() {
+        let (repository, _storage, mut broker) = fixture();
+        let holder = broker.start_worktree("lease holder", None).unwrap();
+        let claimant = broker.start_worktree("lease claimant", None).unwrap();
+        broker.claim_lease(holder.id, "shared.txt", None).unwrap();
+
+        let active_refusal = broker
+            .claim_lease(claimant.id, "shared.txt", None)
+            .expect_err("an active explicit lease must still refuse an overlapping claim");
+        assert!(matches!(
+            active_refusal,
+            BrokerOpError::LeaseClaimConflict { .. }
+        ));
+
+        let missing_worktree = repository
+            .path()
+            .join("missing-stale-owner-worktree")
+            .display()
+            .to_string();
+        broker
+            .store
+            .connection()
+            .execute(
+                "UPDATE sessions
+                 SET status = 'stale', worktree_path = ?1, pid = NULL, last_activity_at = 0
+                 WHERE id = ?2",
+                rusqlite::params![missing_worktree, holder.id],
+            )
+            .unwrap();
+
+        let report = broker.blockers();
+        assert!(
+            report
+                .blockers
+                .iter()
+                .all(|blocker| blocker.kind != crate::BlockerKind::PathLease),
+            "a stale path lease does not become a repository-wide blocker: {report:#?}"
+        );
+
+        let stale_claim = broker
+            .claim_lease(claimant.id, "shared.txt", None)
+            .expect("the shared policy treats a stale lease as informational");
+        assert!(stale_claim.accepted);
+        assert!(stale_claim.blockers.is_empty());
+        assert!(
+            stale_claim
+                .warnings
+                .iter()
+                .any(|warning| warning.session_id == holder.id)
+        );
+    }
+
+    #[test]
     fn timed_out_git_during_claim_preparation_records_no_explicit_claim() {
         use std::time::{Duration, Instant};
 
