@@ -974,7 +974,7 @@ impl Broker {
         };
         // One process snapshot for the whole batch, taken after selection so
         // it is as close to removal as it can be. No snapshot keeps all.
-        let open_paths = crate::reclaim::open_paths_under(Path::new("/"));
+        let open_file_snapshot = crate::reclaim::open_file_snapshot_under(Path::new("/"));
         let records = crate::measurement::load_size_records(self.main_root());
         let mut attempted_any = false;
         for (candidate, selected_proof) in selected {
@@ -1004,22 +1004,11 @@ impl Broker {
                     continue;
                 }
             };
-            let Some(open_paths) = open_paths.as_ref() else {
-                keep_it(
-                    &mut report,
-                    "could not list open files (lsof unavailable), so process use is unknown"
-                        .into(),
-                );
-                continue;
-            };
-            if let Some(open) = open_paths
-                .iter()
-                .find(|open| open.starts_with(&candidate.worktree))
-            {
-                keep_it(
-                    &mut report,
-                    format!("a process has {} open", open.display()),
-                );
+            if let Some(reason) = crate::reclaim::open_file_snapshot_blocker_for_worktree(
+                &open_file_snapshot,
+                &candidate.worktree,
+            ) {
+                keep_it(&mut report, reason);
                 continue;
             }
             // Revalidate every proof now, under the lock, right before removal.

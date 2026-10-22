@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -874,9 +875,8 @@ pub const RECENT_WORK_WINDOW_MS: i64 = 3 * 3_600_000;
 /// Session state cannot see a dev server, a test watcher or a build started
 /// from a plain shell: each outlives the agent that launched it and keeps
 /// writing to the very `node_modules` or `target/` a reclaim would delete.
-/// `open_paths` is one snapshot of every open path (see
-/// [`open_paths_under`]); a candidate is kept when any of them lies in its
-/// worktree.
+/// The process-use snapshot is one listing of open paths with their process
+/// identities; a candidate is kept when any of them lies in its worktree.
 pub fn protect_worktrees_with_open_files(
     candidates: &mut [ReclaimCandidate],
     open_paths: &[PathBuf],
@@ -897,6 +897,136 @@ pub fn protect_worktrees_with_open_files(
                 .into();
         }
     }
+}
+
+/// Process attribution for one named file from a complete `lsof` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenFileUse {
+    pub pid: u32,
+    pub command: String,
+    pub path: PathBuf,
+}
+
+/// A process-use scan is either complete or explicitly unknown. A partial
+/// `lsof` listing must never be treated as an empty listing by a caller that
+/// decides whether to delete build output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenFileSnapshot {
+    Complete(Vec<OpenFileUse>),
+    Incomplete {
+        reason: String,
+        observed: Vec<OpenFileUse>,
+    },
+}
+
+/// Keep a worktree candidate when a complete snapshot attributes an open path
+/// to a process. The reason retains enough identity to find the process and
+/// file during a cleanup review.
+pub(crate) fn protect_worktrees_with_open_file_uses(
+    candidates: &mut [ReclaimCandidate],
+    open_files: &[OpenFileUse],
+) {
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| candidate.reclaimable)
+    {
+        if let Some(open) = open_file_use_for_worktree(&candidate.worktree, open_files) {
+            candidate.reclaimable = false;
+            candidate.reason = open_file_use_reason(open);
+        }
+    }
+}
+
+/// Keep all otherwise-reclaimable candidates when process use could not be
+/// checked. The failure reason is deliberately bounded and is not evidence
+/// that a worktree is idle.
+pub(crate) fn protect_worktrees_when_open_file_snapshot_is_incomplete(
+    candidates: &mut [ReclaimCandidate],
+    reason: &str,
+    observed: &[OpenFileUse],
+) {
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| candidate.reclaimable)
+    {
+        candidate.reclaimable = false;
+        candidate.reason = incomplete_open_file_reason(
+            reason,
+            open_file_use_for_worktree(&candidate.worktree, observed),
+        );
+    }
+}
+
+pub(crate) fn open_file_snapshot_blocker_for_worktree(
+    snapshot: &OpenFileSnapshot,
+    worktree: &Path,
+) -> Option<String> {
+    match snapshot {
+        OpenFileSnapshot::Complete(open_files) => {
+            open_file_use_for_worktree(worktree, open_files).map(open_file_use_reason)
+        }
+        OpenFileSnapshot::Incomplete { reason, observed } => Some(incomplete_open_file_reason(
+            reason,
+            open_file_use_for_worktree(worktree, observed),
+        )),
+    }
+}
+
+fn open_file_use_for_worktree<'a>(
+    worktree: &Path,
+    open_files: &'a [OpenFileUse],
+) -> Option<&'a OpenFileUse> {
+    let canonical = std::fs::canonicalize(worktree).ok();
+    open_files.iter().find(|open| {
+        open.path.starts_with(worktree)
+            || canonical
+                .as_ref()
+                .is_some_and(|canonical| open.path.starts_with(canonical))
+    })
+}
+
+fn incomplete_open_file_reason(reason: &str, observed: Option<&OpenFileUse>) -> String {
+    let reason = bounded_reason(reason, 240);
+    if let Some(open) = observed {
+        bounded_reason(
+            &format!(
+                "{}; lsof snapshot incomplete ({reason}); kept for safety",
+                open_file_use_reason(open)
+            ),
+            520,
+        )
+    } else {
+        format!("process use could not be checked ({reason}); kept for safety")
+    }
+}
+
+pub(crate) fn open_file_use_reason(open: &OpenFileUse) -> String {
+    format!(
+        "process {} ({}) has {} open",
+        open.pid,
+        bounded_process_command(&open.command),
+        bounded_open_path(&open.path)
+    )
+}
+
+fn bounded_process_command(command: &str) -> String {
+    bounded_reason(&format!("{command:?}"), 120)
+}
+
+fn bounded_open_path(path: &Path) -> String {
+    bounded_reason(&format!("{path:?}"), 360)
+}
+
+fn bounded_reason(reason: &str, max_bytes: usize) -> String {
+    let mut bounded = String::new();
+    for character in reason.chars() {
+        if bounded.len() + character.len_utf8() + '…'.len_utf8() > max_bytes {
+            bounded.push('…');
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
 }
 
 /// Keep candidates in worktrees whose Git index changed within `window_ms`.
@@ -955,54 +1085,313 @@ fn git_index_path(worktree: &Path) -> Option<PathBuf> {
     Some(worktree.join(gitdir).join("index"))
 }
 
-/// Every path a process on this host has open beneath `root`, from one
-/// `lsof` snapshot, or `None` when the snapshot cannot be taken.
+/// Runtime and output bounds for a system-wide process-use observation.
+const OPEN_FILE_SNAPSHOT_BUDGET: Duration = Duration::from_secs(10);
+const OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+
+/// One bounded, system-wide `lsof` snapshot filtered to names beneath `root`.
 ///
-/// One system-wide listing filtered here, rather than `lsof +D`: `+D` walks
-/// the whole tree, which under a root of build caches is the slow part of a
-/// reclaim already. Working directories are included -- `lsof` reports them as
-/// the `cwd` descriptor -- so an idle shell parked in a worktree keeps it.
-pub fn open_paths_under(root: &Path) -> Option<Vec<PathBuf>> {
+/// `lsof +D` is intentionally avoided: it walks the complete cache tree. The
+/// command is supervised by `bounded_output`, and timeout, output-limit,
+/// nonzero-exit, malformed, or empty results remain `Incomplete` rather than
+/// being interpreted as no process use.
+pub(crate) fn open_file_snapshot_under(root: &Path) -> OpenFileSnapshot {
     // `lsof` lives in /usr/sbin on macOS, which a trimmed PATH (a launchd
-    // job, a test harness) leaves out; not finding it must not read as "no
-    // process uses this", so the standard locations are tried too (#588).
-    let output = ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof"]
-        .into_iter()
-        .find_map(|program| {
-            std::process::Command::new(program)
-                .args(["-w", "-n", "-P", "-Fn"])
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-        })?;
-    // `lsof` exits 1 when it could not inspect some process (another user's,
-    // one that exited mid-listing) while still listing every other one; only
-    // an empty listing means no snapshot was taken.
-    if output.stdout.is_empty() {
-        return None;
+    // job, a test harness) leaves out; the standard locations are tried too
+    // (#588). A successfully spawned but incomplete listing is not retried as
+    // another binary and never becomes a successful empty snapshot.
+    for program in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof"] {
+        let mut command = std::process::Command::new(program);
+        command.args(["-w", "-n", "-P", "-F0pcfn"]);
+        match crate::bounded_output::output_limited(
+            &mut command,
+            OPEN_FILE_SNAPSHOT_BUDGET,
+            OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES,
+        ) {
+            Ok(output) => return snapshot_from_lsof_capture(output, root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return incomplete_open_file_snapshot(format!(
+                    "could not run lsof ({program}): {error}"
+                ));
+            }
+        }
     }
-    Some(parse_lsof_names(
-        &String::from_utf8_lossy(&output.stdout),
-        root,
-    ))
+    incomplete_open_file_snapshot("lsof was not found in PATH or standard locations")
 }
 
-/// The `n` (name) fields of `lsof -F` output that lie beneath `root`, under
-/// either its given or its canonical spelling.
-fn parse_lsof_names(listing: &str, root: &Path) -> Vec<PathBuf> {
-    let canonical = std::fs::canonicalize(root).ok();
-    listing
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .map(PathBuf::from)
-        .filter(|path| {
-            path.starts_with(root)
-                || canonical
-                    .as_ref()
-                    .is_some_and(|canonical| path.starts_with(canonical))
-        })
-        .collect()
+fn snapshot_from_lsof_capture(
+    output: crate::bounded_output::LimitedOutput,
+    root: &Path,
+) -> OpenFileSnapshot {
+    match output {
+        crate::bounded_output::LimitedOutput::Completed(output) => parse_lsof_output(
+            output.status.success(),
+            &output.stdout,
+            &output.stderr,
+            root,
+        ),
+        crate::bounded_output::LimitedOutput::Deadline => incomplete_open_file_snapshot(format!(
+            "lsof exceeded its {} second time limit",
+            OPEN_FILE_SNAPSHOT_BUDGET.as_secs()
+        )),
+        crate::bounded_output::LimitedOutput::OutputLimit => {
+            incomplete_open_file_snapshot(format!(
+                "lsof output exceeded its {} MiB limit",
+                OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES / (1024 * 1024)
+            ))
+        }
+    }
+}
+
+/// Compatibility view for callers that need only names. `None` means the
+/// process-use snapshot is uncertain; callers must keep the candidate.
+pub fn open_paths_under(root: &Path) -> Option<Vec<PathBuf>> {
+    open_paths_from_snapshot(open_file_snapshot_under(root))
+}
+
+fn open_paths_from_snapshot(snapshot: OpenFileSnapshot) -> Option<Vec<PathBuf>> {
+    match snapshot {
+        OpenFileSnapshot::Complete(open_files) => Some(
+            open_files
+                .into_iter()
+                .map(|open_file| open_file.path)
+                .collect(),
+        ),
+        OpenFileSnapshot::Incomplete { .. } => None,
+    }
+}
+
+fn incomplete_open_file_snapshot(reason: impl Into<String>) -> OpenFileSnapshot {
+    OpenFileSnapshot::Incomplete {
+        reason: reason.into(),
+        observed: Vec::new(),
+    }
+}
+
+fn parse_lsof_output(
+    successful_exit: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    root: &Path,
+) -> OpenFileSnapshot {
+    let (observed, parse_error) = match parse_lsof_records(stdout, root) {
+        Ok(open_files) => (open_files, None),
+        Err((open_files, reason)) => (open_files, Some(reason)),
+    };
+    if !successful_exit {
+        return OpenFileSnapshot::Incomplete {
+            reason: "lsof exited unsuccessfully; its listing may be partial".into(),
+            observed,
+        };
+    }
+    if !stderr.is_empty() {
+        return OpenFileSnapshot::Incomplete {
+            reason: "lsof wrote diagnostics; completeness of its listing is unknown".into(),
+            observed,
+        };
+    }
+    match parse_error {
+        None => OpenFileSnapshot::Complete(observed),
+        Some(reason) => OpenFileSnapshot::Incomplete { reason, observed },
+    }
+}
+
+/// Parse NUL-delimited `lsof -F0pcfn` records. PID and command context is
+/// required for every pathname. A malformed or truncated suffix is rejected;
+/// paths from preceding complete records remain useful positive evidence but
+/// never make the snapshot complete.
+fn parse_lsof_records(
+    listing: &[u8],
+    root: &Path,
+) -> Result<Vec<OpenFileUse>, (Vec<OpenFileUse>, String)> {
+    if listing.is_empty() {
+        return Err((Vec::new(), "lsof returned an empty listing".into()));
+    }
+
+    let terminated = listing.ends_with(&[0]);
+    let fields_bytes = if terminated {
+        &listing[..listing.len() - 1]
+    } else {
+        listing
+    };
+    let fields = fields_bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let complete_field_count = if terminated {
+        fields.len()
+    } else {
+        fields.len().saturating_sub(1)
+    };
+
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let mut pid = None;
+    let mut command = None;
+    let mut saw_process = false;
+    let mut saw_name = false;
+    let mut saw_file_for_process = false;
+    let mut awaiting_name = false;
+    let mut open_files = Vec::new();
+
+    for field in fields.into_iter().take(complete_field_count) {
+        let field = field.strip_prefix(b"\n").unwrap_or(field);
+        let Some((&kind, value)) = field.split_first() else {
+            return Err((open_files, "lsof listing contained an empty field".into()));
+        };
+        if value.is_empty() {
+            return Err((
+                open_files,
+                "lsof listing contained an empty field value".into(),
+            ));
+        }
+        match kind {
+            b'p' => {
+                if saw_process && command.is_none() {
+                    return Err((open_files, "lsof process record had no command name".into()));
+                }
+                if awaiting_name || (saw_process && !saw_file_for_process) {
+                    return Err((
+                        open_files,
+                        "lsof process record had an unnamed open-file record".into(),
+                    ));
+                }
+                let Some(parsed_pid) = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|pid| *pid != 0)
+                else {
+                    return Err((open_files, "lsof process record had an invalid PID".into()));
+                };
+                pid = Some(parsed_pid);
+                command = None;
+                saw_process = true;
+                saw_file_for_process = false;
+            }
+            b'c' => {
+                if pid.is_none() {
+                    return Err((open_files, "lsof command field preceded its PID".into()));
+                }
+                let Some(parsed_command) = std::str::from_utf8(value)
+                    .ok()
+                    .filter(|command| !command.is_empty())
+                else {
+                    return Err((
+                        open_files,
+                        "lsof process record had an invalid command".into(),
+                    ));
+                };
+                if command
+                    .as_deref()
+                    .is_some_and(|command| command != parsed_command)
+                {
+                    return Err((
+                        open_files,
+                        "lsof process record had conflicting command names".into(),
+                    ));
+                }
+                command = Some(parsed_command.to_string());
+            }
+            b'f' => {
+                if pid.is_none() || command.is_none() {
+                    return Err((
+                        open_files,
+                        "lsof file descriptor preceded its process identity".into(),
+                    ));
+                }
+                if awaiting_name {
+                    return Err((
+                        open_files,
+                        "lsof file descriptor had no pathname record".into(),
+                    ));
+                }
+                awaiting_name = true;
+                saw_file_for_process = true;
+            }
+            b'n' => {
+                let Some(pid) = pid else {
+                    return Err((
+                        open_files,
+                        "lsof path field preceded its process record".into(),
+                    ));
+                };
+                let Some(command) = command.as_ref() else {
+                    return Err((open_files, "lsof path field had no process command".into()));
+                };
+                if !awaiting_name {
+                    return Err((
+                        open_files,
+                        "lsof pathname had no preceding file descriptor".into(),
+                    ));
+                }
+                saw_name = true;
+                awaiting_name = false;
+                let Some(path) = path_from_lsof_bytes(value) else {
+                    return Err((
+                        open_files,
+                        "lsof path field could not be represented on this platform".into(),
+                    ));
+                };
+                // Non-path names (for example socket descriptions) cannot
+                // name an entry beneath a worktree. Filesystem paths are
+                // absolute in lsof's name field.
+                if path.is_absolute()
+                    && (path.starts_with(root)
+                        || canonical_root
+                            .as_ref()
+                            .is_some_and(|root| path.starts_with(root)))
+                {
+                    open_files.push(OpenFileUse {
+                        pid,
+                        command: command.clone(),
+                        path,
+                    });
+                }
+            }
+            _ => {
+                return Err((
+                    open_files,
+                    "lsof listing contained an unexpected field".into(),
+                ));
+            }
+        }
+    }
+    if !terminated {
+        return Err((open_files, "lsof listing was not NUL-terminated".into()));
+    }
+    if awaiting_name {
+        return Err((
+            open_files,
+            "lsof file descriptor had no pathname record".into(),
+        ));
+    }
+    if !saw_process || command.is_none() {
+        return Err((
+            open_files,
+            "lsof listing contained no complete process record".into(),
+        ));
+    }
+    if !saw_name {
+        return Err((
+            open_files,
+            "lsof listing contained no pathname records".into(),
+        ));
+    }
+    if !saw_file_for_process {
+        return Err((
+            open_files,
+            "lsof process record had no file descriptors".into(),
+        ));
+    }
+    Ok(open_files)
+}
+
+#[cfg(unix)]
+fn path_from_lsof_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn path_from_lsof_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    String::from_utf8(bytes.to_vec()).ok().map(PathBuf::from)
 }
 
 /// What stays fixed while one worktree is walked.
@@ -1482,12 +1871,162 @@ mod scan_tests {
     }
 
     #[test]
-    fn lsof_names_are_narrowed_to_the_root() {
-        let listing = "p123\nfcwd\nn/w/root/a\nf3\nn/elsewhere/b\np9\nn/w/root/c/d.txt\n";
-        assert_eq!(
-            parse_lsof_names(listing, Path::new("/w/root")),
-            vec![p("/w/root/a"), p("/w/root/c/d.txt")]
+    fn lsof_records_retain_process_identity_and_are_narrowed_to_the_root() {
+        let listing = b"p123\0cnode\0\nfcwd\0n/w/root/web/vite.log\0\nf3\0n/w/root/path\nwith-newline\0\np9\0csh\0\nf4\0n/w/other/file\0";
+        let OpenFileSnapshot::Complete(open_files) =
+            parse_lsof_output(true, listing, &[], Path::new("/w/root"))
+        else {
+            panic!("well-formed lsof records should be complete");
+        };
+        assert_eq!(open_files.len(), 2);
+        assert_eq!(open_files[0].pid, 123);
+        assert_eq!(open_files[0].command, "node");
+        assert_eq!(open_files[0].path, p("/w/root/web/vite.log"));
+        assert_eq!(open_files[1].pid, 123);
+        assert_eq!(open_files[1].path, p("/w/root/path\nwith-newline"));
+    }
+
+    #[test]
+    fn failed_or_incomplete_lsof_records_are_not_an_empty_snapshot() {
+        let root = Path::new("/w/root");
+        let partial = b"p123\0cnode\0\nf3\0n/w/root/target/file\0";
+        for snapshot in [
+            parse_lsof_output(false, partial, &[], root),
+            parse_lsof_output(true, partial, b"permission warning", root),
+            parse_lsof_output(true, &[], &[], root),
+            parse_lsof_output(true, b"p123\0cnode\0n/w/root/target/file", &[], root),
+            parse_lsof_output(true, b"p123\0n/w/root/target/file\0", &[], root),
+            parse_lsof_output(true, b"cnode\0\nf3\0n/w/root/target/file\0", &[], root),
+        ] {
+            assert!(
+                matches!(&snapshot, OpenFileSnapshot::Incomplete { .. }),
+                "invalid lsof result must remain unknown: {snapshot:?}"
+            );
+            assert!(open_paths_from_snapshot(snapshot).is_none());
+        }
+    }
+
+    #[test]
+    fn lsof_timeout_and_output_limit_remain_unknown() {
+        let root = Path::new("/w/root");
+        for result in [
+            crate::bounded_output::LimitedOutput::Deadline,
+            crate::bounded_output::LimitedOutput::OutputLimit,
+        ] {
+            assert!(matches!(
+                snapshot_from_lsof_capture(result, root),
+                OpenFileSnapshot::Incomplete { observed, .. } if observed.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn incomplete_lsof_retains_known_process_use_without_trusting_absence() {
+        let root = Path::new("/w/root");
+        let listing = b"p123\0cnode\0\nf3\0n/w/root/target/file\0";
+        let OpenFileSnapshot::Incomplete { reason, observed } =
+            parse_lsof_output(false, listing, &[], root)
+        else {
+            panic!("a nonzero lsof exit must be incomplete");
+        };
+        assert_eq!(observed.len(), 1);
+        let mut candidates = vec![
+            classify(&p("/w/root/target"), &p("/w/root"), 8, &[]),
+            classify(&p("/w/other/target"), &p("/w/other"), 8, &[]),
+        ];
+        protect_worktrees_when_open_file_snapshot_is_incomplete(
+            &mut candidates,
+            &reason,
+            &observed,
         );
+        assert!(!candidates[0].reclaimable);
+        assert!(candidates[0].reason.contains("123"));
+        assert!(candidates[0].reason.contains("node"));
+        assert!(candidates[0].reason.contains("/w/root/target/file"));
+        assert!(candidates[0].reason.contains("incomplete"));
+        assert!(!candidates[1].reclaimable);
+        assert!(
+            candidates[1]
+                .reason
+                .contains("process use could not be checked")
+        );
+    }
+
+    #[test]
+    fn incomplete_process_use_keeps_every_otherwise_reclaimable_candidate() {
+        let mut candidates = vec![
+            classify(&p("/w/one/target"), &p("/w/one"), 8, &[]),
+            classify(&p("/w/two/node_modules"), &p("/w/two"), 8, &[]),
+        ];
+        protect_worktrees_when_open_file_snapshot_is_incomplete(
+            &mut candidates,
+            "lsof exceeded its time limit",
+            &[],
+        );
+        assert!(candidates.iter().all(|candidate| !candidate.reclaimable));
+        assert!(candidates.iter().all(|candidate| {
+            candidate
+                .reason
+                .contains("process use could not be checked")
+                && candidate.reason.contains("kept for safety")
+        }));
+    }
+
+    #[test]
+    fn open_process_reason_includes_bounded_pid_command_and_path() {
+        let mut candidates = vec![
+            classify(&p("/w/busy/target"), &p("/w/busy"), 8, &[]),
+            classify(&p("/w/quiet/target"), &p("/w/quiet"), 8, &[]),
+        ];
+        protect_worktrees_with_open_file_uses(
+            &mut candidates,
+            &[OpenFileUse {
+                pid: 4321,
+                command: "node\nwatcher".into(),
+                path: p("/w/busy/node_modules/.pnpm-store/index"),
+            }],
+        );
+        assert!(!candidates[0].reclaimable);
+        assert!(candidates[0].reason.contains("4321"));
+        assert!(candidates[0].reason.contains("node\\nwatcher"));
+        assert!(candidates[0].reason.contains(".pnpm-store/index"));
+        assert!(candidates[0].reason.len() <= 520);
+        assert!(candidates[1].reclaimable);
+    }
+
+    #[test]
+    fn process_use_blocker_keeps_unknown_results_and_attributes_known_ones() {
+        let worktree = p("/w/repo");
+        let open = OpenFileUse {
+            pid: 77,
+            command: "node".into(),
+            path: p("/w/repo/node_modules/.pnpm-store/index"),
+        };
+        let complete = OpenFileSnapshot::Complete(vec![open.clone()]);
+        let reason = open_file_snapshot_blocker_for_worktree(&complete, &worktree).unwrap();
+        assert!(reason.contains("77"));
+        assert!(reason.contains("node"));
+        assert!(reason.contains(".pnpm-store/index"));
+
+        let incomplete_without_names = OpenFileSnapshot::Incomplete {
+            reason: "lsof exceeded its time limit".into(),
+            observed: Vec::new(),
+        };
+        let reason =
+            open_file_snapshot_blocker_for_worktree(&incomplete_without_names, &worktree).unwrap();
+        assert!(reason.contains("process use could not be checked"));
+        assert!(reason.contains("kept for safety"));
+
+        let incomplete_with_known_use = OpenFileSnapshot::Incomplete {
+            reason: "lsof exited unsuccessfully".into(),
+            observed: vec![open],
+        };
+        let reason =
+            open_file_snapshot_blocker_for_worktree(&incomplete_with_known_use, &worktree).unwrap();
+        assert!(reason.contains("77"));
+        assert!(reason.contains("/w/repo/node_modules/.pnpm-store/index"));
+        assert!(reason.contains("incomplete"));
+        assert!(reason.contains("kept for safety"));
     }
 
     fn set_index_age(worktree: &Path, age: std::time::Duration) {
