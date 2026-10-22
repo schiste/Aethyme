@@ -869,36 +869,6 @@ pub fn protect_unrecorded_worktrees(candidates: &mut [ReclaimCandidate], recorde
 /// here recently whatever the session row says.
 pub const RECENT_WORK_WINDOW_MS: i64 = 3 * 3_600_000;
 
-/// Keep candidates in worktrees a process has a file or working directory
-/// open in.
-///
-/// Session state cannot see a dev server, a test watcher or a build started
-/// from a plain shell: each outlives the agent that launched it and keeps
-/// writing to the very `node_modules` or `target/` a reclaim would delete.
-/// The process-use snapshot is one listing of open paths with their process
-/// identities; a candidate is kept when any of them lies in its worktree.
-pub fn protect_worktrees_with_open_files(
-    candidates: &mut [ReclaimCandidate],
-    open_paths: &[PathBuf],
-) {
-    for candidate in candidates.iter_mut().filter(|c| c.reclaimable) {
-        let worktree = &candidate.worktree;
-        let canonical = std::fs::canonicalize(worktree).ok();
-        let in_use = open_paths.iter().any(|open| {
-            open.starts_with(worktree)
-                || canonical
-                    .as_ref()
-                    .is_some_and(|canonical| open.starts_with(canonical))
-        });
-        if in_use {
-            candidate.reclaimable = false;
-            candidate.reason = "a process has a file or working directory open in this \
-                worktree; a build or dev server may still be using it"
-                .into();
-        }
-    }
-}
-
 /// Process attribution for one named file from a complete `lsof` snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenFileUse {
@@ -1141,24 +1111,6 @@ fn snapshot_from_lsof_capture(
                 OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES / (1024 * 1024)
             ))
         }
-    }
-}
-
-/// Compatibility view for callers that need only names. `None` means the
-/// process-use snapshot is uncertain; callers must keep the candidate.
-pub fn open_paths_under(root: &Path) -> Option<Vec<PathBuf>> {
-    open_paths_from_snapshot(open_file_snapshot_under(root))
-}
-
-fn open_paths_from_snapshot(snapshot: OpenFileSnapshot) -> Option<Vec<PathBuf>> {
-    match snapshot {
-        OpenFileSnapshot::Complete(open_files) => Some(
-            open_files
-                .into_iter()
-                .map(|open_file| open_file.path)
-                .collect(),
-        ),
-        OpenFileSnapshot::Incomplete { .. } => None,
     }
 }
 
@@ -1859,10 +1811,19 @@ mod scan_tests {
             classify(&p("/w/busy/target"), &p("/w/busy"), 8, &[]),
             classify(&p("/w/quiet/target"), &p("/w/quiet"), 8, &[]),
         ];
-        protect_worktrees_with_open_files(&mut candidates, &[p("/w/busy/web/vite.log")]);
+        protect_worktrees_with_open_file_uses(
+            &mut candidates,
+            &[OpenFileUse {
+                pid: 4321,
+                command: "node".into(),
+                path: p("/w/busy/web/vite.log"),
+            }],
+        );
         assert!(!candidates[0].reclaimable);
         assert!(
-            candidates[0].reason.contains("open"),
+            candidates[0].reason.contains("4321")
+                && candidates[0].reason.contains("node")
+                && candidates[0].reason.contains("/w/busy/web/vite.log"),
             "{}",
             candidates[0].reason
         );
@@ -1872,7 +1833,14 @@ mod scan_tests {
     #[test]
     fn a_sibling_worktree_sharing_a_name_prefix_is_not_kept() {
         let mut candidates = vec![classify(&p("/w/app/target"), &p("/w/app"), 8, &[])];
-        protect_worktrees_with_open_files(&mut candidates, &[p("/w/app-2/src/main.rs")]);
+        protect_worktrees_with_open_file_uses(
+            &mut candidates,
+            &[OpenFileUse {
+                pid: 4321,
+                command: "node".into(),
+                path: p("/w/app-2/src/main.rs"),
+            }],
+        );
         assert!(candidates[0].reclaimable, "{}", candidates[0].reason);
     }
 
@@ -1920,7 +1888,6 @@ mod scan_tests {
                 matches!(&snapshot, OpenFileSnapshot::Incomplete { .. }),
                 "invalid lsof result must remain unknown: {snapshot:?}"
             );
-            assert!(open_paths_from_snapshot(snapshot).is_none());
         }
     }
 
