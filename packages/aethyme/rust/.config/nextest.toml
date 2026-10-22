@@ -16,6 +16,8 @@ fail-fast = true
 failure-output = "final"
 success-output = "never"
 status-level = "fail"
+# Bound each test process so a hang cannot hold the local gate indefinitely.
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.ci]
 # Report every failure in one run instead of stopping at the first.
