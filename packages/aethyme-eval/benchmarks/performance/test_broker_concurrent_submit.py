@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -206,6 +207,35 @@ class BoundedProcessTests(unittest.TestCase):
             with scenario_fixture('unverified-cleanup', Path(temporary)) as (root, state):
                 state['runner'] = SimpleNamespace(cleanup_incomplete=True)
             self.assertTrue(root.is_dir())
+
+    def test_shared_incomplete_flag_does_not_skip_this_command_cleanup(self):
+        pid_path = self.root / 'long-lived-command.pid'
+        code = (
+            'import pathlib, os, time; '
+            f'pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); '
+            'time.sleep(30)'
+        )
+
+        def mark_other_cleanup_incomplete(timeout):
+            deadline = time.monotonic() + 1
+            while not pid_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pid_path.is_file())
+            self.runner.cleanup_incomplete = True
+            time.sleep(min(timeout, 0.01))
+            return []
+
+        with mock.patch(
+                'broker_concurrent_submit.selectors.DefaultSelector.select',
+                side_effect=mark_other_cleanup_incomplete):
+            with self.assertRaisesRegex(RuntimeError, 'command exceeded 0.2 seconds'):
+                self.runner.run(
+                    [sys.executable, '-c', code], self.root,
+                    'shared-cleanup-state', timeout=0.2)
+
+        child_pid = int(pid_path.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
 
     def test_term_ignoring_descendant_is_killed_before_group_anchor_reaped(self):
         pid_path = self.root / 'descendant.pid'

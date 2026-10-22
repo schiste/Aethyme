@@ -388,7 +388,7 @@ class BoundedCommandRunner:
         finally:
             cleanup_error = None
             if (process is not None and process.returncode is None
-                    and not cleanup_attempted and not self.cleanup_incomplete):
+                    and not cleanup_attempted):
                 if failure is None:
                     failure = 'command runner exited before its child completed'
                 cleanup_attempted = True
