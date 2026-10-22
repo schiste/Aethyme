@@ -556,6 +556,7 @@ pub(crate) fn storage_plan_with_context(
     let preparation_cache_root_nonce = preparation_cache_root_binding
         .as_ref()
         .and_then(|binding| binding.instance_nonce.as_deref());
+    let mut enumerate_children = preparation_live_root_children;
     let plan = build_plan(
         &main_root,
         &storage_layout,
@@ -567,6 +568,7 @@ pub(crate) fn storage_plan_with_context(
         crate::SizeScan::Recorded,
         &mut records,
         &worktree_volume_cache_bindings,
+        &mut enumerate_children,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
         binding
@@ -662,6 +664,7 @@ pub(crate) fn storage_apply_with_context(
     let preparation_cache_root = preparation_cache_root_binding
         .as_ref()
         .map(|binding| binding.path.clone());
+    let mut enumerate_children = preparation_live_root_children;
     let plan = build_apply_plan(
         &main_root,
         &storage_layout,
@@ -676,6 +679,7 @@ pub(crate) fn storage_apply_with_context(
         warnings,
         &mut records,
         &worktree_volume_cache_bindings,
+        &mut enumerate_children,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
         binding
@@ -689,6 +693,18 @@ pub(crate) fn storage_apply_with_context(
     if !plan.digest.eq_ignore_ascii_case(confirm) {
         return Err(StorageError::ConfirmationMismatch);
     }
+
+    let mut cache_bindings = preparation_cache_root_binding
+        .into_iter()
+        .collect::<Vec<_>>();
+    cache_bindings.extend(worktree_volume_cache_bindings);
+    let worktree_volume_cache_paths = worktree_volume_cache_paths(&cache_bindings);
+    let live_roots = preparation_live_roots(
+        &main_root,
+        &plan.primary_checkouts,
+        &plan.roots,
+        &worktree_volume_cache_paths,
+    )?;
 
     let mut applied = Vec::new();
     let mut failures = Vec::new();
@@ -706,17 +722,6 @@ pub(crate) fn storage_apply_with_context(
             }),
         }
     }
-    let mut cache_bindings = preparation_cache_root_binding
-        .into_iter()
-        .collect::<Vec<_>>();
-    cache_bindings.extend(worktree_volume_cache_bindings);
-    let worktree_volume_cache_paths = worktree_volume_cache_paths(&cache_bindings);
-    let live_roots = preparation_live_roots(
-        &main_root,
-        &plan.primary_checkouts,
-        &plan.roots,
-        &worktree_volume_cache_paths,
-    );
     for candidate in &plan.preparation_candidates {
         let binding = cache_bindings
             .iter()
@@ -790,7 +795,7 @@ pub(crate) fn storage_apply_with_context(
 /// enrolled tree. Candidate eligibility and confirmation bind filesystem,
 /// Git, ledger, marker, and policy facts; byte estimates are reporting-only.
 #[allow(clippy::too_many_arguments)]
-fn build_apply_plan(
+fn build_apply_plan<F>(
     main_root: &Path,
     storage_layout: &StorageRootLayout,
     preparation_cache_root: Option<&Path>,
@@ -800,7 +805,11 @@ fn build_apply_plan(
     warnings: Vec<String>,
     records: &mut crate::measurement::SizeRecords,
     worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
-) -> Result<StoragePlan, StorageError> {
+    enumerate_children: &mut F,
+) -> Result<StoragePlan, StorageError>
+where
+    F: FnMut(&Path) -> Result<Vec<PathBuf>, StorageError>,
+{
     build_plan(
         main_root,
         storage_layout,
@@ -812,13 +821,14 @@ fn build_apply_plan(
         crate::SizeScan::Recorded,
         records,
         worktree_volume_cache_bindings,
+        enumerate_children,
     )
 }
 
 // Keep the captured preparation-cache identity components explicit here: the
 // plan separately records the optional path, directory identity, and nonce.
 #[allow(clippy::too_many_arguments)]
-fn build_plan(
+fn build_plan<F>(
     main_root: &Path,
     storage_layout: &StorageRootLayout,
     preparation_cache_root: Option<&Path>,
@@ -829,7 +839,11 @@ fn build_plan(
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
     worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
-) -> Result<StoragePlan, StorageError> {
+    enumerate_children: &mut F,
+) -> Result<StoragePlan, StorageError>
+where
+    F: FnMut(&Path) -> Result<Vec<PathBuf>, StorageError>,
+{
     let storage_root = normalise(&absolute_path(main_root, storage_layout.path()));
     let evaluated_at = now_ms();
     let paths = storage_root_entries(&storage_root, storage_layout)?;
@@ -874,12 +888,13 @@ fn build_plan(
     // Live roots come from the worktree container, but the cache itself is
     // resolved beside the host resource database by preparation.rs. These
     // locations can differ when the repository overrides worktree placement.
-    let live_roots = preparation_live_roots(
+    let live_roots = preparation_live_roots_with_reader(
         main_root,
         &primary_checkouts,
         &roots,
         &worktree_volume_cache_paths,
-    );
+        enumerate_children,
+    )?;
     let mut preparation_entries = Vec::new();
     let mut preparation_candidates = Vec::new();
     if let Some(cache_root) = preparation_cache_root {
@@ -3076,7 +3091,27 @@ fn preparation_live_roots(
     primary_checkouts: &[StoragePrimaryCheckout],
     roots: &[StorageRoot],
     verified_worktree_cache_paths: &BTreeSet<PathBuf>,
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>, StorageError> {
+    let mut enumerate_children = preparation_live_root_children;
+    preparation_live_roots_with_reader(
+        main_root,
+        primary_checkouts,
+        roots,
+        verified_worktree_cache_paths,
+        &mut enumerate_children,
+    )
+}
+
+fn preparation_live_roots_with_reader<F>(
+    main_root: &Path,
+    primary_checkouts: &[StoragePrimaryCheckout],
+    roots: &[StorageRoot],
+    verified_worktree_cache_paths: &BTreeSet<PathBuf>,
+    enumerate_children: &mut F,
+) -> Result<Vec<PathBuf>, StorageError>
+where
+    F: FnMut(&Path) -> Result<Vec<PathBuf>, StorageError>,
+{
     let mut live_roots = primary_checkouts
         .iter()
         .map(|checkout| normalise(&checkout.path))
@@ -3085,14 +3120,9 @@ fn preparation_live_roots(
     // Use the same population for inventory and immediate deletion checks.
     // Session worktrees, not just primary checkouts, consume shared entries.
     for root in roots {
-        if let Ok(children) = std::fs::read_dir(&root.path) {
-            for child in children.flatten() {
-                let child_path = child.path();
-                if is_real_directory(&child_path)
-                    && !verified_worktree_cache_paths.contains(&child_path)
-                {
-                    live_roots.push(normalise(&child_path));
-                }
+        for child_path in enumerate_children(&root.path)? {
+            if !verified_worktree_cache_paths.contains(&child_path) {
+                live_roots.push(normalise(&child_path));
             }
         }
     }
@@ -3103,18 +3133,53 @@ fn preparation_live_roots(
         let Some(placement_root) = cache_path.parent() else {
             continue;
         };
-        if let Ok(children) = std::fs::read_dir(placement_root) {
-            for child in children.flatten() {
-                let child_path = child.path();
-                if child_path != *cache_path && is_real_directory(&child_path) {
-                    live_roots.push(normalise(&child_path));
-                }
+        for child_path in enumerate_children(placement_root)? {
+            if child_path != *cache_path {
+                live_roots.push(normalise(&child_path));
             }
         }
     }
     live_roots.sort();
     live_roots.dedup();
-    live_roots
+    Ok(live_roots)
+}
+
+fn preparation_live_root_children(root: &Path) -> Result<Vec<PathBuf>, StorageError> {
+    let children = std::fs::read_dir(root).map_err(|source| StorageError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let mut paths = Vec::new();
+    for child in children {
+        let child = child.map_err(|source| StorageError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let path = child.path();
+        let file_type = child.file_type().map_err(|source| StorageError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if file_type.is_symlink() {
+            return Err(StorageError::Unavailable {
+                reason: format!(
+                    "live-root inventory encountered a symlink at {}; cache liveness is incomplete",
+                    path.display()
+                ),
+            });
+        }
+        if file_type.is_dir() {
+            paths.push(path);
+        } else if child.file_name().as_os_str() != std::ffi::OsStr::new(WORKTREE_ROOT_MARKER) {
+            return Err(StorageError::Unavailable {
+                reason: format!(
+                    "live-root inventory encountered an ambiguous non-directory entry at {}; cache liveness is incomplete",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(paths)
 }
 
 fn worktree_volume_cache_paths(
@@ -5284,6 +5349,200 @@ mod tests {
         }
     }
 
+    struct LiveRootFailureFixture {
+        _temporary: tempfile::TempDir,
+        main_root: PathBuf,
+        storage_layout: StorageRootLayout,
+        host_cache_root: PathBuf,
+        cache_candidate: PathBuf,
+        bindings: Vec<crate::broker::PreparationCacheRootBinding>,
+    }
+
+    impl LiveRootFailureFixture {
+        fn new(placement_root_count: usize) -> Self {
+            let temporary = tempfile::tempdir().unwrap();
+            let main_root = temporary.path().join("repository");
+            std::fs::create_dir_all(&main_root).unwrap();
+            let storage_root = temporary.path().join("worktrees");
+            std::fs::create_dir_all(&storage_root).unwrap();
+
+            let host_cache_root = temporary.path().join("host-preparation-cache");
+            let cache_candidate = host_cache_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("deadbeefdead");
+            std::fs::create_dir_all(&cache_candidate).unwrap();
+            std::fs::write(
+                cache_candidate.join("cache.bin"),
+                b"keep on incomplete inventory",
+            )
+            .unwrap();
+
+            let mut bindings = Vec::new();
+            for index in 0..placement_root_count {
+                let placement_root = temporary.path().join(format!("placement-{index}"));
+                let cache_root = placement_root
+                    .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+                std::fs::create_dir_all(&cache_root).unwrap();
+                let marker = WorktreeRootMarker {
+                    schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+                    repository_key: format!("fixture-{index}"),
+                    repository_root: main_root.clone(),
+                };
+                let marker_path = placement_root.join(WORKTREE_ROOT_MARKER);
+                std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+                let placement_root_handle = std::fs::File::open(&marker_path).unwrap();
+                let host_resource_db_path = temporary.path().join("host-resources.db");
+                bindings.push(crate::broker::PreparationCacheRootBinding {
+                    path: cache_root
+                        .join(TEST_PREPARATION_REPOSITORY)
+                        .join("fixture-cache-key"),
+                    identity: None,
+                    instance_nonce: None,
+                    root_guard: Some(crate::broker::PreparationCacheRootGuard {
+                        root_path: cache_root,
+                        root_identity: Vec::new(),
+                        state: crate::broker::PreparationCacheRootState::Uninitialized,
+                        captured_resource_db_path: host_resource_db_path,
+                        root_handle: std::sync::Arc::new(placement_root_handle),
+                        placement_root: Some(crate::broker::PreparationCachePlacementRootGuard {
+                            path: placement_root,
+                            identity: Vec::new(),
+                            marker,
+                        }),
+                    }),
+                });
+            }
+
+            Self {
+                _temporary: temporary,
+                main_root,
+                storage_layout: StorageRootLayout::KeyedContainer(storage_root),
+                host_cache_root,
+                cache_candidate,
+                bindings,
+            }
+        }
+
+        fn run_plan<F>(
+            &self,
+            apply: bool,
+            enumerate_children: &mut F,
+        ) -> Result<StoragePlan, StorageError>
+        where
+            F: FnMut(&Path) -> Result<Vec<PathBuf>, StorageError>,
+        {
+            let mut records = crate::measurement::SizeRecords::default();
+            if apply {
+                build_apply_plan(
+                    &self.main_root,
+                    &self.storage_layout,
+                    Some(&self.host_cache_root),
+                    None,
+                    None,
+                    7,
+                    Vec::new(),
+                    &mut records,
+                    &self.bindings,
+                    enumerate_children,
+                )
+            } else {
+                build_plan(
+                    &self.main_root,
+                    &self.storage_layout,
+                    Some(&self.host_cache_root),
+                    None,
+                    None,
+                    7,
+                    Vec::new(),
+                    crate::SizeScan::Recorded,
+                    &mut records,
+                    &self.bindings,
+                    enumerate_children,
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn storage_plan_and_apply_refuse_an_unreadable_placement_root() {
+        let fixture = LiveRootFailureFixture::new(1);
+        let expected_root = fixture.bindings[0]
+            .root_guard
+            .as_ref()
+            .unwrap()
+            .placement_root
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+
+        for apply in [false, true] {
+            let mut enumerate_children = |root: &Path| {
+                assert_eq!(root, expected_root.as_path());
+                Err(StorageError::Io {
+                    path: root.to_path_buf(),
+                    source: std::io::Error::other("injected read_dir open failure"),
+                })
+            };
+            let result = fixture.run_plan(apply, &mut enumerate_children);
+            assert!(
+                matches!(result.as_ref().err(), Some(StorageError::Io { .. })),
+                "planning must refuse an unreadable placement root: {result:?}"
+            );
+            assert!(
+                fixture.cache_candidate.is_dir(),
+                "an incomplete liveness inventory must preserve cache entries"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_plan_and_apply_refuse_a_later_placement_iterator_error() {
+        let fixture = LiveRootFailureFixture::new(2);
+        let placement_roots = fixture
+            .bindings
+            .iter()
+            .map(|binding| {
+                binding
+                    .root_guard
+                    .as_ref()
+                    .unwrap()
+                    .placement_root
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(placement_roots[0] < placement_roots[1]);
+
+        for apply in [false, true] {
+            let mut inspected = Vec::new();
+            let mut enumerate_children = |root: &Path| {
+                inspected.push(root.to_path_buf());
+                if root == placement_roots[0].as_path() {
+                    Ok(Vec::new())
+                } else {
+                    Err(StorageError::Io {
+                        path: root.to_path_buf(),
+                        source: std::io::Error::other("injected iterator item failure"),
+                    })
+                }
+            };
+            let result = fixture.run_plan(apply, &mut enumerate_children);
+            drop(enumerate_children);
+            assert!(
+                matches!(result.as_ref().err(), Some(StorageError::Io { .. })),
+                "planning must refuse a partially enumerated placement cohort: {result:?}"
+            );
+            assert_eq!(inspected, placement_roots);
+            assert!(
+                fixture.cache_candidate.is_dir(),
+                "an incomplete liveness inventory must preserve cache entries"
+            );
+        }
+    }
+
     #[test]
     fn storage_root_uses_shared_resolver_and_preserves_root_layouts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6028,7 +6287,7 @@ mod tests {
             estimated_inodes: None,
             reason: "previously dead".into(),
         };
-        let roots = preparation_live_roots(&repo, &[], &[], &BTreeSet::new());
+        let roots = preparation_live_roots(&repo, &[], &[], &BTreeSet::new()).unwrap();
         let resource_db_path = test_host_resource_db(tmp.path());
         assert!(
             apply_preparation_candidate_with_lease_at(
@@ -7033,6 +7292,7 @@ mod tests {
         let root_key = storage_root.to_string_lossy().into_owned();
         let mut records = crate::measurement::SizeRecords::default();
         records.record_usage(&root_key, 0, Some(1), 1);
+        let mut enumerate_children = preparation_live_root_children;
         let plan = build_apply_plan(
             repository.root(),
             &StorageRootLayout::DirectRoot(storage_root.clone()),
@@ -7043,6 +7303,7 @@ mod tests {
             Vec::new(),
             &mut records,
             &[],
+            &mut enumerate_children,
         )
         .unwrap();
 
