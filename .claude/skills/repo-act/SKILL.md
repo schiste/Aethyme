@@ -363,6 +363,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Derive fixture field paths from the actual serde producer, including
   `flatten`, and verify the complete real CLI JSON response; do not infer wire
   nesting from Rust struct nesting.
+- Before merging a qualified PR, inspect `gh pr checks --required` and the
+  repository's current merge requirements. Distinguish queued optional
+  cache-recording jobs from required checks; retain their pending status without
+  imposing an extra merge gate. Investigate any failed substantive check even
+  when it is optional, and never bypass a required check.
 - Before publishing a PR body, run the repository's contract checker against
   that exact body and base. Use its literal checkbox syntax (for example,
   `- [x] **none**`), not prose such as `Contract: none`, and verify the checker

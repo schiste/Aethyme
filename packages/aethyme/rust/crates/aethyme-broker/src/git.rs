@@ -3561,21 +3561,17 @@ impl GitRepo {
     /// the conflicted file list (empty = clean).
     pub fn merge_tree_simulate(&self, base: &str, head: &str) -> Result<MergeSimulation, GitError> {
         // Exit code 1 = conflicts (still writes a tree); >1 = real error.
-        let output = git_command()
-            .args([
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                "--no-messages",
-                base,
-                head,
-            ])
-            .current_dir(&self.root)
-            .output()
-            .map_err(|source| GitError::Spawn {
-                args: "merge-tree --write-tree".into(),
-                source,
-            })?;
+        let args = [
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            base,
+            head,
+        ];
+        let mut command = git_command();
+        command.args(args).current_dir(&self.root);
+        let output = run_git_process_output(command, &args, git_timeout())?;
         let code = output.status.code().unwrap_or(-1);
         if code != 0 && code != 1 {
             return Err(GitError::Git {
@@ -3603,23 +3599,19 @@ impl GitRepo {
         current: &str,
         incoming: &str,
     ) -> Result<MergeSimulation, GitError> {
-        let output = git_command()
-            .args([
-                "merge-tree",
-                "--write-tree",
-                "--name-only",
-                "--no-messages",
-                "--merge-base",
-                old_base,
-                current,
-                incoming,
-            ])
-            .current_dir(&self.root)
-            .output()
-            .map_err(|source| GitError::Spawn {
-                args: "merge-tree --write-tree --merge-base".into(),
-                source,
-            })?;
+        let args = [
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "--merge-base",
+            old_base,
+            current,
+            incoming,
+        ];
+        let mut command = git_command();
+        command.args(args).current_dir(&self.root);
+        let output = run_git_process_output(command, &args, git_timeout())?;
         let code = output.status.code().unwrap_or(-1);
         if code != 0 && code != 1 {
             return Err(GitError::Git {
@@ -5463,6 +5455,72 @@ mod timeout_tests {
             repo.path_is_ignored_checked("target"),
             Err(GitError::TimedOut { .. })
         ));
+    }
+
+    #[test]
+    fn bounded_merge_simulations_preserve_clean_and_conflicting_results() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        run_git(root, &["init", "-q"]).unwrap();
+        run_git(root, &["config", "user.name", "fixture"]).unwrap();
+        run_git(root, &["config", "user.email", "fixture@example.invalid"]).unwrap();
+        std::fs::write(root.join("file.txt"), "base\n").unwrap();
+        run_git(root, &["add", "file.txt"]).unwrap();
+        run_git(root, &["commit", "-qm", "base"]).unwrap();
+        let repo = GitRepo::discover(root).unwrap();
+        let base = repo.head_commit().unwrap();
+        std::fs::write(root.join("file.txt"), "left\n").unwrap();
+        run_git(root, &["commit", "-qam", "left"]).unwrap();
+        let left = repo.head_commit().unwrap();
+        run_git(root, &["checkout", "--detach", &base]).unwrap();
+        std::fs::write(root.join("file.txt"), "right\n").unwrap();
+        run_git(root, &["commit", "-qam", "right"]).unwrap();
+        let right = repo.head_commit().unwrap();
+
+        assert!(
+            repo.merge_tree_simulate(&base, &left)
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+        assert!(
+            repo.merge_tree_with_base(&base, &base, &left)
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+        for result in [
+            repo.merge_tree_simulate(&left, &right),
+            repo.merge_tree_with_base(&base, &left, &right),
+        ] {
+            let result = result.expect("Git exit 1 is a conflict result, not a command failure");
+            assert_eq!(result.conflicts, vec!["file.txt"]);
+            assert!(!result.tree.is_empty());
+        }
+        assert_eq!(
+            repo.head_commit().unwrap(),
+            right,
+            "simulation must not move HEAD"
+        );
+    }
+
+    #[test]
+    fn merge_simulations_refuse_an_expired_inspection_before_starting_git() {
+        let fixture = tempfile::tempdir().unwrap();
+        run_git(fixture.path(), &["init", "-q"]).unwrap();
+        let repo = GitRepo::discover(fixture.path()).unwrap();
+        // Invalid revisions distinguish a spawned Git error from the typed
+        // deadline refusal without sleeps or a timing-sensitive assertion.
+        let _deadline = limit_git_until(Instant::now() - Duration::from_secs(1));
+        for result in [
+            repo.merge_tree_simulate("missing-base", "missing-head"),
+            repo.merge_tree_with_base("missing-base", "missing-current", "missing-incoming"),
+        ] {
+            assert!(
+                matches!(result, Err(GitError::TimedOut { ref args, .. }) if args.starts_with("merge-tree --write-tree")),
+                "an expired inspection must not run a merge simulation: {result:?}"
+            );
+        }
     }
 
     #[test]

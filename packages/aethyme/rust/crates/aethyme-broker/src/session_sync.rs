@@ -251,8 +251,10 @@ impl crate::Broker {
         let catch_up = CatchUp::for_branch(self.repo_handle(), &default.remote, &session.branch);
         let drift =
             crate::main_drift::measure(&worktree, &default_ref, &default_commit, &before, catch_up)
-                .ok_or_else(|| {
-                    sync_refused(format!("could not compare the session with {default_ref}"))
+                .map_err(|error| {
+                    sync_refused(format!(
+                        "could not compare the session with {default_ref}: {error}"
+                    ))
                 })?;
         let mut report = SessionSyncReport {
             session_id,
