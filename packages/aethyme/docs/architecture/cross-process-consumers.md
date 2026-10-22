@@ -751,7 +751,7 @@ it is a child argument. If the supervised helper cannot start, the user command
 is not dispatched and there is no unsupervised fallback. This option does not
 by itself change the JSON report schema.
 
-`aethyme broker exec` accepts `--timeout <seconds>` from 1 through 86400.
+`aethyme broker advanced exec` accepts `--timeout <seconds>` from 1 through 86400.
 Supervised execution defaults to 1800 seconds. An explicit timeout is refused
 when automatic mode selects the legacy terminal runner, which remains
 unbounded. A verified timeout returns a nonzero CLI status after the ownership
