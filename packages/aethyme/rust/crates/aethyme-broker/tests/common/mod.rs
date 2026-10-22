@@ -160,7 +160,7 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
     command
         .env_remove("AETHYME_BROKER_DB")
         .env_remove("AETHYME_GATE_BROKER_DATABASES")
-        .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
         .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
         .env("AETHYME_HOST_STATE_DIR", host_state.clone())
         .env(
@@ -173,7 +173,7 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
             host_state.join("host-operations.db"),
         )
         .env("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT", "true")
-        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", &worktree_root)
+        .env("AETHYME_WORKTREE_ROOT", &worktree_root)
         .env(
             "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
             host_state.join("collaboration"),

@@ -165,7 +165,7 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         );
         let fixture_worktree_root = fixture_state.join("worktrees");
         assert_eq!(
-            env.get(OsStr::new("AETHYME_BROKER_OPEN_WORKTREE_ROOT")),
+            env.get(OsStr::new("AETHYME_WORKTREE_ROOT")),
             Some(&Some(fixture_worktree_root.into_os_string()))
         );
         assert_eq!(
@@ -185,7 +185,7 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         for removed in [
             "AETHYME_BROKER_DB",
             "AETHYME_GATE_BROKER_DATABASES",
-            "AETHYME_WORKTREE_ROOT",
+            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
             "AETHYME_BROKER_STORAGE_CONTEXT_V1",
         ] {
             assert_eq!(env.get(OsStr::new(removed)), Some(&None), "{removed}");
