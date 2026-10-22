@@ -2397,7 +2397,7 @@ pub(crate) fn reconstruct_bounded_with_source_identity(
     Ok((
         validated.snapshot,
         VerifiedSnapshotSourceIdentity {
-            revision: binding.revision.to_string(),
+            revision: binding.revision.as_str().to_owned(),
             source_tree_sha256,
         },
     ))
@@ -2428,7 +2428,9 @@ pub(crate) fn reconstruct_artifact_bounded_under_guard(
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let id = expected.id();
     let validated =
-        validate_manifest_bounded_inner(store, &id, Some(expected), None, limits, &mut |_| {})?;
+        validate_manifest_bounded_inner(store, &id, Some(expected), None, limits, &mut |_, _| {
+            Ok(())
+        })?;
     prepare_empty_destination(dest)?;
     materialize_bounded(store, &validated.snapshot, dest, limits)?;
     Ok(validated.snapshot)
