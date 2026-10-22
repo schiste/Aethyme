@@ -166,9 +166,8 @@ fn auto_cleanup_lap_range<T>(
             id > cursor.after_session_id && id <= cursor.high_water_session_id
         })
         .unwrap_or(candidates.len());
-    let end = candidates.partition_point(|candidate| {
-        session_id(candidate) <= cursor.high_water_session_id
-    });
+    let end = candidates
+        .partition_point(|candidate| session_id(candidate) <= cursor.high_water_session_id);
     start..end
 }
 
@@ -804,8 +803,8 @@ impl Broker {
         // This structure contains only integer fields, so JSON serialization
         // cannot fail. A storage write failure or stale checkpoint must stop
         // planning before any selected checkout can be applied.
-        let value = serde_json::to_string(cursor)
-            .expect("serializing the cleanup cursor is infallible");
+        let value =
+            serde_json::to_string(cursor).expect("serializing the cleanup cursor is infallible");
         if !self.store().meta_compare_and_set(
             AUTO_CLEANUP_CURSOR_KEY,
             expected_raw.as_deref(),
@@ -1193,8 +1192,7 @@ impl Broker {
         // may already be exhausted by the caller's artifact sweep; the cursor
         // guarantees fairness only among candidates this pass can inspect.
         let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
-        let lap =
-            auto_cleanup_lap_range(&mut candidates, &mut cursor, candidate_cursor_session_id);
+        let lap = auto_cleanup_lap_range(&mut candidates, &mut cursor, candidate_cursor_session_id);
         let deferred_after_lap = candidates.len().saturating_sub(lap.end);
         let candidates = candidates.drain(lap).collect::<Vec<_>>();
         report.deferred += deferred_after_lap;
@@ -1215,14 +1213,9 @@ impl Broker {
                 {
                     Err(NotRemoved::Defer)
                 }
-                Err(NotRemoved::Defer) => self.auto_cleanup_verdict(
-                    &candidate,
-                    &policy,
-                    &upstream,
-                    true,
-                    deadline,
-                    None,
-                ),
+                Err(NotRemoved::Defer) => {
+                    self.auto_cleanup_verdict(&candidate, &policy, &upstream, true, deadline, None)
+                }
                 verdict => verdict,
             };
             match verdict {
@@ -1516,7 +1509,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Auto cleanup test"]);
-        git(&root, &["config", "user.email", "auto-cleanup@example.invalid"]);
+        git(
+            &root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         git(&root, &["add", ".gitignore", "README.md"]);
@@ -1543,7 +1539,8 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&root).unwrap();
         let (first_id, first_path) = closed_dirty_checkout(&mut broker, "cursor first candidate");
-        let (second_id, second_path) = closed_dirty_checkout(&mut broker, "cursor second candidate");
+        let (second_id, second_path) =
+            closed_dirty_checkout(&mut broker, "cursor second candidate");
         assert!(first_id < second_id);
         assert!(first_path.is_dir());
         assert!(second_path.is_dir());
@@ -1565,7 +1562,10 @@ mod tests {
         };
         broker
             .store()
-            .meta_set(AUTO_CLEANUP_CURSOR_KEY, &serde_json::to_string(&seed).unwrap())
+            .meta_set(
+                AUTO_CLEANUP_CURSOR_KEY,
+                &serde_json::to_string(&seed).unwrap(),
+            )
             .unwrap();
 
         let first_pass = broker.auto_cleanup_plan(None).unwrap();
