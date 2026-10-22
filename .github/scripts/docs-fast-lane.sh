@@ -43,6 +43,8 @@ if ! git -C "$repo_root" diff --raw --no-renames --no-ext-diff --no-textconv -z 
 fi
 
 records=0
+report_count=0
+report_bytes=0
 while :; do
   raw=''
   if ! IFS= read -r -d '' raw; then
@@ -73,6 +75,8 @@ while :; do
   case "$path" in
     .claude/skills/*.md|.codex/skills/*.md) ;;
     packages/aethyme/docs/reports/*.md)
+      report_count=$((report_count + 1))
+      (( report_count <= 32 )) || select_full_suite 'too many reports for bounded validation'
       # Reports are exempt from freshness/link/spelling ratchets, but fenced
       # examples and legacy absolute blob links still require Rust doc tests.
       # Read only the committed blob, bounded before copying or decoding it.
@@ -81,6 +85,8 @@ while :; do
       fi
       [[ $blob_size =~ ^[0-9]+$ && $blob_size -le 1048576 ]] \
         || select_full_suite 'report exceeds the bounded prose limit'
+      report_bytes=$((report_bytes + blob_size))
+      (( report_bytes <= 4194304 )) || select_full_suite 'reports exceed the aggregate prose limit'
       if [[ -z $content_file ]]; then
         content_file=$(mktemp "${TMPDIR:-/tmp}/aethyme-report-content.XXXXXX") \
           || select_full_suite 'could not create a report validation file'
@@ -89,16 +95,16 @@ while :; do
         || select_full_suite 'could not read report blob'
       if ! python3 - "$content_file" <<'REPORT_PROSE'
 import pathlib
-import re
 import sys
 
 try:
     text = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8", errors="strict")
-    assert "\x00" not in text
-    assert not re.search(r"(?m)^[ \t]*(?:```|~~~)", text)
+    invalid = "\x00" in text or "```" in text or "~~~" in text
     # Match the existing no_absolute_github_links ratchet conservatively.
-    assert not ("github.com/aeptus/aethyme" in text and "/blob/" in text)
-except (OSError, UnicodeError, AssertionError):
+    invalid = invalid or ("github.com/aeptus/aethyme" in text and "/blob/" in text)
+    if invalid:
+        sys.exit(1)
+except (OSError, UnicodeError):
     sys.exit(1)
 REPORT_PROSE
       then

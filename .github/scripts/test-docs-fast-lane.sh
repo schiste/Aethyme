@@ -106,6 +106,9 @@ report_case prose-report true $'# Diagnostic report\n\nMeasured wall time: 12 ms
 report_case backtick-code false $'# Report\n```rust\nfn main() {}\n```\n'
 report_case tilde-code false $'# Report\n~~~json\n{}\n~~~\n'
 report_case indented-code false $'# Report\n  ```bash\ntrue\n  ```\n'
+report_case quoted-code false $'> ```rust\n> fn main() {}\n> ```\n'
+report_case list-code false $'- ~~~json\n  {}\n  ~~~\n'
+report_case inline-fence-marker false 'Mentioning ``` selects full validation conservatively.'
 report_case legacy-blob-link false '[source](https://github.com/aeptus/aethyme/blob/main/file.rs)'
 report_case invalid-utf8 false $'Invalid: \377\n'
 
@@ -139,6 +142,27 @@ OVERSIZE
 git -C "$repo" add -- packages/aethyme/docs/reports/example.md
 commit_changes
 expect_result 'oversized report' false
+
+init_case too-many-reports
+mkdir -p "$repo/packages/aethyme/docs/reports"
+for report_index in {1..33}; do
+  printf 'prose\n' >"$repo/packages/aethyme/docs/reports/$report_index.md"
+done
+git -C "$repo" add -- packages/aethyme/docs/reports
+commit_changes
+expect_result 'aggregate report count ceiling' false
+
+init_case aggregate-report-bytes
+mkdir -p "$repo/packages/aethyme/docs/reports"
+python3 - "$repo/packages/aethyme/docs/reports" <<'TOTAL_BYTES'
+import pathlib
+import sys
+for index in range(5):
+    (pathlib.Path(sys.argv[1]) / f"{index}.md").write_bytes(b"a" * 1048576)
+TOTAL_BYTES
+git -C "$repo" add -- packages/aethyme/docs/reports
+commit_changes
+expect_result 'aggregate report byte ceiling' false
 
 init_case report-with-rust
 mkdir -p "$repo/packages/aethyme/docs/reports"
