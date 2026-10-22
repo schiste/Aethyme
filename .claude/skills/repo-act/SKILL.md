@@ -39,6 +39,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   subprocess starts and group repeated argv. Stack-sample counts measure time in
   sampled frames, not invocation counts; keep instrumented traces and timings
   separate from uninstrumented benchmark samples.
+- When combining Git identity queries, preserve checkout-context checks.
+  `--git-common-dir` succeeds in bare repositories too; require an explicit
+  true `--is-inside-work-tree` result when checkout evidence is needed. Compare
+  main, nested and linked worktrees, and test bare and unavailable contexts
+  before removing a separate discovery call.
 - In nonblocking readiness readers, distinguish available bytes from
   `WouldBlock`: wait only after `WouldBlock`, and drain buffered input without
   a polling sleep after every byte. Assert injected wait-callback counts for
