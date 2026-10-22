@@ -1040,7 +1040,7 @@ mod tests {
     fn bounded_file_input_returns_output_and_status() {
         let expected = vec![b'x'; 128 * 1024];
         let LimitedOutput::Completed(output) = output_with_input_limited(
-            Command::new("cat"),
+            &mut Command::new("cat"),
             file_input(&expected),
             Duration::from_secs(5),
             expected.len(),
