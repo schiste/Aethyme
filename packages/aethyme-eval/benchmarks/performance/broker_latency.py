@@ -562,7 +562,7 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
         if collect_status_diagnostics:
             commands.update({
                 'status_full': [str(binary), 'broker', 'status', '--json'],
-                'doctor': [str(binary), 'broker', 'doctor', '--json'],
+                'doctor': [str(binary), 'broker', 'status', 'doctor', '--json'],
             })
         if aged_released_resource_leases:
             commands['resource_history_list'] = [
