@@ -15,9 +15,9 @@ description: Use when starting work in an unfamiliar repository, when the task a
 ## Repo Identity
 
 - Kind: `monorepo`
-- Languages: `rust, python, typescript`
+- Languages: `rust, python, typescript, javascript`
 - Package manager: `cargo`
-- Key manifests: `packages/aethyme-eval/benchmarks/performance/fixture/package.json, packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml, packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml, packages/aethyme-eval/pyproject.toml, packages/aethyme/rust/Cargo.toml, packages/aethyme/rust/crates/aethyme-broker/Cargo.toml, packages/aethyme/rust/crates/aethyme-cli/Cargo.toml, packages/aethyme/rust/crates/aethyme-engine/Cargo.toml, packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml, packages/aethyme/rust/crates/aethyme-producers/Cargo.toml, packages/aethyme/rust/crates/aethyme-quality/Cargo.toml, packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml`
+- Key manifests: `packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H01/a-state/package.json, packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H02/a-state/package.json, packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P01/a-state/package.json, packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P02/a-state/package.json, packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P03/a-state/package.json, packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P04/a-state/package.json, packages/aethyme-eval/benchmarks/performance/fixture/package.json, packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml, packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml, packages/aethyme-eval/pyproject.toml, packages/aethyme/rust/Cargo.toml, packages/aethyme/rust/crates/aethyme-broker/Cargo.toml, packages/aethyme/rust/crates/aethyme-cli/Cargo.toml, packages/aethyme/rust/crates/aethyme-contracts/Cargo.toml, packages/aethyme/rust/crates/aethyme-engine/Cargo.toml, packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml, packages/aethyme/rust/crates/aethyme-producers/Cargo.toml, packages/aethyme/rust/crates/aethyme-quality/Cargo.toml, packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml`
 
 ## Workspaces
 
@@ -26,6 +26,9 @@ description: Use when starting work in an unfamiliar repository, when the task a
 - `packages/aethyme-eval/benchmarks/performance/fixture` (supporting; python; manifest `packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml`; high confidence)
 - `packages/aethyme-eval/benchmarks/performance/fixture` (supporting; npm; manifest `packages/aethyme-eval/benchmarks/performance/fixture/package.json`; high confidence)
 - `packages/aethyme-eval/benchmarks/performance/fixture/src/rust` (supporting; cargo; manifest `packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml`; high confidence)
+- `packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P01/a-state` (supporting; npm; manifest `packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P01/a-state/package.json`; high confidence)
+- `packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P02/a-state` (supporting; npm; manifest `packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/P02/a-state/package.json`; high confidence)
+- `packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H01/a-state` (supporting; npm; manifest `packages/aethyme-eval/benchmarks/local-v3/fx08/v14-frozen/tasks/H01/a-state/package.json`; high confidence)
 
 ## Start Here
 
@@ -70,6 +73,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 - `docs` (docs; documentation area; high confidence)
 - `packages` (workspace; workspace-style package container; high confidence)
 - `scripts` (tooling; developer tooling or scripts; high confidence)
+- `target` (generated_or_vendor; generated output or vendored dependencies; high confidence)
 
 ## Aethyme Recipes
 
@@ -80,10 +84,15 @@ description: Use when starting work in an unfamiliar repository, when the task a
 - `aethyme graph callers "$PWD" "<symbol-or-file>" --json-output`
   Purpose: Trace likely impact before editing
 
+## Caution Zones
+
+- `target` (likely generated, vendored, fixture, or migration-heavy area)
+
 ## Generated and Dangerous Paths
 
 - Generated/vendor `.aethyme/generated`: tracked generated or vendored surface; verify ownership before editing
 - Generated/vendor `packages/aethyme/rust/crates/aethyme-quality/tests/fixtures/quality_surface/src/generated`: tracked generated or vendored surface; verify ownership before editing
+- Generated/vendor `target`: tracked generated or vendored surface; verify ownership before editing
 - Sensitive `.aethyme/gates.toml`: repository validation policy; changes affect every broker submission
 - Sensitive `.github/workflows`: repository automation; changes can affect publication or shared CI
 
@@ -100,7 +109,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Freshness
 
-- Source digest: `39d0a018a471a52f5e28f9a948e6961eae43654a3647d226f20bef4f18ba4c0b`
-- Tracked source files: `1061`
+- Source digest: `de05b2c21b96c17478a0095608ab0157d504f9d618efae42cd461b624b81fc36`
+- Tracked source files: `3618`
 - Overrides applied: `True`
 - Sections generated: `repo, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, summon, freshness`

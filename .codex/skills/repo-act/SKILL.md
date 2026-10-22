@@ -29,7 +29,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   successful check with a guessed edition can fail workspace CI.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
-  runs rather than wall-clock assertions in ordinary tests. Retain complete CLI
+  runs rather than wall-clock assertions in ordinary tests. Match the recorded
+  workload to the claimed scaling dimension: released lease history does not
+  establish behavior with many sessions or worktrees. Retain complete CLI
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
