@@ -4,6 +4,16 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.30] - 2026-10-22
+
+### Fixed
+
+- Git batch queries use bounded streaming, enforce active deadlines, and reject incomplete or truncated results.
+
+### Changed
+
+- `aethyme broker advanced exec` adds an explicit `--non-interactive` opt-in; default interactive execution remains unchanged.
+
 ## [0.8.29] - 2026-10-22
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0829).
