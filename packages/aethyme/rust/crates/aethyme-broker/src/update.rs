@@ -1741,6 +1741,7 @@ fn ensure_public_links(receipt: &InstallReceipt) -> Result<(), String> {
         &receipt.engine_path,
     )
     .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn atomic_symlink(target: &Path, destination: &Path) -> Result<SelectorLink, AtomicSymlinkError> {
