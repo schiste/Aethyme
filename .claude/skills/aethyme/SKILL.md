@@ -55,6 +55,11 @@ AETHYME_JSON="$(mktemp -t aethyme-explore.XXXXXX)"
    at a time. Keep each manual command under about 120 output lines / 20k chars
    and the whole post-Explore source verification under about 200 lines.
 
+For analysis-envelope consumers, verify how a pinned profile ID is resolved and
+how its producer manifest is bound to the source, generation and fragment
+digest before result paths are consumed. A parseable profile ID is only a
+claim; trace the consumer's check and state its limits.
+
 4. If `safe_to_use_as_answer=false`, follow `verification_steps` and the top
    subsystem lanes as an investigation plan. Do not run broad `rg`, `rg
    --files`, repository-wide grep, multi-file `sed`, or `rg -C` context dumps

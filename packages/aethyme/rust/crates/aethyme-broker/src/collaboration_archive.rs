@@ -172,6 +172,22 @@ pub struct RetainedSnapshot {
     pub content_bytes: u64,
 }
 
+/// Source identity verified from the retained-snapshot record and exact
+/// archived bytes. The tree digest uses the same Git object-record preimage
+/// as `committed_source_tree_digest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedSnapshotSourceIdentity {
+    pub revision: String,
+    pub source_tree_sha256: String,
+}
+
+struct RetainedSnapshotBinding {
+    revision: CommitOid,
+    format: ObjectFormat,
+    entry_count: u64,
+    content_bytes: u64,
+}
+
 /// A contribution whose base and result are both retained.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedContribution {
@@ -1785,6 +1801,96 @@ pub fn retained(
     }))
 }
 
+/// Read the commit binding only when both the row and its content-addressed
+/// retained-snapshot record agree. The row is an index, never the authority
+/// for a reconstructed snapshot's Git revision or object format.
+fn retained_snapshot_binding(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+) -> Result<Option<RetainedSnapshotBinding>, ArchiveError> {
+    let row = store
+        .read_connection()
+        .query_row(
+            "SELECT record_id, record_sha256, commit_oid, entry_count, content_bytes
+             FROM retained_snapshots WHERE snapshot_id = ?1
+               AND snapshot_id NOT IN (SELECT snapshot_id FROM reclaimed_snapshots)",
+            [id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((record_id, record_sha256, row_commit, row_entries, row_bytes)) = row else {
+        return Ok(None);
+    };
+    let corrupt = || ArchiveError::CorruptObject {
+        digest: record_sha256.clone(),
+    };
+    let record_id = RecordId::parse(&record_id).map_err(|_| corrupt())?;
+    let record_digest = parse_digest(&record_sha256).ok_or_else(corrupt)?;
+    let bytes = read_object_unlocked(store, &record_digest, Some(64 * 1024))?;
+    let record = Record::decode(&bytes, &[&RETAINED_SNAPSHOT_SCHEMA]).map_err(|_| corrupt())?;
+    if record.id() != record_id {
+        return Err(corrupt());
+    }
+
+    let field_text = |name: &str| match record.get(name) {
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => None,
+    };
+    let snapshot = field_text("snapshot").ok_or_else(corrupt)?;
+    let record_entries = match record.get("entry_count") {
+        Some(Value::Integer(value)) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+    .ok_or_else(corrupt)?;
+    let record_bytes_text = field_text("content_bytes").ok_or_else(corrupt)?;
+    let record_bytes = record_bytes_text
+        .parse::<u64>()
+        .ok()
+        .filter(|value| value.to_string() == record_bytes_text)
+        .ok_or_else(corrupt)?;
+    let source = match record.get("source") {
+        Some(Value::Object(source)) if source.len() == 3 => source,
+        _ => return Err(corrupt()),
+    };
+    let source_text = |name: &str| match source.get(name) {
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => None,
+    };
+    if source_text("kind") != Some("git_commit") {
+        return Err(corrupt());
+    }
+    let source_commit = source_text("commit").ok_or_else(corrupt)?;
+    let revision = CommitOid::parse(source_commit).map_err(|_| corrupt())?;
+    if row_commit != source_commit || snapshot != id.as_str() {
+        return Err(corrupt());
+    }
+    let format = match source_text("object_format") {
+        Some("sha1") if revision.as_str().len() == 40 => ObjectFormat::Sha1,
+        Some("sha256") if revision.as_str().len() == 64 => ObjectFormat::Sha256,
+        _ => return Err(corrupt()),
+    };
+    let entry_count = u64::try_from(row_entries).map_err(|_| corrupt())?;
+    let content_bytes = u64::try_from(row_bytes).map_err(|_| corrupt())?;
+    if record_entries != entry_count || record_bytes != content_bytes {
+        return Err(corrupt());
+    }
+
+    Ok(Some(RetainedSnapshotBinding {
+        revision,
+        format,
+        entry_count,
+        content_bytes,
+    }))
+}
+
 /// The archive's entry for the contribution whose lineage record is
 /// `lineage`, if its record and both snapshots are still retained. The
 /// lineage record is re-read and must hash to its row, decode to
@@ -2000,14 +2106,18 @@ pub(crate) fn validate_snapshot_bounded(
         source,
     })?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
-    validate_snapshot_bounded_inner(store, id, limits, &mut inspect_content)
+    let mut inspect_entry = |_: &SourceEntry, content: &[u8]| {
+        inspect_content(content);
+        Ok(())
+    };
+    validate_snapshot_bounded_inner(store, id, limits, &mut inspect_entry)
 }
 
 fn validate_snapshot_bounded_inner(
     store: &CollaborationStore,
     id: &SourceSnapshotId,
     limits: ReconstructionLimits,
-    inspect_content: &mut impl FnMut(&[u8]),
+    inspect_content: &mut impl FnMut(&SourceEntry, &[u8]) -> Result<(), ArchiveError>,
 ) -> Result<ValidatedSnapshot, ArchiveError> {
     let retained =
         retained(store, id)?.ok_or_else(|| ArchiveError::NotRetained { id: id.to_string() })?;
@@ -2035,7 +2145,7 @@ fn validate_manifest_bounded_inner(
     expected: Option<&SourceSnapshot>,
     expected_retained: Option<&RetainedSnapshot>,
     limits: ReconstructionLimits,
-    inspect_content: &mut impl FnMut(&[u8]),
+    inspect_content: &mut impl FnMut(&SourceEntry, &[u8]) -> Result<(), ArchiveError>,
 ) -> Result<ValidatedSnapshot, ArchiveError> {
     let manifest_digest = ObjectDigest::of_snapshot(id);
     let manifest_size = object_size(store, &manifest_digest)?;
@@ -2116,7 +2226,7 @@ fn validate_manifest_bounded_inner(
                 limits.max_output_bytes,
             ));
         }
-        inspect_content(&bytes);
+        inspect_content(entry, &bytes)?;
     }
     if actual_output_bytes != output_bytes {
         return Err(corrupt());
@@ -2230,10 +2340,67 @@ pub(crate) fn reconstruct_bounded(
         source,
     })?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
-    let validated = validate_snapshot_bounded_inner(store, id, limits, &mut |_| {})?;
+    let validated = validate_snapshot_bounded_inner(store, id, limits, &mut |_, _| Ok(()))?;
     prepare_empty_destination(dest)?;
     materialize_bounded(store, &validated.snapshot, dest, limits)?;
     Ok(validated.snapshot)
+}
+
+/// Reconstruct a retained source snapshot and bind it to the Git source
+/// identity recorded at capture. The tree digest is computed while validated
+/// archive blobs are already being read, using Git's blob ids and `ls-tree`
+/// record framing rather than conflating the SourceSnapshotId preimage with
+/// the repository tree digest.
+pub(crate) fn reconstruct_bounded_with_source_identity(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    dest: &Path,
+    limits: ReconstructionLimits,
+) -> Result<(SourceSnapshot, VerifiedSnapshotSourceIdentity), ArchiveError> {
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ArchiveError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let binding = retained_snapshot_binding(store, id)?
+        .ok_or_else(|| ArchiveError::NotRetained { id: id.to_string() })?;
+    let mut tree = Sha256::new();
+    let validated = {
+        let mut append_tree_record = |entry: &SourceEntry, content: &[u8]| {
+            if entry.path().starts_with(b".aethyme/graph/") {
+                return Ok(());
+            }
+            let mut blob = GitHasher::new(binding.format, "blob", content.len() as u64);
+            blob.update(content);
+            tree.update(entry.kind().git_mode().as_bytes());
+            tree.update(b" blob ");
+            tree.update(blob.hex().as_bytes());
+            tree.update(b"\t");
+            tree.update(entry.path());
+            tree.update([0]);
+            Ok(())
+        };
+        validate_snapshot_bounded_inner(store, id, limits, &mut append_tree_record)?
+    };
+    if validated.snapshot.id() != *id
+        || validated.snapshot.entries().len() as u64 != binding.entry_count
+        || validated.output_bytes != binding.content_bytes
+    {
+        return Err(ArchiveError::CorruptObject {
+            digest: ObjectDigest::of_snapshot(id).hex(),
+        });
+    }
+    let source_tree_sha256 = hex(&tree.finalize());
+
+    prepare_empty_destination(dest)?;
+    materialize_bounded(store, &validated.snapshot, dest, limits)?;
+    Ok((
+        validated.snapshot,
+        VerifiedSnapshotSourceIdentity {
+            revision: binding.revision.as_str().to_owned(),
+            source_tree_sha256,
+        },
+    ))
 }
 
 /// Reconstruct a build output manifest whose exact object references are
@@ -2261,7 +2428,9 @@ pub(crate) fn reconstruct_artifact_bounded_under_guard(
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let id = expected.id();
     let validated =
-        validate_manifest_bounded_inner(store, &id, Some(expected), None, limits, &mut |_| {})?;
+        validate_manifest_bounded_inner(store, &id, Some(expected), None, limits, &mut |_, _| {
+            Ok(())
+        })?;
     prepare_empty_destination(dest)?;
     materialize_bounded(store, &validated.snapshot, dest, limits)?;
     Ok(validated.snapshot)
