@@ -84,7 +84,7 @@ impl Fixture {
 
 #[test]
 fn stale_lease_and_undelivered_commit_remain_visible_without_global_blocker_advice() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
     std::fs::write(fixture.worktree.join("README.md"), "unrepresented change\n").unwrap();
     git(&fixture.worktree, &["add", "README.md"]);
     git(&fixture.worktree, &["commit", "-qm", "undelivered"]);
