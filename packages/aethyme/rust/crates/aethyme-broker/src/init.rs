@@ -1983,7 +1983,7 @@ mod retention_health_tests {
             .execute(
                 "UPDATE repository_worktree_binding
                  SET state = 'recovery_required', worktree_identity_json = NULL
-                 WHERE singleton = 1",
+                 WHERE binding_id = 1",
                 [],
             )
             .unwrap();

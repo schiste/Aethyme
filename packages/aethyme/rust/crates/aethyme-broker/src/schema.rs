@@ -76,12 +76,13 @@ pub const SCHEMA_VERSION: i64 = 53;
 ///   query only gate, tree and definition, so they could reuse a result
 ///   without checking its execution profile. The global floor therefore
 ///   rises to v52.
-/// - v53: adds a repository worktree-root binding record. Migration writes
-///   only `legacy_unbound`; existing databases retain floor 52 until an
-///   explicit reviewed binding raises it. A fresh staged database raises its
-///   own floor to 53 before the final database path is published. The binding
-///   table is deliberately excluded from the repair list: recreating a missing
-///   row could erase evidence of an existing root and misclassify it as legacy.
+/// - v53: adds per-repository worktree-root binding records. Migration writes
+///   only one unscoped `legacy_unbound` placeholder; existing databases retain
+///   floor 52 until explicit binding. A fresh staged database raises its own
+///   floor to 53 before publication. Bound rows are selected by a stable UUID
+///   stored in the Git common directory; unbound rows may be scoped by that
+///   directory without granting root authority. The table is excluded from
+///   repair because recreating a missing row could erase identity evidence.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 52;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -1764,13 +1765,17 @@ const MIGRATION_V52: &str = "
 ALTER TABLE gate_results ADD COLUMN execution_profile_hash TEXT;
 ";
 
-/// v53: durable repository worktree-root binding. Existing databases remain
-/// explicitly unbound until a reviewed adoption transition records exact
-/// placement evidence. The migration itself never consults the filesystem or
-/// silently adopts the current configuration.
+/// v53: durable per-repository worktree-root binding. Existing databases
+/// remain explicitly unbound until the plan/apply layer confirms an adoption.
+/// The migration itself never consults the filesystem or silently adopts the
+/// current configuration. A common-dir UUID selects each bound repository row;
+/// unbound rows can be scoped by common-dir without granting root authority.
 const MIGRATION_V53: &str = "
 CREATE TABLE IF NOT EXISTS repository_worktree_binding (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    binding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_uuid TEXT UNIQUE CHECK (
+        repository_uuid IS NULL OR length(repository_uuid) = 36
+    ),
     record_schema_version INTEGER NOT NULL CHECK (record_schema_version = 1),
     state TEXT NOT NULL CHECK (state IN (
         'legacy_unbound', 'fresh_unbound', 'fresh_reserved', 'bound',
@@ -1796,10 +1801,13 @@ CREATE TABLE IF NOT EXISTS repository_worktree_binding (
     worktree_identity_json TEXT,
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS repository_worktree_binding_common_dir
+    ON repository_worktree_binding(git_common_dir)
+    WHERE git_common_dir IS NOT NULL;
 INSERT INTO repository_worktree_binding (
-    singleton, record_schema_version, state, origin, updated_at_ms
-) VALUES (1, 1, 'legacy_unbound', 'legacy', 0)
-ON CONFLICT (singleton) DO NOTHING;
+    record_schema_version, state, origin, updated_at_ms
+) SELECT 1, 'legacy_unbound', 'legacy', 0
+  WHERE NOT EXISTS (SELECT 1 FROM repository_worktree_binding);
 ";
 
 const MIGRATIONS: &[&str] = &[
@@ -2529,7 +2537,7 @@ mod tests {
                 "SELECT b.state, m.value
                  FROM repository_worktree_binding b
                  JOIN meta m ON m.key = 'min_compatible_schema'
-                 WHERE b.singleton = 1",
+                 WHERE b.binding_id = 1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

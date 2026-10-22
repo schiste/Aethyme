@@ -74,6 +74,10 @@ impl RepositoryWorktreeRootLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct RepositoryWorktreeBinding {
+    #[serde(skip)]
+    pub binding_id: i64,
+    #[serde(skip)]
+    pub repository_uuid: Option<String>,
     pub state: RepositoryWorktreeBindingState,
     pub origin: Option<RepositoryWorktreeBindingOrigin>,
     pub repository_root: Option<PathBuf>,
@@ -194,12 +198,102 @@ fn with_durable_binding_transaction<T>(
 }
 
 impl BrokerStore {
-    /// Read the singleton binding record. A missing or malformed row is a
-    /// recovery condition; callers must not infer a root from current config.
+    /// Read the binding record selected by this store's captured repository scope.
+    /// Missing or malformed evidence is a recovery condition; callers must not
+    /// infer a root from current configuration.
     pub(crate) fn repository_worktree_binding(
         &self,
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
-        read_repository_worktree_binding(&self.conn)
+        read_repository_worktree_binding(&self.conn, self.binding_scope.as_ref())
+    }
+
+    pub(crate) fn repository_worktree_binding_optional(
+        &self,
+    ) -> Result<Option<RepositoryWorktreeBinding>, BrokerError> {
+        read_repository_worktree_binding_optional(&self.conn, self.binding_scope.as_ref())
+    }
+
+    /// Attach this mutable store to one repository's unbound record. This is
+    /// ordinary database bookkeeping only: it never creates a filesystem
+    /// marker or grants a worktree-root binding.
+    pub(crate) fn ensure_repository_binding_scope(&mut self) -> Result<(), BrokerError> {
+        let Some(scope) = self.binding_scope.clone() else {
+            return Ok(());
+        };
+        validate_absolute_path(&scope.repository_root, "repository root")?;
+        validate_absolute_path(&scope.git_common_dir, "Git common directory")?;
+        validate_absolute_path(&scope.broker_db_path, "broker database path")?;
+        validate_repository_key(&scope.repository_key)?;
+        if self
+            .repository_worktree_binding_optional()?
+            .is_some_and(|binding| binding.git_common_dir.is_some())
+        {
+            return Ok(());
+        }
+        with_durable_binding_transaction(&mut self.conn, |tx| {
+            ensure_current_v53(tx)?;
+            let current = read_repository_worktree_binding_optional(tx, Some(&scope))?;
+            match current {
+                Some(current) if current.git_common_dir.is_some() => Ok(()),
+                Some(current)
+                    if current.state == RepositoryWorktreeBindingState::LegacyUnbound
+                        && current.origin == Some(RepositoryWorktreeBindingOrigin::Legacy)
+                        && current.repository_root.is_none()
+                        && current.repository_uuid.is_none()
+                        && scope.repository_uuid.is_none() =>
+                {
+                    let changed = tx.execute(
+                        "UPDATE repository_worktree_binding
+                         SET path_encoding = ?1, repository_root = ?2, git_common_dir = ?3,
+                             repository_key = ?4, broker_db_path = ?5, updated_at_ms = ?6
+                         WHERE binding_id = ?7 AND state = 'legacy_unbound'
+                           AND origin = 'legacy' AND git_common_dir IS NULL
+                           AND repository_root IS NULL AND repository_uuid IS NULL",
+                        params![
+                            current_path_encoding(),
+                            encode_path(&scope.repository_root),
+                            encode_path(&scope.git_common_dir),
+                            scope.repository_key,
+                            encode_path(&scope.broker_db_path),
+                            super::now_ms(),
+                            current.binding_id,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        return Err(invalid_binding(
+                            "repository scope registration lost its compare-and-set",
+                        ));
+                    }
+                    Ok(())
+                }
+                Some(_) => Err(invalid_binding(
+                    "only an unscoped legacy placeholder can be attached to a repository",
+                )),
+                None if scope.repository_uuid.is_some() => Err(invalid_binding(
+                    "stable repository UUID exists without a matching database binding row",
+                )),
+                None => {
+                    tx.execute(
+                        "INSERT INTO repository_worktree_binding (
+                             repository_uuid, record_schema_version, state, origin,
+                             path_encoding, repository_root, git_common_dir, repository_key,
+                             broker_db_path, updated_at_ms
+                         ) VALUES (NULL, 1, 'legacy_unbound', 'legacy', ?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            current_path_encoding(),
+                            encode_path(&scope.repository_root),
+                            encode_path(&scope.git_common_dir),
+                            scope.repository_key,
+                            encode_path(&scope.broker_db_path),
+                            super::now_ms(),
+                        ],
+                    )?;
+                    Ok(())
+                }
+            }
+        })?;
+        self.repository_worktree_binding()?;
+        Ok(())
     }
 
     /// Initialize a database that was created as a private, unpublished fresh
@@ -215,9 +309,10 @@ impl BrokerStore {
         identity: &RepositoryRootIdentity,
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
         validate_repository_identity(identity)?;
+        let binding_scope = self.binding_scope.clone();
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
-            let current = read_repository_worktree_binding(tx)?;
+            let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             ensure_state(
                 current.state,
                 RepositoryWorktreeBindingState::LegacyUnbound,
@@ -239,7 +334,7 @@ impl BrokerStore {
                  SET state = 'fresh_unbound', origin = 'fresh', path_encoding = ?1,
                      repository_root = ?2, git_common_dir = ?3, repository_key = ?4,
                      broker_db_path = ?5, bootstrap_nonce = ?6, updated_at_ms = ?7
-                 WHERE singleton = 1 AND state = 'legacy_unbound' AND origin = 'legacy'",
+                 WHERE binding_id = ?8 AND state = 'legacy_unbound' AND origin = 'legacy'",
                 params![
                     current_path_encoding(),
                     encode_path(&identity.repository_root),
@@ -248,6 +343,7 @@ impl BrokerStore {
                     encode_path(&identity.broker_db_path),
                     identity.bootstrap_nonce,
                     now,
+                    current.binding_id,
                 ],
             )?;
             if changed != 1 {
@@ -272,9 +368,10 @@ impl BrokerStore {
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
         validate_repository_identity(&reservation.identity)?;
         validate_reservation(reservation)?;
+        let binding_scope = self.binding_scope.clone();
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
-            let current = read_repository_worktree_binding(tx)?;
+            let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             ensure_state(
                 current.state,
                 RepositoryWorktreeBindingState::FreshUnbound,
@@ -287,7 +384,7 @@ impl BrokerStore {
                  SET state = 'fresh_reserved', worktree_root = ?1, root_layout = ?2,
                      root_source = ?3, reservation_digest = ?4,
                      parent_identity_json = ?5, updated_at_ms = ?6
-                 WHERE singleton = 1 AND state = 'fresh_unbound' AND origin = 'fresh'
+                 WHERE binding_id = ?8 AND state = 'fresh_unbound' AND origin = 'fresh'
                    AND bootstrap_nonce = ?7",
                 params![
                     encode_path(&reservation.worktree_root),
@@ -297,6 +394,7 @@ impl BrokerStore {
                     reservation.parent_identity_json,
                     now,
                     reservation.identity.bootstrap_nonce,
+                    current.binding_id,
                 ],
             )?;
             if changed != 1 {
@@ -323,9 +421,10 @@ impl BrokerStore {
         reservation_digest: &str,
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
         validate_hex_digest(reservation_digest, "reservation digest")?;
+        let binding_scope = self.binding_scope.clone();
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
-            let current = read_repository_worktree_binding(tx)?;
+            let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             ensure_state(
                 current.state,
                 RepositoryWorktreeBindingState::FreshReserved,
@@ -341,9 +440,14 @@ impl BrokerStore {
             let changed = tx.execute(
                 "UPDATE repository_worktree_binding
                  SET state = 'recovery_required', updated_at_ms = ?1
-                 WHERE singleton = 1 AND state = 'fresh_reserved'
+                 WHERE binding_id = ?4 AND state = 'fresh_reserved'
                    AND bootstrap_nonce = ?2 AND reservation_digest = ?3",
-                params![super::now_ms(), bootstrap_nonce, reservation_digest],
+                params![
+                    super::now_ms(),
+                    bootstrap_nonce,
+                    reservation_digest,
+                    current.binding_id
+                ],
             )?;
             if changed != 1 {
                 return Err(invalid_binding(
@@ -369,9 +473,40 @@ impl BrokerStore {
         validate_repository_identity(identity)?;
         validate_hex_digest(reservation_digest, "reservation digest")?;
         validate_identity_json(worktree_identity_json, "worktree identity")?;
+        let prior = self.repository_worktree_binding()?;
+        if !matches!(
+            prior.state,
+            RepositoryWorktreeBindingState::FreshReserved
+                | RepositoryWorktreeBindingState::RecoveryRequired
+        ) {
+            return Err(transition_error(
+                prior.state,
+                RepositoryWorktreeBindingState::Bound,
+            ));
+        }
+        ensure_fresh_identity_matches(&prior, identity)?;
+        if prior.reservation_digest.as_deref() != Some(reservation_digest)
+            || prior.worktree_root.is_none()
+            || prior.root_layout.is_none()
+            || prior.root_source.is_none()
+            || prior.parent_identity_json.is_none()
+        {
+            return Err(invalid_binding(
+                "completion does not match a complete root reservation",
+            ));
+        }
+        let mut binding_scope = self.binding_scope.clone().ok_or_else(|| {
+            invalid_binding("fresh completion requires a captured repository scope")
+        })?;
+        let uuid = super::repository_identity::ensure_repository_uuid_marker(
+            &binding_scope.git_common_dir,
+            binding_scope.repository_uuid.as_deref(),
+        )?;
+        binding_scope.repository_uuid = Some(uuid.clone());
+        self.binding_scope = Some(binding_scope.clone());
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
-            let current = read_repository_worktree_binding(tx)?;
+            let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             if !matches!(
                 current.state,
                 RepositoryWorktreeBindingState::FreshReserved
@@ -395,8 +530,9 @@ impl BrokerStore {
             }
             let changed = tx.execute(
                 "UPDATE repository_worktree_binding
-                 SET state = 'bound', worktree_identity_json = ?1, updated_at_ms = ?2
-                 WHERE singleton = 1 AND origin = 'fresh'
+                 SET state = 'bound', worktree_identity_json = ?1, updated_at_ms = ?2,
+                     repository_uuid = ?5
+                 WHERE binding_id = ?6 AND origin = 'fresh'
                    AND state IN ('fresh_reserved', 'recovery_required')
                    AND bootstrap_nonce = ?3 AND reservation_digest = ?4",
                 params![
@@ -404,6 +540,8 @@ impl BrokerStore {
                     super::now_ms(),
                     identity.bootstrap_nonce,
                     reservation_digest,
+                    uuid,
+                    current.binding_id,
                 ],
             )?;
             if changed != 1 {
@@ -433,17 +571,46 @@ impl BrokerStore {
             return Err(BrokerError::RepositoryWorktreeBindingConfirmationMismatch);
         }
         validate_legacy_binding(confirmation)?;
+        let prior = self.repository_worktree_binding()?;
+        ensure_state(
+            prior.state,
+            RepositoryWorktreeBindingState::LegacyUnbound,
+            RepositoryWorktreeBindingState::Bound,
+        )?;
+        if prior.origin != Some(RepositoryWorktreeBindingOrigin::Legacy)
+            || prior.repository_root.as_deref() != Some(confirmation.repository_root.as_path())
+            || prior.git_common_dir.as_deref() != Some(confirmation.git_common_dir.as_path())
+            || prior.repository_key.as_deref() != Some(confirmation.repository_key.as_str())
+            || prior.broker_db_path.as_deref() != Some(confirmation.broker_db_path.as_path())
+        {
+            return Err(invalid_binding(
+                "legacy confirmation differs from the opened repository scope",
+            ));
+        }
         let database_path = self.path.clone();
+        let mut binding_scope = self.binding_scope.clone().ok_or_else(|| {
+            invalid_binding("explicit repository binding requires a captured repository scope")
+        })?;
+        let uuid = super::repository_identity::ensure_repository_uuid_marker(
+            &binding_scope.git_common_dir,
+            binding_scope.repository_uuid.as_deref(),
+        )?;
+        binding_scope.repository_uuid = Some(uuid.clone());
+        self.binding_scope = Some(binding_scope.clone());
         with_durable_binding_transaction(&mut self.conn, |tx| {
             ensure_current_v53(tx)?;
-            let current = read_repository_worktree_binding(tx)?;
+            let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             ensure_state(
                 current.state,
                 RepositoryWorktreeBindingState::LegacyUnbound,
                 RepositoryWorktreeBindingState::Bound,
             )?;
             if current.origin != Some(RepositoryWorktreeBindingOrigin::Legacy)
-                || current.repository_root.is_some()
+                || current.repository_root.as_deref()
+                    != Some(confirmation.repository_root.as_path())
+                || current.git_common_dir.as_deref() != Some(confirmation.git_common_dir.as_path())
+                || current.repository_key.as_deref() != Some(confirmation.repository_key.as_str())
+                || current.broker_db_path.as_deref() != Some(confirmation.broker_db_path.as_path())
                 || current.worktree_root.is_some()
             {
                 return Err(invalid_binding(
@@ -453,13 +620,13 @@ impl BrokerStore {
             super::fresh_database::verify_legacy_database_file_for_binding(&database_path)?;
             let changed = tx.execute(
                 "UPDATE repository_worktree_binding
-                 SET state = 'bound', origin = 'legacy', path_encoding = ?1,
+                 SET state = 'bound', repository_uuid = ?13, origin = 'legacy', path_encoding = ?1,
                      repository_root = ?2, git_common_dir = ?3, repository_key = ?4,
                      broker_db_path = ?5, worktree_root = ?6, root_layout = ?7,
                      root_source = ?8, reservation_digest = ?9,
                      parent_identity_json = ?10, worktree_identity_json = ?11,
                      updated_at_ms = ?12
-                 WHERE singleton = 1 AND state = 'legacy_unbound' AND origin = 'legacy'",
+                 WHERE binding_id = ?14 AND state = 'legacy_unbound' AND origin = 'legacy'",
                 params![
                     current_path_encoding(),
                     encode_path(&confirmation.repository_root),
@@ -473,6 +640,8 @@ impl BrokerStore {
                     confirmation.parent_identity_json,
                     confirmation.worktree_identity_json,
                     super::now_ms(),
+                    uuid,
+                    current.binding_id,
                 ],
             )?;
             if changed != 1 {
@@ -487,9 +656,121 @@ impl BrokerStore {
     }
 }
 
+fn resolve_repository_binding_id(
+    conn: &Connection,
+    scope: Option<&super::repository_identity::RepositoryBindingScope>,
+) -> Result<Option<i64>, BrokerError> {
+    let Some(scope) = scope else {
+        let (count, binding_id): (i64, Option<i64>) = conn.query_row(
+            "SELECT COUNT(*), MIN(binding_id) FROM repository_worktree_binding",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        return match (count, binding_id) {
+            (0, _) => Ok(None),
+            (1, Some(binding_id)) => Ok(Some(binding_id)),
+            _ => Err(invalid_binding(
+                "database has multiple repository bindings; open it with a repository scope",
+            )),
+        };
+    };
+
+    let encoded_common_dir = encode_path(&scope.git_common_dir);
+    let row: Option<(i64, Option<String>, String)> = conn
+        .query_row(
+            "SELECT binding_id, repository_uuid, state
+             FROM repository_worktree_binding WHERE git_common_dir = ?1",
+            [&encoded_common_dir],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((binding_id, stored_uuid, state)) = row {
+        match (scope.repository_uuid.as_deref(), stored_uuid.as_deref()) {
+            (None, Some(_)) => {
+                return Err(invalid_binding(
+                    "repository UUID marker is missing for an already-bound repository",
+                ));
+            }
+            (Some(expected), Some(actual)) if expected != actual => {
+                return Err(invalid_binding(
+                    "repository UUID marker differs from the stored binding",
+                ));
+            }
+            (Some(_), None)
+                if !matches!(
+                    state.as_str(),
+                    "legacy_unbound" | "fresh_unbound" | "fresh_reserved" | "recovery_required"
+                ) =>
+            {
+                return Err(invalid_binding(
+                    "bound repository record has no stable UUID",
+                ));
+            }
+            _ => {}
+        }
+        return Ok(Some(binding_id));
+    }
+
+    if let Some(uuid) = scope.repository_uuid.as_deref() {
+        let other_repository: Option<(i64, Vec<u8>)> = conn
+            .query_row(
+                "SELECT binding_id, git_common_dir FROM repository_worktree_binding
+                 WHERE repository_uuid = ?1",
+                [uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if other_repository.is_some() {
+            return Err(invalid_binding(
+                "repository UUID marker is attached to a different Git common directory",
+            ));
+        }
+        // A marker can be durably published just before the matching database
+        // transaction. No row means there is nothing safe to adopt implicitly.
+        return Ok(None);
+    }
+
+    // Before any repository has been explicitly bound, migration leaves one
+    // unscoped legacy placeholder. It may be read without authority and is
+    // claimed by the first mutable open; all later repositories get their own
+    // unbound row.
+    let placeholders: Vec<i64> = conn
+        .prepare(
+            "SELECT binding_id FROM repository_worktree_binding
+             WHERE state = 'legacy_unbound' AND git_common_dir IS NULL
+               AND repository_root IS NULL ORDER BY binding_id LIMIT 2",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    match placeholders.as_slice() {
+        [binding_id] => Ok(Some(*binding_id)),
+        [] => Ok(None),
+        _ => Err(invalid_binding(
+            "database has multiple unscoped legacy placeholders",
+        )),
+    }
+}
+
 fn read_repository_worktree_binding(
     conn: &Connection,
+    scope: Option<&super::repository_identity::RepositoryBindingScope>,
 ) -> Result<RepositoryWorktreeBinding, BrokerError> {
+    read_repository_worktree_binding_optional(conn, scope)?
+        .ok_or_else(|| invalid_binding("repository binding row is absent"))
+}
+
+fn read_repository_worktree_binding_optional(
+    conn: &Connection,
+    scope: Option<&super::repository_identity::RepositoryBindingScope>,
+) -> Result<Option<RepositoryWorktreeBinding>, BrokerError> {
+    let Some(binding_id) = resolve_repository_binding_id(conn, scope)? else {
+        return Ok(None);
+    };
+    let repository_uuid: Option<String> = conn.query_row(
+        "SELECT repository_uuid FROM repository_worktree_binding WHERE binding_id = ?1",
+        [binding_id],
+        |row| row.get(0),
+    )?;
     let raw = conn
         .query_row(
             "SELECT record_schema_version,
@@ -518,11 +799,12 @@ fn read_repository_worktree_binding(
                          WHEN length(reservation_digest) <= 64 THEN reservation_digest ELSE '' END,
                     CASE WHEN parent_identity_json IS NULL THEN NULL
                          WHEN length(parent_identity_json) <= 4096 THEN parent_identity_json ELSE '' END,
-                    CASE WHEN worktree_identity_json IS NULL THEN NULL
-                         WHEN length(worktree_identity_json) <= 4096 THEN worktree_identity_json ELSE '' END,
+                    CASE WHEN worktree_identity_json IS NULL
+                         THEN NULL WHEN length(worktree_identity_json) <= 4096
+                         THEN worktree_identity_json ELSE '' END,
                     updated_at_ms
-             FROM repository_worktree_binding WHERE singleton = 1",
-            [],
+             FROM repository_worktree_binding WHERE binding_id = ?1",
+            [binding_id],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -545,7 +827,7 @@ fn read_repository_worktree_binding(
             },
         )
         .optional()?
-        .ok_or_else(|| invalid_binding("singleton row is absent".to_owned()))?;
+        .ok_or_else(|| invalid_binding("selected repository binding row disappeared"))?;
     let (
         record_schema_version,
         state,
@@ -571,6 +853,8 @@ fn read_repository_worktree_binding(
     }
     let encoding = path_encoding.as_deref();
     let record = RepositoryWorktreeBinding {
+        binding_id,
+        repository_uuid,
         state: RepositoryWorktreeBindingState::parse(&state)?,
         origin: origin
             .as_deref()
@@ -593,6 +877,9 @@ fn read_repository_worktree_binding(
         updated_at_ms,
     };
     validate_binding_record(&record, encoding)?;
+    if let Some(scope) = scope {
+        validate_binding_scope(&record, scope)?;
+    }
     let floor = read_min_compatible_schema_floor(conn)?;
     let required_floor = if record.state == RepositoryWorktreeBindingState::LegacyUnbound {
         crate::schema::MIN_COMPATIBLE_SCHEMA
@@ -605,7 +892,63 @@ fn read_repository_worktree_binding(
             record.state.as_str()
         )));
     }
-    Ok(record)
+    Ok(Some(record))
+}
+
+fn validate_binding_scope(
+    record: &RepositoryWorktreeBinding,
+    scope: &super::repository_identity::RepositoryBindingScope,
+) -> Result<(), BrokerError> {
+    for (actual, expected, field) in [
+        (
+            record.repository_root.as_deref(),
+            Some(scope.repository_root.as_path()),
+            "repository root",
+        ),
+        (
+            record.git_common_dir.as_deref(),
+            Some(scope.git_common_dir.as_path()),
+            "Git common directory",
+        ),
+        (
+            record.broker_db_path.as_deref(),
+            Some(scope.broker_db_path.as_path()),
+            "broker database path",
+        ),
+    ] {
+        if let Some(actual) = actual
+            && Some(actual) != expected
+        {
+            return Err(invalid_binding(format!(
+                "stored {field} differs from the opened repository"
+            )));
+        }
+    }
+    if let Some(actual) = record.repository_key.as_deref()
+        && actual != scope.repository_key
+    {
+        return Err(invalid_binding(
+            "stored repository key differs from the opened repository",
+        ));
+    }
+    match (
+        record.repository_uuid.as_deref(),
+        scope.repository_uuid.as_deref(),
+    ) {
+        (Some(actual), Some(expected)) if actual == expected => {}
+        (Some(_), _) => {
+            return Err(invalid_binding(
+                "stored repository UUID is missing or differs from the Git marker",
+            ));
+        }
+        (None, Some(_)) if record.state == RepositoryWorktreeBindingState::Bound => {
+            return Err(invalid_binding(
+                "bound repository record has no stable UUID",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn read_min_compatible_schema_floor(conn: &Connection) -> Result<i64, BrokerError> {
@@ -642,11 +985,16 @@ fn validate_binding_record(
     let expected_shape = match record.state {
         RepositoryWorktreeBindingState::LegacyUnbound => {
             record.origin == Some(RepositoryWorktreeBindingOrigin::Legacy)
-                && encoding.is_none()
-                && record.repository_root.is_none()
-                && record.git_common_dir.is_none()
-                && record.repository_key.is_none()
-                && record.broker_db_path.is_none()
+                && (if has_repository_identity {
+                    encoding == Some(current_path_encoding()) && record.repository_uuid.is_none()
+                } else {
+                    encoding.is_none()
+                        && record.repository_root.is_none()
+                        && record.git_common_dir.is_none()
+                        && record.repository_key.is_none()
+                        && record.broker_db_path.is_none()
+                        && record.repository_uuid.is_none()
+                })
                 && record.bootstrap_nonce.is_none()
                 && record.worktree_root.is_none()
                 && record.root_layout.is_none()
@@ -656,7 +1004,8 @@ fn validate_binding_record(
                 && record.worktree_identity_json.is_none()
         }
         RepositoryWorktreeBindingState::FreshUnbound => {
-            record.origin == Some(RepositoryWorktreeBindingOrigin::Fresh)
+            record.repository_uuid.is_none()
+                && record.origin == Some(RepositoryWorktreeBindingOrigin::Fresh)
                 && encoding == Some(current_path_encoding())
                 && has_repository_identity
                 && record.bootstrap_nonce.is_some()
@@ -669,7 +1018,8 @@ fn validate_binding_record(
         }
         RepositoryWorktreeBindingState::FreshReserved
         | RepositoryWorktreeBindingState::RecoveryRequired => {
-            record.origin == Some(RepositoryWorktreeBindingOrigin::Fresh)
+            record.repository_uuid.is_none()
+                && record.origin == Some(RepositoryWorktreeBindingOrigin::Fresh)
                 && encoding == Some(current_path_encoding())
                 && has_repository_identity
                 && record.bootstrap_nonce.is_some()
@@ -677,7 +1027,11 @@ fn validate_binding_record(
                 && record.worktree_identity_json.is_none()
         }
         RepositoryWorktreeBindingState::Bound => {
-            record.origin.is_some()
+            record
+                .repository_uuid
+                .as_deref()
+                .is_some_and(|uuid| super::repository_identity::validate_uuid_v4(uuid).is_ok())
+                && record.origin.is_some()
                 && encoding == Some(current_path_encoding())
                 && has_repository_identity
                 && match record.origin {
@@ -1013,6 +1367,8 @@ mod tests {
         );
 
         let binding = RepositoryWorktreeBinding {
+            binding_id: 1,
+            repository_uuid: Some("f47ac10b-58cc-4372-a567-0e02b2c3d479".to_owned()),
             state: RepositoryWorktreeBindingState::Bound,
             origin: Some(RepositoryWorktreeBindingOrigin::Legacy),
             repository_root: Some(PathBuf::from("/repo")),
@@ -1072,7 +1428,21 @@ mod tests {
     }
 
     fn open_store(directory: &tempfile::TempDir) -> BrokerStore {
-        BrokerStore::open(&directory.path().join("broker.db")).unwrap()
+        let root = directory.path().join("repo");
+        let common = root.join(".git");
+        let database = root.join(".aethyme/broker.db");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let mut store = BrokerStore::open(&database).unwrap();
+        store.binding_scope = Some(super::super::repository_identity::RepositoryBindingScope {
+            repository_root: root,
+            git_common_dir: common,
+            repository_key: "repo-key".to_owned(),
+            broker_db_path: database,
+            repository_uuid: None,
+        });
+        store.ensure_repository_binding_scope().unwrap();
+        store
     }
 
     fn floor(store: &BrokerStore) -> String {
@@ -1089,7 +1459,7 @@ mod tests {
     fn binding_row(store: &BrokerStore) -> Vec<rusqlite::types::Value> {
         let mut statement = store
             .conn
-            .prepare("SELECT * FROM repository_worktree_binding WHERE singleton = 1")
+            .prepare("SELECT * FROM repository_worktree_binding WHERE binding_id = 1")
             .unwrap();
         let columns = statement.column_count();
         statement
@@ -1474,7 +1844,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE repository_worktree_binding SET state = 'bound' WHERE singleton = 1",
+                "UPDATE repository_worktree_binding SET state = 'bound' WHERE binding_id = 1",
                 [],
             )
             .unwrap();
@@ -1511,7 +1881,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE repository_worktree_binding SET path_encoding = '' WHERE singleton = 1",
+                "UPDATE repository_worktree_binding SET path_encoding = '' WHERE binding_id = 1",
                 [],
             )
             .unwrap();
@@ -1547,7 +1917,7 @@ mod tests {
             .conn
             .execute(
                 "UPDATE repository_worktree_binding
-                 SET path_encoding = NULL, repository_root = X'' WHERE singleton = 1",
+                 SET path_encoding = NULL, repository_root = X'' WHERE binding_id = 1",
                 [],
             )
             .unwrap();

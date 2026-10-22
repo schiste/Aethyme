@@ -6569,7 +6569,7 @@ mod tests {
                      broker_db_path = NULL, bootstrap_nonce = NULL, worktree_root = NULL,
                      root_layout = NULL, root_source = NULL, reservation_digest = NULL,
                      parent_identity_json = NULL, worktree_identity_json = NULL
-                 WHERE singleton = 1;
+                 WHERE binding_id = 1;
                  UPDATE meta SET value = '52' WHERE key = 'min_compatible_schema';",
             )
             .unwrap();

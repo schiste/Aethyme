@@ -200,6 +200,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
   missing entrypoint. Bind redundant manifest fields to the same final bytes.
+- Before an expensive broker `resources run`, complete the frozen-helper and
+  receipt preflight in a separate fail-fast step. Do not place preflight and
+  execution in a multiline shell that continues after a failed check. Resource
+  request IDs are one-shot even when a child refuses before Cargo starts; keep
+  the refusal, diagnose it, and submit a fresh uniquely identified request
+  instead of retrying the consumed ID.
 - Before a long run, verify the producer supplies every field the finalizer
   uses to decide validation success, including an explicit validator exit code.
   Add offline controls for missing and nonzero values; do not infer success from

@@ -69,7 +69,7 @@ pub(crate) fn acquire_repository_binding_lock(
 
 #[cfg(not(unix))]
 pub(super) fn open_in_repo(
-    _repo_root: &Path,
+    repo_root: &Path,
     requested_db_path: &Path,
 ) -> Result<BrokerStore, BrokerError> {
     let metadata = match std::fs::symlink_metadata(requested_db_path) {
@@ -92,6 +92,8 @@ pub(super) fn open_in_repo(
             "existing broker database is not a regular non-symlink file".to_owned(),
         ));
     }
+    let binding_scope =
+        super::repository_identity::RepositoryBindingScope::capture(repo_root, requested_db_path)?;
     let connection = Connection::open_with_flags(
         requested_db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -111,9 +113,11 @@ pub(super) fn open_in_repo(
             conn: connection,
             path: requested_db_path.to_path_buf(),
             _snapshot_dir: None,
+            binding_scope: Some(binding_scope),
         };
-        let binding = store.repository_worktree_binding()?;
-        if binding.state != RepositoryWorktreeBindingState::LegacyUnbound {
+        if let Some(binding) = store.repository_worktree_binding_optional()?
+            && binding.state != RepositoryWorktreeBindingState::LegacyUnbound
+        {
             return Err(BrokerError::InvalidRepositoryWorktreeBinding(
                 "identity-bound repository databases require safe Unix no-follow verification"
                     .to_owned(),
@@ -187,6 +191,7 @@ mod unix {
         lock_path: PathBuf,
         parent_path: PathBuf,
         parent_identity: DirectoryIdentity,
+        binding_scope: super::repository_identity::RepositoryBindingScope,
     }
 
     struct IdentityBase {
@@ -326,6 +331,10 @@ mod unix {
             lock_path,
             parent_path,
             parent_identity,
+            binding_scope: super::repository_identity::RepositoryBindingScope::capture(
+                repo_root,
+                &final_path,
+            )?,
         })
     }
 
@@ -728,13 +737,10 @@ mod unix {
                 "could not capture repository Git identity: {error}"
             ))
         })?;
-        let discovered_root =
-            fs::canonicalize(repo.root()).map_err(|source| io_error(repo.root(), source))?;
-        if discovered_root != repository_root {
-            return Err(refusal(
-                "open_in_repo requires the top-level checkout root, not a nested path",
-            ));
-        }
+        let repository_root = fs::canonicalize(repo.main_root().map_err(|error| {
+            refusal(format!("could not resolve main repository root: {error}"))
+        })?)
+        .map_err(|source| io_error(&repository_root, source))?;
         let git_common_dir = fs::canonicalize(repo.git_common_dir().map_err(|error| {
             refusal(format!("could not capture Git common directory: {error}"))
         })?)
@@ -817,6 +823,7 @@ mod unix {
             conn: connection,
             path: paths.stage_path.clone(),
             _snapshot_dir: None,
+            binding_scope: Some(paths.binding_scope.clone()),
         };
         let permit = super::super::open::fresh_database_stage_permit();
         store.initialize_fresh_repository_worktree_binding(&permit, identity)?;
@@ -957,6 +964,7 @@ mod unix {
             conn: connection,
             path: db_path.to_path_buf(),
             _snapshot_dir: None,
+            binding_scope: Some(paths.binding_scope.clone()),
         };
         let binding = store.repository_worktree_binding()?;
         let identity = validate_binding_identity(&binding, base)?;
@@ -1180,12 +1188,10 @@ mod unix {
             conn: connection,
             path: paths.final_path.clone(),
             _snapshot_dir: None,
+            binding_scope: Some(paths.binding_scope.clone()),
         };
-        let binding = store.repository_worktree_binding()?;
-        Ok(Header {
-            floor,
-            binding: Some(binding),
-        })
+        let binding = store.repository_worktree_binding_optional()?;
+        Ok(Header { floor, binding })
     }
 
     fn read_version_if_present(connection: &Connection) -> Result<i64, BrokerError> {
@@ -1262,7 +1268,12 @@ mod unix {
                 ));
             }
             check_existing_sidecars(paths, &paths.final_path)?;
-            return open_verified_current(&paths.final_path, &paths.logical_path, &identity);
+            return open_verified_current(
+                &paths.final_path,
+                &paths.logical_path,
+                &identity,
+                &paths.binding_scope,
+            );
         }
         if require_nonlegacy {
             return Err(refusal(
@@ -1329,7 +1340,12 @@ mod unix {
             "published final database",
         )?;
         check_sidecars(&paths.final_path, false)?;
-        open_verified_current(&paths.final_path, &paths.logical_path, &identity)
+        open_verified_current(
+            &paths.final_path,
+            &paths.logical_path,
+            &identity,
+            &paths.binding_scope,
+        )
     }
 
     fn publish_verified_stage(
@@ -1401,7 +1417,12 @@ mod unix {
             "published final database",
         )?;
         check_sidecars(&paths.final_path, false)?;
-        open_verified_current(&paths.final_path, &paths.logical_path, &published.identity)
+        open_verified_current(
+            &paths.final_path,
+            &paths.logical_path,
+            &published.identity,
+            &paths.binding_scope,
+        )
     }
 
     fn refuse_final_name_collision<T>() -> Result<T, BrokerError> {
@@ -1414,6 +1435,7 @@ mod unix {
         db_path: &Path,
         logical_path: &Path,
         identity: &VerifiedRepositoryIdentity,
+        binding_scope: &super::repository_identity::RepositoryBindingScope,
     ) -> Result<BrokerStore, BrokerError> {
         let connection = Connection::open_with_flags(
             db_path,
@@ -1430,6 +1452,7 @@ mod unix {
             conn: connection,
             path: logical_path.to_path_buf(),
             _snapshot_dir: None,
+            binding_scope: Some(binding_scope.clone()),
         };
         let binding = store.repository_worktree_binding()?;
         if binding.origin != Some(identity.origin)
@@ -1566,6 +1589,57 @@ mod unix {
                 Some(RepositoryWorktreeBindingOrigin::Legacy)
             );
             assert_eq!(binding.bootstrap_nonce, None);
+        }
+
+        #[test]
+        fn moved_bound_repository_marker_cannot_rebind_the_database() {
+            let repo = tempfile::tempdir().unwrap();
+            let (paths, store) = bind_legacy_database(repo.path());
+            drop(store);
+            let original_root = repo.path().to_path_buf();
+            let moved_root = original_root.with_extension("moved");
+            fs::rename(&original_root, &moved_root).unwrap();
+            let moved_database = moved_root.join(".aethyme/broker.db");
+            let database_before = fs::read(&moved_database).unwrap();
+
+            let error = match open_in_repo(&moved_root, &moved_database) {
+                Ok(_) => {
+                    panic!("a moved Git common directory must not inherit a bound repository UUID")
+                }
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                BrokerError::InvalidRepositoryWorktreeBinding(_)
+            ));
+            assert_eq!(fs::read(&moved_database).unwrap(), database_before);
+            fs::remove_dir_all(moved_root).unwrap();
+            let _ = paths;
+        }
+
+        #[test]
+        fn bound_repository_refuses_when_its_stable_uuid_marker_is_deleted() {
+            let repo = tempfile::tempdir().unwrap();
+            let (paths, store) = bind_legacy_database(repo.path());
+            drop(store);
+            let marker = repo.path().join(".git/aethyme-repository-uuid");
+            assert!(marker.is_file());
+            let database_before = fs::read(&paths.final_path).unwrap();
+            fs::remove_file(&marker).unwrap();
+
+            let error = match open_in_repo(repo.path(), &paths.logical_path) {
+                Ok(_) => panic!("a bound repository with a missing UUID marker must refuse"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                BrokerError::InvalidRepositoryWorktreeBinding(_)
+            ));
+            assert!(
+                !marker.exists(),
+                "ordinary open must not repair a missing marker"
+            );
+            assert_eq!(fs::read(&paths.final_path).unwrap(), database_before);
         }
 
         #[test]
@@ -1786,7 +1860,7 @@ mod unix {
             let connection = Connection::open(&paths.final_path).unwrap();
             connection
                 .execute(
-                    "UPDATE repository_worktree_binding SET origin = 'legacy' WHERE singleton = 1",
+                    "UPDATE repository_worktree_binding SET origin = 'legacy' WHERE binding_id = 1",
                     [],
                 )
                 .unwrap();
