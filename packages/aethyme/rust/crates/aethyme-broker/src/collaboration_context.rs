@@ -3821,6 +3821,30 @@ mod tests {
         assert_eq!(gaps(&elsewhere), vec!["analysis_not_scoped"]);
     }
 
+    /// A malformed source can produce a scoped view, but that partial result
+    /// cannot be used as complete evidence that the scope is clear.
+    #[test]
+    fn malformed_source_view_impact_cannot_be_complete_evidence() {
+        let mut fixture = Fixture::new();
+        let malformed = fixture.contribute(&[("src/broken.py", "def broken(:\n")]);
+        let (_, snapshot) = snapshots(&fixture, &malformed);
+        let impact = current_view(&mut fixture, &snapshot)
+            .explain_impact(&["src/broken.py"], 64)
+            .unwrap();
+
+        assert_eq!(impact.coverage, Coverage::Partial);
+        let context = ask(
+            &mut fixture,
+            &["src/broken.py"],
+            vec![impact],
+            Some(&snapshot),
+        );
+        assert!(gaps(&context).contains(&"analysis_partial"));
+        assert!(!gaps(&context).contains(&"analysis_not_scoped"));
+        assert_eq!(context.selection.coverage(), "partial");
+        assert!(!context.selection.absence_is_evidence());
+    }
+
     /// A brief or retention change of a contribution under a dependency
     /// changes the key, even when no posting is added or removed.
     #[test]
