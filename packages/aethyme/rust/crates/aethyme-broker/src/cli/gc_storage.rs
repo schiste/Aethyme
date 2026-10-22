@@ -692,15 +692,21 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     // shell, nor someone working without the hook; both keep using the build
     // output a quiet session's row would release. Checked at plan and again
     // at apply, so a worktree that came back into use in between keeps it.
-    match crate::reclaim::open_paths_under(&root) {
-        Some(open_paths) => {
-            crate::reclaim::protect_worktrees_with_open_files(&mut candidates, &open_paths);
+    match crate::reclaim::open_file_snapshot_under(&root) {
+        crate::reclaim::OpenFileSnapshot::Complete(open_files) => {
+            crate::reclaim::protect_worktrees_with_open_file_uses(&mut candidates, &open_files);
         }
-        None => eprintln!(
-            "Warning: could not list open files (`lsof` unavailable or empty), so a build or \
-             dev server running in a quiet session's worktree is not detected; session activity \
-             and recent Git index changes still protect build output in use."
-        ),
+        crate::reclaim::OpenFileSnapshot::Incomplete { reason, observed } => {
+            crate::reclaim::protect_worktrees_when_open_file_snapshot_is_incomplete(
+                &mut candidates,
+                &reason,
+                &observed,
+            );
+            eprintln!(
+                "Warning: process-use inspection is incomplete; affected cleanup candidates \
+                 are kept for safety: {reason}"
+            );
+        }
     }
     crate::reclaim::protect_recently_worked_worktrees(
         &mut candidates,
