@@ -455,20 +455,22 @@ mod unix {
             links: opened.nlink(),
             size: opened.size(),
         };
+        let file_size = usize::try_from(identity.size)
+            .map_err(|_| refusal("repository UUID marker has an invalid size"))?;
         // SAFETY: `geteuid` takes no pointers and has no caller-side safety preconditions.
         let effective_uid = unsafe { libc::geteuid() };
         if !opened.is_file()
             || identity.uid != effective_uid
             || identity.mode != 0o600
             || identity.links != expected_links
-            || identity.size as usize > MAX_MARKER_BYTES
+            || file_size > MAX_MARKER_BYTES
             || identity != named_before
         {
             return Err(refusal(format!(
                 "repository UUID marker entry {name:?} has unsafe owner, mode, links, size, or identity"
             )));
         }
-        let mut bytes = Vec::with_capacity(identity.size as usize);
+        let mut bytes = Vec::with_capacity(file_size);
         (&mut file)
             .take((MAX_MARKER_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
