@@ -719,6 +719,72 @@ mod tests {
         assert_eq!(waits, 0, "readiness bytes already available must not sleep");
     }
 
+    #[test]
+    fn readiness_waits_only_after_would_block_then_reads_ready_frame() {
+        struct WouldBlockOnceReader {
+            block_once: bool,
+            bytes: Vec<u8>,
+            offset: usize,
+        }
+
+        impl std::io::Read for WouldBlockOnceReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.block_once {
+                    self.block_once = false;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                if self.offset == self.bytes.len() {
+                    return Ok(0);
+                }
+                buffer[0] = self.bytes[self.offset];
+                self.offset += 1;
+                Ok(1)
+            }
+        }
+
+        let expected = "AETHYME_AGENT_READY cleanup-after-would-block";
+        let mut reader = WouldBlockOnceReader {
+            block_once: true,
+            bytes: format!("{expected}\n").into_bytes(),
+            offset: 0,
+        };
+        let mut waits = 0;
+
+        super::await_ready_with_wait(
+            &mut reader,
+            expected,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            || waits += 1,
+        )
+        .unwrap();
+
+        assert_eq!(waits, 1, "only the initial WouldBlock should wait");
+    }
+
+    #[test]
+    fn readiness_expired_deadline_does_not_wait_after_would_block() {
+        struct WouldBlockReader;
+
+        impl std::io::Read for WouldBlockReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        let mut reader = WouldBlockReader;
+        let mut waits = 0;
+        let error = super::await_ready_with_wait(
+            &mut reader,
+            "AETHYME_AGENT_READY cleanup-expired",
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            || waits += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(waits, 0, "an expired deadline must not invoke the wait");
+    }
+
     fn initialized_repo(path: &std::path::Path) {
         std::fs::create_dir_all(path).unwrap();
         for args in [
