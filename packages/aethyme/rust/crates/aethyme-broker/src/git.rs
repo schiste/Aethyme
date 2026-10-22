@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::io::Read;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -219,6 +219,10 @@ pub(crate) const GIT_TIMEOUT_ENV: &str = "AETHYME_GIT_TIMEOUT_SECS";
 /// on purpose: it exists to turn a hang into an error, not to police a slow
 /// but progressing fetch.
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Batch metadata and patch-id output must stay finite even for an unusually
+/// large repository. Patch bodies themselves are streamed between Git.
+const MAX_GIT_BATCH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GIT_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// The deadline for one git invocation, from the value of
 /// [`GIT_TIMEOUT_ENV`]. A missing, unparsable or zero value keeps the
@@ -1786,6 +1790,38 @@ fn run_git_process_output(
     };
     Ok(output)
 }
+
+fn effective_git_deadline(
+    args: &str,
+    budget: Duration,
+    started: Instant,
+) -> Result<Instant, GitError> {
+    let requested = started.checked_add(budget).ok_or_else(|| GitError::Spawn {
+        args: args.to_string(),
+        source: std::io::Error::other("git deadline overflow"),
+    })?;
+    let deadline = active_git_deadline().map_or(requested, |outer| requested.min(outer));
+    if Instant::now() >= deadline {
+        note_git_timeout();
+        return Err(GitError::TimedOut {
+            args: args.to_string(),
+            seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+        });
+    }
+    Ok(deadline)
+}
+
+fn remaining_git_budget(args: &str, deadline: Instant) -> Result<Duration, GitError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        note_git_timeout();
+        return Err(GitError::TimedOut {
+            args: args.to_string(),
+            seconds: 1,
+        });
+    }
+    Ok(remaining)
+}
 /// A commit's tree and parents, in Git's stored parent order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitShape {
@@ -1793,14 +1829,124 @@ pub struct CommitShape {
     pub parents: Vec<String>,
 }
 
-/// Newline-separated commit names, as `--stdin` reads them.
-fn commit_list(commits: &[String]) -> Vec<u8> {
-    let mut input = Vec::with_capacity(commits.len() * 41);
+/// Errors while staging a bounded `--stdin` list for Git.
+#[derive(Debug)]
+enum GitBatchInputError {
+    TooLarge,
+    TimedOut,
+    Io(std::io::Error),
+}
+
+/// Check the complete input size before creating or writing the temporary file.
+fn checked_git_batch_input_len(
+    commits: &[String],
+    deadline: Instant,
+) -> Result<(), GitBatchInputError> {
+    let mut total = 0_usize;
     for commit in commits {
-        input.extend_from_slice(commit.as_bytes());
-        input.push(b'\n');
+        if Instant::now() >= deadline {
+            return Err(GitBatchInputError::TimedOut);
+        }
+        let line_bytes = commit
+            .len()
+            .checked_add(1)
+            .ok_or(GitBatchInputError::TooLarge)?;
+        total = total
+            .checked_add(line_bytes)
+            .filter(|bytes| *bytes <= MAX_GIT_BATCH_INPUT_BYTES)
+            .ok_or(GitBatchInputError::TooLarge)?;
     }
-    input
+    if Instant::now() >= deadline {
+        return Err(GitBatchInputError::TimedOut);
+    }
+    Ok(())
+}
+
+const GIT_BATCH_INPUT_CHUNK_BYTES: usize = 8 * 1024;
+
+fn append_git_batch_bytes(
+    file: &mut std::fs::File,
+    buffer: &mut Vec<u8>,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), GitBatchInputError> {
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(GitBatchInputError::TimedOut);
+        }
+        let room = GIT_BATCH_INPUT_CHUNK_BYTES - buffer.len();
+        let count = room.min(bytes.len());
+        buffer.extend_from_slice(&bytes[..count]);
+        bytes = &bytes[count..];
+        if buffer.len() == GIT_BATCH_INPUT_CHUNK_BYTES {
+            file.write_all(buffer).map_err(GitBatchInputError::Io)?;
+            if Instant::now() >= deadline {
+                return Err(GitBatchInputError::TimedOut);
+            }
+            buffer.clear();
+        }
+    }
+    Ok(())
+}
+
+/// Stage commit names incrementally without allocating a second unbounded list.
+fn git_batch_input(
+    commits: &[String],
+    deadline: Instant,
+) -> Result<std::fs::File, GitBatchInputError> {
+    checked_git_batch_input_len(commits, deadline)?;
+    let mut file = tempfile::tempfile().map_err(GitBatchInputError::Io)?;
+    if Instant::now() >= deadline {
+        return Err(GitBatchInputError::TimedOut);
+    }
+    let mut buffer = Vec::with_capacity(GIT_BATCH_INPUT_CHUNK_BYTES);
+    for commit in commits {
+        if Instant::now() >= deadline {
+            return Err(GitBatchInputError::TimedOut);
+        }
+        append_git_batch_bytes(&mut file, &mut buffer, commit.as_bytes(), deadline)?;
+        append_git_batch_bytes(&mut file, &mut buffer, b"\n", deadline)?;
+    }
+    if Instant::now() >= deadline {
+        return Err(GitBatchInputError::TimedOut);
+    }
+    if !buffer.is_empty() {
+        file.write_all(&buffer).map_err(GitBatchInputError::Io)?;
+        if Instant::now() >= deadline {
+            return Err(GitBatchInputError::TimedOut);
+        }
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(GitBatchInputError::Io)?;
+    if Instant::now() >= deadline {
+        return Err(GitBatchInputError::TimedOut);
+    }
+    Ok(file)
+}
+
+fn git_batch_input_error(
+    args: &str,
+    started: Instant,
+    deadline: Instant,
+    error: GitBatchInputError,
+) -> GitError {
+    match error {
+        GitBatchInputError::TooLarge => GitError::Git {
+            args: args.to_string(),
+            stderr: format!("Git batch input exceeded {MAX_GIT_BATCH_INPUT_BYTES} bytes"),
+        },
+        GitBatchInputError::TimedOut => {
+            note_git_timeout();
+            GitError::TimedOut {
+                args: args.to_string(),
+                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+            }
+        }
+        GitBatchInputError::Io(source) => GitError::Spawn {
+            args: args.to_string(),
+            source,
+        },
+    }
 }
 
 /// Uncommitted work in a checkout, counted the way `git status` shows it.
@@ -3264,7 +3410,7 @@ impl GitRepo {
             "--no-color",
             "--format=%H %T %P",
         ];
-        let stdout = self.run_git_with_stdin(&args, commit_list(commits))?;
+        let stdout = self.run_git_with_stdin(&args, commits)?;
         for line in String::from_utf8_lossy(&stdout).lines() {
             let mut fields = line.split_whitespace();
             let (Some(commit), Some(tree)) = (fields.next(), fields.next()) else {
@@ -3312,77 +3458,55 @@ impl GitRepo {
             "--diff-merges=first-parent",
             "--format=commit %H",
         ];
-        let mut log = git_command()
-            .args(log_args)
-            .current_dir(&self.root)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|source| GitError::Spawn {
-                args: log_args.join(" "),
-                source,
-            })?;
-        let log_stdout = log.stdout.take().ok_or_else(|| GitError::Git {
-            args: log_args.join(" "),
-            stderr: "failed to open log stdout".into(),
-        })?;
+        let pipeline_args = format!("{} | patch-id --verbatim", log_args.join(" "));
+        let started = Instant::now();
+        let deadline = effective_git_deadline(&pipeline_args, git_timeout(), started)?;
+        let input = git_batch_input(commits, deadline)
+            .map_err(|error| git_batch_input_error(&pipeline_args, started, deadline, error))?;
+        let budget = remaining_git_budget(&pipeline_args, deadline)?;
+        let mut log = git_command();
+        log.args(log_args).current_dir(&self.root);
         // The diff streams from one process into the other through a pipe,
         // so it is never held in memory however much history it covers.
-        let patch_id = git_command()
-            .args(PATCH_ID_ARGS)
-            .current_dir(&self.root)
-            .stdin(std::process::Stdio::from(log_stdout))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|source| GitError::Spawn {
-                args: "patch-id --verbatim".into(),
-                source,
-            })?;
-        let mut log_stdin = log.stdin.take().ok_or_else(|| GitError::Git {
-            args: log_args.join(" "),
-            stderr: "failed to open log stdin".into(),
-        })?;
-        let input = commit_list(commits);
-        let writer = std::thread::spawn(move || log_stdin.write_all(&input));
-        let mut log_stderr = log.stderr.take();
-        let stderr_reader = std::thread::spawn(move || {
-            let mut text = String::new();
-            // Only an error message uses this text, so a failed read is
-            // reported inside it rather than failing the batch.
-            if let Some(stderr) = log_stderr.as_mut()
-                && let Err(error) = std::io::Read::read_to_string(stderr, &mut text)
-            {
-                text.push_str(&format!("(git log stderr unreadable: {error})"));
-            }
-            text
-        });
-        let output = patch_id
-            .wait_with_output()
-            .map_err(|source| GitError::Spawn {
-                args: "patch-id --verbatim".into(),
-                source,
-            })?;
-        let log_status = log.wait().map_err(|source| GitError::Spawn {
-            args: log_args.join(" "),
+        let mut patch_id = git_command();
+        patch_id.args(PATCH_ID_ARGS).current_dir(&self.root);
+        let output = crate::bounded_output::pipeline_with_input_limited(
+            &mut log,
+            input,
+            &mut patch_id,
+            budget,
+            MAX_GIT_BATCH_OUTPUT_BYTES,
+        )
+        .map_err(|source| GitError::Spawn {
+            args: pipeline_args.clone(),
             source,
         })?;
-        let log_stderr = stderr_reader.join().unwrap_or_default();
-        writer
-            .join()
-            .map_err(|_| GitError::Git {
-                args: log_args.join(" "),
-                stderr: "log stdin writer panicked".into(),
-            })?
-            .map_err(|source| GitError::Spawn {
-                args: log_args.join(" "),
-                source,
-            })?;
+        let (log_status, log_stderr, output) = match output {
+            crate::bounded_output::LimitedPipelineOutput::Completed {
+                first_status,
+                first_stderr,
+                second,
+            } => (first_status, first_stderr, second),
+            crate::bounded_output::LimitedPipelineOutput::Deadline => {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: pipeline_args,
+                    seconds: budget.as_secs().max(1),
+                });
+            }
+            crate::bounded_output::LimitedPipelineOutput::OutputLimit => {
+                return Err(GitError::Git {
+                    args: pipeline_args,
+                    stderr: format!(
+                        "streamed Git output exceeded {MAX_GIT_BATCH_OUTPUT_BYTES} bytes per captured stream"
+                    ),
+                });
+            }
+        };
         if !log_status.success() {
             return Err(GitError::Git {
                 args: log_args.join(" "),
-                stderr: log_stderr.trim().to_string(),
+                stderr: String::from_utf8_lossy(&log_stderr).trim().to_string(),
             });
         }
         if !output.status.success() {
@@ -3401,43 +3525,51 @@ impl GitRepo {
     }
 
     /// Run git with `input` on stdin and return its stdout. The input is
-    /// written from a thread: a long list fills the output pipe before it is
-    /// consumed, and a single thread would deadlock.
-    fn run_git_with_stdin(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, GitError> {
-        let mut child = git_command()
+    /// staged into an anonymous file so the child runner has no writer thread
+    /// that could outlive the command deadline.
+    fn run_git_with_stdin(&self, args: &[&str], commits: &[String]) -> Result<Vec<u8>, GitError> {
+        let args_display = args.join(" ");
+        let started = Instant::now();
+        let deadline = effective_git_deadline(&args_display, git_timeout(), started)?;
+        let input = git_batch_input(commits, deadline)
+            .map_err(|error| git_batch_input_error(&args_display, started, deadline, error))?;
+        let budget = remaining_git_budget(&args_display, deadline)?;
+        let mut command = git_command();
+        command
             .args(args)
             .current_dir(&self.root)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|source| GitError::Spawn {
-                args: args.join(" "),
-                source,
-            })?;
-        let mut stdin = child.stdin.take().ok_or_else(|| GitError::Git {
-            args: args.join(" "),
-            stderr: "failed to open stdin".into(),
-        })?;
-        let writer = std::thread::spawn(move || stdin.write_all(&input));
-        let output = child.wait_with_output().map_err(|source| GitError::Spawn {
-            args: args.join(" "),
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = crate::bounded_output::output_with_input_limited(
+            &mut command,
+            input,
+            budget,
+            MAX_GIT_BATCH_OUTPUT_BYTES,
+        )
+        .map_err(|source| GitError::Spawn {
+            args: args_display.clone(),
             source,
         })?;
-        writer
-            .join()
-            .map_err(|_| GitError::Git {
-                args: args.join(" "),
-                stderr: "stdin writer panicked".into(),
-            })?
-            .map_err(|source| GitError::Spawn {
-                args: args.join(" "),
-                source,
-            })?;
+        let output = match output {
+            crate::bounded_output::LimitedOutput::Completed(output) => output,
+            crate::bounded_output::LimitedOutput::Deadline => {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: args_display,
+                    seconds: budget.as_secs().max(1),
+                });
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                return Err(GitError::Git {
+                    args: args_display,
+                    stderr: format!(
+                        "Git batch output exceeded {MAX_GIT_BATCH_OUTPUT_BYTES} bytes per stream"
+                    ),
+                });
+            }
+        };
         if !output.status.success() {
             return Err(GitError::Git {
-                args: args.join(" "),
+                args: args_display,
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
@@ -6154,6 +6286,53 @@ mod batched_commit_tests {
 
         let missing = vec!["0000000000000000000000000000000000000001".to_string()];
         assert!(repo.commit_shapes(&missing).is_err());
+    }
+
+    #[test]
+    fn oversized_commit_batch_is_rejected_before_staging() {
+        let commits = vec!["x".repeat(MAX_GIT_BATCH_INPUT_BYTES + 1)];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(matches!(
+            git_batch_input(&commits, deadline),
+            Err(GitBatchInputError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn expired_commit_batch_staging_refuses_before_writing_input() {
+        let commits = vec!["0123456789abcdef".to_string()];
+        let deadline = Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            git_batch_input(&commits, deadline),
+            Err(GitBatchInputError::TimedOut)
+        ));
+    }
+
+    #[test]
+    fn streamed_batch_git_helpers_refuse_an_expired_inspection_before_spawning() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("tracked.txt"), "fixture\n").expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "fixture"]);
+        let repo = GitRepo::discover(root).expect("repo");
+        let head = repo.head_commit().expect("head");
+        let deadline = limit_git_until(Instant::now() - Duration::from_millis(1));
+        let before = git_timeout_generation();
+
+        let shapes = repo.commit_shapes(std::slice::from_ref(&head));
+        assert!(
+            matches!(shapes, Err(GitError::TimedOut { ref args, .. }) if args.starts_with("log --no-walk=unsorted --stdin")),
+            "commit shape batch must respect the active report deadline: {shapes:?}"
+        );
+        let patch_ids = repo.first_parent_patch_ids(&[head]);
+        assert!(
+            matches!(patch_ids, Err(GitError::TimedOut { ref args, .. }) if args.contains("patch-id --verbatim")),
+            "streamed patch-id batch must respect the active report deadline: {patch_ids:?}"
+        );
+        assert_eq!(git_timeout_generation(), before + 2);
+        drop(deadline);
     }
 
     /// A port that differs only in whitespace is different work: re-indented
