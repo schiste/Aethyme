@@ -1928,6 +1928,8 @@ mod scan_tests {
         let prefix = b"p123\0cfixture\0\nfcwd\0tDIR\0n/w/root\0\n";
         for suffix in [
             &b"f10\0tREG\0n\0\n"[..],
+            &b"f10\0tDIR\0n\0\n"[..],
+            &b"f10\0tCHR\0n\0\n"[..],
             &b"f10\0n\0\n"[..],
             &b"f10\0tFUTURETYPE\0n\0\n"[..],
         ] {
