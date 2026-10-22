@@ -519,16 +519,19 @@ fn a_process_in_the_checkout_keeps_it() {
         .current_dir(&worktree)
         .spawn()
         .unwrap();
+    let child_pid = child.id();
     let report = run(&mut broker);
     let _ = child.kill();
     let _ = child.wait();
     let reason = kept_reason(&report, &worktree);
     #[cfg(unix)]
     {
+        let expected_prefix = format!("process {child_pid} (\"sleep\") has \"");
+        let worktree_path = worktree.to_string_lossy();
         assert!(
-            reason.starts_with("a process has")
-                && reason.contains(worktree.to_string_lossy().as_ref())
-                && reason.ends_with("open"),
+            reason.starts_with(expected_prefix.as_str())
+                && reason.contains(worktree_path.as_ref())
+                && reason.ends_with(" open"),
             "{report:#?}"
         );
     }
