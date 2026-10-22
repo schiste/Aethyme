@@ -11,8 +11,9 @@
 //! ref -- the session's own `agent/*` branch -- and nothing that another
 //! session or the default branch depends on. Authorization is durable and
 //! repository-level (`[delivery] push_session_branches = true` on the default
-//! branch), so an agent can push after every commit without asking each time,
-//! and a repository that has not opted in is refused with the key to set.
+//! branch), so an agent can push after every commit without asking each time.
+//! A new PR's mode comes from the trusted broker.pr open_as policy on that same branch;
+//! an existing PR is never changed.
 
 use std::path::Path;
 
@@ -24,6 +25,48 @@ use crate::{
 
 /// The configuration key that authorizes `broker push`, as printed in refusals.
 pub const SESSION_PUSH_POLICY_KEY: &str = "delivery.push_session_branches";
+
+/// How a newly created session pull request should be opened.
+///
+/// The value comes from `[broker.pr] open_as` on the fetched default branch.
+/// Missing configuration preserves the historical draft behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPullRequestOpenAs {
+    Draft,
+    Ready,
+}
+
+impl SessionPullRequestOpenAs {
+    fn from_config_text(text: &str) -> Result<Self, String> {
+        let value = text
+            .parse::<toml::Value>()
+            .map_err(|error| format!(".aethyme/config.toml is invalid: {error}"))?;
+        let Some(broker) = value.get("broker") else {
+            return Ok(Self::Draft);
+        };
+        let broker = broker
+            .as_table()
+            .ok_or_else(|| "[broker] policy must be a table".to_string())?;
+        let Some(pr) = broker.get("pr") else {
+            return Ok(Self::Draft);
+        };
+        let pr = pr
+            .as_table()
+            .ok_or_else(|| "[broker.pr] policy must be a table".to_string())?;
+        if let Some(key) = pr.keys().find(|key| key.as_str() != "open_as") {
+            return Err(format!("[broker.pr] has unsupported key {key:?}"));
+        }
+        let Some(open_as) = pr.get("open_as") else {
+            return Ok(Self::Draft);
+        };
+        match open_as.as_str() {
+            Some("draft") => Ok(Self::Draft),
+            Some("ready") => Ok(Self::Ready),
+            Some(_) => Err("[broker.pr] open_as must be \"draft\" or \"ready\"".into()),
+            None => Err("[broker.pr] open_as must be a string".into()),
+        }
+    }
+}
 
 /// Prefix every broker session branch carries. `broker push` publishes only
 /// refs under it, so the default branch, `aethyme/integration` and tags are
@@ -337,6 +380,18 @@ fn push_authorized(repo: &GitRepo, default: &TrackedDefault) -> Result<bool, Bro
     Ok(config.is_some_and(|config| config.push_session_branches))
 }
 
+/// Read the requested PR mode from the same trusted default-branch commit as
+/// the push authorization. A worktree or session edit cannot change the mode.
+fn pull_request_open_as(
+    repo: &GitRepo,
+    default: &TrackedDefault,
+) -> Result<SessionPullRequestOpenAs, BrokerOpError> {
+    let Some(text) = repo.file_at_commit(&default.commit, ".aethyme/config.toml")? else {
+        return Ok(SessionPullRequestOpenAs::Draft);
+    };
+    SessionPullRequestOpenAs::from_config_text(&text).map_err(refused)
+}
+
 impl Broker {
     /// Where a session's branch stands against its remote-tracking ref.
     /// See [`SessionPushState`]; this never fetches or writes.
@@ -366,8 +421,8 @@ impl Broker {
         })
     }
 
-    /// Publish a live session's own branch, and optionally open a draft pull
-    /// request for it. See the module documentation for the authorization.
+    /// Publish a live session's own branch, and optionally open a pull request
+    /// in the trusted repository-configured mode. See module docs for authorization.
     pub fn push_session(
         &mut self,
         session_id: i64,
@@ -408,6 +463,13 @@ impl Broker {
                 &default.commit[..default.commit.len().min(12)],
             )));
         }
+        // Parse the PR mode before the first remote write. A bad preference
+        // must not leave a branch pushed when opening the requested PR refuses.
+        let pr_open_as = if open_pr {
+            Some(pull_request_open_as(repo, &default)?)
+        } else {
+            None
+        };
         let target = repo
             .resolve_remote_target(&default.remote, None)
             .map_err(|error| refused(format!("remote {:?}: {error}", default.remote)))?;
@@ -492,13 +554,14 @@ impl Broker {
         }
         self.store().meta_set(&pushed_oid_key(session_id), &head)?;
 
-        let pr = if open_pr {
+        let pr = if let Some(open_as) = pr_open_as {
             Some(self.open_session_pull_request(
                 session_id,
                 &session,
                 &default,
                 &target.display_slug,
                 &head,
+                open_as,
                 &main_root,
             )?)
         } else if crate::ReviewPolicy::load(&main_root).is_ok_and(|policy| policy.run_on_push) {
@@ -693,8 +756,8 @@ impl Broker {
         (drift, note)
     }
 
-    /// Find the open pull request for the session branch, or open a draft.
-    /// Never marks one ready and never merges.
+    /// Find the open pull request for the session branch, or create one in the
+    /// trusted configured mode. Existing pull requests are never changed.
     fn open_session_pull_request(
         &mut self,
         session_id: i64,
@@ -702,6 +765,7 @@ impl Broker {
         default: &TrackedDefault,
         repository: &str,
         head: &str,
+        open_as: SessionPullRequestOpenAs,
         cwd: &Path,
     ) -> Result<SessionPullRequest, BrokerOpError> {
         if let Some(existing) =
@@ -744,6 +808,20 @@ impl Broker {
             base.template.as_deref(),
         )
         .map_err(|error| refused(error.to_string()))?;
+        let mut args = vec!["pr".into(), "create".into()];
+        if open_as == SessionPullRequestOpenAs::Draft {
+            args.push("--draft".into());
+        }
+        args.extend([
+            "--head".into(),
+            session.branch.clone(),
+            "--base".into(),
+            default.branch.clone(),
+            "--title".into(),
+            title,
+            "--body".into(),
+            body,
+        ]);
         let create = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id,
@@ -756,19 +834,7 @@ impl Broker {
                 cross_session: None,
                 ref_write_acknowledged: false,
                 authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
-                args: vec![
-                    "pr".into(),
-                    "create".into(),
-                    "--draft".into(),
-                    "--head".into(),
-                    session.branch.clone(),
-                    "--base".into(),
-                    default.branch.clone(),
-                    "--title".into(),
-                    title,
-                    "--body".into(),
-                    body,
-                ],
+                args,
             },
             cwd,
             push_operation_wait(),
@@ -942,6 +1008,48 @@ fn measure_pr_size(main_root: &Path, base_ref: &str, head: &str) -> Option<crate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_pull_request_mode_defaults_to_draft_and_accepts_ready() {
+        assert_eq!(
+            SessionPullRequestOpenAs::from_config_text(
+                "[delivery]\npush_session_branches = true\n"
+            )
+            .unwrap(),
+            SessionPullRequestOpenAs::Draft
+        );
+        assert_eq!(
+            SessionPullRequestOpenAs::from_config_text("[broker.pr]\n").unwrap(),
+            SessionPullRequestOpenAs::Draft
+        );
+        assert_eq!(
+            SessionPullRequestOpenAs::from_config_text("[broker.pr]\nopen_as = \"draft\"\n")
+                .unwrap(),
+            SessionPullRequestOpenAs::Draft
+        );
+        assert_eq!(
+            SessionPullRequestOpenAs::from_config_text("[broker.pr]\nopen_as = \"ready\"\n")
+                .unwrap(),
+            SessionPullRequestOpenAs::Ready
+        );
+    }
+
+    #[test]
+    fn invalid_new_pull_request_mode_fails_closed() {
+        for config in [
+            "[broker.pr]\nopen_as = \"later\"\n",
+            "[broker.pr]\nopen_as = true\n",
+            "[broker.pr]\nother = \"value\"\n",
+            "[broker.pr]\nopen_as = \"ready\"\nother = 1\n",
+            "broker = false\n",
+            "[broker.pr]\nopen_as = [\"ready\"]\n",
+        ] {
+            assert!(
+                SessionPullRequestOpenAs::from_config_text(config).is_err(),
+                "accepted invalid config: {config}"
+            );
+        }
+    }
 
     #[test]
     fn path_hint_needs_a_refused_push_not_any_not_found() {
