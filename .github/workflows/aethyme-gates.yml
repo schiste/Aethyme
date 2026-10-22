@@ -162,6 +162,26 @@ jobs:
             esac
           done
 
+      # The broker's human report includes only the final 20 lines. A failed
+      # workspace suite can be followed by passing doctests/examples, hiding
+      # its diagnostic. Print the complete bounded failure logs only on failure;
+      # GitHub applies its normal secret masking to this console output.
+      - name: Show complete failed gate logs
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_dir=.aethyme/logs/gates
+          if [ ! -d "$log_dir" ]; then
+            echo "No broker gate logs were created before the failure."
+            exit 0
+          fi
+          find "$log_dir" -maxdepth 1 -type f -name '*.fail-*.log' -print0 |
+            while IFS= read -r -d '' log; do
+              printf '%s\n' "Failed gate log: $log"
+              cat -- "$log"
+            done
+
       # Runs after the gates, before the cache post-step saves. Keep
       # third-party artifacts only: the workspace's own crates, test binaries
       # and incremental state are rebuilt on every run anyway, and dropping
