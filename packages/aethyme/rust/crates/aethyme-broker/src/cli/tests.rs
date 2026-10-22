@@ -814,6 +814,7 @@ fn parse_accepts_guarded_exec_command_after_separator() {
         "exec".to_string(),
         "--session".to_string(),
         "7".to_string(),
+        "--non-interactive".to_string(),
         "--".to_string(),
         "cargo".to_string(),
         "fmt".to_string(),
@@ -826,7 +827,45 @@ fn parse_accepts_guarded_exec_command_after_separator() {
 
     assert_eq!(parsed.positional, vec!["exec"]);
     assert_eq!(parsed.session, Some(7));
+    assert!(parsed.non_interactive);
     assert_eq!(parsed.exec_command, vec!["cargo", "fmt", "--check"]);
+}
+
+#[test]
+fn non_interactive_exec_flag_is_broker_side_and_exec_only() {
+    let after_separator = super::parse(&strings(&[
+        "exec",
+        "--session",
+        "7",
+        "--",
+        "--non-interactive",
+    ]))
+    .unwrap_or_else(|_| panic!("child arguments should parse"));
+    assert!(!after_separator.non_interactive);
+    assert_eq!(after_separator.exec_command, vec!["--non-interactive"]);
+
+    let exec = super::parse(&strings(&[
+        "exec",
+        "--session",
+        "7",
+        "--non-interactive",
+        "--",
+        "true",
+    ]))
+    .unwrap_or_else(|_| panic!("guarded exec option should parse"));
+    assert!(super::validate_flags("exec", &exec).is_ok());
+
+    let git = super::parse(&strings(&[
+        "git",
+        "--session",
+        "7",
+        "--non-interactive",
+        "--",
+        "git",
+        "status",
+    ]))
+    .unwrap_or_else(|_| panic!("the shared parser recognizes broker flags"));
+    assert!(super::validate_flags("git", &git).is_err());
 }
 
 #[test]

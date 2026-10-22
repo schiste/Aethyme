@@ -1647,20 +1647,34 @@ impl Broker {
         self.guarded_exec_with_env(session_id, command, &[])
     }
 
-    /// Keep stdout available for the completed JSON report. Child output is
-    /// inherited on stderr without buffering or changing command argv.
-    pub(crate) fn guarded_exec_for_json(
+    /// Run CLI guarded exec with its existing automatic mode by default. The
+    /// explicit non-interactive opt-in forces process-group supervision; JSON
+    /// mode moves child stdout to stderr so the final report remains one JSON
+    /// document. All other child stdio behavior is preserved.
+    pub(crate) fn guarded_exec_for_cli(
         &mut self,
         session_id: i64,
         command: &[String],
+        force_supervised: bool,
+        json_mode: bool,
     ) -> Result<GuardedExecReport, BrokerOpError> {
+        let stdout = if json_mode {
+            std::process::Stdio::from(std::io::stderr())
+        } else {
+            std::process::Stdio::inherit()
+        };
         self.guarded_exec_with_env_heartbeat_mode_and_stdout(
             session_id,
             command,
             &[],
             || Ok(()),
-            crate::inline_exec_supervisor::generic_exec_mode,
-            std::process::Stdio::from(std::io::stderr()),
+            || {
+                select_guarded_exec_mode(
+                    force_supervised,
+                    crate::inline_exec_supervisor::generic_exec_mode,
+                )
+            },
+            stdout,
         )
     }
 
@@ -2059,6 +2073,60 @@ fn map_preparation_exec_supervisor_error(
                 source,
             }
         }
+    }
+}
+
+fn select_guarded_exec_mode(
+    force_supervised: bool,
+    automatic_mode: impl FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
+) -> crate::inline_exec_supervisor::GenericExecMode {
+    if force_supervised {
+        crate::inline_exec_supervisor::GenericExecMode::Supervised
+    } else {
+        automatic_mode()
+    }
+}
+
+#[cfg(test)]
+mod guarded_exec_mode_selection_tests {
+    use super::select_guarded_exec_mode;
+    use crate::inline_exec_supervisor::GenericExecMode;
+
+    #[test]
+    fn non_interactive_opt_in_forces_supervision_without_tty_probe() {
+        let mode = select_guarded_exec_mode(true, || {
+            panic!("opt-in must not probe the controlling terminal")
+        });
+        assert_eq!(mode, GenericExecMode::Supervised);
+    }
+
+    #[test]
+    fn default_exec_mode_preserves_automatic_selection() {
+        let expected = GenericExecMode::Legacy("test controlling terminal".into());
+        let mode = select_guarded_exec_mode(false, || expected.clone());
+        assert_eq!(mode, expected);
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
+mod guarded_exec_unsupported_platform_tests {
+    use crate::inline_exec_supervisor::{InlineExecError, InlineExecSupervisor};
+    use std::path::Path;
+
+    #[test]
+    fn supervised_runner_refuses_unsupported_platform_before_dispatch() {
+        let error = match InlineExecSupervisor::start_inheriting_stdin(
+            Path::new("unused-supervisor-path"),
+            std::process::Stdio::inherit(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported platform started the supervisor"),
+        };
+        assert!(matches!(
+            error,
+            InlineExecError::Setup(ref source)
+                if source.kind() == std::io::ErrorKind::Unsupported
+        ));
     }
 }
 
@@ -2519,7 +2587,7 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
-    fn wrong_helper_refuses_before_the_guarded_command_can_write() {
+    fn non_interactive_exec_refuses_wrong_helper_before_command_dispatch() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let (_repository, _storage, mut broker) = fixture();
@@ -2536,20 +2604,23 @@ mod generic_guarded_exec_tests {
         let marker = Path::new(&session.worktree_path).join("must-not-exist");
 
         let error = broker
-            .guarded_exec_with_env_heartbeat_and_mode(
+            .guarded_exec_for_cli(
                 session.id,
                 &[
                     "/bin/sh".into(),
                     "-c".into(),
                     "printf launched > must-not-exist".into(),
                 ],
-                &[],
-                || Ok(()),
-                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+                true,
+                false,
             )
             .unwrap_err();
 
         assert!(matches!(error, BrokerOpError::Spawn { .. }), "{error}");
+        assert!(
+            error.to_string().contains("helper did not become ready"),
+            "wrong helper was not refused during readiness: {error}"
+        );
         assert!(
             !marker.exists(),
             "guarded command ran without a ready helper"
