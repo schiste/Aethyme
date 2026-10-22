@@ -3015,7 +3015,7 @@ mod tests {
         let options = crate::analysis_view::ViewOptions::new(
             crate::analysis_view::ViewProfile::current("fixture"),
         );
-        crate::analysis_view::view_for_snapshot(&mut fixture.store, snapshot, &options).unwrap()
+        crate::analysis_view::view_for_snapshot(&fixture.store, snapshot, &options).unwrap()
     }
 
     fn pinned_references(
@@ -3417,7 +3417,7 @@ mod tests {
             crate::analysis_view::ViewProfile::with_version("fixture", &incompatible_version);
         let old_options = crate::analysis_view::ViewOptions::new(old_profile);
         let old_reader =
-            crate::analysis_view::view_for_snapshot(&mut fixture.store, &snapshot, &old_options)
+            crate::analysis_view::view_for_snapshot(&fixture.store, &snapshot, &old_options)
                 .unwrap();
         let mut wrong_version = old_reader.find_references("search", 64).unwrap();
         wrong_version.result = Some(object(vec![(
@@ -3602,7 +3602,10 @@ mod tests {
             vec![analysis.clone()],
             Some(&snapshot),
         );
-        assert_eq!(supported.contributions, ids(&[candidate.clone()]));
+        assert_eq!(
+            supported.contributions,
+            ids(std::slice::from_ref(&candidate))
+        );
         assert!(supported.selection.items.iter().any(|item| {
             item.reasons
                 .iter()
@@ -3794,11 +3797,18 @@ mod tests {
     #[test]
     fn a_pinned_view_impact_is_scoped_by_its_changed_paths() {
         let mut fixture = Fixture::new();
-        let change = fixture.contribute(&[("src/search.rs", "v2\n")]);
+        let change = fixture.contribute(&[("src/search.rs", "fn search() { let _value = 2; }\n")]);
         let (_, result) = snapshots(&fixture, &change);
         let impact = current_view(&mut fixture, &result)
-            .explain_impact(&["src/search.rs"], 64)
+            .explain_impact(&["src/search.rs", "src/search.rs"], 64)
             .unwrap();
+        assert_eq!(
+            &impact.subject,
+            &Subject::ChangedPaths(crate::graph_impact::diff_digest(&[
+                "src/search.rs".to_string(),
+            ])),
+            "view impacts use the contract's sorted unique JSON-array digest"
+        );
         let scoped = ask(
             &mut fixture,
             &["src/search.rs"],

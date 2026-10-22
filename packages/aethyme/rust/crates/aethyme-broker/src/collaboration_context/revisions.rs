@@ -600,7 +600,7 @@ mod tests {
         rationale: &Brief,
     ) -> ResolvedContributionRevision {
         revise_contribution_for_operation(
-            &mut fixture.store,
+            &fixture.store,
             &fixture.binding,
             ContributionRevisionRequest {
                 operation_id: operation,
