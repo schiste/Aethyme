@@ -140,12 +140,20 @@ const ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY: &str = "gc.artifact_sweep.recovery_
 const ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY: &str = "gc.artifact_sweep.recovery_completed_ms";
 /// Retry time for an automatic continuation that made no filesystem progress.
 const ARTIFACT_SWEEP_RETRY_AFTER_KEY: &str = "gc.artifact_sweep.retry_after_ms";
+/// Separate durable request for whole-checkout cleanup deferred by an ordinary
+/// automatic pass. Cache-only recovery requests never set this marker.
+const AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY: &str = "gc.artifact_sweep.checkout_cleanup_requested_ms";
+/// Highest whole-checkout cleanup request generation completed by its lane.
+const AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY: &str = "gc.artifact_sweep.checkout_cleanup_completed_ms";
+/// Backoff for a whole-checkout cleanup continuation that made no progress.
+const AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY: &str =
+    "gc.artifact_sweep.checkout_cleanup_retry_after_ms";
 /// Bounded last-worker result; overwritten each run rather than appended.
 const ARTIFACT_SWEEP_WORKER_STATUS_KEY: &str = "gc.artifact_sweep.worker_status";
 const ARTIFACT_SWEEP_META_PREFIX: &str = "gc.artifact_sweep.";
 const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 /// Internal marker which keeps Broker::open from starting a second inline GC
-/// pass before the continuation worker takes its cache-only path.
+/// pass before the continuation worker takes its scoped recovery path.
 pub(crate) const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
 const ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES: usize = 3;
 /// Positive partial deletion is progress, but must not let one detached worker
@@ -156,6 +164,12 @@ const ARTIFACT_SWEEP_WORKER_MAX_PASSES: usize = 8;
 /// a later normal open when this deadline expires.
 const ARTIFACT_SWEEP_WORKER_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
+/// Cache work yields this part of the singleton worker's total budget to an
+/// independently requested whole-checkout cleanup pass.
+const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
+/// Each whole-checkout pass has its own bounded tranche; the cursor resumes
+/// after candidates inspected before this deadline.
+const AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
 /// Broker open checks only for rotation-debt control entries. A small bound
 /// keeps this crash-gap probe cheap even when the shared cache root is wide.
 const PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES: usize = 512;
@@ -4494,9 +4508,9 @@ impl Broker {
     pub(crate) fn resume_gc_maintenance(&mut self) -> Result<Option<GcApplyReport>, BrokerOpError> {
         let continuation_worker = std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some();
         if continuation_worker {
-            // This process is deliberately cache-only. In particular, do not
-            // resume an unrelated authorized checkout-removal journal from
-            // Broker::open before the worker's own scoped pass.
+            // This process must not resume an operator-authorized GC journal.
+            // It enters only the explicit artifact or whole-checkout request
+            // lane after Broker::open returns.
             return Ok(None);
         }
         // Rotation publishes a durable witness before it changes the shared
@@ -4523,9 +4537,9 @@ impl Broker {
             "run bounded inline artifact sweep",
             self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline),
         );
-        // Inline admission stays capped at 250 ms. A detached, installed
-        // worker continues only the durable cache sweep when that pass leaves
-        // an unfinished lap or a pressure-triggered request is pending.
+        // Inline admission stays capped at 250 ms. The detached worker
+        // continues cache recovery from its own request and whole-checkout
+        // cleanup only from its separate deferral request.
         crate::warn_unrecorded(
             "start artifact sweep continuation worker",
             self.maybe_start_artifact_sweep_worker(false),
@@ -4570,6 +4584,12 @@ impl Broker {
         let policy = load_retention_policy(self.main_root())?;
         let (budget_ms, urgency) = self.artifact_sweep_budget(&policy, ArtifactSweepScope::Drain);
         let outcome = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)?;
+        if self.auto_checkout_cleanup_recovery_requested()? {
+            crate::warn_unrecorded(
+                "start deferred automatic checkout cleanup worker",
+                self.maybe_start_artifact_sweep_worker(false),
+            );
+        }
         Ok(ArtifactSweepReport {
             directories_reclaimed: outcome.directories_reclaimed,
             complete: outcome.complete,
@@ -4619,6 +4639,66 @@ impl Broker {
         Ok(())
     }
 
+    /// Record a separate continuation request only when a general automatic
+    /// checkout-cleanup pass deferred work. This is called under the sweep's
+    /// GC lock; cache backlog alone and FinishDrain never create cleanup
+    /// authority.
+    fn persist_auto_checkout_cleanup_request(
+        &mut self,
+        scope: ArtifactSweepScope,
+        report: &crate::auto_cleanup::AutoCleanupReport,
+    ) -> Result<(), BrokerOpError> {
+        if !matches!(
+            scope,
+            ArtifactSweepScope::Inline | ArtifactSweepScope::Drain
+        ) || !report.enabled
+            || report.deferred == 0
+        {
+            return Ok(());
+        }
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        // Keep an existing incomplete generation idempotent. The worker
+        // completes it while holding the same lock as this ordinary pass, so
+        // a later deferral necessarily creates a fresh generation.
+        if requested > completed {
+            return Ok(());
+        }
+        let generation = now_ms()
+            .max(requested.saturating_add(1))
+            .max(completed.saturating_add(1))
+            .max(1);
+        self.artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY, &generation.to_string())?;
+        self.artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, "")?;
+        Ok(())
+    }
+
+    /// Whether a durable whole-checkout cleanup request remains incomplete.
+    fn auto_checkout_cleanup_recovery_requested(&mut self) -> Result<bool, BrokerOpError> {
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(requested > completed)
+    }
+
+    fn auto_checkout_cleanup_retry_pending(&mut self, now: i64) -> Result<bool, BrokerOpError> {
+        Ok(self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|retry_after| retry_after > now))
+    }
+
     /// Launch recovery after the request is durable and any conflicting
     /// preparation lease has been released.
     pub(crate) fn start_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
@@ -4626,34 +4706,51 @@ impl Broker {
         Ok(())
     }
 
-    /// Launch the installed router as a detached cache-only continuation.
+    /// Launch the installed router as a detached, request-scoped continuation.
     /// The OS advisory lock is the singleton; its file stays content-free.
     fn maybe_start_artifact_sweep_worker(
         &mut self,
         pressure_request: bool,
     ) -> Result<(), BrokerOpError> {
         let root = self.main_root().to_path_buf();
+        let artifact_pending = self.artifact_sweep_backlog_pending()?;
+        let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
         if crate::host_state::path_is_ephemeral(&root)
             || artifact_worker_process_is_suppressed()
-            || !self.artifact_sweep_backlog_pending()?
+            || !(artifact_pending || checkout_cleanup_pending)
         {
             return Ok(());
         }
+        let now = now_ms();
+        let mut artifact_due = artifact_pending;
+        let checkout_cleanup_due =
+            checkout_cleanup_pending && !self.auto_checkout_cleanup_retry_pending(now)?;
         if !pressure_request {
             let namespace = self.artifact_sweep_namespace()?.to_string();
-            if worker_retry_pending(self.store(), &namespace, now_ms())? {
-                return Ok(());
-            }
+            artifact_due &= !worker_retry_pending(self.store(), &namespace, now)?;
+        }
+        if !(artifact_due || checkout_cleanup_due) {
+            return Ok(());
         }
         let Some((router, _engine)) = artifact_worker_binaries() else {
-            self.defer_artifact_sweep_worker("runtime_unverified")?;
+            if artifact_due {
+                self.defer_artifact_sweep_worker("runtime_unverified")?;
+            }
+            if checkout_cleanup_due {
+                self.defer_auto_checkout_cleanup_worker("runtime_unverified")?;
+            }
             return Ok(());
         };
         let Some(lock) = try_artifact_sweep_worker_lock(&root)? else {
             return Ok(());
         };
         if !artifact_worker_runtime_is_aligned() {
-            self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
+            if artifact_due {
+                self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
+            }
+            if checkout_cleanup_due {
+                self.defer_auto_checkout_cleanup_worker("runtime_pair_unverified")?;
+            }
             return Ok(());
         }
         let canonical_root =
@@ -4674,14 +4771,26 @@ impl Broker {
             .configure_storage_context_for_child(&mut command)
             .is_err()
         {
-            self.defer_artifact_sweep_worker("storage_context_unavailable")?;
+            if artifact_due {
+                self.defer_artifact_sweep_worker("storage_context_unavailable")?;
+            }
+            if checkout_cleanup_due {
+                self.defer_auto_checkout_cleanup_worker("storage_context_unavailable")?;
+            }
             return Ok(());
         }
         configure_artifact_worker_process_group(&mut command);
         let _child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                self.defer_artifact_sweep_worker(&format!("worker_launch_failed: {error}"))?;
+                if artifact_due {
+                    self.defer_artifact_sweep_worker(&format!("worker_launch_failed: {error}"))?;
+                }
+                if checkout_cleanup_due {
+                    self.defer_auto_checkout_cleanup_worker(&format!(
+                        "worker_launch_failed: {error}"
+                    ))?;
+                }
                 return Ok(());
             }
         };
@@ -4694,12 +4803,14 @@ impl Broker {
         Ok(())
     }
 
-    /// Execute the detached worker's bounded, cache-only continuation loop.
-    /// It exits after three passes without an actual unlink, or after a fixed
-    /// pass or wall-clock limit even when positive partial deletion continues.
-    /// It leaves the durable request/cursor in place and backs off so open
-    /// files or a concurrent writer cannot keep a background process alive
-    /// forever.
+    /// Execute the detached worker's bounded artifact and requested cleanup
+    /// lanes. The artifact loop itself remains cache-only. Each lane retains
+    /// its own request when a pass is incomplete and backs off after repeated
+    /// no-progress passes so open files or concurrent writers cannot keep the
+    /// background process alive forever. Checkout candidate discovery currently
+    /// scans the full cohort before checking the pass deadline, so the reserved
+    /// tranche is cooperative and can overrun on a large cohort; the durable
+    /// cursor bounds proof progress after discovery, not discovery time.
     pub(crate) fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1")) {
             self.write_artifact_sweep_worker_status("refused_environment")?;
@@ -4709,43 +4820,272 @@ impl Broker {
             self.write_artifact_sweep_worker_status("refused_ephemeral_repository")?;
             return Ok(());
         }
-        if !self.artifact_sweep_backlog_pending()? {
+        let artifact_pending = self.artifact_sweep_backlog_pending()?;
+        let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
+        if !(artifact_pending || checkout_cleanup_pending) {
             self.write_artifact_sweep_worker_status("no_backlog")?;
             return Ok(());
         }
         let namespace = self.artifact_sweep_namespace()?.to_string();
-        if worker_retry_pending(self.store(), &namespace, now_ms())? {
+        let now = now_ms();
+        let artifact_due =
+            artifact_pending && !worker_retry_pending(self.store(), &namespace, now)?;
+        let checkout_cleanup_due =
+            checkout_cleanup_pending && !self.auto_checkout_cleanup_retry_pending(now)?;
+        if !(artifact_due || checkout_cleanup_due) {
             self.write_artifact_sweep_worker_status("retry_deferred")?;
             return Ok(());
         }
         if !artifact_worker_runtime_is_aligned() {
-            self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
+            if artifact_due {
+                self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
+            }
+            if checkout_cleanup_due {
+                self.defer_auto_checkout_cleanup_worker("runtime_pair_unverified")?;
+            }
             return Ok(());
         }
-        let policy = load_retention_policy(self.main_root())?;
-        if policy.artifact_sweep_budget_ms == 0 {
-            self.defer_artifact_sweep_worker("artifact_sweep_disabled")?;
-            return Ok(());
+        let worker_started = Instant::now();
+        let cache_lane_result = if artifact_due {
+            (|| {
+                let policy = load_retention_policy(self.main_root())?;
+                if policy.artifact_sweep_budget_ms == 0 {
+                    return self.defer_artifact_sweep_worker("artifact_sweep_disabled");
+                }
+                let request_generation = self
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                // Cache discovery/removal shares the singleton process with a
+                // separate cleanup lane. It yields a reserved tranche whenever
+                // both are due so a wide cache backlog cannot starve checkout
+                // progress.
+                let cache_duration = if checkout_cleanup_due {
+                    ARTIFACT_SWEEP_WORKER_MAX_DURATION
+                        .saturating_sub(AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE)
+                } else {
+                    ARTIFACT_SWEEP_WORKER_MAX_DURATION
+                };
+                self.run_artifact_sweep_recovery_worker_loop(
+                    &policy,
+                    request_generation,
+                    Some(ARTIFACT_SWEEP_WORKER_MAX_PASSES),
+                    Some(cache_duration),
+                    |broker, policy, remaining| {
+                        let deadline = remaining.map(|remaining| Instant::now() + remaining);
+                        broker.sweep_artifacts_autonomously_with_deadline(
+                            policy,
+                            ArtifactSweepScope::AutomaticContinuation,
+                            deadline,
+                        )
+                    },
+                )
+            })()
+        } else {
+            Ok(())
+        };
+
+        self.run_cleanup_after_cache_lane(cache_lane_result, |broker| {
+            // A cleanup request may have arrived while the cache lane was
+            // working. Re-read its generation instead of letting the worker
+            // exit with newly queued work stranded behind its singleton lock.
+            let cleanup_pending = broker.auto_checkout_cleanup_recovery_requested()?;
+            let cleanup_due =
+                cleanup_pending && !broker.auto_checkout_cleanup_retry_pending(now_ms())?;
+            if cleanup_due {
+                let request_generation = broker
+                    .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let remaining =
+                    ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
+                broker.run_auto_checkout_cleanup_recovery_worker_loop(
+                    request_generation,
+                    Some(ARTIFACT_SWEEP_WORKER_MAX_PASSES),
+                    Some(remaining),
+                    |broker, generation, pass_budget| {
+                        let Some(pass_budget) = pass_budget else {
+                            return Ok(None);
+                        };
+                        let deadline = Instant::now() + pass_budget;
+                        broker.auto_checkout_cleanup_recovery_pass(generation, deadline)
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn run_cleanup_after_cache_lane(
+        &mut self,
+        cache_lane_result: Result<(), BrokerOpError>,
+        cleanup_lane: impl FnOnce(&mut Self) -> Result<(), BrokerOpError>,
+    ) -> Result<(), BrokerOpError> {
+        match cache_lane_result {
+            Ok(()) => {}
+            Err(error) if matches!(error, BrokerOpError::Store(_)) => return Err(error),
+            Err(error) => {
+                self.defer_artifact_sweep_worker(&format!("cache_lane_failed: {error}"))?
+            }
         }
-        let request_generation = self
-            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+        cleanup_lane(self)
+    }
+
+    /// The request and completed generation are read and updated while holding
+    /// the same GC lock as the existing auto-cleanup plan/apply operation.
+    /// No operator journal or cache request can enter this path.
+    fn auto_checkout_cleanup_recovery_pass(
+        &mut self,
+        request_generation: i64,
+        deadline: Instant,
+    ) -> Result<Option<(crate::auto_cleanup::AutoCleanupReport, bool)>, BrokerOpError> {
+        let root = self.main_root().to_path_buf();
+        let Ok(_lock) = GcLock::acquire(&root) else {
+            return Ok(None);
+        };
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if completed >= request_generation {
+            return Ok(Some((
+                crate::auto_cleanup::AutoCleanupReport::default(),
+                true,
+            )));
+        }
+        if requested != request_generation {
+            // This pass was scheduled for a stale generation. Leave the
+            // newer request and its completion marker untouched.
+            return Ok(Some((
+                crate::auto_cleanup::AutoCleanupReport::default(),
+                false,
+            )));
+        }
+        let report = self.auto_remove_disposable_checkouts(Some(deadline))?;
+        let policy_valid = report.config_error.is_none();
+        let no_deferred_work = !report.enabled || report.deferred == 0;
+        let mut generation_completed = false;
+        if policy_valid && no_deferred_work {
+            let latest_request = self
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            if latest_request == request_generation {
+                self.artifact_sweep_meta_set(
+                    AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY,
+                    &request_generation.to_string(),
+                )?;
+                self.artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, "")?;
+                generation_completed = true;
+            }
+        }
+        Ok(Some((report, generation_completed)))
+    }
 
-        self.run_artifact_sweep_recovery_worker_loop(
-            &policy,
-            request_generation,
-            Some(ARTIFACT_SWEEP_WORKER_MAX_PASSES),
-            Some(ARTIFACT_SWEEP_WORKER_MAX_DURATION),
-            |broker, policy, remaining| {
-                let deadline = remaining.map(|remaining| Instant::now() + remaining);
-                broker.sweep_artifacts_autonomously_with_deadline(
-                    policy,
-                    ArtifactSweepScope::AutomaticContinuation,
-                    deadline,
-                )
-            },
-        )
+    fn run_auto_checkout_cleanup_recovery_worker_loop(
+        &mut self,
+        request_generation: i64,
+        max_passes: Option<usize>,
+        max_duration: Option<Duration>,
+        mut cleanup_pass: impl FnMut(
+            &mut Self,
+            i64,
+            Option<Duration>,
+        ) -> Result<
+            Option<(crate::auto_cleanup::AutoCleanupReport, bool)>,
+            BrokerOpError,
+        >,
+    ) -> Result<(), BrokerOpError> {
+        let started_at = Instant::now();
+        let mut passes = 0usize;
+        let mut no_progress_passes = 0usize;
+        let mut removed_checkouts = 0usize;
+        loop {
+            let remaining = max_duration.map(|limit| limit.saturating_sub(started_at.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                self.defer_auto_checkout_cleanup_worker(&format!(
+                    "checkout_cleanup_time_limit passes={passes} removed={removed_checkouts}"
+                ))?;
+                return Ok(());
+            }
+            passes = passes.saturating_add(1);
+            let pass_budget = remaining
+                .map(|remaining| remaining.min(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET))
+                .or(Some(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET));
+            let pass = match cleanup_pass(self, request_generation, pass_budget) {
+                Ok(pass) => pass,
+                Err(error) => {
+                    self.defer_auto_checkout_cleanup_worker(&format!(
+                        "checkout_cleanup_failed: {error}"
+                    ))?;
+                    return Ok(());
+                }
+            };
+            let Some((report, generation_completed)) = pass else {
+                no_progress_passes = no_progress_passes.saturating_add(1);
+                if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
+                    self.defer_auto_checkout_cleanup_worker(&format!(
+                        "checkout_cleanup_lock_busy passes={passes}"
+                    ))?;
+                    return Ok(());
+                }
+                let sleep = Duration::from_millis(1_000);
+                let remaining = max_duration
+                    .map(|limit| limit.saturating_sub(started_at.elapsed()))
+                    .unwrap_or(sleep);
+                std::thread::sleep(sleep.min(remaining));
+                continue;
+            };
+            removed_checkouts = removed_checkouts.saturating_add(report.removed.len());
+            if max_duration.is_some_and(|limit| started_at.elapsed() >= limit) {
+                self.defer_auto_checkout_cleanup_worker(&format!(
+                    "checkout_cleanup_time_limit passes={passes} removed={removed_checkouts}"
+                ))?;
+                return Ok(());
+            }
+            if generation_completed {
+                self.write_artifact_sweep_worker_status(&format!(
+                    "checkout_cleanup_complete passes={passes} removed={removed_checkouts}"
+                ))?;
+                return Ok(());
+            }
+            if max_passes.is_some_and(|limit| passes >= limit) {
+                self.defer_auto_checkout_cleanup_worker(&format!(
+                    "checkout_cleanup_pass_limit passes={passes} removed={removed_checkouts}"
+                ))?;
+                return Ok(());
+            }
+            if report.removed.is_empty() {
+                no_progress_passes = no_progress_passes.saturating_add(1);
+                if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
+                    self.defer_auto_checkout_cleanup_worker(&format!(
+                        "checkout_cleanup_no_progress passes={passes} removed={removed_checkouts}"
+                    ))?;
+                    return Ok(());
+                }
+                let sleep = Duration::from_millis(1_000);
+                let remaining = max_duration
+                    .map(|limit| limit.saturating_sub(started_at.elapsed()))
+                    .unwrap_or(sleep);
+                std::thread::sleep(sleep.min(remaining));
+            } else {
+                no_progress_passes = 0;
+            }
+        }
+    }
+
+    fn defer_auto_checkout_cleanup_worker(&mut self, reason: &str) -> Result<(), BrokerOpError> {
+        let retry_after = now_ms().saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS);
+        self.artifact_sweep_meta_set(
+            AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY,
+            &retry_after.to_string(),
+        )?;
+        self.write_artifact_sweep_worker_status(reason)
     }
 
     /// The durable worker loop is separated from the installed-runtime gate
@@ -5762,7 +6102,16 @@ impl Broker {
         // not stop the sweep any more than the sweep's may stop a command.
         let auto_cleanup = if closed_session_id.is_none() && scope_runs_checkout_cleanup(scope) {
             match self.auto_remove_disposable_checkouts(Some(deadline)) {
-                Ok(report) => Some(report),
+                Ok(report) => {
+                    // This runs under the sweep's GC lock. A detached cleanup
+                    // pass holds that same lock through generation completion,
+                    // so an ordinary deferral cannot race a stale completion.
+                    crate::warn_unrecorded(
+                        "persist deferred automatic checkout cleanup request",
+                        self.persist_auto_checkout_cleanup_request(scope, &report),
+                    );
+                    Some(report)
+                }
                 Err(error) => {
                     crate::warn_unrecorded(
                         "run bounded automatic checkout cleanup",
@@ -6946,6 +7295,485 @@ mod tests {
             "a subsequent eligible pass records the requested generation"
         );
         assert!(!test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+    }
+
+    #[test]
+    fn whole_checkout_requests_require_an_inline_or_drain_deferral() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "9")
+            .unwrap();
+        assert!(
+            !broker.auto_checkout_cleanup_recovery_requested().unwrap(),
+            "a cache-only request does not create checkout-cleanup authority"
+        );
+
+        let deferred = crate::auto_cleanup::AutoCleanupReport {
+            enabled: true,
+            deferred: 1,
+            ..crate::auto_cleanup::AutoCleanupReport::default()
+        };
+        for scope in [
+            ArtifactSweepScope::FinishDrain,
+            ArtifactSweepScope::AutomaticContinuation,
+            ArtifactSweepScope::ClosedSession(7),
+        ] {
+            broker
+                .persist_auto_checkout_cleanup_request(scope, &deferred)
+                .unwrap();
+            assert!(
+                !broker.auto_checkout_cleanup_recovery_requested().unwrap(),
+                "{scope:?} must not queue whole-checkout cleanup"
+            );
+        }
+        broker
+            .persist_auto_checkout_cleanup_request(
+                ArtifactSweepScope::Inline,
+                &crate::auto_cleanup::AutoCleanupReport {
+                    enabled: true,
+                    deferred: 0,
+                    ..crate::auto_cleanup::AutoCleanupReport::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            !broker.auto_checkout_cleanup_recovery_requested().unwrap(),
+            "a pass with no deferred candidates must not queue cleanup"
+        );
+        broker
+            .persist_auto_checkout_cleanup_request(
+                ArtifactSweepScope::Inline,
+                &crate::auto_cleanup::AutoCleanupReport {
+                    enabled: false,
+                    deferred: 1,
+                    ..crate::auto_cleanup::AutoCleanupReport::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            !broker.auto_checkout_cleanup_recovery_requested().unwrap(),
+            "a disabled cleanup policy cannot create a worker request"
+        );
+        broker
+            .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Drain, &deferred)
+            .unwrap();
+        let first_generation = broker
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+            .unwrap()
+            .expect("ordinary deferrals persist a separate generation");
+        assert!(broker.auto_checkout_cleanup_recovery_requested().unwrap());
+
+        let retry_after = now_ms().saturating_add(60_000).to_string();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, &retry_after)
+            .unwrap();
+        broker
+            .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Inline, &deferred)
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(first_generation.as_str()),
+            "an incomplete request remains idempotent"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(retry_after.as_str()),
+            "repeated deferral cannot bypass the lane backoff"
+        );
+
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, &first_generation)
+            .unwrap();
+        broker
+            .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Drain, &deferred)
+            .unwrap();
+        let next_generation = broker
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(next_generation.parse::<i64>().unwrap() > first_generation.parse::<i64>().unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(""),
+            "a new request after completion clears only its own lane backoff"
+        );
+    }
+
+    #[test]
+    fn stale_checkout_generation_cannot_run_or_complete_a_newer_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY, "8")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, "3")
+            .unwrap();
+
+        broker
+            .run_auto_checkout_cleanup_recovery_worker_loop(
+                7,
+                Some(1),
+                Some(Duration::from_secs(1)),
+                |broker, generation, pass_budget| {
+                    let deadline = Instant::now()
+                        + pass_budget.unwrap_or(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET);
+                    broker.auto_checkout_cleanup_recovery_pass(generation, deadline)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("8"),
+            "a stale pass cannot replace the newer request generation"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "a stale pass cannot complete the newer request"
+        );
+        assert!(
+            broker
+                .auto_checkout_cleanup_retry_pending(now_ms())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_lane_error_still_dispatches_due_checkout_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, "3")
+            .unwrap();
+        let mut cleanup_dispatched = false;
+
+        broker
+            .run_cleanup_after_cache_lane(
+                Err(BrokerOpError::RetentionConfig(
+                    crate::RetentionConfigError::Parse("invalid fixture retention policy".into()),
+                )),
+                |broker| {
+                    cleanup_dispatched = true;
+                    assert!(broker.auto_checkout_cleanup_recovery_requested()?);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert!(cleanup_dispatched);
+        assert!(test_worker_retry_pending(&mut broker, now_ms()).unwrap());
+        assert!(broker.auto_checkout_cleanup_recovery_requested().unwrap());
+        assert!(
+            !broker
+                .auto_checkout_cleanup_retry_pending(now_ms())
+                .unwrap()
+        );
+
+        let mut cleanup_dispatched_after_db_error = false;
+        let result = broker.run_cleanup_after_cache_lane(
+            Err(BrokerOpError::Store(crate::BrokerError::Sqlite(
+                rusqlite::Error::InvalidQuery,
+            ))),
+            |_broker| {
+                cleanup_dispatched_after_db_error = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "database errors remain fatal");
+        assert!(!cleanup_dispatched_after_db_error);
+    }
+
+    #[test]
+    fn checkout_cleanup_timeout_keeps_request_and_cursor_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, "3")
+            .unwrap();
+        let cursor = r#"{"version":1,"after_session_id":4,"high_water_session_id":9}"#;
+        broker
+            .store()
+            .meta_set("auto_cleanup.cursor", cursor)
+            .unwrap();
+
+        broker
+            .run_auto_checkout_cleanup_recovery_worker_loop(
+                7,
+                Some(8),
+                Some(Duration::from_millis(10)),
+                |_broker, _generation, pass_budget| {
+                    assert!(pass_budget.is_some());
+                    std::thread::sleep(Duration::from_millis(20));
+                    Ok(Some((
+                        crate::auto_cleanup::AutoCleanupReport {
+                            enabled: true,
+                            deferred: 1,
+                            ..crate::auto_cleanup::AutoCleanupReport::default()
+                        },
+                        false,
+                    )))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "a timed-out cleanup pass cannot complete its request"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get("auto_cleanup.cursor")
+                .unwrap()
+                .as_deref(),
+            Some(cursor),
+            "the worker preserves the durable fair cursor for its next attempt"
+        );
+        assert!(
+            broker
+                .auto_checkout_cleanup_retry_pending(now_ms())
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whole_checkout_worker_uses_its_request_and_leaves_gc_journal_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let origin_text = origin.to_string_lossy().into_owned();
+        let publisher = tmp.path().join("publisher");
+        let repo = tmp.path().join("repo");
+        git(
+            tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", "origin.git"],
+        );
+        git(
+            tmp.path(),
+            &["clone", "-q", origin_text.as_str(), "publisher"],
+        );
+        std::fs::write(publisher.join(".gitignore"), "/.aethyme/\ntarget/\n.env\n").unwrap();
+        std::fs::write(publisher.join("README.md"), "fixture\n").unwrap();
+        git(&publisher, &["add", "-A"]);
+        git(&publisher, &["commit", "-qm", "fixture"]);
+        git(&publisher, &["push", "-q", "origin", "main"]);
+        git(tmp.path(), &["clone", "-q", origin_text.as_str(), "repo"]);
+        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repo).unwrap();
+        let session = broker
+            .start_worktree("merged worker candidate", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("feature.txt"), "landed\n").unwrap();
+        git(&worktree, &["add", "feature.txt"]);
+        git(&worktree, &["commit", "-qm", "feature"]);
+        let remote_branch = format!("HEAD:refs/heads/{}", session.branch);
+        git(&worktree, &["push", "-q", "origin", remote_branch.as_str()]);
+        git(&publisher, &["fetch", "-q", "origin"]);
+        let remote_branch = format!("origin/{}", session.branch);
+        git(
+            &publisher,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "merge",
+                remote_branch.as_str(),
+            ],
+        );
+        git(&publisher, &["push", "-q", "origin", "main"]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        broker.close(session.id).unwrap();
+
+        let journal_path = repo.join(".aethyme/gc-journal.json");
+        let journal = GcJournal::from(broker.gc_plan().unwrap());
+        write_journal(&journal_path, &journal).unwrap();
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let deferred = crate::auto_cleanup::AutoCleanupReport {
+            enabled: true,
+            deferred: 1,
+            ..crate::auto_cleanup::AutoCleanupReport::default()
+        };
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, "0")
+            .unwrap();
+        broker
+            .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Drain, &deferred)
+            .unwrap();
+        let first_generation = broker
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+            .unwrap()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+
+        let cleanup_config = repo.join(".aethyme/config.toml");
+        std::fs::write(&cleanup_config, "[cleanup]\nauto_remove = \"invalid\"\n").unwrap();
+        let (invalid_report, invalid_completed) = broker
+            .auto_checkout_cleanup_recovery_pass(first_generation, Instant::now())
+            .unwrap()
+            .expect("the invalid-policy pass acquires the cleanup lock");
+        assert!(invalid_report.config_error.is_some());
+        assert!(!invalid_completed);
+        assert!(worktree.is_dir());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "an invalid cleanup policy leaves its request pending"
+        );
+
+        std::fs::write(&cleanup_config, "[cleanup]\nauto_remove = false\n").unwrap();
+        let (disabled_report, disabled_completed) = broker
+            .auto_checkout_cleanup_recovery_pass(first_generation, Instant::now())
+            .unwrap()
+            .expect("the disabled-policy pass acquires the cleanup lock");
+        assert!(!disabled_report.enabled);
+        assert!(disabled_completed);
+        assert!(worktree.is_dir(), "disabled policy keeps the checkout");
+        broker
+            .persist_auto_checkout_cleanup_request(
+                ArtifactSweepScope::Drain,
+                &crate::auto_cleanup::AutoCleanupReport {
+                    enabled: false,
+                    deferred: 1,
+                    ..crate::auto_cleanup::AutoCleanupReport::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(first_generation.to_string().as_str()),
+            "disabled cleanup cannot enqueue another generation"
+        );
+
+        std::fs::write(&cleanup_config, "[cleanup]\nauto_remove = true\n").unwrap();
+        broker
+            .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Inline, &deferred)
+            .unwrap();
+        let generation = broker
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+            .unwrap()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert!(generation > first_generation);
+        broker
+            .run_auto_checkout_cleanup_recovery_worker_loop(
+                generation,
+                Some(ARTIFACT_SWEEP_WORKER_MAX_PASSES),
+                Some(Duration::from_secs(60)),
+                |broker, generation, pass_budget| {
+                    let deadline = Instant::now()
+                        + pass_budget.unwrap_or(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET);
+                    broker.auto_checkout_cleanup_recovery_pass(generation, deadline)
+                },
+            )
+            .unwrap();
+
+        assert!(
+            !worktree.exists(),
+            "the worker removes the eligible checkout through the existing proof path"
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Cleaned
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(generation.to_string().as_str()),
+            "the exact cleanup request is completed after removal"
+        );
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            journal_before,
+            "whole-checkout cleanup does not resume or rewrite an operator GC journal"
+        );
     }
 
     #[test]
@@ -8571,8 +9399,23 @@ mod tests {
             )
             .unwrap();
         }
+        // Seed a valid operator-authorized journal before the fixture child
+        // opens the broker in worker mode. Broker::open must return through
+        // the worker-only early exit without resuming or rewriting it.
+        let journal_path = root.join(".aethyme/gc-journal.json");
+        let journal_before = {
+            let mut broker = open_detached_fixture_broker(root);
+            let journal = GcJournal::from(broker.gc_plan().unwrap());
+            write_journal(&journal_path, &journal).unwrap();
+            std::fs::read(&journal_path).unwrap()
+        };
         let setup = detached_fixture_command(root, "setup").status().unwrap();
         assert!(setup.success());
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            journal_before,
+            "Broker::open in detached worker mode must leave operator GC journals untouched"
+        );
         let closed_worktree = PathBuf::from(
             std::fs::read_to_string(detached_fixture_marker(root, "closed-worktree")).unwrap(),
         );
