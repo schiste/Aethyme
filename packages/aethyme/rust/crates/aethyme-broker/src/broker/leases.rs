@@ -1647,20 +1647,34 @@ impl Broker {
         self.guarded_exec_with_env(session_id, command, &[])
     }
 
-    /// Keep stdout available for the completed JSON report. Child output is
-    /// inherited on stderr without buffering or changing command argv.
-    pub(crate) fn guarded_exec_for_json(
+    /// Run CLI guarded exec with its existing automatic mode by default. The
+    /// explicit non-interactive opt-in forces process-group supervision; JSON
+    /// mode moves child stdout to stderr so the final report remains one JSON
+    /// document. All other child stdio behavior is preserved.
+    pub(crate) fn guarded_exec_for_cli(
         &mut self,
         session_id: i64,
         command: &[String],
+        force_supervised: bool,
+        json_mode: bool,
     ) -> Result<GuardedExecReport, BrokerOpError> {
+        let stdout = if json_mode {
+            std::process::Stdio::from(std::io::stderr())
+        } else {
+            std::process::Stdio::inherit()
+        };
         self.guarded_exec_with_env_heartbeat_mode_and_stdout(
             session_id,
             command,
             &[],
             || Ok(()),
-            crate::inline_exec_supervisor::generic_exec_mode,
-            std::process::Stdio::from(std::io::stderr()),
+            || {
+                select_guarded_exec_mode(
+                    force_supervised,
+                    crate::inline_exec_supervisor::generic_exec_mode,
+                )
+            },
+            stdout,
         )
     }
 
@@ -2059,6 +2073,38 @@ fn map_preparation_exec_supervisor_error(
                 source,
             }
         }
+    }
+}
+
+fn select_guarded_exec_mode(
+    force_supervised: bool,
+    automatic_mode: impl FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
+) -> crate::inline_exec_supervisor::GenericExecMode {
+    if force_supervised {
+        crate::inline_exec_supervisor::GenericExecMode::Supervised
+    } else {
+        automatic_mode()
+    }
+}
+
+#[cfg(test)]
+mod guarded_exec_mode_selection_tests {
+    use super::select_guarded_exec_mode;
+    use crate::inline_exec_supervisor::GenericExecMode;
+
+    #[test]
+    fn non_interactive_opt_in_forces_supervision_without_tty_probe() {
+        let mode = select_guarded_exec_mode(true, || {
+            panic!("opt-in must not probe the controlling terminal")
+        });
+        assert_eq!(mode, GenericExecMode::Supervised);
+    }
+
+    #[test]
+    fn default_exec_mode_preserves_automatic_selection() {
+        let expected = GenericExecMode::Legacy("test controlling terminal".into());
+        let mode = select_guarded_exec_mode(false, || expected.clone());
+        assert_eq!(mode, expected);
     }
 }
 

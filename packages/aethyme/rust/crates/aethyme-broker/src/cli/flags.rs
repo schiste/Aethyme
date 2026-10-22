@@ -305,7 +305,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("ownership list", &[]),
     ("ownership claim", &["--session", "--reason"]),
     ("ownership release", &["--session"]),
-    ("exec", &["--session", "--"]),
+    ("exec", &["--session", "--non-interactive", "--"]),
     (
         "git",
         &[

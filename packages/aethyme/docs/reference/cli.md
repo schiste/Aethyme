@@ -300,6 +300,13 @@ Commands that deliberately stream raw output, such as `report render --stdout`,
 keep that output format. `advanced exec` captures the child result and reports
 the broker's guarded-execution result; it does not forward child stdout.
 Arguments after `--` belong to the child and do not enable broker JSON mode.
+The optional `--non-interactive` flag forces the supervised process-group
+runner even when a terminal is available. It is a caller assertion, not TTY
+isolation: stdin/stdout/stderr routing stays the same as the default
+invocation (JSON mode still routes child stdout to stderr), and the command may
+still open the controlling terminal. Use it only for commands that do not
+need terminal interaction; if the helper cannot start, the command is not
+dispatched and the broker does not fall back to the unsupervised runner.
 
 Exit code 3 means the requested action was refused; it does not guarantee that
 the command made no state change. Some refusal paths record safe quarantine or
@@ -509,7 +516,7 @@ with a pending rename, while ambiguous or mismatched identity is refused with
 a reason.
 - `aethyme broker submit prepare status --session <id> [--json]`
 - `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]`
-- `aethyme broker advanced exec --session <id> -- <command> [--json]`
+- `aethyme broker advanced exec --session <id> [--non-interactive] -- <command> [--json]`
 - `aethyme broker advanced git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <git-args>`
 - `aethyme broker advanced gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <gh-args>`
 - `aethyme broker advanced operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`

@@ -524,11 +524,12 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         .session
         .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = if parsed.json {
-        broker.guarded_exec_for_json(session, &parsed.exec_command)?
-    } else {
-        broker.guarded_exec(session, &parsed.exec_command)?
-    };
+    let report = broker.guarded_exec_for_cli(
+        session,
+        &parsed.exec_command,
+        parsed.non_interactive,
+        parsed.json,
+    )?;
     let changed_paths = changed_paths_remaining(&report);
     let next_actions = exec_ownership_next_actions(&report);
     if parsed.json {

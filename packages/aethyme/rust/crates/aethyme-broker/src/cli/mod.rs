@@ -333,10 +333,16 @@ Usage:
       AETHYME_CONSOLE_MARKER and AETHYME_CONSOLE_MARKER_DIGEST; the marker is
       removed after clean shutdown. Configure with [console] in
       .aethyme/config.toml: mode, port, port_end, pool_limit, ttl_seconds.
-  aethyme broker exec --session <id> -- <command> [--json]
+  aethyme broker exec --session <id> [--non-interactive] -- <command> [--json]
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
       foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
+      --non-interactive selects supervised process-group execution even when
+      a terminal is available. This is a caller assertion, not TTY isolation:
+      stdio routing stays the same as the default, and the child may still open
+      the terminal. Use it only for commands that do not need terminal
+      interaction. If the supervised helper cannot start, the child is not
+      dispatched.
   aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
       require an exact --repo. Repository writes are serialized, journaled,
@@ -1548,6 +1554,7 @@ struct Parsed {
     planned_paths: Vec<String>,
     declared_scopes: Vec<String>,
     exec_command: Vec<String>,
+    non_interactive: bool,
     /// `merge-chain` tuning: merge method, poll interval, timeouts, gates workflow.
     merge_chain: MergeChainFlags,
     /// Every flag spelled on the command line, in order, as written (`--` for
@@ -1687,6 +1694,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         planned_paths: Vec::new(),
         declared_scopes: Vec::new(),
         exec_command: Vec::new(),
+        non_interactive: false,
         merge_chain: MergeChainFlags::default(),
         given_flags: Vec::new(),
     };
@@ -1701,6 +1709,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                 break;
             }
             "--json" | "--json-output" => parsed.json = true,
+            "--non-interactive" => parsed.non_interactive = true,
             "--summary" => parsed.summary = true,
             "--compact" => parsed.compact = true,
             "--refresh" => parsed.refresh = true,
