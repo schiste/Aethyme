@@ -119,3 +119,64 @@ released resource-lease history, and repeat the published release pair before
 claiming installed-version performance. Reducing command-local Git discovery
 and config reads remains a candidate improvement; the sync result needs
 investigation rather than a timing exemption.
+
+
+## Published release comparison: v0.8.28 to v0.8.29
+
+After publication, the official router and engine pairs were measured with the
+same frozen harness, budgets and 16-file synthetic fixture. The four runs were
+sequential in this order: v0.8.28 fresh, v0.8.29 fresh, v0.8.29 aged, v0.8.28 aged.
+Each run used one session and three samples per action. The aged profile seeded
+1,000 released host-resource leases; it did not create 1,000 sessions. All four
+runs and their workload checks passed. The campaign completed in 43.941 seconds.
+
+The published v0.8.29 pair is now installed globally and selected by the Aethyme
+repository runtime. Its release commit is
+`2c78fd1bcd2f7427e8022f6c0778f65b6be14661`. Later changes, including #979 and
+#982, are absent from these binaries and these measurements.
+
+Milliseconds; each cell lists all three complete CLI samples followed by the
+median in parentheses. Changes compare medians; budgets remain warnings.
+
+| Profile | Action | v0.8.28 samples (median) | v0.8.29 samples (median) | Change |
+| --- | --- | ---: | ---: | ---: |
+| Fresh | Summary status | 278.8, 298.9, 312.9 (298.9) | 337.9, 319.7, 310.2 (319.7) | +7.0% |
+| Fresh | Guarded no-op | 1450.0, 1686.4, 1535.9 (1535.9) | 720.4, 682.2, 720.9 (720.4) | -53.1% |
+| Fresh | Unchanged sync | 580.7, 695.0, 617.9 (617.9) | 503.4, 486.8, 427.5 (486.8) | -21.2% |
+| Fresh | Unchanged push | 951.7, 1033.5, 936.9 (951.7) | 745.4, 674.2, 673.8 (674.2) | -29.2% |
+| Aged | Summary status | 303.8, 300.8, 291.2 (300.8) | 377.3, 341.5, 283.8 (341.5) | +13.5% |
+| Aged | Guarded no-op | 1513.8, 1603.8, 1323.0 (1513.8) | 796.3, 681.4, 712.7 (712.7) | -52.9% |
+| Aged | Unchanged sync | 632.8, 535.8, 570.9 (570.9) | 478.9, 514.4, 526.4 (514.4) | -9.9% |
+| Aged | Unchanged push | 1064.0, 953.6, 1125.9 (1064.0) | 671.1, 674.2, 664.1 (671.1) | -36.9% |
+
+Guard and push improved in both workloads but still exceed their 500 ms median
+warning budgets. Status medians increased in both workloads, while remaining
+within 500 ms. Sync remains within its 1,000 ms budget. Three samples on a shared
+host do not establish statistical significance or production tail latency.
+Start and submit are not timed by this workload. Push uses an unchanged branch
+and local SSH transport to a bare remote, not a public-network delivery. These
+results measure neither model token cost nor concurrent-session scaling.
+
+The 48 budgeted samples and six additional aged resource-list samples have
+complete command/output receipts. Before/after hashes and version banners
+matched for both binary pairs. All evaluations ran on isolated Playgrounds.
+One earlier runner setup failed at JSON serialization before any benchmark child
+started; it is retained separately and contributes no samples.
+
+Reproduction pins (SHA-256):
+
+- Harness: `282c6219fc21d2062f0e611c865073c90e1d670f5ac74876434c29f0e5b7fefe`.
+- Budgets: `c78d9132690ac663a787738cf74a500d0df76799e60b3f7ae5fe33ef1c3b94b4`.
+- Frozen fixture inventory: `e639ab047299a19ef9e1c7ea45beb4c98c63b69bdfd26b41bbc33b5d1671e0de`.
+- v0.8.28 router: `799e297b562dfe73be220d500ee8b71f18bc95adf85b42fc733aea30a5bb5321`.
+- v0.8.28 engine: `95e818136304380ff7e46dc23d7e9652b5eb0f77b02f67a4cfa0ea11d95f9011`.
+- v0.8.29 router: `0349515fb3d9b7387b038d1a5d525fac56d35a8302cfa53be7d5c91b316bbbb0`.
+- v0.8.29 engine: `dd723d77eeeae1e6664e8f1b2320a7c5b4c6d9260575c4086ae74675f0d8564f`.
+- Campaign receipt: `073fd65dbca966fc33ccfab5d4a4d3cfd9b954bd255a02dd213d2f36b19ca559`.
+- Matched summary JSON: `3f1e064f6b4405f92da7823f297f05e061c976cd33cbe2bc908975ab705ba405`.
+
+The next performance work should investigate the status increase, bring guarded
+execution and unchanged push under their existing budgets, and measure many
+sessions separately from released resource-lease history. The earlier debug
+comparisons remain historical diagnostics and are not pooled with this release
+comparison.
