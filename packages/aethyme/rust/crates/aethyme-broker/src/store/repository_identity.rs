@@ -365,6 +365,16 @@ mod unix {
         CString::new(name).map_err(|_| refusal("repository UUID marker name contains NUL"))
     }
 
+    fn checked_stat_identity_cast<Source, Target>(
+        value: Source,
+        message: &'static str,
+    ) -> Result<Target, BrokerError>
+    where
+        Target: TryFrom<Source>,
+    {
+        Target::try_from(value).map_err(|_| refusal(message))
+    }
+
     fn stat_at(directory: &File, name: &str) -> Result<Option<FileIdentity>, BrokerError> {
         let name_c = c_name(name)?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -390,25 +400,41 @@ mod unix {
         }
         // SAFETY: fstatat returned success and initialized the stat.
         let stat = unsafe { stat.assume_init() };
-        let file_type_mode = u32::try_from(stat.st_mode)
-            .map_err(|_| refusal("repository UUID marker has an invalid file mode"))?;
+        let file_type_mode = checked_stat_identity_cast::<_, u32>(
+            stat.st_mode,
+            "repository UUID marker has an invalid file mode",
+        )?;
         let identity = FileIdentity {
-            device: u64::try_from(stat.st_dev)
-                .map_err(|_| refusal("repository UUID marker has an invalid device identity"))?,
-            inode: u64::try_from(stat.st_ino)
-                .map_err(|_| refusal("repository UUID marker has an invalid inode identity"))?,
-            uid: u32::try_from(stat.st_uid)
-                .map_err(|_| refusal("repository UUID marker has an invalid owner identity"))?,
+            device: checked_stat_identity_cast::<_, u64>(
+                stat.st_dev,
+                "repository UUID marker has an invalid device identity",
+            )?,
+            inode: checked_stat_identity_cast::<_, u64>(
+                stat.st_ino,
+                "repository UUID marker has an invalid inode identity",
+            )?,
+            uid: checked_stat_identity_cast::<_, u32>(
+                stat.st_uid,
+                "repository UUID marker has an invalid owner identity",
+            )?,
             mode: file_type_mode & 0o777,
-            links: u64::try_from(stat.st_nlink)
-                .map_err(|_| refusal("repository UUID marker has an invalid link count"))?,
-            size: u64::try_from(stat.st_size)
-                .map_err(|_| refusal("repository UUID marker has an invalid size"))?,
+            links: checked_stat_identity_cast::<_, u64>(
+                stat.st_nlink,
+                "repository UUID marker has an invalid link count",
+            )?,
+            size: checked_stat_identity_cast::<_, u64>(
+                stat.st_size,
+                "repository UUID marker has an invalid size",
+            )?,
         };
-        let file_type_mask = u32::try_from(libc::S_IFMT)
-            .map_err(|_| refusal("repository UUID marker has an invalid file type mask"))?;
-        let regular_file_type = u32::try_from(libc::S_IFREG)
-            .map_err(|_| refusal("repository UUID marker has an invalid regular-file type"))?;
+        let file_type_mask = checked_stat_identity_cast::<_, u32>(
+            libc::S_IFMT,
+            "repository UUID marker has an invalid file type mask",
+        )?;
+        let regular_file_type = checked_stat_identity_cast::<_, u32>(
+            libc::S_IFREG,
+            "repository UUID marker has an invalid regular-file type",
+        )?;
         if file_type_mode & file_type_mask != regular_file_type {
             return Err(refusal(format!(
                 "repository UUID marker entry {name:?} is not a regular file"
