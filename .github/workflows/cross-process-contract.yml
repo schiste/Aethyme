@@ -19,6 +19,10 @@ on:
     branches: ["main", "master"]
     types: [opened, reopened, synchronize, edited]
 
+env:
+  # Match the trusted main-branch Rust cache warmer's environment fingerprint.
+  CARGO_NET_RETRY: "10"
+
 jobs:
   contract-check:
     name: Cross-process contract check
