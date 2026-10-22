@@ -143,6 +143,9 @@ fn main_prints_complete_bounded_failure_logs_without_quiet_success_noise() {
     assert!(diagnostic.contains("-type f -name '*.fail-*.log' -print0"));
     assert!(diagnostic.contains("while IFS= read -r -d '' log; do"));
     assert!(diagnostic.contains("cat -- \"$log\""));
+    assert!(diagnostic.contains("::stop-commands::$token"));
+    assert!(diagnostic.contains("trap 'printf"));
+    assert!(diagnostic.contains("-N16 -tx1 /dev/urandom"));
     assert!(!diagnostic.contains("tail ") && !diagnostic.contains("head "));
     assert!(!diagnostic.contains("continue-on-error"));
 }
@@ -168,9 +171,16 @@ fn failed_gate_diagnostics_keep_an_early_failure_and_literal_log_filenames() {
     let logs = root.path().join(".aethyme/logs/gates");
     std::fs::create_dir_all(&logs).unwrap();
     let marker = "EARLY_WORKSPACE_FAILURE_MUST_SURVIVE";
-    let contents = format!("{marker}\n{}", "later doctest passed\n".repeat(100));
+    let contents = format!(
+        "{marker}\n::error::untrusted annotation\n::stop-commands::attacker\n{}",
+        "later doctest passed\n".repeat(100)
+    );
     // Exercise NUL-delimited names and quoting, rather than a whitespace loop.
-    std::fs::write(logs.join("cargo test\nquoted 'name'.fail-1.log"), &contents).unwrap();
+    std::fs::write(
+        logs.join("cargo test\n::warning::quoted 'name'.fail-1.log"),
+        &contents,
+    )
+    .unwrap();
     std::fs::write(
         logs.join("successful-gate.log"),
         "SUCCESS_LOG_MUST_STAY_QUIET",
@@ -187,6 +197,21 @@ fn failed_gate_diagnostics_keep_an_early_failure_and_literal_log_filenames() {
         stdout.contains(&contents),
         "early failure or later context was omitted"
     );
+    let mut lines = stdout.lines();
+    let first = lines.next().unwrap();
+    let token = first.strip_prefix("::stop-commands::").unwrap();
+    assert!(token.starts_with("aethyme-"));
+    assert_eq!(token.len(), "aethyme-".len() + 32);
+    assert!(
+        token["aethyme-".len()..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    );
+    assert_eq!(lines.next_back().unwrap(), format!("::{token}::"));
+    let payload_start = stdout.find(marker).unwrap();
+    let payload_end = stdout.rfind(&format!("::{token}::")).unwrap();
+    assert!(payload_start > first.len() && payload_start < payload_end);
+    assert!(stdout.contains("\n::warning::quoted 'name'.fail-1.log"));
     assert!(!stdout.contains("SUCCESS_LOG_MUST_STAY_QUIET"));
 }
 

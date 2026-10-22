@@ -176,6 +176,12 @@ jobs:
             echo "No broker gate logs were created before the failure."
             exit 0
           fi
+          # Treat filenames and log bytes as data, including workflow commands.
+          # Bind resumption to a fresh 128-bit OS-random token.
+          token="aethyme-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          [[ "$token" =~ ^aethyme-[0-9a-f]{32}$ ]]
+          printf '%s\n' "::stop-commands::$token"
+          trap 'printf "\n::%s::\n" "$token"' EXIT
           find "$log_dir" -maxdepth 1 -type f -name '*.fail-*.log' -print0 |
             while IFS= read -r -d '' log; do
               printf '%s\n' "Failed gate log: $log"
