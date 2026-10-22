@@ -164,6 +164,7 @@ impl Fixture {
     }
 
     fn set_config_raw(&self, text: &str) {
+        std::fs::create_dir_all(self.repo.join(".aethyme")).unwrap();
         std::fs::write(self.repo.join(".aethyme/config.toml"), text).unwrap();
         git(&self.repo, &["add", ".aethyme/config.toml"]);
         git(&self.repo, &["commit", "-qm", "set PR policy"]);
