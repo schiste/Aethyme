@@ -778,7 +778,7 @@ impl Broker {
             let mut unreadable_witness = None;
             for session in spawned_sessions {
                 let witness = match self.store().spawned_worktree_instance_witness(session.id) {
-                    Ok(Some(witness)) => witness,
+                    Ok(Some(witness)) => Some(witness),
                     Ok(None) => None,
                     Err(error) => {
                         unreadable_witness = Some(error.to_string());
