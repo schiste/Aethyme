@@ -496,8 +496,8 @@ pub struct AutoCleanupReport {
     pub evaluated_at_ms: i64,
     pub removed: Vec<AutoRemovedCheckout>,
     pub kept: Vec<AutoKeptCheckout>,
-    /// Candidates the cursor or budget left for a later pass: a deep proof it
-    /// had no time for, or a removal after the first once it was spent (#460).
+    /// Candidates, or one incomplete discovery pass, left for later because
+    /// the cursor or time budget did not allow a complete proof (#460).
     pub deferred: usize,
 }
 
@@ -584,50 +584,185 @@ pub(crate) enum NotRemoved {
     Defer,
 }
 
-/// The canonical git directory a checkout's `.git` resolves to: the
-/// `gitdir:` a linked worktree's `.git` file names, or the `.git` directory
-/// itself. Two paths that spell the same checkout differently -- a symlinked
-/// host-state root, `/tmp` against `/private/tmp` -- resolve to the same one.
-fn checkout_git_dir(worktree: &Path) -> Option<PathBuf> {
+/// The canonical git directory a checkout's `.git` resolves to. A missing
+/// `.git` target is known absence; permission, malformed metadata and other
+/// I/O failures remain unknown so they cannot authorize cleanup.
+fn checkout_git_dir_checked(worktree: &Path) -> Result<Option<PathBuf>, std::io::Error> {
     let dot_git = worktree.join(".git");
-    let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
-    if metadata.is_dir() {
-        return std::fs::canonicalize(&dot_git).ok();
-    }
-    let text = std::fs::read_to_string(&dot_git).ok()?;
-    let target = text
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir:"))?
-        .trim();
-    let target = Path::new(target);
-    let target = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        worktree.join(target)
+    let metadata = match std::fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
-    std::fs::canonicalize(target).ok()
+    let target = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() {
+        let text = match std::fs::read_to_string(&dot_git) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let target = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed .git file without a gitdir target",
+                )
+            })?;
+        let target = Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            worktree.join(target)
+        }
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            ".git is neither a directory nor a gitdir file",
+        ));
+    };
+
+    match std::fs::canonicalize(target) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
-/// Whether a live session's recorded worktree is, contains or lies inside
-/// `candidate` (canonical). Matched by canonical path, and by git-dir
-/// identity, so a recorded path that spells the checkout through a symlink
-/// still matches. Fail-closed: a recorded path that cannot be resolved is
-/// also compared as written.
-pub(crate) fn live_session_overlaps(
-    candidate: &Path,
-    candidate_git_dir: Option<&Path>,
-    recorded: &str,
-) -> bool {
-    let raw = PathBuf::from(recorded);
-    let resolved = std::fs::canonicalize(&raw).unwrap_or_else(|_| raw.clone());
-    if resolved.starts_with(candidate)
-        || candidate.starts_with(&resolved)
-        || raw.starts_with(candidate)
-        || candidate.starts_with(&raw)
-    {
-        return true;
+#[derive(Debug, Clone)]
+struct ResolvedWorktreePath {
+    raw: PathBuf,
+    canonical_or_raw: PathBuf,
+    git_dir: Option<PathBuf>,
+    resolution_errors: Vec<String>,
+}
+
+impl ResolvedWorktreePath {
+    fn resolve(path: &Path) -> Self {
+        let (canonical_or_raw, path_error) = match std::fs::canonicalize(path) {
+            Ok(path) => (path, None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Preserve the prior raw-path fallback for a genuinely missing
+                // live checkout while keeping non-missing errors distinguishable.
+                (path.to_path_buf(), None)
+            }
+            Err(error) => (
+                path.to_path_buf(),
+                Some(format!("worktree path could not be resolved: {error}")),
+            ),
+        };
+        let (git_dir, git_error) = match checkout_git_dir_checked(path) {
+            Ok(git_dir) => (git_dir, None),
+            Err(error) => (
+                None,
+                Some(format!("Git directory could not be resolved: {error}")),
+            ),
+        };
+        let resolution_errors = path_error.into_iter().chain(git_error).collect();
+        Self {
+            raw: path.to_path_buf(),
+            canonical_or_raw,
+            git_dir,
+            resolution_errors,
+        }
     }
-    candidate_git_dir.is_some_and(|git_dir| checkout_git_dir(&raw).as_deref() == Some(git_dir))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveOverlapEvidence {
+    Disjoint,
+    Overlap,
+    Unknown,
+}
+
+fn deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// Resolve every live path once, retaining the store's order so a candidate
+/// reports the same first matching session as the former per-pair check. An
+/// expired or partial index is never used to authorize cleanup.
+fn resolve_live_worktree_paths(
+    live: &[Session],
+    deadline: Option<Instant>,
+) -> Option<Vec<ResolvedWorktreePath>> {
+    resolve_worktree_paths_until(
+        live.iter().map(|session| Path::new(&session.worktree_path)),
+        || deadline_expired(deadline),
+        ResolvedWorktreePath::resolve,
+    )
+}
+
+fn resolve_worktree_paths_until<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    mut expired: impl FnMut() -> bool,
+    mut resolve: impl FnMut(&Path) -> ResolvedWorktreePath,
+) -> Option<Vec<ResolvedWorktreePath>> {
+    let mut resolved = Vec::new();
+    for path in paths {
+        if expired() {
+            return None;
+        }
+        resolved.push(resolve(path));
+        if expired() {
+            return None;
+        }
+    }
+    Some(resolved)
+}
+
+fn live_worktree_overlap(
+    candidate: &ResolvedWorktreePath,
+    live: &ResolvedWorktreePath,
+) -> LiveOverlapEvidence {
+    let candidate_paths = [&candidate.raw, &candidate.canonical_or_raw];
+    let live_paths = [&live.raw, &live.canonical_or_raw];
+    let paths_overlap = candidate_paths.iter().any(|candidate_path| {
+        live_paths.iter().any(|live_path| {
+            live_path.starts_with(candidate_path) || candidate_path.starts_with(live_path)
+        })
+    });
+    let git_identity_matches = candidate
+        .git_dir
+        .as_ref()
+        .zip(live.git_dir.as_ref())
+        .is_some_and(|(candidate_git_dir, live_git_dir)| candidate_git_dir == live_git_dir);
+    if paths_overlap || git_identity_matches {
+        LiveOverlapEvidence::Overlap
+    } else if !candidate.resolution_errors.is_empty() || !live.resolution_errors.is_empty() {
+        LiveOverlapEvidence::Unknown
+    } else {
+        LiveOverlapEvidence::Disjoint
+    }
+}
+
+fn first_live_worktree_overlap(
+    candidate: &ResolvedWorktreePath,
+    live: &[ResolvedWorktreePath],
+) -> Option<(usize, LiveOverlapEvidence)> {
+    live.iter().enumerate().find_map(
+        |(index, live)| match live_worktree_overlap(candidate, live) {
+            LiveOverlapEvidence::Disjoint => None,
+            evidence => Some((index, evidence)),
+        },
+    )
+}
+
+fn overlap_resolution_error(
+    candidate: &ResolvedWorktreePath,
+    live: &ResolvedWorktreePath,
+) -> String {
+    candidate
+        .resolution_errors
+        .iter()
+        .chain(&live.resolution_errors)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn now_ms() -> i64 {
@@ -816,27 +951,56 @@ impl Broker {
     /// Closed, broker-owned checkouts that still exist, grouped by worktree.
     pub(crate) fn auto_cleanup_candidates(
         &mut self,
-    ) -> Result<(Vec<AutoCleanupCandidate>, Vec<AutoKeptCheckout>), BrokerOpError> {
+        deadline: Option<Instant>,
+    ) -> Result<Option<(Vec<AutoCleanupCandidate>, Vec<AutoKeptCheckout>)>, BrokerOpError> {
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
         let canonical =
             |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let live = self.store().live_sessions()?;
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
+        let Some(live_worktrees) = resolve_live_worktree_paths(&live, deadline) else {
+            return Ok(None);
+        };
         let closed = self.store().cleaned_sessions()?;
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
         let main_root = canonical(self.main_root());
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
         let mut by_path: std::collections::BTreeMap<PathBuf, Vec<Session>> =
             std::collections::BTreeMap::new();
         for session in closed {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
             if session.cleanup_state == SessionCleanupState::Cleaned {
                 continue;
             }
             let path = PathBuf::from(&session.worktree_path);
             if !path.is_dir() {
+                if deadline_expired(deadline) {
+                    return Ok(None);
+                }
                 continue;
             }
-            by_path.entry(canonical(&path)).or_default().push(session);
+            let canonical_path = canonical(&path);
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            by_path.entry(canonical_path).or_default().push(session);
         }
         let mut candidates = Vec::new();
         let mut kept = Vec::new();
         for (path, sessions) in by_path {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
             let ids = sessions
                 .iter()
                 .map(|session| session.id)
@@ -868,18 +1032,34 @@ impl Broker {
             // this exact Git worktree instance proves broker creation.
             // Adopted rows and legacy spawned rows without a witness cannot
             // authorize cleanup, even when the path and repository match.
-            let checkout = match GitRepo::discover(&path) {
+            let checkout_result = {
+                let _git_deadline = deadline.map(crate::git::limit_git_until);
+                GitRepo::discover(&path)
+            };
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let checkout = match checkout_result {
                 Ok(checkout) => checkout,
                 Err(_) => {
                     kept.push(keep("not a readable broker-owned worktree".into()));
                     continue;
                 }
             };
-            let current_witness = checkout.spawned_worktree_instance_witness();
+            let current_witness = {
+                let _git_deadline = deadline.map(crate::git::limit_git_until);
+                checkout.spawned_worktree_instance_witness()
+            };
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
             let mut matched_owner = None;
             let mut diagnostic_owner = None;
             let mut unreadable_witness = None;
             for session in spawned_sessions {
+                if deadline_expired(deadline) {
+                    return Ok(None);
+                }
                 let witness = match self.store().spawned_worktree_instance_witness(session.id) {
                     Ok(Some(witness)) => Some(witness),
                     Ok(None) => None,
@@ -888,6 +1068,9 @@ impl Broker {
                         continue;
                     }
                 };
+                if deadline_expired(deadline) {
+                    return Ok(None);
+                }
                 if witness
                     .as_ref()
                     .is_some_and(|witness| witness.worktree_path != path.to_string_lossy().as_ref())
@@ -917,24 +1100,47 @@ impl Broker {
                 kept.push(keep(reason));
                 continue;
             };
-            if !self
-                .is_broker_owned_worktree(&spawned_owner, Path::new(&spawned_owner.worktree_path))
-            {
+            let is_owned = {
+                let _git_deadline = deadline.map(crate::git::limit_git_until);
+                self.is_broker_owned_worktree(
+                    &spawned_owner,
+                    Path::new(&spawned_owner.worktree_path),
+                )
+            };
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            if !is_owned {
                 kept.push(keep("not a broker-owned worktree".into()));
                 continue;
             }
             // Proof 1: a session still open anywhere in this tree keeps it,
             // whatever state it reports -- an exited or stale session is not
             // a closed one.
-            let git_dir = checkout_git_dir(&path);
-            if let Some(open) = live.iter().find(|session| {
-                live_session_overlaps(&path, git_dir.as_deref(), &session.worktree_path)
-            }) {
-                kept.push(keep(format!(
-                    "session {} is still open ({}) in this worktree",
-                    open.id,
-                    open.status.as_str()
-                )));
+            let candidate_worktree = ResolvedWorktreePath::resolve(&path);
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            if let Some((index, evidence)) =
+                first_live_worktree_overlap(&candidate_worktree, &live_worktrees)
+            {
+                let open = &live[index];
+                let reason = match evidence {
+                    LiveOverlapEvidence::Overlap => format!(
+                        "session {} is still open ({}) in this worktree",
+                        open.id,
+                        open.status.as_str()
+                    ),
+                    LiveOverlapEvidence::Unknown => format!(
+                        "session {} worktree overlap could not be resolved: {}",
+                        open.id,
+                        overlap_resolution_error(&candidate_worktree, &live_worktrees[index])
+                    ),
+                    LiveOverlapEvidence::Disjoint => {
+                        unreachable!("only possible overlaps are returned")
+                    }
+                };
+                kept.push(keep(reason));
                 continue;
             }
             candidates.push(AutoCleanupCandidate {
@@ -943,8 +1149,14 @@ impl Broker {
                 spawned_instance_witness,
                 sessions,
             });
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
         }
-        Ok((candidates, kept))
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
+        Ok(Some((candidates, kept)))
     }
 
     /// Proofs 1-4 for one candidate, against the live state right now.
@@ -1064,23 +1276,37 @@ impl Broker {
         {
             return Err(keep("not a broker-owned worktree".into()));
         }
-        if let Some(live) = self
+        let live = self
             .store()
             .live_sessions()
-            .map_err(|error| keep(format!("live sessions unreadable: {error}")))?
-            .iter()
-            .find(|live| {
-                live_session_overlaps(
-                    &candidate.worktree,
-                    checkout_git_dir(&candidate.worktree).as_deref(),
-                    &live.worktree_path,
-                )
-            })
+            .map_err(|error| keep(format!("live sessions unreadable: {error}")))?;
+        let Some(live_worktrees) = resolve_live_worktree_paths(&live, deadline) else {
+            return Err(NotRemoved::Defer);
+        };
+        if deadline_expired(deadline) {
+            return Err(NotRemoved::Defer);
+        }
+        let candidate_worktree = ResolvedWorktreePath::resolve(&candidate.worktree);
+        if deadline_expired(deadline) {
+            return Err(NotRemoved::Defer);
+        }
+        if let Some((index, evidence)) =
+            first_live_worktree_overlap(&candidate_worktree, &live_worktrees)
         {
-            return Err(keep(format!(
-                "session {} is open in this worktree",
-                live.id
-            )));
+            let reason = match evidence {
+                LiveOverlapEvidence::Overlap => {
+                    format!("session {} is open in this worktree", live[index].id)
+                }
+                LiveOverlapEvidence::Unknown => format!(
+                    "session {} worktree overlap could not be resolved: {}",
+                    live[index].id,
+                    overlap_resolution_error(&candidate_worktree, &live_worktrees[index])
+                ),
+                LiveOverlapEvidence::Disjoint => {
+                    unreachable!("only possible overlaps are returned")
+                }
+            };
+            return Err(keep(reason));
         }
 
         // Proof 2: leases and gates. Processes are checked by the caller
@@ -1170,7 +1396,10 @@ impl Broker {
         if !policy.auto_remove {
             return Ok(AutoCleanupPlan::nothing(report));
         }
-        let (mut candidates, mut kept) = self.auto_cleanup_candidates()?;
+        let Some((mut candidates, mut kept)) = self.auto_cleanup_candidates(deadline)? else {
+            report.deferred += 1;
+            return Ok(AutoCleanupPlan::nothing(report));
+        };
         report.kept.append(&mut kept);
         let Some(upstream) = self.remote_default_ref_and_tip() else {
             for candidate in &candidates {
@@ -1448,14 +1677,17 @@ impl Broker {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupPolicy, auto_cleanup_lap_range,
-        classify_ignored, decode_auto_cleanup_cursor,
+        AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupPolicy, LiveOverlapEvidence,
+        ResolvedWorktreePath, auto_cleanup_lap_range, classify_ignored, decode_auto_cleanup_cursor,
+        first_live_worktree_overlap, resolve_worktree_paths_until,
     };
     use std::path::Path;
     #[cfg(unix)]
     use std::path::PathBuf;
     #[cfg(unix)]
     use std::process::Command;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
 
     fn classify(root: &Path, relative: &str, policy: &AutoCleanupPolicy) -> Result<(), String> {
         let mut budget = super::CLASSIFY_ENTRY_CAP;
@@ -1466,6 +1698,124 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "x").unwrap();
+    }
+
+    #[test]
+    fn partial_live_path_index_is_discarded_when_deadline_expires_mid_scan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first_path = temporary.path().join("first");
+        let second_path = temporary.path().join("second");
+        std::fs::create_dir_all(&first_path).unwrap();
+        std::fs::create_dir_all(&second_path).unwrap();
+        let paths = [first_path.as_path(), second_path.as_path()];
+        let resolved_count = std::cell::Cell::new(0);
+
+        let resolved = resolve_worktree_paths_until(
+            paths,
+            || resolved_count.get() == 1,
+            |path| {
+                resolved_count.set(resolved_count.get() + 1);
+                ResolvedWorktreePath::resolve(path)
+            },
+        );
+
+        assert!(resolved.is_none(), "a partial index cannot be used");
+        assert_eq!(resolved_count.get(), 1, "expiry stops before the next path");
+    }
+
+    #[test]
+    fn live_overlap_index_preserves_component_and_missing_path_fallback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate_path = temporary.path().join("checkout");
+        std::fs::create_dir_all(&candidate_path).unwrap();
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+        let missing_child = ResolvedWorktreePath::resolve(&candidate_path.join("not-created"));
+        let sibling = ResolvedWorktreePath::resolve(&temporary.path().join("checkout-old"));
+
+        assert_eq!(
+            first_live_worktree_overlap(&candidate, &[missing_child]),
+            Some((0, LiveOverlapEvidence::Overlap)),
+            "a genuinely missing live path keeps the existing raw-path fallback"
+        );
+        assert_eq!(
+            first_live_worktree_overlap(&candidate, &[sibling]),
+            None,
+            "path-prefix checks compare components rather than string prefixes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_overlap_index_preserves_canonical_alias_and_git_directory_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let real = temporary.path().join("real");
+        std::fs::create_dir_all(real.join("child")).unwrap();
+        let alias = temporary.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let candidate = ResolvedWorktreePath::resolve(&real);
+        let alias_child = ResolvedWorktreePath::resolve(&alias.join("child"));
+        assert_eq!(
+            first_live_worktree_overlap(&candidate, &[alias_child]),
+            Some((0, LiveOverlapEvidence::Overlap)),
+            "canonical aliases of nested live paths remain protected"
+        );
+
+        let git_dir = temporary.path().join("shared-git-dir");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let candidate_path = temporary.path().join("checkout-one");
+        let live_path = temporary.path().join("checkout-two");
+        for worktree in [&candidate_path, &live_path] {
+            std::fs::create_dir_all(worktree).unwrap();
+            std::fs::write(
+                worktree.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+        }
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+        let live = ResolvedWorktreePath::resolve(&live_path);
+        assert_eq!(
+            first_live_worktree_overlap(&candidate, &[live]),
+            Some((0, LiveOverlapEvidence::Overlap)),
+            "different recorded paths sharing a Git directory remain protected"
+        );
+    }
+
+    #[test]
+    fn unknown_live_path_identity_blocks_instead_of_authorizing_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate_path = temporary.path().join("candidate");
+        let live_path = temporary.path().join("live");
+        std::fs::create_dir_all(candidate_path.join(".git")).unwrap();
+        std::fs::create_dir_all(&live_path).unwrap();
+        std::fs::write(live_path.join(".git"), "not a gitdir pointer\n").unwrap();
+
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+        let unknown_live = ResolvedWorktreePath::resolve(&live_path);
+        assert_eq!(
+            first_live_worktree_overlap(&candidate, &[unknown_live]),
+            Some((0, LiveOverlapEvidence::Unknown)),
+            "unreadable or malformed identity is not treated as a complete disjoint index"
+        );
+    }
+
+    #[test]
+    fn live_overlap_index_keeps_the_first_matching_session_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate_path = temporary.path().join("checkout");
+        std::fs::create_dir_all(candidate_path.join("one")).unwrap();
+        std::fs::create_dir_all(candidate_path.join("two")).unwrap();
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+        let first = ResolvedWorktreePath::resolve(&candidate_path.join("one"));
+        let second = ResolvedWorktreePath::resolve(&candidate_path.join("two"));
+
+        assert_eq!(
+            first_live_worktree_overlap(&candidate, &[first, second]),
+            Some((0, LiveOverlapEvidence::Overlap)),
+            "the index returns the first overlapping live row in store order"
+        );
     }
 
     #[cfg(unix)]
@@ -1557,13 +1907,26 @@ mod tests {
             after_session_id: first_id,
             high_water_session_id: second_id,
         };
+        let seed_json = serde_json::to_string(&seed).unwrap();
         broker
             .store()
-            .meta_set(
-                AUTO_CLEANUP_CURSOR_KEY,
-                &serde_json::to_string(&seed).unwrap(),
-            )
+            .meta_set(AUTO_CLEANUP_CURSOR_KEY, &seed_json)
             .unwrap();
+
+        let expired_deadline = Instant::now() - Duration::from_millis(1);
+        let expired_pass = broker.auto_cleanup_plan(Some(expired_deadline)).unwrap();
+        assert!(expired_pass.selected_worktrees().is_empty());
+        assert!(expired_pass.report.kept.is_empty());
+        assert_eq!(expired_pass.report.deferred, 1);
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(AUTO_CLEANUP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(seed_json.as_str()),
+            "an incomplete discovery pass does not advance the cursor"
+        );
 
         let first_pass = broker.auto_cleanup_plan(None).unwrap();
         assert_eq!(
