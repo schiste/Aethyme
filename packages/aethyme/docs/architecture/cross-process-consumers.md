@@ -749,7 +749,17 @@ child may still open the controlling terminal; terminal reads or job-control
 operations may stop or fail. The flag belongs before `--`; after the separator
 it is a child argument. If the supervised helper cannot start, the user command
 is not dispatched and there is no unsupervised fallback. This option does not
-change the JSON report schema.
+by itself change the JSON report schema.
+
+`aethyme broker exec` accepts `--timeout <seconds>` from 1 through 86400.
+Supervised execution defaults to 1800 seconds. An explicit timeout is refused
+when automatic mode selects the legacy terminal runner, which remains
+unbounded. A verified timeout returns a nonzero CLI status after the ownership
+audit; JSON keeps `command_success: false`, `exit_code: null`, and the always
+present `command_timed_out: true`, with `outcome` set to `timed_out` or
+`timed_out_and_ownership_failed`. If process-group cleanup is unverified, the
+CLI reports an unknown outcome and skips the ownership audit rather than
+claiming that the command stopped.
 
 ### Push size accounting
 
