@@ -4957,14 +4957,19 @@ mod tests {
         let override_path = repo.join(ONBOARDING_OVERRIDE_PATH);
         std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
         let fifo_name = std::ffi::CString::new(override_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_name` is a live NUL-terminated CString, `0o600` is a valid mode, and `mkfifo` reads the path only during this call.
         assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        // SAFETY: `fifo_name` remains a live NUL-terminated CString; `O_RDONLY | O_NONBLOCK` are valid flags and `open` reads it only during this call.
         let reader_fd =
             unsafe { libc::open(fifo_name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
         assert!(reader_fd >= 0);
+        // SAFETY: `fifo_name` remains a live NUL-terminated CString; `O_WRONLY | O_NONBLOCK` are valid flags and `open` reads it only during this call.
         let writer_fd =
             unsafe { libc::open(fifo_name.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
         assert!(writer_fd >= 0);
+        // SAFETY: `reader_fd` is a nonnegative unique descriptor from the successful `open` above and is transferred exactly once to `File`.
         let _fifo_reader = unsafe { std::fs::File::from_raw_fd(reader_fd) };
+        // SAFETY: `writer_fd` is a nonnegative unique descriptor from the successful `open` above and is transferred exactly once to `File`.
         let fifo_writer = unsafe { std::fs::File::from_raw_fd(writer_fd) };
         let (started, started_receive) = std::sync::mpsc::channel();
         let (send, receive) = std::sync::mpsc::channel();
