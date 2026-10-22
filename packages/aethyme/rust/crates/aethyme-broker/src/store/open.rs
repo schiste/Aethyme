@@ -1575,10 +1575,11 @@ mod graph_fence_tests {
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&nested, &database).unwrap();
         assert!(database.is_file());
-        assert!(root
-            .join(".git")
-            .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER)
-            .is_file());
+        assert!(
+            root.join(".git")
+                .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER)
+                .is_file()
+        );
         assert!(aethyme_graph_storage::write_index_shard(&nested, "fixture", &[]).is_err());
         assert!(!nested.join(".aethyme").exists());
         drop(store);
