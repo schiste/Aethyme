@@ -83,6 +83,20 @@ fn join_items(value: &Value, sep: &str) -> String {
 /// dict in insertion order.
 pub fn expected_onboarding_files(repo_path: &Path) -> Result<Vec<(String, String)>, String> {
     let artifact = build_onboarding_artifact(repo_path)?;
+    expected_onboarding_files_from_artifact(artifact)
+}
+
+fn expected_onboarding_files_with_overrides(
+    repo_path: &Path,
+    overrides: &Value,
+) -> Result<Vec<(String, String)>, String> {
+    let artifact = build_onboarding_artifact_with_overrides(repo_path, overrides.clone())?;
+    expected_onboarding_files_from_artifact(artifact)
+}
+
+fn expected_onboarding_files_from_artifact(
+    artifact: Value,
+) -> Result<Vec<(String, String)>, String> {
     let onboarding_markdown = render_onboarding_skill(&artifact)?;
     let act_artifact = build_act_starter_artifact(&artifact)?;
     let act_markdown = render_act_skill(&act_artifact)?;
@@ -107,6 +121,20 @@ pub fn expected_onboarding_files(repo_path: &Path) -> Result<Vec<(String, String
 
 /// Build a deterministic onboarding artifact for a repository.
 pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
+    build_onboarding_artifact_with_optional_overrides(repo_path, None)
+}
+
+fn build_onboarding_artifact_with_overrides(
+    repo_path: &Path,
+    overrides: Value,
+) -> Result<Value, String> {
+    build_onboarding_artifact_with_optional_overrides(repo_path, Some(overrides))
+}
+
+fn build_onboarding_artifact_with_optional_overrides(
+    repo_path: &Path,
+    overrides: Option<Value>,
+) -> Result<Value, String> {
     let repo_path = resolve_path(repo_path);
     let snapshot = snapshot_metadata(&repo_path)?;
     let surface_files = OnboardingFileSnapshot::discover(&repo_path)?;
@@ -135,8 +163,7 @@ pub fn build_onboarding_artifact(repo_path: &Path) -> Result<Value, String> {
     let (generated_paths, dangerous_paths) = collect_path_controls(&surface_files);
     let repo_kind = infer_repo_kind(&repo_path, &manifests, &areas);
     let languages = inventory.languages_primary_first();
-    let overrides = load_overrides(&repo_path);
-
+    let overrides = overrides.unwrap_or_else(|| load_overrides(&repo_path));
     let mut artifact = obj(vec![
         ("schema_version", Value::str(ONBOARDING_SCHEMA_V2)),
         (
@@ -3038,31 +3065,36 @@ fn unknown_override_errors(payload: &Value) -> Vec<String> {
 /// `_load_overrides`: onboarding override payload with the exact Python
 /// tolerances — missing → `{}`, unreadable/invalid/non-object →
 /// `{_invalid_override: true, _source: …}`, else payload + `_source`.
+fn invalid_override() -> Value {
+    obj(vec![
+        ("_invalid_override", Value::Bool(true)),
+        ("_source", Value::str(ONBOARDING_OVERRIDE_PATH)),
+    ])
+}
+
+fn load_overrides_from_text(text: &str) -> Value {
+    let Ok(mut payload) = pyjson::loads(text) else {
+        return invalid_override();
+    };
+    if !payload.is_object() {
+        return invalid_override();
+    }
+    if !unknown_override_errors(&payload).is_empty() {
+        return invalid_override();
+    }
+    payload.set("_source", Value::str(ONBOARDING_OVERRIDE_PATH));
+    payload
+}
+
 pub fn load_overrides(repo_path: &Path) -> Value {
     let override_path = repo_path.join(ONBOARDING_OVERRIDE_PATH);
     if !override_path.exists() {
         return Value::object();
     }
-    let invalid = || {
-        obj(vec![
-            ("_invalid_override", Value::Bool(true)),
-            ("_source", Value::str(ONBOARDING_OVERRIDE_PATH)),
-        ])
-    };
     let Ok(text) = std::fs::read_to_string(&override_path) else {
-        return invalid();
+        return invalid_override();
     };
-    let Ok(mut payload) = pyjson::loads(&text) else {
-        return invalid();
-    };
-    if !payload.is_object() {
-        return invalid();
-    }
-    if !unknown_override_errors(&payload).is_empty() {
-        return invalid();
-    }
-    payload.set("_source", Value::str(ONBOARDING_OVERRIDE_PATH));
-    payload
+    load_overrides_from_text(&text)
 }
 
 fn apply_overrides(artifact: &mut Value, overrides: &Value) -> Result<(), String> {
@@ -3166,21 +3198,9 @@ pub fn json_error_msg(error: &str) -> String {
     }
 }
 
-/// `validate_overrides`: validation status for the onboarding override
-/// file — the exact Python result dict shape.
-pub fn validate_overrides(repo_path: &Path) -> Value {
-    let repo_path = resolve_path(repo_path);
-    let override_path = repo_path.join(ONBOARDING_OVERRIDE_PATH);
-    if !override_path.exists() {
-        return obj(vec![
-            ("ok", Value::Bool(true)),
-            ("exists", Value::Bool(false)),
-            ("path", Value::str(ONBOARDING_OVERRIDE_PATH)),
-            ("errors", Value::Array(vec![])),
-        ]);
-    }
-    let text = std::fs::read_to_string(&override_path).unwrap_or_default();
-    let payload = match pyjson::loads(&text) {
+/// Validate the contents of one onboarding override document.
+fn validate_override_text(text: &str) -> Value {
+    let payload = match pyjson::loads(text) {
         Ok(payload) => payload,
         Err(error) => {
             return obj(vec![
@@ -3240,6 +3260,23 @@ pub fn validate_overrides(repo_path: &Path) -> Value {
         ("path", Value::str(ONBOARDING_OVERRIDE_PATH)),
         ("errors", Value::Array(errors)),
     ])
+}
+
+/// `validate_overrides`: validation status for the onboarding override
+/// file — the exact Python result dict shape.
+pub fn validate_overrides(repo_path: &Path) -> Value {
+    let repo_path = resolve_path(repo_path);
+    let override_path = repo_path.join(ONBOARDING_OVERRIDE_PATH);
+    if !override_path.exists() {
+        return obj(vec![
+            ("ok", Value::Bool(true)),
+            ("exists", Value::Bool(false)),
+            ("path", Value::str(ONBOARDING_OVERRIDE_PATH)),
+            ("errors", Value::Array(vec![])),
+        ]);
+    }
+    let text = std::fs::read_to_string(&override_path).unwrap_or_default();
+    validate_override_text(&text)
 }
 
 fn summon_policy() -> Value {
@@ -3345,19 +3382,41 @@ fn generation_telemetry(artifact: &Value, overrides: &Value) -> Value {
 
 // ── freshness & recommendation ──────────────────────────────────────────────
 
-fn mtime_f64(path: &Path) -> Option<f64> {
-    let metadata = std::fs::metadata(path).ok()?;
+const MAX_OVERRIDE_PROOF_BYTES: u64 = 4 * 1024 * 1024;
+
+fn mtime_from_metadata(metadata: &std::fs::Metadata) -> Option<f64> {
     let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     // CPython computes st_mtime as sec + nsec * 1e-9 in double math.
     Some(duration.as_secs() as f64 + duration.subsec_nanos() as f64 * 1e-9)
 }
 
-fn generated_artifact_matches(repo_path: &Path, relative_path: &str, expected: &str) -> bool {
-    let path = repo_path.join(relative_path);
-    if crate::deploy::ensure_no_symlink_in_path(repo_path, &path).is_err() {
+fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if !left.is_file() || !right.is_file() || left.len() != right.len() {
         return false;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.mtime() == right.mtime()
+            && left.mtime_nsec() == right.mtime_nsec()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        left.modified().ok() == right.modified().ok()
+    }
+}
+
+fn open_regular_file_nofollow(
+    repo_path: &Path,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(std::fs::File, std::fs::Metadata), String> {
+    crate::deploy::ensure_no_symlink_in_path(repo_path, path)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -3365,25 +3424,68 @@ fn generated_artifact_matches(repo_path: &Path, relative_path: &str, expected: &
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let Ok(file) = options.open(&path) else {
-        return false;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() || metadata.len() != expected.len() as u64 {
-        return false;
+    let file = options
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(format!(
+            "{}: expected a regular file no larger than {max_bytes} bytes",
+            path.display()
+        ));
     }
-    let mut actual = Vec::new();
-    if file
-        .take(expected.len() as u64 + 1)
-        .read_to_end(&mut actual)
-        .is_err()
-    {
-        return false;
+    crate::deploy::ensure_no_symlink_in_path(repo_path, path)?;
+    let named_metadata =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !same_file_snapshot(&metadata, &named_metadata) {
+        return Err(format!("{}: file changed while opening", path.display()));
     }
-    crate::deploy::ensure_no_symlink_in_path(repo_path, &path).is_ok()
-        && actual.as_slice() == expected.as_bytes()
+    Ok((file, metadata))
+}
+
+fn read_regular_file_nofollow(
+    repo_path: &Path,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, Option<f64>), String> {
+    let (file, before) = open_regular_file_nofollow(repo_path, path, max_bytes)?;
+    let mut bytes = Vec::new();
+    (&file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{}: file grew beyond its read bound",
+            path.display()
+        ));
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !same_file_snapshot(&before, &after) {
+        return Err(format!("{}: file changed while reading", path.display()));
+    }
+    crate::deploy::ensure_no_symlink_in_path(repo_path, path)?;
+    let named_after =
+        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !same_file_snapshot(&before, &named_after) {
+        return Err(format!("{}: file changed while reading", path.display()));
+    }
+    Ok((bytes, mtime_from_metadata(&before)))
+}
+
+fn mtime_f64(repo_path: &Path, path: &Path) -> Option<f64> {
+    let (_file, metadata) = open_regular_file_nofollow(repo_path, path, u64::MAX).ok()?;
+    mtime_from_metadata(&metadata)
+}
+
+fn generated_artifact_matches(repo_path: &Path, relative_path: &str, expected: &str) -> bool {
+    let path = repo_path.join(relative_path);
+    read_regular_file_nofollow(repo_path, &path, expected.len() as u64)
+        .is_ok_and(|(actual, _)| actual.as_slice() == expected.as_bytes())
 }
 
 /// Whether generated onboarding artifacts are fresh relative to overrides.
@@ -3410,28 +3512,46 @@ pub fn override_freshness(repo_path: &Path) -> Value {
         ]);
     }
 
-    let override_mtime = mtime_f64(&override_path).unwrap_or(0.0);
+    let override_read =
+        read_regular_file_nofollow(&repo_path, &override_path, MAX_OVERRIDE_PROOF_BYTES);
+    let override_mtime = override_read.as_ref().ok().and_then(|(_, mtime)| *mtime);
+    let override_mtime_value = override_mtime.unwrap_or(0.0);
+    let override_text = override_read
+        .as_ref()
+        .ok()
+        .and_then(|(bytes, _)| std::str::from_utf8(bytes).ok());
+
     let onboarding_mtime = if onboarding_exists {
-        mtime_f64(&onboarding_path)
+        mtime_f64(&repo_path, &onboarding_path)
     } else {
         None
     };
     let act_mtime = if act_exists {
-        mtime_f64(&act_path)
+        mtime_f64(&repo_path, &act_path)
     } else {
         None
     };
 
-    let mut onboarding_stale =
-        !onboarding_exists || onboarding_mtime.unwrap_or(0.0) < override_mtime;
-    let mut act_stale = !act_exists || act_mtime.unwrap_or(0.0) < override_mtime;
+    let mut onboarding_stale = match (onboarding_mtime, override_mtime) {
+        (Some(generated), Some(override_mtime)) if onboarding_exists => generated < override_mtime,
+        _ => true,
+    };
+    let mut act_stale = match (act_mtime, override_mtime) {
+        (Some(generated), Some(override_mtime)) if act_exists => generated < override_mtime,
+        _ => true,
+    };
     if (onboarding_stale || act_stale)
-        && matches!(
-            validate_overrides(&repo_path).get("ok"),
-            Some(Value::Bool(true))
-        )
+        && override_text.is_some_and(|text| {
+            matches!(
+                validate_override_text(text).get("ok"),
+                Some(Value::Bool(true))
+            )
+        })
     {
-        if let Ok(expected_files) = expected_onboarding_files(&repo_path) {
+        let text = override_text.expect("validated override text");
+        let overrides = load_overrides_from_text(text);
+        if let Ok(expected_files) = expected_onboarding_files_with_overrides(&repo_path, &overrides)
+        {
             for (relative_path, expected) in expected_files {
                 match relative_path.as_str() {
                     ONBOARDING_JSON_PATH if onboarding_stale && onboarding_exists => {
@@ -3461,7 +3581,7 @@ pub fn override_freshness(repo_path: &Path) -> Value {
     obj(vec![
         ("override_exists", Value::Bool(true)),
         ("override_path", Value::str(ONBOARDING_OVERRIDE_PATH)),
-        ("override_mtime", Value::Float(override_mtime)),
+        ("override_mtime", Value::Float(override_mtime_value)),
         (
             "generated_exists",
             obj(vec![
@@ -4817,6 +4937,146 @@ mod tests {
         assert!(stale.iter().any(|target| target.as_str() == Some("act")));
 
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn override_freshness_rejects_fifo_overrides_without_blocking() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Duration;
+
+        let repo = committed_git_repo("freshness-fifo-override");
+        crate::deploy::deploy_supporting_artifacts(&repo, false).unwrap();
+        let override_path = repo.join(ONBOARDING_OVERRIDE_PATH);
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        let fifo_name = std::ffi::CString::new(override_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let reader_fd =
+            unsafe { libc::open(fifo_name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(reader_fd >= 0);
+        let writer_fd =
+            unsafe { libc::open(fifo_name.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        assert!(writer_fd >= 0);
+        let _fifo_reader = unsafe { std::fs::File::from_raw_fd(reader_fd) };
+        let fifo_writer = unsafe { std::fs::File::from_raw_fd(writer_fd) };
+        let (started, started_receive) = std::sync::mpsc::channel();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker_repo = repo.clone();
+        let worker = std::thread::spawn(move || {
+            started.send(()).expect("test still waits for worker start");
+            let freshness = override_freshness(&worker_repo);
+            send.send(freshness)
+                .expect("freshness result receiver remains live");
+        });
+        started_receive
+            .recv_timeout(Duration::from_secs(7))
+            .expect("finite deadline waits for freshness worker to start");
+        let (cancel_watchdog, watchdog_cancelled) = std::sync::mpsc::channel();
+        let writer_watchdog = std::thread::spawn(move || {
+            // On timeout or caller disconnect, release the FIFO so a
+            // regressed reader cannot leave a blocked worker behind.
+            let _cancelled_or_timed_out = watchdog_cancelled.recv_timeout(Duration::from_secs(5));
+            drop(fifo_writer);
+        });
+        let freshness = receive
+            .recv_timeout(Duration::from_secs(7))
+            .expect("finite FIFO watchdog releases any blocked reader");
+        let writer_was_released = cancel_watchdog.send(()).is_err();
+        worker.join().unwrap();
+        writer_watchdog.join().unwrap();
+        drop(_fifo_reader);
+
+        assert!(
+            !writer_was_released,
+            "freshness waited for EOF from the FIFO override"
+        );
+        assert_eq!(
+            freshness.get("regeneration_required"),
+            Some(&Value::Bool(true))
+        );
+        assert!(freshness
+            .get("stale_targets")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|target| target.as_str() == Some("act")));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn override_freshness_rejects_newer_symlink_and_directory_outputs() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, SystemTime};
+
+        let symlink_repo = committed_git_repo("freshness-symlink-output");
+        crate::deploy::deploy_supporting_artifacts(&symlink_repo, false).unwrap();
+        let symlink_act = symlink_repo.join(ACT_STARTER_JSON_PATH);
+        let expected_act = std::fs::read(&symlink_act).unwrap();
+        let now = SystemTime::now();
+        let old_output_mtime = now - Duration::from_secs(10);
+        let override_mtime = now - Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&symlink_act)
+            .unwrap()
+            .set_modified(old_output_mtime)
+            .unwrap();
+        let symlink_override = symlink_repo.join(ONBOARDING_OVERRIDE_PATH);
+        write(&symlink_override, r#"{"notes": ["A maintainer note"]}"#);
+        std::fs::File::options()
+            .write(true)
+            .open(&symlink_override)
+            .unwrap()
+            .set_modified(override_mtime)
+            .unwrap();
+        let target = symlink_repo.join("act-target.json");
+        std::fs::write(&target, expected_act).unwrap();
+        std::fs::remove_file(&symlink_act).unwrap();
+        symlink(Path::new("../../act-target.json"), &symlink_act).unwrap();
+        let freshness = override_freshness(&symlink_repo);
+        assert!(freshness
+            .get("stale_targets")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("act")));
+        std::fs::remove_dir_all(&symlink_repo).unwrap();
+
+        let directory_repo = committed_git_repo("freshness-directory-output");
+        crate::deploy::deploy_supporting_artifacts(&directory_repo, false).unwrap();
+        let directory_act = directory_repo.join(ACT_STARTER_JSON_PATH);
+        let directory_now = SystemTime::now();
+        let old_output_mtime = directory_now - Duration::from_secs(10);
+        let override_mtime = directory_now - Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&directory_act)
+            .unwrap()
+            .set_modified(old_output_mtime)
+            .unwrap();
+        let directory_override = directory_repo.join(ONBOARDING_OVERRIDE_PATH);
+        write(&directory_override, r#"{"notes": ["A maintainer note"]}"#);
+        std::fs::File::options()
+            .write(true)
+            .open(&directory_override)
+            .unwrap()
+            .set_modified(override_mtime)
+            .unwrap();
+        std::fs::remove_file(&directory_act).unwrap();
+        std::fs::create_dir(&directory_act).unwrap();
+        let freshness = override_freshness(&directory_repo);
+        assert!(freshness
+            .get("stale_targets")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("act")));
+        std::fs::remove_dir_all(&directory_repo).unwrap();
     }
 
     #[test]
