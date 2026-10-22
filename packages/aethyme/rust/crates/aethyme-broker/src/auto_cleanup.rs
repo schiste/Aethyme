@@ -532,7 +532,7 @@ struct AutoCleanupGroupScan {
 }
 
 enum AutoCleanupGroupInspection {
-    Candidate(AutoCleanupCandidate),
+    Candidate(Box<AutoCleanupCandidate>),
     Kept(AutoKeptCheckout),
     Deferred,
 }
@@ -1200,7 +1200,7 @@ impl Broker {
         if deadline_expired(deadline) {
             return Ok(AutoCleanupGroupInspection::Deferred);
         }
-        Ok(AutoCleanupGroupInspection::Candidate(candidate))
+        Ok(AutoCleanupGroupInspection::Candidate(Box::new(candidate)))
     }
 
     /// Proofs 1-4 for one candidate, against the live state right now.
@@ -1504,6 +1504,7 @@ impl Broker {
             };
             match inspection {
                 AutoCleanupGroupInspection::Candidate(candidate) => {
+                    let candidate = *candidate;
                     if !upstream_checked {
                         upstream_checked = true;
                         upstream = {
@@ -1552,7 +1553,10 @@ impl Broker {
                 AutoCleanupGroupInspection::Kept(kept) => report.kept.push(kept),
                 AutoCleanupGroupInspection::Deferred => {
                     report.deferred += 1;
-                    stop_for_deadline = deadline_expired(deadline);
+                    // A selected-group deferral means its proof exhausted
+                    // this tranche. Checkpoint it below, then let the next
+                    // pass resume at the following complete group.
+                    stop_for_deadline = true;
                 }
             }
             cursor.after_session_id = cursor_session_id;
@@ -2120,6 +2124,67 @@ mod tests {
             !selected.contains(&second_path.to_string_lossy().into_owned()),
             "the still-dirty candidate remains protected"
         );
+
+        let (third_id, _) = closed_dirty_checkout(&mut broker, "cursor third candidate");
+        assert!(second_id < third_id);
+        let deferred_cursor = AutoCleanupCursor {
+            version: super::AUTO_CLEANUP_CURSOR_VERSION,
+            after_session_id: first_id,
+            high_water_session_id: third_id,
+        };
+        let deferred_cursor_json = serde_json::to_string(&deferred_cursor).unwrap();
+        broker
+            .store()
+            .meta_set(AUTO_CLEANUP_CURSOR_KEY, &deferred_cursor_json)
+            .unwrap();
+
+        let mut deferred_inspections = Vec::new();
+        let deferred_pass = broker
+            .auto_cleanup_plan_with_group_inspector(None, |_, group, _, _, _| {
+                let session_id = group.sessions[0].id;
+                deferred_inspections.push(session_id);
+                if session_id == second_id {
+                    Ok(AutoCleanupGroupInspection::Deferred)
+                } else {
+                    Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                        worktree: group.worktree.to_string_lossy().into_owned(),
+                        sessions: vec![session_id],
+                        reason: "injected resumed inspection".into(),
+                    }))
+                }
+            })
+            .unwrap();
+        assert_eq!(deferred_inspections, vec![second_id]);
+        assert_eq!(deferred_pass.report.deferred, 2);
+        let checkpoint = broker
+            .store()
+            .meta_get(AUTO_CLEANUP_CURSOR_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_auto_cleanup_cursor(Some(&checkpoint)).after_session_id,
+            second_id,
+            "a deferred selected group is checkpointed before the tranche stops"
+        );
+
+        let mut resumed_inspections = Vec::new();
+        let resumed_pass = broker
+            .auto_cleanup_plan_with_group_inspector(None, |_, group, _, _, _| {
+                let session_id = group.sessions[0].id;
+                resumed_inspections.push(session_id);
+                Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                    worktree: group.worktree.to_string_lossy().into_owned(),
+                    sessions: vec![session_id],
+                    reason: "injected resumed inspection".into(),
+                }))
+            })
+            .unwrap();
+        assert_eq!(
+            resumed_inspections,
+            vec![third_id],
+            "a fresh pass resumes at the next uninspected complete group"
+        );
+        assert_eq!(resumed_pass.report.deferred, 0);
     }
 
     #[test]
