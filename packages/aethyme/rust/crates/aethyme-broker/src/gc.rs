@@ -4926,19 +4926,8 @@ impl Broker {
         // pressure on those filesystems (the main checkout is often elsewhere).
         let mut roots = BTreeSet::from([main_root.clone()]);
         if scope == ArtifactSweepScope::AutomaticContinuation {
-            if let Ok(sessions) = self.store().live_sessions() {
-                roots.extend(
-                    sessions
-                        .into_iter()
-                        .map(|session| PathBuf::from(session.worktree_path)),
-                );
-            }
-            if let Ok(sessions) = self.store().cleaned_sessions() {
-                roots.extend(
-                    sessions
-                        .into_iter()
-                        .map(|session| PathBuf::from(session.worktree_path)),
-                );
+            if let Ok(paths) = self.store().session_worktree_paths() {
+                roots.extend(paths.into_iter().map(PathBuf::from));
             }
             if let Ok(Some(cache_root)) = self.storage_context().preparation_cache_root_binding() {
                 roots.insert(cache_root.path);
@@ -9753,11 +9742,17 @@ mod tests {
             .unwrap();
         }
         tx.execute(
-            "UPDATE sessions SET origin = 'invalid-future-origin' WHERE id = 33",
+            "UPDATE sessions SET repository_schema = -1 WHERE id = 33",
             [],
         )
         .unwrap();
         tx.commit().unwrap();
+        assert!(
+            broker
+                .artifact_sweep_budget_roots(ArtifactSweepScope::AutomaticContinuation)
+                .contains(&remembered_root),
+            "pressure roots must not decode unrelated session metadata"
+        );
         let remembered_key = remembered.to_string_lossy().into_owned();
         broker
             .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &remembered_key)
@@ -9804,7 +9799,7 @@ mod tests {
         let (_temp, store) = session_history_fixture(1799);
         let conn = rusqlite::Connection::open(store.db_path()).unwrap();
         conn.execute(
-            "UPDATE sessions SET origin = 'invalid-future-origin' WHERE id = 33",
+            "UPDATE sessions SET repository_schema = -1 WHERE id = 33",
             [],
         )
         .unwrap();
