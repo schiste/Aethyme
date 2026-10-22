@@ -56,7 +56,7 @@ unicode-normalization = "0.1"
 walkdir = "2"
 
 [workspace.package]
-version = "0.8.29"
+version = "0.8.30"
 
 # Workspace lint floor. Every crate opts in with `[lints] workspace = true`.
 #
