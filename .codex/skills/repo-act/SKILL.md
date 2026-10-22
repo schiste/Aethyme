@@ -38,10 +38,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   sampled frames, not invocation counts; keep instrumented traces and timings
   separate from uninstrumented benchmark samples.
 - In nonblocking readiness readers, distinguish available bytes from
-  `WouldBlock`: drain buffered input without a polling sleep after every byte.
-  Use an injected wait callback to test buffered reads, retry waits and expired
-  deadlines deterministically; measure elapsed gains with a rebuilt pair in a
-  separate uninstrumented Playground run.
+  `WouldBlock`: wait only after `WouldBlock`, and drain buffered input without
+  a polling sleep after every byte. Assert injected wait-callback counts for
+  buffered reads, retries and expired deadlines; measure elapsed gains with a
+  rebuilt pair in a separate uninstrumented Playground run.
 
 - For deadline-bounded cleanup, separate candidate discovery from the
   assertion that partial work completed. One short wall-clock budget may expire
@@ -195,6 +195,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   to make it writable. After a reboot, mark missing evidence interrupted or
   unavailable. Recorded hashes do not recover missing bytes or recreate a trust
   record.
+- Preserve the complete outer `broker advanced resources run <request> -- ...`
+  invocation for supervised native checks. The helper must refuse before Cargo
+  when the host lease ID or generation is absent or malformed, and record both
+  in its result. A local Cargo lock and headroom monitor do not prove host
+  admission. Exercise the missing-lease refusal without starting Cargo.
 - Before an expensive run, invoke the exact frozen helper entrypoint in its
   plan and offline-control modes. Require nonempty parsed output with the
   expected identity, schedule and zero-Cargo result; exit zero alone can hide a
