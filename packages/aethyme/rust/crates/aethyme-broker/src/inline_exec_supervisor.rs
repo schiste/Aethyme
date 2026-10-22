@@ -1082,9 +1082,11 @@ fn run_helper() -> io::Result<u8> {
                 return Ok(125);
             }
         }
-        if let Some(parent_frame) =
-            read_frame_timeout::<ParentFrame>(&mut control, std::time::Duration::from_millis(100))?
-        {
+        if let Some(parent_frame) = read_frame_timeout::<ParentFrame>(
+            &mut control,
+            std::time::Duration::from_millis(100),
+            None,
+        )? {
             match parent_frame {
                 ParentFrame::Ping => {}
                 ParentFrame::Abort => {
@@ -2194,7 +2196,7 @@ mod tests {
         let remainder = encoded[1..].to_vec();
         let reader_fd = reader.as_raw_fd();
         let reader_thread = std::thread::spawn(move || {
-            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100))
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100), None)
         });
 
         let consume_deadline = Instant::now() + Duration::from_secs(2);
@@ -2239,7 +2241,8 @@ mod tests {
 
         let started = Instant::now();
         let error =
-            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100)).unwrap_err();
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100), None)
+                .unwrap_err();
         let elapsed = started.elapsed();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
@@ -2263,7 +2266,7 @@ mod tests {
 
         let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
         assert!(
-            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(10))
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(10), None)
                 .unwrap()
                 .is_none()
         );

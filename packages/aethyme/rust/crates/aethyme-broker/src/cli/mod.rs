@@ -1477,7 +1477,7 @@ struct Parsed {
     generation: Option<i64>,
     events: Option<String>,
     ttl_seconds: Option<i64>,
-    /// `leases wait --timeout` and `finish --timeout` budgets, in seconds.
+    /// `leases wait --timeout`, `finish --timeout`, and `exec --timeout` values, in seconds.
     timeout_seconds: Option<u64>,
     wait: Option<String>,
     since: Option<i64>,
