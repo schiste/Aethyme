@@ -199,6 +199,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- For session-worktree cleanup, treat creation provenance separately from current
+  adoption records. Require a retained `Spawned` session as owner, exclude rows
+  marked `Cleaned` because the path may have been reused, and recheck that row
+  plus Git/root ownership at apply. Cover spawn→close→adopt→close, adopted-only
+  history, and same-path replacement by another repository.
 - Carry the selected worktree-root layout through planning, attribution, and
   apply. A `LibraryOverride` with no `root_container` is a direct repository
   root: inventory that root itself, not its children as keyed repositories.

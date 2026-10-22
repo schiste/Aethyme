@@ -422,6 +422,122 @@ fn a_live_session_that_adopted_the_closed_checkout_keeps_it() {
 }
 
 #[test]
+fn a_retained_spawned_session_owns_a_closed_re_adoption() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (spawned_id, worktree, head) = merged_closed_session(&fx, &mut broker, true);
+    let adopted = broker.adopt(&worktree, Some("picked up again")).unwrap();
+    broker.close(adopted.id).unwrap();
+
+    let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    let removed = &report.removed[0];
+    assert_eq!(removed.head, head);
+    assert!(removed.sessions.contains(&spawned_id));
+    assert!(removed.sessions.contains(&adopted.id));
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn a_cleaned_spawn_record_does_not_authorize_a_closed_adoption() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    broker
+        .store()
+        .set_session_status(spawned_id, aethyme_broker::SessionStatus::Cleaned, None)
+        .unwrap();
+    let adopted = broker
+        .adopt(&worktree, Some("adopted after prior cleanup"))
+        .unwrap();
+    broker.close(adopted.id).unwrap();
+
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("not a broker-owned worktree"));
+    assert!(worktree.exists());
+}
+
+#[test]
+fn a_closed_re_adoption_after_selection_keeps_the_checkout_for_that_pass() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    assert_eq!(plan.selected_worktrees().len(), 1);
+
+    let adopted = broker
+        .adopt(&worktree, Some("adopted after selection"))
+        .unwrap();
+    broker.close(adopted.id).unwrap();
+    let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("closed session set changed"));
+    assert!(worktree.exists());
+}
+
+#[test]
+fn a_retained_spawn_record_does_not_own_a_foreign_checkout_replacement() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    assert_eq!(plan.selected_worktrees().len(), 1);
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    git(&fx.repo, &["worktree", "remove", "--force", &worktree_text]);
+
+    // Recreate the same pathname as a worktree of a different Git repository.
+    // The broker-root marker still names this parent, so cleanup must also
+    // compare the replacement checkout's Git common directory.
+    let foreign_repo = fx._tmp.path().join("foreign-repo");
+    let foreign_repo_name = foreign_repo.file_name().unwrap().to_string_lossy();
+    let origin = fx
+        ._tmp
+        .path()
+        .join("origin.git")
+        .to_string_lossy()
+        .into_owned();
+    git(
+        fx._tmp.path(),
+        &["clone", "-q", &origin, foreign_repo_name.as_ref()],
+    );
+    git(
+        &foreign_repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &worktree_text,
+            "origin/main",
+        ],
+    );
+    let main_common_dir = git_out(
+        &fx.repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    let foreign_common_dir = git_out(
+        &worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    assert_ne!(main_common_dir, foreign_common_dir);
+
+    let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("changed before removal"));
+    assert!(kept_reason(&report, &worktree).contains("not a broker-owned worktree"));
+    assert!(worktree.join("shared.txt").exists());
+    assert!(worktree.exists());
+    assert_eq!(
+        broker.store().session(spawned_id).unwrap().cleanup_state,
+        aethyme_broker::SessionCleanupState::Closed,
+        "the old spawn record remains available but cannot authorize a foreign replacement"
+    );
+}
+
+#[test]
 fn a_change_between_selection_and_removal_keeps_the_checkout() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
