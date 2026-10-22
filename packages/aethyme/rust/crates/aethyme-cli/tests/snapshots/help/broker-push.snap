@@ -7,6 +7,7 @@ exit: 0
       moves forward is pushed plainly; a rebased one is replaced only with a
       lease on the oid this broker last pushed for the session. Requires
       `[delivery] push_session_branches = true` in .aethyme/config.toml on
-      the default branch. --pr also opens a draft pull request when none is
-      open for the branch (never marks it ready, never merges).
+      the default branch. --pr opens a new pull request using the trusted
+      default branch's `[broker.pr] open_as = "draft" | "ready"` setting
+      (default: draft); an existing pull request is reported unchanged.
 --- stderr
