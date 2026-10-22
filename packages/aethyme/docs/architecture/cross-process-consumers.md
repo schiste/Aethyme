@@ -77,9 +77,10 @@ deletion authority: the complete colocated closed-session set, persisted spawn
 witness, fresh instance identity, clean state, remote containment and current
 process-use protection remain required. A stale worker cannot complete a newer
 generation. Non-store cache-lane failures are deferred and do not suppress an
-independently due checkout lane; cache-lane store errors remain fatal. Completion
-means that the pass reported no deferred work, or cleanup became disabled. Kept
-or protected checkouts can remain after a generation completes.
+independently due checkout lane; cache-lane store errors remain fatal. A generation
+completes only when policy is valid and the pass reports no deferred work (or
+cleanup is disabled), and the request generation is still current. Kept or
+protected checkouts can remain after a generation completes.
 
 The worker reserves time for checkout work and stops after bounded passes or
 repeated no-progress, retaining incomplete work with retry backoff. Scheduling
