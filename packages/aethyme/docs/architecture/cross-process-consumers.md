@@ -236,6 +236,12 @@ on public `BrokerOpError` must handle the new unknown-state variants.
 
 Before `status`, `start`, `sync`, `push`, `submit` or `finish` runs from the primary checkout (hooks and advanced commands never move it), the broker checks the current branch against its configured, already-fetched tracking ref. With no tracked or non-ignored untracked changes, no unique commits, no Git operation in progress (merge, cherry-pick, revert, bisect, rebase, a held index lock) and no live broker session working in that checkout, a strictly-behind checkout advances by fast-forward (a compare-and-swap of the branch ref, then the index and worktree) and records `broker.checkout.fast_forwarded` with `trigger` (`broker.<command>`), `branch`, `upstream_ref`, `from` and `to`. This check does not fetch. Success prints `Updated main checkout: <branch> fast-forwarded from <from> to <to> (<upstream_ref>).` to stderr. Dirty, ahead, diverged, detached or unprovable states remain unchanged and print `warning: left the main checkout unchanged: <reason>. Run: <shell-quoted-command>` to stderr. Compatibility read-only snapshots and linked session worktrees are never moved; session worktrees use `broker sync --session <id>`. Standard output is unchanged, so JSON reports stay parseable.
 
+### Session pull request open mode (#887)
+
+`aethyme broker push --session <id> --pr` creates a new pull request using the trusted default branch config `[broker.pr] open_as = "draft" | "ready"` in `.aethyme/config.toml`. A missing setting defaults to `draft`. The value is read from the fetched default-branch commit, not the session worktree; invalid values or unsupported keys inside `[broker.pr]` refuse before the session branch is pushed. The mode only applies when creating a pull request: an existing pull request is reported as the provider reports it and is not changed.
+
+This setting is a user-facing broker config contract. Changes to its accepted values, trust source, default, or existing-PR behavior require updating the config template and the session-push contract tests.
+
 ### Skill template files (canonical sources, deployed by the `aethyme-enhance` crate)
 
 | Source | Deployed to | Invokes | Failure mode if entry point removed |

@@ -27,8 +27,9 @@ printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
 state="$AETHYME_FAKE_PR_STATE"
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   if [ -f "$state" ]; then
-    branch=$(cat "$state")
-    printf '[{"number":7,"url":"https://github.com/acme/project/pull/7","state":"OPEN","headRefName":"%s"}]\n' "$branch"
+    branch=$(sed -n '1p' "$state")
+    draft=$(sed -n '2p' "$state")
+    printf '[{"number":7,"url":"https://github.com/acme/project/pull/7","state":"OPEN","headRefName":"%s","isDraft":%s}]\n' "$branch" "$draft"
   else
     printf '[]\n'
   fi
@@ -36,9 +37,16 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   shift 2
+  branch=
+  draft=false
   while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--head" ]; then printf '%s' "$2" > "$state"; shift 2; else shift; fi
+    case "$1" in
+      --head) branch="$2"; shift 2 ;;
+      --draft) draft=true; shift ;;
+      *) shift ;;
+    esac
   done
+  printf '%s\n%s\n' "$branch" "$draft" > "$state"
   printf 'https://github.com/acme/project/pull/7\n'
   exit 0
 fi
@@ -153,6 +161,23 @@ impl Fixture {
         git(&self.repo, &["add", ".aethyme/config.toml"]);
         git(&self.repo, &["commit", "-qm", "delivery policy"]);
         self.git_env(&["push", "-q", "origin", "main"]);
+    }
+
+    fn set_config_raw(&self, text: &str) {
+        std::fs::create_dir_all(self.repo.join(".aethyme")).unwrap();
+        std::fs::write(self.repo.join(".aethyme/config.toml"), text).unwrap();
+        git(&self.repo, &["add", ".aethyme/config.toml"]);
+        git(&self.repo, &["commit", "-qm", "set PR policy"]);
+        self.git_env(&["push", "-q", "origin", "main"]);
+        self.git_env(&["fetch", "-q", "origin"]);
+    }
+
+    fn set_pr_open_as_raw(&self, value: &str) {
+        let existing = std::fs::read_to_string(self.repo.join(".aethyme/config.toml")).unwrap();
+        self.set_config_raw(&format!(
+            "{}\n[broker.pr]\nopen_as = {value}\n",
+            existing.trim_end()
+        ));
     }
 
     fn broker(&self) -> common::FixtureBroker {
@@ -490,9 +515,9 @@ fn a_closed_session_cannot_push() {
     assert_eq!(fixture.remote_branch(&branch), None);
 }
 
-/// `--pr` opens one draft and afterwards reports the existing one.
+/// `--pr` defaults to draft, and later policy changes leave an existing PR unchanged.
 #[test]
-fn pr_opens_one_draft_and_then_reuses_it() {
+fn pr_opens_one_draft_and_then_reuses_it_unchanged() {
     let fixture = Fixture::new();
     fixture.authorize(true);
     let (session, _) = fixture.session_with_commit();
@@ -500,14 +525,78 @@ fn pr_opens_one_draft_and_then_reuses_it() {
     let first = json(&fixture.push(session, &["--pr"]));
     assert_eq!(first["pr"]["number"], 7);
     assert_eq!(first["pr"]["created"], true);
+    assert_eq!(first["pr"]["draft"], true);
     let log = fixture.gh_log();
     assert!(log.contains("pr create --draft"), "{log}");
     assert!(log.contains("--base main"), "{log}");
     assert!(log.contains("--title feat: first step"), "{log}");
 
+    fixture.set_pr_open_as_raw("\"ready\"");
+
     let second = json(&fixture.push(session, &["--pr"]));
     assert_eq!(second["pr"]["created"], false);
+    assert_eq!(second["pr"]["draft"], true);
     assert_eq!(fixture.gh_log().matches("pr create").count(), 1);
+}
+
+#[test]
+fn pr_opens_ready_when_trusted_default_branch_requests_it() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    fixture.set_pr_open_as_raw("\"ready\"");
+    let (session, worktree) = fixture.session_with_commit();
+    std::fs::write(
+        worktree.join(".aethyme/config.toml"),
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nopen_as = \"draft\"\n",
+    )
+    .unwrap();
+
+    let id = session.to_string();
+    let output = fixture.run(&["push", "--session", &id, "--pr"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Opened ready pull request #7"), "{stdout}");
+    let log = fixture.gh_log();
+    assert!(log.contains("pr create --head"), "{log}");
+    assert!(!log.contains("pr create --draft"), "{log}");
+}
+
+#[test]
+fn malformed_pr_policy_refuses_before_pushing_the_session_branch() {
+    for config in [
+        "broker = false\n[delivery]\npush_session_branches = true\n",
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nother = true\n",
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nopen_as = true\n",
+    ] {
+        let fixture = Fixture::new();
+        fixture.set_config_raw(config);
+        let (session, _) = fixture.session_with_commit();
+        let branch = fixture.broker().store().session(session).unwrap().branch;
+
+        let refused = fixture.push(session, &["--pr"]);
+        assert!(!refused.status.success(), "accepted config: {config}");
+        assert_eq!(fixture.remote_branch(&branch), None, "config: {config}");
+        assert!(fixture.gh_log().is_empty(), "config: {config}");
+    }
+}
+
+#[test]
+fn invalid_pr_open_as_refuses_before_pushing_the_session_branch() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    fixture.set_pr_open_as_raw("\"soon\"");
+    let (session, _) = fixture.session_with_commit();
+    let branch = fixture.broker().store().session(session).unwrap().branch;
+
+    let refused = fixture.push(session, &["--pr"]);
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused).contains("open_as must be \"draft\" or \"ready\""),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(fixture.remote_branch(&branch), None);
+    assert!(fixture.gh_log().is_empty());
 }
 
 /// A repository with a PR template gets that template, filled from the
