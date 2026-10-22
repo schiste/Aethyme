@@ -37,6 +37,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   subprocess starts and group repeated argv. Stack-sample counts measure time in
   sampled frames, not invocation counts; keep instrumented traces and timings
   separate from uninstrumented benchmark samples.
+- In nonblocking readiness readers, distinguish available bytes from
+  `WouldBlock`: drain buffered input without a polling sleep after every byte.
+  Use an injected wait callback to test buffered reads, retry waits and expired
+  deadlines deterministically; measure elapsed gains with a rebuilt pair in a
+  separate uninstrumented Playground run.
 
 - For deadline-bounded cleanup, separate candidate discovery from the
   assertion that partial work completed. One short wall-clock budget may expire
