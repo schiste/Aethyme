@@ -976,6 +976,28 @@ impl BrokerStore {
         Ok(())
     }
 
+    /// Compare the current durable value and replace it atomically. A missing
+    /// expected value inserts only when the key is still absent.
+    pub fn meta_compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, BrokerError> {
+        let changed = match expected {
+            Some(expected) => self.conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = ?2 AND value = ?3",
+                rusqlite::params![value, key, expected],
+            )?,
+            None => self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO NOTHING",
+                rusqlite::params![key, value],
+            )?,
+        };
+        Ok(changed == 1)
+    }
+
     pub fn append_event(
         &mut self,
         kind: &str,
@@ -2051,6 +2073,37 @@ mod artifact_sweep_namespace_tests {
                 .as_deref(),
             Some("17")
         );
+    }
+
+    #[test]
+    fn meta_compare_and_set_rejects_a_second_handle_with_a_stale_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("broker.db");
+        drop(BrokerStore::open(&database).unwrap());
+        let first = BrokerStore::open(&database).unwrap();
+        let second = BrokerStore::open(&database).unwrap();
+        let key = "auto_cleanup.cursor";
+
+        let first_read = first.meta_get(key).unwrap();
+        let second_read = second.meta_get(key).unwrap();
+        assert_eq!(first_read, None);
+        assert_eq!(second_read, first_read);
+
+        assert!(first
+            .meta_compare_and_set(key, first_read.as_deref(), "first")
+            .unwrap());
+        assert!(!second
+            .meta_compare_and_set(key, second_read.as_deref(), "stale-second")
+            .unwrap());
+        assert_eq!(first.meta_get(key).unwrap().as_deref(), Some("first"));
+
+        assert!(second
+            .meta_compare_and_set(key, Some("first"), "second")
+            .unwrap());
+        assert!(!first
+            .meta_compare_and_set(key, Some("first"), "stale-third")
+            .unwrap());
+        assert_eq!(second.meta_get(key).unwrap().as_deref(), Some("second"));
     }
 
     #[test]
