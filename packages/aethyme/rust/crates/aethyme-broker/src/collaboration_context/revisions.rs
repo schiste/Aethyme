@@ -600,7 +600,7 @@ mod tests {
         rationale: &Brief,
     ) -> ResolvedContributionRevision {
         revise_contribution_for_operation(
-            &fixture.store,
+            &mut fixture.store,
             &fixture.binding,
             ContributionRevisionRequest {
                 operation_id: operation,
@@ -638,7 +638,7 @@ mod tests {
             crate::analysis_view::ViewProfile::current("fixture"),
         );
         let view = crate::analysis_view::view_for_snapshot(
-            &mut fixture.store,
+            &fixture.store,
             revision.revision().base(),
             &view_options,
         )
