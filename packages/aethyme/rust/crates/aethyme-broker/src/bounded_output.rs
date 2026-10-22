@@ -194,17 +194,18 @@ pub(crate) fn output_with_input_limited(
         if status.is_none() {
             status = child.0.try_wait()?;
         }
-        if stdout_closed && stderr_closed {
-            if let Some(status) = status.as_ref() {
-                if Instant::now() >= deadline {
-                    return Ok(LimitedOutput::Deadline);
-                }
-                return Ok(LimitedOutput::Completed(Output {
-                    status: status.clone(),
-                    stdout,
-                    stderr,
-                }));
+        if stdout_closed
+            && stderr_closed
+            && let Some(status) = status.as_ref()
+        {
+            if Instant::now() >= deadline {
+                return Ok(LimitedOutput::Deadline);
             }
+            return Ok(LimitedOutput::Completed(Output {
+                status: *status,
+                stdout,
+                stderr,
+            }));
         }
         sleep_until_poll(deadline);
     }
@@ -319,23 +320,24 @@ pub(crate) fn pipeline_with_input_limited(
         if second_status.is_none() {
             second_status = second.0.try_wait()?;
         }
-        if first_stderr_closed && second_stdout_closed && second_stderr_closed {
-            if let (Some(first_status), Some(second_status)) =
+        if first_stderr_closed
+            && second_stdout_closed
+            && second_stderr_closed
+            && let (Some(first_status), Some(second_status)) =
                 (first_status.as_ref(), second_status.as_ref())
-            {
-                if Instant::now() >= deadline {
-                    return Ok(LimitedPipelineOutput::Deadline);
-                }
-                return Ok(LimitedPipelineOutput::Completed {
-                    first_status: first_status.clone(),
-                    first_stderr: first_stderr_bytes,
-                    second: Output {
-                        status: second_status.clone(),
-                        stdout: second_stdout_bytes,
-                        stderr: second_stderr_bytes,
-                    },
-                });
+        {
+            if Instant::now() >= deadline {
+                return Ok(LimitedPipelineOutput::Deadline);
             }
+            return Ok(LimitedPipelineOutput::Completed {
+                first_status: *first_status,
+                first_stderr: first_stderr_bytes,
+                second: Output {
+                    status: *second_status,
+                    stdout: second_stdout_bytes,
+                    stderr: second_stderr_bytes,
+                },
+            });
         }
         sleep_until_poll(deadline);
     }
