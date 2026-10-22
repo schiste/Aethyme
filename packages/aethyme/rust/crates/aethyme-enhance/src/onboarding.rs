@@ -3352,6 +3352,23 @@ fn mtime_f64(path: &Path) -> Option<f64> {
     Some(duration.as_secs() as f64 + duration.subsec_nanos() as f64 * 1e-9)
 }
 
+fn generated_artifact_matches(repo_path: &Path, relative_path: &str, expected: &str) -> bool {
+    let path = repo_path.join(relative_path);
+    if crate::deploy::ensure_no_symlink_in_path(repo_path, &path).is_err() {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() != expected.len() as u64 {
+        return false;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(actual) => actual == expected,
+        Err(_) => false,
+    }
+}
+
 /// Whether generated onboarding artifacts are fresh relative to overrides.
 pub fn override_freshness(repo_path: &Path) -> Value {
     let repo_path = resolve_path(repo_path);
@@ -3377,7 +3394,6 @@ pub fn override_freshness(repo_path: &Path) -> Value {
     }
 
     let override_mtime = mtime_f64(&override_path).unwrap_or(0.0);
-    let mut stale_targets = Vec::new();
     let onboarding_mtime = if onboarding_exists {
         mtime_f64(&onboarding_path)
     } else {
@@ -3388,10 +3404,40 @@ pub fn override_freshness(repo_path: &Path) -> Value {
     } else {
         None
     };
-    if !onboarding_exists || onboarding_mtime.unwrap_or(0.0) < override_mtime {
+
+    let mut onboarding_stale =
+        !onboarding_exists || onboarding_mtime.unwrap_or(0.0) < override_mtime;
+    let mut act_stale = !act_exists || act_mtime.unwrap_or(0.0) < override_mtime;
+    if (onboarding_stale || act_stale)
+        && matches!(
+            validate_overrides(&repo_path).get("ok"),
+            Some(Value::Bool(true))
+        )
+    {
+        if let Ok(expected_files) = expected_onboarding_files(&repo_path) {
+            for (relative_path, expected) in expected_files {
+                match relative_path.as_str() {
+                    ONBOARDING_JSON_PATH if onboarding_stale && onboarding_exists => {
+                        if generated_artifact_matches(&repo_path, &relative_path, &expected) {
+                            onboarding_stale = false;
+                        }
+                    }
+                    ACT_STARTER_JSON_PATH if act_stale && act_exists => {
+                        if generated_artifact_matches(&repo_path, &relative_path, &expected) {
+                            act_stale = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut stale_targets = Vec::new();
+    if onboarding_stale {
         stale_targets.push(Value::str("onboarding"));
     }
-    if !act_exists || act_mtime.unwrap_or(0.0) < override_mtime {
+    if act_stale {
         stale_targets.push(Value::str("act"));
     }
 
@@ -3690,6 +3736,29 @@ mod tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    fn write_override_newer_than_generated(repo: &Path, content: &str) -> std::time::SystemTime {
+        let generated_mtime = [ONBOARDING_JSON_PATH, ACT_STARTER_JSON_PATH]
+            .into_iter()
+            .map(|relative| {
+                std::fs::metadata(repo.join(relative))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+            })
+            .max()
+            .unwrap();
+        let override_mtime = generated_mtime + std::time::Duration::from_secs(5);
+        let override_path = repo.join(ONBOARDING_OVERRIDE_PATH);
+        write(&override_path, content);
+        std::fs::File::options()
+            .write(true)
+            .open(override_path)
+            .unwrap()
+            .set_modified(override_mtime)
+            .unwrap();
+        override_mtime
     }
 
     fn fixture_repo(tag: &str) -> PathBuf {
@@ -4631,6 +4700,106 @@ mod tests {
         assert!(json.contains("\"command\": \"./scripts/test-fast.sh\""));
         assert!(json.contains("\"Use sandbox credentials from 1Password.\""));
         assert!(json.contains("\"skip_when\": [\n      \"single known file\"\n    ]"));
+    }
+
+    #[test]
+    fn unchanged_act_artifact_is_fresh_after_valid_override_regeneration() {
+        let repo = committed_git_repo("freshness-unchanged-act");
+        crate::deploy::deploy_supporting_artifacts(&repo, false).unwrap();
+
+        let act_path = repo.join(ACT_STARTER_JSON_PATH);
+        let act_before = std::fs::read(&act_path).unwrap();
+        let act_mtime_before = std::fs::metadata(&act_path).unwrap().modified().unwrap();
+        let override_mtime =
+            write_override_newer_than_generated(&repo, r#"{"notes": ["A maintainer note"]}"#);
+
+        let actions = crate::deploy::deploy_supporting_artifacts(&repo, false).unwrap();
+        assert_eq!(
+            actions
+                .iter()
+                .find(|action| action.relative_path == ONBOARDING_JSON_PATH)
+                .unwrap()
+                .action,
+            "updated"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .find(|action| action.relative_path == ACT_STARTER_JSON_PATH)
+                .unwrap()
+                .action,
+            "unchanged"
+        );
+        assert_eq!(std::fs::read(&act_path).unwrap(), act_before);
+        assert_eq!(
+            std::fs::metadata(&act_path).unwrap().modified().unwrap(),
+            act_mtime_before
+        );
+        assert!(act_mtime_before < override_mtime);
+
+        let freshness = override_freshness(&repo);
+        assert_eq!(
+            freshness.get("regeneration_required"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(freshness.get("stale_targets"), Some(&Value::Array(vec![])));
+
+        // A backdated content change must remain stale even though the
+        // generated content would otherwise prove the unchanged case fresh.
+        write(&act_path, "not the current act artifact\n");
+        std::fs::File::options()
+            .write(true)
+            .open(&act_path)
+            .unwrap()
+            .set_modified(act_mtime_before)
+            .unwrap();
+        let freshness = override_freshness(&repo);
+        assert_eq!(
+            freshness.get("regeneration_required"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            freshness.get("stale_targets"),
+            Some(&Value::Array(vec![Value::str("act")]))
+        );
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn invalid_override_does_not_get_a_content_based_freshness_waiver() {
+        let repo = committed_git_repo("freshness-invalid-override");
+        crate::deploy::deploy_supporting_artifacts(&repo, false).unwrap();
+
+        let act_path = repo.join(ACT_STARTER_JSON_PATH);
+        let act_before = std::fs::read(&act_path).unwrap();
+        let act_mtime_before = std::fs::metadata(&act_path).unwrap().modified().unwrap();
+        write_override_newer_than_generated(&repo, r#"{"notes": 3}"#);
+        assert_eq!(
+            validate_overrides(&repo).get("ok"),
+            Some(&Value::Bool(false))
+        );
+
+        let actions = crate::deploy::deploy_supporting_artifacts(&repo, false).unwrap();
+        assert_eq!(
+            actions
+                .iter()
+                .find(|action| action.relative_path == ACT_STARTER_JSON_PATH)
+                .unwrap()
+                .action,
+            "unchanged"
+        );
+        assert_eq!(std::fs::read(&act_path).unwrap(), act_before);
+        assert_eq!(
+            std::fs::metadata(&act_path).unwrap().modified().unwrap(),
+            act_mtime_before
+        );
+
+        let freshness = override_freshness(&repo);
+        let stale = freshness.get("stale_targets").unwrap().as_array().unwrap();
+        assert!(stale.iter().any(|target| target.as_str() == Some("act")));
+
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
