@@ -15,6 +15,8 @@ additional migration.
 
 ### Fixed
 
+- Agent startup consumes already-available readiness bytes without sleeping
+  between bytes; deadline, token and message-size checks remain enforced.
 - Successful deployment no longer repeats the full readiness scan after
   verification. It prints the explicit `aethyme broker status readiness`
   follow-up for the deployed repository.
@@ -34,9 +36,20 @@ additional migration.
 - Rust formatting selects the containing Cargo package's edition.
 - Release signing recovers equivalent transparency-log entry conflicts and
   verifies the published standard signature bundle before publication.
+- Status and blocker summaries exclude stale explicit lease observations whose
+  holders no longer block; path ownership and incomplete-inspection warnings
+  remain visible.
+- Analysis views validate producer profiles, input generations and result
+  status before using derived facts. Unsupported or partial producer output
+  cannot establish an absence claim.
+- Failed Git commands preserve bounded diagnostic messages, and merge
+  simulations retain deadlines while inherited output pipes are open.
 
 ### Changed
 
+- Repository owners can configure `[broker.pr] open_as = "draft" | "ready"`
+  on the trusted default branch for newly created session pull requests. Draft
+  remains the default; existing pull requests keep their current state.
 - Start and adopt can report offline PR overlap advice for explicit planned
   paths. Missing, stale, unknown or truncated evidence remains incomplete;
   this advice does not claim a fresh network inspection.
