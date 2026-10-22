@@ -19,6 +19,7 @@ from broker_concurrent_submit import (
     deterministic_payload,
     make_env,
     parse_trace2,
+    scenario_fixture,
     terminate_owned_group,
     validate_output_path,
     validate_submit_outcome,
@@ -199,6 +200,41 @@ class BoundedProcessTests(unittest.TestCase):
                         side_effect=ProcessLookupError) as killpg:
             terminate_owned_group(process)
         killpg.assert_called_once_with(process.pid, 0)
+
+    def test_fixture_is_retained_when_group_absence_cannot_be_proven(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with scenario_fixture('unverified-cleanup', Path(temporary)) as (root, state):
+                state['runner'] = SimpleNamespace(cleanup_incomplete=True)
+            self.assertTrue(root.is_dir())
+
+    def test_term_ignoring_descendant_is_killed_before_group_anchor_reaped(self):
+        pid_path = self.root / 'descendant.pid'
+        ready_path = self.root / 'descendant.ready'
+        child_code = (
+            'import pathlib, signal, time; '
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+            f'pathlib.Path({str(ready_path)!r}).write_text("ready"); '
+            'time.sleep(30)'
+        )
+        leader_code = (
+            'import pathlib, subprocess, sys, time\n'
+            f'child = subprocess.Popen([sys.executable, "-c", {child_code!r}])\n'
+            f'pathlib.Path({str(pid_path)!r}).write_text(str(child.pid))\n'
+            'deadline = time.monotonic() + 2\n'
+            f'ready = pathlib.Path({str(ready_path)!r})\n'
+            'while not ready.exists() and time.monotonic() < deadline:\n'
+            '    time.sleep(0.01)\n'
+            'print("leader exited", flush=True)\n'
+        )
+        with self.assertRaisesRegex(RuntimeError, 'command exceeded 3.5 seconds'):
+            self.runner.run(
+                [sys.executable, '-c', leader_code], self.root,
+                'term-ignoring-descendant', timeout=3.5)
+        self.assertTrue(ready_path.is_file())
+        descendant_pid = int(pid_path.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+        self.assertFalse(self.runner.cleanup_incomplete)
 
     def test_output_limit_escalates_ignored_term_before_reaping_leader(self):
         code = (f'import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '

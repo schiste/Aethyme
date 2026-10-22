@@ -130,6 +130,41 @@ def output_tree_size(root):
     return {'files': count, 'bytes': total}
 
 
+class ProcessCleanupIncomplete(RuntimeError):
+    """The harness could not prove its owned process group is absent."""
+
+
+def require_waitid_support():
+    required = ('waitid', 'P_PID', 'WEXITED', 'WNOHANG', 'WNOWAIT')
+    missing = [name for name in required if not hasattr(os, name)]
+    if missing:
+        raise RuntimeError('safe process-group cleanup requires os.' + ', os.'.join(missing))
+
+
+def leader_exited_without_reaping(process):
+    """Observe our direct child while keeping its process-group ID anchored."""
+    if process.returncode is not None:
+        raise ProcessCleanupIncomplete('owned command leader was reaped before group cleanup')
+    try:
+        result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except InterruptedError:
+        return False
+    except (ChildProcessError, OSError) as error:
+        raise ProcessCleanupIncomplete(
+            f'could not observe unreaped command leader: {error}') from error
+    return result is not None and result.si_pid == process.pid
+
+
+def wait_for_leader_exit(process, deadline):
+    while True:
+        if leader_exited_without_reaping(process):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
 def process_group_absent(process_group, timeout=1.0):
     """Verify cleanup using signal 0 only after the group leader is reaped."""
     deadline = time.monotonic() + timeout
@@ -142,51 +177,61 @@ def process_group_absent(process_group, timeout=1.0):
         except PermissionError as error:
             last = f'process group state is inconclusive: {error}'
         except OSError as error:
-            raise RuntimeError(f'could not inspect process-group state: {error}') from error
+            raise ProcessCleanupIncomplete(
+                f'could not inspect process-group state: {error}') from error
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(last)
+            raise ProcessCleanupIncomplete(last)
         time.sleep(min(0.02, remaining))
 
 
-def terminate_owned_group(process):
-    """Stop the owned group while its direct leader is still unreaped."""
+def terminate_owned_group(process, term_grace=0.2):
+    """Stop descendants while the unreaped leader pins the owned process group."""
+    require_waitid_support()
     if process.returncode is not None:
         process_group_absent(process.pid)
         return
-    signal_error = None
+
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except OSError:
+        # The final signal-0 probe decides whether cleanup completed.
         pass
-    except OSError as error:
-        signal_error = error
+
+    if term_grace > 0:
+        grace_deadline = time.monotonic() + term_grace
+        while time.monotonic() < grace_deadline:
+            # Observe without reaping, but let the whole group use the bounded
+            # grace even if its direct leader exits before its descendants.
+            leader_exited_without_reaping(process)
+            time.sleep(min(0.01, grace_deadline - time.monotonic()))
+
+    # Keep the direct child unreaped even if it exited during TERM grace. It
+    # pins the original process-group identity while SIGKILL stops descendants.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        # The final signal-0 probe decides whether cleanup completed.
+        pass
+
+    reap_deadline = time.monotonic() + 3.0
+    while not leader_exited_without_reaping(process):
+        remaining = reap_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProcessCleanupIncomplete(
+                'owned command leader did not exit before cleanup deadline')
+        time.sleep(min(0.01, remaining))
 
     try:
-        process.wait(timeout=0.2)
-    except subprocess.TimeoutExpired:
-        # wait(timeout) leaves the leader unreaped when it is still alive, so
-        # this numeric group id still names the process group created by Popen.
-        try:
-            if process.returncode is None:
-                os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError as error:
-            signal_error = signal_error or error
-            if process.returncode is None:
-                try:
-                    process.kill()
-                except OSError as child_error:
-                    signal_error = signal_error or child_error
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError('owned command leader could not be reaped') from error
+        process.wait()
+    except OSError as error:
+        raise ProcessCleanupIncomplete(
+            f'could not reap observed command leader: {error}') from error
 
+    # The final post-reap signal-0 probe is authoritative. A TERM/KILL
+    # operation can report EPERM/ESRCH while the owned group is disappearing;
+    # tolerate that only when group absence is then positively established.
     process_group_absent(process.pid)
-    if signal_error is not None:
-        raise RuntimeError(f'owned process-group signal failed: {signal_error}')
 
 
 class ReceiptLog:
@@ -216,9 +261,13 @@ class BoundedCommandRunner:
         self.receipts = receipts
         self.count = 0
         self.lock = threading.Lock()
+        self.cleanup_incomplete = False
 
     def run(self, argv, cwd, label, timeout=COMMAND_TIMEOUT_SECONDS,
             trace_path=None, input_bytes=None, barrier=None):
+        if self.cleanup_incomplete:
+            raise RuntimeError('scenario stopped after uncertain process cleanup')
+        require_waitid_support()
         if not isinstance(argv, (list, tuple)) or not argv or not all(
                 isinstance(arg, str) for arg in argv):
             raise RuntimeError('command argv must be a non-empty string sequence')
@@ -253,6 +302,7 @@ class BoundedCommandRunner:
         stderr = bytearray()
         failure = None
         process = None
+        cleanup_attempted = False
         selector = selectors.DefaultSelector()
         try:
             process = subprocess.Popen(
@@ -313,23 +363,40 @@ class BoundedCommandRunner:
                     break
             if failure is None:
                 try:
-                    process.wait(timeout=max(0.01, deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    failure = f'command remained alive after {timeout} seconds'
-                if failure is None:
-                    try:
-                        process_group_absent(process.pid, timeout=0.2)
-                    except RuntimeError as error:
-                        failure = f'command process group was not quiescent: {error}'
+                    exited = wait_for_leader_exit(process, deadline)
+                except ProcessCleanupIncomplete as error:
+                    self.cleanup_incomplete = True
+                    failure = f'command cleanup ownership became uncertain: {error}'
+                else:
+                    if not exited:
+                        failure = f'command remained alive after {timeout} seconds'
+                    else:
+                        cleanup_attempted = True
+                        try:
+                            # The command is complete. Kill any unexpected
+                            # in-group descendant immediately, without adding
+                            # the failure-path TERM grace to measured latency.
+                            terminate_owned_group(process, term_grace=0)
+                        except ProcessCleanupIncomplete as error:
+                            self.cleanup_incomplete = True
+                            failure = f'command process group was not quiescent: {error}'
+                        except (OSError, RuntimeError) as error:
+                            failure = f'command process cleanup failed: {error}'
         except OSError as error:
-            failure = f'could not start command: {error}'
+            failure = (f'command supervision failed: {error}' if process is not None
+                       else f'could not start command: {error}')
         finally:
             cleanup_error = None
-            if process is not None and process.returncode is None:
+            if (process is not None and process.returncode is None
+                    and not cleanup_attempted and not self.cleanup_incomplete):
                 if failure is None:
                     failure = 'command runner exited before its child completed'
+                cleanup_attempted = True
                 try:
                     terminate_owned_group(process)
+                except ProcessCleanupIncomplete as error:
+                    self.cleanup_incomplete = True
+                    cleanup_error = str(error)
                 except (OSError, RuntimeError) as error:
                     cleanup_error = str(error)
             try:
@@ -352,6 +419,10 @@ class BoundedCommandRunner:
         if cleanup_error is not None:
             failure = (f'{failure}; process cleanup failed: {cleanup_error}'
                        if failure is not None else f'process cleanup failed: {cleanup_error}')
+        if self.cleanup_incomplete:
+            failure = (f'{failure}; fixture root retained at {self.root}'
+                       if failure is not None else
+                       f'process cleanup was incomplete; fixture root retained at {self.root}')
 
         ended_ns = time.monotonic_ns()
         ended_wall = time.time_ns()
@@ -532,9 +603,20 @@ def commit_file(runner, git, worktree, relative_path, data, message, label):
 
 
 @contextmanager
+def scenario_fixture(name, output):
+    root = Path(tempfile.mkdtemp(prefix=f'.fixture-{name}-', dir=output)).resolve(strict=True)
+    state = {'runner': None}
+    try:
+        yield root, state
+    finally:
+        runner = state['runner']
+        if runner is None or not runner.cleanup_incomplete:
+            shutil.rmtree(root)
+
+
+@contextmanager
 def setup_scenario(name, binary, git, output, receipts):
-    with tempfile.TemporaryDirectory(prefix=f'.fixture-{name}-', dir=output) as temporary:
-        root = Path(temporary).resolve(strict=True)
+    with scenario_fixture(name, output) as (root, fixture_state):
         repo, home, tools, remote, trace_dir = (
             root / key for key in ('repo', 'home', 'bin', 'remote.git', 'trace2'))
         for path in (repo, home, root / 'tmp', root / 'preparation', root / 'host-state',
@@ -543,6 +625,7 @@ def setup_scenario(name, binary, git, output, receipts):
         create_shims(tools)
         env = make_env(root, tools, binary, git, remote)
         runner = BoundedCommandRunner(root, output, env, receipts)
+        fixture_state['runner'] = runner
         git_version = run_git(runner, git, repo, f'{name}:git-version', '--version').strip()
         run_git(runner, git, root, f'{name}:init-remote', 'init', '--bare', '-q', '-b',
                 'main', str(remote))
