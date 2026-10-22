@@ -217,7 +217,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   expensive work if the preflight fails; never chmod or unfreeze prior evidence
   to make it writable. After a reboot, mark missing evidence interrupted or
   unavailable. Recorded hashes do not recover missing bytes or recreate a trust
-  record.
+  record. Before expensive runs, preflight serialization of the complete final
+  source and provenance snapshot against receipt limits; place large inventories
+  in bounded, hashed sidecars.
 - Preserve the complete outer `broker advanced resources run <request> -- ...`
   invocation for supervised native checks, bound to the frozen resource request.
   The helper must refuse before resource probes or Cargo when the host lease ID
