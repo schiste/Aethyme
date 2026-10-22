@@ -137,7 +137,7 @@ fn kept_reason<'a>(report: &'a AutoCleanupReport, worktree: &Path) -> &'a str {
         .unwrap_or_else(|| panic!("{} not kept: {report:#?}", worktree.display()))
 }
 
-fn persisted_spawn_witness_count(broker: &Broker, session_id: i64) -> i64 {
+fn persisted_spawn_witness_count(broker: &mut Broker, session_id: i64) -> i64 {
     rusqlite::Connection::open_with_flags(
         broker.store().db_path(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -546,7 +546,7 @@ fn unsupported_platform_spawn_identity_keeps_the_checkout() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
-    assert_eq!(persisted_spawn_witness_count(&broker, spawned_id), 0);
+    assert_eq!(persisted_spawn_witness_count(&mut broker, spawned_id), 0);
 
     let report = run(&mut broker);
 
@@ -566,13 +566,13 @@ fn a_retained_spawned_session_owns_a_closed_re_adoption() {
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (spawned_id, worktree, head) = merged_closed_session(&fx, &mut broker, true);
     assert_eq!(
-        persisted_spawn_witness_count(&broker, spawned_id),
+        persisted_spawn_witness_count(&mut broker, spawned_id),
         1,
         "the spawned session stores its identity in the registration path"
     );
     let adopted = broker.adopt(&worktree, Some("picked up again")).unwrap();
     assert_eq!(
-        persisted_spawn_witness_count(&broker, adopted.id),
+        persisted_spawn_witness_count(&mut broker, adopted.id),
         0,
         "adoption does not create spawn authority"
     );
@@ -595,7 +595,10 @@ fn detached_agent_spawn_registration_persists_instance_witness() {
 
     let report = broker.start_agent_report("witness", "true", None).unwrap();
 
-    assert_eq!(persisted_spawn_witness_count(&broker, report.session.id), 1);
+    assert_eq!(
+        persisted_spawn_witness_count(&mut broker, report.session.id),
+        1
+    );
 }
 
 #[test]
