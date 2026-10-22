@@ -221,21 +221,51 @@ pub struct ArtifactSweepReport {
     pub auto_cleanup: Option<crate::AutoCleanupReport>,
 }
 
-/// Visit order for one sweep pass: everything after the cursor, then the head
-/// of the list.
-///
-/// The wrap matters as much as the resume. Without it a pass starting near the
-/// end of the list would report itself complete after a handful of sessions,
-/// clear the cursor, and send the next pass back to the top -- so the middle of
-/// the list would never be reached. With it, one uninterrupted pass is a full
-/// lap whatever the cursor was.
-fn sweep_order<T: Clone>(items: &[T], cursor: i64, id: impl Fn(&T) -> i64) -> Vec<T> {
-    items
-        .iter()
-        .filter(|item| id(item) > cursor)
-        .chain(items.iter().filter(|item| id(item) <= cursor))
-        .cloned()
-        .collect()
+/// One complete circular lap, fetched in bounded pages. Querying the next page
+/// is deferred until the caller has checked its deadline. The durable cursor
+/// advances only when a candidate is actually taken by the caller.
+struct ClosedSessionPages {
+    start: i64,
+    after: i64,
+    wrapped: bool,
+    only: Option<i64>,
+    done: bool,
+}
+
+impl ClosedSessionPages {
+    fn new(cursor: i64, only: Option<i64>) -> Self {
+        let start = cursor.max(0);
+        Self {
+            start,
+            after: only.map_or(start, |id| id.saturating_sub(1)),
+            wrapped: only.is_some(),
+            only,
+            done: false,
+        }
+    }
+
+    fn next_page(
+        &mut self,
+        store: &crate::BrokerStore,
+    ) -> Result<Vec<crate::Session>, crate::BrokerError> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        loop {
+            let through = self.only.or(self.wrapped.then_some(self.start));
+            let page = store.cleaned_session_page(self.after, through, 32)?;
+            if let Some(last) = page.last() {
+                self.after = last.id;
+                return Ok(page);
+            }
+            if self.wrapped || self.start == 0 {
+                self.done = true;
+                return Ok(Vec::new());
+            }
+            self.wrapped = true;
+            self.after = 0;
+        }
+    }
 }
 
 /// Whether a remembered paused tree may be resumed by path inside `root`.
@@ -5070,14 +5100,11 @@ impl Broker {
                 0,
             ));
         };
-        let live_sessions = self.store().live_sessions()?;
-        let live = live_sessions
-            .iter()
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
+        let live_sessions = self.store().live_session_worktrees()?;
+        let live = live_sessions.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         let live_worktrees = live_sessions
             .iter()
-            .map(|session| PathBuf::from(&session.worktree_path))
+            .map(|(_, path)| PathBuf::from(path))
             .collect::<Vec<_>>();
         let mut preparation_entries_reclaimed = 0usize;
         let mut scan_completed = true;
@@ -5144,15 +5171,8 @@ impl Broker {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let mut last_visited = cursor;
-        let all = self.store().cleaned_sessions()?;
-        let sessions = match closed_session_id {
-            Some(session_id) => all
-                .iter()
-                .filter(|session| session.id == session_id)
-                .cloned()
-                .collect(),
-            None => sweep_order(&all, cursor, |session| session.id),
-        };
+        let mut pages = ClosedSessionPages::new(cursor, closed_session_id);
+        let mut sessions = std::collections::VecDeque::new();
         let interrupted_value = self.artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?;
         let mut interrupted_paths_valid = true;
         let mut blocked_interrupted_paths = Vec::<BlockedInterruptedPath>::new();
@@ -5242,7 +5262,7 @@ impl Broker {
                 }),
         );
         let mut visited_any = false;
-        for session in sessions {
+        loop {
             // Checked before the session is taken, so the cursor names the
             // last session actually visited and the next pass starts here.
             // The first session is always visited: a budget spent before the
@@ -5251,6 +5271,12 @@ impl Broker {
                 scan_completed = false;
                 break;
             }
+            if sessions.is_empty() {
+                sessions.extend(pages.next_page(self.store())?);
+            }
+            let Some(session) = sessions.pop_front() else {
+                break;
+            };
             visited_any = true;
             last_visited = session.id;
             let mut session_scan_complete = true;
@@ -5575,11 +5601,12 @@ impl Broker {
         // broker deletion authority. Retire just that marker; never follow or
         // remove the external path itself. Include live roots so a cache that
         // became active remains queued for a later closed-session pass.
-        if interrupted_paths_valid {
-            let known_worktrees = all
-                .iter()
-                .map(|session| PathBuf::from(&session.worktree_path))
-                .chain(live_worktrees.iter().cloned())
+        if interrupted_paths_valid && !interrupted_paths.is_empty() {
+            let known_worktrees = self
+                .store()
+                .session_worktree_paths()?
+                .into_iter()
+                .map(PathBuf::from)
                 .collect::<Vec<_>>();
             let outside_managed_worktrees = interrupted_paths
                 .iter()
@@ -9631,24 +9658,147 @@ mod tests {
         assert!(!root.exists());
     }
 
-    /// One interrupted pass must advance the next one, and one uninterrupted
-    /// pass must still be a full lap whatever the cursor was.
+    fn session_history_fixture(count: i64) -> (tempfile::TempDir, crate::BrokerStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::BrokerStore::open(&temp.path().join("history.db")).unwrap();
+        let mut conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let tx = conn.transaction().unwrap();
+        for id in 1..=count {
+            tx.execute(
+                "INSERT INTO sessions (id, worktree_path, branch, origin, status,
+                 cleanup_state, created_at, updated_at, last_activity_at)
+                 VALUES (?1, ?2, 'fixture', 'spawned', 'cleaned', 'closed', 1, 1, 1)",
+                rusqlite::params![id, format!("/synthetic/history/{id}")],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        (temp, store)
+    }
+
     #[test]
-    fn a_sweep_resumes_after_the_cursor_and_still_wraps_to_the_head() {
-        let sessions = [1_i64, 2, 3, 4, 5];
+    fn session_history_pages_resume_wrap_and_scope_without_duplicates() {
+        let (_temp, store) = session_history_fixture(1799);
+        for cursor in [0, 3, 32, 1759, 1799, 9999] {
+            let mut pages = ClosedSessionPages::new(cursor, None);
+            let mut actual = Vec::new();
+            loop {
+                let page = pages.next_page(&store).unwrap();
+                assert!(page.len() <= 32);
+                if page.is_empty() {
+                    break;
+                }
+                actual.extend(page.into_iter().map(|session| session.id));
+            }
+            let expected = (1..=1799)
+                .filter(|id| *id > cursor)
+                .chain((1..=1799).filter(|id| *id <= cursor))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "cursor {cursor}");
+            assert!(pages.next_page(&store).unwrap().is_empty());
+        }
+        let mut scoped = ClosedSessionPages::new(0, Some(1759));
+        assert_eq!(
+            scoped
+                .next_page(&store)
+                .unwrap()
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![1759]
+        );
+        assert!(scoped.next_page(&store).unwrap().is_empty());
+        assert!(
+            ClosedSessionPages::new(0, Some(9999))
+                .next_page(&store)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
-        // A fresh cursor visits everything in order.
-        assert_eq!(sweep_order(&sessions, 0, |id| *id), vec![1, 2, 3, 4, 5]);
+    #[test]
+    fn session_history_first_page_does_not_decode_later_rows() {
+        let (_temp, store) = session_history_fixture(1799);
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET origin = 'invalid-future-origin' WHERE id = 33",
+            [],
+        )
+        .unwrap();
+        let mut pages = ClosedSessionPages::new(0, None);
+        let first = pages
+            .next_page(&store)
+            .expect("later history must not be decoded eagerly");
+        assert_eq!(first.len(), 32);
+        assert_eq!(first.first().unwrap().id, 1);
+        assert_eq!(first.last().unwrap().id, 32);
+        assert!(
+            pages.next_page(&store).is_err(),
+            "the malformed second page is not silently ignored"
+        );
+    }
 
-        // After stopping at 3, the next pass starts at 4 -- and still covers
-        // 1..=3 afterwards, so nothing is starved.
-        assert_eq!(sweep_order(&sessions, 3, |id| *id), vec![4, 5, 1, 2, 3]);
+    #[test]
+    fn session_history_protection_includes_live_and_off_page_roots() {
+        let (_temp, store) = session_history_fixture(1799);
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET status = 'active', cleanup_state = 'open' WHERE id > 1600",
+            [],
+        )
+        .unwrap();
+        assert_eq!(store.live_session_worktrees().unwrap().len(), 199);
+        assert!(
+            store
+                .live_session_worktrees()
+                .unwrap()
+                .contains(&(1799, "/synthetic/history/1799".to_owned()))
+        );
+        let roots = store.session_worktree_paths().unwrap();
+        assert_eq!(roots.len(), 1799);
+        assert!(roots.contains(&"/synthetic/history/1500".to_owned()));
+        let mut pages = ClosedSessionPages::new(1599, None);
+        assert_eq!(
+            pages
+                .next_page(&store)
+                .unwrap()
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![1600]
+        );
+        assert_eq!(pages.next_page(&store).unwrap().first().unwrap().id, 1);
+    }
 
-        // A cursor past the end degenerates to a normal full lap rather than
-        // an empty pass.
-        assert_eq!(sweep_order(&sessions, 99, |id| *id), vec![1, 2, 3, 4, 5]);
-
-        assert!(sweep_order(&[] as &[i64], 7, |id| *id).is_empty());
+    #[test]
+    fn session_history_contract_backfill_selects_only_pending_live_rows() {
+        let (_temp, store) = session_history_fixture(100);
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute("UPDATE sessions SET status = 'active', cleanup_state = 'open' WHERE id IN (1, 99, 100)", []).unwrap();
+        conn.execute("UPDATE sessions SET deployment_state_digest = 'recorded', aethyme_version = 'fixture' WHERE id IN (1, 100)", []).unwrap();
+        assert_eq!(
+            store
+                .sessions_missing_repository_contract()
+                .unwrap()
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![99]
+        );
+        conn.execute(
+            "UPDATE sessions SET deployment_state_digest = NULL WHERE id = 100",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .sessions_missing_repository_contract()
+                .unwrap()
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![99, 100]
+        );
     }
 
     #[test]

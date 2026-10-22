@@ -2427,10 +2427,7 @@ impl Broker {
     }
 
     pub(super) fn backfill_live_repository_contracts(&mut self) -> Result<(), BrokerOpError> {
-        for session in self.store.live_sessions()? {
-            if session.repository_contract.is_some() {
-                continue;
-            }
+        for session in self.store.sessions_missing_repository_contract()? {
             let recorded_worktree = PathBuf::from(&session.worktree_path);
             let checkout_root = if recorded_worktree.is_dir() {
                 recorded_worktree.as_path()
