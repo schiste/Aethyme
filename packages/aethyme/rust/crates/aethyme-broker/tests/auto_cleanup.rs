@@ -336,6 +336,28 @@ fn a_deep_proof_the_budget_cannot_afford_is_deferred_not_removed() {
 }
 
 #[test]
+fn deadline_before_first_candidate_does_not_advance_cleanup_cursor() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let cursor_before = broker.store().meta_get("auto_cleanup.cursor").unwrap();
+
+    let report = broker
+        .auto_cleanup_now(Some(std::time::Instant::now()))
+        .unwrap()
+        .unwrap();
+
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert_eq!(report.deferred, 1, "{report:#?}");
+    assert_eq!(
+        broker.store().meta_get("auto_cleanup.cursor").unwrap(),
+        cursor_before,
+        "a deadline before the first candidate must leave scheduling state untouched"
+    );
+    assert!(worktree.exists());
+}
+
+#[test]
 fn an_open_session_keeps_its_checkout() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
@@ -353,6 +375,30 @@ fn a_tracked_change_keeps_the_checkout() {
     std::fs::write(worktree.join("feature.txt"), "edited\n").unwrap();
     let report = run(&mut broker);
     assert!(kept_reason(&report, &worktree).contains("uncommitted or untracked"));
+    assert!(worktree.exists());
+}
+
+#[test]
+fn an_inspected_kept_checkout_checkpoints_the_cursor() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (session_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::write(worktree.join("notes.md"), "mine\n").unwrap();
+
+    let report = run(&mut broker);
+
+    assert!(kept_reason(&report, &worktree).contains("notes.md"));
+    let cursor = broker
+        .store()
+        .meta_get("auto_cleanup.cursor")
+        .unwrap()
+        .expect("an inspected candidate checkpoints the cursor");
+    assert_eq!(
+        cursor,
+        format!(
+            r#"{{"version":1,"after_session_id":{session_id},"high_water_session_id":{session_id}}}"#
+        )
+    );
     assert!(worktree.exists());
 }
 

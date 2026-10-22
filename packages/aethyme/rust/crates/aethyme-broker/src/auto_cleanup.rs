@@ -92,6 +92,85 @@ const GLOB_PROBES: &[&str] = &[
 /// Meta key holding the last auto-cleanup report, which `status` and
 /// `gc plan` show.
 pub(crate) const AUTO_CLEANUP_LAST_REPORT_KEY: &str = "auto_cleanup.last_report";
+const AUTO_CLEANUP_CURSOR_KEY: &str = "auto_cleanup.cursor";
+const AUTO_CLEANUP_CURSOR_VERSION: u32 = 1;
+
+/// Durable scheduling state for closed-checkout cleanup. It grants no
+/// authority to remove a checkout; every candidate still passes the regular
+/// ownership, lifecycle, cleanliness and process-use proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AutoCleanupCursor {
+    version: u32,
+    after_session_id: i64,
+    high_water_session_id: i64,
+}
+
+impl Default for AutoCleanupCursor {
+    fn default() -> Self {
+        Self {
+            version: AUTO_CLEANUP_CURSOR_VERSION,
+            after_session_id: 0,
+            high_water_session_id: 0,
+        }
+    }
+}
+
+fn decode_auto_cleanup_cursor(value: Option<&str>) -> AutoCleanupCursor {
+    value
+        .and_then(|value| serde_json::from_str::<AutoCleanupCursor>(value).ok())
+        .filter(|cursor| {
+            cursor.version == AUTO_CLEANUP_CURSOR_VERSION
+                && cursor.after_session_id >= 0
+                && cursor.high_water_session_id >= cursor.after_session_id
+        })
+        .unwrap_or_default()
+}
+
+fn candidate_cursor_session_id(candidate: &AutoCleanupCandidate) -> i64 {
+    candidate
+        .sessions
+        .iter()
+        .map(|session| session.id)
+        .min()
+        .unwrap_or(0)
+}
+
+/// Sort candidates by their minimum session ID and return the unvisited
+/// suffix of the current lap. The fixed high-water mark keeps new sessions
+/// from extending a lap forever; a completed lap starts again from the
+/// beginning and includes arrivals since the prior snapshot.
+fn auto_cleanup_lap_range<T>(
+    candidates: &mut [T],
+    cursor: &mut AutoCleanupCursor,
+    session_id: impl Fn(&T) -> i64,
+) -> std::ops::Range<usize> {
+    candidates.sort_by_key(|candidate| session_id(candidate));
+    let current_high_water = candidates
+        .last()
+        .map(|candidate| session_id(candidate))
+        .unwrap_or(0);
+    let current_lap_has_work = cursor.high_water_session_id > cursor.after_session_id
+        && candidates.iter().any(|candidate| {
+            let id = session_id(candidate);
+            id > cursor.after_session_id && id <= cursor.high_water_session_id
+        });
+    if !current_lap_has_work {
+        cursor.after_session_id = 0;
+        cursor.high_water_session_id = current_high_water;
+    }
+
+    let start = candidates
+        .iter()
+        .position(|candidate| {
+            let id = session_id(candidate);
+            id > cursor.after_session_id && id <= cursor.high_water_session_id
+        })
+        .unwrap_or(candidates.len());
+    let end = candidates.partition_point(|candidate| {
+        session_id(candidate) <= cursor.high_water_session_id
+    });
+    start..end
+}
 
 /// `[cleanup]` in `.aethyme/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,8 +500,8 @@ pub struct AutoCleanupReport {
     pub evaluated_at_ms: i64,
     pub removed: Vec<AutoRemovedCheckout>,
     pub kept: Vec<AutoKeptCheckout>,
-    /// Candidates the budget left for a later pass: a deep proof it had no
-    /// time for, or a removal after the first once it was spent (#460).
+    /// Candidates the cursor or budget left for a later pass: a deep proof it
+    /// had no time for, or a removal after the first once it was spent (#460).
     pub deferred: usize,
 }
 
@@ -710,6 +789,24 @@ pub(crate) fn containment(
 }
 
 impl Broker {
+    fn auto_cleanup_cursor(&self) -> Result<AutoCleanupCursor, BrokerOpError> {
+        let value = self.store().meta_get(AUTO_CLEANUP_CURSOR_KEY)?;
+        Ok(decode_auto_cleanup_cursor(value.as_deref()))
+    }
+
+    fn persist_auto_cleanup_cursor(
+        &mut self,
+        cursor: &AutoCleanupCursor,
+    ) -> Result<(), BrokerOpError> {
+        // This structure contains only integer fields, so JSON serialization
+        // cannot fail. A storage write failure must stop planning before any
+        // selected checkout can be applied.
+        let value = serde_json::to_string(cursor)
+            .expect("serializing the cleanup cursor is infallible");
+        self.store().meta_set(AUTO_CLEANUP_CURSOR_KEY, &value)?;
+        Ok(())
+    }
+
     /// Closed, broker-owned checkouts that still exist, grouped by worktree.
     pub(crate) fn auto_cleanup_candidates(
         &mut self,
@@ -1067,7 +1164,7 @@ impl Broker {
         if !policy.auto_remove {
             return Ok(AutoCleanupPlan::nothing(report));
         }
-        let (candidates, mut kept) = self.auto_cleanup_candidates()?;
+        let (mut candidates, mut kept) = self.auto_cleanup_candidates()?;
         report.kept.append(&mut kept);
         let Some(upstream) = self.remote_default_ref_and_tip() else {
             for candidate in &candidates {
@@ -1080,30 +1177,45 @@ impl Broker {
             return Ok(AutoCleanupPlan::nothing(report));
         };
 
-        // Cheap proofs for everyone first; the deep proof only with time left.
+        // A persisted high-water mark bounds each lap. The cursor advances
+        // only after one candidate's cheap/deep proof has been attempted, so
+        // a spent deadline never skips an unvisited candidate. This deadline
+        // may already be exhausted by the caller's artifact sweep; the cursor
+        // guarantees fairness only among candidates this pass can inspect.
+        let mut cursor = self.auto_cleanup_cursor()?;
+        let lap =
+            auto_cleanup_lap_range(&mut candidates, &mut cursor, candidate_cursor_session_id);
+        let deferred_after_lap = candidates.len().saturating_sub(lap.end);
+        let candidates = candidates.drain(lap).collect::<Vec<_>>();
+        report.deferred += deferred_after_lap;
+
+        let candidate_count = candidates.len();
         let mut selected = Vec::new();
-        let mut deep_needed = Vec::new();
-        for candidate in candidates {
+        for (index, candidate) in candidates.into_iter().enumerate() {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                report.deferred += 1;
-                continue;
+                report.deferred += candidate_count - index;
+                break;
             }
-            match self.auto_cleanup_verdict(&candidate, &policy, &upstream, false, deadline, None) {
-                Ok(proof) => selected.push((candidate, proof)),
-                Err(NotRemoved::Defer) => deep_needed.push(candidate),
-                Err(NotRemoved::Keep(reason)) => report.kept.push(AutoKeptCheckout {
-                    worktree: candidate.worktree.to_string_lossy().into_owned(),
-                    sessions: candidate.session_ids(),
-                    reason,
-                }),
-            }
-        }
-        for candidate in deep_needed {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                report.deferred += 1;
-                continue;
-            }
-            match self.auto_cleanup_verdict(&candidate, &policy, &upstream, true, deadline, None) {
+            let session_id = candidate_cursor_session_id(&candidate);
+            let verdict =
+                self.auto_cleanup_verdict(&candidate, &policy, &upstream, false, deadline, None);
+            let verdict = match verdict {
+                Err(NotRemoved::Defer)
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+                {
+                    Err(NotRemoved::Defer)
+                }
+                Err(NotRemoved::Defer) => self.auto_cleanup_verdict(
+                    &candidate,
+                    &policy,
+                    &upstream,
+                    true,
+                    deadline,
+                    None,
+                ),
+                verdict => verdict,
+            };
+            match verdict {
                 Ok(proof) => selected.push((candidate, proof)),
                 Err(NotRemoved::Defer) => report.deferred += 1,
                 Err(NotRemoved::Keep(reason)) => report.kept.push(AutoKeptCheckout {
@@ -1112,6 +1224,8 @@ impl Broker {
                     reason,
                 }),
             }
+            cursor.after_session_id = session_id;
+            self.persist_auto_cleanup_cursor(&cursor)?;
         }
         Ok(AutoCleanupPlan {
             report,
@@ -1333,7 +1447,10 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
-    use super::{AutoCleanupPolicy, classify_ignored};
+    use super::{
+        AutoCleanupCursor, AutoCleanupPolicy, auto_cleanup_lap_range, classify_ignored,
+        decode_auto_cleanup_cursor,
+    };
     use std::path::Path;
 
     fn classify(root: &Path, relative: &str, policy: &AutoCleanupPolicy) -> Result<(), String> {
@@ -1345,6 +1462,38 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "x").unwrap();
+    }
+
+    #[test]
+    fn cleanup_cursor_bounds_laps_and_revisits_new_arrivals() {
+        let mut cursor = AutoCleanupCursor::default();
+        let mut first_lap = vec![1_i64, 2, 3];
+        let range = auto_cleanup_lap_range(&mut first_lap, &mut cursor, |id| *id);
+        assert_eq!(&first_lap[range], &[1, 2, 3]);
+        assert_eq!(cursor.high_water_session_id, 3);
+
+        cursor.after_session_id = 2;
+        let mut with_arrivals = vec![1_i64, 2, 3, 4, 5];
+        let range = auto_cleanup_lap_range(&mut with_arrivals, &mut cursor, |id| *id);
+        assert_eq!(&with_arrivals[range], &[3]);
+        assert_eq!(cursor.high_water_session_id, 3);
+
+        // Once the lap reaches its captured high-water mark, later IDs join
+        // the next lap instead of extending this one.
+        cursor.after_session_id = 3;
+        let mut next_lap = vec![1_i64, 2, 3, 4, 5];
+        let range = auto_cleanup_lap_range(&mut next_lap, &mut cursor, |id| *id);
+        assert_eq!(&next_lap[range], &[1, 2, 3, 4, 5]);
+        assert_eq!(cursor.after_session_id, 0);
+        assert_eq!(cursor.high_water_session_id, 5);
+    }
+
+    #[test]
+    fn unknown_cleanup_cursor_version_resets_scheduling_state() {
+        let cursor = decode_auto_cleanup_cursor(Some(
+            r#"{"version":9,"after_session_id":7,"high_water_session_id":12}"#,
+        ));
+        assert_eq!(cursor, AutoCleanupCursor::default());
     }
 
     #[test]
