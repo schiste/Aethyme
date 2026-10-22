@@ -3242,6 +3242,9 @@ pub(crate) enum SubmissionPlanTestPhase {
 pub(crate) type SubmissionPlanTestObserver =
     std::sync::Arc<dyn Fn(SubmissionPlanTestPhase) + Send + Sync>;
 
+#[cfg(test)]
+pub(crate) type WorktreeLifecycleTestObserver = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
 /// One broker instance per repository: git handle on the main checkout +
 /// the shared store. Open from ANY path inside the repo (including a
 /// linked worktree) — state always resolves to the main checkout.
@@ -3271,6 +3274,10 @@ pub struct Broker {
     /// Per-instance synchronization seam for the submit-plan reuse tests.
     #[cfg(test)]
     pub(crate) submission_plan_test_observer: Option<SubmissionPlanTestObserver>,
+    /// Test-only observation point immediately before a worktree lifecycle
+    /// operation waits for the repository-wide lifecycle lock.
+    #[cfg(test)]
+    pub(crate) worktree_lifecycle_test_observer: Option<WorktreeLifecycleTestObserver>,
 }
 
 mod cleanup;

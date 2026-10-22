@@ -7041,6 +7041,77 @@ mod tests {
     }
 
     #[test]
+    fn start_claims_lifecycle_before_recreating_a_removed_empty_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_root = tmp.path().join("repository");
+        let _owner_repo = init_storage_root_test_repository(&owner_root);
+        let test_storage = crate::test_storage::TestStorage::new();
+        let repository = ThisRepository::observe(&owner_root).unwrap();
+        let root = test_storage.host_state_dir().join(&repository.key);
+        let mut options = test_storage.options();
+        options.worktree_root = Some(root.clone());
+        let mut broker = crate::Broker::open_with_options(&owner_root, options).unwrap();
+        assert!(
+            !root.exists(),
+            "opening the broker must not prepare this root"
+        );
+
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            crate::broker::WORKTREE_CARGO_CONFIG,
+        )
+        .unwrap();
+        assert!(write_attributed_marker(&root, &repository).unwrap());
+        let lifecycle_claim =
+            crate::file_lock::acquire_repository_lifecycle_lock(&owner_root).unwrap();
+        assert!(remove_empty_root(&root).unwrap() > 0);
+        assert!(!root.exists());
+
+        let lifecycle_claim = std::sync::Arc::new(std::sync::Mutex::new(Some(lifecycle_claim)));
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_root = root.clone();
+        let claim_at_boundary = std::sync::Arc::clone(&lifecycle_claim);
+        let observed_at_boundary = std::sync::Arc::clone(&observed);
+        broker.worktree_lifecycle_test_observer = Some(std::sync::Arc::new(move |main_root| {
+            *observed_at_boundary.lock().unwrap() =
+                Some((main_root.to_path_buf(), observed_root.exists()));
+            // Release synchronously at the actual claim boundary so the
+            // test exercises the normal entrypoint without a worker that
+            // could be left blocked if setup regresses.
+            drop(claim_at_boundary.lock().unwrap().take());
+        }));
+
+        // This callback runs at the actual start path's lifecycle-claim
+        // boundary. With preparation ordered after the claim, the root is
+        // still absent. Moving preparation back before the claim makes this
+        // observation fail deterministically.
+        let session = broker.start_worktree("root race", None).unwrap();
+        let (observed_main_root, root_was_prepared_before_claim) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("start reached the lifecycle claim boundary");
+        assert_eq!(
+            observed_main_root,
+            owner_root.canonicalize().unwrap(),
+            "the observer must be called for this repository"
+        );
+        assert!(
+            !root_was_prepared_before_claim,
+            "start recreated the root before claiming the lifecycle lock"
+        );
+        let worktree = PathBuf::from(session.worktree_path);
+        assert!(worktree.starts_with(&root));
+        assert!(worktree.is_dir());
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert_eq!(
+            std::fs::read(root.join(".cargo/config.toml")).unwrap(),
+            crate::broker::WORKTREE_CARGO_CONFIG.as_bytes()
+        );
+    }
+
+    #[test]
     fn missing_from_names_each_absent_source() {
         let entry = EntryBuilder {
             on_disk: true,

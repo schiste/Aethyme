@@ -1714,6 +1714,8 @@ impl Broker {
             artifact_sweep_namespace: std::cell::OnceCell::new(),
             #[cfg(test)]
             submission_plan_test_observer: None,
+            #[cfg(test)]
+            worktree_lifecycle_test_observer: None,
         })
     }
 
@@ -1746,6 +1748,8 @@ impl Broker {
             artifact_sweep_namespace: std::cell::OnceCell::new(),
             #[cfg(test)]
             submission_plan_test_observer: None,
+            #[cfg(test)]
+            worktree_lifecycle_test_observer: None,
         };
         broker.backfill_live_repository_contracts()?;
         Ok(broker)
@@ -1794,6 +1798,8 @@ impl Broker {
             artifact_sweep_namespace: std::cell::OnceCell::new(),
             #[cfg(test)]
             submission_plan_test_observer: None,
+            #[cfg(test)]
+            worktree_lifecycle_test_observer: None,
         };
         // Fence pre-#660 binaries out of a repository whose committed config
         // requires collaboration capture. Best effort: the open never fails
