@@ -36,6 +36,24 @@ pub(super) fn open_in_repo(
 }
 
 #[cfg(unix)]
+pub(super) fn open_existing_for_explicit_recovery(
+    repo_root: &Path,
+    requested_db_path: &Path,
+) -> Result<BrokerStore, BrokerError> {
+    unix::open_existing_for_explicit_recovery(repo_root, requested_db_path)
+}
+
+#[cfg(not(unix))]
+pub(super) fn open_existing_for_explicit_recovery(
+    _repo_root: &Path,
+    _requested_db_path: &Path,
+) -> Result<BrokerStore, BrokerError> {
+    Err(BrokerError::InvalidRepositoryWorktreeBinding(
+        "explicit repository binding recovery requires Unix no-follow filesystem checks".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
 pub(super) fn verify_legacy_database_file_for_binding(path: &Path) -> Result<(), BrokerError> {
     unix::verify_legacy_database_file_for_binding(path)
 }
@@ -55,6 +73,24 @@ pub(crate) fn acquire_repository_binding_lock(
     requested_db_path: &Path,
 ) -> Result<std::fs::File, BrokerError> {
     unix::acquire_repository_binding_lock(repo_root, requested_db_path)
+}
+
+#[cfg(unix)]
+pub(crate) fn acquire_repository_binding_lock_for_explicit_recovery(
+    repo_root: &Path,
+    requested_db_path: &Path,
+) -> Result<std::fs::File, BrokerError> {
+    unix::acquire_repository_binding_lock_for_explicit_recovery(repo_root, requested_db_path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_repository_binding_lock_for_explicit_recovery(
+    _repo_root: &Path,
+    _requested_db_path: &Path,
+) -> Result<std::fs::File, BrokerError> {
+    Err(BrokerError::InvalidRepositoryWorktreeBinding(
+        "explicit repository binding recovery requires Unix no-follow filesystem checks".to_owned(),
+    ))
 }
 
 #[cfg(not(unix))]
@@ -294,7 +330,60 @@ mod unix {
         }
     }
 
+    pub(super) fn open_existing_for_explicit_recovery(
+        repo_root: &Path,
+        requested_db_path: &Path,
+    ) -> Result<BrokerStore, BrokerError> {
+        let paths = prepare_paths_for_explicit_recovery(repo_root, requested_db_path)?;
+        if lstat_optional(&paths.final_path)?.is_none() {
+            return Err(refusal(
+                "explicit repository binding recovery requires an existing broker database",
+            ));
+        }
+        if lstat_optional(&paths.stage_path)?.is_some() {
+            return Err(refusal(
+                "explicit repository binding recovery refuses an unfinished fresh database stage",
+            ));
+        }
+
+        let _bootstrap_lock = acquire_bootstrap_lock(&paths)?;
+        verify_parent(&paths)?;
+        if lstat_optional(&paths.final_path)?.is_none()
+            || lstat_optional(&paths.stage_path)?.is_some()
+        {
+            return Err(refusal(
+                "broker database names changed while waiting for explicit recovery",
+            ));
+        }
+        let header = read_header(&paths)?;
+        if header.binding.is_none() {
+            return Err(refusal(
+                "explicit repository binding recovery requires a current schema-53 binding row",
+            ));
+        }
+        let mut store = open_existing_locked(repo_root, &paths, false)?;
+        store.binding_scope = Some(paths.binding_scope.clone());
+        store.ensure_repository_binding_scope()?;
+        Ok(store)
+    }
+
     fn prepare_paths(repo_root: &Path, requested_db_path: &Path) -> Result<DbPaths, BrokerError> {
+        prepare_paths_with_policy(repo_root, requested_db_path, false, true)
+    }
+
+    fn prepare_paths_for_explicit_recovery(
+        repo_root: &Path,
+        requested_db_path: &Path,
+    ) -> Result<DbPaths, BrokerError> {
+        prepare_paths_with_policy(repo_root, requested_db_path, true, false)
+    }
+
+    fn prepare_paths_with_policy(
+        repo_root: &Path,
+        requested_db_path: &Path,
+        allow_marker_recovery_prefix: bool,
+        allow_parent_creation: bool,
+    ) -> Result<DbPaths, BrokerError> {
         let logical_path = absolute_path(requested_db_path)?;
         let filename = logical_path
             .file_name()
@@ -311,8 +400,13 @@ mod unix {
                 return Err(refusal("broker database parent is not a directory"));
             }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_parent_creation => {
                 create_default_parent(repo_root, requested_parent)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(refusal(
+                    "explicit repository binding recovery requires an existing database parent",
+                ));
             }
             Err(source) => return Err(io_error(requested_parent, source)),
         }
@@ -331,10 +425,14 @@ mod unix {
             lock_path,
             parent_path,
             parent_identity,
-            binding_scope: super::repository_identity::RepositoryBindingScope::capture(
-                repo_root,
-                &final_path,
-            )?,
+            binding_scope: if allow_marker_recovery_prefix {
+                super::repository_identity::RepositoryBindingScope::capture_for_explicit_recovery(
+                    repo_root,
+                    &final_path,
+                )?
+            } else {
+                super::repository_identity::RepositoryBindingScope::capture(repo_root, &final_path)?
+            },
         })
     }
 
@@ -520,6 +618,39 @@ mod unix {
     ) -> Result<File, BrokerError> {
         let paths = prepare_paths(repo_root, requested_db_path)?;
         acquire_bootstrap_lock(&paths)
+    }
+
+    pub(super) fn acquire_repository_binding_lock_for_explicit_recovery(
+        repo_root: &Path,
+        requested_db_path: &Path,
+    ) -> Result<File, BrokerError> {
+        let paths = prepare_paths_for_explicit_recovery(repo_root, requested_db_path)?;
+        if lstat_optional(&paths.final_path)?.is_none() {
+            return Err(refusal(
+                "explicit repository binding recovery requires an existing broker database",
+            ));
+        }
+        if lstat_optional(&paths.stage_path)?.is_some() {
+            return Err(refusal(
+                "explicit repository binding recovery refuses an unfinished fresh database stage",
+            ));
+        }
+        let lock = acquire_bootstrap_lock(&paths)?;
+        verify_parent(&paths)?;
+        if lstat_optional(&paths.final_path)?.is_none()
+            || lstat_optional(&paths.stage_path)?.is_some()
+        {
+            return Err(refusal(
+                "broker database names changed while waiting for explicit recovery",
+            ));
+        }
+        let header = read_header(&paths)?;
+        if header.binding.is_none() {
+            return Err(refusal(
+                "explicit repository binding recovery requires a current schema-53 binding row",
+            ));
+        }
+        Ok(lock)
     }
 
     fn lstat_optional(path: &Path) -> Result<Option<Metadata>, BrokerError> {

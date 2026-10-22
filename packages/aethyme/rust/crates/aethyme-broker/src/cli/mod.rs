@@ -2343,6 +2343,12 @@ fn open_broker(read_only_snapshot: bool) -> Result<Broker, UsageError> {
     }
 }
 
+fn open_broker_for_explicit_worktree_root_apply() -> Result<Broker, UsageError> {
+    let cwd = std::env::current_dir()
+        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+    Ok(Broker::open_for_explicit_worktree_root_apply(&cwd)?)
+}
+
 /// Starting or adopting a session is the one useful moment to surface a
 /// stale installed broker. The check is advisory and writes to stderr so a
 /// `--json` session report remains machine-readable.

@@ -20,6 +20,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   test bodies and their assertions, not only test names. An interruption or
   recovery test may already exercise the exact state under a broader name.
 - Inspect caution zones before changing generated or vendored areas.
+- Anchor source simplifications to the exact callee and surrounding context,
+  then inspect every changed hunk. Repeated expressions can occur in both
+  mutating and read-only paths; replacing the first textual match may change
+  the wrong behavior while leaving the intended call untouched.
 
 ## Validation Checklist
 

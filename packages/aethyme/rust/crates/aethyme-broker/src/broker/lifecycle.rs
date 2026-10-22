@@ -2513,6 +2513,8 @@ mod fresh_root_recovery_inventory_tests {
         FreshRepositoryRootReservation, RepositoryRootIdentity, RepositoryWorktreeBindingState,
         RepositoryWorktreeRootLayout,
     };
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::process::Command;
 
     struct FreshRootFixture {
@@ -2622,6 +2624,22 @@ mod fresh_root_recovery_inventory_tests {
             expected_parent,
             reservation,
         }
+    }
+
+    fn create_repository_uuid_temporary(common_dir: &Path) -> (PathBuf, String) {
+        let uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479".to_owned();
+        let temporary =
+            common_dir.join(".aethyme-repository-uuid.0123456789abcdef0123456789abcdef.tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(format!("AETHYME-REPO-UUID-V1\n{uuid}\n").as_bytes())
+            .unwrap();
+        file.sync_all().unwrap();
+        (temporary, uuid)
     }
 
     fn replace_root_with_empty_directory(root: &Path) -> PathBuf {
@@ -3006,6 +3024,63 @@ mod fresh_root_recovery_inventory_tests {
                 .unwrap()
                 .state,
             RepositoryWorktreeBindingState::FreshReserved
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_open_is_the_only_open_that_accepts_marker_prefixes() {
+        let mut fixture = fresh_root_fixture(false);
+        let original_plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        let repository_root = fixture.reservation.identity.repository_root.clone();
+        let common_dir = fixture.reservation.identity.git_common_dir.clone();
+        let options = fixture
+            ._storage
+            .options()
+            .with_worktree_root(fixture.root.clone());
+        drop(fixture.broker);
+
+        let (temporary, uuid) = create_repository_uuid_temporary(&common_dir);
+        let marker = common_dir.join("aethyme-repository-uuid");
+        let expected_marker = format!("AETHYME-REPO-UUID-V1\n{uuid}\n");
+        let graph_fence =
+            common_dir.join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER);
+        std::fs::remove_file(&graph_fence).unwrap();
+
+        assert!(Broker::open_with_options(&repository_root, options.clone()).is_err());
+        assert!(!graph_fence.exists());
+        assert!(BrokerStore::open_snapshot_in_repo(&repository_root).is_err());
+        assert!(!marker.exists());
+        assert_eq!(
+            std::fs::read(&temporary).unwrap(),
+            expected_marker.as_bytes()
+        );
+
+        let mut broker =
+            Broker::open_for_explicit_worktree_root_apply_with_options(&repository_root, options)
+                .unwrap();
+        let recovery_plan = broker.fresh_worktree_root_recovery_plan().unwrap();
+        assert_eq!(recovery_plan.digest, original_plan.digest);
+        assert!(
+            broker
+                .apply_fresh_worktree_root_recovery(&"0".repeat(64))
+                .is_err()
+        );
+        assert!(!marker.exists());
+        assert_eq!(
+            std::fs::read(&temporary).unwrap(),
+            expected_marker.as_bytes()
+        );
+        assert!(!fixture.root.exists());
+
+        broker
+            .apply_fresh_worktree_root_recovery(&recovery_plan.digest)
+            .unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), expected_marker.as_bytes());
+        assert!(!temporary.exists());
+        assert!(fixture.root.is_dir());
+        assert_eq!(
+            broker.store().repository_worktree_binding().unwrap().state,
+            RepositoryWorktreeBindingState::Bound
         );
     }
 
@@ -4275,6 +4350,48 @@ fn sync_bound_directory(path: &Path, expected: &BoundDirectoryIdentity) -> Resul
 impl Broker {
     pub fn open(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
         Self::open_with_options(path_inside_repo, BrokerOpenOptions::default())
+    }
+
+    /// Open for an explicit digest-confirmed worktree-root apply without
+    /// running startup maintenance. Only this operation may inspect a valid
+    /// but incomplete repository UUID marker publication; ordinary and
+    /// read-only opens remain strict and non-repairing.
+    pub(crate) fn open_for_explicit_worktree_root_apply(
+        path_inside_repo: &Path,
+    ) -> Result<Self, BrokerOpError> {
+        Self::open_for_explicit_worktree_root_apply_with_options(
+            path_inside_repo,
+            BrokerOpenOptions::default(),
+        )
+    }
+
+    pub(crate) fn open_for_explicit_worktree_root_apply_with_options(
+        path_inside_repo: &Path,
+        options: BrokerOpenOptions,
+    ) -> Result<Self, BrokerOpError> {
+        let mut storage_context = BrokerStorageContext::capture(options);
+        storage_context.ensure_valid()?;
+        let here = GitRepo::discover(path_inside_repo)?;
+        let main_root = here.main_root()?;
+        let repo = GitRepo::discover(&main_root)?;
+        storage_context.bind_repository(&repo)?;
+        let store = BrokerStore::open_for_explicit_root_recovery(&main_root)?;
+        Ok(Self {
+            repo,
+            store,
+            main_root,
+            graph_impact_provider: Box::new(GraphStoreImpactProvider),
+            storage_context,
+            host_operation_db_path: None,
+            worktree_root_override: None,
+            agent_supervisor_executable: None,
+            collaboration_state_override: None,
+            landing_deadline: std::cell::Cell::new(None),
+            main_common_dir: std::cell::OnceCell::new(),
+            artifact_sweep_namespace: std::cell::OnceCell::new(),
+            #[cfg(test)]
+            submission_plan_test_observer: None,
+        })
     }
 
     /// Open a broker with storage locations captured before startup maintenance.
@@ -6480,10 +6597,11 @@ impl Broker {
             &crate::worktree_registry::RecoveryArtifactIdentity,
         ) -> Result<(), String>,
     ) -> Result<(), BrokerOpError> {
-        let _binding_lock = crate::store::fresh_database::acquire_repository_binding_lock(
-            &self.main_root,
-            self.store.db_path(),
-        )?;
+        let _binding_lock =
+            crate::store::fresh_database::acquire_repository_binding_lock_for_explicit_recovery(
+                &self.main_root,
+                self.store.db_path(),
+            )?;
         let binding = self.store.repository_worktree_binding()?;
         let (identity, root, _layout, source, parent_identity) = fresh_root_recovery_identity(
             &binding,
@@ -7032,10 +7150,11 @@ impl Broker {
             LegacyRepositoryRootConfirmation, RepositoryWorktreeBindingState,
         };
 
-        let _bootstrap_lock = crate::store::fresh_database::acquire_repository_binding_lock(
-            &self.main_root,
-            self.store.db_path(),
-        )?;
+        let _bootstrap_lock =
+            crate::store::fresh_database::acquire_repository_binding_lock_for_explicit_recovery(
+                &self.main_root,
+                self.store.db_path(),
+            )?;
         let binding = self.store.repository_worktree_binding()?;
         if binding.state != RepositoryWorktreeBindingState::LegacyUnbound {
             return Err(BrokerOpError::WorktreeRootUnavailable {

@@ -963,7 +963,7 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
                             .into(),
                     )
                 })?;
-                let mut broker = open_broker(false)?;
+                let mut broker = open_broker_for_explicit_worktree_root_apply()?;
                 broker.apply_fresh_worktree_root_recovery(confirm)?;
                 let binding = broker.store().repository_worktree_binding()?;
                 if parsed.json {
@@ -1045,7 +1045,7 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
                     "worktree-root binding apply requires --confirm <sha256> from its plan".into(),
                 )
             })?;
-            let mut broker = open_broker(false)?;
+            let mut broker = open_broker_for_explicit_worktree_root_apply()?;
             broker.apply_legacy_worktree_root_binding(root, layout, confirm)?;
             if parsed.json {
                 let binding = broker.store().repository_worktree_binding()?;

@@ -29,6 +29,25 @@ impl RepositoryBindingScope {
         repository_root: &Path,
         broker_db_path: &Path,
     ) -> Result<Self, BrokerError> {
+        Self::capture_with_recovery_prefix_policy(repository_root, broker_db_path, false)
+    }
+
+    /// Capture identity for the explicit digest-confirmed apply path only.
+    /// Recognized marker publication prefixes are validated without repair and
+    /// represented as an uncommitted UUID until the apply transition settles
+    /// them. Ordinary and read-only opens must continue to use `capture`.
+    pub(crate) fn capture_for_explicit_recovery(
+        repository_root: &Path,
+        broker_db_path: &Path,
+    ) -> Result<Self, BrokerError> {
+        Self::capture_with_recovery_prefix_policy(repository_root, broker_db_path, true)
+    }
+
+    fn capture_with_recovery_prefix_policy(
+        repository_root: &Path,
+        broker_db_path: &Path,
+        allow_recovery_prefix: bool,
+    ) -> Result<Self, BrokerError> {
         let repository_root =
             fs::canonicalize(repository_root).map_err(|source| BrokerError::Io {
                 path: repository_root.to_path_buf(),
@@ -54,7 +73,11 @@ impl RepositoryBindingScope {
             source,
         })?;
         let repository_key = crate::host_state::repository_key(&main_root, Some(&git_common_dir));
-        let repository_uuid = read_repository_uuid_marker(&git_common_dir)?;
+        let repository_uuid = if allow_recovery_prefix {
+            read_repository_uuid_marker_for_explicit_recovery(&git_common_dir)?
+        } else {
+            read_repository_uuid_marker(&git_common_dir)?
+        };
         Ok(Self {
             repository_root: main_root,
             git_common_dir,
@@ -93,6 +116,41 @@ pub(crate) fn read_repository_uuid_marker(
     {
         let _ = git_common_dir;
         Ok(None)
+    }
+}
+
+/// Read identity only for a digest-confirmed explicit apply. Exact
+/// temp-only and same-inode link-pair states are fully inventoried but remain
+/// unsettled; returning no UUID ensures a bound database row cannot mistake a
+/// publication prefix for a completed marker.
+fn read_repository_uuid_marker_for_explicit_recovery(
+    git_common_dir: &Path,
+) -> Result<Option<String>, BrokerError> {
+    #[cfg(unix)]
+    {
+        let (directory, identity) = open_verified_directory(git_common_dir)?;
+        let inventory = inspect_marker_inventory(git_common_dir, &directory, identity)?;
+        match (inventory.target, inventory.temporaries.as_slice()) {
+            (None, []) => Ok(None),
+            (Some(target), []) => Ok(Some(target.uuid)),
+            (None, [_temporary]) => Ok(None),
+            (Some(target), [temporary])
+                if target.identity.device == temporary.identity.device
+                    && target.identity.inode == temporary.identity.inode
+                    && target.identity.links == 2
+                    && temporary.identity.links == 2
+                    && target.uuid == temporary.uuid =>
+            {
+                Ok(None)
+            }
+            _ => Err(refusal(
+                "repository UUID marker has conflicting or unrecognized recovery entries",
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        read_repository_uuid_marker(git_common_dir)
     }
 }
 
@@ -890,6 +948,10 @@ mod tests {
         file.sync_all().unwrap();
         assert!(read_repository_uuid_marker(directory.path()).is_err());
         assert_eq!(
+            read_repository_uuid_marker_for_explicit_recovery(directory.path()).unwrap(),
+            None
+        );
+        assert_eq!(
             ensure_repository_uuid_marker(directory.path(), Some(uuid)).unwrap(),
             uuid
         );
@@ -905,12 +967,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn explicit_recovery_inspects_link_pair_without_settling_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+        let target = directory.path().join(MARKER_NAME);
+        let temporary = directory.path().join(format!(
+            "{TEMP_PREFIX}0123456789abcdef0123456789abcdef{TEMP_SUFFIX}"
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(format!("{MARKER_HEADER}{uuid}\n").as_bytes())
+            .unwrap();
+        file.sync_all().unwrap();
+        std::fs::hard_link(&temporary, &target).unwrap();
+
+        assert!(read_repository_uuid_marker(directory.path()).is_err());
+        assert_eq!(
+            read_repository_uuid_marker_for_explicit_recovery(directory.path()).unwrap(),
+            None
+        );
+        assert!(target.exists());
+        assert!(temporary.exists());
+
+        assert_eq!(
+            ensure_repository_uuid_marker(directory.path(), Some(uuid)).unwrap(),
+            uuid
+        );
+        assert!(target.exists());
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn explicit_marker_refuses_conflicting_or_unrecognized_prefixes() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join(MARKER_NAME);
         let valid = format!("{MARKER_HEADER}f47ac10b-58cc-4372-a567-0e02b2c3d479\n");
         std::fs::write(&target, valid).unwrap();
         assert!(read_repository_uuid_marker(directory.path()).is_err());
+        assert!(read_repository_uuid_marker_for_explicit_recovery(directory.path()).is_err());
         assert!(ensure_repository_uuid_marker(directory.path(), None).is_err());
 
         std::fs::remove_file(&target).unwrap();
@@ -921,6 +1021,7 @@ mod tests {
             b"unknown",
         )
         .unwrap();
+        assert!(read_repository_uuid_marker_for_explicit_recovery(directory.path()).is_err());
         assert!(ensure_repository_uuid_marker(directory.path(), None).is_err());
     }
 }

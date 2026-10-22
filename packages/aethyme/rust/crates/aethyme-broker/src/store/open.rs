@@ -46,15 +46,30 @@ impl BrokerStore {
 
     fn open_repository_path(repo_root: &Path, path: &Path) -> Result<Self, BrokerError> {
         let repository_root = canonical_main_root(repo_root)?;
+        // Complete the strict, read-only marker and repository-scope checks
+        // before graph-fence enrollment can write any repository metadata.
+        // An ordinary open must refuse an interrupted marker publication
+        // without changing the checkout on its way to that refusal.
+        let binding_scope =
+            super::repository_identity::RepositoryBindingScope::capture(&repository_root, path)?;
         enroll_repository_graph_fence(&repository_root)?;
         let mut store = super::fresh_database::open_in_repo(&repository_root, path)?;
         if store.binding_scope.is_none() {
-            store.binding_scope =
-                Some(super::repository_identity::RepositoryBindingScope::capture(
-                    &repository_root,
-                    path,
-                )?);
+            store.binding_scope = Some(binding_scope);
         }
+        store.ensure_repository_binding_scope()?;
+        Ok(store)
+    }
+
+    /// Open only an existing schema-53 database for an explicit confirmed
+    /// worktree-root apply. This path can inspect a fully validated UUID
+    /// publication prefix but never settles it; ordinary and snapshot opens
+    /// retain their strict marker refusal.
+    pub(crate) fn open_for_explicit_root_recovery(repo_root: &Path) -> Result<Self, BrokerError> {
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = crate::broker_db_path(&repository_root)?;
+        let mut store =
+            super::fresh_database::open_existing_for_explicit_recovery(&repository_root, &path)?;
         store.ensure_repository_binding_scope()?;
         Ok(store)
     }
