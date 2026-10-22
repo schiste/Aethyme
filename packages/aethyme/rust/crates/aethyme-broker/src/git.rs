@@ -2087,13 +2087,38 @@ impl GitRepo {
     /// in `<common>/hooks`, which is what makes them worktree-wide.
     pub fn git_common_dir(&self) -> Result<PathBuf, GitError> {
         let common = run_git(&self.root, &["rev-parse", "--git-common-dir"])?;
+        Ok(Self::absolute_common_dir(&self.root, &common))
+    }
+
+    /// Resolve a checkout's common directory without a separate root lookup.
+    /// The worktree bit is required: a bare repository also has a common
+    /// directory, but cannot supply the checkout evidence ownership needs.
+    pub(crate) fn worktree_common_dir(path: &Path) -> Result<PathBuf, GitError> {
+        let args = ["rev-parse", "--is-inside-work-tree", "--git-common-dir"];
+        let output = run_git(path, &args)?;
+        let Some(("true", common)) = output.split_once('\n') else {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: "cannot establish a Git worktree and common directory".into(),
+            });
+        };
+        if common.is_empty() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: "Git returned an empty common directory".into(),
+            });
+        }
+        Ok(Self::absolute_common_dir(path, common))
+    }
+
+    fn absolute_common_dir(path: &Path, common: &str) -> PathBuf {
         let mut common_dir = PathBuf::from(common);
         if common_dir.is_relative() {
-            common_dir = self.root.join(common_dir);
+            common_dir = path.join(common_dir);
         }
         // Canonicalize to strip the `..` segments git emits from linked
         // worktrees.
-        Ok(common_dir.canonicalize().unwrap_or(common_dir))
+        common_dir.canonicalize().unwrap_or(common_dir)
     }
 
     /// Capture the exact linked-worktree and Git-admin identities needed to
@@ -5563,6 +5588,155 @@ mod subprocess_path_tests {
         let note = subprocess_path_note();
         assert!(note.starts_with(SUBPROCESS_PATH_NOTE_PREFIX), "{note}");
         assert!(note.ends_with('\n'), "{note}");
+    }
+}
+
+/// Combined ownership queries must preserve checkout context.
+#[cfg(test)]
+mod worktree_common_dir_tests {
+    use super::*;
+
+    #[test]
+    fn combined_common_dir_matches_discovery_for_main_nested_and_linked_worktrees() {
+        let fixture = tempfile::tempdir().unwrap();
+        let main = fixture.path().join("main ' checkout");
+        let linked = fixture.path().join("linked ' checkout");
+        std::fs::create_dir(&main).unwrap();
+        run_git(&main, &["init", "-q", "-b", "main"]).unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        )
+        .unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let nested = main.join("nested");
+        let linked_nested = linked.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::create_dir(&linked_nested).unwrap();
+        let expected = GitRepo::discover(&main).unwrap().git_common_dir().unwrap();
+        for path in [&main, &nested, &linked, &linked_nested] {
+            assert_eq!(GitRepo::worktree_common_dir(path).unwrap(), expected);
+            assert_eq!(
+                GitRepo::worktree_common_dir(path).unwrap(),
+                GitRepo::discover(path).unwrap().git_common_dir().unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn combined_common_dir_refuses_bare_repositories_and_non_repositories() {
+        let fixture = tempfile::tempdir().unwrap();
+        assert!(GitRepo::worktree_common_dir(fixture.path()).is_err());
+        run_git(fixture.path(), &["init", "--bare", "-q"]).unwrap();
+        // A common directory alone cannot establish a checkout: bare Git
+        // repositories answer that query successfully too.
+        assert!(run_git(fixture.path(), &["rev-parse", "--git-common-dir"]).is_ok());
+        assert!(GitRepo::discover(fixture.path()).is_err());
+        assert!(GitRepo::worktree_common_dir(fixture.path()).is_err());
+    }
+
+    #[test]
+    fn combined_common_dir_uses_one_git_query() {
+        const ROOT: &str = "AETHYME_COMMON_DIR_QUERY_TEST_ROOT";
+        const TEST: &str = "git::worktree_common_dir_tests::combined_common_dir_uses_one_git_query";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            assert_eq!(
+                GitRepo::worktree_common_dir(&root).unwrap(),
+                root.join(".git").canonicalize().unwrap(),
+            );
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("checkout");
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        run_git(&root, &["init", "-q", "-b", "main"]).unwrap();
+        let global_config = fixture.path().join("empty-git-config");
+        std::fs::write(&global_config, "").unwrap();
+        let trace = fixture.path().join("trace.jsonl");
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", TEST, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                child.env_remove(key);
+            }
+        }
+        let output = child
+            .env(ROOT, &root)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", &global_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TRACE2_EVENT", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let events = std::fs::read_to_string(trace).unwrap();
+        let queries: Vec<Vec<String>> = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["event"] == "start")
+            .filter_map(|event| {
+                let args: Vec<String> = event["argv"]
+                    .as_array()?
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap().to_owned())
+                    .collect();
+                (args.get(1).map(String::as_str) == Some("rev-parse")).then_some(args)
+            })
+            .collect();
+        assert_eq!(
+            queries.len(),
+            1,
+            "ownership lookup must use one Git query: {queries:?}"
+        );
+        assert_eq!(
+            &queries[0][1..],
+            &["rev-parse", "--is-inside-work-tree", "--git-common-dir"]
+        );
+    }
+
+    #[test]
+    fn combined_common_dir_preserves_expired_deadlines() {
+        let fixture = tempfile::tempdir().unwrap();
+        let result = with_git_deadline(Duration::ZERO, || {
+            GitRepo::worktree_common_dir(fixture.path())
+        });
+        assert!(
+            matches!(result, Err(GitError::TimedOut { ref args, .. })
+                if args == "rev-parse --is-inside-work-tree --git-common-dir"),
+            "an unavailable ownership inspection must remain unavailable: {result:?}",
+        );
     }
 }
 
