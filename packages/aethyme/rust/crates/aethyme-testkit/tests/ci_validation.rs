@@ -470,6 +470,20 @@ fn contract_check_reads_the_same_sources_on_prs_and_on_main() {
     assert!(gate.contains("--commit-messages --merged-pr"), "{gate}");
 
     let pr_check = workflow("cross-process-contract.yml");
+    let contract_env = block(&pr_check, "env:");
+    let main_ci = workflow("oss-ci.yml");
+    let main_env = block(&main_ci, "env:");
+    assert!(main_env.contains(&"  CARGO_NET_RETRY: \"10\""));
+    assert!(
+        contract_env.contains(&"  CARGO_NET_RETRY: \"10\""),
+        "the contract workflow must match the trusted cache warmer's environment fingerprint"
+    );
+    let contract_cache = block(&pr_check, "      - name: Cache Rust build");
+    assert!(contract_cache.contains(&"          shared-key: rust-tests"));
+    assert!(
+        contract_cache.contains(&"          save-if: false"),
+        "PR checks may restore the main cache but must not write shared compiler artifacts"
+    );
     assert!(pr_check.contains("fetch-depth: 0"));
     assert!(pr_check.contains("ref: ${{ github.event.pull_request.head.sha }}"));
     assert!(pr_check.contains("BASE_REF: ${{ github.base_ref }}"));

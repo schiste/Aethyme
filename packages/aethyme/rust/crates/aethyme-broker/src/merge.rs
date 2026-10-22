@@ -1973,11 +1973,25 @@ impl Broker {
         if !patch_ids.is_empty() {
             let integration_candidates =
                 repo.first_parent_commits_excluding_oldest(integration_head, recorded_baseline)?;
-            let candidate_shapes = repo.commit_shapes(&integration_candidates)?;
-            let candidate_patch_ids = repo
-                .first_parent_patch_ids(&with_parent(&integration_candidates, &candidate_shapes))?;
+            // The session batch commonly already contains commits shared with
+            // integration. Reuse their exact object-identity results so an
+            // overlapping first-parent history is not diffed twice. Keep
+            // scanning every integration candidate absent from the session
+            // batch: patch-equivalent commits still populate the public match
+            // list even when ancestry already proves a session commit is integrated.
+            let unseen_candidates = integration_candidates
+                .iter()
+                .filter(|commit| !shapes.contains_key(*commit))
+                .cloned()
+                .collect::<Vec<_>>();
+            let candidate_shapes = repo.commit_shapes(&unseen_candidates)?;
+            let candidate_patch_ids =
+                repo.first_parent_patch_ids(&with_parent(&unseen_candidates, &candidate_shapes))?;
             for commit in integration_candidates {
-                if let Some(patch_id) = candidate_patch_ids.get(&commit) {
+                if let Some(patch_id) = patch_ids
+                    .get(&commit)
+                    .or_else(|| candidate_patch_ids.get(&commit))
+                {
                     integration_by_patch
                         .entry(patch_id.clone())
                         .or_default()
@@ -3637,7 +3651,9 @@ mod owned_merge_history_tests {
 #[cfg(test)]
 mod submission_plan_empty_patch_tests {
     use super::*;
+    use std::path::PathBuf;
     use std::process::Command;
+    use std::time::Duration;
 
     fn git(root: &Path, args: &[&str]) -> String {
         let mut command = Command::new("git");
@@ -3665,6 +3681,17 @@ mod submission_plan_empty_patch_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn patch_reuse_broker_options(storage_root: &Path) -> crate::BrokerOpenOptions {
+        let host_state = storage_root.join("host-state");
+        crate::BrokerOpenOptions::default()
+            .with_host_state_dir(&host_state)
+            .with_host_cache_dir(storage_root.join("host-cache"))
+            .with_host_operation_database(host_state.join("host-operations.db"))
+            .with_worktree_root(storage_root.join("worktrees"))
+            .with_collaboration_state(storage_root.join("collaboration"))
+            .with_preparation_cache_root(storage_root.join("preparation-cache"))
     }
 
     #[test]
@@ -3768,5 +3795,210 @@ mod submission_plan_empty_patch_tests {
             provenance_json["matching_integration_commits"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn exact_shared_candidates_reuse_patch_ids_and_unseen_candidates_are_scanned() {
+        const ROOT: &str = "AETHYME_EXACT_PATCH_REUSE_TEST_ROOT";
+        const MODE: &str = "AETHYME_EXACT_PATCH_REUSE_TEST_MODE";
+        const SESSION_HEAD: &str = "AETHYME_EXACT_PATCH_REUSE_SESSION_HEAD";
+        const INTEGRATION_HEAD: &str = "AETHYME_EXACT_PATCH_REUSE_INTEGRATION_HEAD";
+        const SESSION_ID: &str = "AETHYME_EXACT_PATCH_REUSE_SESSION_ID";
+        const EXPECTED_MATCHES: &str = "AETHYME_EXACT_PATCH_REUSE_EXPECTED_MATCHES";
+        const STORAGE_ROOT: &str = "AETHYME_EXACT_PATCH_REUSE_STORAGE_ROOT";
+        const TEST: &str = "merge::submission_plan_empty_patch_tests::exact_shared_candidates_reuse_patch_ids_and_unseen_candidates_are_scanned";
+
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let mode = std::env::var(MODE).unwrap();
+            let session_head = std::env::var(SESSION_HEAD).unwrap();
+            let integration_head = std::env::var(INTEGRATION_HEAD).unwrap();
+            let session_id = std::env::var(SESSION_ID).unwrap().parse::<i64>().unwrap();
+            let expected_matches: Vec<String> =
+                serde_json::from_str(&std::env::var(EXPECTED_MATCHES).unwrap()).unwrap();
+            let storage_root = PathBuf::from(std::env::var_os(STORAGE_ROOT).unwrap());
+            let mut broker =
+                Broker::open_with_options(&root, patch_reuse_broker_options(&storage_root))
+                    .unwrap();
+            let session = broker.store().session(session_id).unwrap();
+            let plan = broker
+                .build_submission_plan(&session, &session_head, &integration_head)
+                .unwrap();
+
+            assert!(plan.safe);
+            assert_eq!(plan.commits.len(), 1);
+            let provenance = &plan.commits[0];
+            assert!(provenance.patch_id.is_some());
+            assert_eq!(provenance.matching_integration_commits, expected_matches);
+            if mode == "ancestry" || mode == "partial_overlap" {
+                assert_eq!(
+                    provenance.integration_state,
+                    SubmissionIntegrationState::AlreadyIntegratedByAncestry
+                );
+            } else {
+                assert_eq!(mode, "cherry_pick");
+                assert_eq!(
+                    provenance.integration_state,
+                    SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity
+                );
+            }
+            return;
+        }
+
+        for mode in ["ancestry", "cherry_pick", "partial_overlap"] {
+            let repository_owner = tempfile::tempdir().unwrap();
+            let root = repository_owner.path().join("repository");
+            std::fs::create_dir(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let storage = crate::test_storage::TestStorage::new();
+            std::fs::create_dir_all(storage.worktree_root()).unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "gc.auto", "0"]);
+            std::fs::write(root.join("base.txt"), "base\n").unwrap();
+            git(&root, &["add", "base.txt"]);
+            git(&root, &["commit", "-qm", "base"]);
+            let base = git(&root, &["rev-parse", "HEAD"]);
+
+            let worktree = storage.worktree_root().join("patch-reuse-probe");
+            let worktree_arg = worktree.to_string_lossy().into_owned();
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "agent/patch-reuse-probe",
+                    &worktree_arg,
+                    &base,
+                ],
+            );
+            let mut setup_broker = storage.open(&root).unwrap();
+            let session = setup_broker
+                .adopt(&worktree, Some("exact patch identity reuse regression"))
+                .unwrap();
+            std::fs::write(worktree.join("session.txt"), "session patch\n").unwrap();
+            git(&worktree, &["add", "session.txt"]);
+            git(&worktree, &["commit", "-qm", "session patch"]);
+            let session_head = git(&worktree, &["rev-parse", "HEAD"]);
+            let (integration_head, expected_matches) = match mode {
+                "ancestry" => (session_head.clone(), vec![session_head.clone()]),
+                "cherry_pick" => {
+                    git(&root, &["cherry-pick", "-x", &session_head]);
+                    let integration_head = git(&root, &["rev-parse", "HEAD"]);
+                    (integration_head.clone(), vec![integration_head])
+                }
+                "partial_overlap" => {
+                    git(&root, &["merge", "--ff-only", &session_head]);
+                    git(&root, &["revert", "--no-edit", &session_head]);
+                    git(&root, &["cherry-pick", "-x", &session_head]);
+                    let first_equivalent = git(&root, &["rev-parse", "HEAD"]);
+                    git(&root, &["revert", "--no-edit", "HEAD"]);
+                    git(&root, &["cherry-pick", "-x", &session_head]);
+                    let second_equivalent = git(&root, &["rev-parse", "HEAD"]);
+                    let integration_head = git(&root, &["rev-parse", "HEAD"]);
+                    (
+                        integration_head,
+                        vec![session_head.clone(), first_equivalent, second_equivalent],
+                    )
+                }
+                _ => unreachable!("known patch reuse fixture mode"),
+            };
+
+            let trace = root.join("patch-reuse-trace.json");
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", TEST, "--nocapture"]);
+            for (key, _) in std::env::vars_os() {
+                if key
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("GIT_")
+                {
+                    child.env_remove(key);
+                }
+            }
+            child
+                .env(ROOT, &root)
+                .env(MODE, mode)
+                .env(SESSION_HEAD, &session_head)
+                .env(INTEGRATION_HEAD, &integration_head)
+                .env(SESSION_ID, session.id.to_string())
+                .env(
+                    EXPECTED_MATCHES,
+                    serde_json::to_string(&expected_matches).unwrap(),
+                )
+                .env(STORAGE_ROOT, storage.root())
+                .env("AETHYME_WORKTREE_ROOT", storage.worktree_root())
+                .env("AETHYME_HOST_STATE_DIR", storage.host_state_dir())
+                .env("AETHYME_HOST_CACHE_DIR", storage.root().join("host-cache"))
+                .env(
+                    "AETHYME_PREPARATION_CACHE_ROOT",
+                    storage.root().join("preparation-cache"),
+                )
+                .env(
+                    "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
+                    storage.host_state_dir().join("host-operations.db"),
+                )
+                .env(
+                    "AETHYME_BROKER_OPEN_COLLABORATION_ROOT",
+                    storage.root().join("collaboration"),
+                )
+                .env_remove("AETHYME_BROKER_DB")
+                .env_remove("AETHYME_GATE_BROKER_DATABASES")
+                .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
+                .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
+                .env_remove("AETHYME_BROKER_STORAGE_CONTEXT_V1")
+                .env("GIT_TRACE2_EVENT", &trace)
+                .current_dir(&root);
+            let output = match crate::bounded_output::output_limited(
+                &mut child,
+                Duration::from_secs(30),
+                1024 * 1024,
+            )
+            .unwrap()
+            {
+                crate::bounded_output::LimitedOutput::Completed(output) => output,
+                crate::bounded_output::LimitedOutput::Deadline => {
+                    panic!("patch reuse test child exceeded its 30-second budget ({mode})")
+                }
+                crate::bounded_output::LimitedOutput::OutputLimit => {
+                    panic!("patch reuse test child exceeded its 1 MiB output cap ({mode})")
+                }
+            };
+            assert!(
+                output.status.success(),
+                "mode={mode}\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let events = std::fs::read_to_string(trace).unwrap();
+            let (mut patch_logs, mut patch_id_processes, mut shape_queries) = (0, 0, 0);
+            for line in events.lines() {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                if event["event"] != "start" {
+                    continue;
+                }
+                let Some(argv) = event["argv"].as_array() else {
+                    continue;
+                };
+                if argv.iter().any(|arg| arg == "--diff-merges=first-parent") {
+                    patch_logs += 1;
+                }
+                if argv.iter().any(|arg| arg == "patch-id") {
+                    patch_id_processes += 1;
+                }
+                if argv.iter().any(|arg| arg == "--format=%H %T %P") {
+                    shape_queries += 1;
+                }
+            }
+            let expected_streams = if mode == "ancestry" { 1 } else { 2 };
+            assert_eq!(patch_logs, expected_streams, "log streams for {mode}");
+            assert_eq!(
+                patch_id_processes, expected_streams,
+                "patch-id processes for {mode}"
+            );
+            assert_eq!(shape_queries, expected_streams, "shape queries for {mode}");
+        }
     }
 }
