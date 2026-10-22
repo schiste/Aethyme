@@ -3348,7 +3348,6 @@ impl Broker {
         ),
         BrokerOpError,
     > {
-        let placement = self.prepare_broker_worktree_root()?;
         let refresh = self.refresh_default_branch_before_start();
         // Verify-only sessions start from the fetched default branch either
         // way; advancing a disposable integration here keeps it from feeding
@@ -3357,11 +3356,15 @@ impl Broker {
         let mut start_base = self.select_session_start_base(explicit_base)?;
         refresh.record(&mut start_base);
         // Refresh may wait on another process or a remote. Acquire the
-        // repository lifecycle claim only after that work, then choose the
-        // unique branch and recheck the destination immediately before the
-        // checkout is allocated. The returned guard stays held until the
-        // caller registers the session or rolls the checkout back.
+        // repository lifecycle claim only after that work. Root preparation
+        // writes the marker and build defaults, so it belongs under the same
+        // claim as storage's empty-root removal; otherwise a confirmed sweep
+        // could delete a root prepared before this final claim.
         let lifecycle_claim = self.claim_worktree_lifecycle()?;
+        let placement = self.prepare_broker_worktree_root()?;
+        // Choose the unique branch and recheck the destination immediately
+        // before the checkout is allocated. The returned guard stays held
+        // until the caller registers the session or rolls the checkout back.
         self.ensure_planned_paths_available(planned_paths, None)?;
         let slug = self.next_worktree_slug(task, &placement.root);
         let worktree_path = placement.root.join(&slug);
