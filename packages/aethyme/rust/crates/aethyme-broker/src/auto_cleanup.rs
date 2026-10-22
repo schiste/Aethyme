@@ -430,6 +430,14 @@ pub struct AutoCleanupReport {
 #[derive(Debug, Clone)]
 pub(crate) struct AutoCleanupCandidate {
     pub worktree: PathBuf,
+    /// The retained spawned session whose creation record proves this path
+    /// belongs to the broker. Adopted sessions can refer to the same checkout
+    /// without being ownership evidence.
+    pub spawned_owner: Session,
+    /// The instance identity captured from the GitRepo returned by spawn and
+    /// committed with `spawned_owner`. `None` is diagnostic-only and is
+    /// refused before containment or removal.
+    pub spawned_instance_witness: Option<crate::events::SpawnedWorktreeInstanceWitness>,
     pub sessions: Vec<Session>,
 }
 
@@ -438,12 +446,8 @@ impl AutoCleanupCandidate {
         self.sessions.iter().map(|session| session.id).collect()
     }
 
-    fn branch(&self) -> Option<&str> {
-        self.sessions
-            .iter()
-            .rev()
-            .find(|session| session.origin == SessionOrigin::Spawned)
-            .map(|session| session.branch.as_str())
+    fn branch(&self) -> &str {
+        self.spawned_owner.branch.as_str()
     }
 }
 
@@ -743,10 +747,76 @@ impl Broker {
                 kept.push(keep("the primary checkout is never removed".into()));
                 continue;
             }
-            let owned = sessions.iter().all(|session| {
-                self.is_broker_owned_worktree(session, Path::new(&session.worktree_path))
-            });
-            if !owned {
+            let spawned_sessions = sessions
+                .iter()
+                .rev()
+                .filter(|session| {
+                    session.origin == SessionOrigin::Spawned
+                        && session.cleanup_state == SessionCleanupState::Closed
+                })
+                .collect::<Vec<_>>();
+            if spawned_sessions.is_empty() {
+                kept.push(keep(
+                    "no matching spawn-time worktree instance witness".into(),
+                ));
+                continue;
+            }
+            // Only a still-retained spawned row with a persisted witness for
+            // this exact Git worktree instance proves broker creation.
+            // Adopted rows and legacy spawned rows without a witness cannot
+            // authorize cleanup, even when the path and repository match.
+            let checkout = match GitRepo::discover(&path) {
+                Ok(checkout) => checkout,
+                Err(_) => {
+                    kept.push(keep("not a readable broker-owned worktree".into()));
+                    continue;
+                }
+            };
+            let current_witness = checkout.spawned_worktree_instance_witness();
+            let mut matched_owner = None;
+            let mut diagnostic_owner = None;
+            let mut unreadable_witness = None;
+            for session in spawned_sessions {
+                let witness = match self.store().spawned_worktree_instance_witness(session.id) {
+                    Ok(Some(witness)) => witness,
+                    Ok(None) => None,
+                    Err(error) => {
+                        unreadable_witness = Some(error.to_string());
+                        continue;
+                    }
+                };
+                if witness
+                    .as_ref()
+                    .is_some_and(|witness| witness.worktree_path != path.to_string_lossy().as_ref())
+                {
+                    continue;
+                }
+                if current_witness.as_ref().is_some_and(|current| {
+                    witness.as_ref().is_some_and(|witness| witness == current)
+                }) {
+                    matched_owner = Some((session.clone(), witness));
+                    break;
+                }
+                // Keep an unproven spawn row only as a diagnostic candidate.
+                // The plan can still report live-session, lease, dirty-tree,
+                // or gate protections on platforms without a stable identity
+                // primitive; auto_cleanup_verdict refuses it before running
+                // containment or removing anything.
+                if diagnostic_owner.is_none() {
+                    diagnostic_owner = Some((session.clone(), witness));
+                }
+            }
+            let owner = matched_owner.or(diagnostic_owner);
+            let Some((spawned_owner, spawned_instance_witness)) = owner else {
+                let reason = unreadable_witness
+                    .map(|error| format!("spawn-time worktree identity is unreadable: {error}"))
+                    .unwrap_or_else(|| "no matching spawn-time worktree instance witness".into());
+                kept.push(keep(reason));
+                continue;
+            };
+            if !self
+                .is_broker_owned_worktree(&spawned_owner, Path::new(&spawned_owner.worktree_path))
+            {
                 kept.push(keep("not a broker-owned worktree".into()));
                 continue;
             }
@@ -766,6 +836,8 @@ impl Broker {
             }
             candidates.push(AutoCleanupCandidate {
                 worktree: path,
+                spawned_owner,
+                spawned_instance_witness,
                 sessions,
             });
         }
@@ -798,22 +870,96 @@ impl Broker {
         if candidate.sessions.is_empty() {
             return Err(keep("no recorded owner".into()));
         }
+        if !candidate
+            .sessions
+            .iter()
+            .any(|session| session.id == candidate.spawned_owner.id)
+        {
+            return Err(keep("no recorded owner".into()));
+        }
+        if candidate
+            .spawned_instance_witness
+            .as_ref()
+            .is_some_and(|witness| {
+                witness.worktree_path != candidate.worktree.to_string_lossy().as_ref()
+            })
+        {
+            return Err(keep("spawn-time worktree identity path changed".into()));
+        }
         if policy.is_pinned(&candidate.worktree) {
             return Err(keep("pinned by [cleanup] keep".into()));
         }
         // Proof 1, re-read: the store may have changed since selection.
+        let canonical =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut current_spawned_owner = None;
         for session in &candidate.sessions {
             let current = self
                 .store()
                 .session(session.id)
                 .map_err(|error| keep(format!("session {} unreadable: {error}", session.id)))?;
-            if !current.status.is_closed() || current.cleanup_state == SessionCleanupState::Open {
+            if !current.status.is_closed() || current.cleanup_state != SessionCleanupState::Closed {
                 return Err(keep(format!(
                     "session {} is not closed ({})",
                     session.id,
                     current.status.as_str()
                 )));
             }
+            if canonical(Path::new(&current.worktree_path)) != candidate.worktree {
+                return Err(keep(format!("session {} changed worktree", session.id)));
+            }
+            if current.id == candidate.spawned_owner.id {
+                current_spawned_owner = Some(current);
+            }
+        }
+        let mut expected_session_ids = candidate.session_ids();
+        expected_session_ids.sort_unstable();
+        let mut current_session_ids = self
+            .store()
+            .cleaned_sessions()
+            .map_err(|error| keep(format!("closed sessions unreadable: {error}")))?
+            .into_iter()
+            .filter(|session| {
+                session.cleanup_state == SessionCleanupState::Closed
+                    && canonical(Path::new(&session.worktree_path)) == candidate.worktree
+            })
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        current_session_ids.sort_unstable();
+        if current_session_ids != expected_session_ids {
+            return Err(keep("closed session set changed".into()));
+        }
+        let owner = current_spawned_owner.ok_or_else(|| keep("no recorded owner".into()))?;
+        if owner.origin != SessionOrigin::Spawned || owner.branch != candidate.spawned_owner.branch
+        {
+            return Err(keep("spawned ownership record changed".into()));
+        }
+        let persisted_witness = self
+            .store()
+            .spawned_worktree_instance_witness(owner.id)
+            .map_err(|error| keep(format!("spawn-time worktree identity unreadable: {error}")))?;
+        if persisted_witness.as_ref() != candidate.spawned_instance_witness.as_ref() {
+            return Err(keep(
+                "spawn-time worktree identity changed or is missing".into(),
+            ));
+        }
+        let checkout = GitRepo::discover(&candidate.worktree)
+            .map_err(|error| keep(format!("worktree could not be re-opened: {error}")))?;
+        let current_witness = checkout.spawned_worktree_instance_witness();
+        match candidate.spawned_instance_witness.as_ref() {
+            Some(expected) if current_witness.as_ref() != Some(expected) => {
+                return Err(keep(
+                    "worktree instance no longer matches its spawn record".into(),
+                ));
+            }
+            None => {}
+            Some(_) => {}
+        }
+        if !self
+            .is_broker_owned_worktree_checked(&owner, &candidate.worktree)
+            .map_err(|error| keep(format!("worktree ownership could not be checked: {error}")))?
+        {
+            return Err(keep("not a broker-owned worktree".into()));
         }
         if let Some(live) = self
             .store()
@@ -857,11 +1003,25 @@ impl Broker {
         }
 
         // Proof 3.
-        let branch = candidate.branch();
-        match unclean_reason(&candidate.worktree, branch, self.main_root(), policy) {
+        match unclean_reason(
+            &candidate.worktree,
+            Some(candidate.branch()),
+            self.main_root(),
+            policy,
+        ) {
             Ok(None) => {}
             Ok(Some(reason)) => return Err(keep(reason)),
             Err(error) => return Err(keep(format!("cleanliness could not be checked: {error}"))),
+        }
+
+        // Without a spawn-time identity, the prior proofs are useful only for
+        // accurate diagnostics. Never allow a legacy or unsupported-platform
+        // row to proceed to containment or removal based on current-path
+        // observations alone.
+        if candidate.spawned_instance_witness.is_none() || current_witness.is_none() {
+            return Err(keep(
+                "spawn-time worktree instance identity is unavailable".into(),
+            ));
         }
 
         // Proof 4.
@@ -1053,7 +1213,7 @@ impl Broker {
                     let removed = AutoRemovedCheckout {
                         worktree: worktree_text.clone(),
                         sessions: candidate.session_ids(),
-                        branch: candidate.branch().map(str::to_string),
+                        branch: Some(candidate.branch().to_string()),
                         head: proof.head.clone(),
                         contained_in: upstream.0.clone(),
                         containing_commit: proof.containing_commit.clone(),
@@ -1099,12 +1259,12 @@ impl Broker {
         self.repo_handle()
             .worktree_remove_registered(&candidate.worktree, true)?;
         ensure_auto_cleanup_path_absent(&candidate.worktree)?;
-        if let Some(branch) = candidate.branch()
-            && self
-                .repo_handle()
-                .resolve_ref(&format!("refs/heads/{branch}"))
-                .as_deref()
-                == Some(proof.head.as_str())
+        let branch = candidate.branch();
+        if self
+            .repo_handle()
+            .resolve_ref(&format!("refs/heads/{branch}"))
+            .as_deref()
+            == Some(proof.head.as_str())
         {
             // Only the exact proved head is deleted; a branch that moved is
             // somebody's and stays. The checked delete refuses a race.
@@ -1335,12 +1495,19 @@ fn ensure_auto_cleanup_path_absent(path: &Path) -> Result<(), BrokerOpError> {
 
 #[cfg(test)]
 mod fail_closed_removal_tests {
-    use super::{AutoCleanupCandidate, ContainmentProof, ensure_auto_cleanup_path_absent};
+    use super::ensure_auto_cleanup_path_absent;
+    #[cfg(unix)]
+    use super::{AutoCleanupCandidate, ContainmentProof};
+    #[cfg(unix)]
     use crate::{SessionCleanupState, git::with_git_deadline};
+    #[cfg(unix)]
     use std::path::Path;
+    #[cfg(unix)]
     use std::process::Command;
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     fn git(root: &Path, args: &[&str]) {
         let mut command = Command::new("git");
         let git_keys = std::env::vars_os()
@@ -1359,6 +1526,7 @@ mod fail_closed_removal_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn auto_cleanup_preserves_candidate_after_git_removal_timeout() {
         let owner = tempfile::tempdir().unwrap();
@@ -1381,9 +1549,17 @@ mod fail_closed_removal_tests {
         broker.close(session.id).unwrap();
         let evidence = worktree.join("keep-for-retry.txt");
         std::fs::write(&evidence, b"preserve this candidate").unwrap();
+        let spawned_owner = broker.store().session(session.id).unwrap();
+        let spawned_instance_witness = broker
+            .store()
+            .spawned_worktree_instance_witness(session.id)
+            .unwrap()
+            .expect("the production spawn path records its instance witness");
         let candidate = AutoCleanupCandidate {
             worktree: worktree.clone(),
-            sessions: vec![broker.store().session(session.id).unwrap()],
+            spawned_owner: spawned_owner.clone(),
+            spawned_instance_witness: Some(spawned_instance_witness),
+            sessions: vec![spawned_owner],
         };
         let proof = ContainmentProof {
             head: "fixture-head".into(),
