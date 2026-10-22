@@ -15,6 +15,8 @@ additional migration.
 
 ### Fixed
 
+- Agent startup consumes already-available readiness bytes without sleeping
+  between bytes; deadline, token and message-size checks remain enforced.
 - Successful deployment no longer repeats the full readiness scan after
   verification. It prints the explicit `aethyme broker status readiness`
   follow-up for the deployed repository.

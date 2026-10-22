@@ -196,8 +196,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unavailable. Recorded hashes do not recover missing bytes or recreate a trust
   record.
 - Preserve the complete outer `broker advanced resources run <request> -- ...`
-  invocation for supervised native checks. The helper must refuse before Cargo
-  when the host lease ID or generation is absent or malformed, and record both
+  invocation for supervised native checks, bound to the frozen resource request.
+  The helper must refuse before resource probes or Cargo when the host lease ID
+  or generation is absent or malformed, and record both
   in its result. A local Cargo lock and headroom monitor do not prove host
   admission. Exercise the missing-lease refusal without starting Cargo.
 - Before an expensive run, invoke the exact frozen helper entrypoint in its
