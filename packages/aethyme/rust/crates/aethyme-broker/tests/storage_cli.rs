@@ -4,9 +4,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 

@@ -9527,7 +9527,6 @@ fn path_is_explicitly_absent(path: &Path) -> bool {
 
 #[cfg(all(test, unix))]
 mod unbound_preparation_cache_open_tests {
-    use super::*;
     use crate::store::repository_binding::{
         RepositoryWorktreeBindingOrigin, RepositoryWorktreeBindingState,
     };
