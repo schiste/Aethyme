@@ -163,6 +163,20 @@ pub(crate) fn suspend_git_deadline() -> GitDeadlineGuard {
 /// reported as not landed is merely kept.
 const PATCH_ID_ARGS: [&str; 2] = ["patch-id", "--verbatim"];
 
+// `git patch-id --verbatim` hashes full pre/post blob IDs for binary diffs
+// and skips their bodies. Keep those full IDs while avoiding binary patch
+// compression and base85 encoding in this streamed producer.
+const FIRST_PARENT_PATCH_ID_LOG_ARGS: [&str; 8] = [
+    "log",
+    "--no-walk=unsorted",
+    "--stdin",
+    "--no-color",
+    "-p",
+    "--full-index",
+    "--diff-merges=first-parent",
+    "--format=commit %H",
+];
+
 /// Which side of a symmetric `left...right` range [`GitRepo::cherry_marked`]
 /// lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3511,16 +3525,7 @@ impl GitRepo {
         if commits.is_empty() {
             return Ok(patch_ids);
         }
-        let log_args = [
-            "log",
-            "--no-walk=unsorted",
-            "--stdin",
-            "--no-color",
-            "-p",
-            "--binary",
-            "--diff-merges=first-parent",
-            "--format=commit %H",
-        ];
+        let log_args = FIRST_PARENT_PATCH_ID_LOG_ARGS;
         let pipeline_args = format!("{} | patch-id --verbatim", log_args.join(" "));
         let started = Instant::now();
         let deadline = effective_git_deadline(&pipeline_args, git_timeout(), started)?;
@@ -6156,14 +6161,18 @@ mod local_branch_tips_tests {
 mod batched_commit_tests {
     use super::*;
 
-    fn run(root: &Path, args: &[&str]) -> String {
+    fn fixture_git_command() -> Command {
         let mut command = Command::new("git");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_") {
                 command.env_remove(key);
             }
         }
-        let out = command
+        command
+    }
+
+    fn run(root: &Path, args: &[&str]) -> String {
+        let out = fixture_git_command()
             .args(args)
             .current_dir(root)
             .env("GIT_AUTHOR_NAME", "t")
@@ -6178,6 +6187,70 @@ mod batched_commit_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn patch_ids_for_log_args(
+        root: &Path,
+        commits: &[String],
+        log_args: &[&str],
+    ) -> (BTreeMap<String, String>, Vec<u8>) {
+        use std::io::Write as _;
+
+        let mut log = fixture_git_command()
+            .args(log_args)
+            .current_dir(root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fixture git log");
+        {
+            let mut stdin = log.stdin.take().expect("git log stdin");
+            for commit in commits {
+                writeln!(stdin, "{commit}").expect("write commit to git log");
+            }
+        }
+        let log_output = log.wait_with_output().expect("wait for git log");
+        assert!(
+            log_output.status.success(),
+            "git {log_args:?}: {}",
+            String::from_utf8_lossy(&log_output.stderr)
+        );
+        assert!(
+            log_output.stdout.len() <= 64 * 1024,
+            "fixture patch stream exceeded its small bound: {} bytes",
+            log_output.stdout.len()
+        );
+
+        let mut patch_id = fixture_git_command()
+            .args(PATCH_ID_ARGS)
+            .current_dir(root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fixture git patch-id");
+        patch_id
+            .stdin
+            .take()
+            .expect("git patch-id stdin")
+            .write_all(&log_output.stdout)
+            .expect("write patch stream to git patch-id");
+        let patch_output = patch_id.wait_with_output().expect("wait for git patch-id");
+        assert!(
+            patch_output.status.success(),
+            "git patch-id --verbatim: {}",
+            String::from_utf8_lossy(&patch_output.stderr)
+        );
+
+        let mut patch_ids = BTreeMap::new();
+        for line in String::from_utf8_lossy(&patch_output.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            if let (Some(patch), Some(commit)) = (fields.next(), fields.next()) {
+                patch_ids.insert(commit.to_string(), patch.to_string());
+            }
+        }
+        (patch_ids, log_output.stdout)
     }
 
     #[test]
@@ -6418,6 +6491,7 @@ mod batched_commit_tests {
         std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").expect("write");
         run(root, &["add", "-A"]);
         run(root, &["commit", "-qm", "root"]);
+        let root_commit = run(root, &["rev-parse", "HEAD"]);
         // An ordinary edit.
         std::fs::write(root.join("a.txt"), "one\n2\nthree\n").expect("write");
         run(root, &["commit", "-qam", "edit"]);
@@ -6426,10 +6500,35 @@ mod batched_commit_tests {
         std::fs::write(root.join("b.txt"), "one\n2\nthree\nfour\n").expect("write");
         run(root, &["add", "-A"]);
         run(root, &["commit", "-qm", "rename"]);
-        // A binary file and a mode change.
+        // Pair binary add, modify, and delete patches with text hunks so the
+        // patch-id has an independent textual contribution as well as the
+        // binary pre/post object IDs.
+        std::fs::write(root.join("b.txt"), "one\n2\nthree\nfour\nadd\n").expect("write");
         std::fs::write(root.join("blob.bin"), [0_u8, 159, 146, 150, 0, 7]).expect("write");
-        run(root, &["add", "blob.bin"]);
-        run(root, &["commit", "-qm", "binary"]);
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "mixed binary add"]);
+        let mixed_binary_add = run(root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("b.txt"), "one\n2\nthree\nfour\nmodify\n").expect("write");
+        std::fs::write(root.join("blob.bin"), [0_u8, 158, 147, 149, 0, 8]).expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "mixed binary modify"]);
+        let mixed_binary_modify = run(root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("b.txt"), "one\n2\nthree\nfour\ndelete\n").expect("write");
+        std::fs::remove_file(root.join("blob.bin")).expect("remove binary file");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "mixed binary delete"]);
+        let mixed_binary_delete = run(root, &["rev-parse", "HEAD"]);
+
+        // Keep a binary-only change too, but compare its result to Git's
+        // legacy producer instead of assuming patch-id emits or omits it.
+        std::fs::write(root.join("pure.bin"), [0_u8, 1, 0, 2, 255]).expect("write");
+        run(root, &["add", "pure.bin"]);
+        run(root, &["commit", "-qm", "pure binary"]);
+        let pure_binary = run(root, &["rev-parse", "HEAD"]);
+
+        // A mode change.
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(root.join("b.txt"), std::fs::Permissions::from_mode(0o755))
@@ -6438,6 +6537,7 @@ mod batched_commit_tests {
         run(root, &["commit", "-qam", "mode"]);
         // An empty commit has no patch id.
         run(root, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let empty_commit = run(root, &["rev-parse", "HEAD"]);
         // A merge, whose patch id is its diff against the first parent.
         run(root, &["switch", "-q", "-c", "side", "HEAD~2"]);
         std::fs::write(root.join("side.txt"), "side\n").expect("write");
@@ -6448,6 +6548,7 @@ mod batched_commit_tests {
             root,
             &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
         );
+        let merge = run(root, &["rev-parse", "HEAD"]);
         // A cherry-pick of the side commit is patch-identical to it.
         run(root, &["switch", "-q", "-c", "picked", "HEAD~1"]);
         run(root, &["cherry-pick", "side"]);
@@ -6469,7 +6570,69 @@ mod batched_commit_tests {
             .first_parent_patch_ids(&with_parents)
             .expect("patch ids");
 
-        let mut empty = 0;
+        const LEGACY_BINARY_LOG_ARGS: [&str; 8] = [
+            "log",
+            "--no-walk=unsorted",
+            "--stdin",
+            "--no-color",
+            "-p",
+            "--binary",
+            "--diff-merges=first-parent",
+            "--format=commit %H",
+        ];
+        let (legacy_patch_ids, legacy_log) =
+            patch_ids_for_log_args(root, &with_parents, &LEGACY_BINARY_LOG_ARGS);
+        let (full_index_patch_ids, full_index_log) =
+            patch_ids_for_log_args(root, &with_parents, &FIRST_PARENT_PATCH_ID_LOG_ARGS);
+        assert_eq!(
+            patch_ids, legacy_patch_ids,
+            "optimized stream vs old --binary producer"
+        );
+        assert_eq!(
+            patch_ids, full_index_patch_ids,
+            "production args vs full-index stream"
+        );
+        let legacy_log = String::from_utf8_lossy(&legacy_log);
+        let full_index_log = String::from_utf8_lossy(&full_index_log);
+        assert!(
+            legacy_log.contains("GIT binary patch"),
+            "legacy binary control"
+        );
+        assert!(
+            full_index_log.contains("Binary files"),
+            "binary diff marker"
+        );
+        assert!(
+            !full_index_log.contains("GIT binary patch"),
+            "full-index output must not include encoded binary bodies"
+        );
+        for commit in [
+            &mixed_binary_add,
+            &mixed_binary_modify,
+            &mixed_binary_delete,
+        ] {
+            assert!(
+                patch_ids.contains_key(commit),
+                "mixed text/binary patch {commit}"
+            );
+            assert_eq!(
+                patch_ids.get(commit),
+                legacy_patch_ids.get(commit),
+                "mixed text/binary patch {commit}"
+            );
+        }
+        assert_eq!(
+            patch_ids.get(&pure_binary),
+            legacy_patch_ids.get(&pure_binary),
+            "pure binary patch parity must follow Git's result without assuming an ID"
+        );
+        let side = run(root, &["rev-parse", "side"]);
+        assert_eq!(
+            patch_ids.get(&merge),
+            patch_ids.get(&side),
+            "merge patch ID uses the first-parent diff"
+        );
+
         for commit in &commits {
             let parents = repo.commit_parents(commit).expect("parents");
             assert_eq!(shapes[commit].parents, parents, "{commit}");
@@ -6482,13 +6645,16 @@ mod batched_commit_tests {
                 Some(parent) => repo.patch_id_between(parent, commit).expect("patch id"),
                 None => None,
             };
-            if expected.is_none() {
-                empty += 1;
-            }
             assert_eq!(patch_ids.get(commit).cloned(), expected, "{commit}");
         }
-        assert_eq!(empty, 2, "the root and the empty commit have no patch id");
-        let side = run(root, &["rev-parse", "side"]);
+        assert!(
+            !patch_ids.contains_key(&root_commit),
+            "root commit has no patch ID"
+        );
+        assert!(
+            !patch_ids.contains_key(&empty_commit),
+            "empty commit has no patch ID"
+        );
         let picked = run(root, &["rev-parse", "picked"]);
         assert_ne!(side, picked);
         assert_eq!(
