@@ -3422,7 +3422,9 @@ mod owned_merge_history_tests {
         use std::sync::{Arc, Mutex, mpsc};
         use std::time::Duration;
 
-        let (tmp, mut submit_broker, plan) = fixture();
+        let managed_root_owner = tempfile::tempdir().unwrap();
+        let managed_root = managed_root_owner.path().join("worktrees");
+        let (tmp, mut submit_broker, plan) = fixture_with_worktree_root(Some(managed_root));
         let owner = Arc::new(tmp);
         let root = owner.path().canonicalize().unwrap();
         git(

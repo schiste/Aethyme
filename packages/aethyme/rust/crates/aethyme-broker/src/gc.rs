@@ -9427,6 +9427,13 @@ mod tests {
             ("preparation-cache", preparation_cache.path()),
         ] {
             let path = path.canonicalize().unwrap();
+            let path = if name == "worktree-root" {
+                let selected = path.join("worktrees");
+                assert!(!selected.exists());
+                selected
+            } else {
+                path
+            };
             std::fs::write(
                 detached_fixture_marker(root, name),
                 path.to_string_lossy().as_ref(),
