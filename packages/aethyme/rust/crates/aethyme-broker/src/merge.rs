@@ -1870,6 +1870,12 @@ impl Broker {
                 "accepted session checkpoint {accepted} was rewritten by broker repair; ownership resumes from the broker-recorded repair baseline {repaired}"
             ));
         }
+        // Reuse the exact exclusive walk when it is needed for both inherited
+        // ownership and the later ancestry membership check. This cache is
+        // local to this plan and these captured head OIDs; a later plan build
+        // performs its own walk. Keep the ownership use strict (`?`) and the
+        // later-only use best-effort with its existing ancestry fallback.
+        let mut outside_integration: Option<BTreeSet<String>> = None;
         let (owned, inherited) = if repo.is_ancestor(recorded_baseline, session_head) {
             let owned = repo.commits_between_oldest(recorded_baseline, session_head)?;
             let inherited = if accepted_checkpoint.is_some() {
@@ -1880,7 +1886,9 @@ impl Broker {
                 Vec::new()
             } else {
                 let owned_set = owned.iter().cloned().collect::<BTreeSet<_>>();
-                repo.commits_excluding_oldest(session_head, integration_head)?
+                let outside = repo.commits_excluding_oldest(session_head, integration_head)?;
+                outside_integration = Some(outside.iter().cloned().collect());
+                outside
                     .into_iter()
                     .filter(|commit| !owned_set.contains(commit))
                     .collect::<Vec<_>>()
@@ -2016,10 +2024,11 @@ impl Broker {
         // is not among the commits the session HEAD has and integration
         // lacks. One rev-list answers that for all of them; if it cannot run,
         // ask per commit as before.
-        let outside_integration = repo
-            .commits_excluding_oldest(session_head, integration_head)
-            .ok()
-            .map(|commits| commits.into_iter().collect::<BTreeSet<_>>());
+        let outside_integration = outside_integration.or_else(|| {
+            repo.commits_excluding_oldest(session_head, integration_head)
+                .ok()
+                .map(|commits| commits.into_iter().collect::<BTreeSet<_>>())
+        });
         let reaches_integration = |commit: &str| match &outside_integration {
             Some(outside) => !outside.contains(commit),
             None => repo.is_ancestor(commit, integration_head),
@@ -4176,7 +4185,8 @@ mod submission_plan_empty_patch_tests {
             );
 
             let events = std::fs::read_to_string(trace).unwrap();
-            let (mut patch_logs, mut patch_id_processes, mut shape_queries) = (0, 0, 0);
+            let (mut patch_logs, mut patch_id_processes, mut shape_queries, mut exclusive_walks) =
+                (0, 0, 0, 0);
             for line in events.lines() {
                 let event: serde_json::Value = serde_json::from_str(line).unwrap();
                 if event["event"] != "start" {
@@ -4185,16 +4195,33 @@ mod submission_plan_empty_patch_tests {
                 let Some(argv) = event["argv"].as_array() else {
                     continue;
                 };
-                if argv.iter().any(|arg| arg == "--diff-merges=first-parent") {
+                let argv = argv
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>();
+                if argv.windows(5).any(|args| {
+                    args[0] == "rev-list"
+                        && args[1] == "--reverse"
+                        && args[2] == session_head.as_str()
+                        && args[3] == "--not"
+                        && args[4] == integration_head.as_str()
+                }) {
+                    exclusive_walks += 1;
+                }
+                if argv.contains(&"--diff-merges=first-parent") {
                     patch_logs += 1;
                 }
-                if argv.iter().any(|arg| arg == "patch-id") {
+                if argv.contains(&"patch-id") {
                     patch_id_processes += 1;
                 }
-                if argv.iter().any(|arg| arg == "--format=%H %T %P") {
+                if argv.contains(&"--format=%H %T %P") {
                     shape_queries += 1;
                 }
             }
+            assert_eq!(
+                exclusive_walks, 1,
+                "one exclusive walk for captured heads in {mode}"
+            );
             let expected_streams = if mode == "ancestry" { 1 } else { 2 };
             assert_eq!(patch_logs, expected_streams, "log streams for {mode}");
             assert_eq!(
