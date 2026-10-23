@@ -1090,11 +1090,15 @@ impl BrokerOpenOptions {
     /// Use a pre-existing, empty preparation-cache root separate from host state.
     ///
     /// The path must be absolute and identify a real directory owned by this
-    /// user. A writable open initializes a durable marker and a nonce-scoped
-    /// child directory; capture and read-only planning do not create them. The
-    /// broker refuses cache writes or reclamation if the root is replaced or
-    /// its marker changes. Existing caches are not moved or deleted by selecting
-    /// this root.
+    /// user. A normal writable open initializes a durable marker and a
+    /// nonce-scoped child directory for a fresh staged or already-bound
+    /// repository. Legacy-unbound opens leave the selected root untouched until
+    /// an operator applies a reviewed worktree-root binding; restricted
+    /// compatibility-backfill opens also leave unbound repositories untouched.
+    /// Capture and read-only planning do not create the marker or child
+    /// directory. The broker refuses cache writes or reclamation if the root is
+    /// replaced or its marker changes. Existing caches are not moved or deleted
+    /// by selecting this root.
     pub fn with_preparation_cache_root(mut self, path: impl Into<PathBuf>) -> Self {
         self.preparation_cache_root = Some(path.into());
         self
