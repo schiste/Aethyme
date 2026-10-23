@@ -6,6 +6,7 @@ pub mod canonical_json;
 pub mod contribution_revision;
 mod digest;
 pub mod project_identity;
+pub mod project_association;
 pub mod record;
 pub mod source_snapshot;
 pub mod symbol_identity;
@@ -19,6 +20,9 @@ pub use project_identity::{
     FileNamespaceConflictKind, FileOperation, FileState, IdentityRelation, ProjectDescriptor,
     ProjectFileIdentityState, ProjectId, ProjectIdentityError, advance_file_identities,
     validate_file_proposals,
+};
+pub use project_association::{
+    ProjectAssociationDescriptor, ProjectAssociationError,
 };
 pub use record::{FieldKind, FieldSpec, Record, RecordError, RecordId, RecordSchema, StateReading};
 pub use source_snapshot::{
