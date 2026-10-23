@@ -12,12 +12,15 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use aethyme_broker::{Broker, BrokerOpenOptions};
+
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
 /// `pr update-branch` answers with the stderr and exit status the test sets,
 /// or kills itself to stand in for a crash part-way through the request.
 const FAKE_GH: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
 case "$1 $2" in
   'pr view')
     printf '{"headRefName":"agent/pr-506","headRefOid":"%s","baseRefName":"main"}\n' \
@@ -25,6 +28,7 @@ case "$1 $2" in
     exit 0
     ;;
   'pr update-branch')
+    if [ -n "$AETHYME_FAKE_GH_DELAY" ]; then sleep "$AETHYME_FAKE_GH_DELAY"; fi
     printf '%s\n' "$AETHYME_FAKE_GH_STDERR" >&2
     if [ "$AETHYME_FAKE_GH_RC" = 'kill' ]; then kill -9 $$; fi
     exit "$AETHYME_FAKE_GH_RC"
@@ -102,6 +106,10 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str], stderr: &str, rc: &str) -> Output {
+        self.run_with_delay(args, stderr, rc, "")
+    }
+
+    fn run_with_delay(&self, args: &[&str], stderr: &str, rc: &str, delay: &str) -> Output {
         common::broker_cli(CLI, args)
             .current_dir(self.repo.path())
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
@@ -114,33 +122,75 @@ impl Fixture {
                 ),
             )
             .env("GIT_SSH_COMMAND", "false")
+            .env("AETHYME_FAKE_GH_LOG", self.bin.path().join("gh.log"))
             .env("AETHYME_FAKE_GH_STDERR", stderr)
             .env("AETHYME_FAKE_GH_RC", rc)
+            .env("AETHYME_FAKE_GH_DELAY", delay)
             .output()
             .unwrap()
     }
 
-    /// Run `gh pr update-branch` through the broker and return the status the
-    /// journal recorded for it.
-    fn update_branch(&self, stderr: &str, rc: &str) -> (Output, String) {
-        let output = self.run(
-            &[
-                "advanced",
-                "gh",
-                "--session",
-                &self.session,
-                "--repo",
-                "schiste/Aethyme",
-                "--reason",
-                "update the PR branch this test is about",
-                "--",
-                "pr",
-                "update-branch",
-                "506",
-            ],
-            stderr,
-            rc,
-        );
+    fn broker(&self) -> Broker {
+        Broker::open_with_options(
+            self.repo.path(),
+            BrokerOpenOptions::default()
+                .with_host_state_dir(self.state.path())
+                .with_host_operation_database(self.state.path().join("host-operations.db")),
+        )
+        .unwrap()
+    }
+
+    fn seed_open_pr_listing(&self) -> String {
+        let fetched_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let listing = serde_json::json!({
+            "fetched_at_ms": fetched_at_ms,
+            "base": "main",
+            "prs": [{
+                "number": 506,
+                "url": "https://github.com/schiste/Aethyme/pull/506",
+                "head": "agent/pr-506",
+                "head_oid": "1111111111111111111111111111111111111111"
+            }]
+        })
+        .to_string();
+        let mut broker = self.broker();
+        broker
+            .store()
+            .meta_set("pr_overlap.open_prs", &listing)
+            .unwrap();
+        listing
+    }
+
+    fn cached_open_pr_listing(&self) -> Option<String> {
+        let mut broker = self.broker();
+        broker.store().meta_get("pr_overlap.open_prs").unwrap()
+    }
+
+    fn gh_operation(
+        &self,
+        flags: &[&str],
+        gh_args: &[&str],
+        stderr: &str,
+        rc: &str,
+        delay: &str,
+    ) -> (Output, String) {
+        let mut args = vec![
+            "advanced",
+            "gh",
+            "--session",
+            &self.session,
+            "--repo",
+            "schiste/Aethyme",
+            "--reason",
+            "update the PR operation fixture",
+        ];
+        args.extend(flags);
+        args.push("--");
+        args.extend(gh_args);
+        let output = self.run_with_delay(&args, stderr, rc, delay);
         let listed = self.run(&["advanced", "operations", "list", "--json"], "", "0");
         let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
         let operations = listed["operations"].as_array().unwrap();
@@ -148,14 +198,75 @@ impl Fixture {
         let status = operations[0]["status"].as_str().unwrap().to_string();
         (output, status)
     }
+
+    /// Run `gh pr update-branch` through the broker and return the status the
+    /// journal recorded for it.
+    fn update_branch(&self, stderr: &str, rc: &str) -> (Output, String) {
+        self.gh_operation(&[], &["pr", "update-branch", "506"], stderr, rc, "")
+    }
+}
+
+fn assert_invalidated_listing(fixture: &Fixture, original: &str) {
+    let current = fixture
+        .cached_open_pr_listing()
+        .expect("the stale listing sentinel remains in the cache key");
+    assert_ne!(
+        current, original,
+        "the successful or uncertain write invalidates the listing"
+    );
+    let value: serde_json::Value = serde_json::from_str(&current).unwrap();
+    assert_eq!(value["fetched_at_ms"], 0);
+    assert_eq!(value["base"], "");
+    assert_eq!(value["prs"], serde_json::json!([]));
+}
+
+#[test]
+fn a_successful_pr_topology_write_invalidates_cached_open_pr_membership() {
+    let fixture = Fixture::new();
+    let original = fixture.seed_open_pr_listing();
+    let (output, status) = fixture.update_branch("", "0");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(status, "succeeded");
+    assert_invalidated_listing(&fixture, &original);
+}
+
+#[test]
+fn changing_a_pr_base_invalidates_cached_open_pr_membership() {
+    let fixture = Fixture::new();
+    let original = fixture.seed_open_pr_listing();
+    let (output, status) = fixture.gh_operation(
+        &[],
+        &["pr", "edit", "506", "--base", "develop"],
+        "",
+        "0",
+        "",
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(status, "succeeded");
+    assert_invalidated_listing(&fixture, &original);
 }
 
 #[test]
 fn a_conflict_refusal_is_failed_and_does_not_write_block() {
     let fixture = Fixture::new();
+    let original = fixture.seed_open_pr_listing();
     let (output, status) = fixture.update_branch("X Cannot update PR branch due to conflicts", "1");
 
     assert_eq!(status, "failed");
+    assert_eq!(
+        fixture.cached_open_pr_listing().as_deref(),
+        Some(original.as_str())
+    );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("write-blocked"), "{stderr}");
@@ -168,14 +279,64 @@ fn a_conflict_refusal_is_failed_and_does_not_write_block() {
 #[test]
 fn a_transport_failure_stays_outcome_unknown() {
     let fixture = Fixture::new();
+    let original = fixture.seed_open_pr_listing();
     let (output, status) = fixture.update_branch(
         "Post \"https://api.github.com/graphql\": read: connection reset by peer",
         "1",
     );
 
     assert_eq!(status, "outcome_unknown");
+    assert_invalidated_listing(&fixture, &original);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("write-blocked"), "{stderr}");
+}
+
+#[test]
+fn a_timed_out_pr_topology_write_invalidates_cached_open_pr_membership() {
+    let fixture = Fixture::new();
+    let original = fixture.seed_open_pr_listing();
+    let (output, status) = fixture.gh_operation(
+        &["--queue-timeout", "5"],
+        &["pr", "update-branch", "506"],
+        "",
+        "0",
+        "30",
+    );
+
+    assert_eq!(status, "outcome_unknown");
+    assert!(!output.status.success());
+    assert_invalidated_listing(&fixture, &original);
+    let gh_log = std::fs::read_to_string(fixture.bin.path().join("gh.log")).unwrap();
+    assert!(gh_log.contains("pr update-branch 506"), "{gh_log}");
+}
+
+#[test]
+fn a_body_only_pr_edit_keeps_cached_open_pr_membership() {
+    let fixture = Fixture::new();
+    let original = fixture.seed_open_pr_listing();
+    let (output, status) = fixture.gh_operation(
+        &[],
+        &[
+            "pr",
+            "edit",
+            "506",
+            "--body=do not close; --base=release; state=closed",
+        ],
+        "",
+        "0",
+        "",
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(status, "succeeded");
+    assert_eq!(
+        fixture.cached_open_pr_listing().as_deref(),
+        Some(original.as_str())
+    );
 }
 
 #[test]
