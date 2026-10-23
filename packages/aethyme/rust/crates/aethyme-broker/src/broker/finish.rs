@@ -1158,9 +1158,9 @@ impl Broker {
         if canonical_path.parent() != Some(parent.as_path()) {
             return Ok(false);
         }
-        let checkout = match GitRepo::discover(&canonical_path) {
-            Ok(checkout) => checkout,
-            Err(discovery_error) => {
+        let actual = match GitRepo::worktree_common_dir(&canonical_path) {
+            Ok(common_dir) => common_dir,
+            Err(inspection_error) => {
                 // The pointer is independent evidence only if it names this
                 // repository and its gitdir is actually gone. A timeout or
                 // other Git failure while the gitdir still exists must remain
@@ -1171,10 +1171,9 @@ impl Broker {
                 {
                     return Ok(true);
                 }
-                return Err(discovery_error);
+                return Err(inspection_error);
             }
         };
-        let actual = checkout.git_common_dir()?;
         let expected = self.main_git_common_dir()?;
         Ok(actual == expected)
     }

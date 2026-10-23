@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-20
+Last Updated: 2026-10-22
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -59,6 +59,39 @@ host state and use a compatible runtime. See
 [the storage lifecycle recovery contract](local-v3-storage-lifecycle.md)
 before applying a plan.
 
+### Detached whole-checkout continuation (#997, #999)
+
+The same private worker can process a separate whole-checkout request after an
+enabled automatic cleanup pass in `Inline` or `Drain` scope defers work.
+Artifact backlog or a cache-only request alone does not create checkout work;
+only the qualifying pass's own checkout deferral does. `FinishDrain` never creates
+that request. Its requested generation, completed generation and retry-after value
+are separate from cache-lap completion and use the captured storage-context
+namespace. The worker does not read, resume or rewrite an operator's
+`.aethyme/gc-journal.json`.
+
+The installed-pair and singleton-worker checks above still apply. Each checkout
+pass also acquires the GC lock, rechecks the exact request generation and runs
+the ordinary automatic-removal proofs. A request is scheduling state, not
+deletion authority: the complete colocated closed-session set, persisted spawn
+witness, fresh instance identity, clean state, remote containment and current
+process-use protection remain required. A stale worker cannot complete a newer
+generation. Non-store cache-lane failures are deferred and do not suppress an
+independently due checkout lane; cache-lane store errors remain fatal. A generation
+completes only when policy is valid and the pass reports no deferred work (or
+cleanup is disabled), and the request generation is still current. Kept or
+protected checkouts can remain after a generation completes.
+
+The worker reserves time for checkout work and stops after bounded passes or
+repeated no-progress, retaining incomplete work with retry backoff. Scheduling
+builds complete canonical cohorts and live-path evidence before rotating the
+durable cursor, then inspects selected cohorts. A deferred cohort is
+checkpointed before ending that tranche so a later pass can reach the next
+cohort. Complete history discovery and individual filesystem or database calls
+can exceed the cooperative deadline. This is neither a hard completion deadline
+nor a repository storage quota; retained or unknown work may continue occupying
+space.
+
 ### GC journal recovery commands (#852)
 
 The operator-facing `aethyme broker gc abandon --confirm <pending-digest>`
@@ -77,13 +110,30 @@ pruned automatically, and cannot be forgotten while its exact bytes are needed
 for active-journal crash recovery. Neither command accepts an arbitrary archive
 path or grants deletion authority.
 
+### Spawned-worktree instance witnesses (#995)
+
+Broker schema 53 adds `spawned_worktree_instances`, with a session ID and a
+versioned witness captured from the checkout returned by Git worktree creation.
+The session and witness are recorded in the same transaction. Later automatic
+whole-checkout cleanup compares that persisted instance with fresh filesystem,
+Git identity, ownership and lifecycle evidence before removal. A path or session
+registration alone is insufficient authority.
+
+The migration does not backfill historical or adopted checkouts. Missing,
+changed or unknown evidence retains the checkout. The minimum compatible schema
+remains 52: compatible older writers can register sessions without this optional
+table, and this runtime will not automatically remove those unwitnessed
+checkouts. This marker does not fence every older binary's cleanup behavior.
+Drain old clients and deploy an aligned router/engine pair before relying on the
+new cleanup policy across a repository.
+
 ### Detached automatic artifact continuation (#818)
 
-The broker starts the private `broker gc __continue-artifacts <canonical-main-root>` child only from the installed router paired with its sibling engine. The child requires `AETHYME_GC_ARTIFACT_SWEEP_WORKER=1`, a writable non-ephemeral main checkout, aligned router/engine build identities, and the OS advisory singleton lock before it opens broker state. The subprocess is cache-only: it may remove eligible ignored build caches, but never removes a checkout or branch. It records completion only after a full eligible cache lap; deadline, lease contention, deletion failure, or repeated no-progress leaves the generation pending with bounded backoff. A new pressure refusal clears that backoff. The command remains hidden from help and is invoked only by the paired installed runtime.
+The broker starts the private `broker gc __continue-artifacts <canonical-main-root>` child only from the installed router paired with its sibling engine. The child requires `AETHYME_GC_ARTIFACT_SWEEP_WORKER=1`, a writable non-ephemeral main checkout, aligned router/engine build identities, and the OS advisory singleton lock before it opens broker state. Its artifact lane may remove eligible ignored build caches; that lane never removes a checkout or branch. A separate durable request can enable the whole-checkout lane described below. It records completion only after a full eligible cache lap; deadline, lease contention, deletion failure, or repeated no-progress leaves the generation pending with bounded backoff. A new pressure refusal clears that backoff. The command remains hidden from help and is invoked only by the paired installed runtime.
 
 Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
 
-The nine durable artifact-sweep keys are scoped by a SHA-256 namespace derived
+The nine durable cache-sweep keys are scoped by a SHA-256 namespace derived
 from the complete captured broker storage context. Linked worktrees in the
 same repository and using the same captured context share sweep state; a
 different effective host-storage configuration gets a separate cursor and
