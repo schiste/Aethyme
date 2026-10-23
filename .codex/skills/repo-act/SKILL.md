@@ -460,7 +460,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   focused selection. Test bounded output with explicit omission counts; a
   smaller display must still surface the coordination state callers need.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
-  check child output on the intended stream separately. A report may retain
+  check child output on the intended stream separately. Include both stdout
+  and stderr in subprocess failure assertions: a structured refusal can be
+  written to stdout while stderr is empty. A report may retain
   the original command arguments, so searching its serialized text for a child
   marker cannot establish output isolation. Assert command metadata separately.
 - For CLI subprocess-count regressions, trace the complete invoked path,
