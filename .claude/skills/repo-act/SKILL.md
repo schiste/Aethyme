@@ -90,9 +90,6 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and mirrored-skill parity; never commit a template overwrite blindly.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
-- Treat full-repository static audits as validation work during a local build
-  pause; route them to remote checks instead of running them locally. A prebuilt
-  executable can still consume substantial CPU across bulk imports and scans.
 - Choose focused local Cargo checks by compilation target as well as test name.
   A name filter selects cases at runtime; `--lib` still compiles the full unit-test
   target. Start with a relevant integration-test target when available, keep one
@@ -110,6 +107,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Cargo `[env]` configuration: Cargo injects those values into test child
   processes, while direct execution does not. Replay and record relevant values
   explicitly, or classify the direct run as non-equivalent.
+- Treat full-repository static audits as validation work during a local build
+  pause; route them to remote checks instead of running them locally. A prebuilt
+  executable can still consume substantial CPU across bulk imports and scans.
 - Smoke-test each binary against its own CLI contract. Run read-only probes
   outside a Git checkout with isolated home/state; preserve an unsupported
   command as a failed probe instead of treating it as a successful smoke check.
