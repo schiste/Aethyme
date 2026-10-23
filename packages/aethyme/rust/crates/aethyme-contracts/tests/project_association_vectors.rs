@@ -140,13 +140,13 @@ fn each_explicit_proposal_has_a_fresh_bounded_record_id_and_old_readers_refuse_i
             capability: None,
         },
     ];
-    let old_schema = RecordSchema {
+    static OLD_SCHEMA: RecordSchema = RecordSchema {
         name: PROJECT_ASSOCIATION_SCHEMA_NAME,
         fields: OLD_FIELDS,
         capabilities: &[],
     };
     assert!(matches!(
-        Record::decode(&bytes, &[&old_schema]),
+        Record::decode(&bytes, &[&OLD_SCHEMA]),
         Err(RecordError::UnsupportedCapability { capability })
             if capability == PROJECT_ASSOCIATION_PROPOSAL_NONCE_CAPABILITY
     ));
