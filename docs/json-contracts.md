@@ -602,7 +602,11 @@ says `experimental-v0`, and a consumer must check `schema` first.
 Project association proposals name two independently approved project
 bindings and require distinct `ProjectId`s. `propose --write` creates the
 canonical `.aethyme/project-association.json` proposal without changing either
-store. `confirm` requires the exact proposal `RecordId`, rechecks both
+store. The returned descriptor includes a required `proposal_nonce` field and
+the `project-association-proposal-nonce-v1` capability in `requires`. Its
+`sha256:<64 lowercase hex>` value is non-secret and gives each deliberate
+proposal fresh canonical identity; older readers refuse the capability.
+`confirm` requires the exact proposal `RecordId`, rechecks both
 committed descriptors and both retained local bindings, then writes the
 canonical object and confirmation row only to the invoking project's existing
 store. The peer store is opened read-only. `revoke` changes only that local
@@ -610,6 +614,10 @@ row and does not open the peer store. These records grant no execution,
 acceptance, or source permission authority. Schema 31 stores the local record
 and its canonical object root; binaries that do not preserve association roots
 cannot write the migrated store.
+
+A revoked `RecordId` remains a tombstone. To associate the pair again, move or
+remove the prior proposal file, create a fresh proposal, and confirm its new
+exact `RecordId`; the old record remains revoked.
 
 Resolution handoff commands are local and experimental. Every success object
 states `dispatches_agent: false` and `grants_acceptance: false`. `prepare`
