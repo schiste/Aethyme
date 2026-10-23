@@ -1201,10 +1201,19 @@ required_for_hooks = false
     ));
     let session = started["id"].as_i64().unwrap().to_string();
     let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    let placement_root = PathBuf::from(started["worktree_placement"]["root"].as_str().unwrap());
+    let canonical_worktree = worktree.canonicalize().unwrap();
+    let canonical_placement_root = placement_root.canonicalize().unwrap();
     assert!(worktree.is_dir(), "managed worktree must exist: {started}");
     assert!(
-        worktree.join(".aethyme-worktree-root.json").is_file(),
-        "start must write the ownership marker required by worktree-volume storage: {started}"
+        canonical_worktree.starts_with(&canonical_placement_root),
+        "managed worktree must be inside its returned placement root: {started}"
+    );
+    assert!(
+        canonical_placement_root
+            .join(".aethyme-worktree-root.json")
+            .is_file(),
+        "start must write the placement-root ownership marker required by worktree-volume storage: {started}"
     );
     let prepared = json(run(
         repo.path(),
