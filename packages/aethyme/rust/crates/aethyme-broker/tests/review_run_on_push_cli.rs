@@ -7,8 +7,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
-
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
@@ -210,9 +208,8 @@ impl Fixture {
 
     /// A live session with one committed change: (id, branch, head).
     fn session(&self) -> (i64, String, String) {
-        let session = Broker::open(&self.repo)
+        let session = common::open_fixture_broker(&self.repo, self.tmp.path())
             .unwrap()
-            .with_host_operation_database(self.tmp.path().join("host-state/operations.db"))
             .start_worktree("push early", None)
             .unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
@@ -225,7 +222,7 @@ impl Fixture {
 
     fn push(&self, session: i64, branch: &str, head: &str, env: &[(&str, &str)]) -> Output {
         let id = session.to_string();
-        common::broker_cli(CLI, &["push", "--session", &id, "--json"])
+        common::broker_cli_for_fixture(CLI, &["push", "--session", &id, "--json"], &self.repo)
             .current_dir(&self.repo)
             .env(
                 "PATH",
@@ -235,7 +232,10 @@ impl Fixture {
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
-            .env("AETHYME_HOST_STATE_DIR", self.tmp.path().join("host-state"))
+            .env(
+                "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+                self.tmp.path().join("worktrees"),
+            )
             .env("AETHYME_AGENT_PID", std::process::id().to_string())
             .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
             .env("AETHYME_FAKE_GH_STATE", &self.state)

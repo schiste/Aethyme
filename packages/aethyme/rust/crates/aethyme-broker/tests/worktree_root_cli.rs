@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use aethyme_broker::{Broker, BrokerOpenOptions};
+
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
@@ -46,12 +48,76 @@ fn run_with_host_state(repo: &Path, state: &Path, args: &[&str]) -> Output {
     run(repo, state, args)
 }
 
-fn run_with_root(repo: &Path, root: &Path, args: &[&str]) -> Output {
-    common::broker_cli_for_fixture(CLI, args, repo)
+fn run_with_new_database_and_root(
+    repo: &Path,
+    state: &Path,
+    cache: &Path,
+    database: &Path,
+    root_container: &Path,
+    args: &[&str],
+) -> Output {
+    common::broker_cli(CLI, args)
         .current_dir(repo)
-        .env("AETHYME_WORKTREE_ROOT", root)
+        .env("AETHYME_HOST_STATE_DIR", state)
+        .env("AETHYME_HOST_CACHE_DIR", cache)
+        .env("AETHYME_BROKER_DB", database)
+        .env("AETHYME_WORKTREE_ROOT", root_container)
         .output()
         .unwrap()
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn sqlite_count_if_present(path: &Path, query: &str) -> u64 {
+    if !path.is_file() {
+        return 0;
+    }
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap()
+        .query_row(query, [], |row| row.get(0))
+        .unwrap()
+}
+
+fn worktree_root_registry_path(state: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(state)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("worktree-roots-")
+        })
+        .map(|directory| directory.join("registry.sqlite3"))
+}
+
+fn bind_managed_root_fixture(repo: &Path, state: &Path, cache: &Path, root: &Path) {
+    std::fs::create_dir_all(state).unwrap();
+    std::fs::create_dir_all(cache).unwrap();
+    std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+    let options = BrokerOpenOptions::default()
+        .with_host_state_dir(state)
+        .with_host_cache_dir(cache)
+        .with_worktree_root(root);
+    let mut broker = Broker::open_with_options(repo, options).unwrap();
+    let bootstrap = broker
+        .start_worktree("fixture root binding", None)
+        .unwrap();
+    let branch = bootstrap.branch.clone();
+    broker.close(bootstrap.id).unwrap();
+    broker.cleanup(bootstrap.id, false).unwrap();
+    if !git_output(repo, &["branch", "--list", &branch]).is_empty() {
+        git(repo, &["branch", "-D", &branch]);
+    }
+    assert!(root.join(".aethyme-worktree-root.json").is_file());
 }
 
 fn run_with_storage_paths(
@@ -60,14 +126,34 @@ fn run_with_storage_paths(
     preparation_cache: &Path,
     args: &[&str],
 ) -> Output {
-    common::broker_cli(CLI, args)
+    run_with_host_paths(repo, host_state, Some(preparation_cache), args)
+}
+
+fn run_without_preparation_cache(
+    repo: &Path,
+    host_state: &Path,
+    args: &[&str],
+) -> Output {
+    run_with_host_paths(repo, host_state, None, args)
+}
+
+fn run_with_host_paths(
+    repo: &Path,
+    host_state: &Path,
+    preparation_cache: Option<&Path>,
+    args: &[&str],
+) -> Output {
+    let mut command = common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_HOST_STATE_DIR", host_state)
         .env(
             "AETHYME_HOST_CACHE_DIR",
             host_state.with_file_name("host-cache"),
-        )
-        .env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache)
+        );
+    if let Some(preparation_cache) = preparation_cache {
+        command.env("AETHYME_PREPARATION_CACHE_ROOT", preparation_cache);
+    }
+    command
         .env(
             "AETHYME_BROKER_OPEN_HOST_OPERATION_DB",
             host_state.join("host-operations.db"),
@@ -79,6 +165,11 @@ fn run_with_storage_paths(
         )
         .output()
         .unwrap()
+}
+
+fn snapshot_status(repository: &Path) -> serde_json::Value {
+    let broker = Broker::open_snapshot(repository).unwrap();
+    serde_json::to_value(broker.status_current_snapshot(0).unwrap()).unwrap()
 }
 
 struct LegacyRootFixture {
@@ -478,15 +569,43 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("project");
     let state = tmp.path().join("state");
+    let cache = tmp.path().join("cache");
+    let database = tmp.path().join("broker.db");
     fixture_at(&repo);
-
-    let first = json(run_with_host_state(
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    let linked_checkout = tmp.path().join("unmanaged-checkout");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/unmanaged-checkout",
+            linked_checkout.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let plan = json(run_with_new_database_and_root(
         &repo,
         &state,
-        &["start", "--task", "owner", "--json"],
+        &cache,
+        &database,
+        &linked_checkout,
+        &["advanced", "worktree-root", "--json"],
     ));
-    let first_path = PathBuf::from(first["worktree_path"].as_str().unwrap());
-    let output = run_with_root(&repo, &first_path, &["start", "--task", "nested", "--json"]);
+    let selected_root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
+    assert!(selected_root.starts_with(&linked_checkout));
+    assert!(!selected_root.exists());
+    let output = run_with_new_database_and_root(
+        &repo,
+        &state,
+        &cache,
+        &database,
+        &linked_checkout,
+        &["start", "--task", "nested", "--json"],
+    );
 
     assert!(!output.status.success());
     assert!(
@@ -494,6 +613,7 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
         "{}",
         json_error::message(&output)
     );
+    assert!(!selected_root.exists(), "refused nested root was allocated");
 }
 
 #[test]
@@ -646,12 +766,27 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
             let repo = tmp.path().join("project");
             let state = tmp.path().join("state");
             let cache = tmp.path().join("cache");
-            let root = tmp.path().join("override-worktrees");
+            let root_container = tmp.path().join("override-worktrees");
             let sentinel = tmp.path().join("agent-ran");
             fixture_at(&repo);
-            if !override_root {
-                std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(&cache).unwrap();
+            let selected_container = if override_root {
+                root_container.clone()
+            } else {
+                state.join("worktrees")
+            };
+            std::fs::create_dir_all(&selected_container).unwrap();
+            let mut plan_command = common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
+                .current_dir(&repo)
+                .env("AETHYME_HOST_STATE_DIR", &state)
+                .env("AETHYME_HOST_CACHE_DIR", &cache);
+            if override_root {
+                plan_command.env("AETHYME_WORKTREE_ROOT", &root_container);
             }
+            let plan = json(plan_command.output().unwrap());
+            let selected_root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
+            assert!(!selected_root.exists(), "the selected root starts absent");
             let args = if agent {
                 vec![
                     "start",
@@ -674,7 +809,7 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
                 .env("AETHYME_TEST_AGENT_SENTINEL", &sentinel)
                 .env(aethyme_broker::TEST_AVAILABLE_BYTES_ENV, "1024");
             if override_root {
-                command.env("AETHYME_WORKTREE_ROOT", &root);
+                command.env("AETHYME_WORKTREE_ROOT", &root_container);
             }
             let output = command.output().unwrap();
             let text = format!(
@@ -687,10 +822,9 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
                 "low-space start was admitted: {text}"
             );
             assert!(text.contains("broker recovery reserve"), "{text}");
-            assert!(!root.exists(), "override root allocated before admission");
             assert!(
-                !state.join("worktrees").exists(),
-                "host root allocated before admission"
+                !selected_root.exists(),
+                "selected worktree root allocated before admission"
             );
             assert!(
                 !repo.join(".aethyme/worktrees").exists(),
@@ -770,6 +904,8 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
             upload_pack.to_str().unwrap(),
         ],
     );
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
     let plan = json(
         common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
             .current_dir(&repo)
@@ -880,6 +1016,9 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             let container = tmp.path().join("worktrees");
             let sentinel = tmp.path().join("agent-ran");
             fixture_at(&repo);
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::create_dir_all(&container).unwrap();
             let plan = json(
                 common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
                     .current_dir(&repo)
@@ -890,11 +1029,18 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                     .unwrap(),
             );
             let root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
-            std::fs::create_dir_all(&root).unwrap();
+            if case == "unmarked" {
+                std::fs::create_dir_all(&root).unwrap();
+            } else {
+                bind_managed_root_fixture(&repo, &state, &cache, &root);
+            }
             let payload = root.join("preserve.txt");
             std::fs::write(&payload, b"unrelated contents").unwrap();
             let marker = root.join(".aethyme-worktree-root.json");
             let external = tmp.path().join("external-marker.json");
+            if case == "unmarked" && marker.exists() {
+                std::fs::remove_file(&marker).unwrap();
+            }
             if case == "oversized" {
                 let owner = serde_json::json!({
                     "schema_version": 1,
@@ -924,7 +1070,9 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o750)).unwrap();
+                let expected_mode = if case == "unmarked" { 0o750 } else { 0o700 };
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(expected_mode))
+                    .unwrap();
             }
             let before_entries: Vec<_> = std::fs::read_dir(&root)
                 .unwrap()
@@ -932,6 +1080,14 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 .collect();
             let before_marker = std::fs::read(&marker).ok();
             let before_external = std::fs::read(&external).ok();
+            let sessions_before = sqlite_count_if_present(
+                &repo.join(".aethyme/broker.db"),
+                "SELECT count(*) FROM sessions",
+            );
+            let roots_before = worktree_root_registry_path(&state)
+                .as_deref()
+                .map(|path| sqlite_count_if_present(path, "SELECT count(*) FROM roots"))
+                .unwrap_or(0);
             let args = if agent {
                 vec![
                     "start",
@@ -959,7 +1115,7 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             );
             assert!(!output.status.success(), "{case}/{agent}: {text}");
             let expected = if case == "unmarked" {
-                "nonempty unmarked directory"
+                "fresh binding refuses an existing root"
             } else {
                 "invalid ownership marker"
             };
@@ -972,7 +1128,7 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 use std::os::unix::fs::PermissionsExt;
                 assert_eq!(
                     std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-                    0o750,
+                    if case == "unmarked" { 0o750 } else { 0o700 },
                     "{case}: refusing ownership must precede chmod"
                 );
                 if case.ends_with("link") {
@@ -998,34 +1154,19 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 "root contents changed after refusal"
             );
             assert!(!sentinel.exists(), "unadmitted agent ran");
-            let database = rusqlite::Connection::open_with_flags(
-                repo.join(".aethyme/broker.db"),
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .unwrap();
-            let sessions: u64 = database
-                .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(sessions, 0);
-            let history_dir = std::fs::read_dir(&state)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| {
-                    path.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with("worktree-roots-")
-                })
-                .unwrap();
-            let history = rusqlite::Connection::open_with_flags(
-                history_dir.join("registry.sqlite3"),
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .unwrap();
-            let roots: u64 = history
-                .query_row("SELECT count(*) FROM roots", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(roots, 0, "refused root acquired ownership history");
+            let sessions_after = sqlite_count_if_present(
+                &repo.join(".aethyme/broker.db"),
+                "SELECT count(*) FROM sessions",
+            );
+            assert_eq!(
+                sessions_after, sessions_before,
+                "refused start registered a session"
+            );
+            let roots_after = worktree_root_registry_path(&state)
+                .as_deref()
+                .map(|path| sqlite_count_if_present(path, "SELECT count(*) FROM roots"))
+                .unwrap_or(0);
+            assert_eq!(roots_after, roots_before, "refused root changed ownership history");
             let branches = Command::new("git")
                 .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
                 .current_dir(&repo)
@@ -1057,19 +1198,7 @@ fn synthetic_downgrade_status_leaves_database_root_and_cache_unchanged() {
     let retained_worktree_before = std::fs::read(&retained_worktree_file).unwrap();
     let session_rows_before = session_rows(&fixture.database);
 
-    let output = run_with_storage_paths(
-        &fixture.repository,
-        &fixture.host_state,
-        &fixture.preparation_cache,
-        &["status", "--read-only-snapshot", "--json"],
-    );
-    assert!(
-        output.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let _status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let _status = snapshot_status(&fixture.repository);
 
     assert_eq!(std::fs::read(&fixture.database).unwrap(), database_before);
     assert_eq!(read_meta(&fixture.database, "schema_version"), "52");
@@ -1119,10 +1248,9 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
     let retained_worktree_file = fixture.worktree.join("legacy-retained.txt");
     let session_rows_before = session_rows(&fixture.database);
 
-    let refused_start = run_with_storage_paths(
+    let refused_start = run_without_preparation_cache(
         &fixture.repository,
         &fixture.host_state,
-        &fixture.preparation_cache,
         &["start", "--task", "must review legacy root", "--json"],
     );
     let refusal_text = format!(
@@ -1169,10 +1297,9 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         "keyed_container",
         "--json",
     ];
-    let plan = json(run_with_storage_paths(
+    let plan = json(run_without_preparation_cache(
         &fixture.repository,
         &fixture.host_state,
-        &fixture.preparation_cache,
         &plan_args,
     ));
     assert_eq!(plan["worktree_root"], root_arg);
@@ -1207,10 +1334,9 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         digest,
         "--json",
     ];
-    let binding = json(run_with_storage_paths(
+    let binding = json(run_without_preparation_cache(
         &fixture.repository,
         &fixture.host_state,
-        &fixture.preparation_cache,
         &apply_args,
     ));
     assert_eq!(binding["state"], "bound");
@@ -1236,6 +1362,7 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         1
     );
 
+    std::fs::create_dir_all(&fixture.preparation_cache).unwrap();
     let started = json(run_with_storage_paths(
         &fixture.repository,
         &fixture.host_state,
@@ -1417,19 +1544,7 @@ fn v028_schema52_snapshot_status_preserves_the_released_session_root_and_cache()
         .map(|entry| entry.unwrap().file_name())
         .collect::<std::collections::BTreeSet<_>>();
 
-    let output = run_with_storage_paths(
-        &fixture.repository,
-        &fixture.host_state,
-        &fixture.preparation_cache,
-        &["status", "--read-only-snapshot", "--json"],
-    );
-    assert!(
-        output.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let _status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let _status = snapshot_status(&fixture.repository);
 
     assert_eq!(std::fs::read(&fixture.database).unwrap(), database_before);
     assert_eq!(read_meta(&fixture.database, "schema_version"), "52");
@@ -1459,10 +1574,9 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     let original_worktree_file = fixture.worktree.join("README.md");
     let original_worktree_file_before = std::fs::read(&original_worktree_file).unwrap();
 
-    let refused_start = run_with_storage_paths(
+    let refused_start = run_without_preparation_cache(
         &fixture.repository,
         &fixture.host_state,
-        &fixture.preparation_cache,
         &["start", "--task", "must review legacy root", "--json"],
     );
     let refusal_text = format!(
@@ -1486,10 +1600,9 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     );
 
     let root_arg = fixture.worktree_root.to_string_lossy().into_owned();
-    let plan = json(run_with_storage_paths(
+    let plan = json(run_without_preparation_cache(
         &fixture.repository,
         &fixture.host_state,
-        &fixture.preparation_cache,
         &[
             "advanced",
             "worktree-root",
@@ -1509,10 +1622,9 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert_eq!(event_rows(&fixture.database), events_before);
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
 
-    let bound = json(run_with_storage_paths(
+    let bound = json(run_without_preparation_cache(
         &fixture.repository,
         &fixture.host_state,
-        &fixture.preparation_cache,
         &[
             "advanced",
             "worktree-root",
@@ -1534,6 +1646,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert_eq!(event_rows(&fixture.database), events_before);
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
 
+    std::fs::create_dir_all(&fixture.preparation_cache).unwrap();
     let started = json(run_with_storage_paths(
         &fixture.repository,
         &fixture.host_state,

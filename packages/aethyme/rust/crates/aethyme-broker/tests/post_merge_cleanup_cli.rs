@@ -4,9 +4,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, MergeStatus};
+use aethyme_broker::MergeStatus;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -68,12 +69,13 @@ fn write_executable(path: &Path, contents: &str) {
 fn run_merge(
     repo: &Path,
     fake_bin: &Path,
-    host_state: &Path,
+    fixture_owner: &Path,
     session_id: i64,
     upstream_sha: &str,
 ) -> Output {
-    Command::new(CLI)
-        .args([
+    common::broker_cli_for_fixture(
+        CLI,
+        &[
             "advanced",
             "gh",
             "--session",
@@ -88,12 +90,17 @@ fn run_merge(
             "merge",
             "42",
             "--merge",
-        ])
-        .current_dir(repo)
+        ],
+        repo,
+    )
         .env("PATH", prepend_path(fake_bin))
         .env("AETHYME_TEST_REAL_GIT", real_git())
         .env("AETHYME_TEST_UPSTREAM_SHA", upstream_sha)
-        .env("AETHYME_HOST_STATE_DIR", host_state)
+        .env(
+            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+            fixture_owner.join("worktrees"),
+        )
+        .current_dir(repo)
         .output()
         .unwrap()
 }
@@ -130,7 +137,7 @@ fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
     git(&repo, &["config", "branch.main.remote", "origin"]);
     git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = common::open_fixture_broker(&repo, temp.path()).unwrap();
     let session = broker
         .start_worktree("land through pull request", None)
         .unwrap();
@@ -180,7 +187,7 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
     let output = run_merge(
         &repo,
         &fake_bin,
-        &temp.path().join("host-state"),
+        temp.path(),
         session.id,
         &upstream,
     );
@@ -206,7 +213,7 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
     assert_eq!(git(&repo, &["rev-parse", "origin/main"]), upstream);
     assert_eq!(git(&repo, &["rev-parse", "aethyme/integration"]), upstream);
     assert_ne!(promotion, upstream);
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = common::open_fixture_broker(&repo, temp.path()).unwrap();
     let entry = broker
         .store()
         .merge_queue()
