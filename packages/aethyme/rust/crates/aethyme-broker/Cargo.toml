@@ -64,6 +64,9 @@ tar = { workspace = true }
 # Release availability and downgrade decisions use semantic versions rather
 # than string ordering.
 semver = { workspace = true }
+# The cross-process contract inventory is scanned as one literal multi-pattern
+# set so each changed line is searched once.
+regex = { workspace = true }
 
 # `tests/gate_policy.rs` asserts over the live `.aethyme/gates.toml`, so it
 # needs the monorepo root rather than this crate's. `repo_root()` discovers
