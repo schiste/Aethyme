@@ -240,10 +240,27 @@ real saving there comes from migrating to pnpm, not from the flag.
 
 The shared store is keyed by preparation digest, so a repository whose lockfile
 differs between branches accumulates one store directory per distinct input set.
-`shared_cache.max_bytes` caps that, and the store is rotated when it exceeds the
-budget. Rotation happens inside the exclusive lease, never after it, because it
-removes a store other worktrees may be reading. Declaring a budget without a
-`repository_shared` step is refused rather than ignored.
+When set, `shared_cache.max_bytes` caps that, and the store is rotated when it
+exceeds the budget. Rotation happens inside the exclusive lease, never after it,
+because it removes a store other worktrees may be reading. Declaring a budget
+without a `repository_shared` step is refused rather than ignored.
+
+By default the broker places this store beside its captured host resource
+database. A repository may select the worktree placement filesystem when its
+package manager can hardlink its content-addressable store into each worktree:
+
+```toml
+[shared_cache]
+root = "worktree_volume"
+```
+
+The broker derives a repository-owned cache root under the selected worktree
+placement root and verifies its ownership marker and filesystem before use.
+An explicit `AETHYME_PREPARATION_CACHE_ROOT` operator setting keeps precedence;
+the broker refuses that setting for this mode if it is on another filesystem.
+Changing the selected placement does not migrate or remove an old cache root.
+Only the package-manager store can share physical data this way; declared
+worktree outputs such as Python virtual environments remain per-worktree.
 
 `npm install` is never drafted. It rewrites a committed lockfile, which is a
 tracked-file mutation the worktree guard refuses without an explicit lease.

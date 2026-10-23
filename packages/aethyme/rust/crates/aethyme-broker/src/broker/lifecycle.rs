@@ -9,6 +9,7 @@ const BROKER_OPEN_COLLABORATION_ROOT_ENV: &str = "AETHYME_BROKER_OPEN_COLLABORAT
 // Keep the private transport key stable; the payload version rejects old children explicitly.
 const BROKER_OPEN_STORAGE_CONTEXT_ENV: &str = "AETHYME_BROKER_STORAGE_CONTEXT_V1";
 const PREPARATION_CACHE_ROOT_ENV: &str = "AETHYME_PREPARATION_CACHE_ROOT";
+pub(crate) const WORKTREE_VOLUME_PREPARATION_CACHE_ROOT: &str = ".aethyme-preparation-cache";
 const BROKER_OPEN_STORAGE_CONTEXT_LEGACY_VERSION: u32 = 2;
 const BROKER_OPEN_STORAGE_CONTEXT_V4_VERSION: u32 = 4;
 const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
@@ -1009,6 +1010,7 @@ impl BrokerStorageContext {
                             reason: "captured preparation-cache root handle is unavailable".into(),
                         }
                     })?,
+                    placement_root: None,
                 }),
             }));
         }
@@ -1185,6 +1187,19 @@ fn validate_captured_preparation_cache_root(
 pub(crate) fn validate_preparation_cache_root_guard(
     guard: &crate::broker::PreparationCacheRootGuard,
 ) -> Result<(), BrokerOpError> {
+    if let Some(placement_root) = &guard.placement_root {
+        if guard.root_path
+            != placement_root
+                .path
+                .join(WORKTREE_VOLUME_PREPARATION_CACHE_ROOT)
+        {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "worktree-volume cache root no longer matches its captured placement root"
+                    .into(),
+            });
+        }
+        validate_worktree_placement_root_guard(placement_root)?;
+    }
     validate_captured_preparation_cache_root(
         &guard.root_path,
         &guard.root_identity,
@@ -1192,6 +1207,188 @@ pub(crate) fn validate_preparation_cache_root_guard(
         Some(&guard.captured_resource_db_path),
         &guard.root_handle,
     )
+}
+
+fn validate_worktree_placement_root_guard(
+    guard: &crate::broker::PreparationCachePlacementRootGuard,
+) -> Result<(), BrokerOpError> {
+    if !matches!(
+        std::fs::canonicalize(&guard.path),
+        Ok(canonical) if canonical == guard.path
+    ) {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "captured worktree placement root {} is no longer canonical",
+                guard.path.display()
+            )
+            .into_boxed_str(),
+        });
+    }
+    let identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(&guard.path)
+        .and_then(|identity| identity.encode())
+        .map_err(|error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot recheck captured worktree placement root {}: {error}",
+                guard.path.display()
+            )
+            .into_boxed_str(),
+        })?;
+    if identity != guard.identity {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "captured worktree placement root {} was replaced",
+                guard.path.display()
+            )
+            .into_boxed_str(),
+        });
+    }
+    let marker = crate::worktree_registry::read_marker(&guard.path).map_err(|error| {
+        BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot recheck worktree placement ownership marker in {}: {error}",
+                guard.path.display()
+            )
+            .into_boxed_str(),
+        }
+    })?;
+    if marker != guard.marker {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "worktree placement ownership marker changed in {}",
+                guard.path.display()
+            )
+            .into_boxed_str(),
+        });
+    }
+    Ok(())
+}
+
+fn capture_worktree_placement_root_guard(
+    path: &Path,
+    expected_marker: &WorktreeRootMarker,
+) -> Result<crate::broker::PreparationCachePlacementRootGuard, BrokerOpError> {
+    if !matches!(std::fs::canonicalize(path), Ok(canonical) if canonical == path) {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "worktree placement root {} is not canonical",
+                path.display()
+            )
+            .into_boxed_str(),
+        });
+    }
+    let identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(path)
+        .and_then(|identity| identity.encode())
+        .map_err(|error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot capture worktree placement root {}: {error}",
+                path.display()
+            )
+            .into_boxed_str(),
+        })?;
+    let marker = crate::worktree_registry::read_marker(path).map_err(|error| {
+        BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot verify worktree placement ownership marker in {}: {error}",
+                path.display()
+            )
+            .into_boxed_str(),
+        }
+    })?;
+    if &marker != expected_marker {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "worktree placement root {} belongs to a different repository",
+                path.display()
+            )
+            .into_boxed_str(),
+        });
+    }
+    Ok(crate::broker::PreparationCachePlacementRootGuard {
+        path: path.to_path_buf(),
+        identity,
+        marker,
+    })
+}
+
+/// Capture an already initialized worktree-volume cache root for read-only
+/// maintenance. A missing child is ordinary absence; an existing unmarked or
+/// malformed child is a blocker and is never adopted here.
+pub(crate) fn capture_worktree_volume_preparation_cache_root(
+    placement_root: &Path,
+    expected_marker: &WorktreeRootMarker,
+    resource_db_path: &Path,
+) -> Result<Option<crate::broker::PreparationCacheRootBinding>, BrokerOpError> {
+    let root_path = placement_root.join(WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+    match std::fs::symlink_metadata(&root_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: format!(
+                    "cannot inspect worktree-volume preparation-cache root {}: {error}",
+                    root_path.display()
+                )
+                .into_boxed_str(),
+            });
+        }
+        Ok(_) => {}
+    }
+    let placement_guard = capture_worktree_placement_root_guard(placement_root, expected_marker)?;
+    let (canonical, identity, state, directory) = capture_preparation_cache_root(&root_path)
+        .map_err(|reason| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "existing worktree-volume preparation-cache root {} is invalid: {reason}",
+                root_path.display()
+            )
+            .into_boxed_str(),
+        })?;
+    let context = BrokerStorageContext {
+        host_resource_db_path: Some(resource_db_path.to_path_buf()),
+        preparation_cache_root_override: Some(canonical),
+        preparation_cache_root_identity: Some(identity),
+        preparation_cache_root_state: Some(state),
+        preparation_cache_root_handle: Some(directory),
+        ..BrokerStorageContext::default()
+    };
+    let mut binding = context
+        .preparation_cache_root_binding()?
+        .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+            reason: "existing worktree-volume preparation-cache root has no captured host-resource database".into(),
+        })?;
+    let placement_identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(
+        placement_root,
+    )
+    .map_err(|error| BrokerOpError::InvalidStorageContext {
+        reason: format!(
+            "cannot verify worktree-volume preparation-cache filesystem at {}: {error}",
+            placement_root.display()
+        )
+        .into_boxed_str(),
+    })?;
+    let cache_identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(
+        &binding.path,
+    )
+    .map_err(|error| BrokerOpError::InvalidStorageContext {
+        reason: format!(
+            "cannot verify worktree-volume preparation-cache filesystem at {}: {error}",
+            binding.path.display()
+        )
+        .into_boxed_str(),
+    })?;
+    if !placement_identity.same_filesystem(&cache_identity) {
+        return Err(BrokerOpError::InvalidStorageContext {
+            reason: "worktree-volume preparation-cache root is on a different filesystem from the worktree placement root".into(),
+        });
+    }
+    let guard =
+        binding
+            .root_guard
+            .as_mut()
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "worktree-volume preparation-cache root has no retained root guard".into(),
+            })?;
+    guard.placement_root = Some(placement_guard);
+    binding.validate()?;
+    Ok(Some(binding))
 }
 
 fn matches_capture_state(
@@ -2014,6 +2211,232 @@ impl Broker {
 
     pub(crate) fn storage_context(&self) -> &BrokerStorageContext {
         &self.storage_context
+    }
+
+    pub(crate) fn worktree_volume_preparation_cache_root_bindings(
+        &self,
+    ) -> Result<Vec<crate::broker::PreparationCacheRootBinding>, BrokerOpError> {
+        let git_common_dir =
+            self.repo
+                .git_common_dir()
+                .map_err(|error| BrokerOpError::InvalidStorageContext {
+                    reason: format!("cannot inspect repository Git common directory: {error}")
+                        .into_boxed_str(),
+                })?;
+        Self::capture_worktree_volume_preparation_cache_roots(
+            &self.main_root,
+            &git_common_dir,
+            &self.storage_context,
+        )
+    }
+
+    pub(crate) fn preparation_cache_root_bindings_for_maintenance(
+        &self,
+    ) -> Result<Vec<crate::broker::PreparationCacheRootBinding>, BrokerOpError> {
+        let mut bindings = self
+            .storage_context
+            .preparation_cache_root_binding()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        bindings.extend(self.worktree_volume_preparation_cache_root_bindings()?);
+        bindings.sort_by(|left, right| left.path.cmp(&right.path));
+        bindings.dedup_by(|left, right| left.path == right.path);
+        Ok(bindings)
+    }
+
+    pub(crate) fn initialize_worktree_volume_preparation_cache_root(
+        &self,
+        worktree_path: &Path,
+    ) -> Result<crate::broker::PreparationCacheRootBinding, BrokerOpError> {
+        if self
+            .storage_context
+            .preparation_cache_root_override
+            .is_some()
+        {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "worktree-volume cache initialization cannot replace an explicit preparation-cache root".into(),
+            });
+        }
+        let placement_root =
+            worktree_path
+                .parent()
+                .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                    reason: "worktree path has no placement root".into(),
+                })?;
+        let _resource_db_path = self
+            .storage_context
+            .host_resource_db_path
+            .as_deref()
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "the broker's captured host resource database path is unavailable".into(),
+            })?;
+        let placement_marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: self.repository_worktree_key()?,
+            repository_root: self.main_root.clone(),
+        };
+        let placement_guard =
+            capture_worktree_placement_root_guard(placement_root, &placement_marker)?;
+        crate::preparation::rotation_debt::ensure_preparation_cache_root_child(
+            placement_root,
+            WORKTREE_VOLUME_PREPARATION_CACHE_ROOT,
+            &placement_guard.identity,
+        )
+        .map_err(|error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot create or capture worktree-volume preparation-cache root under {}: {error}",
+                placement_root.display()
+            )
+            .into_boxed_str(),
+        })?;
+        let cache_root = placement_root.join(WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+        let (canonical, identity, state, directory) = capture_preparation_cache_root(&cache_root)
+            .map_err(|reason| {
+            BrokerOpError::InvalidStorageContext {
+                reason: format!(
+                    "cannot capture worktree-volume preparation-cache root {}: {reason}",
+                    cache_root.display()
+                )
+                .into_boxed_str(),
+            }
+        })?;
+        let placement_identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(
+            placement_root,
+        )
+        .map_err(|error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot verify worktree placement filesystem at {}: {error}",
+                placement_root.display()
+            )
+            .into_boxed_str(),
+        })?;
+        let cache_root_identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(
+            &canonical,
+        )
+        .map_err(|error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot verify worktree-volume preparation-cache filesystem at {}: {error}",
+                canonical.display()
+            )
+            .into_boxed_str(),
+        })?;
+        if !placement_identity.same_filesystem(&cache_root_identity) {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "worktree-volume preparation-cache root is on a different filesystem from the worktree placement root".into(),
+            });
+        }
+        validate_worktree_placement_root_guard(&placement_guard)?;
+        let mut cache_context = self.storage_context.clone();
+        cache_context.preparation_cache_root_override = Some(canonical);
+        cache_context.preparation_cache_root_identity = Some(identity);
+        cache_context.preparation_cache_root_state = Some(state);
+        cache_context.preparation_cache_root_handle = Some(directory);
+        cache_context.initialize_preparation_cache_root(&self.repo)?;
+        validate_worktree_placement_root_guard(&placement_guard)?;
+        let mut binding = cache_context
+            .preparation_cache_root_binding()?
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason:
+                    "initialized worktree-volume cache root has no captured host-resource database"
+                        .into(),
+            })?;
+        binding
+            .root_guard
+            .as_mut()
+            .ok_or_else(|| BrokerOpError::InvalidStorageContext {
+                reason: "initialized worktree-volume cache root has no retained guard".into(),
+            })?
+            .placement_root = Some(placement_guard);
+        binding.validate()?;
+        let worktree_identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(
+            worktree_path,
+        )
+        .map_err(|error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot verify worktree filesystem at {}: {error}",
+                worktree_path.display()
+            )
+            .into_boxed_str(),
+        })?;
+        let namespace_identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(
+            &binding.path,
+        )
+        .map_err(|error| BrokerOpError::InvalidStorageContext {
+            reason: format!(
+                "cannot verify preparation-cache namespace filesystem at {}: {error}",
+                binding.path.display()
+            )
+            .into_boxed_str(),
+        })?;
+        if !worktree_identity.same_filesystem(&namespace_identity) {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "worktree-volume preparation-cache root is on a different filesystem from the worktree".into(),
+            });
+        }
+        Ok(binding)
+    }
+
+    /// Discover only already-present worktree-volume cache roots beneath the
+    /// repository's captured, marker-bound placement candidates. Missing children
+    /// are ordinary absence; an existing child that cannot be proved belongs to
+    /// this repository makes the maintenance inventory incomplete.
+    pub(crate) fn capture_worktree_volume_preparation_cache_roots(
+        main_root: &Path,
+        git_common_dir: &Path,
+        context: &BrokerStorageContext,
+    ) -> Result<Vec<crate::broker::PreparationCacheRootBinding>, BrokerOpError> {
+        let plan = plan_worktree_root_with_context(main_root, Some(git_common_dir), context);
+        if let Some(reason) = &plan.storage_context_refusal {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: reason.clone().into_boxed_str(),
+            });
+        }
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: plan.repository_key.clone(),
+            repository_root: main_root.to_path_buf(),
+        };
+        let mut bindings = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (placement_root, _) in worktree_root_candidates_for(&plan) {
+            let cache_root = placement_root.join(WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+            match std::fs::symlink_metadata(&cache_root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(BrokerOpError::InvalidStorageContext {
+                        reason: format!(
+                            "cannot inspect worktree-volume preparation-cache root {}: {error}",
+                            cache_root.display()
+                        )
+                        .into_boxed_str(),
+                    });
+                }
+                Ok(_) => {}
+            }
+            let Some(resource_db_path) = context.host_resource_db_path.as_deref() else {
+                return Err(BrokerOpError::InvalidStorageContext {
+                reason: format!(
+                    "the broker's captured host-resource database path is unavailable for existing worktree-volume cache root {}",
+                    cache_root.display()
+                )
+                .into_boxed_str(),
+            });
+            };
+            let Some(binding) = capture_worktree_volume_preparation_cache_root(
+                &placement_root,
+                &marker,
+                resource_db_path,
+            )?
+            else {
+                continue;
+            };
+            binding.validate()?;
+            if seen.insert(binding.path.clone()) {
+                bindings.push(binding);
+            }
+        }
+        bindings.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(bindings)
     }
 
     /// Bind a child command to the storage context captured by this broker.
@@ -4870,6 +5293,112 @@ mod worktree_root_candidate_tests {
 #[cfg(test)]
 mod artifact_sweep_namespace_tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn worktree_volume_cache_capture_requires_owned_real_marker_bound_roots() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let placement_root = temporary.path().join("external/repository-key");
+        std::fs::create_dir_all(&placement_root).unwrap();
+        let placement_root = placement_root.canonicalize().unwrap();
+        let repository_root = temporary.path().join("repository");
+        std::fs::create_dir(&repository_root).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "repository-key".into(),
+            repository_root: repository_root.canonicalize().unwrap(),
+        };
+        std::fs::write(
+            placement_root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let host_state = temporary.path().join("host-state");
+        std::fs::create_dir(&host_state).unwrap();
+        let resource_db = host_state.join("host-resources.db");
+        std::fs::File::create(&resource_db).unwrap();
+        let resource_db = resource_db.canonicalize().unwrap();
+
+        assert!(
+            capture_worktree_volume_preparation_cache_root(&placement_root, &marker, &resource_db,)
+                .unwrap()
+                .is_none(),
+            "an absent child is ordinary absence"
+        );
+
+        let cache_root = placement_root.join(WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+        std::fs::create_dir(&cache_root).unwrap();
+        assert!(
+            capture_worktree_volume_preparation_cache_root(&placement_root, &marker, &resource_db,)
+                .is_err(),
+            "an existing but uninitialized child is not adopted"
+        );
+        std::fs::remove_dir(&cache_root).unwrap();
+
+        let placement_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&placement_root)
+                .unwrap()
+                .encode()
+                .unwrap();
+        crate::preparation::rotation_debt::ensure_preparation_cache_root_child(
+            &placement_root,
+            WORKTREE_VOLUME_PREPARATION_CACHE_ROOT,
+            &placement_identity,
+        )
+        .unwrap();
+        let canonical = cache_root.canonicalize().unwrap();
+        let cache_root_capture =
+            crate::preparation::rotation_debt::capture_preparation_cache_root(&cache_root).unwrap();
+        crate::preparation::rotation_debt::initialize_preparation_cache_root(
+            &canonical,
+            &cache_root_capture.identity,
+            &cache_root_capture.directory,
+            &resource_db,
+            || Ok(false),
+        )
+        .unwrap();
+        let binding =
+            capture_worktree_volume_preparation_cache_root(&placement_root, &marker, &resource_db)
+                .unwrap()
+                .unwrap();
+        binding.validate().unwrap();
+        assert_eq!(
+            binding
+                .root_guard
+                .as_ref()
+                .unwrap()
+                .placement_root
+                .as_ref()
+                .unwrap()
+                .path,
+            placement_root
+        );
+
+        let mut wrong_marker = marker.clone();
+        wrong_marker.repository_key = "different-repository".into();
+        assert!(
+            capture_worktree_volume_preparation_cache_root(
+                &placement_root,
+                &wrong_marker,
+                &resource_db,
+            )
+            .is_err()
+        );
+
+        let displaced = placement_root.join("displaced-cache");
+        std::fs::rename(&cache_root, &displaced).unwrap();
+        symlink(&displaced, &cache_root).unwrap();
+        assert!(
+            binding.validate().is_err(),
+            "replacement by symlink is refused"
+        );
+        assert!(
+            capture_worktree_volume_preparation_cache_root(&placement_root, &marker, &resource_db,)
+                .is_err()
+        );
+    }
 
     #[test]
     fn namespace_matches_the_bounded_child_context_and_tracks_effective_roots() {

@@ -4549,21 +4549,44 @@ impl Broker {
 
     fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
         let storage = self.storage_context();
-        let cache_root_binding = storage.preparation_cache_root_binding()?;
-        let probe = match (
-            cache_root_binding.as_ref(),
-            storage.host_resource_db_path.as_deref(),
-        ) {
-            (Some(cache_root), Some(resource_db_path)) => {
-                crate::preparation::probe_rotation_recovery(
-                    &cache_root.path,
-                    cache_root.identity.as_deref(),
-                    resource_db_path,
-                    PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES,
-                    Instant::now() + PREPARATION_ROTATION_DEBT_PROBE_BUDGET,
-                )
+        let cache_root_bindings = self.preparation_cache_root_bindings_for_maintenance()?;
+        let probe_deadline = Instant::now() + PREPARATION_ROTATION_DEBT_PROBE_BUDGET;
+        let probe = if let Some(resource_db_path) = storage.host_resource_db_path.as_deref() {
+            if cache_root_bindings.is_empty() {
+                crate::preparation::rotation_debt::DebtProbe::Unknown
+            } else {
+                let mut aggregate = crate::preparation::rotation_debt::DebtProbe::NoDebt;
+                for binding in &cache_root_bindings {
+                    let current = if binding.validate().is_ok() {
+                        crate::preparation::probe_rotation_recovery(
+                            &binding.path,
+                            binding.identity.as_deref(),
+                            resource_db_path,
+                            PREPARATION_ROTATION_DEBT_PROBE_MAX_ENTRIES,
+                            probe_deadline,
+                        )
+                    } else {
+                        crate::preparation::rotation_debt::DebtProbe::Unknown
+                    };
+                    aggregate = match (aggregate, current) {
+                        (_, crate::preparation::rotation_debt::DebtProbe::Unknown)
+                        | (crate::preparation::rotation_debt::DebtProbe::Unknown, _) => {
+                            crate::preparation::rotation_debt::DebtProbe::Unknown
+                        }
+                        (_, crate::preparation::rotation_debt::DebtProbe::Pending)
+                        | (crate::preparation::rotation_debt::DebtProbe::Pending, _) => {
+                            crate::preparation::rotation_debt::DebtProbe::Pending
+                        }
+                        _ => crate::preparation::rotation_debt::DebtProbe::NoDebt,
+                    };
+                    if aggregate == crate::preparation::rotation_debt::DebtProbe::Unknown {
+                        break;
+                    }
+                }
+                aggregate
             }
-            _ => crate::preparation::rotation_debt::DebtProbe::Unknown,
+        } else {
+            crate::preparation::rotation_debt::DebtProbe::Unknown
         };
         if probe == crate::preparation::rotation_debt::DebtProbe::NoDebt
             || self.artifact_sweep_recovery_requested()?
@@ -5286,8 +5309,8 @@ impl Broker {
             if let Ok(paths) = self.store().session_worktree_paths() {
                 roots.extend(paths.into_iter().map(PathBuf::from));
             }
-            if let Ok(Some(cache_root)) = self.storage_context().preparation_cache_root_binding() {
-                roots.insert(cache_root.path);
+            if let Ok(cache_roots) = self.preparation_cache_root_bindings_for_maintenance() {
+                roots.extend(cache_roots.into_iter().map(|binding| binding.path));
             }
         }
         roots
@@ -5470,27 +5493,31 @@ impl Broker {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let captured_cache_root = storage_context.preparation_cache_root_binding()?;
-            let preparation_sweep = match (
-                worktree_roots.is_empty(),
-                captured_cache_root.as_ref(),
-                storage_context.host_resource_db_path.as_deref(),
-            ) {
-                (false, Some(cache_root), Some(resource_db_path)) => {
-                    crate::storage::sweep_preparation_cache_for_roots_with_binding(
-                        &main_root,
-                        &worktree_roots,
-                        cache_root,
-                        resource_db_path,
-                        deadline,
-                    )
-                }
-                _ => crate::storage::PreparationCacheSweepReport {
+            let preparation_sweep = if worktree_roots.is_empty() {
+                crate::storage::PreparationCacheSweepReport {
                     entries_removed: 0,
                     bytes_reclaimed: 0,
                     filesystem_entries_reclaimed: 0,
                     complete: false,
-                },
+                }
+            } else if let (Some(resource_db_path), Ok(cache_bindings)) = (
+                storage_context.host_resource_db_path.as_deref(),
+                self.preparation_cache_root_bindings_for_maintenance(),
+            ) {
+                crate::storage::sweep_preparation_caches_for_roots_with_bindings(
+                    &main_root,
+                    &worktree_roots,
+                    &cache_bindings,
+                    resource_db_path,
+                    deadline,
+                )
+            } else {
+                crate::storage::PreparationCacheSweepReport {
+                    entries_removed: 0,
+                    bytes_reclaimed: 0,
+                    filesystem_entries_reclaimed: 0,
+                    complete: false,
+                }
             };
             preparation_entries_reclaimed = preparation_sweep.filesystem_entries_reclaimed;
             scan_completed = preparation_sweep.complete;
