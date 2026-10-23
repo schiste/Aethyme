@@ -39,7 +39,7 @@ fn an_untrusted_policy_on_the_baseline_is_refused_as_submit_refuses_it() {
     }
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
-    let host_state = common::fixture_host_state_dir(tmp.owner_path());
+    let host_state = common::fixture_host_state_dir(root);
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(

@@ -356,7 +356,7 @@ fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
         let repo = fixture();
         let mut broker = common::open_fixture_repository_broker(&repo).unwrap();
         let owned_root_path = broker.worktree_root().to_path_buf();
-        let owned_cache = common::fixture_preparation_cache_root(repo.owner_path())
+        let owned_cache = common::fixture_preparation_cache_root(repo.path())
             .canonicalize()
             .unwrap();
         let mut child_context = Command::new("not-executed");

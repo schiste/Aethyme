@@ -47,7 +47,7 @@ fn files(dir: &Path) -> Vec<std::path::PathBuf> {
 fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
-    let host_state = common::fixture_host_state_dir(tmp.owner_path());
+    let host_state = common::fixture_host_state_dir(root);
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(

@@ -138,9 +138,12 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
 pub fn broker_cli_for_fixture(binary: &str, args: &[&str], fixture_root: &Path) -> Command {
     let mut command = broker_cli(binary, args);
     isolate_host_paths(&mut command, fixture_root);
-    // Fresh worktree placement requires the fixture-owned host-state base to exist.
-    std::fs::create_dir_all(fixture_host_state_dir(fixture_root))
-        .expect("create fixture-owned host-state directory");
+    if matches!(args.first(), Some(&"start" | &"start-agent" | &"adopt")) {
+        // Fresh worktree placement requires the fixture-owned host-state base
+        // to exist. Do not pre-create it for status or planning fixtures.
+        std::fs::create_dir_all(fixture_host_state_dir(fixture_root))
+            .expect("create fixture-owned host-state directory");
+    }
     command
 }
 
@@ -253,11 +256,13 @@ pub fn open_fixture_broker(
         .canonicalize()
         .expect("canonicalize fixture root")
         .join("worktrees");
-    let host_state_dir = fixture_host_state_dir(fixture_root);
+    // Match CLI fixtures: host databases belong to this repository, while
+    // linked worktrees stay under the separate fixture owner.
+    let host_state_dir = fixture_host_state_dir(repository);
     let options = BrokerOpenOptions::default()
         .with_host_state_dir(host_state_dir.clone())
-        .with_host_cache_dir(fixture_host_cache_dir(fixture_root))
-        .with_preparation_cache_root(prepare_fixture_cache(fixture_root))
+        .with_host_cache_dir(fixture_host_cache_dir(repository))
+        .with_preparation_cache_root(prepare_fixture_cache(repository))
         .with_host_operation_database(host_state_dir.join("host-operations.db"))
         .with_worktree_root(worktree_root_path.clone())
         .with_collaboration_state(host_state_dir.join("collaboration"));
