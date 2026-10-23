@@ -6,10 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
     AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker,
-    BrokerOpenOptions, BrokerOpError, DeliveryExecutionReport,
-    EntryExposureResolutionKind, EntryExposureState, IntegrationDeliveryState, NewAdvisory,
-    OperationIdentityProvenance, OperationStatus, RepositoryDeliveryMode,
-    RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
+    BrokerOpError, BrokerOpenOptions, DeliveryExecutionReport, EntryExposureResolutionKind,
+    EntryExposureState, IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance,
+    OperationStatus, RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult,
+    ShipPublicationMode,
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
