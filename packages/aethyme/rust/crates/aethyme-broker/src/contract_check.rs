@@ -667,10 +667,12 @@ fn unified_diff(repo_root: &Path, revisions: &[&str]) -> Result<Vec<String>, Str
 /// - Removed lines are the operation that breaks downstream consumers
 ///   (the entry point is gone; callers crash).
 ///
-/// A symbol is only reported when the diff REDUCES its occurrences:
-/// removed-count > added-count. Rewriting a line — which is how every
-/// edit to a registry row appears, since a row is one long line — shows
-/// each of its symbols as both removed and added, and reduces nothing.
+/// A symbol is only reported when at least one Git filepair reduces its
+/// occurrences: removed-count > added-count within that filepair. Additions
+/// in unrelated files cannot cancel a removal. Rewriting a line — which is how
+/// every edit to a registry row appears, since a row is one long line — shows
+/// each of its symbols as both removed and added in the same filepair, and
+/// reduces nothing.
 /// Counting only removals flagged those rewrites (2026-08-07 sweep hit
 /// this while repairing a stale row), and the only way past the gate was
 /// to attach an introduce/soft-retire/hard-delete label to a change that
@@ -739,6 +741,11 @@ fn build_symbol_matcher(
     })
 }
 
+/// Find tracked symbols whose occurrences are reduced by a diff.
+///
+/// Input from production callers is Git unified-diff output: each raw
+/// `diff --git` header starts a filepair. Headerless helper input is treated as
+/// one implicit filepair.
 pub fn find_touched_symbols(
     diff_lines: &[String],
     tracked: &BTreeSet<String>,
@@ -755,32 +762,111 @@ fn find_touched_symbols_with_limit(
     let Some(patterns) = matcher.patterns.as_ref() else {
         return Ok(BTreeMap::new());
     };
-    let mut removed = vec![Vec::new(); matcher.symbols.len()];
-    let mut added = vec![0usize; matcher.symbols.len()];
-    for line in diff_lines {
-        // `--- a/path` and `+++ b/path` appear at hunk boundaries. Skip
-        // them; real removals are `-text`, real additions `+text`.
-        if line.starts_with("---") || line.starts_with("+++") {
+
+    Ok(find_touched_symbols_by_filepair(
+        diff_lines,
+        &matcher.symbols,
+        |body, visit_match| {
+            for id in patterns.matches(body).iter() {
+                visit_match(id);
+            }
+        },
+    ))
+}
+
+fn find_touched_symbols_by_filepair(
+    diff_lines: &[String],
+    symbols: &[&str],
+    mut match_line: impl FnMut(&str, &mut dyn FnMut(usize)),
+) -> BTreeMap<String, Vec<String>> {
+    let mut findings = BTreeMap::<String, Vec<String>>::new();
+    visit_diff_filepairs(diff_lines, |filepair| {
+        // First find out whether this filepair removes any content. This pass
+        // only checks diff prefixes; addition-only files never invoke the
+        // symbol matcher, even when they contain many generated lines.
+        let has_removals = visit_changed_lines(filepair, |_, _, _| {});
+        if !has_removals {
+            return;
+        }
+
+        let mut removed = vec![Vec::new(); symbols.len()];
+        let mut added = vec![0usize; symbols.len()];
+        visit_changed_lines(filepair, |is_removal, line, body| {
+            if is_removal {
+                let mut record_match = |id| removed[id].push(line.clone());
+                match_line(body, &mut record_match);
+            } else {
+                let mut record_match = |id| added[id] += 1;
+                match_line(body, &mut record_match);
+            }
+        });
+
+        for ((symbol, removed_lines), added_count) in
+            symbols.iter().copied().zip(removed).zip(added)
+        {
+            if removed_lines.len() > added_count {
+                findings
+                    .entry(symbol.to_string())
+                    .or_default()
+                    .extend(removed_lines);
+            }
+        }
+    });
+    findings
+}
+
+/// Visit each raw Git filepair. Headerless helper input remains one implicit
+/// filepair, while a detected rename stays grouped under its single diff header.
+fn visit_diff_filepairs(diff_lines: &[String], mut visit: impl FnMut(&[String])) {
+    let mut start = 0;
+    for (index, line) in diff_lines.iter().enumerate() {
+        if line.starts_with("diff --git ") {
+            if start < index {
+                visit(&diff_lines[start..index]);
+            }
+            start = index + 1;
+        }
+    }
+    if start < diff_lines.len() {
+        visit(&diff_lines[start..]);
+    }
+}
+
+/// Visit changed lines in one filepair, returning whether a removal occurred.
+/// File-header `---`/`+++` pairs are metadata only before a hunk starts; the
+/// same prefixes inside a hunk are real changed content and must be counted.
+fn visit_changed_lines(
+    diff_lines: &[String],
+    mut visit: impl FnMut(bool, &String, &str),
+) -> bool {
+    let mut hunk_started = false;
+    let mut has_removals = false;
+    let mut index = 0;
+    while index < diff_lines.len() {
+        let line = &diff_lines[index];
+        if line.starts_with("@@") {
+            hunk_started = true;
+            index += 1;
+            continue;
+        }
+        if !hunk_started
+            && line.starts_with("--- ")
+            && diff_lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with("+++ "))
+        {
+            index += 2;
             continue;
         }
         if let Some(body) = line.strip_prefix('-') {
-            for id in patterns.matches(body).iter() {
-                removed[id].push(line.clone());
-            }
+            has_removals = true;
+            visit(true, line, body);
         } else if let Some(body) = line.strip_prefix('+') {
-            for id in patterns.matches(body).iter() {
-                added[id] += 1;
-            }
+            visit(false, line, body);
         }
+        index += 1;
     }
-    Ok(matcher
-        .symbols
-        .into_iter()
-        .zip(removed)
-        .zip(added)
-        .filter(|((_symbol, lines), added_count)| lines.len() > *added_count)
-        .map(|((symbol, lines), _added_count)| (symbol.to_string(), lines))
-        .collect())
+    has_removals
 }
 
 /// Tracked cross-process symbols a diff touches, for the change
@@ -1308,6 +1394,163 @@ mod tests {
         ]);
         let findings = find_touched_symbols(&diff, &tracked_explore()).unwrap();
         assert_eq!(findings.get("aethyme-explore").map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn find_touched_symbols_does_not_cancel_across_filepairs() {
+        let tracked = tracked_explore();
+        let diff = diff_of(&[
+            "diff --git a/src/old.rs b/src/old.rs",
+            "--- a/src/old.rs",
+            "+++ b/src/old.rs",
+            "@@ -1 +0,0 @@",
+            "-removed aethyme-explore",
+            "diff --git a/vendor/new.rs b/vendor/new.rs",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/vendor/new.rs",
+            "@@ -0,0 +1 @@",
+            "+added aethyme-explore",
+        ]);
+
+        let findings = find_touched_symbols(&diff, &tracked).unwrap();
+
+        assert_eq!(findings.get("aethyme-explore").map(Vec::len), Some(1));
+        assert_eq!(findings["aethyme-explore"][0], "-removed aethyme-explore");
+    }
+
+    #[test]
+    fn find_touched_symbols_counts_each_symbol_independently_per_filepair() {
+        let tracked = BTreeSet::from([
+            "aethyme-explore".to_string(),
+            "usage_boundary_query".to_string(),
+        ]);
+        let diff = diff_of(&[
+            "diff --git a/src/registry.md b/src/registry.md",
+            "--- a/src/registry.md",
+            "+++ b/src/registry.md",
+            "@@ -1 +1 @@",
+            "-removed aethyme-explore",
+            "+added usage_boundary_query",
+        ]);
+
+        let findings = find_touched_symbols(&diff, &tracked).unwrap();
+
+        assert!(findings.contains_key("aethyme-explore"));
+        assert!(!findings.contains_key("usage_boundary_query"));
+    }
+
+    #[test]
+    fn find_touched_symbols_keeps_a_rename_as_one_filepair() {
+        let tracked = tracked_explore();
+        let balanced_rename = diff_of(&[
+            "diff --git a/src/old.rs b/src/new.rs",
+            "similarity index 80%",
+            "rename from src/old.rs",
+            "rename to src/new.rs",
+            "--- a/src/old.rs",
+            "+++ b/src/new.rs",
+            "@@ -1 +1 @@",
+            "-old aethyme-explore wording",
+            "+new aethyme-explore wording",
+        ]);
+        let unbalanced_rename = diff_of(&[
+            "diff --git a/src/old.rs b/src/new.rs",
+            "similarity index 80%",
+            "rename from src/old.rs",
+            "rename to src/new.rs",
+            "--- a/src/old.rs",
+            "+++ b/src/new.rs",
+            "@@ -1 +0,0 @@",
+            "-old aethyme-explore wording",
+        ]);
+
+        assert!(find_touched_symbols(&balanced_rename, &tracked)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            find_touched_symbols(&unbalanced_rename, &tracked)
+                .unwrap()
+                .get("aethyme-explore")
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn find_touched_symbols_skips_matcher_for_addition_only_filepairs() {
+        let diff = diff_of(&[
+            "diff --git a/src/old.rs b/src/old.rs",
+            "--- a/src/old.rs",
+            "+++ b/src/old.rs",
+            "@@ -1 +0,0 @@",
+            "-removed aethyme-explore",
+            "diff --git a/vendor/generated.rs b/vendor/generated.rs",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/vendor/generated.rs",
+            "@@ -0,0 +1,2 @@",
+            "+generated aethyme-explore",
+            "+generated aethyme-explore again",
+        ]);
+        let mut matched_bodies = Vec::new();
+
+        let findings = find_touched_symbols_by_filepair(
+            &diff,
+            &["aethyme-explore"],
+            |body, visit_match| {
+                matched_bodies.push(body.to_string());
+                if body.contains("aethyme-explore") {
+                    visit_match(0);
+                }
+            },
+        );
+
+        assert_eq!(findings.get("aethyme-explore").map(Vec::len), Some(1));
+        assert_eq!(matched_bodies, vec!["removed aethyme-explore".to_string()]);
+    }
+
+    #[test]
+    fn find_touched_symbols_counts_triple_prefix_lines_inside_hunks() {
+        let tracked = tracked_explore();
+        let removal = diff_of(&[
+            "diff --git a/src/contract.rs b/src/contract.rs",
+            "--- a/src/contract.rs",
+            "+++ b/src/contract.rs",
+            "@@ -1 +0,0 @@",
+            "--- aethyme-explore",
+        ]);
+        let balanced = diff_of(&[
+            "diff --git a/src/contract.rs b/src/contract.rs",
+            "--- a/src/contract.rs",
+            "+++ b/src/contract.rs",
+            "@@ -1 +1 @@",
+            "--- aethyme-explore",
+            "+++ aethyme-explore",
+        ]);
+
+        assert_eq!(
+            find_touched_symbols(&removal, &tracked)
+                .unwrap()
+                .get("aethyme-explore")
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(find_touched_symbols(&balanced, &tracked)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn find_touched_symbols_keeps_headerless_helpers_as_one_filepair() {
+        let diff = diff_of(&[
+            "-removed aethyme-explore",
+            "+rewritten aethyme-explore",
+        ]);
+
+        assert!(find_touched_symbols(&diff, &tracked_explore())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
