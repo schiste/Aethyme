@@ -793,10 +793,10 @@ fn find_touched_symbols_by_filepair(
         let mut added = vec![0usize; symbols.len()];
         visit_changed_lines(filepair, |is_removal, line, body| {
             if is_removal {
-                let mut record_match = |id| removed[id].push(line.clone());
+                let mut record_match = |id: usize| removed[id].push(line.clone());
                 match_line(body, &mut record_match);
             } else {
-                let mut record_match = |id| added[id] += 1;
+                let mut record_match = |id: usize| added[id] += 1;
                 match_line(body, &mut record_match);
             }
         });
@@ -835,10 +835,7 @@ fn visit_diff_filepairs(diff_lines: &[String], mut visit: impl FnMut(&[String]))
 /// Visit changed lines in one filepair, returning whether a removal occurred.
 /// File-header `---`/`+++` pairs are metadata only before a hunk starts; the
 /// same prefixes inside a hunk are real changed content and must be counted.
-fn visit_changed_lines(
-    diff_lines: &[String],
-    mut visit: impl FnMut(bool, &String, &str),
-) -> bool {
+fn visit_changed_lines(diff_lines: &[String], mut visit: impl FnMut(bool, &String, &str)) -> bool {
     let mut hunk_started = false;
     let mut has_removals = false;
     let mut index = 0;
@@ -1465,9 +1462,11 @@ mod tests {
             "-old aethyme-explore wording",
         ]);
 
-        assert!(find_touched_symbols(&balanced_rename, &tracked)
-            .unwrap()
-            .is_empty());
+        assert!(
+            find_touched_symbols(&balanced_rename, &tracked)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             find_touched_symbols(&unbalanced_rename, &tracked)
                 .unwrap()
@@ -1495,16 +1494,13 @@ mod tests {
         ]);
         let mut matched_bodies = Vec::new();
 
-        let findings = find_touched_symbols_by_filepair(
-            &diff,
-            &["aethyme-explore"],
-            |body, visit_match| {
+        let findings =
+            find_touched_symbols_by_filepair(&diff, &["aethyme-explore"], |body, visit_match| {
                 matched_bodies.push(body.to_string());
                 if body.contains("aethyme-explore") {
                     visit_match(0);
                 }
-            },
-        );
+            });
 
         assert_eq!(findings.get("aethyme-explore").map(Vec::len), Some(1));
         assert_eq!(matched_bodies, vec!["removed aethyme-explore".to_string()]);
@@ -1536,21 +1532,22 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
-        assert!(find_touched_symbols(&balanced, &tracked)
-            .unwrap()
-            .is_empty());
+        assert!(
+            find_touched_symbols(&balanced, &tracked)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn find_touched_symbols_keeps_headerless_helpers_as_one_filepair() {
-        let diff = diff_of(&[
-            "-removed aethyme-explore",
-            "+rewritten aethyme-explore",
-        ]);
+        let diff = diff_of(&["-removed aethyme-explore", "+rewritten aethyme-explore"]);
 
-        assert!(find_touched_symbols(&diff, &tracked_explore())
-            .unwrap()
-            .is_empty());
+        assert!(
+            find_touched_symbols(&diff, &tracked_explore())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
