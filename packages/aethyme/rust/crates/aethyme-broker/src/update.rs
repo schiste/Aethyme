@@ -3,18 +3,20 @@
 //! The planner is pure once manifest bytes and detected installation state are
 //! supplied. Network access and plan persistence live at the CLI boundary.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::file_lock::ExclusiveFileLock;
 use crate::update_cache::{self, ManifestFetch};
 use crate::{ReleaseArtifact, ReleaseCompatibility, ReleaseManifest};
 
@@ -25,6 +27,9 @@ const DEFAULT_RELEASE_BASE_URL: &str = "https://github.com/schiste/Aethyme";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_RELEASE_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const UPDATE_LOCK_FILENAME: &str = ".update.lock";
+const UPDATE_LOCK_WAIT: Duration = Duration::from_secs(10);
+const UPDATE_LOCK_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +122,137 @@ impl InstallReceipt {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedRootIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Serialize updater instances that use this version of the installer-managed
+/// update path. Keep this lock file in the persistent managed root (not under
+/// `versions`, whose contents are pruned after activation) and never unlink it.
+fn acquire_installation_update_lock(receipt: &InstallReceipt) -> Result<ExclusiveFileLock, String> {
+    let deadline = Instant::now() + UPDATE_LOCK_WAIT;
+    loop {
+        if let Some(lock) = try_acquire_installation_update_lock(receipt)? {
+            return Ok(lock);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "another update holds {}; retry after it finishes",
+                receipt.managed_root.join(UPDATE_LOCK_FILENAME).display()
+            ));
+        }
+        thread::sleep(UPDATE_LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn try_acquire_installation_update_lock(
+    receipt: &InstallReceipt,
+) -> Result<Option<ExclusiveFileLock>, String> {
+    receipt.validate().map_err(|error| error.to_string())?;
+    let expected_root = managed_root_identity(&receipt.managed_root)?;
+    let lock_path = receipt.managed_root.join(UPDATE_LOCK_FILENAME);
+    let file =
+        open_installation_update_lock_file(&receipt.managed_root, &lock_path, expected_root)?;
+    let identity_file = file.try_clone().map_err(|error| {
+        format!(
+            "duplicate update lock handle {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    match ExclusiveFileLock::try_acquire(file)
+        .map_err(|error| format!("acquire update lock {}: {error}", lock_path.display()))?
+    {
+        Some(lock) => {
+            if managed_root_identity(&receipt.managed_root)? != expected_root {
+                return Err(format!(
+                    "managed installation root changed while acquiring {}",
+                    lock_path.display()
+                ));
+            }
+            verify_installation_update_lock_file(&lock_path, &identity_file)?;
+            Ok(Some(lock))
+        }
+        None => Ok(None),
+    }
+}
+
+fn managed_root_identity(path: &Path) -> Result<ManagedRootIdentity, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "inspect managed installation root {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() || fs::canonicalize(path).ok().as_deref() != Some(path) {
+        return Err(format!(
+            "managed installation root {} is not a canonical real directory",
+            path.display()
+        ));
+    }
+    Ok(ManagedRootIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn open_installation_update_lock_file(
+    managed_root: &Path,
+    lock_path: &Path,
+    expected_root: ManagedRootIdentity,
+) -> Result<fs::File, String> {
+    if managed_root_identity(managed_root)? != expected_root {
+        return Err(format!(
+            "managed installation root changed before opening {}",
+            lock_path.display()
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .mode(0o600);
+    let file = options
+        .open(lock_path)
+        .map_err(|error| format!("open update lock {}: {error}", lock_path.display()))?;
+    verify_installation_update_lock_file(lock_path, &file)?;
+    if managed_root_identity(managed_root)? != expected_root {
+        return Err(format!(
+            "managed installation root changed while opening {}",
+            lock_path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn verify_installation_update_lock_file(lock_path: &Path, opened: &fs::File) -> Result<(), String> {
+    let named = fs::symlink_metadata(lock_path)
+        .map_err(|error| format!("recheck update lock {}: {error}", lock_path.display()))?;
+    let opened_metadata = opened.metadata().map_err(|error| {
+        format!(
+            "inspect opened update lock {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    if !named.file_type().is_file()
+        || !opened_metadata.file_type().is_file()
+        || named.dev() != opened_metadata.dev()
+        || named.ino() != opened_metadata.ino()
+        || named.nlink() != 1
+        || opened_metadata.nlink() != 1
+    {
+        return Err(format!(
+            "update lock {} is not the expected unique regular file",
+            lock_path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1120,10 +1256,22 @@ pub fn bootstrap_install(
         versions_dir: managed_root.join("versions"),
     };
     receipt.validate().map_err(|error| error.to_string())?;
+    fs::create_dir_all(&receipt.managed_root).map_err(|error| {
+        format!(
+            "create managed installation root {}: {error}",
+            receipt.managed_root.display()
+        )
+    })?;
+    let update_lock = acquire_installation_update_lock(&receipt)?;
     let manifest_sha256 = sha256_bytes(&manifest_bytes);
-    let (active_bundle, rollback_bundle) =
-        activate_payload(payload, &receipt, &manifest.version, &manifest_sha256)?;
-    write_receipt(&receipt)?;
+    let (active_bundle, rollback_bundle) = activate_payload_with_completion(
+        payload,
+        &receipt,
+        &manifest.version,
+        &manifest_sha256,
+        &update_lock,
+        || write_receipt(&receipt),
+    )?;
     Ok(UpdateExecutionReport {
         manifest_sha256,
         installed_version: manifest.version,
@@ -1162,6 +1310,7 @@ pub fn execute_confirmed_update_with(
         .as_ref()
         .ok_or("installer provenance has no receipt")?;
     let receipt = read_receipt(receipt_path)?;
+    let update_lock = acquire_installation_update_lock(&receipt)?;
     let plan_path = receipt
         .managed_root
         .join("update-plans")
@@ -1220,10 +1369,17 @@ pub fn execute_confirmed_update_with(
     run_tar(&["-xzf"], &archive_path, Some(&payload))?;
     verify_payload(&payload, &plan.target_version)?;
 
-    let (active_bundle, rollback_bundle) =
-        activate_payload(&payload, &receipt, &plan.target_version, confirmation)?;
-    fs::remove_file(&plan_path)
-        .map_err(|error| format!("remove consumed plan {}: {error}", plan_path.display()))?;
+    let (active_bundle, rollback_bundle) = activate_payload_with_completion(
+        &payload,
+        &receipt,
+        &plan.target_version,
+        confirmation,
+        &update_lock,
+        || {
+            fs::remove_file(&plan_path)
+                .map_err(|error| format!("remove consumed plan {}: {error}", plan_path.display()))
+        },
+    )?;
     Ok(UpdateExecutionReport {
         manifest_sha256: confirmation.to_string(),
         installed_version: plan.target_version,
@@ -1360,11 +1516,13 @@ fn write_receipt(receipt: &InstallReceipt) -> Result<(), String> {
     sync_directory(&receipt.managed_root)
 }
 
-fn activate_payload(
+fn activate_payload_with_completion(
     payload: &Path,
     receipt: &InstallReceipt,
     version: &str,
     manifest_sha256: &str,
+    update_lock: &ExclusiveFileLock,
+    completion: impl FnOnce() -> Result<(), String>,
 ) -> Result<(PathBuf, Option<PathBuf>), String> {
     receipt.validate().map_err(|error| error.to_string())?;
     validate_digest(manifest_sha256, "manifest")?;
@@ -1408,64 +1566,268 @@ fn activate_payload(
     }
 
     let relative_target = PathBuf::from("versions").join(&bundle_name);
-    let old_target = fs::read_link(&receipt.current_link).ok();
-    if let Some(old) = &old_target
-        && old != &relative_target
+    let old_selector = read_selector_link(&receipt.current_link)?;
+    if let Some(old) = &old_selector
+        && old.target != relative_target
     {
-        atomic_symlink(old, &receipt.previous_link)?;
+        atomic_symlink(&old.target, &receipt.previous_link).map_err(|error| error.to_string())?;
     }
-    atomic_symlink(&relative_target, &receipt.current_link)?;
-    ensure_public_links(receipt)?;
-    if let Err(error) = verify_public_pair(receipt, version) {
-        if let Some(old) = &old_target {
-            atomic_symlink(old, &receipt.current_link)?;
-        }
+    let published_selector = publish_current_selector(
+        receipt,
+        update_lock,
+        &relative_target,
+        old_selector.as_ref(),
+        || atomic_symlink(&relative_target, &receipt.current_link),
+    )?;
+
+    let post_switch = (|| {
+        ensure_public_links(receipt)?;
+        verify_public_pair(receipt, version)?;
+        cleanup_old_bundles(receipt)?;
+        completion()
+    })();
+    if let Err(error) = post_switch {
+        let recovery = restore_selector_if_still_owned(
+            receipt,
+            update_lock,
+            &published_selector,
+            old_selector.as_ref(),
+        );
         return Err(format!(
-            "activation verification failed and was rolled back: {error}"
+            "activation failed after selector switch: {error}; {recovery}"
         ));
     }
-    cleanup_old_bundles(receipt)?;
+
     let rollback_bundle = fs::read_link(&receipt.previous_link)
         .ok()
         .map(|path| receipt.managed_root.join(path));
     Ok((final_bundle, rollback_bundle))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectorLink {
+    target: PathBuf,
+    device: u64,
+    inode: u64,
+    ctime_seconds: i64,
+    ctime_nanoseconds: i64,
+}
+
+#[derive(Debug)]
+struct AtomicSymlinkError {
+    message: String,
+    published: Option<SelectorLink>,
+}
+
+impl std::fmt::Display for AtomicSymlinkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn read_selector_link(path: &Path) -> Result<Option<SelectorLink>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect selector {}: {error}", path.display())),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Err(format!(
+            "selector {} is not a symlink; refusing to replace it",
+            path.display()
+        ));
+    }
+    let target = fs::read_link(path)
+        .map_err(|error| format!("read selector {}: {error}", path.display()))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| format!("recheck selector {}: {error}", path.display()))?;
+    if after.dev() != metadata.dev()
+        || after.ino() != metadata.ino()
+        || after.ctime() != metadata.ctime()
+        || after.ctime_nsec() != metadata.ctime_nsec()
+        || !after.file_type().is_symlink()
+    {
+        return Err(format!(
+            "selector {} changed while it was being inspected",
+            path.display()
+        ));
+    }
+    Ok(Some(SelectorLink {
+        target,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        ctime_seconds: metadata.ctime(),
+        ctime_nanoseconds: metadata.ctime_nsec(),
+    }))
+}
+
+fn publish_current_selector(
+    receipt: &InstallReceipt,
+    update_lock: &ExclusiveFileLock,
+    target: &Path,
+    old_selector: Option<&SelectorLink>,
+    publish: impl FnOnce() -> Result<SelectorLink, AtomicSymlinkError>,
+) -> Result<SelectorLink, String> {
+    let current = read_selector_link(&receipt.current_link)?;
+    if current.as_ref() != old_selector {
+        return Err(format!(
+            "current selector {} changed before activation; refusing to replace it",
+            receipt.current_link.display()
+        ));
+    }
+    match publish() {
+        Ok(published) => Ok(published),
+        Err(error) => {
+            let Some(published) = error.published.as_ref() else {
+                return Err(error.to_string());
+            };
+            let recovery =
+                restore_selector_if_still_owned(receipt, update_lock, published, old_selector);
+            Err(format!(
+                "activate selector {} to {}: {}; {recovery}",
+                receipt.current_link.display(),
+                target.display(),
+                error
+            ))
+        }
+    }
+}
+
+fn restore_selector_if_still_owned(
+    receipt: &InstallReceipt,
+    _update_lock: &ExclusiveFileLock,
+    published: &SelectorLink,
+    old_selector: Option<&SelectorLink>,
+) -> String {
+    match read_selector_link(&receipt.current_link) {
+        Ok(Some(current)) if &current == published => {}
+        Ok(Some(_)) => {
+            return "rollback skipped because another writer replaced the current selector".into();
+        }
+        Ok(None) => {
+            return "rollback skipped because the current selector is already absent".into();
+        }
+        Err(error) => {
+            return format!(
+                "rollback skipped because the current selector cannot be checked: {error}"
+            );
+        }
+    }
+
+    if let Some(previous) = old_selector {
+        match atomic_symlink(&previous.target, &receipt.current_link) {
+            Ok(_) => format!("restored previous selector {}", previous.target.display()),
+            Err(error) => match read_selector_link(&receipt.current_link) {
+                Ok(Some(current)) if current.target == previous.target => format!(
+                    "selector points to previous target {}, but rollback durability is uncertain: {error}",
+                    previous.target.display()
+                ),
+                _ => format!("rollback to previous selector failed: {error}"),
+            },
+        }
+    } else {
+        "rollback skipped because no previous selector existed; the newly published selector remains active".into()
+    }
+}
+
 fn ensure_public_links(receipt: &InstallReceipt) -> Result<(), String> {
     atomic_symlink(
         Path::new(".aethyme-managed/current/aethyme"),
         &receipt.router_path,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     atomic_symlink(
         Path::new(".aethyme-managed/current/aethyme-engine-cli"),
         &receipt.engine_path,
     )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
-fn atomic_symlink(target: &Path, destination: &Path) -> Result<(), String> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| format!("{} has no parent", destination.display()))?;
-    fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+fn atomic_symlink(target: &Path, destination: &Path) -> Result<SelectorLink, AtomicSymlinkError> {
+    atomic_symlink_with_sync(target, destination, sync_directory)
+}
+
+fn atomic_symlink_with_sync(
+    target: &Path,
+    destination: &Path,
+    sync: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<SelectorLink, AtomicSymlinkError> {
+    let parent = destination.parent().ok_or_else(|| AtomicSymlinkError {
+        message: format!("{} has no parent", destination.display()),
+        published: None,
+    })?;
+    fs::create_dir_all(parent).map_err(|error| AtomicSymlinkError {
+        message: format!("create {}: {error}", parent.display()),
+        published: None,
+    })?;
     let name = destination
         .file_name()
-        .ok_or_else(|| format!("{} has no filename", destination.display()))?
+        .ok_or_else(|| AtomicSymlinkError {
+            message: format!("{} has no filename", destination.display()),
+            published: None,
+        })?
         .to_string_lossy();
     let temporary = parent.join(format!(
         ".{name}.new-{}-{}",
         std::process::id(),
         now_unix_ms()
     ));
-    std::os::unix::fs::symlink(target, &temporary)
-        .map_err(|error| format!("create symlink {}: {error}", temporary.display()))?;
+    std::os::unix::fs::symlink(target, &temporary).map_err(|error| AtomicSymlinkError {
+        message: format!("create symlink {}: {error}", temporary.display()),
+        published: None,
+    })?;
+    let metadata = match fs::symlink_metadata(&temporary) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(AtomicSymlinkError {
+                message: format!("inspect staged symlink {}: {error}", temporary.display()),
+                published: None,
+            });
+        }
+    };
+    let staged_device = metadata.dev();
+    let staged_inode = metadata.ino();
     if let Err(error) = fs::rename(&temporary, destination) {
         let _ = fs::remove_file(&temporary);
-        return Err(format!(
-            "activate symlink {}: {error}",
-            destination.display()
-        ));
+        return Err(AtomicSymlinkError {
+            message: format!("activate symlink {}: {error}", destination.display()),
+            published: None,
+        });
     }
-    sync_directory(parent)
+    let published = match read_selector_link(destination) {
+        Ok(Some(published))
+            if published.device == staged_device
+                && published.inode == staged_inode
+                && published.target.as_path() == target =>
+        {
+            published
+        }
+        Ok(_) => {
+            return Err(AtomicSymlinkError {
+                message: format!(
+                    "selector {} changed before its published identity could be confirmed",
+                    destination.display()
+                ),
+                published: None,
+            });
+        }
+        Err(error) => {
+            return Err(AtomicSymlinkError {
+                message: format!(
+                    "symlink was renamed to {}, but its published identity could not be confirmed; no rollback was attempted: {error}",
+                    destination.display()
+                ),
+                published: None,
+            });
+        }
+    };
+    sync(parent).map_err(|error| AtomicSymlinkError {
+        message: format!("sync activated symlink {}: {error}", destination.display()),
+        published: Some(published.clone()),
+    })?;
+    Ok(published)
 }
 
 fn verify_existing_bundle(payload: &Path, bundle: &Path) -> Result<(), String> {
@@ -1814,6 +2176,27 @@ mod tests {
         let path = root.join(format!("manifest-{version}.json"));
         fs::write(&path, manifest("stable", version)).unwrap();
         path
+    }
+
+    fn install_receipt(install_dir: &Path) -> InstallReceipt {
+        let install_dir = fs::canonicalize(install_dir).unwrap();
+        let managed_root = install_dir.join(".aethyme-managed");
+        InstallReceipt {
+            schema_version: INSTALL_RECEIPT_SCHEMA_VERSION,
+            method: "aethyme-installer".into(),
+            router_path: install_dir.join("aethyme"),
+            engine_path: install_dir.join("aethyme-engine-cli"),
+            current_link: managed_root.join("current"),
+            previous_link: managed_root.join("previous"),
+            versions_dir: managed_root.join("versions"),
+            managed_root,
+            install_dir,
+        }
+    }
+
+    fn acquire_test_update_lock(receipt: &InstallReceipt) -> ExclusiveFileLock {
+        fs::create_dir_all(&receipt.managed_root).unwrap();
+        acquire_installation_update_lock(receipt).unwrap()
     }
 
     #[test]
@@ -2290,6 +2673,209 @@ mod tests {
 
         assert!(error.contains("quick-test failed"));
         assert_eq!(fs::read_link(current).unwrap(), before);
+    }
+
+    #[test]
+    fn post_switch_completion_failure_restores_previous_selector() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
+        bootstrap_install(
+            &fake_payload(temp.path(), "0.2.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.2.0"),
+            target,
+        )
+        .unwrap();
+
+        let receipt = install_receipt(&install_dir);
+        let previous = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        let manifest_bytes = manifest("stable", "0.3.0");
+        let update_lock = acquire_test_update_lock(&receipt);
+        let error = activate_payload_with_completion(
+            &fake_payload(temp.path(), "0.3.0", true),
+            &receipt,
+            "0.3.0",
+            &sha256_bytes(&manifest_bytes),
+            &update_lock,
+            || {
+                assert!(
+                    try_acquire_installation_update_lock(&receipt)
+                        .unwrap()
+                        .is_none(),
+                    "a second updater must remain excluded through completion"
+                );
+                Err("injected receipt persistence failure".into())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected receipt persistence failure"));
+        assert!(error.contains("restored previous selector"));
+        let restored = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        assert_eq!(restored.target, previous.target);
+    }
+
+    #[test]
+    fn failed_first_activation_keeps_the_only_selector_active_and_reports_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        fs::create_dir(&install_dir).unwrap();
+        let receipt = install_receipt(&install_dir);
+        let manifest_bytes = manifest("stable", "0.2.0");
+        let update_lock = acquire_test_update_lock(&receipt);
+
+        let error = activate_payload_with_completion(
+            &fake_payload(temp.path(), "0.2.0", true),
+            &receipt,
+            "0.2.0",
+            &sha256_bytes(&manifest_bytes),
+            &update_lock,
+            || Err("injected receipt persistence failure".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("no previous selector existed"));
+        let current = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        assert!(current.target.to_string_lossy().contains("v0.2.0-"));
+    }
+
+    #[test]
+    fn post_rename_sync_failure_restores_selector_that_is_still_ours() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
+        bootstrap_install(
+            &fake_payload(temp.path(), "0.2.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.2.0"),
+            target,
+        )
+        .unwrap();
+
+        let receipt = install_receipt(&install_dir);
+        let previous = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        let update_lock = acquire_test_update_lock(&receipt);
+        let error = publish_current_selector(
+            &receipt,
+            &update_lock,
+            Path::new("versions/v0.3.0-test"),
+            Some(&previous),
+            || {
+                atomic_symlink_with_sync(
+                    Path::new("versions/v0.3.0-test"),
+                    &receipt.current_link,
+                    |_| {
+                        assert!(
+                            try_acquire_installation_update_lock(&receipt)
+                                .unwrap()
+                                .is_none(),
+                            "a second updater must remain excluded at selector publication"
+                        );
+                        Err("injected directory sync failure".into())
+                    },
+                )
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("injected directory sync failure"));
+        assert!(error.contains("restored previous selector"));
+        let restored = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        assert_eq!(restored.target, previous.target);
+    }
+
+    #[test]
+    fn post_rename_failure_does_not_rollback_a_concurrent_selector() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
+        bootstrap_install(
+            &fake_payload(temp.path(), "0.2.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.2.0"),
+            target,
+        )
+        .unwrap();
+
+        let receipt = install_receipt(&install_dir);
+        let previous = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        let update_lock = acquire_test_update_lock(&receipt);
+        let concurrent_target = Path::new("versions/v0.4.0-concurrent");
+        let error = publish_current_selector(
+            &receipt,
+            &update_lock,
+            Path::new("versions/v0.3.0-test"),
+            Some(&previous),
+            || {
+                atomic_symlink_with_sync(
+                    Path::new("versions/v0.3.0-test"),
+                    &receipt.current_link,
+                    |_| {
+                        assert!(
+                            try_acquire_installation_update_lock(&receipt)
+                                .unwrap()
+                                .is_none(),
+                            "a second updater must remain excluded while rollback is pending"
+                        );
+                        let concurrent_temp = receipt.managed_root.join(format!(
+                            ".current.concurrent-{}-{}",
+                            std::process::id(),
+                            now_unix_ms()
+                        ));
+                        std::os::unix::fs::symlink(concurrent_target, &concurrent_temp)
+                            .map_err(|error| error.to_string())?;
+                        fs::rename(&concurrent_temp, &receipt.current_link)
+                            .map_err(|error| error.to_string())?;
+                        Err("injected directory sync failure".into())
+                    },
+                )
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("rollback skipped because another writer replaced"));
+        let current = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        assert_eq!(current.target.as_path(), concurrent_target);
+    }
+
+    #[test]
+    fn activation_refuses_to_replace_a_selector_changed_since_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
+        bootstrap_install(
+            &fake_payload(temp.path(), "0.2.0", true),
+            &install_dir,
+            &manifest_file(temp.path(), "0.2.0"),
+            target,
+        )
+        .unwrap();
+
+        let receipt = install_receipt(&install_dir);
+        let preflight_selector = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        let update_lock = acquire_test_update_lock(&receipt);
+        let concurrent_target = Path::new("versions/v0.4.0-concurrent");
+        let concurrent_temp = receipt.managed_root.join(format!(
+            ".current.concurrent-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::os::unix::fs::symlink(concurrent_target, &concurrent_temp).unwrap();
+        fs::rename(&concurrent_temp, &receipt.current_link).unwrap();
+
+        let error = publish_current_selector(
+            &receipt,
+            &update_lock,
+            Path::new("versions/v0.3.0-test"),
+            Some(&preflight_selector),
+            || panic!("stale activation must not publish"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed before activation"));
+        let current = read_selector_link(&receipt.current_link).unwrap().unwrap();
+        assert_eq!(current.target.as_path(), concurrent_target);
     }
 
     #[test]
