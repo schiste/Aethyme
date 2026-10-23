@@ -2075,11 +2075,16 @@ fn exposure_plan_cli_is_stable_and_does_not_mutate_lifecycle_state() {
     let output = Command::new(CLI)
         .args(["advanced", "exposures", "plan", "--json"])
         .current_dir(&fixture.repo)
+        .env(
+            "AETHYME_HOST_STATE_DIR",
+            fixture.host_operations.parent().unwrap(),
+        )
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
