@@ -12,7 +12,8 @@
 //!   #613's v49 then failed with "duplicate column name"). Migrations from
 //!   v48 on are therefore applied idempotently, and every open runs a repair
 //!   pass that re-creates their objects when a database claims the version
-//!   but lacks them. Never point a dev build at a real broker database.
+//!   but lacks them. Identity-bearing v54 binding state is intentionally not
+//!   repairable. Never point a dev build at a real broker database.
 //! - `meta.min_compatible_schema` records the oldest schema version whose
 //!   binaries may still read and write the database. A binary older than the
 //!   database opens it without migrating when its own [`SCHEMA_VERSION`] is at
@@ -33,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 53;
+pub const SCHEMA_VERSION: i64 = 54;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -79,6 +80,13 @@ pub const SCHEMA_VERSION: i64 = 53;
 ///   Older readers and writers ignore the table. Missing witnesses never
 ///   authorize automatic removal, so v52 writers remain safe and the floor
 ///   stays at v52.
+/// - v54: adds per-repository worktree-root binding records. Migration writes
+///   only one unscoped `legacy_unbound` placeholder; existing databases retain
+///   floor 52 until explicit binding. A fresh staged database raises its own
+///   floor to 54 before publication. Bound rows are selected by a stable UUID
+///   stored in the Git common directory; unbound rows may be scoped by that
+///   directory without granting root authority. The table is excluded from
+///   repair because recreating a missing row could erase identity evidence.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 52;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -1770,6 +1778,51 @@ CREATE TABLE IF NOT EXISTS spawned_worktree_instances (
 );
 ";
 
+/// v54: durable per-repository worktree-root binding. Existing databases
+/// remain explicitly unbound until the plan/apply layer confirms an adoption.
+/// The migration itself never consults the filesystem or silently adopts the
+/// current configuration. A common-dir UUID selects each bound repository row;
+/// unbound rows can be scoped by common-dir without granting root authority.
+const MIGRATION_V54: &str = "
+CREATE TABLE IF NOT EXISTS repository_worktree_binding (
+    binding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_uuid TEXT UNIQUE CHECK (
+        repository_uuid IS NULL OR length(repository_uuid) = 36
+    ),
+    record_schema_version INTEGER NOT NULL CHECK (record_schema_version = 1),
+    state TEXT NOT NULL CHECK (state IN (
+        'legacy_unbound', 'fresh_unbound', 'fresh_reserved', 'bound',
+        'recovery_required'
+    )),
+    origin TEXT CHECK (origin IN ('legacy', 'fresh')),
+    path_encoding TEXT CHECK (path_encoding IN (
+        'unix_bytes', 'windows_utf16le', 'utf8'
+    )),
+    repository_root BLOB,
+    git_common_dir BLOB,
+    repository_key TEXT,
+    broker_db_path BLOB,
+    bootstrap_nonce TEXT,
+    worktree_root BLOB,
+    root_layout TEXT CHECK (root_layout IN ('keyed_container', 'direct_root')),
+    root_source TEXT CHECK (root_source IN (
+        'host_state', 'repository_config', 'environment_override',
+        'library_override', 'repository_fallback'
+    )),
+    reservation_digest TEXT,
+    parent_identity_json TEXT,
+    worktree_identity_json TEXT,
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS repository_worktree_binding_common_dir
+    ON repository_worktree_binding(git_common_dir)
+    WHERE git_common_dir IS NOT NULL;
+INSERT INTO repository_worktree_binding (
+    record_schema_version, state, origin, updated_at_ms
+) SELECT 1, 'legacy_unbound', 'legacy', 0
+  WHERE NOT EXISTS (SELECT 1 FROM repository_worktree_binding);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1824,6 +1877,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V51,
     MIGRATION_V52,
     MIGRATION_V53,
+    MIGRATION_V54,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2049,7 +2103,10 @@ fn compatibility_floor_for_migration(version: i64) -> Option<i64> {
     }
 }
 
-fn record_min_compatible_schema_floor(conn: &Connection, minimum: i64) -> Result<(), BrokerError> {
+pub(crate) fn record_min_compatible_schema_floor(
+    conn: &Connection,
+    minimum: i64,
+) -> Result<(), BrokerError> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value
@@ -2476,13 +2533,49 @@ mod tests {
     }
 
     #[test]
-    fn v52_requires_a_profile_aware_reader_for_gate_cache_reuse() {
+    fn v54_additive_binding_schema_keeps_v52_reader_compatibility() {
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
         let conn = migrated();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 51).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 42).unwrap());
+    }
+
+    #[test]
+    fn explicit_binding_floor_fences_v53_writers() {
+        let conn = migrated();
+        set_meta(&conn, "min_compatible_schema", 54);
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 53).unwrap());
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 54).unwrap());
+    }
+
+    #[test]
+    fn v54_adds_legacy_unbound_state_without_raising_the_floor_or_repairing_identity() {
+        let conn = migrated_through(53);
+        set_meta(&conn, "min_compatible_schema", 52);
+        assert!(table_exists(&conn, "spawned_worktree_instances").unwrap());
+
+        migrate(&conn).unwrap();
+        assert!(table_exists(&conn, "spawned_worktree_instances").unwrap());
+
+        let (state, floor): (String, String) = conn
+            .query_row(
+                "SELECT b.state, m.value
+                 FROM repository_worktree_binding b
+                 JOIN meta m ON m.key = 'min_compatible_schema'
+                 WHERE b.binding_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "legacy_unbound");
+        assert_eq!(floor, "52");
+
+        conn.execute_batch("DROP TABLE repository_worktree_binding")
+            .unwrap();
+        repair_recorded_migrations(&conn).unwrap();
+        assert!(!table_exists(&conn, "repository_worktree_binding").unwrap());
     }
 
     #[test]
@@ -2734,11 +2827,8 @@ mod tests {
 
     #[test]
     fn v53_adds_optional_spawn_witnesses_without_fencing_v52_writers() {
-        let conn = migrated_through(52);
+        let conn = migrated_through(53);
         set_meta(&conn, "min_compatible_schema", 52);
-
-        migrate(&conn).unwrap();
-
         assert_eq!(current_version(&conn).unwrap(), 53);
         assert_eq!(
             conn.query_row(
