@@ -57,8 +57,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use regex::{RegexSet, RegexSetBuilder};
+
 /// Tokens shorter than this are too noisy to track (`a`, `it`, `of`).
 const MIN_SYMBOL_LEN: usize = 4;
+
+/// Bound the escaped pattern source and compiled matcher retained for one
+/// contract scan. A larger registry fails as an unknown scan, never clean.
+const MAX_SYMBOL_PATTERN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SYMBOL_SET_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Path of the consumers registry, relative to the repository root.
 pub const DEFAULT_CONSUMERS_DOC: &str =
@@ -196,7 +203,13 @@ pub fn run(args: &[String]) -> u8 {
         return 0;
     }
 
-    let findings = find_touched_symbols(&diff_lines, &tracked);
+    let findings = match find_touched_symbols(&diff_lines, &tracked) {
+        Ok(findings) => findings,
+        Err(message) => {
+            eprintln!("ERROR: could not scan tracked cross-process symbols: {message}");
+            return 2;
+        }
+    };
     if findings.is_empty() {
         println!(
             "clean: no tracked cross-process symbols touched on removed lines \
@@ -664,53 +677,86 @@ fn unified_diff(repo_root: &Path, revisions: &[&str]) -> Result<Vec<String>, Str
 /// did none of those things. A guard that can only be satisfied by
 /// mislabelling corrupts the signal it exists to give, so it counts both
 /// sides now.
-/// Whether `body` mentions `symbol` as a symbol rather than as a fragment of a
-/// longer name.
-///
-/// A plain substring test reports a removal whenever a tracked name appears
-/// anywhere inside another identifier: deleting `changed_paths: Vec::new()`
-/// was reported as removing the tracked `paths`, which left the author with no
-/// truthful contract label to declare (#263). Identifier characters on either
-/// side mean this is a different name, so the occurrence says nothing about
-/// the tracked one.
-///
-/// Deliberately still matches inside comments and string literals. Command
-/// names reach their dispatch as string literals, so skipping those would turn
-/// a genuine removal into silence -- the failure this check exists to prevent.
-fn mentions_symbol(body: &str, symbol: &str) -> bool {
-    if symbol.is_empty() {
-        return false;
-    }
-    let bytes = body.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = body[from..].find(symbol) {
-        let start = from + offset;
-        let end = start + symbol.len();
-        let before_joins = start
-            .checked_sub(1)
-            .is_some_and(|index| is_symbol_byte(bytes[index]));
-        let after_joins = bytes.get(end).copied().is_some_and(is_symbol_byte);
-        if !before_joins && !after_joins {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
+struct TrackedSymbolMatcher<'a> {
+    symbols: Vec<&'a str>,
+    patterns: Option<RegexSet>,
 }
 
-/// Bytes that can continue an identifier, and so join a match to its
-/// neighbour. `-` counts because tracked names are CLI spellings such as
-/// `check-contract`, where a hyphen is part of the name rather than a break.
-fn is_symbol_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+/// Compile the tracked literals once, with the same ASCII-byte boundary rule
+/// used by the former per-symbol scanner. In valid UTF-8, every non-ASCII
+/// scalar is a boundary just as each of its bytes was previously.
+fn build_symbol_matcher(
+    tracked: &BTreeSet<String>,
+    compiled_size_limit: usize,
+) -> Result<TrackedSymbolMatcher<'_>, String> {
+    const PREFIX: &str = r"(?:\A|[^A-Za-z0-9_-])";
+    const SUFFIX: &str = r"(?:\z|[^A-Za-z0-9_-])";
+
+    let mut symbol_bytes = 0usize;
+    let mut pattern_bytes = 0usize;
+    let mut symbols = Vec::new();
+    let mut patterns = Vec::new();
+    for symbol in tracked.iter().map(String::as_str).filter(|s| !s.is_empty()) {
+        symbol_bytes = symbol_bytes
+            .checked_add(symbol.len())
+            .ok_or_else(|| "tracked contract symbols exceed the size limit".to_string())?;
+        if symbol_bytes > MAX_SYMBOL_PATTERN_BYTES {
+            return Err(format!(
+                "tracked contract symbols exceed the {MAX_SYMBOL_PATTERN_BYTES}-byte source limit"
+            ));
+        }
+        let pattern = format!("{PREFIX}{}{SUFFIX}", regex::escape(symbol));
+        pattern_bytes = pattern_bytes
+            .checked_add(pattern.len())
+            .ok_or_else(|| "tracked contract symbol patterns exceed the size limit".to_string())?;
+        if pattern_bytes > MAX_SYMBOL_PATTERN_BYTES {
+            return Err(format!(
+                "tracked contract symbol patterns exceed the {MAX_SYMBOL_PATTERN_BYTES}-byte source limit"
+            ));
+        }
+        symbols.push(symbol);
+        patterns.push(pattern);
+    }
+
+    if patterns.is_empty() {
+        return Ok(TrackedSymbolMatcher {
+            symbols,
+            patterns: None,
+        });
+    }
+
+    let patterns = RegexSetBuilder::new(patterns)
+        .size_limit(compiled_size_limit)
+        .build()
+        .map_err(|error| {
+            format!(
+                "could not compile tracked contract symbols within the {compiled_size_limit}-byte limit: {error}"
+            )
+        })?;
+    Ok(TrackedSymbolMatcher {
+        symbols,
+        patterns: Some(patterns),
+    })
 }
 
 pub fn find_touched_symbols(
     diff_lines: &[String],
     tracked: &BTreeSet<String>,
-) -> BTreeMap<String, Vec<String>> {
-    let mut removed: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut added: BTreeMap<String, usize> = BTreeMap::new();
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    find_touched_symbols_with_limit(diff_lines, tracked, MAX_SYMBOL_SET_SIZE_BYTES)
+}
+
+fn find_touched_symbols_with_limit(
+    diff_lines: &[String],
+    tracked: &BTreeSet<String>,
+    matcher_size_limit: usize,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let matcher = build_symbol_matcher(tracked, matcher_size_limit)?;
+    let Some(patterns) = matcher.patterns.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut removed = vec![Vec::new(); matcher.symbols.len()];
+    let mut added = vec![0usize; matcher.symbols.len()];
     for line in diff_lines {
         // `--- a/path` and `+++ b/path` appear at hunk boundaries. Skip
         // them; real removals are `-text`, real additions `+text`.
@@ -718,26 +764,23 @@ pub fn find_touched_symbols(
             continue;
         }
         if let Some(body) = line.strip_prefix('-') {
-            for symbol in tracked {
-                if mentions_symbol(body, symbol) {
-                    removed
-                        .entry(symbol.clone())
-                        .or_default()
-                        .push(line.clone());
-                }
+            for id in patterns.matches(body).iter() {
+                removed[id].push(line.clone());
             }
         } else if let Some(body) = line.strip_prefix('+') {
-            for symbol in tracked {
-                if mentions_symbol(body, symbol) {
-                    *added.entry(symbol.clone()).or_default() += 1;
-                }
+            for id in patterns.matches(body).iter() {
+                added[id] += 1;
             }
         }
     }
-    removed
+    Ok(matcher
+        .symbols
         .into_iter()
-        .filter(|(symbol, lines)| lines.len() > added.get(symbol).copied().unwrap_or(0))
-        .collect()
+        .zip(removed)
+        .zip(added)
+        .filter(|((_symbol, lines), added_count)| lines.len() > *added_count)
+        .map(|((symbol, lines), _added_count)| (symbol.to_string(), lines))
+        .collect())
 }
 
 /// Tracked cross-process symbols a diff touches, for the change
@@ -765,7 +808,7 @@ pub fn touched_symbols_for_classification(
             doc.display()
         ));
     }
-    Ok(find_touched_symbols(diff_lines, &tracked)
+    Ok(find_touched_symbols(diff_lines, &tracked)?
         .into_keys()
         .collect())
 }
@@ -812,8 +855,8 @@ pub fn preflight_submit_decision(
     // decide whether a submission is refused.
     let diff_lines = read_diff_between(repo_root, base, "HEAD")
         .map_err(|message| format!("could not diff {base}..HEAD: {message}"))?;
-    let findings = find_touched_symbols(&diff_lines, &tracked);
-    Ok(validate_submit_decision(&findings, pending_commit_messages))
+    let scan = find_touched_symbols(&diff_lines, &tracked);
+    Ok(preflight_decision_after_scan(scan, pending_commit_messages))
 }
 
 fn validate_submit_decision(
@@ -846,6 +889,18 @@ fn validate_submit_decision(
          If `none` is correct for a tracked removal, also add `Contract justification: <reason>` (at least {MIN_JUSTIFICATION_CHARS} characters).\n",
         reason.trim_start_matches("ERROR: ")
     ))
+}
+
+fn preflight_decision_after_scan(
+    scan: Result<BTreeMap<String, Vec<String>>, String>,
+    pending_commit_messages: &str,
+) -> Result<(), String> {
+    match scan {
+        Ok(findings) => validate_submit_decision(&findings, pending_commit_messages),
+        Err(message) => Err(format!(
+            "could not scan tracked contract symbols: {message}"
+        )),
+    }
 }
 
 /// The contract decision an author declared.
@@ -1162,7 +1217,7 @@ mod tests {
             "-    call_graph_builder();".to_string(),
         ];
         assert!(
-            find_touched_symbols(&diff, &tracked).is_empty(),
+            find_touched_symbols(&diff, &tracked).unwrap().is_empty(),
             "changed_paths, graphs and call_graph_builder are other names"
         );
     }
@@ -1178,7 +1233,7 @@ mod tests {
             "-        \"graph\" => run_graph(tail),".to_string(),
             "-    let paths = collect();".to_string(),
         ];
-        let findings = find_touched_symbols(&diff, &tracked);
+        let findings = find_touched_symbols(&diff, &tracked).unwrap();
         assert_eq!(findings.len(), 2, "both removals must still be reported");
         assert!(findings.contains_key("graph"));
         assert!(findings.contains_key("paths"));
@@ -1189,9 +1244,18 @@ mod tests {
     fn a_hyphenated_name_does_not_match_a_longer_hyphenated_one() {
         let tracked = BTreeSet::from(["check-contract".to_string()]);
         let removed_longer = vec!["-    run(\"check-contract-plan\");".to_string()];
-        assert!(find_touched_symbols(&removed_longer, &tracked).is_empty());
+        assert!(
+            find_touched_symbols(&removed_longer, &tracked)
+                .unwrap()
+                .is_empty()
+        );
         let removed_exact = vec!["-    run(\"check-contract\");".to_string()];
-        assert_eq!(find_touched_symbols(&removed_exact, &tracked).len(), 1);
+        assert_eq!(
+            find_touched_symbols(&removed_exact, &tracked)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1206,7 +1270,7 @@ mod tests {
             "  context line mentions aethyme-explore (unchanged)",
             "- removing aethyme-explore (this is the dangerous direction)",
         ]);
-        let findings = find_touched_symbols(&diff, &tracked_explore());
+        let findings = find_touched_symbols(&diff, &tracked_explore()).unwrap();
         let hits = findings.get("aethyme-explore").expect("symbol flagged");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].starts_with('-'));
@@ -1224,7 +1288,11 @@ mod tests {
             "- | `aethyme-explore` | old wording |",
             "+ | `aethyme-explore` | new wording |",
         ]);
-        assert!(find_touched_symbols(&diff, &tracked_explore()).is_empty());
+        assert!(
+            find_touched_symbols(&diff, &tracked_explore())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1238,7 +1306,7 @@ mod tests {
             "- row two cites `aethyme-explore`",
             "+ merged row cites `aethyme-explore`",
         ]);
-        let findings = find_touched_symbols(&diff, &tracked_explore());
+        let findings = find_touched_symbols(&diff, &tracked_explore()).unwrap();
         assert_eq!(findings.get("aethyme-explore").map(Vec::len), Some(2));
     }
 
@@ -1255,7 +1323,77 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        assert!(find_touched_symbols(&diff, &tracked).is_empty());
+        assert!(find_touched_symbols(&diff, &tracked).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ascii_boundary_rule_treats_non_ascii_characters_as_boundaries() {
+        let tracked = BTreeSet::from(["paths".to_string()]);
+        let diff = vec!["- épathsé".to_string()];
+
+        let findings = find_touched_symbols(&diff, &tracked).unwrap();
+
+        assert_eq!(findings.get("paths").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn punctuation_bearing_symbols_match_literally_and_can_overlap() {
+        let tracked = BTreeSet::from(["foo.bar".to_string(), "bar.baz".to_string()]);
+        let diff = vec!["- foo.bar.baz".to_string()];
+
+        let findings = find_touched_symbols(&diff, &tracked).unwrap();
+
+        assert_eq!(
+            findings.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["bar.baz", "foo.bar"]
+        );
+    }
+
+    #[test]
+    fn repeated_occurrences_on_one_line_count_once_for_both_sides() {
+        let tracked = BTreeSet::from(["foo.bar".to_string()]);
+        let diff = diff_of(&["- foo.bar foo.bar", "+ foo.bar"]);
+
+        assert!(find_touched_symbols(&diff, &tracked).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejected_utf8_adjacent_match_does_not_split_the_next_search_offset() {
+        let tracked = BTreeSet::from(["éé".to_string()]);
+        let diff = vec!["- xéé éé".to_string()];
+
+        let findings = find_touched_symbols(&diff, &tracked).unwrap();
+
+        assert_eq!(findings.get("éé").map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn empty_symbols_are_ignored_like_the_previous_matcher() {
+        let tracked = BTreeSet::from([String::new()]);
+        let diff = vec!["- any removed line".to_string()];
+
+        assert!(find_touched_symbols(&diff, &tracked).unwrap().is_empty());
+    }
+
+    #[test]
+    fn matcher_size_limit_fails_instead_of_returning_no_findings() {
+        let tracked = BTreeSet::from(["aethyme-explore".to_string()]);
+
+        assert!(build_symbol_matcher(&tracked, 1).is_err());
+    }
+
+    #[test]
+    fn submit_preflight_refuses_when_symbol_scanning_fails() {
+        let tracked = BTreeSet::from(["aethyme-explore".to_string()]);
+        let diff = vec!["- aethyme-explore".to_string()];
+        let scan = find_touched_symbols_with_limit(&diff, &tracked, 1);
+
+        let verdict = preflight_decision_after_scan(scan, "");
+
+        assert!(matches!(
+            verdict,
+            Err(message) if message.contains("could not scan tracked contract symbols")
+        ));
     }
 
     /// A justification has to say something. Token reasons would make the
