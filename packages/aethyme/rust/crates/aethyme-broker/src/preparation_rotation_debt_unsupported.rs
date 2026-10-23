@@ -7,6 +7,25 @@ use std::io;
 use std::path::Path;
 use std::time::Instant;
 
+/// Platform placeholder for filesystem identity checks. Operations that need
+/// descriptor-relative identity capture fail closed through `capture`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryIdentity;
+
+impl DirectoryIdentity {
+    pub(crate) fn capture(_path: &Path) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn encode(&self) -> io::Result<Vec<u8>> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn same_filesystem(&self, _other: &Self) -> bool {
+        false
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DebtInventory {
     pub(crate) repositories: Vec<String>,
@@ -59,6 +78,14 @@ pub(crate) struct InitializedPreparationCacheRoot {
 pub(crate) fn capture_preparation_cache_root(
     _path: &Path,
 ) -> io::Result<PreparationCacheRootCapture> {
+    Err(unsupported())
+}
+
+pub(crate) fn ensure_preparation_cache_root_child(
+    _parent_path: &Path,
+    _child_name: &str,
+    _expected_parent_identity: &[u8],
+) -> io::Result<()> {
     Err(unsupported())
 }
 

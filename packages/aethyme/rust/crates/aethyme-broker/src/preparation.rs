@@ -227,6 +227,14 @@ pub enum PreparationCachePolicy {
     RepositoryShared,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCacheRoot {
+    #[default]
+    Host,
+    WorktreeVolume,
+}
+
 /// Byte budget for the repository-shared preparation cache.
 ///
 /// A shared cache is keyed by preparation digest, so a repository whose
@@ -235,11 +243,18 @@ pub enum PreparationCachePolicy {
 /// write quota: a preparation step can exceed it, and active entries remain
 /// protected while in use. Disabling the threshold preserves the historical
 /// behavior, but does not bound growth across distinct inputs or clones.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SharedCacheBudget {
-    /// Rotate the whole shared cache when it exceeds this many bytes.
+    /// Rotate the whole shared cache when it exceeds this many bytes. Zero or
+    /// an omitted value leaves the cache without a size threshold.
+    #[serde(default)]
     pub max_bytes: u64,
+    /// Select the cache filesystem. The host default preserves existing
+    /// placement; worktree-volume uses the selected session's Aethyme-owned
+    /// placement root, unless an explicit operator root was captured.
+    #[serde(default)]
+    pub root: SharedCacheRoot,
 }
 
 fn default_cache_policy() -> PreparationCachePolicy {
@@ -600,24 +615,6 @@ impl Broker {
         })?;
         let source_digest = preparation_source_digest(&root, &config, session_id)?;
         let digest = preparation_digest(&root, &config, session_id)?;
-        let managed_shared_cache_path = if config.managed_storage.is_some()
-            && config
-                .steps
-                .iter()
-                .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
-        {
-            Some(
-                preparation_cache_root_binding_for_broker(self)?
-                    .path
-                    .join(repository_identity(self))
-                    .join(&digest[..12]),
-            )
-        } else {
-            None
-        };
-        let managed_storage_plan =
-            managed_preparation_storage_plan(&root, &config, managed_shared_cache_path.as_deref())?;
-        require_managed_storage_execution_ready(managed_storage_plan.as_ref())?;
         let status = self.preparation_status(session_id)?;
         if status.state == PreparationState::Current {
             return Ok(PreparationReport {
@@ -658,9 +655,53 @@ impl Broker {
             .steps
             .iter()
             .any(|step| step.cache == PreparationCachePolicy::RepositoryShared);
-        let cache_root_binding = shared
-            .then(|| preparation_cache_root_binding_for_broker(self))
-            .transpose()?;
+        let cache_root_binding = if shared {
+            let binding = match config
+                .shared_cache
+                .as_ref()
+                .map_or(SharedCacheRoot::Host, |cache| cache.root)
+            {
+                SharedCacheRoot::Host => preparation_cache_root_binding_for_broker(self)?,
+                SharedCacheRoot::WorktreeVolume
+                    if self
+                        .storage_context()
+                        .preparation_cache_root_override
+                        .is_none() => self
+                    .initialize_worktree_volume_preparation_cache_root(&root)
+                    .map_err(|error| PreparationError::StorageUnavailable {
+                        path: root.clone(),
+                        reason: format!(
+                            "cannot initialize the worktree-volume preparation-cache root: {error}"
+                        ),
+                    })?,
+                SharedCacheRoot::WorktreeVolume => {
+                    preparation_cache_root_binding_for_broker(self)?
+                }
+            };
+            if config
+                .shared_cache
+                .as_ref()
+                .is_some_and(|cache| cache.root == SharedCacheRoot::WorktreeVolume)
+            {
+                ensure_preparation_cache_root_on_worktree_volume(&root, &binding)?;
+            }
+            Some(binding)
+        } else {
+            None
+        };
+        let managed_shared_cache_path = if config.managed_storage.is_some() && shared {
+            cache_root_binding.as_ref().map(|binding| {
+                binding
+                    .path
+                    .join(repository_identity(self))
+                    .join(&digest[..12])
+            })
+        } else {
+            None
+        };
+        let managed_storage_plan =
+            managed_preparation_storage_plan(&root, &config, managed_shared_cache_path.as_deref())?;
+        require_managed_storage_execution_ready(managed_storage_plan.as_ref())?;
         let cache_dir = cache_root_binding.as_ref().map(|binding| {
             binding
                 .path
@@ -739,7 +780,14 @@ impl Broker {
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
         let rotation_result = if shared {
-            shared_cache_budget(config.shared_cache.as_ref(), &digest, self)
+            shared_cache_budget(
+                config.shared_cache.as_ref(),
+                &digest,
+                self,
+                cache_root_binding
+                    .as_ref()
+                    .expect("shared cache has a binding"),
+            )
         } else {
             Ok(None)
         };
@@ -1058,7 +1106,7 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
             .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
     {
         return Err(invalid_config(
-            "shared_cache.max_bytes requires at least one step with cache = \"repository_shared\"",
+            "shared_cache requires at least one step with cache = \"repository_shared\"",
         ));
     }
     let mut runtime_names = BTreeSet::new();
@@ -2056,22 +2104,8 @@ fn shared_cache_budget(
     budget: Option<&SharedCacheBudget>,
     digest: &str,
     broker: &Broker,
+    cache_root_binding: &crate::broker::PreparationCacheRootBinding,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
-    let cache_root_binding = broker
-        .storage_context()
-        .preparation_cache_root_binding()
-        .map_err(|error| PreparationError::StorageUnavailable {
-            path: broker
-                .storage_context()
-                .preparation_cache_root_override
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("preparation-cache")),
-            reason: format!("captured preparation-cache root is unavailable: {error}"),
-        })?
-        .ok_or_else(|| PreparationError::StorageUnavailable {
-            path: PathBuf::from("preparation-cache"),
-            reason: "the broker's captured host resource database path is unavailable".into(),
-        })?;
     let cache_root = cache_root_binding.path.clone();
     let resource_db_path = broker
         .storage_context()
@@ -2088,8 +2122,43 @@ fn shared_cache_budget(
         &repository_identity(broker),
         digest,
         cache_root_binding.identity.as_deref(),
-        Some(&cache_root_binding),
+        Some(cache_root_binding),
     )
+}
+
+fn ensure_preparation_cache_root_on_worktree_volume(
+    worktree: &Path,
+    binding: &crate::broker::PreparationCacheRootBinding,
+) -> Result<(), PreparationError> {
+    binding
+        .validate()
+        .map_err(|error| PreparationError::StorageUnavailable {
+            path: binding.path.clone(),
+            reason: format!("captured preparation-cache root changed: {error}"),
+        })?;
+    let worktree_identity =
+        rotation_debt::DirectoryIdentity::capture(worktree).map_err(|error| {
+            PreparationError::StorageUnavailable {
+                path: worktree.to_path_buf(),
+                reason: format!("cannot verify worktree filesystem: {error}"),
+            }
+        })?;
+    let cache_identity =
+        rotation_debt::DirectoryIdentity::capture(&binding.path).map_err(|error| {
+            PreparationError::StorageUnavailable {
+                path: binding.path.clone(),
+                reason: format!("cannot verify preparation-cache filesystem: {error}"),
+            }
+        })?;
+    if !worktree_identity.same_filesystem(&cache_identity) {
+        return Err(PreparationError::StorageUnavailable {
+            path: binding.path.clone(),
+            reason:
+                "selected preparation-cache root is on a different filesystem from the worktree"
+                    .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Rotation against an explicit cache root and repository identity.
@@ -3231,6 +3300,7 @@ mod tests {
                 state,
                 captured_resource_db_path: resource_db_path.to_path_buf(),
                 root_handle: std::sync::Arc::new(captured.directory),
+                placement_root: None,
             }),
         }
     }
@@ -3990,6 +4060,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_shared_cache_without_a_root_selector_keeps_the_host_default() {
+        let parsed = parse_config(&shared_budget_config(true, 1024)).unwrap();
+        assert_eq!(
+            parsed.shared_cache.expect("declared").root,
+            SharedCacheRoot::Host
+        );
+    }
+
+    #[test]
+    fn a_worktree_volume_root_selector_does_not_enable_a_budget() {
+        let source = "schema_version = 1\n\
+            [[steps]]\n\
+            name = \"deps\"\n\
+            command = [\"tool\", \"install\"]\n\
+            inputs = [\"lock.file\"]\n\
+            outputs = [\"vendor/\"]\n\
+            cache = \"repository_shared\"\n\
+            [shared_cache]\n\
+            root = \"worktree_volume\"\n";
+        let parsed = parse_config(source).expect("root selection is independent of the budget");
+        let shared_cache = parsed.shared_cache.expect("declared");
+        assert_eq!(shared_cache.root, SharedCacheRoot::WorktreeVolume);
+        assert_eq!(shared_cache.max_bytes, 0, "omitted means no size threshold");
+    }
+
     /// `0` is the pre-existing behaviour and must stay available: a
     /// single-clone developer gains nothing from a ceiling.
     #[test]
@@ -4080,7 +4176,10 @@ mod tests {
         assert_eq!(directory_bytes(&store).unwrap(), None);
         assert!(
             shared_cache_budget_at(
-                Some(&SharedCacheBudget { max_bytes: 1 }),
+                Some(&SharedCacheBudget {
+                    max_bytes: 1,
+                    ..SharedCacheBudget::default()
+                }),
                 &cache_root,
                 SHARED_CACHE_TEST_REPOSITORY,
                 "abcdef123456",
@@ -4107,6 +4206,7 @@ mod tests {
 
         let budget = SharedCacheBudget {
             max_bytes: bytes - 1,
+            ..SharedCacheBudget::default()
         };
         let rotation = shared_cache_budget_at(
             Some(&budget),
@@ -4160,7 +4260,10 @@ mod tests {
         let resource_db = tmp.path().join("host-state/host-resources.db");
 
         let error = shared_cache_budget_at_with_resource_db_and_identity(
-            Some(&SharedCacheBudget { max_bytes: 1 }),
+            Some(&SharedCacheBudget {
+                max_bytes: 1,
+                ..SharedCacheBudget::default()
+            }),
             &cache_root,
             &resource_db,
             SHARED_CACHE_TEST_REPOSITORY,
@@ -4201,7 +4304,10 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("payload"), vec![0_u8; 4096]).unwrap();
         let rotation = shared_cache_budget_at(
-            Some(&SharedCacheBudget { max_bytes: 1 }),
+            Some(&SharedCacheBudget {
+                max_bytes: 1,
+                ..SharedCacheBudget::default()
+            }),
             &cache_root,
             SHARED_CACHE_TEST_REPOSITORY,
             "0123456789ab",
@@ -4417,7 +4523,10 @@ mod tests {
 
         assert!(matches!(
             shared_cache_budget_at(
-                Some(&SharedCacheBudget { max_bytes: 1 }),
+                Some(&SharedCacheBudget {
+                    max_bytes: 1,
+                    ..SharedCacheBudget::default()
+                }),
                 &cache_root,
                 SHARED_CACHE_TEST_REPOSITORY,
                 "abcdef123456",
@@ -4439,7 +4548,10 @@ mod tests {
 
         assert!(matches!(
             shared_cache_budget_at(
-                Some(&SharedCacheBudget { max_bytes: 1 }),
+                Some(&SharedCacheBudget {
+                    max_bytes: 1,
+                    ..SharedCacheBudget::default()
+                }),
                 &cache_root,
                 SHARED_CACHE_TEST_REPOSITORY,
                 "abcdef123456",
