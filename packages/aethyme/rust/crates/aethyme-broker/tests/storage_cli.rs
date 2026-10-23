@@ -1,5 +1,6 @@
 //! Host-scoped storage inventory and reviewed reclamation.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -17,10 +18,33 @@ impl TestRepo {
     }
 }
 
+fn isolate_fixture_git_environment(command: &mut Command, repo: &Path) {
+    let fixture_root = repo
+        .parent()
+        .expect("the repository is nested under an owned fixture root");
+    let home = fixture_root.join("git-home");
+    let xdg_config = fixture_root.join("git-config");
+    let global_config = fixture_root.join("empty-global-gitconfig");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg_config).unwrap();
+    std::fs::write(&global_config, "").unwrap();
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", xdg_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", global_config);
+}
+
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
+    let mut command = Command::new("git");
+    command.args(args).current_dir(repo);
+    isolate_fixture_git_environment(&mut command, repo);
+    let output = command
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
@@ -86,7 +110,9 @@ fn run_at(repo: &Path, current_dir: &Path, container: &Path, args: &[&str]) -> O
         aethyme_broker::HostResourceCoordinator::open(&host_state.join("host-resources.db"))
             .unwrap(),
     );
-    common::broker_cli(CLI, args)
+    let mut command = common::broker_cli(CLI, args);
+    isolate_fixture_git_environment(&mut command, repo);
+    command
         .current_dir(current_dir)
         .env("AETHYME_WORKTREE_ROOT", container)
         .env("AETHYME_HOST_STATE_DIR", host_state)
@@ -1131,3 +1157,146 @@ fn a_shared_branch_named_by_a_session_is_reported_shared_not_session_owned() {
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[test]
+fn same_volume_shared_cache_is_reclaimed_only_when_root_liveness_is_known() {
+    let (repo, container) = fixture();
+    std::fs::write(
+        repo.path().join(".gitignore"),
+        "/.aethyme/broker.db*\n/.aethyme/broker.toml\n/.aethyme/run/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join(".aethyme/prepare.toml"),
+        r#"schema_version = 1
+
+[shared_cache]
+root = "worktree_volume"
+
+[[steps]]
+name = "record-cache-root"
+command = ["sh", "-c", "mkdir -p \"$AETHYME_PREPARE_CACHE_DIR\" node_modules && printf '%s' \"$AETHYME_PREPARE_CACHE_DIR\" > node_modules/cache-root"]
+inputs = ["README.md"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+required_for_hooks = false
+"#,
+    )
+    .unwrap();
+    git(repo.path(), &["add", ".gitignore"]);
+    git(repo.path(), &["add", ".aethyme/prepare.toml"]);
+    git(repo.path(), &["commit", "-qm", "configure same-volume preparation cache"]);
+    git(
+        repo.path(),
+        &["ls-files", "--error-unmatch", ".aethyme/prepare.toml"],
+    );
+
+    let started = json(run(
+        repo.path(),
+        container.path(),
+        &[
+            "start",
+            "--adopt",
+            ".",
+            "--task",
+            "same-volume preparation cache",
+            "--json",
+        ],
+    ));
+    let session = started["id"].as_i64().unwrap().to_string();
+    let prepared = json(run(
+        repo.path(),
+        container.path(),
+        &["submit", "prepare", "--session", &session, "--json"],
+    ));
+    assert_eq!(prepared["state"], "current");
+    assert_eq!(prepared["shared_cache_coordinated"], true);
+
+    let cache_path = PathBuf::from(
+        std::fs::read_to_string(repo.path().join("node_modules/cache-root"))
+            .unwrap()
+            .trim(),
+    )
+    .canonicalize()
+    .unwrap();
+    let container_path = container.path().canonicalize().unwrap();
+    assert!(
+        cache_path.starts_with(&container_path),
+        "worktree-volume cache {cache_path:?} is outside its configured container {container_path:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&cache_path).unwrap().dev(),
+        std::fs::metadata(&container_path).unwrap().dev(),
+        "worktree-volume cache and worktree container must be on the same filesystem"
+    );
+    let current_key = cache_path.file_name().unwrap().to_str().unwrap();
+    assert_eq!(current_key.len(), 12);
+    assert!(current_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let unknown_key = if current_key == "0123456789ab" {
+        "fedcba987654"
+    } else {
+        "0123456789ab"
+    };
+    let unknown_cache_entry = cache_path.parent().unwrap().join(unknown_key);
+    std::fs::create_dir_all(&unknown_cache_entry).unwrap();
+    std::fs::write(unknown_cache_entry.join("cache-probe"), "stale\n").unwrap();
+    let unknown_cache_entry = unknown_cache_entry.canonicalize().unwrap();
+    let unknown_cache_entry_text = unknown_cache_entry.to_str().unwrap();
+
+    // A regular file inside a valid keyed root is not a checkout and must not
+    // make cache liveness unknown by itself.
+    let keyed_root = container_path.join("ordinary-file-control");
+    marker(&keyed_root, "ordinary-file-control", repo.path());
+    std::fs::write(keyed_root.join("ordinary-file"), "not a checkout\n").unwrap();
+    let eligible = json(run(
+        repo.path(),
+        container.path(),
+        &["storage", "plan", "--json"],
+    ));
+    let eligible_entry = eligible["preparation_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == unknown_cache_entry_text)
+        .expect("unknown cache key is inventoried");
+    assert_eq!(eligible_entry["reclaimable"], true);
+    assert!(eligible["preparation_candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["path"] == unknown_cache_entry_text));
+
+    // A non-directory entry directly in the keyed container is a StorageRoot.
+    let unknown_root = container_path.join("globalrootchild");
+    std::fs::write(&unknown_root, "unclassified root\n").unwrap();
+    let unknown_root = unknown_root.canonicalize().unwrap();
+    let retained = json(run(
+        repo.path(),
+        container.path(),
+        &["storage", "plan", "--json"],
+    ));
+    let root = retained["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|root| root["path"] == unknown_root.to_str().unwrap())
+        .expect("direct container child appears in the storage plan");
+    assert_eq!(root["filesystem_kind"], "file");
+    let retained_entry = retained["preparation_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == unknown_cache_entry_text)
+        .expect("unknown cache key remains inventoried");
+    assert_eq!(retained_entry["reclaimable"], false);
+    assert!(retained_entry["reason"]
+        .as_str()
+        .unwrap()
+        .contains("could not be verified"));
+    assert!(!retained["preparation_candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|candidate| candidate["path"] == unknown_cache_entry_text));
+}
+
