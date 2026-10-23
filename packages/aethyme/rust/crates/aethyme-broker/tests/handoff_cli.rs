@@ -39,11 +39,11 @@ fn init_repo(repo: &Path) {
     git(repo, &["commit", "-qm", "init"]);
 }
 
-fn finished_fixture() -> (tempfile::TempDir, PathBuf, i64) {
+fn finished_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, i64) {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let worktree = tmp.path().join(".aethyme/worktrees/handoff-cli");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let worktree = worktree_owner.path().join("handoff-cli");
     git(
         tmp.path(),
         &[
@@ -87,7 +87,7 @@ fn finished_fixture() -> (tempfile::TempDir, PathBuf, i64) {
         })
         .unwrap();
     assert!(broker.finish(session.id).unwrap().closed);
-    (tmp, worktree, session.id)
+    (tmp, worktree_owner, worktree, session.id)
 }
 
 fn event_fingerprints(repo: &Path) -> Vec<(i64, String, Option<String>)> {
@@ -114,7 +114,7 @@ fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
 
 #[test]
 fn handoff_json_by_session_has_a_stable_read_only_contract() {
-    let (tmp, _worktree, session_id) = finished_fixture();
+    let (tmp, _worktree_owner, _worktree, session_id) = finished_fixture();
     let before = event_fingerprints(tmp.path());
     let session = session_id.to_string();
     let output = run(
@@ -173,7 +173,7 @@ fn handoff_json_by_session_has_a_stable_read_only_contract() {
 
 #[test]
 fn handoff_by_worktree_returns_the_latest_completed_session() {
-    let (tmp, worktree, first_session_id) = finished_fixture();
+    let (tmp, _worktree_owner, worktree, first_session_id) = finished_fixture();
     let mut broker = Broker::open(tmp.path()).unwrap();
     let second = broker
         .adopt(&worktree, Some("follow-up on the same worktree"))
@@ -212,9 +212,8 @@ fn handoff_by_worktree_returns_the_latest_completed_session() {
     assert!(text.contains("cleanup safe: yes"), "{text}");
 }
 
-fn unlanded_worktree(repo: &Path) -> PathBuf {
-    let worktree = repo.join(".aethyme/worktrees/unlanded");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+fn unlanded_worktree(repo: &Path, owner: &tempfile::TempDir) -> PathBuf {
+    let worktree = owner.path().join("unlanded");
     git(
         repo,
         &[
@@ -258,7 +257,8 @@ fn handoff_for(repo: &Path, worktree: &Path) -> Output {
 fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let worktree = unlanded_worktree(tmp.path());
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let worktree = unlanded_worktree(tmp.path(), &worktree_owner);
     commit_unlanded_work(&worktree);
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker
@@ -285,7 +285,8 @@ fn adopting_unlanded_work_and_changing_nothing_is_not_cleanup_safe() {
 fn re_adopted_session_hands_off_after_submitting_inherited_work() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let worktree = unlanded_worktree(tmp.path());
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let worktree = unlanded_worktree(tmp.path(), &worktree_owner);
     let mut broker = Broker::open(tmp.path()).unwrap();
     let first = broker.adopt(&worktree, Some("unlanded work")).unwrap();
     commit_unlanded_work(&worktree);
@@ -328,7 +329,7 @@ fn re_adopted_session_hands_off_after_submitting_inherited_work() {
 
 #[test]
 fn handoff_by_absolute_worktree_survives_worktree_removal() {
-    let (tmp, worktree, session_id) = finished_fixture();
+    let (tmp, _worktree_owner, worktree, session_id) = finished_fixture();
     git(
         tmp.path(),
         &["worktree", "remove", "--force", worktree.to_str().unwrap()],
