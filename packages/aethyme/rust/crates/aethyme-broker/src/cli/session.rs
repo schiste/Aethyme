@@ -2087,7 +2087,17 @@ pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
         Some("resolve") => return run_cleanup_resolve(parsed),
         _ => {}
     }
-    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let bulk_plan = parsed.all_cleaned && !parsed.apply;
+    if parsed.read_only_snapshot && !bulk_plan {
+        return Err(UsageError::Message(
+            "cleanup apply and single-session removal require the current writable repository database; --read-only-snapshot is available only for the --all-cleaned plan".into(),
+        ));
+    }
+    // The default bulk plan is diagnostic and removes nothing. Read a
+    // compatibility snapshot so an unavailable bound worktree root can be
+    // reported as a blocked item instead of failing before planning. Apply
+    // and single-session cleanup still use the strictly validated writable DB.
+    let mut broker = open_broker(bulk_plan)?;
     if parsed.all_cleaned {
         if !parsed.positional.is_empty() || parsed.force || parsed.dry_run {
             return Err(UsageError::Message(
