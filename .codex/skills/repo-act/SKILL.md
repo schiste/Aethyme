@@ -113,6 +113,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   target. Start with a relevant integration-test target when available, keep one
   Cargo worker, and retain the remaining unit coverage as pending qualification.
   A resource-stopped compile provides no test result.
+- If CI cancels older runs on push, retain useful in-progress workspace test
+  results before pushing a formatting or diagnostic follow-up. Commit the
+  correction locally while waiting; cancel early when the run is no longer
+  useful. Qualify the final head separately and label evidence by its source head.
 - When reusing a CI build cache, compare the producer and consumer fingerprints,
   including toolchain, lockfiles and environment variables, then confirm the log
   shows a cache restore. A matching shared key alone does not prove reuse.
