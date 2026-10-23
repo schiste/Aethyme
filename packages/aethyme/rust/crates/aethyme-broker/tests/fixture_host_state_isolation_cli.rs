@@ -299,6 +299,11 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
 fn fixture_command_binds_captured_storage_context() {
     let fixture = fixture();
     let fixture_root = fixture.owner_path().canonicalize().unwrap();
+    let mut broker = isolation::open(fixture.path());
+    broker
+        .start_worktree("initialize captured fixture context", None)
+        .unwrap();
+    drop(broker);
     let command = isolation::command(CLI, fixture.path(), &[]);
     let env = configured_env(&command);
 
@@ -359,6 +364,7 @@ fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
         let owned_cache = common::fixture_preparation_cache_root(repo.owner_path())
             .canonicalize()
             .unwrap();
+        let session = broker.start_worktree("library fixture", None).unwrap();
         let mut child_context = Command::new("not-executed");
         broker
             .configure_storage_context_for_child(&mut child_context)
@@ -367,7 +373,6 @@ fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
             configured_env(&child_context).get(OsStr::new("AETHYME_PREPARATION_CACHE_ROOT")),
             Some(&Some(owned_cache.clone().into_os_string()))
         );
-        let session = broker.start_worktree("library fixture", None).unwrap();
         let owned_root = owned_root_path.canonicalize().unwrap();
         let checkout = PathBuf::from(session.worktree_path);
         assert!(
