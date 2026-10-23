@@ -38,6 +38,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // The override is a container; fresh binding creates its repository child.
+        std::fs::create_dir(tmp.path().join("worktrees")).unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);

@@ -1253,7 +1253,8 @@ mod tests {
         assert_eq!(
             fence(required.repo.path()),
             Some(crate::CollaborationFence {
-                min_compatible_schema: crate::schema::MIN_COMPATIBLE_SCHEMA,
+                // Fresh identity-bound databases fence older root-unaware writers.
+                min_compatible_schema: 54,
                 reason: crate::schema::COLLABORATION_FENCE_REASON.into(),
                 source: "committed".into(),
                 state: "active",
