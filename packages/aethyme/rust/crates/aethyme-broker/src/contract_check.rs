@@ -897,7 +897,9 @@ fn preflight_decision_after_scan(
 ) -> Result<(), String> {
     match scan {
         Ok(findings) => validate_submit_decision(&findings, pending_commit_messages),
-        Err(message) => Err(format!("could not scan tracked contract symbols: {message}")),
+        Err(message) => Err(format!(
+            "could not scan tracked contract symbols: {message}"
+        )),
     }
 }
 
@@ -1242,11 +1244,18 @@ mod tests {
     fn a_hyphenated_name_does_not_match_a_longer_hyphenated_one() {
         let tracked = BTreeSet::from(["check-contract".to_string()]);
         let removed_longer = vec!["-    run(\"check-contract-plan\");".to_string()];
-        assert!(find_touched_symbols(&removed_longer, &tracked)
-            .unwrap()
-            .is_empty());
+        assert!(
+            find_touched_symbols(&removed_longer, &tracked)
+                .unwrap()
+                .is_empty()
+        );
         let removed_exact = vec!["-    run(\"check-contract\");".to_string()];
-        assert_eq!(find_touched_symbols(&removed_exact, &tracked).unwrap().len(), 1);
+        assert_eq!(
+            find_touched_symbols(&removed_exact, &tracked)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1279,9 +1288,11 @@ mod tests {
             "- | `aethyme-explore` | old wording |",
             "+ | `aethyme-explore` | new wording |",
         ]);
-        assert!(find_touched_symbols(&diff, &tracked_explore())
-            .unwrap()
-            .is_empty());
+        assert!(
+            find_touched_symbols(&diff, &tracked_explore())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
