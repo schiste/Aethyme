@@ -357,7 +357,8 @@ impl Broker {
     pub(crate) fn invalidate_cached_open_pr_listing(&self) {
         crate::warn_unrecorded(
             "invalidate the cached open pull request listing",
-            self.store_ref().meta_set(OPEN_PRS_KEY, INVALIDATED_OPEN_PRS),
+            self.store_ref()
+                .meta_set(OPEN_PRS_KEY, INVALIDATED_OPEN_PRS),
         );
     }
 

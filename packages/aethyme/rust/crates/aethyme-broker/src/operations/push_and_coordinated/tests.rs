@@ -55,7 +55,15 @@ fn open_pr_cache_invalidation_tracks_topology_flags_not_body_values() {
         vec!["pr", "reopen", "506"],
         vec!["pr", "merge", "506"],
         vec!["pr", "update-branch", "506"],
-        vec!["--repo", "acme/project", "pr", "edit", "506", "--base", "main"],
+        vec![
+            "--repo",
+            "acme/project",
+            "pr",
+            "edit",
+            "506",
+            "--base",
+            "main",
+        ],
         vec!["pr", "edit", "506", "--base=release"],
         vec!["pr", "edit", "506", "-B", "release"],
     ] {
