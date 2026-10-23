@@ -2769,7 +2769,11 @@ impl Broker {
                     None,
                     Some(&details.to_string()),
                 )?;
-                if should_invalidate_open_pr_listing(request.provider, &request.args, operation.status) {
+                if should_invalidate_open_pr_listing(
+                    request.provider,
+                    &request.args,
+                    operation.status,
+                ) {
                     self.invalidate_cached_open_pr_listing();
                 }
                 if let Some(guard) = &mut host_guard {
@@ -3037,11 +3041,7 @@ impl Broker {
             exit_code,
             Some(&details.to_string()),
         )?;
-        if should_invalidate_open_pr_listing(
-            request.provider,
-            &request.args,
-            operation.status,
-        ) {
+        if should_invalidate_open_pr_listing(request.provider, &request.args, operation.status) {
             self.invalidate_cached_open_pr_listing();
         }
         if let Some(guard) = &mut host_guard {
