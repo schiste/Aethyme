@@ -87,7 +87,8 @@ impl Fixture {
             .unwrap();
         assert!(
             output.status.success(),
-            "broker start: {}",
+            "broker start: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let started: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

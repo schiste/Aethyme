@@ -87,7 +87,8 @@ impl Fixture {
             .unwrap();
         assert!(
             output.status.success(),
-            "aethyme {args:?}: {}",
+            "aethyme {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         output

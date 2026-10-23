@@ -179,7 +179,8 @@ fn confirmed_execute_preserves_publishes_verifies_syncs_and_resumes() {
     );
     assert!(
         executed.status.success(),
-        "{}",
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&executed.stdout),
         String::from_utf8_lossy(&executed.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
@@ -237,7 +238,8 @@ fn execute_publishes_but_does_not_sync_a_dirty_primary_checkout() {
     );
     assert!(
         executed.status.success(),
-        "{}",
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&executed.stdout),
         String::from_utf8_lossy(&executed.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
@@ -280,7 +282,8 @@ fn stale_main_enrolls_from_upstream_and_preexisting_sibling_detects_activation()
     );
     assert!(
         executed.status.success(),
-        "{}",
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&executed.stdout),
         String::from_utf8_lossy(&executed.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
@@ -406,7 +409,8 @@ fn persisted_phase_boundaries_resume_without_duplicate_publication() {
         );
         assert!(
             resumed.status.success(),
-            "phase {phase}: {}",
+            "phase {phase}: stdout={} stderr={}",
+            String::from_utf8_lossy(&resumed.stdout),
             String::from_utf8_lossy(&resumed.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
