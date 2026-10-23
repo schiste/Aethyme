@@ -2,6 +2,7 @@
 
 **Status:** Integration in progress
 **Baseline:** `19b40e54a3ff1aceaad5129af55bb2fa59d78a6c` (main, 2026-10-23)
+**Last Updated:** 2026-10-23
 
 This manifest records which parts of the durable worktree-root PR stack are
 already present on main, which behavior remains to integrate, and when the

@@ -489,8 +489,7 @@ mod unix {
     }
 
     fn sibling_path(parent: &Path, filename: &std::ffi::OsStr, suffix: &str) -> PathBuf {
-        let mut name = OsString::from(".");
-        name.push(filename);
+        let mut name = OsString::from(filename);
         name.push(suffix);
         parent.join(name)
     }
@@ -1637,6 +1636,26 @@ mod unix {
                 "git init failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+
+        #[test]
+        fn fresh_database_sidecars_match_runtime_ignore_prefix() {
+            let repo = tempfile::tempdir().unwrap();
+            init_repository(repo.path());
+            let database = repo.path().join(".aethyme/broker.db");
+            let paths = prepare_paths(repo.path(), &database).unwrap();
+
+            for path in [&paths.stage_path, &paths.lock_path] {
+                let relative = path
+                    .strip_prefix(repo.path())
+                    .unwrap()
+                    .to_str()
+                    .expect("database sidecar path is valid UTF-8");
+                assert!(
+                    crate::runtime_paths::is_broker_runtime_path(relative),
+                    "database sidecar must match the existing broker runtime ignore prefix: {relative}"
+                );
+            }
         }
 
         fn create_verified_stage(repo_root: &Path) -> (DbPaths, IdentityBase, VerifiedDatabase) {
