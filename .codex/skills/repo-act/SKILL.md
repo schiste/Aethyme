@@ -55,6 +55,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   during discovery. Use a deterministic deadline seam to prove partial progress
   and a seeded persisted marker to test fresh-process resume; assert the marker
   before invoking the resume path.
+- For whole-checkout cleanup, finish canonical grouping of every retained row
+  and build complete live-path evidence before scheduling. Rotate a durable
+  cursor across complete cohorts before per-cohort Git, witness and ownership
+  proofs; never let a partial cohort authorize removal. Keep exact closed-set
+  and fresh apply-time proofs. State that grouping remains O(history), and that
+  one database or filesystem operation can exceed a wall-clock budget.
 
 - When bounding cleanup over session history, page candidate records before
   decoding them and check the deadline before fetching another page. Keep live
@@ -201,6 +207,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- For session-worktree cleanup, treat creation provenance separately from current
+  adoption records. Require a retained `Spawned` session as owner, exclude rows
+  marked `Cleaned` because the path may have been reused, and recheck that row
+  plus Git/root ownership at apply. A path, branch, root marker, or common Git
+  directory can be recreated in the same repository; persist a creator-time
+  worktree/admin-directory identity with the spawned row and compare it at
+  selection and apply. Never infer missing identity for legacy or adopted
+  rows. Cover spawn→close→adopt→close, adopted-only history, and same-path,
+  same-branch replacements both within the same repository and from another
+  repository.
 - Carry the selected worktree-root layout through planning, attribution, and
   apply. A `LibraryOverride` with no `root_container` is a direct repository
   root: inventory that root itself, not its children as keyed repositories.
@@ -237,6 +253,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   unique log and manifest paths. Check which filenames the delegated monitor
   owns; store caller summaries under distinct names instead of overwriting or
   exclusively creating those monitor outputs. Preserve earlier outputs before retrying.
+  If the helper exclusively creates its output root, preflight its parent with a
+  removable canary and leave the output root absent; do not precreate it.
   Freeze source for each invocation and record the exact head and dirty-state
   hashes before and after it. If relevant source changes during a run, retain
   that run as diagnostic evidence and rerun the committed source.
@@ -333,9 +351,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For routine Rust validation, reuse a matching warm target and run one Cargo
   process at a time with `--locked -j1`. Prefer a selected package/binary or
   focused test filter. On a resource-constrained target, use `debug=0` and
-  `incremental=0` from the outset; avoid changing profile settings on a warm
-  target. Expand to verbose or workspace-wide runs only when explicitly needed
-  or after a focused failure.
+  `incremental=0` from the outset; when setting Cargo profile environment
+  variables, use booleans such as `CARGO_PROFILE_DEV_INCREMENTAL=false` and
+  `CARGO_PROFILE_TEST_INCREMENTAL=false` (`CARGO_INCREMENTAL=0` accepts a
+  numeric value). Avoid changing profile settings on a warm target. Expand to
+  verbose or workspace-wide runs only when explicitly needed or after a
+  focused failure.
 - Before a long or frozen Rust inventory, verify each selected
   `--package`/`--test` pair against the owning package's effective Cargo
   targets: the `tests/` defaults and any `[[test]]` or `autotests` settings
