@@ -127,8 +127,13 @@ blocked.
    The draft body is composed from the session task, commit sections, and the
    default pull-request template on the fetched base branch. Prepare the
    reviewed body from the repository template, preserving its required
-   contract decision and justification fields. When a task has an exact
-   reviewed body, set it through the coordinated GitHub path:
+   contract decision and justification fields.
+   Put any justification on a plain-text line starting exactly
+   `Contract justification: ` with at least 24 characters after the prefix.
+   For a `none` choice, avoid comment-only bodies containing tracked terms
+   such as `classification` or `evidence`, which may be mistaken for a choice.
+   When a task has an exact reviewed body, set it through the coordinated
+   GitHub path:
 
    ```bash
    aethyme broker advanced gh --session <your-session-id> --repo <owner/name> \
