@@ -529,6 +529,66 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    pub(crate) fn cleaned_session_max_id(&self) -> Result<i64, BrokerError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM sessions WHERE status = 'cleaned'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Read one bounded keyset page without decoding the rest of the history.
+    pub(crate) fn cleaned_session_page(
+        &self,
+        after: i64,
+        through: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE status = 'cleaned' AND id > ?1
+             AND (?2 IS NULL OR id <= ?2) ORDER BY id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![after, through, limit.min(32) as i64],
+            session_from_row,
+        )?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
+    /// Complete protection projection; never cap live identities to a GC page.
+    pub(crate) fn live_session_worktrees(&self) -> Result<Vec<(i64, String)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, worktree_path FROM sessions WHERE status <> 'cleaned' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Recovery needs all roots, including owners outside the current page.
+    pub(crate) fn session_worktree_paths(&self) -> Result<Vec<String>, BrokerError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT worktree_path FROM sessions")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn sessions_missing_repository_contract(&self) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE status <> 'cleaned' AND deployment_state_digest IS NULL ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], session_from_row)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
     /// Fill the repository contract for a live pre-v9 session exactly once.
     /// The deployment digest is the presence marker because repository schema
     /// and gate digest are both legitimately nullable.

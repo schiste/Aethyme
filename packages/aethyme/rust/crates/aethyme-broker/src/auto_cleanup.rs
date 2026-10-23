@@ -41,6 +41,7 @@ use crate::{Broker, BrokerOpError, GitRepo};
 /// | Directory | Counts only when |
 /// | --- | --- |
 /// | `node_modules` | always (package manager output) |
+/// | `.pnpm-store` | nonempty package-manager store (shared artifact witness) |
 /// | `target` | a sibling `Cargo.toml`, or `CACHEDIR.TAG` inside |
 /// | `.venv` | `pyvenv.cfg` inside |
 /// | `build`, `dist` | a sibling `package.json`, `setup.py`, `pyproject.toml` or `CMakeLists.txt` |
@@ -50,6 +51,7 @@ use crate::{Broker, BrokerOpError, GitRepo};
 /// `my_build/` and `targets.json` are not build output.
 pub const BUILT_IN_REGENERABLE: &[&str] = &[
     "node_modules",
+    ".pnpm-store",
     "target",
     ".venv",
     "build",
@@ -246,7 +248,12 @@ fn regenerable_dir(
         {
             Some(false)
         }
-        _ => None,
+        // Share the artifact-sweep catalog rather than silently leaving a
+        // recognized package-manager store behind in whole-checkout cleanup.
+        // The recursive safety scan still runs after this classification.
+        _ => crate::artifact_catalog::unattended_witness(name, &[])
+            .filter(|witness| witness.confirms(&path))
+            .map(|_| false),
     };
     recognised.or_else(|| {
         policy
@@ -1178,6 +1185,35 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "x").unwrap();
+    }
+
+    #[test]
+    fn whole_checkout_names_cover_the_unattended_artifact_catalog() {
+        for kind in crate::artifact_catalog::CATALOG {
+            if kind.unattended {
+                assert!(
+                    super::BUILT_IN_REGENERABLE.contains(&kind.name),
+                    "{}",
+                    kind.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pnpm_store_requires_a_witness_and_keeps_sensitive_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        std::fs::create_dir(root.join(".pnpm-store")).unwrap();
+        assert!(classify(root, ".pnpm-store/", &policy).is_err());
+        touch(root, ".pnpm-store/v10/files/00/content");
+        assert_eq!(classify(root, ".pnpm-store/", &policy), Ok(()));
+        touch(root, ".pnpm-store/.env");
+        assert!(classify(root, ".pnpm-store/", &policy).is_err());
+        std::fs::remove_file(root.join(".pnpm-store/.env")).unwrap();
+        touch(root, ".pnpm-store/.aethyme/state.json");
+        assert!(classify(root, ".pnpm-store/", &policy).is_err());
     }
 
     #[test]

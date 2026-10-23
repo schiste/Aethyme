@@ -60,6 +60,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and a seeded persisted marker to test fresh-process resume; assert the marker
   before invoking the resume path.
 
+- When bounding cleanup over session history, page candidate records before
+  decoding them and check the deadline before fetching another page. Keep live
+  protection complete and preserve recovery authority for owners outside the
+  current page. Exercise the production sweep with an expired deadline and
+  invalid metadata on a later page; keep corruption fixtures within database
+  constraints so they reach the intended read path. Inspect background pressure
+  sampling too: a bounded foreground loop can still leave eager worker reads.
+
 - When a managed output is also an input to generated context or freshness
   digests, update it before deriving those artifacts. Verify first deployment
   and an unchanged repeat; a second-run rewrite can reveal incorrect ordering.
