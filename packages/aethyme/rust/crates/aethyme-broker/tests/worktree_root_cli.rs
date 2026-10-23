@@ -77,9 +77,16 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 }
 
 fn sqlite_count_if_present(path: &Path, query: &str) -> u64 {
-    if !path.is_file() {
-        return 0;
-    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => panic!("cannot inspect SQLite fixture {}: {error}", path.display()),
+    };
+    assert!(
+        metadata.file_type().is_file(),
+        "SQLite fixture is not a regular file: {}",
+        path.display()
+    );
     rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .unwrap()
         .query_row(query, [], |row| row.get(0))
@@ -87,15 +94,42 @@ fn sqlite_count_if_present(path: &Path, query: &str) -> u64 {
 }
 
 fn worktree_root_registry_path(state: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(state)
-        .ok()?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .find(|path| {
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .starts_with("worktree-roots-")
-        })
+    let entries = match std::fs::read_dir(state) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("cannot inspect host-state fixture {}: {error}", state.display()),
+    };
+    let mut registries = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!("cannot inspect host-state entry under {}: {error}", state.display())
+        });
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("worktree-roots-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().unwrap_or_else(|error| {
+            panic!("cannot inspect worktree-root registry path {}: {error}", path.display())
+        });
+        assert!(
+            file_type.is_dir(),
+            "worktree-root registry catalog is not a directory: {}",
+            path.display()
+        );
+        registries.push(path);
+    }
+    assert!(
+        registries.len() <= 1,
+        "expected at most one worktree-root registry catalog under {}, found {}",
+        state.display(),
+        registries.len()
+    );
+    registries
+        .pop()
         .map(|directory| directory.join("registry.sqlite3"))
 }
 
@@ -1004,12 +1038,18 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     );
 }
 
-/// Selecting a root is not authority to adopt unrelated files, and an invalid
-/// ownership witness must not be followed, overwritten, or read without a bound.
+/// Selecting a root is not authority to adopt unrelated files, bypass its
+/// ownership witness, or change permissions before refusing it.
 #[test]
 fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes() {
-    for case in ["unmarked", "oversized", "broken-link", "valid-link"] {
-        if cfg!(not(unix)) && case.ends_with("link") {
+    for case in [
+        "unmarked",
+        "oversized",
+        "broken-link",
+        "valid-link",
+        "writable-mode",
+    ] {
+        if cfg!(not(unix)) && (case.ends_with("link") || case == "writable-mode") {
             continue;
         }
         for agent in [false, true] {
@@ -1074,7 +1114,11 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let expected_mode = if case == "unmarked" { 0o750 } else { 0o700 };
+                let expected_mode = match case {
+                    "unmarked" | "oversized" => 0o750,
+                    "writable-mode" => 0o770,
+                    _ => 0o700,
+                };
                 std::fs::set_permissions(&root, std::fs::Permissions::from_mode(expected_mode))
                     .unwrap();
             }
@@ -1092,6 +1136,10 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 .as_deref()
                 .map(|path| sqlite_count_if_present(path, "SELECT count(*) FROM roots"))
                 .unwrap_or(0);
+            if case != "unmarked" {
+                assert!(sessions_before > 0, "{case}: bound fixture has no sessions");
+                assert!(roots_before > 0, "{case}: bound fixture has no registry root");
+            }
             let args = if agent {
                 vec![
                     "start",
@@ -1118,10 +1166,10 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(!output.status.success(), "{case}/{agent}: {text}");
-            let expected = if case == "unmarked" {
-                "fresh binding refuses an existing root"
-            } else {
-                "invalid ownership marker"
+            let expected = match case {
+                "unmarked" => "fresh binding refuses an existing root",
+                "writable-mode" => "cannot verify bound worktree-root permissions",
+                _ => "invalid ownership marker",
             };
             assert!(text.contains(expected), "{case}/{agent}: {text}");
             assert_eq!(std::fs::read(&payload).unwrap(), b"unrelated contents");
@@ -1132,7 +1180,11 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 use std::os::unix::fs::PermissionsExt;
                 assert_eq!(
                     std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-                    if case == "unmarked" { 0o750 } else { 0o700 },
+                    match case {
+                        "unmarked" | "oversized" => 0o750,
+                        "writable-mode" => 0o770,
+                        _ => 0o700,
+                    },
                     "{case}: refusing ownership must precede chmod"
                 );
                 if case.ends_with("link") {
