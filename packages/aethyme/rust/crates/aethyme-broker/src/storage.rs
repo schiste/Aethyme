@@ -5783,7 +5783,11 @@ mod tests {
                     &mut should_not_descend,
                 )
                 .unwrap();
-                assert!(live_roots.contains(expected_path));
+                assert!(
+                    live_roots
+                        .iter()
+                        .any(|root| root.as_path() == expected_path)
+                );
                 let (entries, candidates) = inspect_preparation_cache(
                     &cache_root,
                     &live_roots,
