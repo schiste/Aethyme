@@ -997,8 +997,10 @@ impl Broker {
         // Root creation is an explicit submit side effect. Keep it after the
         // ownership, policy, provenance, replay, and checkout checks, and
         // before the queue row records this submission.
+        let lifecycle_claim = self.claim_worktree_lifecycle()?;
         self.prepare_worktree_root_for_submission()?;
         let entry = self.store().submit(session_id, &head, &base)?;
+        drop(lifecycle_claim);
         // A new head supersedes this session's older in-flight entries:
         // without this, a stale conflicted entry would be re-simulated
         // (and re-announced) on every future promotion.
@@ -2905,17 +2907,34 @@ mod owned_merge_history_tests {
     }
 
     fn fixture() -> (tempfile::TempDir, Broker, SubmissionPlan) {
-        fixture_with_worktree_root(None)
+        fixture_with_root_and_legacy_mode(None, false)
     }
 
     fn fixture_with_worktree_root(
         worktree_root: Option<PathBuf>,
+    ) -> (tempfile::TempDir, Broker, SubmissionPlan) {
+        fixture_with_root_and_legacy_mode(worktree_root, false)
+    }
+
+    fn fixture_with_legacy_binding() -> (tempfile::TempDir, Broker, SubmissionPlan) {
+        fixture_with_root_and_legacy_mode(None, true)
+    }
+
+    fn fixture_with_root_and_legacy_mode(
+        worktree_root: Option<PathBuf>,
+        legacy_binding: bool,
     ) -> (tempfile::TempDir, Broker, SubmissionPlan) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
         edit(root, "base.txt", "base\n");
         let base = git(root, &["rev-parse", "HEAD"]);
+        if legacy_binding {
+            // Opening an existing broker database through the ordinary schema
+            // path creates the valid legacy-unbound state used for refusal.
+            let database_path = crate::broker_db_path(root).unwrap();
+            drop(crate::BrokerStore::open(&database_path).unwrap());
+        }
         let mut broker = match worktree_root {
             Some(worktree_root) => Broker::open_with_options(
                 root,
@@ -2975,9 +2994,26 @@ mod owned_merge_history_tests {
         );
 
         let observer_root = root.clone();
+        let lifecycle_repository_root = root.clone();
         let observer_worktree_root = worktree_root.clone();
         let preflight_observed = Arc::new(AtomicBool::new(false));
         let preflight_observed_by_hook = Arc::clone(&preflight_observed);
+        let lifecycle_observed = Arc::new(AtomicBool::new(false));
+        let lifecycle_observed_by_hook = Arc::clone(&lifecycle_observed);
+        let root_before_lifecycle_claim = worktree_root.clone();
+        let preflight_before_lifecycle_claim = Arc::clone(&preflight_observed);
+        broker.worktree_lifecycle_test_observer = Some(Arc::new(move |main_root| {
+            assert_eq!(main_root, lifecycle_repository_root);
+            assert!(
+                preflight_before_lifecycle_claim.load(Ordering::SeqCst),
+                "submit must finish refresh and preflight before claiming lifecycle"
+            );
+            assert!(
+                !root_before_lifecycle_claim.exists(),
+                "submit prepared its root before the lifecycle claim"
+            );
+            lifecycle_observed_by_hook.store(true, Ordering::SeqCst);
+        }));
         broker.submission_plan_test_observer = Some(Arc::new(move |phase| {
             if phase == crate::broker::SubmissionPlanTestPhase::PreflightPlanReady {
                 preflight_observed_by_hook.store(true, Ordering::SeqCst);
@@ -3013,6 +3049,10 @@ mod owned_merge_history_tests {
             preflight_observed.load(Ordering::SeqCst),
             "submit must reach the preflight boundary"
         );
+        assert!(
+            lifecycle_observed.load(Ordering::SeqCst),
+            "fresh root preparation must claim the repository lifecycle lock"
+        );
         assert_eq!(outcome.entry.session_id, session_id);
         assert_eq!(outcome.entry.head_commit, expected_head);
         assert_eq!(
@@ -3027,6 +3067,47 @@ mod owned_merge_history_tests {
                 .iter()
                 .any(|entry| entry.id == outcome.entry.id)
         );
+    }
+
+    #[test]
+    fn submit_refuses_legacy_unbound_before_planning_or_queueing() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let (_tmp, mut broker, plan) = fixture_with_legacy_binding();
+        assert_eq!(
+            broker.store().repository_worktree_binding().unwrap().state,
+            crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound
+        );
+        let preflight_observed = Arc::new(AtomicBool::new(false));
+        let preflight_observed_by_hook = Arc::clone(&preflight_observed);
+        broker.submission_plan_test_observer = Some(Arc::new(move |phase| {
+            if phase == crate::broker::SubmissionPlanTestPhase::PreflightPlanReady {
+                preflight_observed_by_hook.store(true, Ordering::SeqCst);
+            }
+        }));
+
+        let result = broker.submit_with_intent(
+            plan.session_id,
+            crate::gates::CachePolicy::Bypass,
+            crate::PromotionIntent::VerifyOnly,
+        );
+
+        assert!(matches!(
+            result,
+            Err(BrokerOpError::WorktreeRootUnavailable { .. })
+        ));
+        assert!(
+            !preflight_observed.load(Ordering::SeqCst),
+            "legacy-unbound submit must refuse before planning"
+        );
+        assert_eq!(
+            broker.store().repository_worktree_binding().unwrap().state,
+            crate::store::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound
+        );
+        assert!(broker.store().merge_queue().unwrap().is_empty());
     }
 
     #[test]
