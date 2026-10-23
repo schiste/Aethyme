@@ -8144,10 +8144,16 @@ impl Broker {
                 reason: "root parent identity changed before reservation".into(),
             });
         }
+        let registration_admission =
+            self.admit_fresh_worktree_root_registration(&candidate.root)?;
         self.store
             .reserve_fresh_repository_worktree_root(&reservation)?;
 
-        let result = self.finish_fresh_worktree_root(&reservation, &expected_parent);
+        let result = self.finish_fresh_worktree_root(
+            &reservation,
+            &expected_parent,
+            registration_admission,
+        );
         match result {
             Ok(root_identity_json) => {
                 let completion = verify_private_worktree_root_permissions(
@@ -8284,12 +8290,31 @@ impl Broker {
         }
     }
 
+    fn admit_fresh_worktree_root_registration(
+        &self,
+        root: &Path,
+    ) -> Result<crate::worktree_registry::RegistrationAdmission, BrokerOpError> {
+        crate::worktree_registry::admit(&self.host_operation_database_path()?, root).map_err(
+            |error| BrokerOpError::WorktreeRootUnavailable {
+                path: root.to_path_buf(),
+                reason: format!("cannot retain worktree storage discovery: {error}"),
+            },
+        )
+    }
+
     fn finish_fresh_worktree_root(
         &mut self,
         reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
         expected_parent: &BoundDirectoryIdentity,
+        admission: crate::worktree_registry::RegistrationAdmission,
     ) -> Result<String, BrokerOpError> {
-        self.finish_fresh_worktree_root_with_checkpoint(reservation, expected_parent, |_, _| Ok(()))
+        self.finish_fresh_worktree_root_with_optional_admission_and_checkpoint_and_sync(
+            reservation,
+            expected_parent,
+            Some(admission),
+            |_, _| Ok(()),
+            sync_bound_directory,
+        )
     }
 
     fn finish_fresh_worktree_root_with_checkpoint(
@@ -8310,6 +8335,23 @@ impl Broker {
         &mut self,
         reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
         expected_parent: &BoundDirectoryIdentity,
+        checkpoint: impl FnMut(FreshRootPublicationCheckpoint, &Path) -> Result<(), String>,
+        sync_directory: impl FnMut(&Path, &BoundDirectoryIdentity) -> Result<(), String>,
+    ) -> Result<String, BrokerOpError> {
+        self.finish_fresh_worktree_root_with_optional_admission_and_checkpoint_and_sync(
+            reservation,
+            expected_parent,
+            None,
+            checkpoint,
+            sync_directory,
+        )
+    }
+
+    fn finish_fresh_worktree_root_with_optional_admission_and_checkpoint_and_sync(
+        &mut self,
+        reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
+        expected_parent: &BoundDirectoryIdentity,
+        admission: Option<crate::worktree_registry::RegistrationAdmission>,
         mut checkpoint: impl FnMut(FreshRootPublicationCheckpoint, &Path) -> Result<(), String>,
         mut sync_directory: impl FnMut(&Path, &BoundDirectoryIdentity) -> Result<(), String>,
     ) -> Result<String, BrokerOpError> {
@@ -8326,6 +8368,10 @@ impl Broker {
                 reason: "root parent identity changed after reservation".into(),
             });
         }
+        let admission = match admission {
+            Some(admission) => admission,
+            None => self.admit_fresh_worktree_root_registration(root)?,
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -8384,13 +8430,6 @@ impl Broker {
                 reason: format!("cannot durably publish reserved worktree-root name: {reason}"),
             }
         })?;
-        let admission =
-            crate::worktree_registry::admit(&self.host_operation_database_path()?, root).map_err(
-                |error| BrokerOpError::WorktreeRootUnavailable {
-                    path: root.clone(),
-                    reason: format!("cannot retain worktree storage discovery: {error}"),
-                },
-            )?;
         require_bound_directory_identity(root, &identity).map_err(|reason| {
             BrokerOpError::WorktreeRootUnavailable {
                 path: root.clone(),
