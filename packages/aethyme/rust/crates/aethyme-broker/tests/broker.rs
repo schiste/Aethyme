@@ -112,9 +112,10 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
     // Broker opened from INSIDE the hand-made worktree still resolves to
     // the main checkout's database (attach-first, one shared db).
     let external_root = tempfile::tempdir().unwrap();
+    let worktree_root = external_root.path().join("worktrees");
     let mut broker = common::open_fixture_broker(&hand_made, tmp.owner_path())
         .unwrap()
-        .with_worktree_root(external_root.path());
+        .with_worktree_root(&worktree_root);
     assert_eq!(
         broker.main_root().canonicalize().unwrap(),
         tmp.path().canonicalize().unwrap()
@@ -133,7 +134,7 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
     let spawned_path = std::path::PathBuf::from(&spawned.worktree_path);
     assert_eq!(
         spawned_path.parent(),
-        Some(external_root.path().canonicalize().unwrap().as_path())
+        Some(worktree_root.canonicalize().unwrap().as_path())
     );
     assert!(spawned_path.ends_with("spawned-task"));
 
@@ -158,10 +159,11 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
 fn start_worktree_creates_broker_managed_session_without_process() {
     let tmp = common::FixtureRepository::new();
     let external_root = tempfile::tempdir().unwrap();
+    let worktree_root = external_root.path().join("worktrees");
     init_repo(tmp.path());
     let mut broker = open_fixture_broker(tmp.path())
         .unwrap()
-        .with_worktree_root(external_root.path());
+        .with_worktree_root(&worktree_root);
 
     let session = broker
         .start_worktree(
@@ -184,13 +186,13 @@ fn start_worktree_creates_broker_managed_session_without_process() {
     assert!(wt.exists());
     assert_eq!(
         wt.parent(),
-        Some(external_root.path().canonicalize().unwrap().as_path())
+        Some(worktree_root.canonicalize().unwrap().as_path())
     );
     assert!(wt.ends_with("isolated-edits"));
     // Build discipline sits one directory above the worktree: cargo finds it
     // by walking up, it is never an untracked file inside the checkout, and a
     // repository shipping its own `.cargo/config.toml` still outranks it.
-    let cargo_config = external_root.path().join(".cargo/config.toml");
+    let cargo_config = worktree_root.join(".cargo/config.toml");
     let defaults = std::fs::read_to_string(&cargo_config).unwrap();
     assert!(defaults.contains("incremental = false"), "{defaults}");
     assert!(defaults.contains("line-tables-only"), "{defaults}");
@@ -208,10 +210,11 @@ fn start_worktree_creates_broker_managed_session_without_process() {
 fn two_session_worktrees_are_distinct_and_registered() {
     let tmp = common::FixtureRepository::new();
     let external_root = tempfile::tempdir().unwrap();
+    let worktree_root = external_root.path().join("worktrees");
     init_repo(tmp.path());
     let mut broker = open_fixture_broker(tmp.path())
         .unwrap()
-        .with_worktree_root(external_root.path());
+        .with_worktree_root(&worktree_root);
 
     let first = broker
         .start_worktree("first isolated session", None)
@@ -1254,13 +1257,14 @@ fn finish_retention_policy_keeps_safe_worktrees_when_disabled_or_invalid() {
     ] {
         let tmp = common::FixtureRepository::new();
         let external_root = tempfile::tempdir().unwrap();
+        let worktree_root = external_root.path().join("worktrees");
         init_repo(tmp.path());
         std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
         std::fs::write(tmp.path().join(".aethyme/broker.toml"), policy).unwrap();
 
         let mut broker = open_fixture_broker(tmp.path())
             .unwrap()
-            .with_worktree_root(external_root.path());
+            .with_worktree_root(&worktree_root);
         let session = broker.start_worktree("keep landed worktree", None).unwrap();
         let wt = std::path::PathBuf::from(&session.worktree_path);
         std::fs::write(wt.join("landed.txt"), "delivered\n").unwrap();
@@ -1317,9 +1321,10 @@ fn a_squash_merged_session_can_be_recorded_and_finished() {
     );
 
     let external_root = tempfile::tempdir().unwrap();
+    let worktree_root = external_root.path().join("worktrees");
     let mut broker = open_fixture_broker(tmp.path())
         .unwrap()
-        .with_worktree_root(external_root.path());
+        .with_worktree_root(&worktree_root);
     let session = broker.start_worktree("squash task", None).unwrap();
     let wt = std::path::PathBuf::from(&session.worktree_path);
 
