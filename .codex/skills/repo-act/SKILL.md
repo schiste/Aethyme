@@ -142,7 +142,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
-  leave stale Git pointers after teardown. Assert paths and cleanup; avoid
+  leave stale Git pointers after teardown. For storage-preparation tests
+  that require broker placement ownership, use `start --task ... --json`
+  to create a managed worktree. Read `worktree_placement.root`,
+  canonicalize it and the returned worktree path, assert containment, and
+  check `.aethyme-worktree-root.json` at the placement root. Derive cache
+  paths from the returned `worktree_path`. `start --adopt` reuses an
+  existing checkout and does not create that placement marker; do not
+  synthesize it in the fixture. Assert paths and cleanup; avoid
   process-wide environment mutation in parallel tests. Filtering
   `std::env::vars_os()` and passing the result to `Command::envs` does not
   clear inherited `GIT_*` variables; it only adds or overrides values. For
