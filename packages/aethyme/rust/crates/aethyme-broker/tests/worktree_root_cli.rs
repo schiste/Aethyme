@@ -705,22 +705,19 @@ fn host_state_inside_a_linked_worktree_falls_back_without_creating_its_worktrees
     );
 
     std::fs::write(&available_bytes, "68719476736\n").unwrap();
-    let output = common::broker_cli(
-        CLI,
-        &["start", "--task", "nested host state", "--json"],
-    )
-    .current_dir(&repo)
-    .env("AETHYME_HOST_STATE_DIR", &host_state)
-    .env("AETHYME_HOST_CACHE_DIR", &cache)
-    .env("AETHYME_BROKER_DB", &database)
-    .env_remove("AETHYME_WORKTREE_ROOT")
-    .env_remove("AETHYME_GATE_BROKER_DATABASES")
-    .env(
-        aethyme_broker::TEST_AVAILABLE_BYTES_ENV,
-        format!("@{}", available_bytes.display()),
-    )
-    .output()
-    .unwrap();
+    let output = common::broker_cli(CLI, &["start", "--task", "nested host state", "--json"])
+        .current_dir(&repo)
+        .env("AETHYME_HOST_STATE_DIR", &host_state)
+        .env("AETHYME_HOST_CACHE_DIR", &cache)
+        .env("AETHYME_BROKER_DB", &database)
+        .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("AETHYME_GATE_BROKER_DATABASES")
+        .env(
+            aethyme_broker::TEST_AVAILABLE_BYTES_ENV,
+            format!("@{}", available_bytes.display()),
+        )
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "start should use the safe repository fallback: {}",
