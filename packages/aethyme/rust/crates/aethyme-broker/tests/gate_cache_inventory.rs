@@ -205,8 +205,8 @@ fn world() -> World {
     )
     .unwrap();
 
-    let state = common::fixture_host_state_dir(fixture.owner_path());
-    let cache = common::fixture_host_cache_dir(fixture.owner_path());
+    let state = common::fixture_host_state_dir(&repo);
+    let cache = common::fixture_host_cache_dir(&repo);
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
     let finished = broker.start_worktree("finished work", None).unwrap();
     let finished_path = PathBuf::from(&finished.worktree_path);

@@ -344,6 +344,11 @@ fn opening_the_broker_backfills_live_pre_contract_sessions() {
     let head = rev(tmp.path(), "HEAD");
     let session_id = {
         let mut broker = open_fixture_broker(tmp.path()).unwrap();
+        let root_setup = broker
+            .start_worktree("bind root before backfill", None)
+            .unwrap();
+        broker.close(root_setup.id).unwrap();
+        broker.cleanup(root_setup.id, false).unwrap();
         broker
             .store()
             .register_session(&NewSession {
