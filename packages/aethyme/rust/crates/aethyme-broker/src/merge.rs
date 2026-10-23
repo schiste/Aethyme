@@ -2905,12 +2905,25 @@ mod owned_merge_history_tests {
     }
 
     fn fixture() -> (tempfile::TempDir, Broker, SubmissionPlan) {
+        fixture_with_worktree_root(None)
+    }
+
+    fn fixture_with_worktree_root(
+        worktree_root: Option<PathBuf>,
+    ) -> (tempfile::TempDir, Broker, SubmissionPlan) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
         edit(root, "base.txt", "base\n");
         let base = git(root, &["rev-parse", "HEAD"]);
-        let mut broker = Broker::open(root).unwrap();
+        let mut broker = match worktree_root {
+            Some(worktree_root) => Broker::open_with_options(
+                root,
+                crate::BrokerOpenOptions::default().with_worktree_root(worktree_root),
+            )
+            .unwrap(),
+            None => Broker::open(root).unwrap(),
+        };
         let source = root.join(".aethyme/worktrees/source");
         git(
             root,
@@ -2948,7 +2961,9 @@ mod owned_merge_history_tests {
             atomic::{AtomicBool, Ordering},
         };
 
-        let (tmp, mut broker, plan) = fixture();
+        let root_owner = tempfile::tempdir().unwrap();
+        let worktree_root = root_owner.path().join("managed-worktrees");
+        let (tmp, mut broker, plan) = fixture_with_worktree_root(Some(worktree_root.clone()));
         let root = tmp.path().canonicalize().unwrap();
         let session_id = plan.session_id;
         let expected_head = plan.session_head.clone();
@@ -2960,6 +2975,7 @@ mod owned_merge_history_tests {
         );
 
         let observer_root = root.clone();
+        let observer_worktree_root = worktree_root.clone();
         let preflight_observed = Arc::new(AtomicBool::new(false));
         let preflight_observed_by_hook = Arc::clone(&preflight_observed);
         broker.submission_plan_test_observer = Some(Arc::new(move |phase| {
@@ -2967,7 +2983,12 @@ mod owned_merge_history_tests {
                 preflight_observed_by_hook.store(true, Ordering::SeqCst);
                 // The non-root preflight has finished, but submit must not
                 // reserve or bind a root until its final checkout check passes.
-                let mut observer = Broker::open(&observer_root).unwrap();
+                let mut observer = Broker::open_with_options(
+                    &observer_root,
+                    crate::BrokerOpenOptions::default()
+                        .with_worktree_root(observer_worktree_root.clone()),
+                )
+                .unwrap();
                 assert_eq!(
                     observer
                         .store()
@@ -2998,12 +3019,14 @@ mod owned_merge_history_tests {
             broker.store().repository_worktree_binding().unwrap().state,
             crate::store::repository_binding::RepositoryWorktreeBindingState::Bound
         );
-        assert!(broker
-            .store()
-            .merge_queue()
-            .unwrap()
-            .iter()
-            .any(|entry| entry.id == outcome.entry.id));
+        assert!(
+            broker
+                .store()
+                .merge_queue()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == outcome.entry.id)
+        );
     }
 
     #[test]
