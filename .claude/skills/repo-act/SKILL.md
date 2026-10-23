@@ -91,6 +91,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and mirrored-skill parity; never commit a template overwrite blindly.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
+- Before adding broker-owned persistent sidecars, verify each generated path
+  matches `runtime_paths.rs` and the standard runtime `.gitignore` prefix. Add
+  a regression from the path producer to the runtime-path classifier; keep
+  private-file checks strict if an ignore mismatch is found.
 - Choose focused local Cargo checks by compilation target as well as test name.
   A name filter selects cases at runtime; `--lib` still compiles the full unit-test
   target. Start with a relevant integration-test target when available, keep one
