@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/libsqlite3-sys-0.30.1"]
 members = [
     "crates/aethyme-broker",
     "crates/aethyme-cli",
@@ -84,3 +85,6 @@ unimplemented = "deny"
 # manifest: the tree has ~45 `unsafe` blocks and this makes an undocumented one a
 # build failure rather than something a reviewer has to catch.
 undocumented_unsafe_blocks = "deny"
+
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys-0.30.1" }
