@@ -39,7 +39,10 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
         }
 
         let expected_root = isolation::worktree_root(fixture.path());
-        assert!(!expected_root.exists(), "fresh fixture root must not preexist");
+        assert!(
+            !expected_root.exists(),
+            "fresh fixture root must not preexist"
+        );
         let mut broker = isolation::open(fixture.path());
         let session = broker.start_worktree("retained fixture", None).unwrap();
         let expected_root = expected_root.canonicalize().unwrap();

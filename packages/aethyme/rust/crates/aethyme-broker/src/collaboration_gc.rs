@@ -2909,7 +2909,9 @@ mod tests {
         assert_eq!(plan.retained[&RetentionClass::Record].objects, 2);
         let unrooted_path = object_relpath(&unrooted_digest);
         assert!(
-            objects(&plan).iter().any(|item| item.relpath == unrooted_path),
+            objects(&plan)
+                .iter()
+                .any(|item| item.relpath == unrooted_path),
             "expired orphan should make the plan applyable: {:?}",
             plan.reclaimable
         );
