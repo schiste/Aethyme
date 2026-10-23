@@ -113,7 +113,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   use. Keep draining after the cap, expose an explicit truncation signal, and
   refuse to treat a valid-looking prefix as a complete listing or proof.
   Preserve the provider exit status and test both the cap boundary and a
-  syntactically valid truncated prefix.
+  syntactically valid truncated prefix. For command-specific field protocols,
+  capture one bounded sample from the exact argv and test its real framing and
+  context fields alongside malformed and truncated fixtures.
 - Before writing a broker PR body, prepare the exact body file and run the
   pinned CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`.
   Review each refusal; use a `Contract justification:` of at least 24 characters
