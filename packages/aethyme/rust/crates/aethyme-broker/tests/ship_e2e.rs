@@ -63,7 +63,7 @@ impl Fixture {
         );
         git(&repo, &["push", "-qu", "origin", "main"]);
         Self {
-            host_operations: tmp.path().join("host-state/operations.db"),
+            host_operations: tmp.path().join("host-state/host-operations.db"),
             _tmp: tmp,
             repo,
             remote,

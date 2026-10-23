@@ -152,7 +152,13 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
         !text.contains("no ownership violation"),
         "this one really is an ownership violation: {text}"
     );
-    let mut broker = aethyme_broker::Broker::open(repo.path()).unwrap();
+    let mut broker = aethyme_broker::Broker::open_with_options(
+        repo.path(),
+        aethyme_broker::BrokerOpenOptions::default()
+            .with_host_state_dir(state.path())
+            .with_worktree_root(state.path().join("worktrees")),
+    )
+    .unwrap();
     let events = broker.store().events_after(0, i64::MAX).unwrap();
     let out_of_lease = events
         .iter()
