@@ -1197,16 +1197,15 @@ required_for_hooks = false
     let started = json(run(
         repo.path(),
         container.path(),
-        &[
-            "start",
-            "--adopt",
-            ".",
-            "--task",
-            "same-volume preparation cache",
-            "--json",
-        ],
+        &["start", "--task", "same-volume preparation cache", "--json"],
     ));
     let session = started["id"].as_i64().unwrap().to_string();
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    assert!(worktree.is_dir(), "managed worktree must exist: {started}");
+    assert!(
+        worktree.join(".aethyme-worktree-root.json").is_file(),
+        "start must write the ownership marker required by worktree-volume storage: {started}"
+    );
     let prepared = json(run(
         repo.path(),
         container.path(),
@@ -1216,7 +1215,7 @@ required_for_hooks = false
     assert_eq!(prepared["shared_cache_coordinated"], true);
 
     let cache_path = PathBuf::from(
-        std::fs::read_to_string(repo.path().join("node_modules/cache-root"))
+        std::fs::read_to_string(worktree.join("node_modules/cache-root"))
             .unwrap()
             .trim(),
     )
