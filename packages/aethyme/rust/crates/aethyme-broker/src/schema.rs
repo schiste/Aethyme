@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 52;
+pub const SCHEMA_VERSION: i64 = 53;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -75,6 +75,10 @@ pub const SCHEMA_VERSION: i64 = 52;
 ///   query only gate, tree and definition, so they could reuse a result
 ///   without checking its execution profile. The global floor therefore
 ///   rises to v52.
+/// - v53: adds an optional per-session spawned-worktree instance witness.
+///   Older readers and writers ignore the table. Missing witnesses never
+///   authorize automatic removal, so v52 writers remain safe and the floor
+///   stays at v52.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 52;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -1757,6 +1761,15 @@ const MIGRATION_V52: &str = "
 ALTER TABLE gate_results ADD COLUMN execution_profile_hash TEXT;
 ";
 
+const MIGRATION_V53: &str = "
+-- Only a witness captured from the GitRepo returned by spawn can authorize
+-- automatic worktree removal. Legacy and adopted sessions have no row.
+CREATE TABLE IF NOT EXISTS spawned_worktree_instances (
+    session_id   INTEGER PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
+    witness_json TEXT NOT NULL
+);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1810,6 +1823,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V50,
     MIGRATION_V51,
     MIGRATION_V52,
+    MIGRATION_V53,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -1835,6 +1849,7 @@ const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
         ],
     ),
     (50, MIGRATION_V50, &["verification_candidates"]),
+    (53, MIGRATION_V53, &["spawned_worktree_instances"]),
 ];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
@@ -2581,10 +2596,10 @@ mod tests {
         .unwrap();
 
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 52);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
-        assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 52, 51).unwrap());
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 51).unwrap());
 
         let nullable: i64 = conn
             .query_row(
@@ -2619,7 +2634,7 @@ mod tests {
 
             migrate(&conn).unwrap();
 
-            assert_eq!(current_version(&conn).unwrap(), 52);
+            assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
             assert_eq!(
                 conn.query_row(
                     "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
@@ -2629,8 +2644,8 @@ mod tests {
                 .unwrap(),
                 "52"
             );
-            assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
-            assert!(!schema_is_compatible_with(&conn, 52, 51).unwrap());
+            assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
+            assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 51).unwrap());
 
             let nullable: i64 = conn
                 .query_row(
@@ -2699,8 +2714,8 @@ mod tests {
         set_meta(&conn, "min_compatible_schema", 47);
 
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 52);
-        assert!(schema_is_compatible_with(&conn, 52, 52).unwrap());
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
         let columns = conn
             .prepare("PRAGMA table_info(gate_results)")
             .unwrap()
@@ -2715,6 +2730,51 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn v53_adds_optional_spawn_witnesses_without_fencing_v52_writers() {
+        let conn = migrated_through(52);
+        set_meta(&conn, "min_compatible_schema", 52);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 53);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "52"
+        );
+        assert!(schema_is_compatible_with(&conn, 53, 52).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 53, 51).unwrap());
+        assert!(table_exists(&conn, "spawned_worktree_instances").unwrap());
+
+        // A v52 writer does not know the additive table and can still create
+        // ordinary session rows; such rows have no cleanup authority.
+        conn.execute(
+            "INSERT INTO sessions (worktree_path, branch, origin, status,
+                                   created_at, updated_at, last_activity_at)
+             VALUES ('/legacy/worktree', 'agent/legacy', 'spawned', 'active', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let witness_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM spawned_worktree_instances",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(witness_count, 0);
+
+        conn.execute_batch("DROP TABLE spawned_worktree_instances")
+            .unwrap();
+        repair_recorded_migrations(&conn).unwrap();
+        assert!(table_exists(&conn, "spawned_worktree_instances").unwrap());
     }
 
     #[test]

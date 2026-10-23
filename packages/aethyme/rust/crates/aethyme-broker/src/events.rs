@@ -175,6 +175,25 @@ pub fn session_abandoned_unpushed_payload(
     .to_string()
 }
 
+/// Filesystem identity tuple captured from the GitRepo created by spawn.
+/// Missing or changed tuples cannot authorize unattended checkout removal.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnedWorktreeInstanceWitness {
+    pub(crate) schema_version: u8,
+    pub(crate) worktree_path: String,
+    pub(crate) worktree_device: u64,
+    pub(crate) worktree_inode: u64,
+    pub(crate) git_pointer_device: u64,
+    pub(crate) git_pointer_inode: u64,
+    pub(crate) git_admin_path: String,
+    pub(crate) git_admin_device: u64,
+    pub(crate) git_admin_inode: u64,
+    pub(crate) git_common_path: String,
+    pub(crate) git_common_device: u64,
+    pub(crate) git_common_inode: u64,
+}
+
 /// Immutable identity captured before `finish` begins physical cleanup. A
 /// later retry may use it only when the same registered checkout is still
 /// present and its remaining dirt is exclusively unstaged tracked deletions.

@@ -339,6 +339,8 @@ pub enum BrokerOpError {
     PromotionRecordConfirmationMismatch { actual: String },
     #[error("GC is already running under process {pid}; wait or inspect .aethyme/gc.lock")]
     GcLocked { pid: String },
+    #[error("automatic cleanup cursor changed concurrently; this candidate plan was not returned")]
+    AutoCleanupCursorChanged,
     #[error("GC recovery journal is invalid: {reason}")]
     InvalidGcJournal { reason: String },
     #[error("GC reviewed artifact drifted at {path}: expected {expected}, observed {actual}")]
