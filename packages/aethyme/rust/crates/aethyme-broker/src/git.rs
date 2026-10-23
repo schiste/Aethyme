@@ -6585,19 +6585,23 @@ mod batched_commit_tests {
         let (full_index_patch_ids, full_index_log) =
             patch_ids_for_log_args(root, &with_parents, &FIRST_PARENT_PATCH_ID_LOG_ARGS);
         assert_eq!(
-            patch_ids,
-            legacy_patch_ids,
+            patch_ids, legacy_patch_ids,
             "optimized stream vs old --binary producer"
         );
         assert_eq!(
-            patch_ids,
-            full_index_patch_ids,
+            patch_ids, full_index_patch_ids,
             "production args vs full-index stream"
         );
         let legacy_log = String::from_utf8_lossy(&legacy_log);
         let full_index_log = String::from_utf8_lossy(&full_index_log);
-        assert!(legacy_log.contains("GIT binary patch"), "legacy binary control");
-        assert!(full_index_log.contains("Binary files"), "binary diff marker");
+        assert!(
+            legacy_log.contains("GIT binary patch"),
+            "legacy binary control"
+        );
+        assert!(
+            full_index_log.contains("Binary files"),
+            "binary diff marker"
+        );
         assert!(
             !full_index_log.contains("GIT binary patch"),
             "full-index output must not include encoded binary bodies"
@@ -6607,7 +6611,11 @@ mod batched_commit_tests {
             "full-index output should omit the fixture's encoded binary bodies"
         );
 
-        for commit in [&mixed_binary_add, &mixed_binary_modify, &mixed_binary_delete] {
+        for commit in [
+            &mixed_binary_add,
+            &mixed_binary_modify,
+            &mixed_binary_delete,
+        ] {
             assert!(
                 patch_ids.contains_key(commit),
                 "mixed text/binary patch {commit}"
