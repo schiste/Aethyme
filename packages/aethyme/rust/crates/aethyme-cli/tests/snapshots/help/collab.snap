@@ -30,6 +30,15 @@ Usage:
   aethyme collab project bind --confirm <descriptor-record-id> [--json]
       Bind this local store to the exact descriptor and pointer committed in this clone.
       Binding grants no execution or acceptance authority.
+  aethyme collab project association propose --peer-repo <path> [--write] [--json]
+      Propose a bounded association between two independently approved local projects.
+      The proposal grants no authority until its exact RecordId is confirmed locally.
+  aethyme collab project association confirm --peer-repo <path> --confirm <record-id> [--json]
+      Revalidate both committed descriptors and bindings, then persist confirmation only
+      in the invoking project's local identity/object store.
+  aethyme collab project association revoke --confirm <record-id> [--json]
+      Revoke one exact local association record without accessing the peer store.
+      A revoked RecordId stays revoked; a fresh proposal requires a new exact confirmation.
   aethyme collab contribution revise --operation ID [--brief-file PATH]
        [--file-operations PATH] [--depends-on RECORD_ID...] [--clear-dependencies] [--json]
       Append an immutable revision for one retained capture operation. A retry
