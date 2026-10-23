@@ -8333,6 +8333,7 @@ impl Broker {
         )
     }
 
+    #[cfg(all(test, unix))]
     fn finish_fresh_worktree_root_with_checkpoint(
         &mut self,
         reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
@@ -8347,6 +8348,7 @@ impl Broker {
         )
     }
 
+    #[cfg(all(test, unix))]
     fn finish_fresh_worktree_root_with_checkpoint_and_sync(
         &mut self,
         reservation: &crate::store::repository_binding::FreshRepositoryRootReservation,
