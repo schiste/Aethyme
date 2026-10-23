@@ -1445,6 +1445,37 @@ mod tests {
         store
     }
 
+    #[cfg(unix)]
+    fn open_fresh_store(directory: &tempfile::TempDir) -> BrokerStore {
+        let root = directory.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let database = root.join(".aethyme/broker.db");
+        super::super::fresh_database::open_in_repo(&root, &database).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn fresh_identity(store: &BrokerStore) -> RepositoryRootIdentity {
+        let binding = store.repository_worktree_binding().unwrap();
+        assert_eq!(binding.state, RepositoryWorktreeBindingState::FreshUnbound);
+        RepositoryRootIdentity {
+            repository_root: binding.repository_root.unwrap(),
+            git_common_dir: binding.git_common_dir.unwrap(),
+            repository_key: binding.repository_key.unwrap(),
+            broker_db_path: binding.broker_db_path.unwrap(),
+            bootstrap_nonce: binding.bootstrap_nonce.unwrap(),
+        }
+    }
+
     fn floor(store: &BrokerStore) -> String {
         store
             .conn
@@ -1617,18 +1648,13 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn fresh_binding_requires_exact_bootstrap_and_reservation_before_bound() {
+    fn fresh_binding_reservation_rejects_identity_mismatch_before_bound() {
         let directory = tempfile::tempdir().unwrap();
-        let mut store = open_store(&directory);
-        assert_eq!(floor(&store), "52");
-        let identity = identity(&directory);
-        let stage_permit = super::super::open::test_fresh_database_stage_permit();
-
-        let fresh = store
-            .initialize_fresh_repository_worktree_binding(&stage_permit, &identity)
-            .unwrap();
-        assert_eq!(fresh.state, RepositoryWorktreeBindingState::FreshUnbound);
+        let mut store = open_fresh_store(&directory);
+        let identity = fresh_identity(&store);
+        let fresh = store.repository_worktree_binding().unwrap();
         assert_eq!(fresh.origin, Some(RepositoryWorktreeBindingOrigin::Fresh));
         assert_eq!(floor(&store), "54");
 
@@ -1737,15 +1763,12 @@ mod tests {
         assert_eq!(floor(&store), "54");
     }
 
+    #[cfg(unix)]
     #[test]
     fn nonlegacy_binding_states_require_floor_without_repairing_binding_bytes() {
         let directory = tempfile::tempdir().unwrap();
-        let mut store = open_store(&directory);
-        let identity = identity(&directory);
-        let stage_permit = super::super::open::test_fresh_database_stage_permit();
-        store
-            .initialize_fresh_repository_worktree_binding(&stage_permit, &identity)
-            .unwrap();
+        let mut store = open_fresh_store(&directory);
+        let identity = fresh_identity(&store);
 
         let check_low_floor = |store: &mut BrokerStore| {
             let row_before = binding_row(store);
