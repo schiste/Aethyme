@@ -80,6 +80,37 @@ fn open_archive_lock(store: &CollaborationStore) -> std::io::Result<std::fs::Fil
     open_lock_file(&path)
 }
 
+fn open_existing_archive_lock_read_only(
+    store: &CollaborationStore,
+) -> std::io::Result<std::fs::File> {
+    let path = lock_path(store);
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("archive lock has no parent directory"))?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive lock directory {} is not a real directory", parent.display()),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive lock {} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 /// The archive held shared: reclamation cannot apply until it drops.
 #[derive(Debug)]
 pub struct ArchiveUse {
@@ -164,6 +195,19 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     file.lock_shared()?;
     #[cfg(test)]
     report_archive_use_acquired();
+    Ok(ArchiveUse {
+        project_dir: store.project_dir().into(),
+        _file: file,
+    })
+}
+
+/// Hold an existing archive barrier shared without creating or modifying
+/// peer state. Reclamation and writes cannot proceed while the guard is held.
+pub(crate) fn archive_use_read_only(
+    store: &CollaborationStore,
+) -> std::io::Result<ArchiveUse> {
+    let file = open_existing_archive_lock_read_only(store)?;
+    file.lock_shared()?;
     Ok(ArchiveUse {
         project_dir: store.project_dir().into(),
         _file: file,
@@ -1065,6 +1109,31 @@ impl<'a> Closure<'a> {
             }
             self.snapshot(&anchor)?;
             self.snapshot(&bootstrap)?;
+        }
+        if self.store.schema_version() >= 31 {
+            let associations: Vec<(String, String)> = collect_live_roots(
+                self.store
+                    .read_connection()
+                    .prepare(
+                        "SELECT association_record_id,association_object_sha256
+                         FROM local_project_associations ORDER BY association_record_id",
+                    )?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?,
+                &mut self.identity_roots_remaining,
+            )?;
+            for (record_id, digest) in associations {
+                if RecordId::parse(&record_id).is_err() {
+                    self.problems.push(format!(
+                        "confirmed project association has malformed record id {record_id}"
+                    ));
+                }
+                match parse_hex_digest(&digest) {
+                    Some(digest) => self.object(digest, RetentionClass::Record),
+                    None => self.problems.push(format!(
+                        "confirmed project association {record_id} has malformed object digest"
+                    )),
+                }
+            }
         }
         Ok(())
     }

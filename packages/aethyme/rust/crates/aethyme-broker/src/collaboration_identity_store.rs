@@ -10,12 +10,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aethyme_contracts::experimental_v0::{
     BriefReference, ContributionId, ContributionRevision, EntryKind, FileId,
-    FileIdentityTransition, FileOperation, ProjectDescriptor, ProjectFileIdentityState, ProjectId,
-    RecordId, SourceSnapshot, SourceSnapshotId, advance_file_identities,
+    FileIdentityTransition, FileOperation, ProjectAssociationDescriptor, ProjectDescriptor,
+    ProjectFileIdentityState, ProjectId, RecordId, SourceSnapshot, SourceSnapshotId,
+    advance_file_identities,
     brief::Brief,
     canonical_json::{Object, Value as CanonicalValue},
     contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
     project_identity::{MAX_DESCRIPTOR_BYTES, MAX_DESCRIPTOR_FILES, PROJECT_DESCRIPTOR_PATH},
+    project_association::MAX_PROJECT_ASSOCIATION_BYTES,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use thiserror::Error;
@@ -78,6 +80,25 @@ pub struct ApprovedProjectBinding {
     committed_config_commit: CommitOid,
     bootstrap_snapshot: SourceSnapshotId,
     bootstrap_transition_sha256: String,
+}
+
+/// A canonical association row loaded from one local store. This value is
+/// crate-private and does not grant mapping authority; each mapping resolution
+/// must reload it alongside both independently approved project bindings.
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedProjectAssociation {
+    descriptor: ProjectAssociationDescriptor,
+    confirmed: bool,
+}
+
+impl PersistedProjectAssociation {
+    pub(crate) fn descriptor(&self) -> &ProjectAssociationDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) fn is_confirmed(&self) -> bool {
+        self.confirmed
+    }
 }
 
 impl ApprovedProjectBinding {
@@ -493,6 +514,118 @@ pub(crate) fn resolve_approved_project_binding_with_archive_use(
     validate_archive_use(store, archive_use)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     resolve_approved_project_binding_locked(store)
+}
+
+/// Reload one exact canonical association from the invoking project's local
+/// identity store. Callers must hold its archive-use barrier and must also
+/// independently reload both project bindings before resolving a mapping.
+pub(crate) fn resolve_persisted_project_association_with_archive_use(
+    store: &CollaborationStore,
+    association_record_id: &RecordId,
+    archive_use: &ArchiveUse,
+) -> Result<Option<PersistedProjectAssociation>, IdentityStoreError> {
+    validate_archive_use(store, archive_use)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    if store.schema_version() < 31 {
+        return Err(IdentityStoreError::UnsupportedSchema {
+            actual: store.schema_version(),
+        });
+    }
+    type AssociationRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+    );
+    let row: Option<AssociationRow> = store
+        .read_connection()
+        .query_row(
+            "SELECT association_object_sha256,local_project_key,local_project_id,
+                    peer_project_id,local_descriptor_record_id,peer_descriptor_record_id,
+                    peer_project_key,status,confirmed_ms,revoked_ms
+             FROM local_project_associations WHERE association_record_id=?1",
+            [association_record_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        digest_text,
+        local_key,
+        local_id_text,
+        peer_id_text,
+        local_descriptor_text,
+        peer_descriptor_text,
+        peer_key,
+        status,
+        confirmed_ms,
+        revoked_ms,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if local_key != store.project().as_str()
+        || confirmed_ms < 0
+        || (status == "confirmed" && revoked_ms.is_some())
+        || (status == "revoked" && revoked_ms.is_none_or(|time| time < confirmed_ms))
+        || !matches!(status.as_str(), "confirmed" | "revoked")
+    {
+        return Err(IdentityStoreError::Corrupt(
+            "project association row has an invalid owner or status timestamp".into(),
+        ));
+    }
+    let digest = archive::parse_digest(&digest_text)
+        .ok_or_else(|| IdentityStoreError::Corrupt("invalid project association digest".into()))?;
+    let bytes = archive::read_object_bounded(store, &digest, MAX_PROJECT_ASSOCIATION_BYTES)?;
+    let (descriptor, observed_id) = ProjectAssociationDescriptor::from_record(&bytes)
+        .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+    if observed_id != *association_record_id
+        || descriptor.local_project_key() != local_key
+        || descriptor.local_project_id().as_str() != local_id_text
+        || descriptor.peer_project_id().as_str() != peer_id_text
+        || descriptor.local_descriptor_record_id().as_str() != local_descriptor_text
+        || descriptor.peer_descriptor_record_id().as_str() != peer_descriptor_text
+        || descriptor.peer_project_key() != peer_key
+    {
+        return Err(IdentityStoreError::Corrupt(
+            "canonical project association differs from its indexed row".into(),
+        ));
+    }
+    let active_rows: i64 = store.read_connection().query_row(
+        "SELECT count(*) FROM local_project_associations
+         WHERE status='confirmed' AND (
+             (local_project_id=?1 AND peer_project_id=?2) OR
+             (local_project_id=?2 AND peer_project_id=?1))",
+        rusqlite::params![local_id_text, peer_id_text],
+        |row| row.get(0),
+    )?;
+    if (status == "confirmed" && active_rows != 1) || active_rows > 1 {
+        return Err(IdentityStoreError::Corrupt(
+            "project association pair has missing or ambiguous active rows".into(),
+        ));
+    }
+    Ok(Some(PersistedProjectAssociation {
+        descriptor,
+        confirmed: status == "confirmed",
+    }))
 }
 
 fn resolve_approved_project_binding_locked(

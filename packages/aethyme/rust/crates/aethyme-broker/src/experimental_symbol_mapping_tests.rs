@@ -7,21 +7,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::experimental_symbol_mapping::{
+use crate::experimental_symbol_mapping::{
     CapturedCloneSnapshot, CloneSnapshotBinding, MappingResolution, resolve_within_binding,
 };
 use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceEntry};
 use aethyme_contracts::experimental_v0::symbol_identity::{
     SYMBOL_MAPPING_AUTHORITY, decode_symbol_identity_record,
 };
-use aethyme_contracts::experimental_v0::{Record, RecordId, SourceSnapshot, StateReading};
+use aethyme_contracts::experimental_v0::{ProjectId, Record, RecordId, SourceSnapshot, StateReading};
 use aethyme_graph_schema::{NodeId, NodeKind};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const SEED: &str = "tests/fixtures/synthetic-playground-symbol-identity/seed";
-const PROJECT: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PROJECT: &str = "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa";
+const PEER_PROJECT: &str = "proj:bbbbbbbbbbbbbbbbbbbbbbbbba";
+const OTHER_PROJECT: &str = "proj:ccccccccccccccccccccccccca";
 const PROFILE: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FIXTURE_GIT_PATH: &str = "/usr/bin:/bin";
 const FIXTURE_GIT_NULL_DEVICE: &str = "/dev/null";
@@ -279,10 +281,12 @@ fn mapping_fixture_named(
     let right_node = node_ids(&clones.right, "src/lib.ts", symbol_name);
     let left_clone = rid("clone-a");
     let right_clone = rid("clone-b");
-    let project = if matches!(scenario, RecordScenario::CrossProject) {
-        rid("different-project")
+    let left_project = ProjectId::parse(PROJECT).unwrap();
+    let right_project = ProjectId::parse(PEER_PROJECT).unwrap();
+    let right_project_in_records = if matches!(scenario, RecordScenario::CrossProject) {
+        ProjectId::parse(OTHER_PROJECT).unwrap()
     } else {
-        RecordId::parse(PROJECT).unwrap()
+        right_project.clone()
     };
     let profile = if matches!(scenario, RecordScenario::ProfileMismatch) {
         rid("different-profile")
@@ -302,8 +306,11 @@ fn mapping_fixture_named(
         right_source.id()
     };
     let right_source_encoded = right_source_id.as_str();
-    let local_binding = CloneSnapshotBinding::from_snapshots(
-        RecordId::parse(PROJECT).unwrap(),
+    let association_record_id = rid("association-clone-a-to-b");
+    let local_binding = CloneSnapshotBinding::from_snapshots_for_test(
+        association_record_id.clone(),
+        left_project.clone(),
+        right_project.clone(),
         CapturedCloneSnapshot::new(left_clone.clone(), left_repo, &left_source),
         CapturedCloneSnapshot::new(right_clone.clone(), right_repo, &right_source),
         RecordId::parse(PROFILE).unwrap(),
@@ -329,22 +336,22 @@ fn mapping_fixture_named(
     };
     let (left_symbol, left_symbol_bytes) =
         if matches!(scenario, RecordScenario::ExternalPackageVersionMismatch) {
-            external_symbol_record(project.as_str(), left_clone.as_str(), "1.0.0")
+            external_symbol_record(left_project.as_str(), left_clone.as_str(), "1.0.0")
         } else {
-            symbol_record(project.as_str(), left_clone.as_str(), &left_symbol_node)
+            symbol_record(left_project.as_str(), left_clone.as_str(), &left_symbol_node)
         };
     let (right_symbol, right_symbol_bytes) = if matches!(scenario, RecordScenario::UnknownScope) {
         canonical_record(json!({
             "schema": "aethyme.symbol-ref/experimental-v0",
-            "project_id": project.as_str(),
+            "project_id": right_project_in_records.as_str(),
             "clone_id": right_clone_in_records.as_str(),
             "scope": { "kind": "future_scope", "opaque": "retained" }
         }))
     } else if matches!(scenario, RecordScenario::ExternalPackageVersionMismatch) {
-        external_symbol_record(project.as_str(), right_clone_in_records.as_str(), "2.0.0")
+        external_symbol_record(right_project_in_records.as_str(), right_clone_in_records.as_str(), "2.0.0")
     } else {
         symbol_record(
-            project.as_str(),
+            right_project_in_records.as_str(),
             right_clone_in_records.as_str(),
             &right_symbol_node,
         )
@@ -355,7 +362,7 @@ fn mapping_fixture_named(
     let (left_origin, left_origin_bytes) = canonical_record(json!({
         "schema": "aethyme.symbol-origin-evidence/experimental-v0",
         "authority": SYMBOL_MAPPING_AUTHORITY,
-        "project_id": project.as_str(),
+        "project_id": left_project.as_str(),
         "clone_id": left_clone.as_str(),
         "symbol_ref": left_symbol_id.as_str(),
         "source_snapshot": left_source.id().as_str(),
@@ -372,7 +379,7 @@ fn mapping_fixture_named(
     let (right_origin, right_origin_bytes) = canonical_record(json!({
         "schema": "aethyme.symbol-origin-evidence/experimental-v0",
         "authority": SYMBOL_MAPPING_AUTHORITY,
-        "project_id": project.as_str(),
+        "project_id": right_project_in_records.as_str(),
         "clone_id": right_clone_in_records.as_str(),
         "symbol_ref": right_origin_symbol,
         "source_snapshot": right_source_encoded,
@@ -404,7 +411,9 @@ fn mapping_fixture_named(
     let mapping_value = json!({
         "schema": "aethyme.explicit-symbol-mapping-evidence/experimental-v0",
         "authority": SYMBOL_MAPPING_AUTHORITY,
-        "project_id": project.as_str(),
+        "association_record_id": association_record_id.as_str(),
+        "left_project_id": left_project.as_str(),
+        "right_project_id": right_project_in_records.as_str(),
         "left_clone_id": left_clone.as_str(),
         "right_clone_id": right_clone_in_records.as_str(),
         "left_source_snapshot": left_source.id().as_str(),
@@ -507,7 +516,7 @@ fn actual_playground_clones_bind_observations_and_keep_existing_node_ids() {
 
 #[test]
 fn identical_local_names_need_document_and_producer_scope_and_package_versions_survive() {
-    let project = RecordId::parse(PROJECT).unwrap();
+    let project = ProjectId::parse(PROJECT).unwrap();
     let clone = rid("scope-clone");
     let (doc_one, _) = canonical_record(json!({
         "schema": "aethyme.symbol-ref/experimental-v0",
@@ -569,8 +578,10 @@ fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
         old_copy,
         node_ids(&clones.right, "src/copied.ts", "copy_me")
     );
-    let refreshed = CloneSnapshotBinding::from_snapshots(
-        RecordId::parse(PROJECT).unwrap(),
+    let refreshed = CloneSnapshotBinding::from_snapshots_for_test(
+        rid("association-clone-a-to-b"),
+        ProjectId::parse(PROJECT).unwrap(),
+        ProjectId::parse(PEER_PROJECT).unwrap(),
         CapturedCloneSnapshot::new(
             rid("clone-a"),
             repo_component(&clones.left),

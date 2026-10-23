@@ -41,8 +41,11 @@ pub(super) fn command(main_root: &Path, worktree: &Path, rest: &[&str]) -> Resul
     match rest {
         ["enroll", flags @ ..] => enroll(worktree, flags),
         ["bind", flags @ ..] => bind(main_root, worktree, flags),
+        ["association", association_args @ ..] => {
+            super::project_association::command(main_root, worktree, association_args)
+        }
         _ => Err(Failure::usage(
-            "project requires `enroll --commit <full-oid> [--write]` or `bind --confirm <record-id>`,",
+            "project requires `enroll --commit <full-oid> [--write]`, `bind --confirm <record-id>`, or `association <propose|confirm|revoke>`,",
         )),
     }
 }
@@ -471,7 +474,7 @@ fn binding_output(
     )
 }
 
-fn committed_enrollment(config: &str) -> Result<(ProjectKey, String), Failure> {
+pub(super) fn committed_enrollment(config: &str) -> Result<(ProjectKey, String), Failure> {
     // This path validates the exact committed file, instead of consulting the
     // mutable/default-branch config selector used by submit and capture.
     let parsed = config
@@ -539,7 +542,7 @@ fn committed_enrollment(config: &str) -> Result<(ProjectKey, String), Failure> {
     Ok((project, pointer))
 }
 
-fn committed_regular_file(
+pub(super) fn committed_regular_file(
     repo: &Path,
     commit: &CommitOid,
     snapshot: &SourceSnapshot,
@@ -672,7 +675,7 @@ fn committed_regular_file(
     Ok(bytes)
 }
 
-fn is_ancestor(repo: &Path, ancestor: &CommitOid, descendant: &CommitOid) -> Result<bool, Failure> {
+pub(super) fn is_ancestor(repo: &Path, ancestor: &CommitOid, descendant: &CommitOid) -> Result<bool, Failure> {
     let output = archive::git(repo)
         .args([
             "merge-base",

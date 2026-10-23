@@ -7,6 +7,7 @@
 //! it carries no verification, acceptance or execution authority.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use aethyme_contracts::experimental_v0::canonical_json::Value;
 use aethyme_contracts::experimental_v0::symbol_identity::{
@@ -15,16 +16,18 @@ use aethyme_contracts::experimental_v0::symbol_identity::{
     SYMBOL_REF_SCHEMA_NAME, SymbolScopeKind, decode_symbol_identity_record, symbol_scope_kind,
 };
 use aethyme_contracts::experimental_v0::{
-    Record, RecordId, SourceSnapshot, SourceSnapshotId, StateReading,
+    ProjectId, Record, RecordId, SourceSnapshot, SourceSnapshotId, StateReading,
 };
 use aethyme_graph_schema::NodeId;
 
-/// A local binding token that is not representable on the wire. Callers make
-/// it from the exact source snapshots and repo namespace values they captured
-/// for two distinct clones, then pass it alongside the serialized proposal.
+/// A local binding token that is not representable on the wire. The only
+/// production constructor is the association resolver below, which reloads
+/// the confirmed local row and both approved stores on every call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloneSnapshotBinding {
-    project_id: RecordId,
+pub(crate) struct CloneSnapshotBinding {
+    association_record_id: RecordId,
+    left_project_id: ProjectId,
+    right_project_id: ProjectId,
     left_clone_id: RecordId,
     right_clone_id: RecordId,
     left_source_snapshot: SourceSnapshotId,
@@ -36,14 +39,14 @@ pub struct CloneSnapshotBinding {
 
 /// Locally captured identity and source for one clone in a mapping binding.
 #[derive(Debug, Clone)]
-pub struct CapturedCloneSnapshot<'a> {
+struct CapturedCloneSnapshot<'a> {
     clone_id: RecordId,
     repo_component: String,
     source: &'a SourceSnapshot,
 }
 
 impl<'a> CapturedCloneSnapshot<'a> {
-    pub fn new(
+    fn new(
         clone_id: RecordId,
         repo_component: impl Into<String>,
         source: &'a SourceSnapshot,
@@ -57,8 +60,11 @@ impl<'a> CapturedCloneSnapshot<'a> {
 }
 
 impl CloneSnapshotBinding {
-    pub fn from_snapshots(
-        project_id: RecordId,
+    #[cfg(test)]
+    fn from_snapshots_for_test(
+        association_record_id: RecordId,
+        left_project_id: ProjectId,
+        right_project_id: ProjectId,
         left: CapturedCloneSnapshot<'_>,
         right: CapturedCloneSnapshot<'_>,
         profile: RecordId,
@@ -76,6 +82,9 @@ impl CloneSnapshotBinding {
         if left_clone_id == right_clone_id {
             return Err(BindingError::SameClone);
         }
+        if left_project_id == right_project_id {
+            return Err(BindingError::SameProject);
+        }
         if left_repo_component.is_empty()
             || right_repo_component.is_empty()
             || left_repo_component.contains(':')
@@ -84,7 +93,9 @@ impl CloneSnapshotBinding {
             return Err(BindingError::InvalidRepoComponent);
         }
         Ok(Self {
-            project_id,
+            association_record_id,
+            left_project_id,
+            right_project_id,
             left_clone_id,
             right_clone_id,
             left_source_snapshot: left_source.id(),
@@ -95,8 +106,16 @@ impl CloneSnapshotBinding {
         })
     }
 
-    pub fn project_id(&self) -> &RecordId {
-        &self.project_id
+    pub fn association_record_id(&self) -> &RecordId {
+        &self.association_record_id
+    }
+
+    pub fn left_project_id(&self) -> &ProjectId {
+        &self.left_project_id
+    }
+
+    pub fn right_project_id(&self) -> &ProjectId {
+        &self.right_project_id
     }
 
     pub fn left_clone_id(&self) -> &RecordId {
@@ -124,6 +143,8 @@ impl CloneSnapshotBinding {
 pub enum BindingError {
     #[error("clone binding must name two distinct clones")]
     SameClone,
+    #[error("association binding must name two distinct ProjectIds")]
+    SameProject,
     #[error("repo namespace must be nonempty and contain no colon")]
     InvalidRepoComponent,
 }
@@ -165,10 +186,128 @@ pub enum MappingResolution {
     Unknown(&'static str),
 }
 
+/// Resolve one mapping only after rebuilding its local authorization from the
+/// current repositories and stores. The temporary token never leaves this
+/// call and cannot be deserialized or supplied by a caller.
+pub(crate) fn resolve_associated_mapping(
+    local_repository: &Path,
+    peer_repository: &Path,
+    association_record_id: &RecordId,
+    profile: &RecordId,
+    claim_bytes: &[u8],
+    evidence_bytes: &[&[u8]],
+) -> MappingResolution {
+    use crate::collaboration_cli::project_association;
+    use crate::collaboration_identity_store::{
+        self as identity_store, IdentityStateResolution,
+    };
+
+    let (local_root, local_main_root) = match project_association::repository_roots(local_repository) {
+        Ok(roots) => roots,
+        Err(_) => return MappingResolution::Unknown("local_repository_unavailable"),
+    };
+    let (peer_root, peer_main_root) = match project_association::repository_roots(peer_repository) {
+        Ok(roots) => roots,
+        Err(_) => return MappingResolution::Unknown("peer_repository_unavailable"),
+    };
+    if local_root == peer_root || local_main_root == peer_main_root {
+        return MappingResolution::Unknown("same_repository_side");
+    }
+    let local = match project_association::inspect_project(&local_main_root, &local_root) {
+        Ok(context) => context,
+        Err(_) => return MappingResolution::Unknown("local_binding_unavailable"),
+    };
+    let peer = match project_association::inspect_project(&peer_main_root, &peer_root) {
+        Ok(context) => context,
+        Err(_) => return MappingResolution::Unknown("peer_binding_unavailable"),
+    };
+    if local.binding.project_id() == peer.binding.project_id() {
+        return MappingResolution::Unknown("same_project_id");
+    }
+
+    let persisted = match identity_store::resolve_persisted_project_association_with_archive_use(
+        &local.store,
+        association_record_id,
+        &local.archive,
+    ) {
+        Ok(Some(association)) => association,
+        Ok(None) => return MappingResolution::Unknown("association_missing"),
+        Err(_) => return MappingResolution::Unknown("association_unavailable_or_corrupt"),
+    };
+    if !persisted.is_confirmed() {
+        return MappingResolution::Unknown("association_revoked");
+    }
+    let association = persisted.descriptor();
+    if association.local_project_key() != local.key.as_str()
+        || association.peer_project_key() != peer.key.as_str()
+        || association.local_project_id() != local.binding.project_id()
+        || association.peer_project_id() != peer.binding.project_id()
+        || association.local_descriptor_record_id() != local.binding.descriptor_record_id()
+        || association.peer_descriptor_record_id() != peer.binding.descriptor_record_id()
+        || association.local_anchor_snapshot() != local.binding.descriptor().anchor_snapshot()
+        || association.peer_anchor_snapshot() != peer.binding.descriptor().anchor_snapshot()
+    {
+        return MappingResolution::Unknown("association_side_or_binding_mismatch");
+    }
+
+    let local_source_id = local.source_snapshot.id();
+    let peer_source_id = peer.source_snapshot.id();
+    let local_identity = identity_store::resolve_project_file_identity_state_with_archive_use(
+        &local.store,
+        &local.binding,
+        &local_source_id,
+        &local.archive,
+    );
+    let peer_identity = identity_store::resolve_project_file_identity_state_with_archive_use(
+        &peer.store,
+        &peer.binding,
+        &peer_source_id,
+        &peer.archive,
+    );
+    if !matches!(
+        local_identity,
+        Ok(IdentityStateResolution::Anchor(_)
+            | IdentityStateResolution::Bootstrap(_)
+            | IdentityStateResolution::Replayed(_))
+    ) || !matches!(
+        peer_identity,
+        Ok(IdentityStateResolution::Anchor(_)
+            | IdentityStateResolution::Bootstrap(_)
+            | IdentityStateResolution::Replayed(_))
+    ) {
+        return MappingResolution::Unknown("source_identity_unknown_or_unavailable");
+    }
+    if !local.head_is_current() || !peer.head_is_current() {
+        return MappingResolution::Unknown("source_head_changed_during_resolution");
+    }
+
+    let Some(left_repo_component) = repo_component(&local.root) else {
+        return MappingResolution::Unknown("local_repository_namespace_invalid");
+    };
+    let Some(right_repo_component) = repo_component(&peer.root) else {
+        return MappingResolution::Unknown("peer_repository_namespace_invalid");
+    };
+    let binding = CloneSnapshotBinding {
+        association_record_id: association_record_id.clone(),
+        left_project_id: association.local_project_id().clone(),
+        right_project_id: association.peer_project_id().clone(),
+        // The confirmed descriptor IDs uniquely identify the two separately
+        // enrolled clone identities and preserve the association's order.
+        left_clone_id: association.local_descriptor_record_id().clone(),
+        right_clone_id: association.peer_descriptor_record_id().clone(),
+        left_source_snapshot: local_source_id,
+        right_source_snapshot: peer_source_id,
+        profile: profile.clone(),
+        left_repo_component,
+        right_repo_component,
+    };
+    resolve_within_binding(&binding, claim_bytes, evidence_bytes)
+}
+
 /// Resolve an advisory claim against one local binding and exactly the seven
 /// canonical records in its reference closure: mapping evidence, two
 /// observations, two symbol references and two independent origins.
-pub fn resolve_within_binding(
+fn resolve_within_binding(
     local_binding: &CloneSnapshotBinding,
     claim_bytes: &[u8],
     evidence_bytes: &[&[u8]],
@@ -292,10 +431,16 @@ pub fn resolve_within_binding(
     let Some(profile) = record_id(binding, "profile") else {
         return MappingResolution::Unknown("invalid_profile_reference");
     };
-    let Some(project) = record_id(binding, "project_id") else {
-        return MappingResolution::Unknown("invalid_project_reference");
+    let Some(left_project) = project_id(binding, "left_project_id") else {
+        return MappingResolution::Unknown("invalid_left_project_reference");
     };
-    if project != local_binding.project_id
+    let Some(right_project) = project_id(binding, "right_project_id") else {
+        return MappingResolution::Unknown("invalid_right_project_reference");
+    };
+    if record_id(binding, "association_record_id").as_ref()
+            != Some(&local_binding.association_record_id)
+        || left_project != local_binding.left_project_id
+        || right_project != local_binding.right_project_id
         || left_clone != local_binding.left_clone_id
         || right_clone != local_binding.right_clone_id
         || text(binding, "left_source_snapshot")
@@ -324,12 +469,12 @@ pub fn resolve_within_binding(
     }
     if !symbol_matches(
         left_symbol,
-        &project,
+        &left_project,
         &left_clone,
         &local_binding.left_repo_component,
     ) || !symbol_matches(
         right_symbol,
-        &project,
+        &right_project,
         &right_clone,
         &local_binding.right_repo_component,
     ) {
@@ -340,14 +485,14 @@ pub fn resolve_within_binding(
     }
     if !origin_matches(
         left_origin,
-        &project,
+        &left_project,
         &left_clone,
         &left_symbol_id,
         &profile,
         left_observation,
     ) || !origin_matches(
         right_origin,
-        &project,
+        &right_project,
         &right_clone,
         &right_symbol_id,
         &profile,
@@ -380,7 +525,10 @@ fn claim_binding_matches_claim(
         && record_id(binding, "right_observation").as_ref() == Some(right_observation)
         && text(binding, "authority") == Some(SYMBOL_MAPPING_AUTHORITY)
         && text(claim, "authority") == Some(SYMBOL_MAPPING_AUTHORITY)
-        && record_id(binding, "project_id").as_ref() == Some(&local_binding.project_id)
+        && record_id(binding, "association_record_id").as_ref()
+            == Some(&local_binding.association_record_id)
+        && project_id(binding, "left_project_id").as_ref() == Some(&local_binding.left_project_id)
+        && project_id(binding, "right_project_id").as_ref() == Some(&local_binding.right_project_id)
 }
 
 fn observation_matches(
@@ -399,11 +547,11 @@ fn observation_matches(
 
 fn symbol_matches(
     symbol: &Record,
-    project: &RecordId,
+    project: &ProjectId,
     clone: &RecordId,
     expected_repo: &str,
 ) -> bool {
-    if record_id(symbol, "project_id").as_ref() != Some(project)
+    if project_id(symbol, "project_id").as_ref() != Some(project)
         || record_id(symbol, "clone_id").as_ref() != Some(clone)
     {
         return false;
@@ -468,13 +616,13 @@ fn external_package_coordinates(record: &Record) -> Option<(&str, &str, &str)> {
 
 fn origin_matches(
     origin: &Record,
-    project: &RecordId,
+    project: &ProjectId,
     clone: &RecordId,
     symbol: &RecordId,
     profile: &RecordId,
     observation: &Record,
 ) -> bool {
-    record_id(origin, "project_id").as_ref() == Some(project)
+    project_id(origin, "project_id").as_ref() == Some(project)
         && record_id(origin, "clone_id").as_ref() == Some(clone)
         && record_id(origin, "symbol_ref").as_ref() == Some(symbol)
         && record_id(origin, "profile").as_ref() == Some(profile)
@@ -489,6 +637,13 @@ fn record_id(record: &Record, field: &str) -> Option<RecordId> {
         return None;
     };
     RecordId::parse(encoded).ok()
+}
+
+fn project_id(record: &Record, field: &str) -> Option<ProjectId> {
+    let Value::String(encoded) = record.get(field)? else {
+        return None;
+    };
+    ProjectId::parse(encoded).ok()
 }
 
 fn text<'a>(record: &'a Record, field: &str) -> Option<&'a str> {
@@ -510,3 +665,15 @@ fn string_set(record: &Record, field: &str) -> Option<Vec<RecordId>> {
         })
         .collect()
 }
+
+fn repo_component(repository: &Path) -> Option<String> {
+    let component = repository.file_name()?.to_str()?;
+    if component.is_empty() || component.contains(':') {
+        return None;
+    }
+    Some(component.to_owned())
+}
+
+#[cfg(test)]
+#[path = "experimental_symbol_mapping_tests.rs"]
+mod tests;

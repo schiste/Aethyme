@@ -81,6 +81,7 @@ pub static EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA: RecordSchema = RecordSchema 
     name: EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA_NAME,
     fields: &[
         field("authority", true, FieldKind::String),
+        field("association_record_id", true, FieldKind::String),
         field("left_project_id", true, FieldKind::String),
         field("right_project_id", true, FieldKind::String),
         field("left_clone_id", true, FieldKind::String),
@@ -228,6 +229,7 @@ fn validate_record(record: &Record) -> Result<(), SymbolIdentityError> {
         }
         EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA_NAME => {
             advisory(record)?;
+            record_id(record, "association_record_id")?;
             let left_project = project_id(record, "left_project_id")?;
             let right_project = project_id(record, "right_project_id")?;
             if left_project == right_project {

@@ -578,6 +578,9 @@ says `experimental-v0`, and a consumer must check `schema` first.
 |---|---|
 | `collab status` | `aethyme.collab-status/experimental-v0` |
 | `collab enroll` | `aethyme.collab-enroll/experimental-v0` |
+| `collab project association propose` | `aethyme.collab-project-association-propose/experimental-v0` |
+| `collab project association confirm` | `aethyme.collab-project-association-confirm/experimental-v0` |
+| `collab project association revoke` | `aethyme.collab-project-association-revoke/experimental-v0` |
 | `collab capture recover` | `aethyme.collab-capture-recover/experimental-v0` |
 | `collab capture abort` | `aethyme.collab-capture-abort/experimental-v0` |
 | `collab capture receipt` | `aethyme.collab-capture-receipt/experimental-v0` |
@@ -595,6 +598,18 @@ says `experimental-v0`, and a consumer must check `schema` first.
 | `collab resolution import` | `aethyme.collab-resolution-import/experimental-v0` |
 | `collab resolution attach` | `aethyme.collab-resolution-attach/experimental-v0` |
 | any refusal or failure | `aethyme.collab-error/experimental-v0` |
+
+Project association proposals name two independently approved project
+bindings and require distinct `ProjectId`s. `propose --write` creates the
+canonical `.aethyme/project-association.json` proposal without changing either
+store. `confirm` requires the exact proposal `RecordId`, rechecks both
+committed descriptors and both retained local bindings, then writes the
+canonical object and confirmation row only to the invoking project's existing
+store. The peer store is opened read-only. `revoke` changes only that local
+row and does not open the peer store. These records grant no execution,
+acceptance, or source permission authority. Schema 31 stores the local record
+and its canonical object root; binaries that do not preserve association roots
+cannot write the migrated store.
 
 Resolution handoff commands are local and experimental. Every success object
 states `dispatches_agent: false` and `grants_acceptance: false`. `prepare`
