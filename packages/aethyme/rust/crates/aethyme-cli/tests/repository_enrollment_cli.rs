@@ -25,7 +25,7 @@ fn run(repo: &Path, args: &[&str]) -> Output {
     run_with_env(repo, args, None)
 }
 
-fn run_with_env(repo: &Path, args: &[&str], extra: Option<(&str, &str)>) -> Output {
+fn command_with_env(repo: &Path, args: &[&str], extra: Option<(&str, &str)>) -> Command {
     let binary = aethyme_bin();
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let mut paths = vec![binary.parent().unwrap().to_path_buf()];
@@ -44,7 +44,51 @@ fn run_with_env(repo: &Path, args: &[&str], extra: Option<(&str, &str)>) -> Outp
     if let Some((key, value)) = extra {
         command.env(key, value);
     }
-    command.output().unwrap()
+    command
+}
+
+fn run_with_env(repo: &Path, args: &[&str], extra: Option<(&str, &str)>) -> Output {
+    command_with_env(repo, args, extra).output().unwrap()
+}
+
+fn failure_context(repo: &Path, output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut context = format!("stdout={stdout} stderr={stderr}");
+    let operation_id = stderr
+        .split_once("ship push operation ")
+        .and_then(|(_, remainder)| remainder.split_whitespace().next())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|id| *id > 0);
+    let Some(operation_id) = operation_id else {
+        return context;
+    };
+
+    let operation_id = operation_id.to_string();
+    let mut command = command_with_env(
+        repo,
+        &[
+            "broker",
+            "advanced",
+            "operations",
+            "show",
+            &operation_id,
+            "--json",
+        ],
+        None,
+    );
+    match command.output() {
+        Ok(shown) => context.push_str(&format!(
+            "\noperation {operation_id} show (exit {:?}): stdout={} stderr={}",
+            shown.status.code(),
+            String::from_utf8_lossy(&shown.stdout),
+            String::from_utf8_lossy(&shown.stderr)
+        )),
+        Err(error) => context.push_str(&format!(
+            "\noperation {operation_id} show could not be launched: {error}"
+        )),
+    }
+    context
 }
 
 struct Fixture {
@@ -179,9 +223,8 @@ fn confirmed_execute_preserves_publishes_verifies_syncs_and_resumes() {
     );
     assert!(
         executed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&executed.stdout),
-        String::from_utf8_lossy(&executed.stderr)
+        "{}",
+        failure_context(&fixture.clone, &executed)
     );
     let report: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
     assert_eq!(report["schema_version"], 1);
@@ -238,9 +281,8 @@ fn execute_publishes_but_does_not_sync_a_dirty_primary_checkout() {
     );
     assert!(
         executed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&executed.stdout),
-        String::from_utf8_lossy(&executed.stderr)
+        "{}",
+        failure_context(&fixture.clone, &executed)
     );
     let report: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
     assert_eq!(report["local_main_synchronized"], false);
@@ -282,9 +324,8 @@ fn stale_main_enrolls_from_upstream_and_preexisting_sibling_detects_activation()
     );
     assert!(
         executed.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&executed.stdout),
-        String::from_utf8_lossy(&executed.stderr)
+        "{}",
+        failure_context(&fixture.clone, &executed)
     );
     let report: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
     assert_eq!(report["local_main_synchronized"], true);
@@ -409,9 +450,8 @@ fn persisted_phase_boundaries_resume_without_duplicate_publication() {
         );
         assert!(
             resumed.status.success(),
-            "phase {phase}: stdout={} stderr={}",
-            String::from_utf8_lossy(&resumed.stdout),
-            String::from_utf8_lossy(&resumed.stderr)
+            "phase {phase}: {}",
+            failure_context(&fixture.clone, &resumed)
         );
         let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
         assert_eq!(report["completed"], true, "phase {phase}");
