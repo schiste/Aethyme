@@ -3252,9 +3252,11 @@ mod fresh_root_recovery_inventory_tests {
             expected_marker.as_bytes()
         );
 
-        let mut broker =
-            Broker::open_for_explicit_worktree_root_recovery_with_options(&repository_root, options)
-                .unwrap();
+        let mut broker = Broker::open_for_explicit_worktree_root_recovery_with_options(
+            &repository_root,
+            options,
+        )
+        .unwrap();
         let recovery_plan = broker.fresh_worktree_root_recovery_plan().unwrap();
         assert_eq!(recovery_plan.digest, original_plan.digest);
         assert!(

@@ -1325,9 +1325,8 @@ fn recovery_plan_inspects_incomplete_repository_uuid_marker_without_settling_it(
     assert_eq!(changed, 1);
     drop(connection);
 
-    let temporary = repository.join(
-        ".git/.aethyme-repository-uuid.0123456789abcdef0123456789abcdef.tmp",
-    );
+    let temporary =
+        repository.join(".git/.aethyme-repository-uuid.0123456789abcdef0123456789abcdef.tmp");
     let expected_marker = b"AETHYME-REPO-UUID-V1\nf47ac10b-58cc-4372-a567-0e02b2c3d479\n";
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -1348,7 +1347,10 @@ fn recovery_plan_inspects_incomplete_repository_uuid_marker_without_settling_it(
     ));
     assert_eq!(plan["binding"]["state"], "fresh_reserved");
     assert_eq!(plan["can_apply"], true);
-    assert!(!marker.exists(), "planning must not settle the marker prefix");
+    assert!(
+        !marker.exists(),
+        "planning must not settle the marker prefix"
+    );
     assert_eq!(std::fs::read(&temporary).unwrap(), expected_marker);
     assert_eq!(read_meta(&database, "min_compatible_schema"), "54");
     let connection = rusqlite::Connection::open_with_flags(
