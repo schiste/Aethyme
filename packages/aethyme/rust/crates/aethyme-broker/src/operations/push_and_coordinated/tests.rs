@@ -47,6 +47,54 @@ fn the_subcommand_is_found_behind_leading_flags_but_never_inside_one() {
     );
 }
 
+#[test]
+fn open_pr_cache_invalidation_tracks_topology_flags_not_body_values() {
+    for argv in [
+        vec!["pr", "create"],
+        vec!["pr", "close", "506"],
+        vec!["pr", "reopen", "506"],
+        vec!["pr", "merge", "506"],
+        vec!["pr", "update-branch", "506"],
+        vec!["--repo", "acme/project", "pr", "edit", "506", "--base", "main"],
+        vec!["pr", "edit", "506", "--base=release"],
+        vec!["pr", "edit", "506", "-B", "release"],
+    ] {
+        assert!(gh_pr_topology_write(&gh(&argv)), "{argv:?}");
+    }
+
+    for argv in [
+        vec!["pr", "list", "--state", "closed"],
+        vec!["pr", "edit", "506", "--body", "--base"],
+        vec!["pr", "edit", "506", "-b", "-B"],
+        vec!["pr", "edit", "506", "--body=state=closed --base=release"],
+        vec!["pr", "edit", "506", "--title", "close this PR"],
+        vec!["issue", "edit", "506", "--body=--base=release"],
+    ] {
+        assert!(!gh_pr_topology_write(&gh(&argv)), "{argv:?}");
+    }
+
+    assert!(should_invalidate_open_pr_listing(
+        OperationProvider::Github,
+        &gh(&["pr", "update-branch", "506"]),
+        OperationStatus::Succeeded,
+    ));
+    assert!(should_invalidate_open_pr_listing(
+        OperationProvider::Github,
+        &gh(&["pr", "update-branch", "506"]),
+        OperationStatus::OutcomeUnknown,
+    ));
+    assert!(!should_invalidate_open_pr_listing(
+        OperationProvider::Github,
+        &gh(&["pr", "update-branch", "506"]),
+        OperationStatus::Failed,
+    ));
+    assert!(!should_invalidate_open_pr_listing(
+        OperationProvider::Git,
+        &gh(&["pr", "update-branch", "506"]),
+        OperationStatus::Succeeded,
+    ));
+}
+
 /// Every spelling `gh` accepts for a label has to be seen, because a label
 /// this misses is one the pre-flight check cannot refuse (#184).
 #[test]

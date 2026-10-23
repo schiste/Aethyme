@@ -51,6 +51,7 @@ const ADJACENT_LINES: u32 = 3;
 const WHOLE_FILE: (u32, u32) = (0, u32::MAX);
 
 const OPEN_PRS_KEY: &str = "pr_overlap.open_prs";
+const INVALIDATED_OPEN_PRS: &str = r#"{"fetched_at_ms":0,"base":"","prs":[]}"#;
 
 fn ranges_key(number: i64) -> String {
     format!("pr_overlap.ranges.{number}")
@@ -349,6 +350,17 @@ fn wait() -> QueueWait {
 }
 
 impl Broker {
+    /// Make the cached open-PR listing unusable after a coordinated command
+    /// may have changed which PRs are open or which base/head the listing
+    /// describes. This typed sentinel is deliberately stale and has no base,
+    /// so the next overlap check refreshes it through the normal bounded path.
+    pub(crate) fn invalidate_cached_open_pr_listing(&self) {
+        crate::warn_unrecorded(
+            "invalidate the cached open pull request listing",
+            self.store_ref().meta_set(OPEN_PRS_KEY, INVALIDATED_OPEN_PRS),
+        );
+    }
+
     /// The committed change of `branch_ref` against the default branch.
     fn ranges_for_head(&self, default: &TrackedDefault, head: &str) -> Option<FileRanges> {
         let repo = self.repo_handle();

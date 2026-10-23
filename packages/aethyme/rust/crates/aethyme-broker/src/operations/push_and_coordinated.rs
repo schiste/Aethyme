@@ -402,12 +402,91 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
 /// half is not itself the value of a preceding flag -- the same rule
 /// [`crate::creates_pull_request`] applies to one hard-coded pair, generalised.
 fn gh_subcommand(args: &[String]) -> Option<(&str, &str)> {
+    let (_, command, action) = gh_subcommand_with_index(args)?;
+    Some((command, action))
+}
+
+fn gh_subcommand_with_index(args: &[String]) -> Option<(usize, &str, &str)> {
     args.windows(2).enumerate().find_map(|(index, pair)| {
         (!pair[0].starts_with('-')
             && !pair[1].starts_with('-')
             && (index == 0 || !args[index - 1].starts_with('-')))
-        .then(|| (pair[0].as_str(), pair[1].as_str()))
+        .then(|| (index, pair[0].as_str(), pair[1].as_str()))
     })
+}
+
+/// Whether a coordinated GitHub command can change cached open-PR membership
+/// or the head/base identity stored with that listing. Content-only edits do
+/// not invalidate it, and option values are consumed before flags are checked.
+/// Arbitrary `gh api` payloads and writes outside this broker retain the cache TTL.
+fn gh_pr_topology_write(args: &[String]) -> bool {
+    match gh_subcommand(args) {
+        Some(("pr", "create" | "close" | "reopen" | "merge" | "update-branch")) => true,
+        Some(("pr", "edit")) => gh_pr_edit_changes_base(args),
+        _ => false,
+    }
+}
+
+/// `gh pr edit` only affects the listing's topology when it changes the base.
+/// Do not inspect body/title values: they are arbitrary content and can contain
+/// flag-looking text. These are the value-taking edit options supported by
+/// `gh`; their values must be skipped while scanning for `--base`.
+fn gh_pr_edit_changes_base(args: &[String]) -> bool {
+    const VALUE_FLAGS: &[&str] = &[
+        "-R",
+        "--repo",
+        "-t",
+        "--title",
+        "-b",
+        "--body",
+        "-F",
+        "--body-file",
+        "--attach",
+        "-m",
+        "--milestone",
+        "--add-assignee",
+        "--add-label",
+        "--add-project",
+        "--add-reviewer",
+        "--remove-assignee",
+        "--remove-label",
+        "--remove-project",
+        "--remove-reviewer",
+    ];
+    let Some((command_index, "pr", "edit")) = gh_subcommand_with_index(args) else {
+        return false;
+    };
+    let mut index = command_index + 2;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            break;
+        }
+        if matches!(argument.as_str(), "-B" | "--base") {
+            return args.get(index + 1).is_some();
+        }
+        if argument.starts_with("--base=") || argument.starts_with("-B") {
+            return true;
+        }
+        if VALUE_FLAGS.contains(&argument.as_str()) {
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn should_invalidate_open_pr_listing(
+    provider: OperationProvider,
+    args: &[String],
+    status: OperationStatus,
+) -> bool {
+    provider == OperationProvider::Github
+        && matches!(
+            status,
+            OperationStatus::Succeeded | OperationStatus::OutcomeUnknown
+        )
+        && gh_pr_topology_write(args)
 }
 
 /// Every value a repeatable `gh` flag carries, in either spelling.
@@ -2690,6 +2769,13 @@ impl Broker {
                     None,
                     Some(&details.to_string()),
                 )?;
+                if should_invalidate_open_pr_listing(
+                    request.provider,
+                    &request.args,
+                    operation.status,
+                ) {
+                    self.invalidate_cached_open_pr_listing();
+                }
                 if let Some(guard) = &mut host_guard {
                     guard.finish(operation.status)?;
                 }
@@ -2955,6 +3041,13 @@ impl Broker {
             exit_code,
             Some(&details.to_string()),
         )?;
+        if should_invalidate_open_pr_listing(
+            request.provider,
+            &request.args,
+            operation.status,
+        ) {
+            self.invalidate_cached_open_pr_listing();
+        }
         if let Some(guard) = &mut host_guard {
             guard.finish(operation.status)?;
         }
