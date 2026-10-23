@@ -1124,13 +1124,13 @@ impl<'a> Closure<'a> {
             for (record_id, digest) in associations {
                 if RecordId::parse(&record_id).is_err() {
                     self.problems.push(format!(
-                        "confirmed project association has malformed record id {record_id}"
+                        "project association has malformed record id {record_id}"
                     ));
                 }
                 match parse_hex_digest(&digest) {
                     Some(digest) => self.object(digest, RetentionClass::Record),
                     None => self.problems.push(format!(
-                        "confirmed project association {record_id} has malformed object digest"
+                        "project association {record_id} has malformed object digest"
                     )),
                 }
             }
