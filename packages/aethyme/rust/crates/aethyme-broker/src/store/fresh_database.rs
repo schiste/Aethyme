@@ -1689,7 +1689,10 @@ mod unix {
             let requested_db_path = repo_root.join(".aethyme/broker.db");
             fs::create_dir_all(requested_db_path.parent().unwrap()).unwrap();
             let paths = prepare_paths(repo_root, &requested_db_path).unwrap();
-            let store = BrokerStore::open(&paths.final_path).unwrap();
+            // Seed a legacy database, then attach its invoking repository scope
+            // before constructing a confirmation for the scoped binding API.
+            drop(BrokerStore::open(&paths.final_path).unwrap());
+            let store = open_in_repo(repo_root, &paths.logical_path).unwrap();
             let base = capture_identity_base(repo_root, &paths.final_path).unwrap();
             let digest = "c3".repeat(32);
             let confirmation = LegacyRepositoryRootConfirmation {
