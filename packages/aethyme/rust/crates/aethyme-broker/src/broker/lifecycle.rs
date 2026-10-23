@@ -2767,6 +2767,8 @@ mod fresh_root_recovery_inventory_tests {
                 "user.name=Aethyme Test",
                 "-c",
                 "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-qm",
@@ -4742,9 +4744,23 @@ impl Broker {
             #[cfg(test)]
             worktree_lifecycle_test_observer: None,
         };
-        // A fresh or legacy-unbound store remains available for non-root
-        // operations, but startup maintenance waits for an explicit binding.
+        // Fresh staged stores already have a repository-scoped bootstrap
+        // identity, so a separate pinned cache root can be initialized without
+        // selecting or creating a worktree root. Legacy-unbound stores defer
+        // this initialization and root maintenance.
         if broker.validate_bound_repository_worktree_root()?.is_none() {
+            let binding = broker.store.repository_worktree_binding()?;
+            if binding.state
+                == crate::store::repository_binding::RepositoryWorktreeBindingState::FreshUnbound
+                && binding.origin
+                    == Some(
+                        crate::store::repository_binding::RepositoryWorktreeBindingOrigin::Fresh,
+                    )
+            {
+                broker
+                    .storage_context
+                    .initialize_preparation_cache_root(&broker.repo)?;
+            }
             return Ok(broker);
         }
         broker
@@ -9505,6 +9521,118 @@ fn path_is_explicitly_absent(path: &Path) -> bool {
         std::fs::symlink_metadata(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     )
+}
+
+#[cfg(all(test, unix))]
+mod unbound_preparation_cache_open_tests {
+    use super::*;
+    use crate::store::repository_binding::{
+        RepositoryWorktreeBindingOrigin, RepositoryWorktreeBindingState,
+    };
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(repository: &Path, arguments: &[&str]) {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repository).args(arguments);
+        for (name, _) in
+            std::env::vars_os().filter(|(name, _)| name.to_string_lossy().starts_with("GIT_"))
+        {
+            command.env_remove(name);
+        }
+        let output = command.output().expect("run isolated Git fixture command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repository_fixture() -> tempfile::TempDir {
+        let repository = tempfile::tempdir().unwrap();
+        git(
+            repository.path(),
+            &["init", "-q", "-b", "main", "--template="],
+        );
+        git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=Aethyme Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        );
+        repository
+    }
+
+    #[test]
+    fn fresh_unbound_open_initializes_explicit_cache_without_binding_or_creating_worktree_root() {
+        let repository = repository_fixture();
+        let storage = crate::test_storage::TestStorage::new();
+
+        let broker = storage.open(repository.path()).unwrap();
+        let binding = broker.store_ref().repository_worktree_binding().unwrap();
+        assert_eq!(binding.state, RepositoryWorktreeBindingState::FreshUnbound);
+        assert_eq!(binding.origin, Some(RepositoryWorktreeBindingOrigin::Fresh));
+        assert!(!storage.worktree_root().exists());
+        assert!(!repository.path().join(".aethyme/worktrees").exists());
+        assert!(
+            broker
+                .storage_context()
+                .preparation_cache_root()
+                .unwrap()
+                .unwrap()
+                .is_dir()
+        );
+        assert!(
+            std::fs::read_dir(
+                broker
+                    .storage_context()
+                    .preparation_cache_root()
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+            .next()
+            .is_some(),
+            "fresh-unbound open must initialize the explicitly selected cache root"
+        );
+    }
+
+    #[test]
+    fn legacy_unbound_open_leaves_explicit_cache_uninitialized_and_creates_no_root() {
+        let repository = repository_fixture();
+        let database = repository.path().join(".aethyme/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(include_str!("../../tests/fixtures/v028-schema52.sql"))
+            .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let cache_root = storage.root().join("preparation-cache");
+
+        let broker = storage.open(repository.path()).unwrap();
+        let binding = broker.store_ref().repository_worktree_binding().unwrap();
+        assert_eq!(binding.state, RepositoryWorktreeBindingState::LegacyUnbound);
+        assert_eq!(
+            binding.origin,
+            Some(RepositoryWorktreeBindingOrigin::Legacy)
+        );
+        assert!(
+            std::fs::read_dir(&cache_root).unwrap().next().is_none(),
+            "legacy-unbound open must leave the explicitly selected cache root untouched"
+        );
+        assert!(!storage.worktree_root().exists());
+        assert!(!repository.path().join(".aethyme/worktrees").exists());
+    }
 }
 
 #[cfg(test)]
