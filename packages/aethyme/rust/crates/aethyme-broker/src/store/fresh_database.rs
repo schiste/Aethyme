@@ -1799,6 +1799,7 @@ mod unix {
         fn legacy_binding_refuses_group_world_writable_database_before_transition() {
             let repo = tempfile::tempdir().unwrap();
             let (paths, mut store, confirmation) = prepare_legacy_database(repo.path());
+            let binding_before = store.repository_worktree_binding().unwrap();
             fs::set_permissions(&paths.final_path, fs::Permissions::from_mode(0o666)).unwrap();
 
             let error = store
@@ -1815,7 +1816,10 @@ mod unix {
                 binding.origin,
                 Some(RepositoryWorktreeBindingOrigin::Legacy)
             );
-            assert_eq!(binding.repository_root, None);
+            assert_eq!(
+                binding, binding_before,
+                "refusal must leave the binding unchanged"
+            );
             assert_eq!(binding.bootstrap_nonce, None);
         }
 
