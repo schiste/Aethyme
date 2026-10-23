@@ -169,7 +169,11 @@ fn run_with_host_paths(
 
 fn snapshot_status(repository: &Path) -> serde_json::Value {
     let broker = Broker::open_snapshot(repository).unwrap();
-    serde_json::to_value(broker.status_current_snapshot(0).unwrap()).unwrap()
+    let status = serde_json::to_value(broker.status_current_snapshot(0).unwrap()).unwrap();
+    assert!(status["summary"].is_object(), "{status}");
+    assert!(status["agents"].is_array(), "{status}");
+    assert!(status["integration_branch"].is_string(), "{status}");
+    status
 }
 
 struct LegacyRootFixture {

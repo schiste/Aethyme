@@ -373,7 +373,8 @@ fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) 
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
 
-    let root = bind_fixture_worktree_root(tmp.path(), tmp.path());
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
     let worktree = root.join("submit");
     git(
         tmp.path(),
@@ -1629,7 +1630,8 @@ fn submit_replays_a_bounded_gate_failure_tail() {
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
 
-    let root = bind_fixture_worktree_root(tmp.path(), tmp.path());
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
     let worktree = root.join("submit-failure");
     git(
         tmp.path(),
@@ -1912,7 +1914,8 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
     .unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
-    let root = bind_fixture_worktree_root(tmp.path(), tmp.path());
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
     let worktree = root.join("codes");
     git(
         tmp.path(),
@@ -2011,7 +2014,8 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
     .unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
-    let root = bind_fixture_worktree_root(tmp.path(), tmp.path());
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
     let worktree = root.join("host");
     git(
         tmp.path(),
