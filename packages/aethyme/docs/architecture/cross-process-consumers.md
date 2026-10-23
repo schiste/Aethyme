@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-22
+Last Updated: 2026-10-23
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -58,6 +58,28 @@ strict record decoder may refuse the recovered record, so operators must keep
 host state and use a compatible runtime. See
 [the storage lifecycle recovery contract](local-v3-storage-lifecycle.md)
 before applying a plan.
+
+
+### Repository-scoped worktree-root bindings (#1002)
+
+The public operator surfaces are `aethyme broker advanced worktree-root
+[--json]`, `worktree-root binding plan <exact-root> <layout> [--json]`,
+`worktree-root binding apply <exact-root> <layout> --confirm <sha256>
+[--json]`, `worktree-root recovery plan [--json]`, and `worktree-root
+recovery apply --confirm <sha256> [--json]`. The full command syntax and JSON
+fields are documented in [the broker CLI reference](../reference/cli.md).
+Opening the placement command may attach the current Git common directory to
+an unbound repository row; it does not create or bind the root. Binding and
+recovery plans are read-only, and apply requires the exact digest from the
+reviewed plan. Recovery accepts only the supported durable prefixes of a fresh
+reservation.
+
+Schema v54 adds the per-repository binding record. The v54 migration retains
+compatibility floor 52 for legacy unbound databases; identity-bound writes
+raise that database's floor to 54 so v53 writers refuse it. The schema v53
+`spawned_worktree_instances` witness remains intact. Consumers should preserve
+the version-1 binding record's lower-snake-case states, origins, layouts, and
+sources, and tolerate nullable fields as documented in the CLI reference.
 
 ### Detached whole-checkout continuation (#997, #999)
 

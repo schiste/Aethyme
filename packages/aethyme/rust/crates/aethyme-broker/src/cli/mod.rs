@@ -212,13 +212,22 @@ Usage:
       session worktree. Shared caches are serialized host-wide; no command is
       ever run automatically by start or adopt. --offline refuses any step
       without a declared offline_command.
-  aethyme broker worktree-root [--json]
+  aethyme broker advanced worktree-root [--json]
       Resolve the scanner-safe external root used by future broker starts.
       Read-only: reports the preferred location, repository key and
       fallbacks without creating any directory. A [worktrees] root in
       .aethyme/config.toml supersedes the per-user default while it exists,
       is outside the repository and has worktrees.min_free_bytes free;
       otherwise starts use the default and say why.
+  aethyme broker advanced worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]
+      Review an existing legacy root before binding it to this repository.
+      Planning does not discover, create or change a root.
+  aethyme broker advanced worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]
+      Bind only the reviewed legacy root if every planned identity still matches.
+  aethyme broker advanced worktree-root recovery plan [--json]
+      Inspect an incomplete fresh-root reservation and its durable prefixes.
+  aethyme broker advanced worktree-root recovery apply --confirm <sha256> [--json]
+      Complete only the fresh-root reservation bound to the reviewed digest.
   aethyme broker worktrees [--measure] [--json]
       List every worktree on this host with its repository, size, age and
       what removing it would lose (uncommitted, unpushed, recoverable).
@@ -2346,6 +2355,12 @@ fn open_broker(read_only_snapshot: bool) -> Result<Broker, UsageError> {
     } else {
         Ok(Broker::open(&cwd)?)
     }
+}
+
+fn open_broker_for_explicit_worktree_root_recovery() -> Result<Broker, UsageError> {
+    let cwd = std::env::current_dir()
+        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+    Ok(Broker::open_for_explicit_worktree_root_recovery(&cwd)?)
 }
 
 /// Starting or adopting a session is the one useful moment to surface a
