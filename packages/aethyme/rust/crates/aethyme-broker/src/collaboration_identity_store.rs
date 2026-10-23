@@ -16,8 +16,8 @@ use aethyme_contracts::experimental_v0::{
     brief::Brief,
     canonical_json::{Object, Value as CanonicalValue},
     contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
-    project_identity::{MAX_DESCRIPTOR_BYTES, MAX_DESCRIPTOR_FILES, PROJECT_DESCRIPTOR_PATH},
     project_association::MAX_PROJECT_ASSOCIATION_BYTES,
+    project_identity::{MAX_DESCRIPTOR_BYTES, MAX_DESCRIPTOR_FILES, PROJECT_DESCRIPTOR_PATH},
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use thiserror::Error;

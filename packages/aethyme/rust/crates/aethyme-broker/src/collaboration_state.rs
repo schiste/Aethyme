@@ -3052,7 +3052,10 @@ mod tests {
         drop(store);
 
         let mut migrated = open(host.path(), &[]).unwrap();
-        assert_eq!(migrated.schema_version(), COLLABORATION_STATE_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.schema_version(),
+            COLLABORATION_STATE_SCHEMA_VERSION
+        );
         let floor: i64 = migrated
             .read_connection()
             .query_row(

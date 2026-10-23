@@ -31,11 +31,7 @@ const CONFIG_PATH: &str = ".aethyme/config.toml";
 const MAX_POLICY_BYTES: usize = 1024 * 1024;
 const CONFIRM_NEXT: &str = "review the exact association RecordId, then run `aethyme collab project association confirm --peer-repo <path> --confirm <record-id>`";
 
-pub(super) fn command(
-    main_root: &Path,
-    worktree: &Path,
-    rest: &[&str],
-) -> Result<Output, Failure> {
+pub(super) fn command(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
     match rest {
         ["propose", flags @ ..] => propose(main_root, worktree, flags),
         ["confirm", flags @ ..] => confirm(main_root, worktree, flags),
@@ -106,7 +102,9 @@ fn confirm(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, F
     let (peer_path, confirmed) = parse_confirm_flags(rest)?;
     let bytes = read_working_association(worktree)?;
     let (association, actual_record_id) = ProjectAssociationDescriptor::from_record(&bytes)
-        .map_err(|error| Failure::refused("invalid_association", error.to_string(), CONFIRM_NEXT))?;
+        .map_err(|error| {
+            Failure::refused("invalid_association", error.to_string(), CONFIRM_NEXT)
+        })?;
     if actual_record_id != confirmed {
         return Err(Failure::refused(
             "association_confirmation_mismatch",
@@ -136,7 +134,10 @@ fn confirm(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, F
     let local_archive = collaboration_gc::archive_use(&local_store).map_err(|error| {
         Failure::domain(
             "archive_lock",
-            format!("{}: {error}", collaboration_gc::lock_path(&local_store).display()),
+            format!(
+                "{}: {error}",
+                collaboration_gc::lock_path(&local_store).display()
+            ),
         )
     })?;
     let _local_response = collaboration_sensitive::response_use(&local_store)
@@ -199,8 +200,7 @@ fn revoke(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Fa
             "project association revoke requires exactly --confirm <association-record-id>",
         ));
     }
-    let confirmed =
-        RecordId::parse(rest[1]).map_err(|error| Failure::usage(error.to_string()))?;
+    let confirmed = RecordId::parse(rest[1]).map_err(|error| Failure::usage(error.to_string()))?;
     let local = inspect_project(main_root, worktree)?;
     let (_, _, exists) = locate_for_repository(main_root, &local.key)
         .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
@@ -217,18 +217,16 @@ fn revoke(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Fa
         .map_err(|error| Failure::domain("archive_lock", error.to_string()))?;
     let _response = collaboration_sensitive::response_use(&store)
         .map_err(|error| Failure::refused("sensitive_response", error.to_string(), CONFIRM_NEXT))?;
-    let binding = identity_store::resolve_approved_project_binding_with_archive_use(
-        &store,
-        &archive_use,
-    )
-    .map_err(identity_binding_failure)?
-    .ok_or_else(|| {
-        Failure::refused(
-            "local_binding_missing",
-            "the invoking project's approved descriptor binding is missing",
-            "restore or bind the exact local descriptor before revoking its association",
-        )
-    })?;
+    let binding =
+        identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
+            .map_err(identity_binding_failure)?
+            .ok_or_else(|| {
+                Failure::refused(
+                    "local_binding_missing",
+                    "the invoking project's approved descriptor binding is missing",
+                    "restore or bind the exact local descriptor before revoking its association",
+                )
+            })?;
     validate_binding_matches_context(&binding, &local)?;
     let association = load_association_row(&store, &confirmed)?;
     if association.descriptor.local_project_key() != local.key.as_str()
@@ -283,7 +281,10 @@ fn revoke(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Fa
             "grants_execution_authority":false,
             "grants_acceptance_authority":false,
         }),
-        format!("association {} is {} locally\npeer store was not accessed\n", confirmed, status),
+        format!(
+            "association {} is {} locally\npeer store was not accessed\n",
+            confirmed, status
+        ),
     ))
 }
 
@@ -307,25 +308,30 @@ impl ProjectContext {
     }
 }
 
-pub(crate) fn inspect_project(main_root: &Path, worktree: &Path) -> Result<ProjectContext, Failure> {
+pub(crate) fn inspect_project(
+    main_root: &Path,
+    worktree: &Path,
+) -> Result<ProjectContext, Failure> {
     let head = archive::pin_commit(worktree, "HEAD")
         .map_err(|error| Failure::domain("git", error.to_string()))?;
     let snapshot = archive::snapshot_of_commit(worktree, &head)
         .map_err(|error| Failure::domain("archive", error.to_string()))?;
-    let config_bytes = committed_regular_file(
-        worktree,
-        &head,
-        &snapshot,
-        CONFIG_PATH,
-        MAX_POLICY_BYTES,
-    )?;
-    let config_text = std::str::from_utf8(&config_bytes)
-        .map_err(|_| Failure::refused("config_unreadable", "committed config is not UTF-8", CONFIRM_NEXT))?;
+    let config_bytes =
+        committed_regular_file(worktree, &head, &snapshot, CONFIG_PATH, MAX_POLICY_BYTES)?;
+    let config_text = std::str::from_utf8(&config_bytes).map_err(|_| {
+        Failure::refused(
+            "config_unreadable",
+            "committed config is not UTF-8",
+            CONFIRM_NEXT,
+        )
+    })?;
     let (key, pointer) = committed_enrollment(config_text)?;
     if pointer != PROJECT_DESCRIPTOR_PATH {
         return Err(Failure::refused(
             "descriptor_pointer_mismatch",
-            format!("committed [collaboration] descriptor must be exactly {PROJECT_DESCRIPTOR_PATH:?}"),
+            format!(
+                "committed [collaboration] descriptor must be exactly {PROJECT_DESCRIPTOR_PATH:?}"
+            ),
             "commit the reviewed project descriptor pointer before associating clones",
         ));
     }
@@ -364,17 +370,23 @@ pub(crate) fn inspect_project(main_root: &Path, worktree: &Path) -> Result<Proje
     }
     let store = inspect_store_for_repository(main_root, &key)
         .map_err(|error| Failure::domain(error.code(), error.to_string()))?
-        .ok_or_else(|| Failure::refused("binding_missing", "project store disappeared", CONFIRM_NEXT))?;
+        .ok_or_else(|| {
+            Failure::refused("binding_missing", "project store disappeared", CONFIRM_NEXT)
+        })?;
     let archive_use = collaboration_gc::archive_use_read_only(&store)
         .map_err(|error| Failure::domain("archive_lock", error.to_string()))?;
     let response = collaboration_sensitive::response_use_read_only(&store)
         .map_err(|error| Failure::refused("sensitive_response", error.to_string(), CONFIRM_NEXT))?;
-    let binding = identity_store::resolve_approved_project_binding_with_archive_use(
-        &store,
-        &archive_use,
-    )
-    .map_err(identity_binding_failure)?
-    .ok_or_else(|| Failure::refused("binding_missing", "approved project binding is missing", CONFIRM_NEXT))?;
+    let binding =
+        identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
+            .map_err(identity_binding_failure)?
+            .ok_or_else(|| {
+                Failure::refused(
+                    "binding_missing",
+                    "approved project binding is missing",
+                    CONFIRM_NEXT,
+                )
+            })?;
     let context = ProjectContext {
         root: worktree.to_path_buf(),
         main_root: main_root.to_path_buf(),
@@ -475,7 +487,18 @@ fn load_association_row(
             "upgrade the local store before resolving or revoking this association",
         ));
     }
-    type Row = (String, String, String, String, String, String, String, String, i64, Option<i64>);
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+    );
     let row: Option<Row> = store
         .read_connection()
         .query_row(
@@ -486,17 +509,40 @@ fn load_association_row(
             [expected_record_id.as_str()],
             |row| {
                 Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
                 ))
             },
         )
         .optional()
         .map_err(sqlite)?;
-    let Some((digest_text, local_key, local_id_text, peer_id_text, local_descriptor_text, peer_descriptor_text, peer_key, status, confirmed_ms, revoked_ms)) = row else {
+    let Some((
+        digest_text,
+        local_key,
+        local_id_text,
+        peer_id_text,
+        local_descriptor_text,
+        peer_descriptor_text,
+        peer_key,
+        status,
+        confirmed_ms,
+        revoked_ms,
+    )) = row
+    else {
         return Err(Failure::refused(
             "association_missing",
-            format!("association {} is not persisted in this local project store", expected_record_id),
+            format!(
+                "association {} is not persisted in this local project store",
+                expected_record_id
+            ),
             "confirm the exact proposal in the invoking project before resolving it",
         ));
     };
@@ -505,10 +551,17 @@ fn load_association_row(
         || (status == "revoked" && revoked_ms.is_none_or(|time| time < confirmed_ms))
         || !matches!(status.as_str(), "confirmed" | "revoked")
     {
-        return Err(Failure::domain("association_corrupt", "association status timestamps are inconsistent".into()));
+        return Err(Failure::domain(
+            "association_corrupt",
+            "association status timestamps are inconsistent".into(),
+        ));
     }
-    let digest = archive::parse_digest(&digest_text)
-        .ok_or_else(|| Failure::domain("association_corrupt", "association object digest is malformed".into()))?;
+    let digest = archive::parse_digest(&digest_text).ok_or_else(|| {
+        Failure::domain(
+            "association_corrupt",
+            "association object digest is malformed".into(),
+        )
+    })?;
     let bytes = archive::read_object_bounded(store, &digest, MAX_PROJECT_ASSOCIATION_BYTES)
         .map_err(|error| Failure::domain("association_corrupt", error.to_string()))?;
     let (descriptor, observed_record_id) = ProjectAssociationDescriptor::from_record(&bytes)
@@ -581,7 +634,10 @@ fn persist_confirmed_association(
     let digest_text = object_digest.hex();
     if let Some((existing_digest, status)) = existing {
         if existing_digest != digest_text {
-            return Err(Failure::domain("association_corrupt", "record ID is indexed to a different canonical object".into()));
+            return Err(Failure::domain(
+                "association_corrupt",
+                "record ID is indexed to a different canonical object".into(),
+            ));
         }
         if status == "confirmed" {
             transaction.commit().map_err(sqlite)?;
@@ -599,7 +655,10 @@ fn persist_confirmed_association(
              WHERE status='confirmed' AND (
                  (local_project_id=?1 AND peer_project_id=?2) OR
                  (local_project_id=?2 AND peer_project_id=?1))",
-            rusqlite::params![descriptor.local_project_id().as_str(), descriptor.peer_project_id().as_str()],
+            rusqlite::params![
+                descriptor.local_project_id().as_str(),
+                descriptor.peer_project_id().as_str()
+            ],
             |row| row.get(0),
         )
         .map_err(sqlite)?;
@@ -640,7 +699,11 @@ fn read_working_association(worktree: &Path) -> Result<Vec<u8>, Failure> {
     let metadata = std::fs::symlink_metadata(&directory)
         .map_err(|error| Failure::domain("io", format!("{}: {error}", directory.display())))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(Failure::refused("symlinked_config", "the .aethyme directory must be a real directory", CONFIRM_NEXT));
+        return Err(Failure::refused(
+            "symlinked_config",
+            "the .aethyme directory must be a real directory",
+            CONFIRM_NEXT,
+        ));
     }
     let path = worktree.join(PROJECT_ASSOCIATION_PATH);
     let mut options = std::fs::OpenOptions::new();
@@ -650,30 +713,55 @@ fn read_working_association(worktree: &Path) -> Result<Vec<u8>, Failure> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
-    let file = options.open(&path)
-        .map_err(|error| Failure::refused("association_missing", format!("{}: {error}", path.display()), CONFIRM_NEXT))?;
-    if !file.metadata().map_err(|error| Failure::domain("io", error.to_string()))?.is_file() {
-        return Err(Failure::refused("invalid_association_file", "the association proposal must be a regular file", CONFIRM_NEXT));
+    let file = options.open(&path).map_err(|error| {
+        Failure::refused(
+            "association_missing",
+            format!("{}: {error}", path.display()),
+            CONFIRM_NEXT,
+        )
+    })?;
+    if !file
+        .metadata()
+        .map_err(|error| Failure::domain("io", error.to_string()))?
+        .is_file()
+    {
+        return Err(Failure::refused(
+            "invalid_association_file",
+            "the association proposal must be a regular file",
+            CONFIRM_NEXT,
+        ));
     }
     let mut bytes = Vec::new();
     file.take((MAX_PROJECT_ASSOCIATION_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| Failure::domain("io", error.to_string()))?;
     if bytes.len() > MAX_PROJECT_ASSOCIATION_BYTES {
-        return Err(Failure::refused("association_too_large", "the association proposal exceeds its byte limit", CONFIRM_NEXT));
+        return Err(Failure::refused(
+            "association_too_large",
+            "the association proposal exceeds its byte limit",
+            CONFIRM_NEXT,
+        ));
     }
     Ok(bytes)
 }
 
 fn write_association_descriptor(worktree: &Path, bytes: &[u8]) -> Result<PathBuf, Failure> {
     if bytes.len() > MAX_PROJECT_ASSOCIATION_BYTES {
-        return Err(Failure::refused("association_too_large", "the association proposal exceeds its byte limit", CONFIRM_NEXT));
+        return Err(Failure::refused(
+            "association_too_large",
+            "the association proposal exceeds its byte limit",
+            CONFIRM_NEXT,
+        ));
     }
     let directory = worktree.join(".aethyme");
     let metadata = std::fs::symlink_metadata(&directory)
         .map_err(|error| Failure::domain("io", format!("{}: {error}", directory.display())))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(Failure::refused("symlinked_config", "the .aethyme directory must be a real directory", CONFIRM_NEXT));
+        return Err(Failure::refused(
+            "symlinked_config",
+            "the .aethyme directory must be a real directory",
+            CONFIRM_NEXT,
+        ));
     }
     let path = worktree.join(PROJECT_ASSOCIATION_PATH);
     let mut options = std::fs::OpenOptions::new();
@@ -681,7 +769,9 @@ fn write_association_descriptor(worktree: &Path, bytes: &[u8]) -> Result<PathBuf
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
     let mut file = options.open(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -707,16 +797,31 @@ fn parse_peer_flags(rest: &[&str]) -> Result<(PathBuf, bool), Failure> {
     while index < rest.len() {
         match rest[index] {
             "--peer-repo" => {
-                if peer.is_some() { return Err(Failure::usage("duplicate --peer-repo")); }
-                peer = Some(PathBuf::from(*rest.get(index + 1).ok_or_else(|| Failure::usage("--peer-repo needs a path"))?));
+                if peer.is_some() {
+                    return Err(Failure::usage("duplicate --peer-repo"));
+                }
+                peer = Some(PathBuf::from(
+                    *rest
+                        .get(index + 1)
+                        .ok_or_else(|| Failure::usage("--peer-repo needs a path"))?,
+                ));
                 index += 2;
             }
-            "--write" => { if write { return Err(Failure::usage("duplicate --write")); } write = true; index += 1; }
-            flag if flag.starts_with("--") => return Err(Failure::usage(format!("unknown flag {flag}"))),
+            "--write" => {
+                if write {
+                    return Err(Failure::usage("duplicate --write"));
+                }
+                write = true;
+                index += 1;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(Failure::usage(format!("unknown flag {flag}")));
+            }
             _ => return Err(Failure::usage("unexpected project association argument")),
         }
     }
-    let peer = peer.ok_or_else(|| Failure::usage("project association requires --peer-repo <path>"))?;
+    let peer =
+        peer.ok_or_else(|| Failure::usage("project association requires --peer-repo <path>"))?;
     Ok((peer, write))
 }
 
@@ -727,38 +832,60 @@ fn parse_confirm_flags(rest: &[&str]) -> Result<(PathBuf, RecordId), Failure> {
     while index < rest.len() {
         match rest[index] {
             "--peer-repo" => {
-                if peer.is_some() { return Err(Failure::usage("duplicate --peer-repo")); }
-                peer = Some(PathBuf::from(*rest.get(index + 1).ok_or_else(|| Failure::usage("--peer-repo needs a path"))?));
+                if peer.is_some() {
+                    return Err(Failure::usage("duplicate --peer-repo"));
+                }
+                peer = Some(PathBuf::from(
+                    *rest
+                        .get(index + 1)
+                        .ok_or_else(|| Failure::usage("--peer-repo needs a path"))?,
+                ));
                 index += 2;
             }
             "--confirm" => {
-                if confirmed.is_some() { return Err(Failure::usage("duplicate --confirm")); }
-                let value = *rest.get(index + 1).ok_or_else(|| Failure::usage("--confirm needs an association RecordId"))?;
-                confirmed = Some(RecordId::parse(value).map_err(|error| Failure::usage(error.to_string()))?);
+                if confirmed.is_some() {
+                    return Err(Failure::usage("duplicate --confirm"));
+                }
+                let value = *rest
+                    .get(index + 1)
+                    .ok_or_else(|| Failure::usage("--confirm needs an association RecordId"))?;
+                confirmed = Some(
+                    RecordId::parse(value).map_err(|error| Failure::usage(error.to_string()))?,
+                );
                 index += 2;
             }
-            flag if flag.starts_with("--") => return Err(Failure::usage(format!("unknown flag {flag}"))),
+            flag if flag.starts_with("--") => {
+                return Err(Failure::usage(format!("unknown flag {flag}")));
+            }
             _ => return Err(Failure::usage("unexpected project association argument")),
         }
     }
     Ok((
-        peer.ok_or_else(|| Failure::usage("project association confirm requires --peer-repo <path>"))?,
-        confirmed.ok_or_else(|| Failure::usage("project association confirm requires --confirm <record-id>"))?,
+        peer.ok_or_else(|| {
+            Failure::usage("project association confirm requires --peer-repo <path>")
+        })?,
+        confirmed.ok_or_else(|| {
+            Failure::usage("project association confirm requires --confirm <record-id>")
+        })?,
     ))
 }
 
 pub(crate) fn repository_roots(path: &Path) -> Result<(PathBuf, PathBuf), Failure> {
-    let repository = crate::git::GitRepo::discover(path).map_err(|error| Failure::refused(
-        "not_a_repository",
-        format!("{}: {error}", path.display()),
-        "pass the root of an independently enrolled Git repository",
-    ))?;
+    let repository = crate::git::GitRepo::discover(path).map_err(|error| {
+        Failure::refused(
+            "not_a_repository",
+            format!("{}: {error}", path.display()),
+            "pass the root of an independently enrolled Git repository",
+        )
+    })?;
     let worktree = repository.root().to_path_buf();
-    let main_root = repository.main_root().map_err(|error| Failure::refused(
-        "not_a_repository",
-        format!("{}: {error}", path.display()),
-        "pass the root of an independently enrolled Git repository",
-    ))?;
+    let main_root = repository.main_root().map_err(|error| {
+        Failure::refused(
+            "not_a_repository",
+            format!("{}: {error}", path.display()),
+            "pass the root of an independently enrolled Git repository",
+        )
+    })?;
     Ok((worktree, main_root))
 }
 
@@ -768,14 +895,23 @@ fn now_ms() -> Result<i64, Failure> {
         .map_err(|error| Failure::domain("clock", error.to_string()))?
         .as_millis()
         .try_into()
-        .map_err(|_| Failure::domain("clock", "system timestamp exceeds SQLite integer range".into()))
+        .map_err(|_| {
+            Failure::domain(
+                "clock",
+                "system timestamp exceeds SQLite integer range".into(),
+            )
+        })
 }
 
 fn identity_binding_failure(error: identity_store::IdentityStoreError) -> Failure {
     let code = error.code();
     let message = error.to_string();
     if matches!(error, identity_store::IdentityStoreError::Corrupt(_)) {
-        Failure::refused(code, message, "repair or restore the local project identity record before associating clones")
+        Failure::refused(
+            code,
+            message,
+            "repair or restore the local project identity record before associating clones",
+        )
     } else {
         Failure::domain(code, message)
     }

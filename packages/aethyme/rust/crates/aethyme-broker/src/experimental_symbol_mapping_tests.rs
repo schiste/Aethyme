@@ -14,7 +14,9 @@ use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceEntry
 use aethyme_contracts::experimental_v0::symbol_identity::{
     SYMBOL_MAPPING_AUTHORITY, decode_symbol_identity_record,
 };
-use aethyme_contracts::experimental_v0::{ProjectId, Record, RecordId, SourceSnapshot, StateReading};
+use aethyme_contracts::experimental_v0::{
+    ProjectId, Record, RecordId, SourceSnapshot, StateReading,
+};
 use aethyme_graph_schema::{NodeId, NodeKind};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -338,7 +340,11 @@ fn mapping_fixture_named(
         if matches!(scenario, RecordScenario::ExternalPackageVersionMismatch) {
             external_symbol_record(left_project.as_str(), left_clone.as_str(), "1.0.0")
         } else {
-            symbol_record(left_project.as_str(), left_clone.as_str(), &left_symbol_node)
+            symbol_record(
+                left_project.as_str(),
+                left_clone.as_str(),
+                &left_symbol_node,
+            )
         };
     let (right_symbol, right_symbol_bytes) = if matches!(scenario, RecordScenario::UnknownScope) {
         canonical_record(json!({
@@ -348,7 +354,11 @@ fn mapping_fixture_named(
             "scope": { "kind": "future_scope", "opaque": "retained" }
         }))
     } else if matches!(scenario, RecordScenario::ExternalPackageVersionMismatch) {
-        external_symbol_record(right_project_in_records.as_str(), right_clone_in_records.as_str(), "2.0.0")
+        external_symbol_record(
+            right_project_in_records.as_str(),
+            right_clone_in_records.as_str(),
+            "2.0.0",
+        )
     } else {
         symbol_record(
             right_project_in_records.as_str(),

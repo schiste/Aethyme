@@ -675,7 +675,11 @@ pub(super) fn committed_regular_file(
     Ok(bytes)
 }
 
-pub(super) fn is_ancestor(repo: &Path, ancestor: &CommitOid, descendant: &CommitOid) -> Result<bool, Failure> {
+pub(super) fn is_ancestor(
+    repo: &Path,
+    ancestor: &CommitOid,
+    descendant: &CommitOid,
+) -> Result<bool, Failure> {
     let output = archive::git(repo)
         .args([
             "merge-base",

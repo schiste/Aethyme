@@ -91,7 +91,10 @@ fn open_existing_archive_lock_read_only(
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("archive lock directory {} is not a real directory", parent.display()),
+            format!(
+                "archive lock directory {} is not a real directory",
+                parent.display()
+            ),
         ));
     }
     let mut options = std::fs::OpenOptions::new();
@@ -203,9 +206,7 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
 
 /// Hold an existing archive barrier shared without creating or modifying
 /// peer state. Reclamation and writes cannot proceed while the guard is held.
-pub(crate) fn archive_use_read_only(
-    store: &CollaborationStore,
-) -> std::io::Result<ArchiveUse> {
+pub(crate) fn archive_use_read_only(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     let file = open_existing_archive_lock_read_only(store)?;
     file.lock_shared()?;
     Ok(ArchiveUse {

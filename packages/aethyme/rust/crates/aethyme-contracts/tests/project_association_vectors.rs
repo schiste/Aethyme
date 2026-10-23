@@ -22,7 +22,11 @@ fn association_is_bounded_canonical_and_round_trips_both_project_ids() {
     let association = association();
     let (bytes, id) = association.to_record();
     assert!(bytes.len() <= MAX_PROJECT_ASSOCIATION_BYTES);
-    assert!(std::str::from_utf8(&bytes).unwrap().starts_with("{\"local_anchor_snapshot\":"));
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .starts_with("{\"local_anchor_snapshot\":")
+    );
     let (decoded, decoded_id) = ProjectAssociationDescriptor::from_record(&bytes).unwrap();
     assert_eq!(decoded, association);
     assert_eq!(decoded_id, id);
@@ -38,7 +42,10 @@ fn association_rejects_noncanonical_oversized_and_same_identity_inputs() {
     let (bytes, _) = association().to_record();
     let noncanonical = [b" ".as_slice(), &bytes].concat();
     assert!(ProjectAssociationDescriptor::from_record(&noncanonical).is_err());
-    assert!(ProjectAssociationDescriptor::from_record(&vec![b' '; MAX_PROJECT_ASSOCIATION_BYTES + 1]).is_err());
+    assert!(
+        ProjectAssociationDescriptor::from_record(&vec![b' '; MAX_PROJECT_ASSOCIATION_BYTES + 1])
+            .is_err()
+    );
 
     let error = ProjectAssociationDescriptor::new(
         "local-one",

@@ -51,7 +51,10 @@ impl Fixture {
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
             .env("AETHYME_HOST_CACHE_DIR", self.cache.path())
             .env("AETHYME_WORKTREE_ROOT", self.worktrees.path())
-            .env("AETHYME_CHAU7_MCP_BRIDGE", "/__aethyme_test_no_chau7_bridge__")
+            .env(
+                "AETHYME_CHAU7_MCP_BRIDGE",
+                "/__aethyme_test_no_chau7_bridge__",
+            )
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_CACHE_HOME")
             .output()
@@ -86,8 +89,7 @@ impl Fixture {
         let session = started["id"].as_i64().unwrap().to_string();
         let (_, submitted) = self.json(repo, &["broker", "submit", "--session", &session]);
         assert_eq!(
-            submitted["collaboration_capture"]["status"],
-            "acknowledged",
+            submitted["collaboration_capture"]["status"], "acknowledged",
             "{submitted:#}"
         );
     }
@@ -116,14 +118,20 @@ fn enroll_and_bind(fixture: &Fixture, repo: &Path, anchor: &str, suffix: &str) -
     let project_key = enrollment["project_key"].as_str().unwrap().to_string();
     let project_id = enrollment["project_id"].as_str().unwrap().to_string();
     git(repo, &["add", "-f", ".aethyme/config.toml"]);
-    git(repo, &["commit", "-qm", &format!("enable collaboration {suffix}")]);
+    git(
+        repo,
+        &["commit", "-qm", &format!("enable collaboration {suffix}")],
+    );
 
     let (code, proposed) = fixture.json(
         repo,
         &["collab", "project", "enroll", "--commit", anchor, "--write"],
     );
     assert_eq!(code, 0, "{proposed:#}");
-    let descriptor_id = proposed["descriptor_record_id"].as_str().unwrap().to_string();
+    let descriptor_id = proposed["descriptor_record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let config_path = repo.join(".aethyme/config.toml");
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str("descriptor = \".aethyme/project-descriptor.json\"\n");
@@ -137,7 +145,14 @@ fn enroll_and_bind(fixture: &Fixture, repo: &Path, anchor: &str, suffix: &str) -
             ".aethyme/project-descriptor.json",
         ],
     );
-    git(repo, &["commit", "-qm", &format!("commit descriptor pointer {suffix}")]);
+    git(
+        repo,
+        &[
+            "commit",
+            "-qm",
+            &format!("commit descriptor pointer {suffix}"),
+        ],
+    );
 
     fixture.capture(repo, &format!("association-{suffix}"));
     let (code, bound) = fixture.json(
@@ -155,9 +170,8 @@ fn independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local
     let fixture = Fixture::new();
     let seed = tempfile::tempdir().unwrap();
     git(seed.path(), &["init", "-q", "-b", "main"]);
-    let playground = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "../aethyme-broker/tests/fixtures/synthetic-playground-symbol-identity/seed",
-    );
+    let playground = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../aethyme-broker/tests/fixtures/synthetic-playground-symbol-identity/seed");
     std::fs::create_dir_all(seed.path().join("src")).unwrap();
     for relative in ["src/lib.ts", "src/other.ts"] {
         std::fs::copy(playground.join(relative), seed.path().join(relative)).unwrap();
@@ -172,7 +186,13 @@ fn independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local
     let origin = tempfile::tempdir().unwrap();
     git(
         seed.path(),
-        &["clone", "--quiet", "--bare", ".", origin.path().to_str().unwrap()],
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            ".",
+            origin.path().to_str().unwrap(),
+        ],
     );
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
@@ -199,17 +219,31 @@ fn independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local
     let (code, proposal) = fixture.json(
         left.path(),
         &[
-            "collab", "project", "association", "propose", "--peer-repo",
-            right.path().to_str().unwrap(), "--write",
+            "collab",
+            "project",
+            "association",
+            "propose",
+            "--peer-repo",
+            right.path().to_str().unwrap(),
+            "--write",
         ],
     );
     assert_eq!(code, 0, "{proposal:#}");
-    let association_id = proposal["association_record_id"].as_str().unwrap().to_string();
+    let association_id = proposal["association_record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (code, confirmed) = fixture.json(
         left.path(),
         &[
-            "collab", "project", "association", "confirm", "--peer-repo",
-            right.path().to_str().unwrap(), "--confirm", &association_id,
+            "collab",
+            "project",
+            "association",
+            "confirm",
+            "--peer-repo",
+            right.path().to_str().unwrap(),
+            "--confirm",
+            &association_id,
         ],
     );
     assert_eq!(code, 0, "{confirmed:#}");
@@ -222,30 +256,56 @@ fn independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local
     let (code, reopened) = fixture.json(
         left.path(),
         &[
-            "collab", "project", "association", "confirm", "--peer-repo",
-            right.path().to_str().unwrap(), "--confirm", &association_id,
+            "collab",
+            "project",
+            "association",
+            "confirm",
+            "--peer-repo",
+            right.path().to_str().unwrap(),
+            "--confirm",
+            &association_id,
         ],
     );
     assert_eq!(code, 0, "{reopened:#}");
     assert_eq!(reopened["status"], "already_confirmed");
     let (code, peer_missing) = fixture.json(
         right.path(),
-        &["collab", "project", "association", "revoke", "--confirm", &association_id],
+        &[
+            "collab",
+            "project",
+            "association",
+            "revoke",
+            "--confirm",
+            &association_id,
+        ],
     );
     assert_eq!(code, 3, "{peer_missing:#}");
     assert_eq!(peer_missing["code"], "association_missing");
 
     let (code, revoked) = fixture.json(
         left.path(),
-        &["collab", "project", "association", "revoke", "--confirm", &association_id],
+        &[
+            "collab",
+            "project",
+            "association",
+            "revoke",
+            "--confirm",
+            &association_id,
+        ],
     );
     assert_eq!(code, 0, "{revoked:#}");
     assert_eq!(revoked["status"], "revoked");
     let (code, reactivation) = fixture.json(
         left.path(),
         &[
-            "collab", "project", "association", "confirm", "--peer-repo",
-            right.path().to_str().unwrap(), "--confirm", &association_id,
+            "collab",
+            "project",
+            "association",
+            "confirm",
+            "--peer-repo",
+            right.path().to_str().unwrap(),
+            "--confirm",
+            &association_id,
         ],
     );
     assert_eq!(code, 3, "{reactivation:#}");

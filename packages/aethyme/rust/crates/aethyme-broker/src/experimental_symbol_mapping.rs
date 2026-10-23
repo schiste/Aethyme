@@ -198,14 +198,13 @@ pub(crate) fn resolve_associated_mapping(
     evidence_bytes: &[&[u8]],
 ) -> MappingResolution {
     use crate::collaboration_cli::project_association;
-    use crate::collaboration_identity_store::{
-        self as identity_store, IdentityStateResolution,
-    };
+    use crate::collaboration_identity_store::{self as identity_store, IdentityStateResolution};
 
-    let (local_root, local_main_root) = match project_association::repository_roots(local_repository) {
-        Ok(roots) => roots,
-        Err(_) => return MappingResolution::Unknown("local_repository_unavailable"),
-    };
+    let (local_root, local_main_root) =
+        match project_association::repository_roots(local_repository) {
+            Ok(roots) => roots,
+            Err(_) => return MappingResolution::Unknown("local_repository_unavailable"),
+        };
     let (peer_root, peer_main_root) = match project_association::repository_roots(peer_repository) {
         Ok(roots) => roots,
         Err(_) => return MappingResolution::Unknown("peer_repository_unavailable"),
@@ -438,7 +437,7 @@ fn resolve_within_binding(
         return MappingResolution::Unknown("invalid_right_project_reference");
     };
     if record_id(binding, "association_record_id").as_ref()
-            != Some(&local_binding.association_record_id)
+        != Some(&local_binding.association_record_id)
         || left_project != local_binding.left_project_id
         || right_project != local_binding.right_project_id
         || left_clone != local_binding.left_clone_id

@@ -7,8 +7,7 @@ use super::project_identity::{ProjectId, ProjectIdentityError};
 use super::record::{FieldKind, FieldSpec, Record, RecordError, RecordId, RecordSchema};
 use super::source_snapshot::SourceSnapshotId;
 
-pub const PROJECT_ASSOCIATION_SCHEMA_NAME: &str =
-    "aethyme.project-association/experimental-v0";
+pub const PROJECT_ASSOCIATION_SCHEMA_NAME: &str = "aethyme.project-association/experimental-v0";
 pub const PROJECT_ASSOCIATION_PATH: &str = ".aethyme/project-association.json";
 pub const MAX_PROJECT_ASSOCIATION_BYTES: usize = 16 * 1024;
 const MAX_PROJECT_KEY_BYTES: usize = 64;
@@ -138,8 +137,14 @@ impl ProjectAssociationDescriptor {
                 ("schema".into(), text(PROJECT_ASSOCIATION_SCHEMA_NAME)),
                 ("local_project_key".into(), text(&self.local_project_key)),
                 ("peer_project_key".into(), text(&self.peer_project_key)),
-                ("local_project_id".into(), text(self.local_project_id.as_str())),
-                ("peer_project_id".into(), text(self.peer_project_id.as_str())),
+                (
+                    "local_project_id".into(),
+                    text(self.local_project_id.as_str()),
+                ),
+                (
+                    "peer_project_id".into(),
+                    text(self.peer_project_id.as_str()),
+                ),
                 (
                     "local_descriptor_record_id".into(),
                     text(self.local_descriptor_record_id.as_str()),

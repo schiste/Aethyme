@@ -260,9 +260,12 @@ fn open_existing_response_lock_read_only(
     let parent = path
         .parent()
         .ok_or_else(|| SensitiveError::Invalid("response lock directory".into()))?;
-    for directory in [parent, parent.parent().ok_or_else(|| {
-        SensitiveError::Invalid("response lock authority directory".into())
-    })?] {
+    for directory in [
+        parent,
+        parent
+            .parent()
+            .ok_or_else(|| SensitiveError::Invalid("response lock authority directory".into()))?,
+    ] {
         let metadata = fs::symlink_metadata(directory)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(SensitiveError::Invalid(format!(
