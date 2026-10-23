@@ -333,15 +333,21 @@ Usage:
       AETHYME_CONSOLE_MARKER and AETHYME_CONSOLE_MARKER_DIGEST; the marker is
       removed after clean shutdown. Configure with [console] in
       .aethyme/config.toml: mode, port, port_end, pool_limit, ttl_seconds.
-  aethyme broker exec --session <id> [--non-interactive] [--json] -- <command>
+  aethyme broker exec --session <id> [--non-interactive] [--timeout <1..86400 seconds>] [--json] -- <command>
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
       foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
+      Supervised execution has a 1800-second deadline by default; --timeout
+      overrides it. On expiry, the supervisor verifies process-group cleanup
+      before the ownership audit, and JSON reports command_timed_out as true.
       --non-interactive selects supervised process-group execution even when
       a terminal is available. This is a caller assertion, not TTY isolation:
       stdio routing stays the same as the default, and the child may still open
       the terminal. Use it only for commands that do not need terminal
       interaction; terminal reads or job-control operations may stop or fail.
+      Automatic legacy terminal execution has no deadline; an explicit
+      --timeout is refused in that mode. Combine it with --non-interactive
+      only for a command that does not need terminal interaction.
       If the supervised helper cannot start, the child is not dispatched.
   aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
@@ -1377,6 +1383,7 @@ fn report_main_checkout_unchanged(reason: &str, command: &str) {
     eprintln!("warning: left the main checkout unchanged: {reason}. Run: {command}");
 }
 
+#[derive(Debug)]
 enum UsageError {
     Help,
     Message(String),
@@ -1471,7 +1478,7 @@ struct Parsed {
     generation: Option<i64>,
     events: Option<String>,
     ttl_seconds: Option<i64>,
-    /// `leases wait --timeout` and `finish --timeout` budgets, in seconds.
+    /// `leases wait --timeout`, `finish --timeout`, and `exec --timeout` values, in seconds.
     timeout_seconds: Option<u64>,
     wait: Option<String>,
     since: Option<i64>,

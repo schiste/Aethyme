@@ -720,11 +720,19 @@ the command or audit fails and retains the completed report on stdout.
 Additive fields:
 
 - `ownership_ok`: the actual ownership audit result, independent of the child.
+- `command_timed_out`: always present as a boolean. `true` means supervised
+  execution reached its command deadline and process-group cleanup was verified;
+  normal child exits and legacy terminal execution report `false`. A verified
+  timeout reports `exit_code: null` and `command_success: false`, then still
+  runs the post-execution ownership audit. If cleanup cannot be verified, the
+  command returns an unknown-outcome error instead of a report and skips audit.
 - `conflicting_leases`: blocking leases retained from that audit, including the
   holder session and path. An edited file being dirty before execution does not
   itself imply an ownership violation.
-- `outcome`: `passed`, `command_failed`, `ownership_failed`, or
-  `command_and_ownership_failed`, derived from those two independent results.
+- `outcome`: `passed`, `command_failed`, `ownership_failed`,
+  `command_and_ownership_failed`, `timed_out`, or
+  `timed_out_and_ownership_failed`. Timeout outcomes reflect verified command
+  termination plus the independent ownership audit.
 - `next_actions`: explicit lease claim commands for missing owned paths, or
   coordination guidance for conflicting leases and adoption-time foreign edits.
   Paths covered by a blocking or foreign directory receive coordination only.

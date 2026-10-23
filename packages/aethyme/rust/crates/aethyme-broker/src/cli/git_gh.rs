@@ -461,12 +461,21 @@ fn changed_paths_remaining(report: &crate::GuardedExecReport) -> Vec<String> {
 #[serde(rename_all = "snake_case")]
 enum ExecOutcome {
     Passed,
+    TimedOut,
     CommandFailed,
     OwnershipFailed,
+    TimedOutAndOwnershipFailed,
     CommandAndOwnershipFailed,
 }
 
 fn exec_outcome(report: &crate::GuardedExecReport) -> ExecOutcome {
+    if report.command_timed_out {
+        return if report.ownership_ok {
+            ExecOutcome::TimedOut
+        } else {
+            ExecOutcome::TimedOutAndOwnershipFailed
+        };
+    }
     match (report.command_success, report.ownership_ok) {
         (true, true) => ExecOutcome::Passed,
         (false, true) => ExecOutcome::CommandFailed,
@@ -523,12 +532,14 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
+    let requested_timeout = exec_timeout_from_seconds(parsed.timeout_seconds)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let report = broker.guarded_exec_for_cli(
         session,
         &parsed.exec_command,
         parsed.non_interactive,
         parsed.json,
+        requested_timeout,
     )?;
     let changed_paths = changed_paths_remaining(&report);
     let next_actions = exec_ownership_next_actions(&report);
@@ -556,7 +567,9 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         out!(
             "exec session {}: command {}{}",
             session,
-            if report.command_success {
+            if report.command_timed_out {
+                "timed out"
+            } else if report.command_success {
                 "passed"
             } else {
                 "failed"
@@ -632,7 +645,11 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         // sends the reader to debug leases when the wrapped command
         // simply exited non-zero for its own reasons.
         let guard_refused = !report.ownership_ok;
-        return Err(UsageError::Message(
+        return Err(UsageError::Message(if report.command_timed_out {
+            "guarded exec: the command timed out after verified process-group cleanup; \
+                 the ownership audit still ran, and any edits remain listed above"
+                .to_string()
+        } else {
             match (report.command_success, guard_refused) {
                 (true, _) => {
                     "guarded exec ownership audit failed after execution: the command already ran \
@@ -655,10 +672,22 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
                         .map(|code| code.to_string())
                         .unwrap_or_else(|| "by signal".into())
                 ),
-            },
-        ));
+            }
+        }));
     }
     Ok(())
+}
+
+fn exec_timeout_from_seconds(
+    seconds: Option<u64>,
+) -> Result<Option<std::time::Duration>, UsageError> {
+    match seconds {
+        None => Ok(None),
+        Some(seconds @ 1..=86_400) => Ok(Some(std::time::Duration::from_secs(seconds))),
+        Some(_) => Err(UsageError::Message(
+            "--timeout for broker exec must be between 1 and 86400 seconds".into(),
+        )),
+    }
 }
 
 /// The `broker advanced git|gh` invocation as typed, kept to print the
@@ -1256,6 +1285,7 @@ mod exec_report_tests {
             command: vec!["test".into()],
             exit_code: Some(0),
             command_success: true,
+            command_timed_out: false,
             ownership_ok: true,
             conflicting_leases: Vec::new(),
             before_dirty_paths: Vec::new(),
@@ -1283,6 +1313,11 @@ mod exec_report_tests {
     fn outcomes_use_the_actual_audit_independently_of_dirty_paths_and_child_status() {
         let mut report = completed_report();
         assert_eq!(exec_outcome(&report), ExecOutcome::Passed);
+        let ordinary_serialized_report = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            ordinary_serialized_report.get("command_timed_out"),
+            Some(&serde_json::Value::Bool(false))
+        );
         report.command_success = false;
         report.exit_code = Some(7);
         report
@@ -1296,6 +1331,45 @@ mod exec_report_tests {
         );
         report.command_success = true;
         assert_eq!(exec_outcome(&report), ExecOutcome::OwnershipFailed);
+        report.command_success = false;
+        report.exit_code = None;
+        report.command_timed_out = true;
+        assert_eq!(
+            exec_outcome(&report),
+            ExecOutcome::TimedOutAndOwnershipFailed
+        );
+        report.ownership_ok = true;
+        assert_eq!(exec_outcome(&report), ExecOutcome::TimedOut);
+        assert_eq!(
+            serde_json::to_value(exec_outcome(&report)).unwrap(),
+            serde_json::json!("timed_out")
+        );
+        let serialized_report = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized_report.get("command_timed_out"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn exec_timeout_override_has_a_closed_seconds_range() {
+        assert_eq!(exec_timeout_from_seconds(None).unwrap(), None);
+        assert_eq!(
+            exec_timeout_from_seconds(Some(1)).unwrap(),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            exec_timeout_from_seconds(Some(86_400)).unwrap(),
+            Some(std::time::Duration::from_secs(86_400))
+        );
+        assert!(matches!(
+            exec_timeout_from_seconds(Some(0)),
+            Err(UsageError::Message(message)) if message.contains("1 and 86400")
+        ));
+        assert!(matches!(
+            exec_timeout_from_seconds(Some(86_401)),
+            Err(UsageError::Message(message)) if message.contains("1 and 86400")
+        ));
     }
 
     #[test]

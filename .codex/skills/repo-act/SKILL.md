@@ -62,6 +62,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   during discovery. Use a deterministic deadline seam to prove partial progress
   and a seeded persisted marker to test fresh-process resume; assert the marker
   before invoking the resume path.
+- In a deadline-bounded loop, recheck the monotonic deadline after every
+  callback or heartbeat and before accepting a result. That work can consume the
+  remaining budget even when the loop checked immediately beforehand; test this
+  with an injected callback that runs past the deadline.
+
 - For whole-checkout cleanup, finish canonical grouping of every retained row
   and build complete live-path evidence before scheduling. Rotate a durable
   cursor across complete cohorts before per-cohort Git, witness and ownership
