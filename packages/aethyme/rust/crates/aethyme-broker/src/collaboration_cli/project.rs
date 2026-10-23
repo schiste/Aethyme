@@ -4,8 +4,9 @@
 //! A descriptor printed by `enroll` is only a proposal. It becomes this
 //! clone's trusted local mapping only after its exact path is named by the
 //! committed config, the operator confirms its RecordId, and its anchor is
-//! independently present in this store's retained archive. `ProjectKey`
-//! remains the local store key and is never treated as the logical ProjectId.
+//! independently present in this store's retained archive. The canonical
+//! `proj-<base32>` key written by `collab enroll` preserves that enrollment's
+//! ProjectId; other local keys remain opaque store names.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -90,9 +91,14 @@ fn enroll(worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
     }
     let snapshot = archive::snapshot_of_commit(worktree, &requested)
         .map_err(|error| Failure::domain("archive", error.to_string()))?;
-    let encoded = super::mint_project_id()?;
-    let project_id = ProjectId::parse(&format!("proj:{encoded}"))
-        .map_err(|error| Failure::domain("invalid_project_id", error.to_string()))?;
+    let project_id = match existing_enrollment_project_id(worktree, &current)? {
+        Some(project_id) => project_id,
+        None => {
+            let encoded = super::mint_project_id()?;
+            ProjectId::parse(&format!("proj:{encoded}"))
+                .map_err(|error| Failure::domain("invalid_project_id", error.to_string()))?
+        }
+    };
     let descriptor = ProjectDescriptor::from_snapshot(project_id, requested.as_str(), &snapshot)
         .map_err(enrollment_descriptor_failure)?;
     let (bytes, record_id) = descriptor.to_record();
@@ -139,6 +145,37 @@ fn enroll(worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
         CONFIRM_NEXT,
     );
     Ok((value, text))
+}
+
+/// Reuse the logical ProjectId that `collab enroll` encoded in its
+/// canonical local key. Arbitrary legacy keys are not interpreted as IDs.
+fn existing_enrollment_project_id(
+    worktree: &Path,
+    current: &CommitOid,
+) -> Result<Option<ProjectId>, Failure> {
+    let Some(config_bytes) = archive::raw_file_at_commit(worktree, current, CONFIG_PATH.as_bytes())
+        .map_err(|error| Failure::domain("archive", error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let Ok(config_text) = std::str::from_utf8(&config_bytes) else {
+        return Ok(None);
+    };
+    let Ok(config) = config_text.parse::<toml::Value>() else {
+        return Ok(None);
+    };
+    let Some(project_key) = config
+        .get("collaboration")
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("project"))
+        .and_then(toml::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Some(encoded) = project_key.strip_prefix("proj-") else {
+        return Ok(None);
+    };
+    Ok(ProjectId::parse(&format!("proj:{encoded}")).ok())
 }
 
 fn enrollment_descriptor_failure(error: ProjectIdentityError) -> Failure {

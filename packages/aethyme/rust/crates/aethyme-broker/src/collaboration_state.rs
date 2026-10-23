@@ -1161,8 +1161,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
 ];
 /// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
 /// while preserving all schema-25 rows. Fixtures start from a current store,
-/// so also remove schema-29, schema-28 and schema-27 additions before
-/// lowering their version marker;
+/// so also remove schema-31 associations and schema-29, schema-28 and
+/// schema-27 additions before lowering their version marker;
 /// otherwise they model an impossible hybrid database and make the migration
 /// add columns that the fixture already has. This is test setup only:
 /// production migrations continue to reject malformed databases instead of
@@ -1261,13 +1261,39 @@ fn drop_resolution_schema_28_for_legacy_fixture(
     Ok(())
 }
 
-/// Remove only schema-29 managed-resolution authority from an empty current
-/// test store before it becomes a historical fixture. Never hide or discard a
-/// reservation proof, a selected root, or an attempt binding.
+/// Remove the schema-31 association table from an empty current test store
+/// before it becomes a historical fixture. Never discard a persisted
+/// association while constructing a database from an older schema.
+#[cfg(test)]
+fn drop_project_association_schema_31_for_legacy_fixture(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    if !fixture_table_exists(connection, "local_project_associations")? {
+        return Ok(());
+    }
+    let has_associations: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_project_associations)",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        !has_associations,
+        "cannot downgrade a fixture containing schema-31 project associations"
+    );
+    connection.execute_batch("DROP TABLE local_project_associations;")?;
+    Ok(())
+}
+
+/// Remove schema-29 managed-resolution authority from an empty current test
+/// store before it becomes a historical fixture. Never hide or discard a
+/// reservation proof, a selected root, or an attempt binding. The schema-31
+/// association table is also removed because the fixture is subsequently
+/// marked as an older schema.
 #[cfg(test)]
 fn drop_resolution_schema_29_for_legacy_fixture(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<()> {
+    drop_project_association_schema_31_for_legacy_fixture(connection)?;
     if !fixture_table_exists(connection, "local_resolution_reservation_proofs")? {
         return Ok(());
     }
@@ -3013,6 +3039,9 @@ mod tests {
 
         // Recreate the exact v27 trigger and schema-29 marker. Migration 30
         // must replace that durable rule without rewriting prior charges.
+        // The current fixture began at schema 31, so remove its empty v31-only
+        // association table before representing the historical v29 database.
+        drop_project_association_schema_31_for_legacy_fixture(store.connection()).unwrap();
         store
             .connection()
             .execute_batch(
