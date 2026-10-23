@@ -2854,6 +2854,11 @@ mod tests {
 
         let confirmed = association('5');
         let revoked = association('6');
+        // Include an expired orphan so the planner records an applyable plan;
+        // the association objects themselves must stay rooted after grace.
+        let unrooted_digest =
+            crate::collaboration_archive::put_object(&store, b"unrooted association GC candidate")
+                .unwrap();
         let mut rooted_objects = Vec::new();
         for (descriptor, status, revoked_ms) in [
             (&confirmed, "confirmed", None),
@@ -2902,6 +2907,12 @@ mod tests {
         let plan = plan(&mut store, &defaults()).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert_eq!(plan.retained[&RetentionClass::Record].objects, 2);
+        let unrooted_path = object_relpath(&unrooted_digest);
+        assert!(
+            objects(&plan).iter().any(|item| item.relpath == unrooted_path),
+            "expired orphan should make the plan applyable: {:?}",
+            plan.reclaimable
+        );
         for (_, digest) in &rooted_objects {
             let path = object_relpath(digest);
             assert!(
@@ -2911,6 +2922,10 @@ mod tests {
             );
         }
         apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert!(
+            !object_path(&store, &unrooted_digest).exists(),
+            "expired orphan should be reclaimed by the applyable plan"
+        );
         for (record_id, digest) in rooted_objects {
             let bytes = crate::collaboration_archive::read_object(&store, &digest).unwrap();
             let (_, observed_record_id) =
