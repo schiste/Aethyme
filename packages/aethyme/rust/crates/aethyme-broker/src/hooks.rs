@@ -993,11 +993,14 @@ fn push_is_a_running_coordinated_write(main_root: &Path) -> bool {
         std::env::var(name)
             .ok()
             .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|id| *id > 0)
     };
-    let (Some(operation_id), Some(session_id)) = (
-        id("AETHYME_BROKER_OPERATION_ID"),
-        id("AETHYME_BROKER_SESSION_ID"),
-    ) else {
+    let Some(operation_id) = id("AETHYME_BROKER_OPERATION_ID") else {
+        warn_unproved_coordinated_push("operation_id_missing_or_invalid");
+        return false;
+    };
+    let Some(session_id) = id("AETHYME_BROKER_SESSION_ID") else {
+        warn_unproved_coordinated_push("session_id_missing_or_invalid");
         return false;
     };
     let store = match BrokerStore::open_in_repo(main_root) {
@@ -1020,13 +1023,27 @@ fn push_is_a_running_coordinated_write(main_root: &Path) -> bool {
             return false;
         }
     };
-    matches!(
-        operation,
-        Some(operation)
-            if operation.session_id == session_id
-                && operation.status == crate::OperationStatus::Running
-                && operation.effect != crate::OperationEffect::Read
-    )
+    let Some(operation) = operation else {
+        warn_unproved_coordinated_push("operation_row_missing");
+        return false;
+    };
+    if operation.session_id != session_id {
+        warn_unproved_coordinated_push("session_mismatch");
+        return false;
+    }
+    if operation.status != crate::OperationStatus::Running {
+        warn_unproved_coordinated_push("operation_not_running");
+        return false;
+    }
+    if operation.effect == crate::OperationEffect::Read {
+        warn_unproved_coordinated_push("read_effect");
+        return false;
+    }
+    true
+}
+
+fn warn_unproved_coordinated_push(reason: &'static str) {
+    eprintln!("warning: Aethyme pre-push could not verify coordinated push ({reason})");
 }
 
 /// Fail closed at Git's write boundary when this machine has opted into
