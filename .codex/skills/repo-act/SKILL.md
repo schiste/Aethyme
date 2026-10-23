@@ -24,10 +24,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 ## Validation Checklist
 
 - Before committing a substantive change, use colon-terminated section headings (`Problem:`, `Decision:`, `Rationale:`, `Validation:`) and require `aethyme repo lint-commit-message <file>` to report `Valid: yes`; the linter does not recognize bare headings.
-- For broker SQLite legacy-migration fixtures, remove newer-version tables and
-  indexes before setting the old schema-version marker so startup exercises the
-  intended migration. Seed constraint-valid legacy authority rows for refusal
-  tests; empty authority tables can classify as fresh and bypass the refusal.
+- For broker SQLite legacy-migration fixtures, restrict schema-downgrade
+  helpers to disposable fixtures and refuse to drop later-schema authority
+  tables that contain rows. Remove empty later-schema objects before lowering
+  the version marker. Seed constraint-valid legacy authority rows in refusal
+  tests, since empty authority tables can classify as fresh.
 - Before standalone `rustfmt` or `rustc` validation, resolve the owning
   crate's Cargo edition, including workspace inheritance, and pass that edition.
   Formatting rules vary by edition even when the source compiles in both; a
