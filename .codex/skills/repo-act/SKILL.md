@@ -32,6 +32,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   tables that contain rows. Remove empty later-schema objects before lowering
   the version marker. Seed constraint-valid legacy authority rows in refusal
   tests, since empty authority tables can classify as fresh.
+- When hardening SQLite filesystem checks on POSIX, account for process-owned
+  locks: closing another descriptor for the same inode can release a live
+  connection's locks, including on a refusal path. Preserve no-follow and
+  metadata checks; verify lock preservation with a separate conflicting writer.
+  A successful integrity check alone does not establish safe descriptor lifetime.
 - Before standalone `rustfmt` or `rustc` validation, resolve the owning
   crate's Cargo edition, including workspace inheritance, and pass that edition.
   Formatting rules vary by edition even when the source compiles in both; a

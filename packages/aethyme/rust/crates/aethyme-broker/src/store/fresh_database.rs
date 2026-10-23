@@ -1876,8 +1876,8 @@ mod unix {
 
             // A shared override may live under another checkout. Mirror the
             // repository-scoped store opener without mutating process env.
-            let scope = RepositoryBindingScope::capture(other_repo.path(), &paths.logical_path)
-                .unwrap();
+            let scope =
+                RepositoryBindingScope::capture(other_repo.path(), &paths.logical_path).unwrap();
             let mut other = open_in_repo(other_repo.path(), &paths.logical_path)
                 .expect("a distinct repository may share this database");
             other.binding_scope = Some(scope.clone());
