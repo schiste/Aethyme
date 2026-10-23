@@ -295,11 +295,7 @@ mod unix {
     }
 
     impl SqliteProbeFile {
-        fn open(
-            path: &Path,
-            kind: u32,
-            label: &str,
-        ) -> Result<(Self, ProbeMetadata), BrokerError> {
+        fn open(path: &Path, kind: u32, label: &str) -> Result<(Self, ProbeMetadata), BrokerError> {
             let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|source| {
                 io_error(
                     path,
@@ -323,7 +319,9 @@ mod unix {
             if result.abi_version != SQLITE_PROBE_ABI_V1
                 || result.struct_size as usize != std::mem::size_of::<SqliteProbeResultV1>()
             {
-                return Err(refusal(format!("{label} probe returned an invalid ABI record")));
+                return Err(refusal(format!(
+                    "{label} probe returned an invalid ABI record"
+                )));
             }
             let metadata = result.metadata(path, label)?;
             Ok((file, metadata))
@@ -337,9 +335,7 @@ mod unix {
             let mut result = SqliteProbeResultV1::new();
             // SAFETY: result is a writable repr(C) v1 object; the token was
             // created by the matching native acquire function and is live.
-            let code = unsafe {
-                sqlite3_aethyme_probe_metadata_v1(self.handle.get(), &mut result)
-            };
+            let code = unsafe { sqlite3_aethyme_probe_metadata_v1(self.handle.get(), &mut result) };
             if code != rusqlite::ffi::SQLITE_OK {
                 return Err(sqlite_probe_error(path, label, code));
             }
@@ -347,7 +343,9 @@ mod unix {
                 || result.struct_size as usize != std::mem::size_of::<SqliteProbeResultV1>()
                 || result.handle != 0
             {
-                return Err(refusal(format!("{label} probe returned an invalid metadata record")));
+                return Err(refusal(format!(
+                    "{label} probe returned an invalid metadata record"
+                )));
             }
             result.metadata(path, label)
         }
@@ -361,9 +359,7 @@ mod unix {
             if code != rusqlite::ffi::SQLITE_OK {
                 crate::warn_unrecorded(
                     "release SQLite metadata probe",
-                    Err::<(), String>(format!(
-                        "native release returned SQLite code {code}"
-                    )),
+                    Err::<(), String>(format!("native release returned SQLite code {code}")),
                 );
             }
         }
@@ -943,11 +939,8 @@ mod unix {
                 )));
             }
             let expected = file_identity(&before);
-            let (_file, opened) = SqliteProbeFile::open(
-                &sidecar,
-                SQLITE_PROBE_SIDECAR,
-                "SQLite sidecar",
-            )?;
+            let (_file, opened) =
+                SqliteProbeFile::open(&sidecar, SQLITE_PROBE_SIDECAR, "SQLite sidecar")?;
             if !opened.is_regular_file()
                 || opened.owner_uid() != effective_uid()
                 || opened.link_count() != 1
@@ -1988,8 +1981,14 @@ mod unix {
 
             let wal_path = append_suffix(&paths.final_path, "-wal");
             let shm_path = append_suffix(&paths.final_path, "-shm");
-            assert!(wal_path.is_file(), "active WAL writer creates its WAL sidecar");
-            assert!(shm_path.is_file(), "active WAL writer creates its SHM sidecar");
+            assert!(
+                wal_path.is_file(),
+                "active WAL writer creates its WAL sidecar"
+            );
+            assert!(
+                shm_path.is_file(),
+                "active WAL writer creates its SHM sidecar"
+            );
 
             let reverified = verify_database(
                 &paths,
@@ -2185,16 +2184,16 @@ mod unix {
                 .expect("capacity parent holds the WAL writer lock");
 
             let shm_path = append_suffix(&paths.final_path, "-shm");
-            assert!(shm_path.is_file(), "active WAL writer creates its SHM sidecar");
+            assert!(
+                shm_path.is_file(),
+                "active WAL writer creates its SHM sidecar"
+            );
             let alias = temp.path().join("shm-hard-link-alias");
             std::fs::hard_link(&shm_path, &alias)
                 .expect("create a disposable hard-link alias to the live SHM inode");
-            let (alias_probe, alias_metadata) = SqliteProbeFile::open(
-                &alias,
-                SQLITE_PROBE_SIDECAR,
-                "live SHM alias regression",
-            )
-            .expect("native metadata probe opens the live SHM alias");
+            let (alias_probe, alias_metadata) =
+                SqliteProbeFile::open(&alias, SQLITE_PROBE_SIDECAR, "live SHM alias regression")
+                    .expect("native metadata probe opens the live SHM alias");
             assert_eq!(alias_metadata.link_count(), 2);
             drop(alias_probe);
             let alias_refusal = check_existing_sidecars(&paths, &paths.final_path)
@@ -2325,7 +2324,11 @@ mod unix {
                 }
                 Err(error) => error,
             };
-            assert!(overflow.to_string().contains("probe capacity (128 descriptors)"));
+            assert!(
+                overflow
+                    .to_string()
+                    .contains("probe capacity (128 descriptors)")
+            );
             drop(held);
             let (recovered, _) = SqliteProbeFile::open(
                 &paths.final_path,
