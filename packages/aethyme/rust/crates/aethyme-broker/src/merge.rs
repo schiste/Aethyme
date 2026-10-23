@@ -2865,6 +2865,7 @@ mod verification_candidate_tests {
 #[cfg(test)]
 mod owned_merge_history_tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn git(root: &Path, args: &[&str]) -> String {
         let mut command = std::process::Command::new("git");
