@@ -48,9 +48,9 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
     let poisoned_xdg_cache = capsule_root.as_path().join("poisoned-xdg-cache");
     let poisoned_home = capsule_root.as_path().join("poisoned-home");
 
-    // A fresh open keeps child context pending until the managed start binds
-    // its root. Payloads stay inside the resulting nonce-scoped namespace.
-    let mut initialized = Broker::open_with_options(
+    // First writable open initializes the opt-in root while it is empty. The
+    // test payload is placed only inside the resulting nonce-scoped namespace.
+    let initialized = Broker::open_with_options(
         repo.path(),
         BrokerOpenOptions::default()
             .with_host_state_dir(private_state.clone())
@@ -59,17 +59,7 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
             .with_worktree_root(private_worktrees.clone())
             .with_preparation_cache_root(private_preparation_root.clone()),
     )
-    .expect("open the separate preparation-cache root");
-    let mut pending_child = Command::new("not-executed");
-    assert!(
-        initialized
-            .configure_storage_context_for_child(&mut pending_child)
-            .is_err(),
-        "fresh unbound storage must not be exported as initialized child context"
-    );
-    initialized
-        .start_worktree("initialize captured startup context", None)
-        .expect("bind the fixture root and initialize its preparation cache");
+    .expect("initialize the separate preparation-cache root");
     let private_effective_root = initialized
         .storage_context()
         .preparation_cache_root()
