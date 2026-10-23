@@ -3091,6 +3091,17 @@ fn current_preparation_keys(
     let mut keys = BTreeSet::new();
     for root in roots {
         check_preparation_sweep_deadline(deadline)?;
+        // Inventory can contain direct regular-file roots (for example, a
+        // .DS_Store entry). They cannot contain a checkout, so omit them from
+        // cache liveness. Do not treat any other lstat result as safe; defer
+        // to the shared reader so its existing error handling remains
+        // authoritative for symlinks, special files, and I/O failures.
+        if matches!(
+            std::fs::symlink_metadata(root),
+            Ok(metadata) if metadata.file_type().is_file()
+        ) {
+            continue;
+        }
         let key = crate::preparation::current_cache_key_before(root, Some(deadline)).map_err(
             |error| StorageError::Unavailable {
                 reason: format!("checkout preparation liveness is unknown: {error}"),
@@ -6397,6 +6408,78 @@ mod tests {
         assert_eq!(report.filesystem_entries_reclaimed, 2);
         assert!(report.complete);
         assert!(!entry.exists());
+    }
+
+    #[test]
+    fn preparation_sweep_ignores_regular_file_roots_but_retains_unknown_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = b"cache payload under review";
+        let (main_root, worktree_root, cache_root, entry, resource_db_path) =
+            preparation_sweep_status_fixture(tmp.path(), payload);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let ordinary_file = worktree_root.join(".DS_Store");
+        std::fs::write(&ordinary_file, b"desktop metadata").unwrap();
+
+        // The sweep's key collection also tolerates a directly observed file
+        // when given one by an inventory caller.
+        let file_keys =
+            current_preparation_keys(std::slice::from_ref(&ordinary_file), deadline).unwrap();
+        assert!(file_keys.is_empty());
+
+        let report = sweep_preparation_cache_for_roots_with_status(
+            &main_root,
+            std::slice::from_ref(&worktree_root),
+            &cache_root,
+            None,
+            &resource_db_path,
+            deadline,
+        );
+        assert!(
+            report.complete,
+            "regular sibling file blocked sweep: {report:?}"
+        );
+        assert_eq!(report.entries_removed, 1);
+        assert!(!entry.exists());
+        assert!(ordinary_file.is_file());
+
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), payload).unwrap();
+        // An empty unmarked directory has no preparation key and is safe to
+        // ignore. Malformed metadata makes this checkout's key unknown.
+        let malformed_checkout = worktree_root.join("checkout-with-malformed-prep");
+        std::fs::create_dir(&malformed_checkout).unwrap();
+        let config_dir = malformed_checkout.join(".aethyme");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::write(config_dir.join("prepare.toml"), "invalid = [").unwrap();
+        let malformed_report = sweep_preparation_cache_for_roots_with_status(
+            &main_root,
+            std::slice::from_ref(&worktree_root),
+            &cache_root,
+            None,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        assert!(!malformed_report.complete);
+        assert!(entry.join("cache.bin").is_file());
+        std::fs::remove_dir_all(&malformed_checkout).unwrap();
+
+        #[cfg(unix)]
+        {
+            let target = tmp.path().join("symlink-target");
+            std::fs::create_dir(&target).unwrap();
+            let symlink = worktree_root.join("symlink-child");
+            std::os::unix::fs::symlink(&target, &symlink).unwrap();
+            let symlink_report = sweep_preparation_cache_for_roots_with_status(
+                &main_root,
+                std::slice::from_ref(&worktree_root),
+                &cache_root,
+                None,
+                &resource_db_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+            );
+            assert!(!symlink_report.complete);
+            assert!(entry.join("cache.bin").is_file());
+        }
     }
 
     #[test]
