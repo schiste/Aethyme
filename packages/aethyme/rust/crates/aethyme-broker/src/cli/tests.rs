@@ -1,5 +1,31 @@
 use super::{UsageError, owned_comment_from_view, repository_wide_publication_lines};
 
+#[test]
+fn exec_timeout_is_parsed_separately_from_child_arguments() {
+    let args = [
+        "--session",
+        "42",
+        "--timeout",
+        "17",
+        "--",
+        "tool",
+        "--timeout",
+        "child-value",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let parsed = super::parse(&args).unwrap();
+
+    assert_eq!(parsed.session, Some(42));
+    assert_eq!(parsed.timeout_seconds, Some(17));
+    assert_eq!(
+        parsed.exec_command,
+        vec!["tool", "--timeout", "child-value"]
+    );
+    super::validate_flags("exec", &parsed).unwrap();
+}
+
 /// One entry of `gh pr view --json comments`. `id` is spelled the way `gh`
 /// really spells it -- a GraphQL node id -- so a test can never accidentally
 /// pass by reading the field the edit endpoint cannot use.

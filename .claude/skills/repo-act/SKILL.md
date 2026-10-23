@@ -59,6 +59,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   during discovery. Use a deterministic deadline seam to prove partial progress
   and a seeded persisted marker to test fresh-process resume; assert the marker
   before invoking the resume path.
+- In a deadline-bounded loop, recheck the monotonic deadline after every
+  callback or heartbeat and before accepting a result. That work can consume the
+  remaining budget even when the loop checked immediately beforehand; test this
+  with an injected callback that runs past the deadline.
+
 - For whole-checkout cleanup, finish canonical grouping of every retained row
   and build complete live-path evidence before scheduling. Rotate a durable
   cursor across complete cohorts before per-cohort Git, witness and ownership
@@ -93,6 +98,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - When reusing a CI build cache, compare the producer and consumer fingerprints,
   including toolchain, lockfiles and environment variables, then confirm the log
   shows a cache restore. A matching shared key alone does not prove reuse.
+- For package-manager cache growth, inspect the effective store path from the
+  package manager's install metadata and compare its filesystem with the
+  worktree's. A shared configured path can still cause per-worktree copies when
+  the store is on another filesystem; pnpm documents this for `storeDir` and
+  `packageImportMethod` in its [v10 settings](https://github.com/pnpm/pnpm.io/blob/main/versioned_docs/version-10.x/settings.md).
 - When substituting a prebuilt Rust test binary for Cargo, inspect the effective
   Cargo `[env]` configuration: Cargo injects those values into test child
   processes, while direct execution does not. Replay and record relevant values
@@ -234,7 +244,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   expensive work if the preflight fails; never chmod or unfreeze prior evidence
   to make it writable. After a reboot, mark missing evidence interrupted or
   unavailable. Recorded hashes do not recover missing bytes or recreate a trust
-  record.
+  record. Before expensive runs, preflight serialization of the complete final
+  source and provenance snapshot against receipt limits; place large inventories
+  in bounded, hashed sidecars.
 - Preserve the complete outer `broker advanced resources run <request> -- ...`
   invocation for supervised native checks, bound to the frozen resource request.
   The helper must refuse before resource probes or Cargo when the host lease ID
@@ -453,7 +465,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   records; a clean Git status does not cover them. Preserve irreplaceable
   reports outside the worktree and build target, verify copied file sizes and
   hashes, and check symlink targets before cleanup. Keep regenerable build
-  output separate from the evidence archive.
+  output separate from the evidence archive. For cache reclamation, test ordinary
+  files, reserved-cache name collisions, and non-container roots separately; an
+  incomplete liveness inventory must retain cache candidates.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.

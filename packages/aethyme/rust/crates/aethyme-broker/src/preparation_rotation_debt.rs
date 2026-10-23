@@ -67,7 +67,7 @@ impl DirectoryIdentity {
             && self.filesystem_id == other.filesystem_id
     }
 
-    fn same_filesystem(&self, other: &Self) -> bool {
+    pub(crate) fn same_filesystem(&self, other: &Self) -> bool {
         self.device == other.device && self.filesystem_id == other.filesystem_id
     }
 }
@@ -199,6 +199,61 @@ pub(crate) fn capture_preparation_cache_root(
         identity: identity_bytes,
         state,
     })
+}
+
+/// Create or open one private cache-root child beneath a pinned, owner-bound
+/// worktree placement directory. Existing entries are opened without following
+/// symlinks; their cache-root marker is validated by the caller before use.
+pub(crate) fn ensure_preparation_cache_root_child(
+    parent_path: &Path,
+    child_name: &str,
+    expected_parent_identity: &[u8],
+) -> io::Result<()> {
+    let expected_parent = decode_directory_identity(expected_parent_identity)?;
+    let deadline = Instant::now() + PREPARATION_ROOT_LOCK_WAIT;
+    let parent = open_real_directory_chain(parent_path, deadline)?;
+    let parent_identity = identity_for_directory(&parent)?;
+    if !parent_identity.same_directory(&expected_parent) {
+        return Err(invalid_record(
+            "worktree placement root changed before cache-root creation",
+        ));
+    }
+    let child_name = component(child_name)?;
+    let child = match open_directory_at(parent.as_raw_fd(), &child_name) {
+        Ok(child) => child,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // SAFETY: parent is pinned and child_name is a validated single
+            // component. mkdirat cannot follow or replace another entry.
+            let created = if unsafe {
+                libc::mkdirat(
+                    parent.as_raw_fd(),
+                    child_name.as_ptr(),
+                    0o700 as libc::mode_t,
+                )
+            } == 0
+            {
+                true
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+                false
+            };
+            if created {
+                normalize_created_directory_mode(
+                    parent.as_raw_fd(),
+                    &child_name,
+                    0o700 as libc::mode_t,
+                )?;
+                parent.sync_all()?;
+            }
+            open_directory_at(parent.as_raw_fd(), &child_name)?
+        }
+        Err(error) => return Err(error),
+    };
+    identity_for_directory(&child)?;
+    ensure_cache_root_path_identity(parent_path, &parent, &expected_parent, deadline)
 }
 
 /// Initialize only the opt-in root marker/nonce child. The caller must already
@@ -4027,6 +4082,34 @@ mod tests {
 
     const REPOSITORY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TRANSACTION: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn directory_identity_rejects_a_different_filesystem() {
+        let worktree = DirectoryIdentity {
+            device: 7,
+            inode: 11,
+            filesystem_id: "aabb".into(),
+        };
+        let same_filesystem = DirectoryIdentity {
+            device: 7,
+            inode: 12,
+            filesystem_id: "aabb".into(),
+        };
+        let different_device = DirectoryIdentity {
+            device: 8,
+            inode: 12,
+            filesystem_id: "aabb".into(),
+        };
+        let different_filesystem_id = DirectoryIdentity {
+            device: 7,
+            inode: 12,
+            filesystem_id: "ccdd".into(),
+        };
+
+        assert!(worktree.same_filesystem(&same_filesystem));
+        assert!(!worktree.same_filesystem(&different_device));
+        assert!(!worktree.same_filesystem(&different_filesystem_id));
+    }
 
     fn initialize_test_cache_root(
         path: &Path,
