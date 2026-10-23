@@ -6389,9 +6389,14 @@ mod tests {
 
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), payload).unwrap();
-        let unmarked_directory = worktree_root.join("unmarked-child");
-        std::fs::create_dir(&unmarked_directory).unwrap();
-        let unmarked_report = sweep_preparation_cache_for_roots_with_status(
+        // An empty unmarked directory has no preparation key and is safe to
+        // ignore. Malformed metadata makes this checkout's key unknown.
+        let malformed_checkout = worktree_root.join("checkout-with-malformed-prep");
+        std::fs::create_dir(&malformed_checkout).unwrap();
+        let config_dir = malformed_checkout.join(".aethyme");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::write(config_dir.join("prepare.toml"), "invalid = [").unwrap();
+        let malformed_report = sweep_preparation_cache_for_roots_with_status(
             &main_root,
             std::slice::from_ref(&worktree_root),
             &cache_root,
@@ -6399,9 +6404,9 @@ mod tests {
             &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
-        assert!(!unmarked_report.complete);
+        assert!(!malformed_report.complete);
         assert!(entry.join("cache.bin").is_file());
-        std::fs::remove_dir(&unmarked_directory).unwrap();
+        std::fs::remove_dir_all(&malformed_checkout).unwrap();
 
         #[cfg(unix)]
         {
