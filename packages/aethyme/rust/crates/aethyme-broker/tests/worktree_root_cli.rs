@@ -265,7 +265,9 @@ fn v028_schema52_root_fixture(owner: &Path) -> LegacyRootFixture {
     }
 }
 
-fn event_rows(database: &Path) -> Vec<(i64, i64, i64, String, Option<i64>, Option<String>)> {
+type EventRow = (i64, i64, i64, String, Option<i64>, Option<String>);
+
+fn event_rows(database: &Path) -> Vec<EventRow> {
     let connection = rusqlite::Connection::open_with_flags(
         database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
