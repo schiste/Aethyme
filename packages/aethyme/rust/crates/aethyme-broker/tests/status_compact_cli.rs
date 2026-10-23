@@ -297,3 +297,43 @@ fn compact_status_retains_bounded_waiter_resources() {
     assert!(text.contains("resource-0: session 200"), "{text}");
     assert!(!text.contains("resource-11"), "{text}");
 }
+
+#[test]
+fn summary_defers_gate_history_queries_to_full_inspection() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    // Make gate history unavailable independently of session/coordination
+    // records. A full recovery inspection must report that fault; summary
+    // explicitly defers this source and must not query it at all.
+    rusqlite::Connection::open(aethyme_broker::broker_db_path(fixture.path()).unwrap())
+        .unwrap()
+        .execute_batch("ALTER TABLE gate_results RENAME TO unavailable_gate_history")
+        .unwrap();
+    let blockers = broker.blockers();
+    assert!(
+        blockers
+            .unavailable
+            .iter()
+            .any(|source| source.source == "broker.db gate_results"),
+        "full inspection must report unavailable gate history: {blockers:?}"
+    );
+    // Inspect through the already-open broker: a new CLI process correctly
+    // refuses a database missing a required table during schema validation,
+    // before it reaches the snapshot collector this regression exercises.
+    let summary = serde_json::to_value(broker.status_brief_snapshot(0).unwrap()).unwrap();
+    let advice = summary["advice"].as_array().unwrap();
+    assert!(
+        !advice.iter().any(|item| {
+            item["id"] == "blockers.sources-unavailable"
+                && item["evidence"].as_array().is_some_and(|evidence| {
+                    evidence.iter().any(|entry| {
+                        entry
+                            .as_str()
+                            .is_some_and(|text| text.starts_with("broker.db gate_results:"))
+                    })
+                })
+        }),
+        "routine status must not query deferred gate history: {summary}"
+    );
+}

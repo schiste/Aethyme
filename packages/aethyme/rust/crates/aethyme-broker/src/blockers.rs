@@ -257,6 +257,10 @@ impl Broker {
     }
 
     fn collect_blockers(&self) -> BlockerReport {
+        self.collect_blockers_with_recovery(true)
+    }
+
+    fn collect_blockers_with_recovery(&self, inspect_recovery: bool) -> BlockerReport {
         let mut report = BlockerReport::default();
         let mut linked_host_operations = Vec::new();
         match self.operation_blockers(&mut linked_host_operations) {
@@ -281,18 +285,22 @@ impl Broker {
         // can say whether a particular requested path is refused. Listing a
         // stale claim as a repository-wide blocker is wrong; the full lease
         // and liveness views already expose it for information.
-        match self.gate_cache_blockers() {
-            Ok(found) => report.blockers.extend(found),
-            Err(error) => report
-                .unavailable
-                .push(source_error("broker.db gate_results", error)),
+        if inspect_recovery {
+            match self.gate_cache_blockers() {
+                Ok(found) => report.blockers.extend(found),
+                Err(error) => report
+                    .unavailable
+                    .push(source_error("broker.db gate_results", error)),
+            }
         }
         report.blockers.extend(self.pidfile_blockers());
-        match self.action_required_blockers() {
-            Ok(found) => report.blockers.extend(found),
-            Err(error) => report
-                .unavailable
-                .push(source_error("session worktrees", error)),
+        if inspect_recovery {
+            match self.action_required_blockers() {
+                Ok(found) => report.blockers.extend(found),
+                Err(error) => report
+                    .unavailable
+                    .push(source_error("session worktrees", error)),
+            }
         }
         report.paired_recovery = paired_recovery(&report.blockers);
         if report.paired_recovery.is_some() {
@@ -304,7 +312,7 @@ impl Broker {
     /// Recorded blocker observations for routine status. Recovery commands need
     /// fresh worktree inspection and are deliberately deferred to `broker unblock`.
     pub(crate) fn blocker_status_advice_snapshot(&self) -> Vec<crate::StatusAdvice> {
-        let report = self.collect_blockers();
+        let report = self.collect_blockers_with_recovery(false);
         let mut advice = Vec::new();
         if let Some(mut item) = status_advice(&report.blockers) {
             item.reason = "recorded coordination blockers; worktree recovery remedies have not been inspected";
