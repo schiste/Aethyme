@@ -6,9 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
     AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker,
-    BrokerOpError, DeliveryExecutionReport, EntryExposureResolutionKind, EntryExposureState,
-    IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance, OperationStatus,
-    RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
+    BrokerOpenOptions, BrokerOpError, DeliveryExecutionReport,
+    EntryExposureResolutionKind, EntryExposureState, IntegrationDeliveryState, NewAdvisory,
+    OperationIdentityProvenance, OperationStatus, RepositoryDeliveryMode,
+    RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -71,9 +72,11 @@ impl Fixture {
     }
 
     fn broker(&self) -> Broker {
-        Broker::open(&self.repo)
-            .unwrap()
-            .with_host_operation_database(&self.host_operations)
+        let host_state_dir = self.host_operations.parent().unwrap();
+        let options = BrokerOpenOptions::default()
+            .with_host_state_dir(host_state_dir)
+            .with_host_operation_database(&self.host_operations);
+        Broker::open_with_options(&self.repo, options).unwrap()
     }
 
     fn promoted_entry(&self) -> (i64, i64, String) {

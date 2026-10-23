@@ -4,6 +4,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
@@ -805,12 +808,17 @@ fn a_kept_worktree_that_disappears_is_still_reported_missing() {
     );
 }
 
-/// The last worktree is gone and only bookkeeping remains: the root becomes a
-/// reviewed candidate, and the next `broker start` recreates it.
+/// An empty root stays selected by its durable repository binding, so apply
+/// retains it and the next `broker start` reuses it.
 #[test]
-fn an_empty_root_is_a_reviewed_candidate_and_the_next_start_recreates_it() {
+fn an_empty_bound_root_is_retained_and_reused_after_apply() {
     let (repo, container) = fixture();
-    start_and_finish(repo.path(), container.path(), "only task", &[]);
+    let removed_worktree = start_and_finish(repo.path(), container.path(), "only task", &[]);
+    assert!(
+        !removed_worktree.exists(),
+        "finish removes the session worktree"
+    );
+
     let plan = json(run(
         repo.path(),
         container.path(),
@@ -819,11 +827,23 @@ fn an_empty_root_is_a_reviewed_candidate_and_the_next_start_recreates_it() {
     let root = own_root(&plan);
     assert_eq!(root["empty"], true, "{root}");
     let root_path = PathBuf::from(root["path"].as_str().unwrap());
+    let marker_path = root_path.join(".aethyme-worktree-root.json");
+    let marker_before = std::fs::read(&marker_path).unwrap();
+    #[cfg(unix)]
+    let marker_inode_before = std::fs::metadata(&marker_path).unwrap().ino();
     assert!(root_path.join(".cargo/config.toml").is_file());
+    assert!(
+        root["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker.as_str().unwrap().contains("binding")),
+        "the durable binding must explain why the empty root is retained: {root}"
+    );
     let candidates = plan["candidates"].as_array().unwrap();
-    assert_eq!(candidates.len(), 1, "{plan}");
-    assert_eq!(candidates[0]["kind"], "empty_root");
-    assert_eq!(plan["summary"]["empty_root_count"], 1);
+    assert!(candidates.is_empty(), "{plan}");
+    assert_eq!(plan["summary"]["candidate_count"], 0, "{plan}");
+    assert_eq!(plan["summary"]["empty_root_count"], 0, "{plan}");
 
     let digest = plan["digest"].as_str().unwrap();
     let applied = json(run(
@@ -832,7 +852,17 @@ fn an_empty_root_is_a_reviewed_candidate_and_the_next_start_recreates_it() {
         &["gc", "storage", "apply", "--confirm", digest, "--json"],
     ));
     assert_eq!(applied["complete"], true, "{applied}");
-    assert!(!root_path.exists(), "the empty root should be removed");
+    assert!(
+        applied["applied"].as_array().unwrap().is_empty(),
+        "{applied}"
+    );
+    assert!(root_path.is_dir(), "apply must retain the bound root");
+    assert_eq!(std::fs::read(&marker_path).unwrap(), marker_before);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&marker_path).unwrap().ino(),
+        marker_inode_before
+    );
 
     let started = json(run(
         repo.path(),
@@ -840,9 +870,37 @@ fn an_empty_root_is_a_reviewed_candidate_and_the_next_start_recreates_it() {
         &["start", "--task", "after the sweep", "--json"],
     ));
     let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
-    assert!(worktree.is_dir(), "start must recreate the root: {started}");
-    assert!(root_path.join(".aethyme-worktree-root.json").is_file());
+    assert!(
+        worktree.is_dir(),
+        "start must create the next worktree: {started}"
+    );
+    assert!(
+        worktree.starts_with(&root_path),
+        "start must reuse the bound root: {started}"
+    );
+    assert_eq!(std::fs::read(&marker_path).unwrap(), marker_before);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&marker_path).unwrap().ino(),
+        marker_inode_before
+    );
     assert!(root_path.join(".cargo/config.toml").is_file());
+
+    let id = started["id"].as_i64().unwrap().to_string();
+    let finished = run(repo.path(), container.path(), &["finish", "--session", &id]);
+    assert!(
+        finished.status.success(),
+        "finish: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(!worktree.exists(), "finish should remove {worktree:?}");
+    assert!(root_path.is_dir(), "finish must keep the bound root");
+    assert_eq!(std::fs::read(&marker_path).unwrap(), marker_before);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&marker_path).unwrap().ino(),
+        marker_inode_before
+    );
 }
 
 /// Anything the broker did not write there -- including build defaults an

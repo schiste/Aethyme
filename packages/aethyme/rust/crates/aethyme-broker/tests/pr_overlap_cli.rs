@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
+use aethyme_broker::{Broker, BrokerOpenOptions};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -216,9 +216,11 @@ impl Fixture {
     }
 
     fn broker_with_root(&self) -> (Broker, PathBuf) {
-        let broker = Broker::open(&self.repo)
-            .unwrap()
-            .with_host_operation_database(self.tmp.path().join("host-state/operations.db"));
+        let host_state_dir = self.tmp.path().join("host-state");
+        let options = BrokerOpenOptions::default()
+            .with_host_state_dir(&host_state_dir)
+            .with_host_operation_database(host_state_dir.join("host-operations.db"));
+        let broker = Broker::open_with_options(&self.repo, options).unwrap();
         let repository_key = broker.worktree_root_plan().unwrap().repository_key;
         let root_parent = self.tmp.path().join("host-state/worktrees");
         std::fs::create_dir_all(&root_parent).unwrap();

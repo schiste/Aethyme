@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, BrokerStore, GitRepo, NewSession, SessionOrigin};
+use aethyme_broker::{Broker, BrokerOpenOptions, BrokerStore, GitRepo, NewSession, SessionOrigin};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -137,9 +137,11 @@ impl Fixture {
     }
 
     fn broker(&self) -> Broker {
-        Broker::open(&self.repo)
-            .unwrap()
-            .with_host_operation_database(self.tmp.path().join("host-state/host-operations.db"))
+        let host_state_dir = self.tmp.path().join("host-state");
+        let options = BrokerOpenOptions::default()
+            .with_host_state_dir(&host_state_dir)
+            .with_host_operation_database(host_state_dir.join("host-operations.db"));
+        Broker::open_with_options(&self.repo, options).unwrap()
     }
 
     /// A live session with one committed change to `file`.
