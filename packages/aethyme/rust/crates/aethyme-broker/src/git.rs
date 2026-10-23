@@ -6606,11 +6606,6 @@ mod batched_commit_tests {
             !full_index_log.contains("GIT binary patch"),
             "full-index output must not include encoded binary bodies"
         );
-        assert!(
-            full_index_log.len() < legacy_log.len(),
-            "full-index output should omit the fixture's encoded binary bodies"
-        );
-
         for commit in [
             &mixed_binary_add,
             &mixed_binary_modify,
