@@ -1145,6 +1145,105 @@ fn validate_recovery_registry_schema(connection: &Connection) -> io::Result<()> 
     Ok(())
 }
 
+#[cfg(unix)]
+fn effective_user_id() -> libc::uid_t {
+    // SAFETY: geteuid takes no pointers and only returns the calling process'
+    // effective user ID.
+    unsafe { libc::geteuid() }
+}
+
+/// Sync the entries that name the host registry before its row can be used to
+/// complete a repository-root binding. SQLite's FULL commit makes registry
+/// contents durable; these directory syncs make a newly-created registry file
+/// and its containing directory reachable after a crash as well.
+#[cfg(unix)]
+fn sync_registry_namespace(host_operation_database: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn open_checked_directory(
+        path: &Path,
+        require_current_owner: bool,
+    ) -> io::Result<(fs::File, Metadata)> {
+        let named_before = fs::symlink_metadata(path)?;
+        if !named_before.is_dir() || named_before.file_type().is_symlink() {
+            return Err(invalid("worktree registry directory changed type"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+        let directory = options.open(path)?;
+        let opened = directory.metadata()?;
+        let named_after = fs::symlink_metadata(path)?;
+        if !opened.is_dir()
+            || !named_after.is_dir()
+            || named_after.file_type().is_symlink()
+            || opened.dev() != named_before.dev()
+            || opened.ino() != named_before.ino()
+            || opened.uid() != named_before.uid()
+            || opened.dev() != named_after.dev()
+            || opened.ino() != named_after.ino()
+            || opened.uid() != named_after.uid()
+            || (require_current_owner && opened.uid() != effective_user_id())
+        {
+            return Err(invalid(
+                "worktree registry directory identity changed before syncing",
+            ));
+        }
+        Ok((directory, opened))
+    }
+
+    let host_parent = host_operation_database
+        .parent()
+        .ok_or_else(|| invalid("host operation database has no parent"))?;
+    let host_parent = fs::canonicalize(host_parent)?;
+    let directory_name = registry_directory(host_operation_database)?
+        .file_name()
+        .ok_or_else(|| invalid("worktree registry has no directory name"))?
+        .to_os_string();
+    let registry_directory = host_parent.join(directory_name);
+
+    // Open both names without following their final components. The registry
+    // directory is a child of the existing host database parent; syncing the
+    // child makes registry.sqlite3 durable, and syncing the parent makes the
+    // child directory name durable.
+    let (registry, registry_identity) = open_checked_directory(&registry_directory, true)?;
+    // The host database parent may be an intentionally shared, root-owned
+    // sticky directory such as /tmp. Pin its identity for the sync without
+    // changing its ownership or requiring it to belong to this user.
+    let (parent, parent_identity) = open_checked_directory(&host_parent, false)?;
+    registry.sync_all()?;
+    parent.sync_all()?;
+
+    for (path, opened) in [
+        (&registry_directory, registry_identity),
+        (&host_parent, parent_identity),
+    ] {
+        let named_after = fs::symlink_metadata(path)?;
+        if !named_after.is_dir()
+            || named_after.file_type().is_symlink()
+            || named_after.dev() != opened.dev()
+            || named_after.ino() != opened.ino()
+            || named_after.uid() != opened.uid()
+        {
+            return Err(invalid(
+                "worktree registry directory identity changed while syncing",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Fresh/bound repository-root provisioning is refused on non-Unix platforms,
+// where this module cannot open and sync directory entries without following
+// links. Ordinary legacy registry operations remain available there.
+#[cfg(not(unix))]
+fn sync_registry_namespace(_host_operation_database: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fresh-root recovery requires Unix directory durability",
+    ))
+}
 fn record_key(root: &Path) -> String {
     format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()))
 }
