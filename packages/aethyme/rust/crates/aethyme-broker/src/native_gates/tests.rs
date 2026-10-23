@@ -1931,8 +1931,8 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
         )
         .unwrap();
     assert_eq!(
-        migrated_floor, 29,
-        "schema 30 keeps schema 29 as its minimum compatible floor"
+        migrated_floor, 31,
+        "schema 31 retains association objects during reclamation"
     );
     let roots_before = root_count(&s.f.store, &job.id);
     assert!(roots_before > 0);

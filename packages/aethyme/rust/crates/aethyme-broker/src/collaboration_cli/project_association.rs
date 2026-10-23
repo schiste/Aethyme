@@ -112,6 +112,13 @@ fn confirm(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, F
             Failure::refused("invalid_association", error.to_string(), CONFIRM_NEXT)
         })?;
     if actual_record_id != confirmed {
+        if persisted_revocation_matches_local_project(main_root, worktree, &confirmed)? {
+            return Err(Failure::refused(
+                "association_revoked",
+                "this exact association proposal was already revoked and cannot be reactivated",
+                REPROPOSE_NEXT,
+            ));
+        }
         return Err(Failure::refused(
             "association_confirmation_mismatch",
             format!("confirmed {confirmed}, but the descriptor is {actual_record_id}"),
@@ -496,6 +503,31 @@ fn validate_association_sides(
 struct StoredAssociation {
     descriptor: ProjectAssociationDescriptor,
     status: String,
+}
+
+fn persisted_revocation_matches_local_project(
+    main_root: &Path,
+    worktree: &Path,
+    record_id: &RecordId,
+) -> Result<bool, Failure> {
+    let Ok(local) = inspect_project(main_root, worktree) else {
+        return Ok(false);
+    };
+    let stored = match load_association_row(&local._store, record_id) {
+        Ok(stored) => stored,
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "association_missing" | "association_schema_unavailable"
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(stored.status == "revoked"
+        && stored.descriptor.local_project_key() == local.key.as_str()
+        && stored.descriptor.local_project_id() == local.binding.project_id())
 }
 
 fn load_association_row(

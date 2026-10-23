@@ -826,8 +826,8 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
         )
         .unwrap();
     assert_eq!(
-        floor, "29",
-        "schema 30 keeps schema 29 as its minimum compatible floor"
+        floor, "31",
+        "schema 31 retains association objects during reclamation"
     );
 }
 
