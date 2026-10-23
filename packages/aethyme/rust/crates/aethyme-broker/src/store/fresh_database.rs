@@ -2236,10 +2236,8 @@ mod unix {
             );
             assert!(
                 successful_checks >= 120,
-                concat!(
-                    "expected one retained SHM probe per pass, got ",
-                    "{successful_checks} successful passes",
-                )
+                "expected one retained SHM probe per pass, got {} successful passes",
+                successful_checks,
             );
 
             run_lock_child(
