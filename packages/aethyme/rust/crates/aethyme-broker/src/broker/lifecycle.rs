@@ -8165,11 +8165,8 @@ impl Broker {
         self.store
             .reserve_fresh_repository_worktree_root(&reservation)?;
 
-        let result = self.finish_fresh_worktree_root(
-            &reservation,
-            &expected_parent,
-            registration_admission,
-        );
+        let result =
+            self.finish_fresh_worktree_root(&reservation, &expected_parent, registration_admission);
         match result {
             Ok(root_identity_json) => {
                 let completion = verify_private_worktree_root_permissions(
