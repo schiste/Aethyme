@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use aethyme_broker::GitRepo;
@@ -37,6 +37,14 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 fn run(repo: &Path, args: &[&str]) -> Output {
     common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
+        .output()
+        .unwrap()
+}
+
+fn run_with_managed_worktree_root(repo: &Path, root: &Path, args: &[&str]) -> Output {
+    common::broker_cli_for_fixture(CLI, args, repo)
+        .current_dir(repo)
+        .env("AETHYME_BROKER_OPEN_WORKTREE_ROOT", root)
         .output()
         .unwrap()
 }
@@ -337,6 +345,18 @@ fn run_count(path: &Path) -> usize {
     std::fs::read_to_string(path).unwrap().lines().count()
 }
 
+fn bind_fixture_worktree_root(repository: &Path, fixture_owner: &Path) -> PathBuf {
+    let mut broker = common::open_fixture_broker(repository, fixture_owner).unwrap();
+    let root = broker.worktree_root().to_path_buf();
+    let bootstrap = broker
+        .start_worktree("fixture worktree-root bootstrap", None)
+        .unwrap();
+    broker.close(bootstrap.id).unwrap();
+    broker.cleanup(bootstrap.id, false).unwrap();
+    assert!(root.join(".aethyme-worktree-root.json").is_file());
+    root
+}
+
 fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
@@ -353,8 +373,9 @@ fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) 
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
 
-    let worktree = tmp.path().join(".aethyme/worktrees/submit");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
+    let worktree = root.join("submit");
     git(
         tmp.path(),
         &[
@@ -367,8 +388,9 @@ fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) 
             "main",
         ],
     );
-    let adopted = stdout(run(
+    let adopted = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["start", "--adopt", "--task", "gate evidence", "--json"],
     ));
     let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
@@ -378,9 +400,17 @@ fn submit_verification_case(gates: Option<&str>) -> (serde_json::Value, String) 
     git(&worktree, &["add", "scripts/check.sh"]);
     git(&worktree, &["commit", "-qm", "add script"]);
 
-    let json = stdout(run(&worktree, &["submit", "--session", &session, "--json"]));
+    let json = stdout(run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["submit", "--session", &session, "--json"],
+    ));
     let json = serde_json::from_str(&json).unwrap();
-    let text = stdout(run(&worktree, &["submit", "--session", &session]));
+    let text = stdout(run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["submit", "--session", &session],
+    ));
     (json, text)
 }
 
@@ -906,8 +936,8 @@ fn pre_push_failure_names_the_gate_and_prints_its_bounded_output() {
 #[test]
 fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
     let tmp = fixture();
-    let worktree = tmp.path().join(".aethyme/worktrees/noop-submit");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), tmp.owner_path());
+    let worktree = root.join("noop-submit");
     git(
         tmp.path(),
         &[
@@ -920,15 +950,17 @@ fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
             "main",
         ],
     );
-    let adopted = stdout(run(
+    let adopted = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["start", "--adopt", "--task", "inspect only", "--json"],
     ));
     let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
     let session_id = session["id"].as_i64().unwrap().to_string();
 
-    let json = stdout(run(
+    let json = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["submit", "--session", &session_id, "--json"],
     ));
     let outcome: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -938,7 +970,11 @@ fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
     assert_eq!(outcome["gate_outcomes"], serde_json::json!([]));
     assert!(!tmp.path().join("gate-runs.txt").exists());
 
-    let text = stdout(run(&worktree, &["submit", "--session", &session_id]));
+    let text = stdout(run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["submit", "--session", &session_id],
+    ));
     assert!(text.contains("no pending session-owned content"));
     assert!(text.contains("integration was not moved and no gates ran"));
     assert!(!text.contains("gate wall time"));
@@ -947,8 +983,8 @@ fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
 #[test]
 fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
     let tmp = fixture();
-    let worktree = tmp.path().join(".aethyme/worktrees/unknown-submit-command");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), tmp.owner_path());
+    let worktree = root.join("unknown-submit-command");
     git(
         tmp.path(),
         &[
@@ -961,8 +997,9 @@ fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
             "main",
         ],
     );
-    let adopted = stdout(run(
+    let adopted = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &[
             "start",
             "--adopt",
@@ -992,8 +1029,9 @@ fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
     // Keep the exact typo that previously fell through to submit. The
     // temporary fixture makes it safe to assert that it cannot run a gate or
     // write a queue entry / holder binding.
-    let output = run(
+    let output = run_with_managed_worktree_root(
         &worktree,
+        &root,
         &[
             "submit",
             "status",
@@ -1013,8 +1051,9 @@ fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
 
     // A trailing word after the flags never reaches the surface resolver's
     // first-word check; the dispatcher's positional check must refuse it too.
-    let output = run(
+    let output = run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["submit", "--session", &session_id, "--no-cache", "status"],
     );
     assert_eq!(output.status.code(), Some(2));
@@ -1046,8 +1085,8 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "configure submit gate"]);
 
-    let worktree = tmp.path().join(".aethyme/worktrees/submit-cache");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), tmp.owner_path());
+    let worktree = root.join("submit-cache");
     git(
         tmp.path(),
         &[
@@ -1060,8 +1099,9 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
             "main",
         ],
     );
-    let adopted = stdout(run(
+    let adopted = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["start", "--adopt", "--task", "submit cache", "--json"],
     ));
     let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
@@ -1070,32 +1110,36 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     git(&worktree, &["add", "tracked.txt"]);
     git(&worktree, &["commit", "-qm", "submitted change"]);
 
-    let first = stdout(run(
+    let first = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["submit", "--session", &session_id, "--json"],
     ));
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(first["gate_outcomes"][0]["cached"], false);
     assert_eq!(run_count(&counter), 1);
 
-    let cached = stdout(run(
+    let cached = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["submit", "--session", &session_id, "--json"],
     ));
     let cached: serde_json::Value = serde_json::from_str(&cached).unwrap();
     assert_eq!(cached["gate_outcomes"][0]["cached"], true);
     assert_eq!(run_count(&counter), 1);
 
-    let bypassed = stdout(run(
+    let bypassed = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["submit", "--session", &session_id, "--no-cache", "--json"],
     ));
     let bypassed: serde_json::Value = serde_json::from_str(&bypassed).unwrap();
     assert_eq!(bypassed["gate_outcomes"][0]["cached"], false);
     assert_eq!(run_count(&counter), 2);
 
-    let refreshed = stdout(run(
+    let refreshed = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["submit", "--session", &session_id, "--json"],
     ));
     let refreshed: serde_json::Value = serde_json::from_str(&refreshed).unwrap();
@@ -1118,8 +1162,8 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
     git(tmp.path(), &["add", ".aethyme/gates.toml"]);
     git(tmp.path(), &["commit", "-qm", "configure exact-tree gate"]);
 
-    let worktree = tmp.path().join(".aethyme/worktrees/exact-tree");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), tmp.owner_path());
+    let worktree = root.join("exact-tree");
     git(
         tmp.path(),
         &[
@@ -1132,8 +1176,9 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
             "main",
         ],
     );
-    let adopted = stdout(run(
+    let adopted = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["start", "--adopt", "--task", "prove once", "--json"],
     ));
     let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
@@ -1142,8 +1187,9 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
     git(&worktree, &["add", "tracked.txt"]);
     git(&worktree, &["commit", "-qm", "change tracked input"]);
 
-    let preflight = stdout(run(
+    let preflight = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &[
             "advanced",
             "gates",
@@ -1157,8 +1203,9 @@ fn session_gate_proof_is_reused_by_unchanged_integration_submission() {
     assert_eq!(preflight[0]["cached"], false);
     assert_eq!(run_count(&counter), 1);
 
-    let submission = stdout(run(
+    let submission = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["submit", "--session", &session_id, "--json"],
     ));
     let submission: serde_json::Value = serde_json::from_str(&submission).unwrap();
@@ -1583,8 +1630,9 @@ fn submit_replays_a_bounded_gate_failure_tail() {
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
 
-    let worktree = tmp.path().join(".aethyme/worktrees/submit-failure");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
+    let worktree = root.join("submit-failure");
     git(
         tmp.path(),
         &[
@@ -1597,8 +1645,9 @@ fn submit_replays_a_bounded_gate_failure_tail() {
             "main",
         ],
     );
-    let adopted: serde_json::Value = serde_json::from_str(&stdout(run(
+    let adopted: serde_json::Value = serde_json::from_str(&stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["start", "--adopt", "--task", "failure output", "--json"],
     )))
     .unwrap();
@@ -1607,7 +1656,11 @@ fn submit_replays_a_bounded_gate_failure_tail() {
     git(&worktree, &["add", "tracked.txt"]);
     git(&worktree, &["commit", "-qm", "change"]);
 
-    let failed = run(&worktree, &["submit", "--session", &session]);
+    let failed = run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["submit", "--session", &session],
+    );
     assert!(!failed.status.success());
     let stderr = String::from_utf8(failed.stderr).unwrap();
     assert!(stderr.contains("gate failure output (last 1 line(s))"));
@@ -1861,8 +1914,9 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
     .unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
-    let worktree = tmp.path().join(".aethyme/worktrees/codes");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
+    let worktree = root.join("codes");
     git(
         tmp.path(),
         &[
@@ -1875,8 +1929,9 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
             "main",
         ],
     );
-    let adopted = stdout(run(
+    let adopted = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["start", "--adopt", "--task", "exit codes", "--json"],
     ));
     let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
@@ -1884,7 +1939,11 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
     std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
     git(&worktree, &["commit", "-qam", "change"]);
 
-    let rejected = run(&worktree, &["submit", "--session", &session, "--json"]);
+    let rejected = run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["submit", "--session", &session, "--json"],
+    );
     assert_eq!(
         rejected.status.code(),
         Some(i32::from(aethyme_broker::exit_status::VERIFICATION_FAILED)),
@@ -1894,7 +1953,11 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
     let outcome: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert_eq!(outcome["entry"]["status"], "rejected");
 
-    let rejected_text = run(&worktree, &["submit", "--session", &session]);
+    let rejected_text = run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["submit", "--session", &session],
+    );
     assert_eq!(
         rejected_text.status.code(),
         Some(i32::from(aethyme_broker::exit_status::VERIFICATION_FAILED)),
@@ -1902,8 +1965,9 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
         String::from_utf8_lossy(&rejected_text.stderr)
     );
 
-    let refused = run(
+    let refused = run_with_managed_worktree_root(
         &worktree,
+        &root,
         &[
             "advanced",
             "git",
@@ -1950,8 +2014,9 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
     .unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "fixture"]);
-    let worktree = tmp.path().join(".aethyme/worktrees/host");
-    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let worktree_owner = tempfile::tempdir().unwrap();
+    let root = bind_fixture_worktree_root(tmp.path(), worktree_owner.path());
+    let worktree = root.join("host");
     git(
         tmp.path(),
         &[
@@ -1964,8 +2029,9 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
             "main",
         ],
     );
-    let adopted = stdout(run(
+    let adopted = stdout(run_with_managed_worktree_root(
         &worktree,
+        &root,
         &["start", "--adopt", "--task", "host failure", "--json"],
     ));
     let adopted: serde_json::Value = serde_json::from_str(&adopted).unwrap();
@@ -1973,19 +2039,28 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
     std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
     git(&worktree, &["commit", "-qam", "change"]);
 
-    let submitted = run(&worktree, &["submit", "--session", &session, "--json"]);
+    let submitted = run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["submit", "--session", &session, "--json"],
+    );
     assert_eq!(
         submitted.status.code(),
         Some(i32::from(aethyme_broker::exit_status::ENVIRONMENT)),
         "{}",
         String::from_utf8_lossy(&submitted.stderr)
     );
-    let status = stdout(run(&worktree, &["status", "--json"]));
+    let status = stdout(run_with_managed_worktree_root(
+        &worktree,
+        &root,
+        &["status", "--json"],
+    ));
     assert!(status.contains("the code was not judged"), "{status}");
     assert!(!status.contains("commit a fix"), "{status}");
 
-    let repeated = run(
+    let repeated = run_with_managed_worktree_root(
         &worktree,
+        &root,
         &[
             "advanced",
             "git",
