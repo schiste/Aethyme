@@ -32,6 +32,7 @@ dependencies = [
  "globset",
  "libc",
  "noyalib",
+ "regex",
  "rusqlite",
  "semver",
  "serde",
