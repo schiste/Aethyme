@@ -659,6 +659,98 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
 }
 
 #[test]
+fn host_state_inside_a_linked_worktree_falls_back_without_creating_its_worktrees_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("project");
+    let linked_checkout = tmp.path().join("unmanaged-checkout");
+    let cache = tmp.path().join("cache");
+    let database = tmp.path().join("broker.db");
+    let available_bytes = tmp.path().join("available-bytes");
+    fixture_at(&repo);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/unmanaged-checkout",
+            linked_checkout.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let linked_checkout = linked_checkout.canonicalize().unwrap();
+    let host_state = linked_checkout.join(".aethyme/host-state");
+    std::fs::create_dir_all(&host_state).unwrap();
+    let host_state = host_state.canonicalize().unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let plan = json(
+        common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
+            .current_dir(&repo)
+            .env("AETHYME_HOST_STATE_DIR", &host_state)
+            .env("AETHYME_HOST_CACHE_DIR", &cache)
+            .env("AETHYME_BROKER_DB", &database)
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            .env_remove("AETHYME_GATE_BROKER_DATABASES")
+            .output()
+            .unwrap(),
+    );
+    let selected_root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
+    let worktrees_parent = host_state.join("worktrees");
+    assert!(selected_root.starts_with(&host_state));
+    assert!(
+        !worktrees_parent.exists(),
+        "planning created the nested parent"
+    );
+
+    std::fs::write(&available_bytes, "68719476736\n").unwrap();
+    let output = common::broker_cli(
+        CLI,
+        &["start", "--task", "nested host state", "--json"],
+    )
+    .current_dir(&repo)
+    .env("AETHYME_HOST_STATE_DIR", &host_state)
+    .env("AETHYME_HOST_CACHE_DIR", &cache)
+    .env("AETHYME_BROKER_DB", &database)
+    .env_remove("AETHYME_WORKTREE_ROOT")
+    .env_remove("AETHYME_GATE_BROKER_DATABASES")
+    .env(
+        aethyme_broker::TEST_AVAILABLE_BYTES_ENV,
+        format!("@{}", available_bytes.display()),
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "start should use the safe repository fallback: {}",
+        json_error::message(&output)
+    );
+    let started = json(output);
+    assert_eq!(
+        started["worktree_placement"]["source"],
+        "repository_fallback"
+    );
+    assert!(
+        started["worktree_placement"]["fallback_reason"]
+            .as_str()
+            .unwrap()
+            .contains("refusing nested broker worktree path"),
+        "{started}"
+    );
+    assert!(
+        !worktrees_parent.exists(),
+        "nested host-state worktrees parent was created"
+    );
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    assert!(!worktree.starts_with(&linked_checkout));
+    assert!(
+        git_output(&linked_checkout, &["status", "--porcelain"]).is_empty(),
+        "linked checkout changed"
+    );
+}
+
+#[test]
 fn unavailable_host_placement_uses_reported_registered_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("project");
@@ -934,20 +1026,6 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
         ],
     );
     git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
-    std::fs::write(&bytes, "68719476736\n").unwrap();
-    std::fs::write(
-        &upload_pack,
-        "#!/bin/sh\nprintf '0\\n' > \"$AETHYME_TEST_RESERVE_BYTES_PATH\" || exit 1\nexec git-upload-pack \"$@\"\n",
-    ).unwrap();
-    std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700)).unwrap();
-    git(
-        &repo,
-        &[
-            "config",
-            "remote.origin.uploadpack",
-            upload_pack.to_str().unwrap(),
-        ],
-    );
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
     let plan = json(
@@ -965,6 +1043,21 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     assert!(!root.exists(), "read-only planning allocated the placement");
     // Environment overrides select an existing container; planning above did not create it.
     std::fs::create_dir_all(&root).unwrap();
+    bind_managed_root_fixture(&repo, &state, &cache, &actual_root);
+    std::fs::write(&bytes, "68719476736\n").unwrap();
+    std::fs::write(
+        &upload_pack,
+        "#!/bin/sh\nprintf '0\\n' > \"$AETHYME_TEST_RESERVE_BYTES_PATH\" || exit 1\nexec git-upload-pack \"$@\"\n",
+    ).unwrap();
+    std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().unwrap(),
+        ],
+    );
     let output = common::broker_cli(
         CLI,
         &[
@@ -1107,6 +1200,11 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             }
             #[cfg(unix)]
             if case.ends_with("link") {
+                assert!(
+                    marker.is_file(),
+                    "{case}: managed setup should create a regular marker"
+                );
+                std::fs::remove_file(&marker).unwrap();
                 if case == "valid-link" {
                     let owner = serde_json::json!({
                         "schema_version": 1,
@@ -1472,7 +1570,8 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         &fixture.host_state,
         &fixture.preparation_cache,
         &[
-            "adopt",
+            "start",
+            "--adopt",
             checkout_arg.as_str(),
             "--task",
             "adopt after reviewed binding",
@@ -1660,7 +1759,15 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert!(!fixture.repository_uuid_marker.exists());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);
-    assert_eq!(event_rows(&fixture.database), events_before);
+    let events_after_refusal = event_rows(&fixture.database);
+    assert!(events_after_refusal.starts_with(&events_before));
+    assert_eq!(events_after_refusal.len(), events_before.len() + 1);
+    let failed_start = events_after_refusal.last().unwrap();
+    assert_eq!(failed_start.3, "broker.command.failed");
+    let failed_start_payload: serde_json::Value =
+        serde_json::from_str(failed_start.5.as_deref().unwrap()).unwrap();
+    assert_eq!(failed_start_payload["command_surface"], "broker.start");
+    assert_eq!(failed_start_payload["failure_class"], "command_failed");
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
     assert_eq!(
         std::fs::read(&original_worktree_file).unwrap(),
@@ -1687,7 +1794,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert!(!fixture.repository_uuid_marker.exists());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);
-    assert_eq!(event_rows(&fixture.database), events_before);
+    assert_eq!(event_rows(&fixture.database), events_after_refusal);
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
 
     let bound = json(run_without_preparation_cache(
@@ -1711,7 +1818,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert!(fixture.repository_uuid_marker.is_file());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);
-    assert_eq!(event_rows(&fixture.database), events_before);
+    assert_eq!(event_rows(&fixture.database), events_after_refusal);
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
 
     std::fs::create_dir_all(&fixture.preparation_cache).unwrap();
@@ -1724,7 +1831,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert_eq!(started["worktree_placement"]["root"], root_arg);
     assert!(fixture.preparation_cache.is_dir());
     assert!(session_rows(&fixture.database).starts_with(&sessions_before));
-    assert!(event_rows(&fixture.database).starts_with(&events_before));
+    assert!(event_rows(&fixture.database).starts_with(&events_after_refusal));
 
     let checkout_owner = tempfile::tempdir().unwrap();
     let checkout = checkout_owner.path().join("adopted");
@@ -1746,7 +1853,8 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         &fixture.host_state,
         &fixture.preparation_cache,
         &[
-            "adopt",
+            "start",
+            "--adopt",
             checkout_arg.as_str(),
             "--task",
             "adopt after binding",
@@ -1758,7 +1866,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         checkout
     );
     assert!(session_rows(&fixture.database).starts_with(&sessions_before));
-    assert!(event_rows(&fixture.database).starts_with(&events_before));
+    assert!(event_rows(&fixture.database).starts_with(&events_after_refusal));
 }
 
 #[path = "common/json_error.rs"]

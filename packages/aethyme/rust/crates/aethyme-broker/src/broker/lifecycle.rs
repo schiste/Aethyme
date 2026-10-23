@@ -7877,6 +7877,11 @@ impl Broker {
             path: root.clone(),
             reason,
         })?;
+        // A fresh root beneath another linked checkout would itself be a
+        // write inside that checkout. Refuse it before reservation creates
+        // the directory or ownership marker; the later destination check
+        // still protects the actual worktree path.
+        self.refuse_nested_worktree_path(&root)?;
         let layout = if source != WorktreeRootSource::RepositoryFallback
             && source != WorktreeRootSource::LibraryOverride
             && (plan
@@ -8004,6 +8009,9 @@ impl Broker {
             }
         };
 
+        // A host-state base can be configured inside another linked checkout.
+        // Refuse that owner before creating its standard worktrees parent.
+        self.refuse_nested_worktree_path(&ancestor_identity.canonical_path)?;
         let minimum = self.configured_worktree_minimum(source)?;
         preflight_worktree_root(
             &self.main_root,
