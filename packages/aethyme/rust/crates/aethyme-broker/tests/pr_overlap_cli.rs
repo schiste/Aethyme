@@ -220,11 +220,9 @@ impl Fixture {
             .unwrap()
             .with_host_operation_database(self.tmp.path().join("host-state/operations.db"));
         let repository_key = broker.worktree_root_plan().unwrap().repository_key;
-        let root = self
-            .tmp
-            .path()
-            .join("host-state/worktrees")
-            .join(repository_key);
+        let root_parent = self.tmp.path().join("host-state/worktrees");
+        std::fs::create_dir_all(&root_parent).unwrap();
+        let root = root_parent.join(repository_key);
         (broker.with_worktree_root(root.clone()), root)
     }
 
