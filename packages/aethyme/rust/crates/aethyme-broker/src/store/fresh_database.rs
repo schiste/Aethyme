@@ -1621,6 +1621,7 @@ mod unix {
         use crate::store::repository_binding::{
             LegacyRepositoryRootConfirmation, RepositoryWorktreeRootLayout,
         };
+        use crate::store::repository_identity::RepositoryBindingScope;
         use std::os::unix::fs::PermissionsExt;
 
         fn init_repository(repo_root: &Path) {
@@ -1865,26 +1866,44 @@ mod unix {
         }
 
         #[test]
-        fn explicitly_bound_legacy_database_refuses_a_different_checkout() {
+        fn a_second_repository_sharing_a_bound_legacy_database_starts_unbound() {
             let repo = tempfile::tempdir().unwrap();
             let other_repo = tempfile::tempdir().unwrap();
             let (paths, store) = bind_legacy_database(repo.path());
+            let original_binding = store.repository_worktree_binding().unwrap();
             drop(store);
             init_repository(other_repo.path());
-            let database_before = fs::read(&paths.final_path).unwrap();
 
-            let error = match open_in_repo(other_repo.path(), &paths.logical_path) {
-                Ok(_) => panic!("a legacy binding must not open from a different checkout"),
-                Err(error) => error,
-            };
-            assert!(matches!(
-                error,
-                BrokerError::InvalidRepositoryWorktreeBinding(_)
-            ));
-            assert_eq!(fs::read(&paths.final_path).unwrap(), database_before);
-            assert!(
-                !other_repo.path().join(".aethyme").exists(),
-                "identity refusal must not create state in the other checkout"
+            // A shared override may live under another checkout. Mirror the
+            // repository-scoped store opener without mutating process env.
+            let scope = RepositoryBindingScope::capture(other_repo.path(), &paths.logical_path)
+                .unwrap();
+            let mut other = open_in_repo(other_repo.path(), &paths.logical_path)
+                .expect("a distinct repository may share this database");
+            other.binding_scope = Some(scope.clone());
+            other.ensure_repository_binding_scope().unwrap();
+            let other_binding = other.repository_worktree_binding().unwrap();
+            assert_ne!(other_binding.binding_id, original_binding.binding_id);
+            assert_eq!(
+                other_binding.state,
+                RepositoryWorktreeBindingState::LegacyUnbound
+            );
+            assert_eq!(
+                other_binding.origin,
+                Some(RepositoryWorktreeBindingOrigin::Legacy)
+            );
+            assert_eq!(other_binding.git_common_dir, Some(scope.git_common_dir));
+            assert_eq!(other_binding.worktree_root, None);
+            assert_eq!(other_binding.root_layout, None);
+            assert_eq!(other_binding.root_source, None);
+            assert_eq!(other_binding.bootstrap_nonce, None);
+            drop(other);
+
+            let reopened = open_in_repo(repo.path(), &paths.logical_path).unwrap();
+            assert_eq!(
+                reopened.repository_worktree_binding().unwrap(),
+                original_binding,
+                "registering another repository must preserve the original binding"
             );
         }
 
