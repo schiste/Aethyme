@@ -149,6 +149,10 @@ impl Broker {
             }
             .into());
         }
+        #[cfg(test)]
+        if let Some(observer) = &self.worktree_lifecycle_test_observer {
+            observer(&main_root);
+        }
         crate::file_lock::acquire_repository_lifecycle_lock(&main_root).map_err(|source| {
             BrokerError::Io {
                 path: main_root.join(".aethyme/run"),
