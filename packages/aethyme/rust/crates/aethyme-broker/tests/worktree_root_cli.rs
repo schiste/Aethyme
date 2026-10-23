@@ -508,20 +508,10 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
             }),
         "agent log allocated before late admission"
     );
-    let mut entries: Vec<_> = std::fs::read_dir(&actual_root)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    entries.sort();
-    assert_eq!(
-        entries,
-        vec![
-            std::ffi::OsString::from(".aethyme-worktree-root.json"),
-            std::ffi::OsString::from(".cargo")
-        ],
-        "a checkout was created despite late refusal"
+    assert!(
+        !actual_root.exists(),
+        "worktree root was allocated despite late admission refusal: {text}"
     );
-    assert!(actual_root.join(".cargo/config.toml").is_file());
     let branches = Command::new("git")
         .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
         .current_dir(&repo)

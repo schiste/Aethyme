@@ -44,6 +44,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   true `--is-inside-work-tree` result when checkout evidence is needed. Compare
   main, nested and linked worktrees, and test bare and unavailable contexts
   before removing a separate discovery call.
+- For concurrency-ordering regressions, exercise the real entrypoint and
+  synchronize on an explicit test hook at the protected boundary. Assert the
+  competing operation's state there; do not infer lock order from sleeps or
+  timeouts, or simulate only one side of the race.
 - In nonblocking readiness readers, distinguish available bytes from
   `WouldBlock`: wait only after `WouldBlock`, and drain buffered input without
   a polling sleep after every byte. Assert injected wait-callback counts for

@@ -4461,6 +4461,18 @@ fn apply_candidate(
     {
         return Err("stray directory is not a direct child of its reviewed root".into());
     }
+    // Session creation/adoption/removal use this same repository-wide lock.
+    // Take it before rechecking ownership and the root marker so a start that
+    // has passed its own final claim cannot race the last bookkeeping unlink.
+    // Stray checkouts need the same exclusion: worktree-add may be between
+    // creating its `.git` pointer and registering the checkout in Git.
+    let _lifecycle_claim = match candidate.kind {
+        StorageCandidateKind::EmptyRoot | StorageCandidateKind::StrayDirectory => Some(
+            crate::file_lock::acquire_repository_lifecycle_lock(&candidate.repository_root)
+                .map_err(|error| format!("cannot acquire repository lifecycle lock: {error}"))?,
+        ),
+        _ => None,
+    };
     let observation = read_marker(current_marker_root);
     let Some(marker) = observation.marker else {
         return Err("ownership marker disappeared or became unreadable".into());
@@ -7792,6 +7804,145 @@ mod tests {
         std::fs::remove_dir(root.join("new-session")).unwrap();
         assert!(remove_empty_root(&root).unwrap() > 0);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn empty_root_apply_waits_for_start_lifecycle_claim_and_rechecks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_root = tmp.path().join("repository");
+        let owner = init_storage_root_test_repository(&owner_root);
+        let _store = crate::BrokerStore::open(&owner_root.join(crate::BROKER_DB_RELPATH)).unwrap();
+        let host_state = tmp.path().join("host-state");
+        let repository = ThisRepository::observe(&owner_root).unwrap();
+        let root = host_state.join(&repository.key);
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            crate::broker::WORKTREE_CARGO_CONFIG,
+        )
+        .unwrap();
+        assert!(write_attributed_marker(&root, &repository).unwrap());
+        let marker_bytes = std::fs::read(root.join(WORKTREE_ROOT_MARKER)).unwrap();
+        let candidate = StorageCandidate {
+            kind: StorageCandidateKind::EmptyRoot,
+            path: root.clone(),
+            root_path: root.clone(),
+            repository_key: repository.key,
+            repository_root: owner_root.clone(),
+            git_marker: false,
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: "fixture reviewed empty root".into(),
+            marker_sha256: format!("{:x}", Sha256::digest(marker_bytes)),
+        };
+        let mut context = bound_storage_context(&owner, &host_state);
+        context.worktree_root_override = Some(root.clone());
+        let layout = storage_layout_with_context(&owner_root, &context).unwrap();
+
+        // A start holds the lifecycle claim from final root preparation through
+        // worktree-add and session registration. Storage must wait, then see
+        // the new child and refuse to remove the root.
+        let start_claim = crate::file_lock::acquire_repository_lifecycle_lock(&owner_root).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let candidate_for_apply = candidate.clone();
+        let layout_for_apply = layout.clone();
+        let apply = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            result_tx
+                .send(apply_candidate(&candidate_for_apply, &layout_for_apply))
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+        match result_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            unexpected => {
+                drop(start_claim);
+                let _ = apply.join();
+                panic!("storage apply did not wait for the lifecycle claim: {unexpected:?}");
+            }
+        }
+
+        std::fs::create_dir(root.join("new-session")).unwrap();
+        drop(start_claim);
+        let error = result_rx.recv().unwrap().unwrap_err();
+        apply.join().unwrap();
+
+        assert!(error.contains("new-session"), "{error}");
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert!(root.join(".cargo/config.toml").is_file());
+        assert!(root.join("new-session").is_dir());
+    }
+
+    #[test]
+    fn start_claims_lifecycle_before_recreating_a_removed_empty_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_root = tmp.path().join("repository");
+        let _owner_repo = init_storage_root_test_repository(&owner_root);
+        let test_storage = crate::test_storage::TestStorage::new();
+        let repository = ThisRepository::observe(&owner_root).unwrap();
+        let root = test_storage.host_state_dir().join(&repository.key);
+        let mut options = test_storage.options();
+        options.worktree_root = Some(root.clone());
+        let mut broker = crate::Broker::open_with_options(&owner_root, options).unwrap();
+        assert!(
+            !root.exists(),
+            "opening the broker must not prepare this root"
+        );
+
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            crate::broker::WORKTREE_CARGO_CONFIG,
+        )
+        .unwrap();
+        assert!(write_attributed_marker(&root, &repository).unwrap());
+        let lifecycle_claim =
+            crate::file_lock::acquire_repository_lifecycle_lock(&owner_root).unwrap();
+        assert!(remove_empty_root(&root).unwrap() > 0);
+        assert!(!root.exists());
+
+        let lifecycle_claim = std::sync::Arc::new(std::sync::Mutex::new(Some(lifecycle_claim)));
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_root = root.clone();
+        let claim_at_boundary = std::sync::Arc::clone(&lifecycle_claim);
+        let observed_at_boundary = std::sync::Arc::clone(&observed);
+        broker.worktree_lifecycle_test_observer = Some(std::sync::Arc::new(move |main_root| {
+            *observed_at_boundary.lock().unwrap() =
+                Some((main_root.to_path_buf(), observed_root.exists()));
+            // Release synchronously at the actual claim boundary so the
+            // test exercises the normal entrypoint without a worker that
+            // could be left blocked if setup regresses.
+            drop(claim_at_boundary.lock().unwrap().take());
+        }));
+
+        // This callback runs at the actual start path's lifecycle-claim
+        // boundary. With preparation ordered after the claim, the root is
+        // still absent. Moving preparation back before the claim makes this
+        // observation fail deterministically.
+        let session = broker.start_worktree("root race", None).unwrap();
+        let (observed_main_root, root_was_prepared_before_claim) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("start reached the lifecycle claim boundary");
+        assert_eq!(
+            observed_main_root,
+            owner_root.canonicalize().unwrap(),
+            "the observer must be called for this repository"
+        );
+        assert!(
+            !root_was_prepared_before_claim,
+            "start recreated the root before claiming the lifecycle lock"
+        );
+        let worktree = PathBuf::from(session.worktree_path);
+        assert!(worktree.starts_with(&root));
+        assert!(worktree.is_dir());
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+        assert_eq!(
+            std::fs::read(root.join(".cargo/config.toml")).unwrap(),
+            crate::broker::WORKTREE_CARGO_CONFIG.as_bytes()
+        );
     }
 
     #[test]
