@@ -155,7 +155,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
-  leave stale Git pointers after teardown. For storage-preparation tests
+  leave stale Git pointers after teardown. The environment override is a
+  container: create it before startup, leaving its per-repository child absent
+  so fresh binding can create it. For storage-preparation tests
   that require broker placement ownership, use `start --task ... --json`
   to create a managed worktree. Read `worktree_placement.root`,
   canonicalize it and the returned worktree path, assert containment, and
@@ -193,7 +195,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   drop/reopen; dropping one broker handle must not delete session checkouts.
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
-  directory separately.
+  directory separately. Initialize Git before deriving paths under its metadata:
+  a helper called before initialization may select a different fallback directory.
   Complete fixture branch/ref setup before opening the broker whenever
   possible: its live default database may be .aethyme/broker.db, and a later
   git add -A can commit it. Before any post-open branch switch, assert the
