@@ -1,0 +1,17 @@
+Aethyme local patch record for libsqlite3-sys 0.30.1
+
+Upstream provenance
+- Crate: libsqlite3-sys 0.30.1, crates.io archive SHA-256 2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149.
+- Upstream repository revision: 499cc7bb986e04cc66e6ed762522f7ea449178d1.
+- The unmodified upstream `sqlite3/sqlite3.c` SHA-256 is c01235302fe80da901fb70c7622c39147e29d9f29b7f6eb746b23517f320c90d.
+- Upstream Cargo manifests, licenses, bindings, SQLite and SQLCipher sources are retained; this file records the local delta.
+
+Local delta
+- `build.rs` watches `sqlite3/aethyme_probe.inc` as an input to the bundled SQLite build.
+- `sqlite3/sqlite3.c` includes `aethyme_probe.inc` and invokes its drain hooks at Unix VFS descriptor, lock, and WAL shared-memory lifecycle points.
+- `sqlite3/aethyme_probe.inc` provides the private versioned metadata-probe ABI used by the broker. It supports the bundled Unix VFS with POSIX locking and the supported macOS NFS method, preserves no-follow metadata opens, and retains descriptors until VFS lock and shared-memory accounting indicates that closing is safe. Unsupported VFS configurations fail closed.
+- The helper bounds retained descriptor slots at 128 and returns an explicit capacity refusal. Slots become reusable after SQLite releases the matching lock/shared-memory references and the VFS drains them.
+- Workspace `Cargo.toml` selects this path-patched crate and excludes it from workspace auto-membership. `Cargo.lock` keeps version 0.30.1 and the same dependency list while omitting the registry source/checksum fields required for a path patch.
+
+Maintenance
+A future libsqlite3-sys or bundled SQLite update must reapply this delta against the new upstream source, recheck all Rust-side no-follow, inode, owner, mode, link-count, and size guards, and requalify rollback-journal locks, WAL/SHM alias handling, bounded capacity refusal, and recovery after VFS close. The native helper is specific to this bundled Unix VFS patch; do not use it with a different SQLite VFS or build configuration without requalification.
