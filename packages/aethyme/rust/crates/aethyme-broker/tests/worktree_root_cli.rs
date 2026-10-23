@@ -180,7 +180,8 @@ fn run_with_host_paths(
     preparation_cache: Option<&Path>,
     args: &[&str],
 ) -> Output {
-    let mut command = common::broker_cli(CLI, args)
+    let mut command = common::broker_cli(CLI, args);
+    command
         .current_dir(repo)
         .env("AETHYME_HOST_STATE_DIR", host_state)
         .env(
@@ -819,10 +820,11 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
             };
             std::fs::create_dir_all(&selected_container).unwrap();
             let mut plan_command =
-                common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
-                    .current_dir(&repo)
-                    .env("AETHYME_HOST_STATE_DIR", &state)
-                    .env("AETHYME_HOST_CACHE_DIR", &cache);
+                common::broker_cli(CLI, &["advanced", "worktree-root", "--json"]);
+            plan_command
+                .current_dir(&repo)
+                .env("AETHYME_HOST_STATE_DIR", &state)
+                .env("AETHYME_HOST_CACHE_DIR", &cache);
             if override_root {
                 plan_command.env("AETHYME_WORKTREE_ROOT", &root_container);
             }
