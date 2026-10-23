@@ -3142,10 +3142,10 @@ where
     for root in roots {
         // `inspect_root` already knows that a non-directory entry is not a
         // storage container, and that a Git checkout placed at the container
-        // level is never reconciled as one. Preserve that classification for
-        // cache liveness too: retain its own key as evidence, but do not walk
-        // through it. If the path cannot supply a key, cache inventory will
-        // become unknown and retain entries.
+        // level is never reconciled as one. Preserve the observed path without
+        // walking through it. Cache liveness distinguishes regular files,
+        // which cannot contain a checkout, from symlinks and other unresolved
+        // types, which keep the inventory unknown.
         if root.filesystem_kind != StorageFilesystemKind::Directory
             || root.marker_status == StorageMarkerStatus::NotApplicable
         {
@@ -3266,10 +3266,12 @@ fn inspect_preparation_cache(
     let mut live_keys = BTreeSet::new();
     let mut liveness_unknown = false;
     for root in live_roots {
-        // `current_cache_key` reads config by path. Require a real root first
-        // so a non-directory or symlink cannot supply a confident key.
+        // `current_cache_key` reads config by path. Only a real directory can
+        // supply a key. A regular file cannot contain a checkout, while a
+        // symlink, special file, or missing path leaves liveness unknown.
         match std::fs::symlink_metadata(root) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.file_type().is_file() => continue,
             Ok(_) | Err(_) => {
                 liveness_unknown = true;
                 continue;
@@ -3696,6 +3698,23 @@ fn apply_preparation_candidate_under_lease(
         }
     } else {
         for root in live_roots {
+            let metadata = std::fs::symlink_metadata(root).map_err(|error| {
+                format!(
+                    "cannot verify preparation liveness at {}: {error}",
+                    root.display()
+                )
+            })?;
+            if metadata.file_type().is_file() {
+                // A regular file cannot be a checkout. Recheck its type at
+                // apply time so a replacement symlink or special file refuses.
+                continue;
+            }
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(format!(
+                    "cannot verify preparation liveness at {}; it is not a real directory",
+                    root.display()
+                ));
+            }
             let key = crate::preparation::current_cache_key_before(root, Some(deadline))
                 .map_err(|error| format!("cannot verify preparation liveness: {error}"))?;
             if key.as_deref() == Some(candidate.key.as_str()) {
@@ -5804,7 +5823,7 @@ mod tests {
                 assert!(candidates.is_empty());
             };
 
-        let non_directory_root = temporary.path().join("non-directory-root");
+        let non_directory_root = temporary.path().join(".DS_Store");
         std::fs::write(&non_directory_root, b"not a checkout directory").unwrap();
         let file_root = inspect_root(
             &non_directory_root,
@@ -5816,7 +5835,56 @@ mod tests {
         );
         assert_eq!(file_root.filesystem_kind, StorageFilesystemKind::File);
         let expected_file_path = file_root.path.clone();
-        assert_unknown_root_retains_entries(file_root, &expected_file_path, &mut records);
+        let mut should_not_descend = |_: &Path| -> Result<Vec<PathBuf>, StorageError> {
+            panic!("a regular file is not a storage container")
+        };
+        let live_roots = preparation_live_roots_with_reader(
+            &main_root,
+            &[],
+            &[file_root],
+            &BTreeSet::new(),
+            &mut should_not_descend,
+        )
+        .unwrap();
+        assert!(live_roots.iter().any(|root| root == &expected_file_path));
+        let (entries, candidates) = inspect_preparation_cache(
+            &cache_root,
+            &live_roots,
+            crate::SizeScan::Recorded,
+            &mut records,
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(candidates.len(), 2);
+        assert!(entries.iter().all(|entry| entry.reclaimable));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.reason.contains("inputs have changed"))
+        );
+
+        // Liveness uses a fresh lstat: if the observed file becomes a
+        // directory with unreadable preparation config before inspection,
+        // the inventory returns to fail-closed behavior.
+        std::fs::remove_file(&non_directory_root).unwrap();
+        std::fs::create_dir_all(non_directory_root.join(".aethyme")).unwrap();
+        std::fs::write(
+            non_directory_root.join(".aethyme/prepare.toml"),
+            "invalid = [",
+        )
+        .unwrap();
+        let (entries, candidates) = inspect_preparation_cache(
+            &cache_root,
+            &live_roots,
+            crate::SizeScan::Recorded,
+            &mut records,
+        );
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries.iter().all(|entry| {
+                !entry.reclaimable && entry.reason.contains("could not be verified")
+            })
+        );
+        assert!(candidates.is_empty());
 
         #[cfg(unix)]
         {
@@ -5834,6 +5902,81 @@ mod tests {
             let expected_link_path = link_root.path.clone();
             assert_unknown_root_retains_entries(link_root, &expected_link_path, &mut records);
         }
+    }
+
+    #[test]
+    fn reviewed_preparation_removal_ignores_current_regular_file_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("preparation-cache");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("ccccccccccc1");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"stale").unwrap();
+        let candidate = StoragePreparationCandidate {
+            path: entry.clone(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
+            key: "ccccccccccc1".into(),
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: "no checkout computes this key".into(),
+        };
+        let ordinary_file = tmp.path().join(".DS_Store");
+        std::fs::write(&ordinary_file, b"desktop metadata").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+
+        let removed = apply_preparation_candidate_with_lease_at(
+            &candidate,
+            &[ordinary_file],
+            &resource_db_path,
+            &cache_root,
+        );
+
+        assert!(
+            removed.is_ok(),
+            "a regular file cannot be a live checkout: {removed:?}"
+        );
+        assert!(!entry.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewed_preparation_removal_refuses_a_root_replaced_by_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("preparation-cache");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("ccccccccccc1");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"stale").unwrap();
+        let candidate = StoragePreparationCandidate {
+            path: entry.clone(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
+            key: "ccccccccccc1".into(),
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: "no checkout computes this key".into(),
+        };
+        let root = tmp.path().join(".DS_Store");
+        std::fs::write(&root, b"desktop metadata").unwrap();
+        let target = tmp.path().join("unknown-target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::remove_file(&root).unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+
+        let result = apply_preparation_candidate_with_lease_at(
+            &candidate,
+            &[root],
+            &resource_db_path,
+            &cache_root,
+        );
+
+        assert!(
+            result.is_err(),
+            "a replacement symlink makes liveness unknown"
+        );
+        assert!(entry.join("cache.bin").is_file());
     }
 
     #[test]
