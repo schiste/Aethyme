@@ -318,9 +318,10 @@ fn summary_defers_gate_history_queries_to_full_inspection() {
             .any(|source| source.source == "broker.db gate_results"),
         "full inspection must report unavailable gate history: {blockers:?}"
     );
-    drop(broker);
-
-    let summary = json_status(fixture.path(), &["status", "--summary", "--json"]);
+    // Inspect through the already-open broker: a new CLI process correctly
+    // refuses a database missing a required table during schema validation,
+    // before it reaches the snapshot collector this regression exercises.
+    let summary = serde_json::to_value(broker.status_brief_snapshot(0).unwrap()).unwrap();
     let advice = summary["advice"].as_array().unwrap();
     assert!(
         !advice.iter().any(|item| {
