@@ -197,9 +197,11 @@ mod unix {
         RepositoryWorktreeBindingState,
     };
     use super::*;
-    use std::ffi::OsString;
+    use std::ffi::{CString, OsString};
     use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
     use std::io::Read;
+    use std::num::NonZeroU64;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::thread;
@@ -218,6 +220,247 @@ mod unix {
         inode: u64,
         uid: u32,
         mode: u32,
+    }
+
+    const SQLITE_PROBE_ABI_V1: u32 = 1;
+    const SQLITE_PROBE_MAIN_DATABASE: u32 = 1;
+    const SQLITE_PROBE_SIDECAR: u32 = 2;
+    const SQLITE_PROBE_CAPACITY_REFUSAL: i32 = 0x4159_5001;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct SqliteProbeResultV1 {
+        abi_version: u32,
+        struct_size: u32,
+        handle: u64,
+        device: u64,
+        inode: u64,
+        size: u64,
+        links: u64,
+        uid: u64,
+        mode: u64,
+    }
+
+    impl SqliteProbeResultV1 {
+        fn new() -> Self {
+            Self {
+                abi_version: SQLITE_PROBE_ABI_V1,
+                struct_size: std::mem::size_of::<Self>() as u32,
+                ..Self::default()
+            }
+        }
+
+        fn metadata(&self, path: &Path, label: &str) -> Result<ProbeMetadata, BrokerError> {
+            let uid = u32::try_from(self.uid).map_err(|_| {
+                refusal(format!(
+                    "{label} probe returned an invalid owner: {}",
+                    path.display()
+                ))
+            })?;
+            let mode = u32::try_from(self.mode).map_err(|_| {
+                refusal(format!(
+                    "{label} probe returned invalid mode metadata: {}",
+                    path.display()
+                ))
+            })?;
+            Ok(ProbeMetadata {
+                device: self.device,
+                inode: self.inode,
+                size: self.size,
+                links: self.links,
+                uid,
+                mode,
+            })
+        }
+    }
+
+    unsafe extern "C" {
+        fn sqlite3_aethyme_probe_acquire_v1(
+            path: *const std::ffi::c_char,
+            kind: u32,
+            out: *mut SqliteProbeResultV1,
+        ) -> std::ffi::c_int;
+        fn sqlite3_aethyme_probe_metadata_v1(
+            handle: u64,
+            out: *mut SqliteProbeResultV1,
+        ) -> std::ffi::c_int;
+        fn sqlite3_aethyme_probe_release_v1(handle: u64) -> std::ffi::c_int;
+    }
+
+    /// Opaque native token for a probe descriptor retained until SQLite's
+    /// Unix VFS can close it without releasing process-associated locks.
+    /// This guard is scoped to the initialized bundled SQLite runtime.
+    struct SqliteProbeFile {
+        handle: NonZeroU64,
+    }
+
+    impl SqliteProbeFile {
+        fn open(path: &Path, kind: u32, label: &str) -> Result<(Self, ProbeMetadata), BrokerError> {
+            let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|source| {
+                io_error(
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, source),
+                )
+            })?;
+            let mut result = SqliteProbeResultV1::new();
+            // SAFETY: path_c is NUL-terminated and remains alive through the
+            // call; result is a writable repr(C) v1 object initialized above.
+            let code =
+                unsafe { sqlite3_aethyme_probe_acquire_v1(path_c.as_ptr(), kind, &mut result) };
+            if code != rusqlite::ffi::SQLITE_OK {
+                return Err(sqlite_probe_error(path, label, code));
+            }
+            let Some(handle) = NonZeroU64::new(result.handle) else {
+                return Err(refusal(format!(
+                    "{label} probe returned success without a descriptor token"
+                )));
+            };
+            let file = Self { handle };
+            if result.abi_version != SQLITE_PROBE_ABI_V1
+                || result.struct_size as usize != std::mem::size_of::<SqliteProbeResultV1>()
+            {
+                return Err(refusal(format!(
+                    "{label} probe returned an invalid ABI record"
+                )));
+            }
+            let metadata = result.metadata(path, label)?;
+            Ok((file, metadata))
+        }
+
+        fn metadata_snapshot(
+            &self,
+            path: &Path,
+            label: &str,
+        ) -> Result<ProbeMetadata, BrokerError> {
+            let mut result = SqliteProbeResultV1::new();
+            // SAFETY: result is a writable repr(C) v1 object; the token was
+            // created by the matching native acquire function and is live.
+            let code = unsafe { sqlite3_aethyme_probe_metadata_v1(self.handle.get(), &mut result) };
+            if code != rusqlite::ffi::SQLITE_OK {
+                return Err(sqlite_probe_error(path, label, code));
+            }
+            if result.abi_version != SQLITE_PROBE_ABI_V1
+                || result.struct_size as usize != std::mem::size_of::<SqliteProbeResultV1>()
+                || result.handle != 0
+            {
+                return Err(refusal(format!(
+                    "{label} probe returned an invalid metadata record"
+                )));
+            }
+            result.metadata(path, label)
+        }
+    }
+
+    impl Drop for SqliteProbeFile {
+        fn drop(&mut self) {
+            // SAFETY: this object owns the unique nonzero token returned by
+            // acquire; SQLite's native helper serializes and validates release.
+            let code = unsafe { sqlite3_aethyme_probe_release_v1(self.handle.get()) };
+            if code != rusqlite::ffi::SQLITE_OK {
+                crate::warn_unrecorded(
+                    "release SQLite metadata probe",
+                    Err::<(), String>(format!("native release returned SQLite code {code}")),
+                );
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ProbeMetadata {
+        device: u64,
+        inode: u64,
+        size: u64,
+        links: u64,
+        uid: u32,
+        mode: u32,
+    }
+
+    trait GuardMetadata {
+        fn is_regular_file(&self) -> bool;
+        fn device_number(&self) -> u64;
+        fn inode_number(&self) -> u64;
+        fn byte_len(&self) -> u64;
+        fn link_count(&self) -> u64;
+        fn owner_uid(&self) -> u32;
+        fn permission_mode(&self) -> u32;
+    }
+
+    impl GuardMetadata for Metadata {
+        fn is_regular_file(&self) -> bool {
+            self.is_file()
+        }
+
+        fn device_number(&self) -> u64 {
+            MetadataExt::dev(self)
+        }
+
+        fn inode_number(&self) -> u64 {
+            MetadataExt::ino(self)
+        }
+
+        fn byte_len(&self) -> u64 {
+            self.len()
+        }
+
+        fn link_count(&self) -> u64 {
+            MetadataExt::nlink(self)
+        }
+
+        fn owner_uid(&self) -> u32 {
+            MetadataExt::uid(self)
+        }
+
+        fn permission_mode(&self) -> u32 {
+            MetadataExt::mode(self)
+        }
+    }
+
+    impl GuardMetadata for ProbeMetadata {
+        fn is_regular_file(&self) -> bool {
+            u64::from(self.mode) & u64::from(libc::S_IFMT) == u64::from(libc::S_IFREG)
+        }
+
+        fn device_number(&self) -> u64 {
+            self.device
+        }
+
+        fn inode_number(&self) -> u64 {
+            self.inode
+        }
+
+        fn byte_len(&self) -> u64 {
+            self.size
+        }
+
+        fn link_count(&self) -> u64 {
+            self.links
+        }
+
+        fn owner_uid(&self) -> u32 {
+            self.uid
+        }
+
+        fn permission_mode(&self) -> u32 {
+            self.mode
+        }
+    }
+
+    fn sqlite_probe_error(path: &Path, label: &str, code: i32) -> BrokerError {
+        if code == SQLITE_PROBE_CAPACITY_REFUSAL {
+            return refusal(format!(
+                "{label} probe capacity (128 descriptors) is exhausted while SQLite retains files: {}",
+                path.display()
+            ));
+        }
+        let detail = if code == rusqlite::ffi::SQLITE_IOERR_FSTAT {
+            "could not take a safe file metadata snapshot"
+        } else {
+            "could not securely open or validate the file"
+        };
+        refusal(format!(
+            "{label} {detail} (SQLite probe code {code}): {}",
+            path.display()
+        ))
     }
 
     struct DbPaths {
@@ -696,20 +939,12 @@ mod unix {
                 )));
             }
             let expected = file_identity(&before);
-            let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-            let file = options
-                .open(&sidecar)
-                .map_err(|source| io_error(&sidecar, source))?;
-            let opened = file
-                .metadata()
-                .map_err(|source| io_error(&sidecar, source))?;
-            if !opened.file_type().is_file()
-                || opened.uid() != effective_uid()
-                || opened.nlink() != 1
-                || opened.mode() & 0o022 != 0
+            let (_file, opened) =
+                SqliteProbeFile::open(&sidecar, SQLITE_PROBE_SIDECAR, "SQLite sidecar")?;
+            if !opened.is_regular_file()
+                || opened.owner_uid() != effective_uid()
+                || opened.link_count() != 1
+                || opened.permission_mode() & 0o022 != 0
                 || file_identity(&opened) != expected
             {
                 return Err(refusal(format!(
@@ -742,14 +977,14 @@ mod unix {
     }
 
     fn checked_legacy_file(
-        metadata: &Metadata,
+        metadata: &impl GuardMetadata,
         expected_links: u64,
         label: &str,
     ) -> Result<FileIdentity, BrokerError> {
-        if !metadata.is_file()
-            || metadata.uid() != effective_uid()
-            || metadata.mode() & 0o022 != 0
-            || metadata.nlink() != expected_links
+        if !metadata.is_regular_file()
+            || metadata.owner_uid() != effective_uid()
+            || metadata.permission_mode() & 0o022 != 0
+            || metadata.link_count() != expected_links
         {
             return Err(refusal(format!(
                 "{label} must be an owned, non-group/world-writable regular file with {expected_links} link(s)"
@@ -776,17 +1011,10 @@ mod unix {
         path: &Path,
         expected_links: u64,
         label: &str,
-    ) -> Result<(File, FileIdentity), BrokerError> {
+    ) -> Result<(SqliteProbeFile, FileIdentity), BrokerError> {
         let before = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
         let expected = checked_legacy_file(&before, expected_links, label)?;
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-        let file = options
-            .open(path)
-            .map_err(|source| io_error(path, source))?;
-        let opened = file.metadata().map_err(|source| io_error(path, source))?;
+        let (file, opened) = SqliteProbeFile::open(path, SQLITE_PROBE_MAIN_DATABASE, label)?;
         if checked_legacy_file(&opened, expected_links, label)? != expected {
             return Err(refusal(format!("{label} changed while opening")));
         }
@@ -795,14 +1023,14 @@ mod unix {
     }
 
     fn checked_private_file(
-        metadata: &Metadata,
+        metadata: &impl GuardMetadata,
         expected_links: u64,
         label: &str,
     ) -> Result<FileIdentity, BrokerError> {
-        if !metadata.is_file()
-            || metadata.uid() != effective_uid()
-            || metadata.mode() & 0o077 != 0
-            || metadata.nlink() != expected_links
+        if !metadata.is_regular_file()
+            || metadata.owner_uid() != effective_uid()
+            || metadata.permission_mode() & 0o077 != 0
+            || metadata.link_count() != expected_links
         {
             return Err(refusal(format!(
                 "{label} must be an owned private regular file with {expected_links} link(s)"
@@ -811,12 +1039,12 @@ mod unix {
         Ok(file_identity(metadata))
     }
 
-    fn file_identity(metadata: &Metadata) -> FileIdentity {
+    fn file_identity(metadata: &impl GuardMetadata) -> FileIdentity {
         FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            uid: metadata.uid(),
-            mode: metadata.mode() & 0o7777,
+            device: metadata.device_number(),
+            inode: metadata.inode_number(),
+            uid: metadata.owner_uid(),
+            mode: metadata.permission_mode() & 0o7777,
         }
     }
 
@@ -838,17 +1066,10 @@ mod unix {
         path: &Path,
         expected_links: u64,
         label: &str,
-    ) -> Result<(File, FileIdentity), BrokerError> {
+    ) -> Result<(SqliteProbeFile, FileIdentity), BrokerError> {
         let before = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
         let expected = checked_private_file(&before, expected_links, label)?;
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-        let file = options
-            .open(path)
-            .map_err(|source| io_error(path, source))?;
-        let opened = file.metadata().map_err(|source| io_error(path, source))?;
+        let (file, opened) = SqliteProbeFile::open(path, SQLITE_PROBE_MAIN_DATABASE, label)?;
         if checked_private_file(&opened, expected_links, label)? != expected {
             return Err(refusal(format!("{label} changed while opening")));
         }
@@ -1054,10 +1275,8 @@ mod unix {
         } else {
             open_private_regular(db_path, expected_links, "fresh repository database")?
         };
-        let before = file
-            .metadata()
-            .map_err(|source| io_error(db_path, source))?;
-        if cap && before.len() > FRESH_DATABASE_MAX_BYTES {
+        let before = file.metadata_snapshot(db_path, "broker database")?;
+        if cap && before.byte_len() > FRESH_DATABASE_MAX_BYTES {
             return Err(refusal("fresh database stage exceeds the 64 MiB cap"));
         }
 
@@ -1139,15 +1358,13 @@ mod unix {
         if cap {
             ensure_file_size(db_path)?;
         }
-        let after = file
-            .metadata()
-            .map_err(|source| io_error(db_path, source))?;
+        let after = file.metadata_snapshot(db_path, "broker database")?;
         let named = if legacy_bound {
             verify_named_legacy_file(db_path, inode, expected_links, "legacy repository database")?
         } else {
             verify_named_file(db_path, inode, expected_links, "fresh repository database")?
         };
-        if before.len() != after.len() || after.len() != named.len() {
+        if before.byte_len() != after.byte_len() || after.byte_len() != named.len() {
             return Err(refusal(
                 "fresh database size changed during read-only verification",
             ));
@@ -1657,6 +1874,520 @@ mod unix {
                     "database sidecar must match the existing broker runtime ignore prefix: {relative}"
                 );
             }
+        }
+
+        #[test]
+        fn metadata_probe_preserves_sqlite_locks_and_reclaims_capacity() {
+            const CHILD_DB_ENV: &str = "AETHYME_TEST_SQLITE_PROBE_LOCK_DB";
+            const CHILD_EXPECT_ENV: &str = "AETHYME_TEST_SQLITE_PROBE_LOCK_EXPECT";
+            const CAPACITY_CHILD_ENV: &str = "AETHYME_TEST_SQLITE_PROBE_CAPACITY_CHILD";
+            const TEST_NAME: &str = concat!(
+                "store::fresh_database::unix::tests::",
+                "metadata_probe_preserves_sqlite_locks_and_reclaims_capacity",
+            );
+
+            if let Some(database) = std::env::var_os(CHILD_DB_ENV) {
+                run_lock_child_case(&database, CHILD_EXPECT_ENV);
+                return;
+            }
+
+            if std::env::var_os(CAPACITY_CHILD_ENV).is_some() {
+                run_probe_capacity_child(
+                    TEST_NAME,
+                    CHILD_DB_ENV,
+                    CHILD_EXPECT_ENV,
+                    CAPACITY_CHILD_ENV,
+                );
+                println!("AETHYME_SQLITE_PROBE_CAPACITY_CHILD_OK");
+                return;
+            }
+
+            let temp = tempfile::tempdir().expect("isolated test directory");
+            let raw_control_db = temp.path().join("raw-close-control.db");
+            let guarded_db = temp.path().join("guarded-probe.db");
+            create_delete_journal_database(&raw_control_db);
+            create_delete_journal_database(&guarded_db);
+
+            // Independent control: closing any descriptor for this inode in
+            // the parent's process releases its POSIX locks. Keep this
+            // disposable database free of data writes.
+            let raw_control = open_immediate_parent(&raw_control_db);
+            let raw = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&raw_control_db)
+                .expect("raw-close control opens the existing regular file");
+            drop(raw);
+            run_lock_child(
+                &raw_control_db,
+                "available",
+                TEST_NAME,
+                CHILD_DB_ENV,
+                CHILD_EXPECT_ENV,
+                CAPACITY_CHILD_ENV,
+            );
+            raw_control
+                .execute_batch("ROLLBACK")
+                .expect("control parent rolls back without data changes");
+            drop(raw_control);
+
+            let guarded_parent = open_immediate_parent(&guarded_db);
+            drop(
+                open_private_regular(&guarded_db, 1, "private-open lock regression")
+                    .expect("the owned mode-0600 database passes private-file checks"),
+            );
+            run_lock_child(
+                &guarded_db,
+                "busy",
+                TEST_NAME,
+                CHILD_DB_ENV,
+                CHILD_EXPECT_ENV,
+                CAPACITY_CHILD_ENV,
+            );
+            guarded_parent
+                .execute_batch("ROLLBACK")
+                .expect("guarded parent releases its rollback-journal lock");
+            run_lock_child(
+                &guarded_db,
+                "available",
+                TEST_NAME,
+                CHILD_DB_ENV,
+                CHILD_EXPECT_ENV,
+                CAPACITY_CHILD_ENV,
+            );
+            drop(guarded_parent);
+
+            let wal_repo = temp.path().join("wal-repository");
+            std::fs::create_dir(&wal_repo).expect("create isolated WAL repository root");
+            let (paths, base, verified) = create_verified_stage(&wal_repo);
+            let published = publish_verified_stage(&paths, &base, &verified)
+                .expect("publish a real bound fresh database for WAL checks");
+            drop(published);
+
+            let wal_parent = Connection::open_with_flags(
+                &paths.final_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .expect("open the published database for WAL lock assertions");
+            let journal_mode: String = wal_parent
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .expect("select WAL mode for the sidecar case");
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            wal_parent
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("parent holds SQLite's WAL writer lock");
+
+            let wal_path = append_suffix(&paths.final_path, "-wal");
+            let shm_path = append_suffix(&paths.final_path, "-shm");
+            assert!(
+                wal_path.is_file(),
+                "active WAL writer creates its WAL sidecar"
+            );
+            assert!(
+                shm_path.is_file(),
+                "active WAL writer creates its SHM sidecar"
+            );
+
+            let reverified = verify_database(
+                &paths,
+                &paths.final_path,
+                &base,
+                DatabaseProof::PublishedUnbound { expected_links: 1 },
+            )
+            .expect("full published-database verification succeeds during a WAL writer");
+            assert_eq!(reverified.identity, verified.identity);
+            run_lock_child(
+                &paths.final_path,
+                "busy",
+                TEST_NAME,
+                CHILD_DB_ENV,
+                CHILD_EXPECT_ENV,
+                CAPACITY_CHILD_ENV,
+            );
+
+            wal_parent
+                .execute_batch("ROLLBACK")
+                .expect("WAL parent releases its writer transaction");
+            run_lock_child(
+                &paths.final_path,
+                "available",
+                TEST_NAME,
+                CHILD_DB_ENV,
+                CHILD_EXPECT_ENV,
+                CAPACITY_CHILD_ENV,
+            );
+            drop(wal_parent);
+
+            run_capacity_child_process(
+                TEST_NAME,
+                CHILD_DB_ENV,
+                CHILD_EXPECT_ENV,
+                CAPACITY_CHILD_ENV,
+            );
+        }
+
+        fn run_lock_child_case(database: &std::ffi::OsStr, expected_env: &str) {
+            let expected = std::env::var(expected_env).expect("child expectation is set");
+            let connection = Connection::open_with_flags(
+                PathBuf::from(database),
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .expect("child opens the existing test database");
+            connection
+                .busy_timeout(Duration::ZERO)
+                .expect("zero busy timeout is accepted");
+
+            match connection.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => {
+                    connection
+                        .execute_batch("ROLLBACK")
+                        .expect("child releases its immediate transaction");
+                    assert_eq!(expected, "available", "the database must be locked");
+                }
+                Err(rusqlite::Error::SqliteFailure(failure, _)) => {
+                    assert_eq!(failure.code, rusqlite::ErrorCode::DatabaseBusy);
+                    assert_eq!(failure.extended_code, rusqlite::ffi::SQLITE_BUSY);
+                    assert_eq!(expected, "busy", "the database lock unexpectedly vanished");
+                }
+                Err(error) => panic!("expected exact SQLITE_BUSY or success, got {error:?}"),
+            }
+            println!("AETHYME_SQLITE_PROBE_LOCK_CHILD_OK:{expected}");
+        }
+
+        fn run_lock_child(
+            database: &Path,
+            expected: &str,
+            test_name: &str,
+            database_env: &str,
+            expected_env: &str,
+            capacity_child_env: &str,
+        ) {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("locate this unit-test binary"),
+            );
+            command
+                .args(["--exact", test_name, "--nocapture"])
+                .env(database_env, database)
+                .env(expected_env, expected)
+                .env_remove(capacity_child_env);
+            let output = match crate::bounded_output::output_limited(
+                &mut command,
+                Duration::from_secs(15),
+                64 * 1024,
+            )
+            .expect("launch the exact child lock probe")
+            {
+                crate::bounded_output::LimitedOutput::Completed(output) => output,
+                crate::bounded_output::LimitedOutput::Deadline => {
+                    panic!("child lock probe exceeded its 15-second budget")
+                }
+                crate::bounded_output::LimitedOutput::OutputLimit => {
+                    panic!("child lock probe exceeded its 64 KiB output cap")
+                }
+            };
+            assert!(
+                output.status.success(),
+                "child expected {expected:?}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let marker = format!("AETHYME_SQLITE_PROBE_LOCK_CHILD_OK:{expected}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == marker.as_str()),
+                "exact child test did not emit its validated result marker: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn run_capacity_child_process(
+            test_name: &str,
+            database_env: &str,
+            expected_env: &str,
+            capacity_child_env: &str,
+        ) {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("locate this unit-test binary"),
+            );
+            command
+                .args(["--exact", test_name, "--nocapture"])
+                .env(capacity_child_env, "1")
+                .env_remove(database_env)
+                .env_remove(expected_env);
+            let output = match crate::bounded_output::output_limited(
+                &mut command,
+                Duration::from_secs(30),
+                64 * 1024,
+            )
+            .expect("launch the exact isolated probe-capacity case")
+            {
+                crate::bounded_output::LimitedOutput::Completed(output) => output,
+                crate::bounded_output::LimitedOutput::Deadline => {
+                    panic!("probe-capacity child exceeded its 30-second budget")
+                }
+                crate::bounded_output::LimitedOutput::OutputLimit => {
+                    panic!("probe-capacity child exceeded its 64 KiB output cap")
+                }
+            };
+            assert!(
+                output.status.success(),
+                "capacity child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == "AETHYME_SQLITE_PROBE_CAPACITY_CHILD_OK"),
+                concat!(
+                    "exact capacity child did not emit its validated result marker: ",
+                    "stdout={} stderr={}",
+                ),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn run_probe_capacity_child(
+            test_name: &str,
+            database_env: &str,
+            expected_env: &str,
+            capacity_child_env: &str,
+        ) {
+            let temp = tempfile::tempdir().expect("isolated capacity test directory");
+            let wal_repo = temp.path().join("wal-repository");
+            std::fs::create_dir(&wal_repo).expect("create isolated WAL repository root");
+            let (paths, base, verified) = create_verified_stage(&wal_repo);
+            let published = publish_verified_stage(&paths, &base, &verified)
+                .expect("publish a real bound fresh database for capacity checks");
+            drop(published);
+
+            let wal_parent = Connection::open_with_flags(
+                &paths.final_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .expect("open the published database for capacity checks");
+            let journal_mode: String = wal_parent
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .expect("select WAL mode for capacity checks");
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            wal_parent
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("capacity parent holds the WAL writer lock");
+
+            let shm_path = append_suffix(&paths.final_path, "-shm");
+            assert!(
+                shm_path.is_file(),
+                "active WAL writer creates its SHM sidecar"
+            );
+            let alias = temp.path().join("shm-hard-link-alias");
+            std::fs::hard_link(&shm_path, &alias)
+                .expect("create a disposable hard-link alias to the live SHM inode");
+            let (alias_probe, alias_metadata) =
+                SqliteProbeFile::open(&alias, SQLITE_PROBE_SIDECAR, "live SHM alias regression")
+                    .expect("native metadata probe opens the live SHM alias");
+            assert_eq!(alias_metadata.link_count(), 2);
+            drop(alias_probe);
+            let alias_refusal = check_existing_sidecars(&paths, &paths.final_path)
+                .expect_err("the production guard rejects a second SHM hard link");
+            assert!(
+                alias_refusal.to_string().contains("with one link"),
+                "unexpected refusal for the SHM hard-link alias: {alias_refusal}",
+            );
+            std::fs::remove_file(&alias).expect("remove the disposable SHM alias");
+            check_existing_sidecars(&paths, &paths.final_path)
+                .expect("the actual sidecars return to their expected single-link state");
+
+            verify_database(
+                &paths,
+                &paths.final_path,
+                &base,
+                DatabaseProof::PublishedUnbound { expected_links: 1 },
+            )
+            .expect("full verification succeeds while capacity case holds a WAL writer");
+
+            let mut successful_checks = 0usize;
+            let mut saw_capacity_refusal = false;
+            for _ in 0..=128 {
+                match check_existing_sidecars(&paths, &paths.final_path) {
+                    Ok(()) => successful_checks += 1,
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains("probe capacity (128 descriptors)") =>
+                    {
+                        saw_capacity_refusal = true;
+                        break;
+                    }
+                    Err(error) => panic!("sidecar check failed before capacity: {error}"),
+                }
+            }
+            assert!(
+                saw_capacity_refusal,
+                "persistent WAL references must cause an explicit bounded-capacity refusal"
+            );
+            assert!(
+                successful_checks >= 120,
+                "expected one retained SHM probe per pass, got {} successful passes",
+                successful_checks,
+            );
+
+            run_lock_child(
+                &paths.final_path,
+                "busy",
+                test_name,
+                database_env,
+                expected_env,
+                capacity_child_env,
+            );
+            wal_parent
+                .execute_batch("ROLLBACK")
+                .expect("capacity parent releases the WAL writer lock");
+            run_lock_child(
+                &paths.final_path,
+                "available",
+                test_name,
+                database_env,
+                expected_env,
+                capacity_child_env,
+            );
+            drop(wal_parent);
+
+            // A stale token must not release a newer token that reused its
+            // table cell. Both live records remain readable after rejection.
+            let (first, _) = SqliteProbeFile::open(
+                &paths.final_path,
+                SQLITE_PROBE_MAIN_DATABASE,
+                "stale-token first probe",
+            )
+            .expect("first probe acquires a token");
+            let stale_handle = first.handle.get();
+            let (second, _) = SqliteProbeFile::open(
+                &paths.final_path,
+                SQLITE_PROBE_MAIN_DATABASE,
+                "stale-token second probe",
+            )
+            .expect("second probe acquires an independent token");
+            drop(first);
+            let (third, _) = SqliteProbeFile::open(
+                &paths.final_path,
+                SQLITE_PROBE_MAIN_DATABASE,
+                "stale-token replacement probe",
+            )
+            .expect("replacement probe can reuse a released slot");
+            assert_eq!(
+                third.handle.get() & 0xff,
+                stale_handle & 0xff,
+                "replacement token reuses the released token-table cell",
+            );
+            assert_ne!(third.handle.get(), stale_handle);
+            // SAFETY: this deliberately replays an invalidated opaque token to
+            // verify the helper rejects it without touching a live token.
+            let stale_release = unsafe { sqlite3_aethyme_probe_release_v1(stale_handle) };
+            assert_eq!(stale_release, rusqlite::ffi::SQLITE_MISUSE);
+            second
+                .metadata_snapshot(&paths.final_path, "stale-token second probe")
+                .expect("stale-token rejection leaves the second token valid");
+            third
+                .metadata_snapshot(&paths.final_path, "stale-token replacement probe")
+                .expect("stale-token rejection leaves the replacement token valid");
+            drop((second, third));
+
+            let mut held = Vec::with_capacity(128);
+            for _ in 0..128 {
+                let (probe, _) = SqliteProbeFile::open(
+                    &paths.final_path,
+                    SQLITE_PROBE_MAIN_DATABASE,
+                    "descriptor-capacity recovery",
+                )
+                .expect("all slots are reclaimed after the WAL connection closes");
+                held.push(probe);
+            }
+            let overflow = match SqliteProbeFile::open(
+                &paths.final_path,
+                SQLITE_PROBE_MAIN_DATABASE,
+                "descriptor-capacity boundary",
+            ) {
+                Ok((probe, _)) => {
+                    drop(probe);
+                    panic!("the 129th live probe must refuse at fixed capacity");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                overflow
+                    .to_string()
+                    .contains("probe capacity (128 descriptors)")
+            );
+            drop(held);
+            let (recovered, _) = SqliteProbeFile::open(
+                &paths.final_path,
+                SQLITE_PROBE_MAIN_DATABASE,
+                "descriptor-capacity post-release recovery",
+            )
+            .expect("releasing a full batch returns probe capacity");
+            drop(recovered);
+        }
+
+        fn create_delete_journal_database(path: &Path) {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+            let created = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .expect("create a fresh mode-0600 database inode");
+            drop(created);
+
+            let connection = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .expect("initialize the existing database file");
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .expect("select rollback-journal mode");
+            assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+            connection
+                .execute_batch("CREATE TABLE lock_probe (value INTEGER NOT NULL);")
+                .expect("create fixture schema before lock assertions");
+            drop(connection);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("keep the database private after SQLite initialization");
+            let metadata = std::fs::metadata(path).expect("inspect the initialized database");
+            assert_eq!(metadata.uid(), effective_uid());
+            assert_eq!(metadata.mode() & 0o777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+        }
+
+        fn open_immediate_parent(path: &Path) -> Connection {
+            let connection = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .expect("parent opens the existing database");
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("read the existing journal mode");
+            assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("parent holds SQLite's rollback-journal RESERVED lock");
+            connection
         }
 
         fn create_verified_stage(repo_root: &Path) -> (DbPaths, IdentityBase, VerifiedDatabase) {
