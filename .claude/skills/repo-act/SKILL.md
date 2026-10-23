@@ -19,6 +19,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Before declaring a regression missing during issue triage, inspect likely
   test bodies and their assertions, not only test names. An interruption or
   recovery test may already exercise the exact state under a broader name.
+- During issue-status audits, treat plan and architecture prose as a claim:
+  map each acceptance criterion to current implementation and test assertions
+  at the audited commit before marking it absent or complete.
 - Inspect caution zones before changing generated or vendored areas.
 
 ## Validation Checklist
@@ -428,7 +431,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   repository's current merge requirements. Distinguish queued optional
   cache-recording jobs from required checks; retain their pending status without
   imposing an extra merge gate. Investigate any failed substantive check even
-  when it is optional, and never bypass a required check.
+  when it is optional, and never bypass a required check. After retargeting a
+  stacked PR, verify required jobs actually ran for the current head and base;
+  a skipped job from an edited-event filter is not passing validation. Inspect
+  workflow triggers and trigger an authorized real run without changing reviewed
+  source or inventing a pass.
 - Before publishing a PR body, run the repository's contract checker against
   that exact body and base. Use its literal checkbox syntax (for example,
   `- [x] **none**`), not prose such as `Contract: none`, and verify the checker

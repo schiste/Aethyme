@@ -29,7 +29,8 @@ renames change them. These are existing semantics and remain unchanged.
 |---|---|---|
 | `SourceSnapshotId` | **Implemented, experimental v0.** Golden vectors from an independent implementation. | `aethyme-contracts::experimental_v0::source_snapshot` |
 | `NodeId` (existing) | **Unchanged.** Body and signature independence now pinned by a test (T65 baseline, #700). | `aethyme-graph-indexer/tests/rust_indexer.rs` |
-| `ProjectId` | Proposed below; no code. | — |
+| `ProjectId` | Experimental v0 enrollment and approved descriptor binding are implemented; T03 association qualification remains pending. | `aethyme-contracts::experimental_v0::project_identity`; `aethyme-broker::collaboration_cli::project` |
+| `ProjectAssociation` | Experimental v0 exact-record proposal, local confirmation, revocation and fail-closed mapping resolution are implemented; T03 host-lane qualification remains pending. | `aethyme-contracts::experimental_v0::project_association`; `aethyme-broker::collaboration_cli::project_association`; `aethyme-broker::experimental_symbol_mapping` |
 | `FileId` | Proposed below; generic enrollment and rename/copy/split rules remain unqualified after bounded E1. | — |
 | `ContributionId` / `ContributionRevisionId` | Proposed below; generic lineage remains unqualified after the specific bounded E1 inheritance and subtraction cases. | — |
 | `BrokerId` / `SessionRef` | Proposed below; no code. | — |
@@ -62,14 +63,35 @@ renames change them. These are existing semantics and remain unchanged.
 | Case and composition | **Faithful (decided 2026-10-09).** Paths differing only by letter case or Unicode composition are distinct, valid entries, as in Git. Materialization (#670) must refuse such collisions explicitly on a case-insensitive or normalizing filesystem. |
 | Not | A Git object id, the graph manifest digest, or execution identity (#670). |
 
-### ProjectId: proposed
+### ProjectId: experimental v0; T03 association qualification pending
 
 - **Minted** once, at random, in an explicit enrollment descriptor (`proj:<random 128-bit,
   base32>`). Not derived from URL, path or tree; the current repository key is path-derived
   and stays a local storage key only.
-- **Two clones** enrolled independently get two ProjectIds. They are bound only by an
-  authenticated, reviewed association record, never by a matching URL or tree (T03).
+- **Two clones** enrolled independently get two ProjectIds. They can be associated only
+  by an exact operator-confirmed record that rechecks both committed descriptors and both
+  independently approved local bindings, never by a matching URL or tree.
 - **Lifecycle:** a rebind is an explicit new descriptor revision, never an edit in place.
+
+### ProjectAssociation: experimental v0; T03 qualification pending
+
+- `aethyme collab project association propose --peer-repo <path> [--write]` names the
+  exact local and peer ProjectKeys, ProjectIds, committed descriptor RecordIds and anchor
+  snapshots. Every explicit proposal also has a bounded `sha256:<64 lowercase hex>` nonce
+  in its canonical record, so proposing the same bound pair later yields a new exact
+  RecordId. The nonce is not secret and grants no authority. A proposal file changes no
+  collaboration store.
+- `confirm --peer-repo <path> --confirm <record-id>` revalidates both current committed
+  descriptor pointers and both independently approved bindings, then writes one canonical
+  object and one row in the invoking project's existing identity/object store. The peer
+  remains read-only; confirmation does not create a cross-database transaction.
+- `revoke --confirm <record-id>` changes only the local row. Mapping resolution reloads
+  that canonical row and both approved bindings on each call; stale, missing, revoked,
+  ambiguous, unavailable or wrong-side state resolves as unknown.
+- Revoked association records remain tombstones and cannot be reactivated. To associate
+  the same pair again, move or remove the old proposal file, create a fresh proposal and
+  explicitly confirm its new RecordId; the old RecordId remains revoked.
+- Associations grant no source permission, execution, acceptance or transitive authority.
 
 ### FileId: proposed; generic transition rules remain unqualified
 
@@ -160,7 +182,7 @@ renames change them. These are existing semantics and remain unchanged.
 | Plan test | State |
 |---|---|
 | T01 (canonical golden vectors) | Rust canonical vectors for source snapshots, records and analysis are present and independently checked. TypeScript parity is deferred until a real TS consumer exists; it is not evidence for unimplemented TS behavior. |
-| T03 (two clones) | Pending: needs the ProjectId enrollment descriptor and reviewed clone-association binding. AQ0 synthetic Git clones exercise scoped symbol mapping, not same-project enrollment. |
+| T03 (two clones) | Implementation and process-level CLI coverage added; qualification pending the focused host-lane run. The test starts from two clones of one origin commit/tree, then uses the real CLI enrollment, binding, proposal, confirmation, reopen and revocation routes. |
 | T05 (rename, copy, split, competing paths) | Pending: needs generic FileId enrollment and explicit rename/copy/split/competing-path behavior. The bounded E1 move/edit profile does not qualify identity transitions. |
 | T65 (body edit keeps NodeId, revision changes) | Baseline done (#700). The "revision binds the exact input" half is #655's envelope. |
 | T66 (scoped symbols, clone mapping) | The bounded AQ0 fixture is source-qualified: 4/4 actual-clone tests, including NodeId preservation, plus 3/3 symbol-vector tests. The adapter remains advisory and no producer integration is claimed. See [AQ0 evidence](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md). |

@@ -49,6 +49,8 @@ pub mod composition;
 mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
+// The T03 mapping adapter is compiled for the experimental contract tests but is not activated by a provider.
+#[allow(dead_code)]
 pub mod experimental_symbol_mapping;
 pub mod local_capture_notice;
 pub mod native_gates;

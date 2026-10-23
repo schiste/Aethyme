@@ -80,6 +80,40 @@ fn open_archive_lock(store: &CollaborationStore) -> std::io::Result<std::fs::Fil
     open_lock_file(&path)
 }
 
+fn open_existing_archive_lock_read_only(
+    store: &CollaborationStore,
+) -> std::io::Result<std::fs::File> {
+    let path = lock_path(store);
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("archive lock has no parent directory"))?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive lock directory {} is not a real directory",
+                parent.display()
+            ),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("archive lock {} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 /// The archive held shared: reclamation cannot apply until it drops.
 #[derive(Debug)]
 pub struct ArchiveUse {
@@ -164,6 +198,18 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     file.lock_shared()?;
     #[cfg(test)]
     report_archive_use_acquired();
+    Ok(ArchiveUse {
+        project_dir: store.project_dir().into(),
+        _file: file,
+    })
+}
+
+/// Hold an existing archive barrier shared without creating or modifying
+/// peer state. This blocks exclusive reclamation while held; other shared
+/// archive users may still proceed.
+pub(crate) fn archive_use_read_only(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
+    let file = open_existing_archive_lock_read_only(store)?;
+    file.lock_shared()?;
     Ok(ArchiveUse {
         project_dir: store.project_dir().into(),
         _file: file,
@@ -1065,6 +1111,31 @@ impl<'a> Closure<'a> {
             }
             self.snapshot(&anchor)?;
             self.snapshot(&bootstrap)?;
+        }
+        if self.store.schema_version() >= 31 {
+            let associations: Vec<(String, String)> = collect_live_roots(
+                self.store
+                    .read_connection()
+                    .prepare(
+                        "SELECT association_record_id,association_object_sha256
+                         FROM local_project_associations ORDER BY association_record_id",
+                    )?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?,
+                &mut self.identity_roots_remaining,
+            )?;
+            for (record_id, digest) in associations {
+                if RecordId::parse(&record_id).is_err() {
+                    self.problems.push(format!(
+                        "project association has malformed record id {record_id}"
+                    ));
+                }
+                match parse_hex_digest(&digest) {
+                    Some(digest) => self.object(digest, RetentionClass::Record),
+                    None => self.problems.push(format!(
+                        "project association {record_id} has malformed object digest"
+                    )),
+                }
+            }
         }
         Ok(())
     }
@@ -2753,6 +2824,99 @@ mod tests {
         );
         apply(&mut store, &plan.digest, &defaults()).unwrap();
         assert_reconstructs(&store, &one);
+    }
+
+    #[test]
+    fn confirmed_and_revoked_project_associations_remain_roots_after_grace() {
+        use aethyme_contracts::experimental_v0::{
+            ProjectAssociationDescriptor, ProjectAssociationNonce, ProjectId, RecordId,
+            SourceSnapshotId,
+        };
+
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        assert!(store.schema_version() >= 31);
+        let association = |nonce: char| {
+            ProjectAssociationDescriptor::new(
+                "proj-a",
+                "proj-b",
+                ProjectId::parse("proj:aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                ProjectId::parse("proj:bbbbbbbbbbbbbbbbbbbbbbbbba").unwrap(),
+                RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap(),
+                RecordId::parse(&format!("sha256:{}", "2".repeat(64))).unwrap(),
+                SourceSnapshotId::parse(&format!("sha256:{}", "3".repeat(64))).unwrap(),
+                SourceSnapshotId::parse(&format!("sha256:{}", "4".repeat(64))).unwrap(),
+                ProjectAssociationNonce::parse(format!("sha256:{}", nonce.to_string().repeat(64)))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let confirmed = association('5');
+        let revoked = association('6');
+        let mut rooted_objects = Vec::new();
+        for (descriptor, status, revoked_ms) in [
+            (&confirmed, "confirmed", None),
+            (&revoked, "revoked", Some(2_i64)),
+        ] {
+            let (bytes, record_id) = descriptor.to_record();
+            let digest = crate::collaboration_archive::put_object(&store, &bytes).unwrap();
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO local_project_associations
+                     (association_record_id,association_object_sha256,local_project_key,
+                      local_project_id,peer_project_id,local_descriptor_record_id,
+                      peer_descriptor_record_id,peer_project_key,status,confirmed_ms,revoked_ms)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10)",
+                    rusqlite::params![
+                        record_id.as_str(),
+                        digest.hex(),
+                        descriptor.local_project_key(),
+                        descriptor.local_project_id().as_str(),
+                        descriptor.peer_project_id().as_str(),
+                        descriptor.local_descriptor_record_id().as_str(),
+                        descriptor.peer_descriptor_record_id().as_str(),
+                        descriptor.peer_project_key(),
+                        status,
+                        revoked_ms,
+                    ],
+                )
+                .unwrap();
+            rooted_objects.push((record_id, digest));
+        }
+
+        age(&store);
+        for (_, digest) in &rooted_objects {
+            let grace_elapsed = std::time::SystemTime::now()
+                .duration_since(
+                    std::fs::metadata(object_path(&store, digest))
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(grace_elapsed > std::time::Duration::from_millis(DEFAULT_GRACE_MS as u64));
+        }
+
+        let plan = plan(&mut store, &defaults()).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_eq!(plan.retained[&RetentionClass::Record].objects, 2);
+        for (_, digest) in &rooted_objects {
+            let path = object_relpath(digest);
+            assert!(
+                objects(&plan).iter().all(|item| item.relpath != path),
+                "association object {path} became reclaimable: {:?}",
+                plan.reclaimable
+            );
+        }
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
+        for (record_id, digest) in rooted_objects {
+            let bytes = crate::collaboration_archive::read_object(&store, &digest).unwrap();
+            let (_, observed_record_id) =
+                ProjectAssociationDescriptor::from_record(&bytes).unwrap();
+            assert_eq!(observed_record_id, record_id);
+        }
     }
 
     #[test]

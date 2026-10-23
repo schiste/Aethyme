@@ -253,6 +253,44 @@ fn open_response_lock(store: &CollaborationStore) -> Result<File, SensitiveError
     open_response_lock_at(store.project_dir())
 }
 
+fn open_existing_response_lock_read_only(
+    store: &CollaborationStore,
+) -> Result<File, SensitiveError> {
+    let path = lock_path(store);
+    let parent = path
+        .parent()
+        .ok_or_else(|| SensitiveError::Invalid("response lock directory".into()))?;
+    for directory in [
+        parent,
+        parent
+            .parent()
+            .ok_or_else(|| SensitiveError::Invalid("response lock authority directory".into()))?,
+    ] {
+        let metadata = fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(SensitiveError::Invalid(format!(
+                "response lock directory {} is not a real directory",
+                directory.display()
+            )));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(SensitiveError::Invalid(format!(
+            "response lock {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
 /// Hold a shared response barrier and reject a tombstoned project.
 pub fn response_use(store: &CollaborationStore) -> Result<ResponseUse, SensitiveError> {
     let path = lock_path(store);
@@ -267,6 +305,44 @@ pub fn response_use(store: &CollaborationStore) -> Result<ResponseUse, Sensitive
         return Ok(guard);
     }
     let file = open_response_lock(store)?;
+    file.lock_shared()?;
+    let state = Rc::new(SharedLockState {
+        _file: file,
+        count: Cell::new(1),
+    });
+    RESPONSE_READERS.with(|readers| {
+        readers.borrow_mut().insert(path.clone(), state.clone());
+    });
+    let guard = ResponseUse {
+        path,
+        state,
+        _not_send: PhantomData,
+    };
+    if let Err(error) = ensure_available(store) {
+        drop(guard);
+        return Err(error);
+    }
+    Ok(guard)
+}
+
+/// Hold the existing response barrier without creating or modifying files.
+/// Peer-project verification uses this so a read never initializes that
+/// project's state as a side effect.
+pub(crate) fn response_use_read_only(
+    store: &CollaborationStore,
+) -> Result<ResponseUse, SensitiveError> {
+    let path = lock_path(store);
+    if let Some(state) = RESPONSE_READERS.with(|readers| readers.borrow().get(&path).cloned()) {
+        state.count.set(state.count.get().saturating_add(1));
+        let guard = ResponseUse {
+            path,
+            state,
+            _not_send: PhantomData,
+        };
+        ensure_available(store)?;
+        return Ok(guard);
+    }
+    let file = open_existing_response_lock_read_only(store)?;
     file.lock_shared()?;
     let state = Rc::new(SharedLockState {
         _file: file,

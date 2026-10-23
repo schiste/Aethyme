@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 30;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 31;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -79,8 +79,10 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 30;
 // resolution authority or its idempotency roots.
 // Schema 30 adjusts only the v27 attempt-charge trigger to admit the managed
 // resolver's existing NULL session label. It adds no columns or new encoding;
-// schema 29 remains the oldest compatible reader.
-const MIN_COMPATIBLE_SCHEMA: i64 = 29;
+// it does not change the compatibility floor.
+// Schema 31 adds confirmed project-association roots. Older reclamation
+// writers cannot see those roots and could delete their canonical objects.
+const MIN_COMPATIBLE_SCHEMA: i64 = 31;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -1130,6 +1132,32 @@ const MIGRATIONS: &[(i64, &str)] = &[
              SELECT RAISE(ABORT, 'resolution attempt requires a v27 pre-dispatch charge');
          END;"#,
     ),
+    (
+        31,
+        r#"CREATE TABLE local_project_associations (
+             association_record_id TEXT PRIMARY KEY NOT NULL,
+             association_object_sha256 TEXT NOT NULL
+                 CHECK (length(association_object_sha256)=64
+                        AND association_object_sha256 NOT GLOB '*[^0-9a-f]*'),
+             local_project_key TEXT NOT NULL,
+             local_project_id TEXT NOT NULL,
+             peer_project_id TEXT NOT NULL,
+             local_descriptor_record_id TEXT NOT NULL,
+             peer_descriptor_record_id TEXT NOT NULL,
+             peer_project_key TEXT NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('confirmed','revoked')),
+             confirmed_ms INTEGER NOT NULL CHECK (confirmed_ms >= 0),
+             revoked_ms INTEGER,
+             CHECK (local_project_id <> peer_project_id),
+             CHECK ((status='confirmed' AND revoked_ms IS NULL)
+                    OR (status='revoked' AND revoked_ms IS NOT NULL))
+         ) STRICT;
+         CREATE UNIQUE INDEX local_project_associations_active_pair
+             ON local_project_associations(local_project_id,peer_project_id)
+             WHERE status='confirmed';
+         CREATE INDEX local_project_associations_by_peer
+             ON local_project_associations(peer_project_id,status);"#,
+    ),
 ];
 /// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
 /// while preserving all schema-25 rows. Fixtures start from a current store,
@@ -1150,6 +1178,7 @@ pub(crate) fn drop_identity_revision_schema_for_legacy_fixture(
          DROP TABLE IF EXISTS reclaimed_contribution_revisions;
          DROP TABLE IF EXISTS contribution_revisions;
          DROP TABLE IF EXISTS local_logical_contributions;
+         DROP TABLE IF EXISTS local_project_associations;
          DROP TABLE IF EXISTS local_project_file_ids;
          DROP TABLE IF EXISTS local_project_bindings;
          DROP INDEX IF EXISTS capture_receipts_operation_lineage;",
@@ -1791,6 +1820,28 @@ pub fn inspect_for_repository(
         return Ok(None);
     }
     inspect_at(project_dir, project).map(Some)
+}
+
+/// Open an existing repository project's collaboration store read-only.
+/// Unlike [`open_for_repository`], this never creates, configures or migrates
+/// state; it is used when an operation must verify a peer binding without
+/// writing to that project's database.
+pub(crate) fn inspect_store_for_repository(
+    main_root: &Path,
+    project: &ProjectKey,
+) -> Result<Option<CollaborationStore>, CollaborationStateError> {
+    let (_, project_dir, exists) = locate_for_repository(main_root, project)?;
+    if !exists {
+        return Ok(None);
+    }
+    let snapshot = inspect_at(project_dir, project)?;
+    Ok(Some(CollaborationStore {
+        project: project.clone(),
+        project_dir: snapshot.project_dir,
+        connection: snapshot.connection,
+        durability: snapshot.durability,
+        schema_version: snapshot.schema_version,
+    }))
 }
 
 /// [`inspect_for_repository`] for a located project directory that holds a
@@ -2738,7 +2789,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_associations; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
@@ -2868,11 +2919,11 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 29);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 31);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
-        // Earlier writers cannot preserve immutable revision heads, durable
-        // asynchronous attempts or the archive roots those attempts name.
-        const { assert!(MIN_COMPATIBLE_SCHEMA >= 29) };
+        // The floor must cover both durable asynchronous roots and the new
+        // canonical objects retained by project associations.
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 31) };
     }
 
     #[test]
@@ -3001,7 +3052,10 @@ mod tests {
         drop(store);
 
         let mut migrated = open(host.path(), &[]).unwrap();
-        assert_eq!(migrated.schema_version(), 30);
+        assert_eq!(
+            migrated.schema_version(),
+            COLLABORATION_STATE_SCHEMA_VERSION
+        );
         let floor: i64 = migrated
             .read_connection()
             .query_row(
@@ -3010,7 +3064,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(floor, 29);
+        assert_eq!(floor, MIN_COMPATIBLE_SCHEMA);
         assert_eq!(
             attempt_row(migrated.read_connection(), "schema30-existing-charge"),
             before,
@@ -4858,7 +4912,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE IF EXISTS reclaimed_contribution_revisions; DROP TABLE IF EXISTS contribution_revision_identity_bases; DROP TABLE IF EXISTS contribution_revision_heads; DROP TABLE IF EXISTS contribution_revisions; DROP TABLE IF EXISTS local_logical_contributions; DROP TABLE IF EXISTS local_project_associations; DROP TABLE IF EXISTS local_project_file_ids; DROP TABLE IF EXISTS local_project_bindings; DROP INDEX IF EXISTS capture_receipts_operation_lineage; DROP TABLE IF EXISTS contribution_briefs; DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )

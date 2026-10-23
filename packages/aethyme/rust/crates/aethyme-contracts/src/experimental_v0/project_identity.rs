@@ -1062,7 +1062,7 @@ pub struct FileNamespaceConflict {
     pub kind: FileNamespaceConflictKind,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProjectIdentityError {
     #[error("invalid logical project ID {0:?}")]
     InvalidProjectId(String),
