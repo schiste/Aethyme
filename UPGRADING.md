@@ -23,6 +23,89 @@ Breaking releases: [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
 
+Unreleased migration note: [schema 54 worktree-root binding](#unreleased-schema-54-worktree-root-binding).
+
+## Unreleased: schema 54 worktree-root binding
+
+These notes describe the implementation on main; no release version has been
+assigned. They are not a report that an existing database has been migrated or
+that rollout has occurred.
+
+### Compatibility
+
+The broker schema is now version 54. The additive v54 migration creates the
+per-repository worktree-root binding table and, when needed, one unscoped
+`legacy_unbound` row. A normal writable open may attach that row to the current
+Git common directory. The migration does not inspect the filesystem, choose a
+worktree root, create a repository UUID marker, or bind a root. Existing
+session, operation, and queue rows are retained. A placement or binding plan
+can open the database and therefore may run this migration and attach its
+unbound row, even though the plan does not create or bind a worktree root.
+
+`MIN_COMPATIBLE_SCHEMA` remains 52. A schema-52-compatible writer can continue
+to use a schema-54 database while its stored compatibility floor remains 52
+and no other feature has raised that floor. Explicitly binding a legacy root or
+reserving a fresh root raises the stored floor to 54 in the same durable state
+transition. After that transition, writers that support only schemas below 54
+refuse the database. When repositories share one `AETHYME_BROKER_DB`, each
+Git common directory has its own binding row, but the compatibility floor
+applies to the shared database.
+
+### Before migrating or binding
+
+Resolve the database path for every repository, including any
+`AETHYME_BROKER_DB` override. Linked worktrees use their repository's common
+database; independent repositories that point at one path share a database.
+Before its first writable open, stop all processes that can write each distinct
+database and make a WAL-aware backup. Install the same router and engine pair
+wherever that database can be opened before applying a root binding. Preserve
+the repository's Git common directory, selected worktree root, and host
+worktree registry; the binding workflow does not relocate them.
+
+### Migrate and bind
+
+The first normal writable open applies the additive v54 migration. It does not
+bind a legacy root. Inspect the selected placement with
+`aethyme broker advanced worktree-root --json`. For an existing legacy root,
+review `aethyme broker advanced worktree-root binding plan <exact-root>
+<keyed_container|direct_root> --json`, then apply only its displayed digest:
+
+```bash
+aethyme broker advanced worktree-root binding apply <exact-root> \
+  <keyed_container|direct_root> --confirm <sha256> --json
+```
+
+The plan and apply refer to the root already on disk; they do not create or
+move it. If a fresh reservation was interrupted, review
+`aethyme broker advanced worktree-root recovery plan --json` and use the
+exact reported digest with:
+
+```bash
+aethyme broker advanced worktree-root recovery apply \
+  --confirm <sha256> --json
+```
+
+Recovery refuses unknown files, marker contents, registry entries, or database
+sidecar states. It does not discard unknown files, reset the database, or
+select a different root. Do not repair a refusal by editing markers or binding
+rows by hand.
+
+### Rollback
+
+Before a root-binding transition, a migrated database can be opened by an
+older writer with schema-52 support that honors `min_compatible_schema` while
+the stored floor remains 52, provided no other feature has raised it. Schema
+54 has no down migration. After binding or fresh-root reservation raises the
+floor to 54, older binaries are refused; do not lower the floor or drop the
+binding table to force a downgrade.
+
+After a binding transition, rollback requires a coordinated restore with
+writers stopped: restore the database from a pre-transition backup together
+with its corresponding repository UUID marker, worktree-root marker, and host
+registry state. Restoring only the database is not a supported rollback. That
+recovery procedure has not been run against an existing user database as part
+of this unreleased note.
+
 ## Installing or updating (every release)
 
 The `aethyme` router and `aethyme-engine-cli` are one release unit. Install,
