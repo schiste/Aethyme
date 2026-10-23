@@ -26,6 +26,7 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Before committing a substantive change, use colon-terminated section headings (`Problem:`, `Decision:`, `Rationale:`, `Validation:`) and require `aethyme repo lint-commit-message <file>` to report `Valid: yes`; the linter does not recognize bare headings.
 - Before standalone `rustfmt` or `rustc` validation, resolve the owning
   crate's Cargo edition, including workspace inheritance, and pass that edition.
   Formatting rules vary by edition even when the source compiles in both; a
