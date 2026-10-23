@@ -50,6 +50,11 @@ impl LeaseClaimPreparation {
     }
 }
 
+struct GuardedExecOutput {
+    stdout: std::process::Stdio,
+    supervised_timeout: std::time::Duration,
+}
+
 impl Broker {
     // ── agents (liveness) ─────────────────────────────────────────────
 
@@ -1657,24 +1662,36 @@ impl Broker {
         command: &[String],
         force_supervised: bool,
         json_mode: bool,
+        requested_timeout: Option<std::time::Duration>,
     ) -> Result<GuardedExecReport, BrokerOpError> {
+        let mode = select_guarded_exec_mode(
+            force_supervised,
+            crate::inline_exec_supervisor::generic_exec_mode,
+        );
+        let supervised_timeout =
+            crate::inline_exec_supervisor::select_guarded_exec_timeout(&mode, requested_timeout)
+                .map_err(|reason| BrokerOpError::GuardedExecTimeoutRequiresSupervision {
+                    session_id,
+                    reason: format!(
+                        "{reason}; add --non-interactive only when the command does not need terminal interaction"
+                    ),
+                })?
+                .unwrap_or(crate::inline_exec_supervisor::DEFAULT_GUARDED_EXEC_TIMEOUT);
         let stdout = if json_mode {
             std::process::Stdio::from(std::io::stderr())
         } else {
             std::process::Stdio::inherit()
         };
-        self.guarded_exec_with_env_heartbeat_mode_and_stdout(
+        self.guarded_exec_with_env_heartbeat_mode_and_output(
             session_id,
             command,
             &[],
             || Ok(()),
-            || {
-                select_guarded_exec_mode(
-                    force_supervised,
-                    crate::inline_exec_supervisor::generic_exec_mode,
-                )
+            move || mode,
+            GuardedExecOutput {
+                stdout,
+                supervised_timeout,
             },
-            stdout,
         )
     }
 
@@ -1718,29 +1735,36 @@ impl Broker {
         F: FnMut() -> Result<(), BrokerOpError>,
         M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
     {
-        self.guarded_exec_with_env_heartbeat_mode_and_stdout(
+        self.guarded_exec_with_env_heartbeat_mode_and_output(
             session_id,
             command,
             environment,
             heartbeat,
             select_mode,
-            std::process::Stdio::inherit(),
+            GuardedExecOutput {
+                stdout: std::process::Stdio::inherit(),
+                supervised_timeout: crate::inline_exec_supervisor::DEFAULT_GUARDED_EXEC_TIMEOUT,
+            },
         )
     }
 
-    fn guarded_exec_with_env_heartbeat_mode_and_stdout<F, M>(
+    fn guarded_exec_with_env_heartbeat_mode_and_output<F, M>(
         &mut self,
         session_id: i64,
         command: &[String],
         environment: &[(String, String)],
         mut heartbeat: F,
         select_mode: M,
-        stdout: std::process::Stdio,
+        output: GuardedExecOutput,
     ) -> Result<GuardedExecReport, BrokerOpError>
     where
         F: FnMut() -> Result<(), BrokerOpError>,
         M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
     {
+        let GuardedExecOutput {
+            stdout,
+            supervised_timeout,
+        } = output;
         let supervisor_executable = self.agent_supervisor_executable.clone();
         self.guarded_exec_with_runner(session_id, command, move |session| {
             let mut execution_environment = vec![
@@ -1775,16 +1799,19 @@ impl Broker {
                         )
                         .map_err(|error| map_guarded_exec_supervisor_error(session_id, command, error))?;
                     let result = supervisor
-                        .run(
+                        .run_with_timeout(
                             Path::new(&session.worktree_path),
                             command,
                             &execution_environment,
+                            Some(supervised_timeout),
                             &mut heartbeat,
                         )
                         .map_err(|error| map_guarded_exec_supervisor_error(session_id, command, error))?;
                     GuardedCommandResult {
                         exit_code: result.exit_code,
                         succeeded: result.succeeded,
+                        timed_out: result.termination
+                            == crate::inline_exec_supervisor::CommandTermination::TimedOut,
                     }
                 }
                 crate::inline_exec_supervisor::GenericExecMode::Legacy(reason) => {
@@ -1832,6 +1859,7 @@ impl Broker {
                     GuardedCommandResult {
                         exit_code: status.code(),
                         succeeded: status.success(),
+                        timed_out: false,
                     }
                 }
             };
@@ -1929,6 +1957,8 @@ impl Broker {
             Ok(GuardedCommandResult {
                 exit_code: result.exit_code,
                 succeeded: result.succeeded,
+                timed_out: result.termination
+                    == crate::inline_exec_supervisor::CommandTermination::TimedOut,
             })
         })
     }
@@ -2008,6 +2038,7 @@ impl Broker {
             command: command.to_vec(),
             exit_code: status.exit_code,
             command_success,
+            command_timed_out: status.timed_out,
             ownership_ok: audit.ok,
             conflicting_leases: audit.conflicting_leases,
             before_dirty_paths: before_dirty,
@@ -2165,6 +2196,7 @@ fn map_guarded_exec_supervisor_error(
 struct GuardedCommandResult {
     exit_code: Option<i32>,
     succeeded: bool,
+    timed_out: bool,
 }
 
 /// The paths a lease refresh records as `session`'s implicit leases, or
@@ -2522,6 +2554,40 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
+    fn supervised_exec_timeout_keeps_the_post_command_ownership_audit() {
+        use std::time::Duration;
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("timed guarded exec", None).unwrap();
+        broker.claim_lease(session.id, "tracked.txt", None).unwrap();
+        let report = broker
+            .guarded_exec_for_cli(
+                session.id,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf before-timeout > tracked.txt; sleep 30".into(),
+                ],
+                true,
+                false,
+                Some(Duration::from_millis(100)),
+            )
+            .unwrap();
+
+        assert!(report.command_timed_out);
+        assert_eq!(report.exit_code, None);
+        assert!(!report.command_success);
+        assert!(report.ownership_ok);
+        assert!(!report.ok);
+        assert!(report.outside_lease_paths.is_empty());
+        assert_eq!(report.touched_paths, vec!["tracked.txt".to_owned()]);
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&session.worktree_path).join("tracked.txt")).unwrap(),
+            "before-timeout"
+        );
+    }
+
+    #[test]
     fn generic_heartbeat_abort_marks_outcome_unknown_and_stops_descendant() {
         use std::time::Duration;
 
@@ -2613,6 +2679,7 @@ mod generic_guarded_exec_tests {
                 ],
                 true,
                 false,
+                None,
             )
             .unwrap_err();
 

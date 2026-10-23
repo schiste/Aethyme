@@ -22,6 +22,8 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const FRAME_IO_TIMEOUT: std::time::Duration = READY_TIMEOUT;
 const HELPER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const GROUP_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const DEFAULT_GUARDED_EXEC_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 
 #[derive(Debug)]
 pub(crate) enum InlineExecError {
@@ -275,12 +277,34 @@ impl WireCommandStartError {
 pub(crate) struct CommandResult {
     pub exit_code: Option<i32>,
     pub succeeded: bool,
+    pub termination: CommandTermination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandTermination {
+    Exited,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GenericExecMode {
     Supervised,
     Legacy(String),
+}
+
+/// Select a deadline only for supervised execution. Legacy mode keeps its
+/// existing behavior unless the caller explicitly asked for a timeout, in
+/// which case refusing is safer than promising a bound it cannot enforce.
+pub(crate) fn select_guarded_exec_timeout(
+    mode: &GenericExecMode,
+    requested: Option<std::time::Duration>,
+) -> Result<Option<std::time::Duration>, String> {
+    match (mode, requested) {
+        (GenericExecMode::Supervised, Some(timeout)) => Ok(Some(timeout)),
+        (GenericExecMode::Supervised, None) => Ok(Some(DEFAULT_GUARDED_EXEC_TIMEOUT)),
+        (GenericExecMode::Legacy(_), None) => Ok(None),
+        (GenericExecMode::Legacy(reason), Some(_)) => Err(reason.clone()),
+    }
 }
 
 fn select_generic_exec_mode(
@@ -544,10 +568,25 @@ impl InlineExecSupervisor {
 
     #[cfg(unix)]
     pub(crate) fn run<F>(
+        self,
+        cwd: &Path,
+        command: &[String],
+        environment: &[(String, String)],
+        heartbeat: F,
+    ) -> Result<CommandResult, InlineExecError>
+    where
+        F: FnMut() -> Result<(), crate::BrokerOpError>,
+    {
+        self.run_with_timeout(cwd, command, environment, None, heartbeat)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn run_with_timeout<F>(
         mut self,
         cwd: &Path,
         command: &[String],
         environment: &[(String, String)],
+        command_timeout: Option<std::time::Duration>,
         mut heartbeat: F,
     ) -> Result<CommandResult, InlineExecError>
     where
@@ -596,27 +635,53 @@ impl InlineExecSupervisor {
             };
         }
 
+        let command_deadline = command_timeout.map(|timeout| Instant::now() + timeout);
         let mut next_ping = Instant::now() + Duration::from_secs(1);
         loop {
+            if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return self.timed_out_result();
+            }
             if let Err(error) = heartbeat() {
+                if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return self.timed_out_result();
+                }
                 let cleanup = self.abort_and_verify();
                 return match cleanup {
                     Ok(()) => Err(InlineExecError::OperationAfterDispatch(error)),
                     Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
                 };
             }
+            if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return self.timed_out_result();
+            }
+            let now = Instant::now();
+            let read_timeout = command_deadline.map_or(Duration::from_millis(200), |deadline| {
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(200))
+            });
             let frame = match read_frame_timeout(
                 self.control.as_mut().expect("control stream is present"),
-                Duration::from_millis(200),
+                read_timeout,
+                command_deadline,
             ) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
+                    if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return self.timed_out_result();
+                    }
                     if Instant::now() >= next_ping {
+                        let ping_deadline = Instant::now() + Duration::from_secs(1);
+                        let write_deadline = command_deadline
+                            .map_or(ping_deadline, |deadline| deadline.min(ping_deadline));
                         if let Err(error) = write_frame_until(
                             self.control.as_mut().expect("control stream is present"),
                             &ParentFrameRef::Ping,
-                            Instant::now() + Duration::from_secs(1),
+                            write_deadline,
                         ) {
+                            if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                                return self.timed_out_result();
+                            }
                             let cleanup = self.terminate_and_verify();
                             return match cleanup {
                                 Ok(()) => Err(InlineExecError::CommandOutcomeUnknown(format!(
@@ -630,6 +695,9 @@ impl InlineExecSupervisor {
                     continue;
                 }
                 Err(error) => {
+                    if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return self.timed_out_result();
+                    }
                     let cleanup = self.terminate_and_verify();
                     return match cleanup {
                         Ok(()) => Err(InlineExecError::CommandOutcomeUnknown(format!(
@@ -646,6 +714,7 @@ impl InlineExecSupervisor {
                     Ok(CommandResult {
                         exit_code: code,
                         succeeded: code == Some(0),
+                        termination: CommandTermination::Exited,
                     })
                 }
                 HelperFrame::CommandStartFailed { error } => {
@@ -682,9 +751,24 @@ impl InlineExecSupervisor {
     #[cfg(not(unix))]
     pub(crate) fn run<F>(
         self,
+        cwd: &Path,
+        command: &[String],
+        environment: &[(String, String)],
+        heartbeat: F,
+    ) -> Result<CommandResult, InlineExecError>
+    where
+        F: FnMut() -> Result<(), crate::BrokerOpError>,
+    {
+        self.run_with_timeout(cwd, command, environment, None, heartbeat)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn run_with_timeout<F>(
+        self,
         _: &Path,
         _: &[String],
         _: &[(String, String)],
+        _: Option<std::time::Duration>,
         _: F,
     ) -> Result<CommandResult, InlineExecError>
     where
@@ -694,6 +778,20 @@ impl InlineExecSupervisor {
             io::ErrorKind::Unsupported,
             "process-group supervision requires a supported Unix platform",
         )))
+    }
+
+    #[cfg(unix)]
+    fn timed_out_result(&mut self) -> Result<CommandResult, InlineExecError> {
+        self.abort_and_verify().map_err(|reason| {
+            InlineExecError::CleanupUnknown(format!(
+                "the execution deadline elapsed after command dispatch; its cleanup could not be verified: {reason}"
+            ))
+        })?;
+        Ok(CommandResult {
+            exit_code: None,
+            succeeded: false,
+            termination: CommandTermination::TimedOut,
+        })
     }
 
     #[cfg(unix)]
@@ -984,9 +1082,11 @@ fn run_helper() -> io::Result<u8> {
                 return Ok(125);
             }
         }
-        if let Some(parent_frame) =
-            read_frame_timeout::<ParentFrame>(&mut control, std::time::Duration::from_millis(100))?
-        {
+        if let Some(parent_frame) = read_frame_timeout::<ParentFrame>(
+            &mut control,
+            std::time::Duration::from_millis(100),
+            None,
+        )? {
             match parent_frame {
                 ParentFrame::Ping => {}
                 ParentFrame::Abort => {
@@ -1389,6 +1489,7 @@ fn read_frame_until<T: serde::de::DeserializeOwned>(
 fn read_frame_timeout<T: serde::de::DeserializeOwned>(
     stream: &mut std::os::unix::net::UnixStream,
     idle_timeout: std::time::Duration,
+    command_deadline: Option<std::time::Instant>,
 ) -> io::Result<Option<T>> {
     with_nonblocking(stream, |stream| {
         let mut received_any = false;
@@ -1406,7 +1507,10 @@ fn read_frame_timeout<T: serde::de::DeserializeOwned>(
         // The short timeout above only answers whether a new frame has begun.
         // Once its first byte arrives, keep one absolute deadline for the rest
         // of the frame so a stalled or dripping peer cannot extend it forever.
-        let frame_deadline = std::time::Instant::now() + FRAME_IO_TIMEOUT;
+        let frame_deadline = command_deadline.map_or_else(
+            || std::time::Instant::now() + FRAME_IO_TIMEOUT,
+            |deadline| (std::time::Instant::now() + FRAME_IO_TIMEOUT).min(deadline),
+        );
         read_exact_until(stream, &mut magic[1..], frame_deadline, &mut received_any)?;
         read_frame_after_magic(stream, magic, frame_deadline, &mut received_any).map(Some)
     })
@@ -1630,6 +1734,36 @@ mod tests {
     }
 
     #[test]
+    fn guarded_exec_timeout_is_defaulted_only_for_supervised_mode() {
+        use std::time::Duration;
+
+        assert_eq!(
+            select_guarded_exec_timeout(&GenericExecMode::Supervised, None).unwrap(),
+            Some(Duration::from_secs(30 * 60))
+        );
+        assert_eq!(
+            select_guarded_exec_timeout(
+                &GenericExecMode::Supervised,
+                Some(Duration::from_secs(17))
+            )
+            .unwrap(),
+            Some(Duration::from_secs(17))
+        );
+        assert_eq!(
+            select_guarded_exec_timeout(&GenericExecMode::Legacy("tty".into()), None).unwrap(),
+            None
+        );
+        assert!(
+            select_guarded_exec_timeout(
+                &GenericExecMode::Legacy("tty".into()),
+                Some(Duration::from_secs(17))
+            )
+            .unwrap_err()
+            .contains("tty")
+        );
+    }
+
+    #[test]
     fn inline_helper_child_fixture() {
         if std::env::var_os("AETHYME_TEST_INLINE_EXEC_SUPERVISOR").is_some() {
             std::process::exit(super::run_helper().unwrap_or(125).into());
@@ -1729,10 +1863,34 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(7));
         assert!(!result.succeeded);
+        assert_eq!(result.termination, CommandTermination::Exited);
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
             "one two:three::literal\nargument"
         );
+    }
+
+    #[test]
+    fn command_deadline_includes_time_spent_in_heartbeat() {
+        use std::time::Duration;
+
+        let owner = tempfile::tempdir().unwrap();
+        let result = start_helper()
+            .run_with_timeout(
+                owner.path(),
+                &["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                &[],
+                Some(Duration::from_millis(100)),
+                || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.termination, CommandTermination::TimedOut);
+        assert_eq!(result.exit_code, None);
+        assert!(!result.succeeded);
     }
 
     #[test]
@@ -2038,7 +2196,7 @@ mod tests {
         let remainder = encoded[1..].to_vec();
         let reader_fd = reader.as_raw_fd();
         let reader_thread = std::thread::spawn(move || {
-            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100))
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100), None)
         });
 
         let consume_deadline = Instant::now() + Duration::from_secs(2);
@@ -2083,7 +2241,8 @@ mod tests {
 
         let started = Instant::now();
         let error =
-            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100)).unwrap_err();
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(100), None)
+                .unwrap_err();
         let elapsed = started.elapsed();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(
@@ -2107,7 +2266,7 @@ mod tests {
 
         let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
         assert!(
-            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(10))
+            read_frame_timeout::<HelperFrame>(&mut reader, Duration::from_millis(10), None)
                 .unwrap()
                 .is_none()
         );
