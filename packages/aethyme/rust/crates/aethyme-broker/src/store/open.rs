@@ -89,6 +89,35 @@ impl BrokerStore {
         Ok(store)
     }
 
+    /// Open a read-only snapshot for one exact repository database path.
+    /// Storage inventory uses this instead of the ambient broker DB override,
+    /// then requires the selected binding row to carry the full captured owner
+    /// identity before it can authorize root cleanup.
+    pub(crate) fn open_snapshot_at_in_repo(
+        repo_root: &Path,
+        database_path: &Path,
+    ) -> Result<Self, BrokerError> {
+        let repository_root = canonical_main_root(repo_root)?;
+        let scope = super::repository_identity::RepositoryBindingScope::capture(
+            &repository_root,
+            database_path,
+        )?;
+        let mut store = Self::open_snapshot_at(database_path)?;
+        store.binding_scope = Some(scope.clone());
+        let binding = store.repository_worktree_binding()?;
+        if binding.repository_root.as_deref() != Some(scope.repository_root.as_path())
+            || binding.git_common_dir.as_deref() != Some(scope.git_common_dir.as_path())
+            || binding.repository_key.as_deref() != Some(scope.repository_key.as_str())
+            || binding.broker_db_path.as_deref() != Some(scope.broker_db_path.as_path())
+            || binding.repository_uuid != scope.repository_uuid
+        {
+            return Err(BrokerError::InvalidRepositoryWorktreeBinding(
+                "owner snapshot binding does not match the selected repository identity".into(),
+            ));
+        }
+        Ok(store)
+    }
+
     /// Open an exact broker database path read-only, without applying the
     /// process-wide repository-database override. Host storage inventory uses
     /// this when joining several repositories' ledgers: one test or embedding
