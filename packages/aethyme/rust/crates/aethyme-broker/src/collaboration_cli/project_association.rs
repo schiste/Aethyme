@@ -3,10 +3,12 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aethyme_contracts::experimental_v0::project_association::{
     MAX_PROJECT_ASSOCIATION_BYTES, PROJECT_ASSOCIATION_PATH, ProjectAssociationDescriptor,
+    ProjectAssociationNonce,
 };
 use aethyme_contracts::experimental_v0::project_identity::{
     PROJECT_DESCRIPTOR_PATH, ProjectDescriptor,
@@ -14,6 +16,7 @@ use aethyme_contracts::experimental_v0::project_identity::{
 use aethyme_contracts::experimental_v0::{RecordId, SourceSnapshot};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::collaboration_archive::{self as archive, CommitOid, ObjectDigest};
 use crate::collaboration_gc::{self, ArchiveUse};
@@ -30,6 +33,9 @@ use super::{Failure, Output};
 const CONFIG_PATH: &str = ".aethyme/config.toml";
 const MAX_POLICY_BYTES: usize = 1024 * 1024;
 const CONFIRM_NEXT: &str = "review the exact association RecordId, then run `aethyme collab project association confirm --peer-repo <path> --confirm <record-id>`";
+const REPROPOSE_NEXT: &str = "move or remove the old `.aethyme/project-association.json`, run `aethyme collab project association propose --peer-repo <path> --write`, then review and confirm the new exact RecordId";
+const ASSOCIATION_NONCE_DOMAIN: &[u8] = b"aethyme association proposal nonce v1\0";
+static ASSOCIATION_PROPOSAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn command(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
     match rest {
@@ -293,12 +299,12 @@ pub(crate) struct ProjectContext {
     pub(crate) main_root: PathBuf,
     pub(crate) key: ProjectKey,
     pub(crate) head_commit: CommitOid,
-    pub(crate) source_snapshot: SourceSnapshot,
+    pub(crate) _source_snapshot: SourceSnapshot,
     pub(crate) descriptor: ProjectDescriptor,
     pub(crate) descriptor_record_id: RecordId,
-    pub(crate) store: CollaborationStore,
+    pub(crate) _store: CollaborationStore,
     pub(crate) binding: ApprovedProjectBinding,
-    pub(crate) archive: ArchiveUse,
+    pub(crate) _archive: ArchiveUse,
     _response: ResponseUse,
 }
 
@@ -395,9 +401,9 @@ pub(crate) fn inspect_project(
         descriptor,
         descriptor_record_id,
         binding,
-        source_snapshot: snapshot,
-        store,
-        archive: archive_use,
+        _source_snapshot: snapshot,
+        _store: store,
+        _archive: archive_use,
         _response: response,
     };
     validate_binding_matches_context(&context.binding, &context)?;
@@ -436,8 +442,24 @@ fn association_descriptor(
         peer.binding.descriptor_record_id().clone(),
         local.binding.descriptor().anchor_snapshot().clone(),
         peer.binding.descriptor().anchor_snapshot().clone(),
+        new_proposal_nonce()?,
     )
     .map_err(|error| Failure::refused("invalid_association", error.to_string(), CONFIRM_NEXT))
+}
+
+fn new_proposal_nonce() -> Result<ProjectAssociationNonce, Failure> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Failure::domain("clock", error.to_string()))?
+        .as_nanos();
+    let sequence = ASSOCIATION_PROPOSAL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut digest = Sha256::new();
+    digest.update(ASSOCIATION_NONCE_DOMAIN);
+    digest.update(timestamp.to_be_bytes());
+    digest.update(std::process::id().to_be_bytes());
+    digest.update(sequence.to_be_bytes());
+    ProjectAssociationNonce::parse(format!("sha256:{:x}", digest.finalize()))
+        .map_err(|error| Failure::domain("invalid_proposal_nonce", error.to_string()))
 }
 
 fn validate_association_sides(
@@ -646,7 +668,7 @@ fn persist_confirmed_association(
         return Err(Failure::refused(
             "association_revoked",
             "this exact association proposal was already revoked and cannot be reactivated",
-            "propose and explicitly confirm a new association record",
+            REPROPOSE_NEXT,
         ));
     }
     let active_count: i64 = transaction

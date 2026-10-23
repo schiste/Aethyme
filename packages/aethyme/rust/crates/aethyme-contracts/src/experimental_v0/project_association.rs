@@ -9,8 +9,11 @@ use super::source_snapshot::SourceSnapshotId;
 
 pub const PROJECT_ASSOCIATION_SCHEMA_NAME: &str = "aethyme.project-association/experimental-v0";
 pub const PROJECT_ASSOCIATION_PATH: &str = ".aethyme/project-association.json";
+pub const PROJECT_ASSOCIATION_PROPOSAL_NONCE_CAPABILITY: &str =
+    "project-association-proposal-nonce-v1";
 pub const MAX_PROJECT_ASSOCIATION_BYTES: usize = 16 * 1024;
 const MAX_PROJECT_KEY_BYTES: usize = 64;
+const PROPOSAL_NONCE_HEX_BYTES: usize = 64;
 
 const fn field(name: &'static str) -> FieldSpec {
     FieldSpec {
@@ -18,6 +21,15 @@ const fn field(name: &'static str) -> FieldSpec {
         required: true,
         kind: FieldKind::String,
         capability: None,
+    }
+}
+
+const fn proposal_nonce_field() -> FieldSpec {
+    FieldSpec {
+        name: "proposal_nonce",
+        required: true,
+        kind: FieldKind::String,
+        capability: Some(PROJECT_ASSOCIATION_PROPOSAL_NONCE_CAPABILITY),
     }
 }
 
@@ -32,9 +44,36 @@ pub static PROJECT_ASSOCIATION_SCHEMA: RecordSchema = RecordSchema {
         field("peer_descriptor_record_id"),
         field("local_anchor_snapshot"),
         field("peer_anchor_snapshot"),
+        proposal_nonce_field(),
     ],
-    capabilities: &[],
+    capabilities: &[PROJECT_ASSOCIATION_PROPOSAL_NONCE_CAPABILITY],
 };
+
+/// A bounded, non-secret value that gives each explicit proposal fresh record
+/// identity. It is not proof, authority, or an approval token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAssociationNonce(String);
+
+impl ProjectAssociationNonce {
+    pub fn parse(value: impl Into<String>) -> Result<Self, ProjectAssociationError> {
+        let value = value.into();
+        let Some(hex) = value.strip_prefix("sha256:") else {
+            return Err(ProjectAssociationError::InvalidProposalNonce);
+        };
+        if hex.len() != PROPOSAL_NONCE_HEX_BYTES
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ProjectAssociationError::InvalidProposalNonce);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// A bounded proposal that names two independently approved local projects.
 /// It does not itself establish authority; the broker must confirm the exact
@@ -49,6 +88,7 @@ pub struct ProjectAssociationDescriptor {
     peer_descriptor_record_id: RecordId,
     local_anchor_snapshot: SourceSnapshotId,
     peer_anchor_snapshot: SourceSnapshotId,
+    proposal_nonce: ProjectAssociationNonce,
 }
 
 impl ProjectAssociationDescriptor {
@@ -62,6 +102,7 @@ impl ProjectAssociationDescriptor {
         peer_descriptor_record_id: RecordId,
         local_anchor_snapshot: SourceSnapshotId,
         peer_anchor_snapshot: SourceSnapshotId,
+        proposal_nonce: ProjectAssociationNonce,
     ) -> Result<Self, ProjectAssociationError> {
         let local_project_key = local_project_key.into();
         let peer_project_key = peer_project_key.into();
@@ -85,6 +126,7 @@ impl ProjectAssociationDescriptor {
             peer_descriptor_record_id,
             local_anchor_snapshot,
             peer_anchor_snapshot,
+            proposal_nonce,
         };
         if association.canonical_bytes().len() > MAX_PROJECT_ASSOCIATION_BYTES {
             return Err(ProjectAssociationError::TooLarge);
@@ -124,6 +166,10 @@ impl ProjectAssociationDescriptor {
         &self.peer_anchor_snapshot
     }
 
+    pub fn proposal_nonce(&self) -> &ProjectAssociationNonce {
+        &self.proposal_nonce
+    }
+
     pub fn to_record(&self) -> (Vec<u8>, RecordId) {
         let bytes = self.canonical_bytes();
         let record = Record::decode(&bytes, &[&PROJECT_ASSOCIATION_SCHEMA])
@@ -135,6 +181,10 @@ impl ProjectAssociationDescriptor {
         Value::Object(
             Object::new(vec![
                 ("schema".into(), text(PROJECT_ASSOCIATION_SCHEMA_NAME)),
+                (
+                    "requires".into(),
+                    Value::Array(vec![text(PROJECT_ASSOCIATION_PROPOSAL_NONCE_CAPABILITY)]),
+                ),
                 ("local_project_key".into(), text(&self.local_project_key)),
                 ("peer_project_key".into(), text(&self.peer_project_key)),
                 (
@@ -161,6 +211,7 @@ impl ProjectAssociationDescriptor {
                     "peer_anchor_snapshot".into(),
                     text(self.peer_anchor_snapshot.as_str()),
                 ),
+                ("proposal_nonce".into(), text(self.proposal_nonce.as_str())),
             ])
             .expect("association fields are distinct"),
         )
@@ -180,6 +231,7 @@ impl ProjectAssociationDescriptor {
         };
         const ALLOWED: &[&str] = &[
             "schema",
+            "requires",
             "local_project_key",
             "peer_project_key",
             "local_project_id",
@@ -188,6 +240,7 @@ impl ProjectAssociationDescriptor {
             "peer_descriptor_record_id",
             "local_anchor_snapshot",
             "peer_anchor_snapshot",
+            "proposal_nonce",
         ];
         if raw.iter().any(|(name, _)| !ALLOWED.contains(&name)) {
             return Err(ProjectAssociationError::UnknownField);
@@ -210,6 +263,7 @@ impl ProjectAssociationDescriptor {
                 .map_err(|_| ProjectAssociationError::InvalidField("local_anchor_snapshot"))?,
             SourceSnapshotId::parse(value("peer_anchor_snapshot")?)
                 .map_err(|_| ProjectAssociationError::InvalidField("peer_anchor_snapshot"))?,
+            ProjectAssociationNonce::parse(value("proposal_nonce")?)?,
         )?;
         if descriptor.canonical_bytes() != input {
             return Err(ProjectAssociationError::NonCanonical);
@@ -236,6 +290,10 @@ pub enum ProjectAssociationError {
     SameProjectId,
     #[error("both association sides must use different descriptor records")]
     SameDescriptor,
+    #[error(
+        "project association proposal nonce must be sha256 followed by 64 lowercase hex digits"
+    )]
+    InvalidProposalNonce,
     #[error(transparent)]
     Project(#[from] ProjectIdentityError),
     #[error(transparent)]
@@ -255,6 +313,7 @@ impl ProjectAssociationError {
             Self::SameStore => "same_store",
             Self::SameProjectId => "same_project_id",
             Self::SameDescriptor => "same_descriptor",
+            Self::InvalidProposalNonce => "invalid_proposal_nonce",
             Self::Project(_) => "invalid_project_id",
             Self::Record(error) => error.code(),
             Self::CanonicalJson(error) => error.code(),

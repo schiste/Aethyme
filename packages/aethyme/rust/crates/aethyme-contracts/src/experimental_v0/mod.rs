@@ -15,7 +15,9 @@ pub use contribution_revision::{
     BriefReference, ContributionId, ContributionRevision, ContributionRevisionError,
 };
 pub use digest::ID_PREFIX;
-pub use project_association::{ProjectAssociationDescriptor, ProjectAssociationError};
+pub use project_association::{
+    ProjectAssociationDescriptor, ProjectAssociationError, ProjectAssociationNonce,
+};
 pub use project_identity::{
     EnrolledFile, FileChange, FileId, FileIdentityTransition, FileNamespaceConflict,
     FileNamespaceConflictKind, FileOperation, FileState, IdentityRelation, ProjectDescriptor,

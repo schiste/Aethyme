@@ -225,9 +225,9 @@ pub(crate) fn resolve_associated_mapping(
     }
 
     let persisted = match identity_store::resolve_persisted_project_association_with_archive_use(
-        &local.store,
+        &local._store,
         association_record_id,
-        &local.archive,
+        &local._archive,
     ) {
         Ok(Some(association)) => association,
         Ok(None) => return MappingResolution::Unknown("association_missing"),
@@ -249,19 +249,19 @@ pub(crate) fn resolve_associated_mapping(
         return MappingResolution::Unknown("association_side_or_binding_mismatch");
     }
 
-    let local_source_id = local.source_snapshot.id();
-    let peer_source_id = peer.source_snapshot.id();
+    let local_source_id = local._source_snapshot.id();
+    let peer_source_id = peer._source_snapshot.id();
     let local_identity = identity_store::resolve_project_file_identity_state_with_archive_use(
-        &local.store,
+        &local._store,
         &local.binding,
         &local_source_id,
-        &local.archive,
+        &local._archive,
     );
     let peer_identity = identity_store::resolve_project_file_identity_state_with_archive_use(
-        &peer.store,
+        &peer._store,
         &peer.binding,
         &peer_source_id,
-        &peer.archive,
+        &peer._archive,
     );
     if !matches!(
         local_identity,

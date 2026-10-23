@@ -86,11 +86,15 @@ pub struct ApprovedProjectBinding {
 /// crate-private and does not grant mapping authority; each mapping resolution
 /// must reload it alongside both independently approved project bindings.
 #[derive(Debug, Clone)]
+// Reserved for the explicit experimental mapping resolver; T03 does not activate it.
+#[allow(dead_code)]
 pub(crate) struct PersistedProjectAssociation {
     descriptor: ProjectAssociationDescriptor,
     confirmed: bool,
 }
 
+// These accessors are consumed only by the reserved experimental resolver.
+#[allow(dead_code)]
 impl PersistedProjectAssociation {
     pub(crate) fn descriptor(&self) -> &ProjectAssociationDescriptor {
         &self.descriptor
@@ -519,6 +523,8 @@ pub(crate) fn resolve_approved_project_binding_with_archive_use(
 /// Reload one exact canonical association from the invoking project's local
 /// identity store. Callers must hold its archive-use barrier and must also
 /// independently reload both project bindings before resolving a mapping.
+// The resolver is intentionally not activated by a provider in experimental T03.
+#[allow(dead_code)]
 pub(crate) fn resolve_persisted_project_association_with_archive_use(
     store: &CollaborationStore,
     association_record_id: &RecordId,

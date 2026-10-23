@@ -77,7 +77,10 @@ renames change them. These are existing semantics and remain unchanged.
 
 - `aethyme collab project association propose --peer-repo <path> [--write]` names the
   exact local and peer ProjectKeys, ProjectIds, committed descriptor RecordIds and anchor
-  snapshots. A proposal file changes no collaboration store.
+  snapshots. Every explicit proposal also has a bounded `sha256:<64 lowercase hex>` nonce
+  in its canonical record, so proposing the same bound pair later yields a new exact
+  RecordId. The nonce is not secret and grants no authority. A proposal file changes no
+  collaboration store.
 - `confirm --peer-repo <path> --confirm <record-id>` revalidates both current committed
   descriptor pointers and both independently approved bindings, then writes one canonical
   object and one row in the invoking project's existing identity/object store. The peer
@@ -85,6 +88,9 @@ renames change them. These are existing semantics and remain unchanged.
 - `revoke --confirm <record-id>` changes only the local row. Mapping resolution reloads
   that canonical row and both approved bindings on each call; stale, missing, revoked,
   ambiguous, unavailable or wrong-side state resolves as unknown.
+- Revoked association records remain tombstones and cannot be reactivated. To associate
+  the same pair again, move or remove the old proposal file, create a fresh proposal and
+  explicitly confirm its new RecordId; the old RecordId remains revoked.
 - Associations grant no source permission, execution, acceptance or transitive authority.
 
 ### FileId: proposed; generic transition rules remain unqualified

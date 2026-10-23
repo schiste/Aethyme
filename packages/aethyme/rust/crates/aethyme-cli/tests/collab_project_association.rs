@@ -177,10 +177,7 @@ fn independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local
         std::fs::copy(playground.join(relative), seed.path().join(relative)).unwrap();
     }
     std::fs::write(seed.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    std::fs::create_dir_all(seed.path().join(".aethyme")).unwrap();
-    std::fs::write(seed.path().join(".aethyme/config.toml"), "").unwrap();
     git(seed.path(), &["add", "-A"]);
-    git(seed.path(), &["add", "-f", ".aethyme/config.toml"]);
     git(seed.path(), &["commit", "-qm", "identical source seed"]);
     let anchor = git(seed.path(), &["rev-parse", "HEAD"]);
     let origin = tempfile::tempdir().unwrap();
@@ -310,4 +307,72 @@ fn independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local
     );
     assert_eq!(code, 3, "{reactivation:#}");
     assert_eq!(reactivation["code"], "association_revoked");
+
+    std::fs::remove_file(left.path().join(".aethyme/project-association.json")).unwrap();
+    let (code, replacement) = fixture.json(
+        left.path(),
+        &[
+            "collab",
+            "project",
+            "association",
+            "propose",
+            "--peer-repo",
+            right.path().to_str().unwrap(),
+            "--write",
+        ],
+    );
+    assert_eq!(code, 0, "{replacement:#}");
+    let replacement_id = replacement["association_record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(replacement_id, association_id);
+    assert_ne!(
+        replacement["association"]["proposal_nonce"], proposal["association"]["proposal_nonce"],
+        "each deliberate proposal gets a fresh nonce"
+    );
+    let (code, replacement_confirmed) = fixture.json(
+        left.path(),
+        &[
+            "collab",
+            "project",
+            "association",
+            "confirm",
+            "--peer-repo",
+            right.path().to_str().unwrap(),
+            "--confirm",
+            &replacement_id,
+        ],
+    );
+    assert_eq!(code, 0, "{replacement_confirmed:#}");
+    assert_eq!(replacement_confirmed["status"], "confirmed");
+
+    let (code, old_still_revoked) = fixture.json(
+        left.path(),
+        &[
+            "collab",
+            "project",
+            "association",
+            "confirm",
+            "--peer-repo",
+            right.path().to_str().unwrap(),
+            "--confirm",
+            &association_id,
+        ],
+    );
+    assert_eq!(code, 3, "{old_still_revoked:#}");
+    assert_eq!(old_still_revoked["code"], "association_revoked");
+    let (code, replacement_peer_missing) = fixture.json(
+        right.path(),
+        &[
+            "collab",
+            "project",
+            "association",
+            "revoke",
+            "--confirm",
+            &replacement_id,
+        ],
+    );
+    assert_eq!(code, 3, "{replacement_peer_missing:#}");
+    assert_eq!(replacement_peer_missing["code"], "association_missing");
 }
