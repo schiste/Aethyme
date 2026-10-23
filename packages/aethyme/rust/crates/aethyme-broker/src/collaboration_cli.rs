@@ -49,12 +49,25 @@ mod contribution;
 mod lifecycle;
 #[path = "collaboration_cli/project.rs"]
 mod project;
+#[path = "collaboration_cli/project_association.rs"]
+pub(crate) mod project_association;
 #[path = "collaboration_cli/resolution.rs"]
 mod resolution;
 #[cfg(test)]
 pub(crate) use project::test_support as project_test_support;
 #[path = "collaboration_cli/sensitive.rs"]
 mod sensitive;
+
+#[cfg(test)]
+pub(crate) fn project_command_for_test(
+    main_root: &Path,
+    worktree: &Path,
+    rest: &[&str],
+) -> Result<Value, String> {
+    project::command(main_root, worktree, rest)
+        .map(|(value, _)| value)
+        .map_err(|failure| format!("{}: {}", failure.code, failure.message))
+}
 
 pub const STATUS_SCHEMA: &str = "aethyme.collab-status/experimental-v0";
 pub const CAPTURE_RECOVER_SCHEMA: &str = "aethyme.collab-capture-recover/experimental-v0";
@@ -100,6 +113,15 @@ Usage:
   aethyme collab project bind --confirm <descriptor-record-id> [--json]
       Bind this local store to the exact descriptor and pointer committed in this clone.
       Binding grants no execution or acceptance authority.
+  aethyme collab project association propose --peer-repo <path> [--write] [--json]
+      Propose a bounded association between two independently approved local projects.
+      The proposal grants no authority until its exact RecordId is confirmed locally.
+  aethyme collab project association confirm --peer-repo <path> --confirm <record-id> [--json]
+      Revalidate both committed descriptors and bindings, then persist confirmation only
+      in the invoking project's local identity/object store.
+  aethyme collab project association revoke --confirm <record-id> [--json]
+      Revoke one exact local association record without accessing the peer store.
+      A revoked RecordId stays revoked; a fresh proposal requires a new exact confirmation.
   aethyme collab contribution revise --operation ID [--brief-file PATH]
        [--file-operations PATH] [--depends-on RECORD_ID...] [--clear-dependencies] [--json]
       Append an immutable revision for one retained capture operation. A retry
@@ -270,7 +292,7 @@ location, or a state that forbids the action; do not retry unchanged).
 
 /// A refused or failed command: what to print and how to exit.
 #[derive(Debug)]
-struct Failure {
+pub(crate) struct Failure {
     code: String,
     message: String,
     next_action: Option<String>,
@@ -473,6 +495,7 @@ fn command_name(args: &[String]) -> String {
         "configure",
         "objective",
         "project",
+        "association",
         "contribution",
         "revise",
         "capture-notice",

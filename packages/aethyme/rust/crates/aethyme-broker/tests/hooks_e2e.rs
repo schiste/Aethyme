@@ -258,11 +258,21 @@ fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
     sh(tmp.path(), &["add", "feature.txt"]);
     sh(tmp.path(), &["commit", "-qm", "feature one"]);
 
-    let blocked = git_output(tmp.path(), &["push", "origin", "HEAD:main"]);
+    let blocked = Command::new("git")
+        .args(["push", "origin", "HEAD:main"])
+        .current_dir(tmp.path())
+        .env_remove("AETHYME_BROKER_SESSION_ID")
+        .env_remove("AETHYME_BROKER_OPERATION_ID")
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&blocked.stderr);
     assert!(!blocked.status.success());
     assert!(
         stderr.contains("git push refused by Aethyme pre-push"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("operation_id_missing_or_invalid"),
         "{stderr}"
     );
     assert!(stderr.contains("broker advanced ship plan"), "{stderr}");
@@ -313,6 +323,25 @@ fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
         !forged.status.success(),
         "forged coordination ids must not unlock a protected push"
     );
+    let forged_stderr = String::from_utf8_lossy(&forged.stderr);
+    assert!(
+        forged_stderr.contains("operation_row_missing"),
+        "{forged_stderr}"
+    );
+
+    let missing_session = Command::new("git")
+        .args(["push", "origin", "HEAD:main"])
+        .current_dir(tmp.path())
+        .env_remove("AETHYME_BROKER_SESSION_ID")
+        .env("AETHYME_BROKER_OPERATION_ID", "11")
+        .output()
+        .unwrap();
+    let missing_session_stderr = String::from_utf8_lossy(&missing_session.stderr);
+    assert!(!missing_session.status.success());
+    assert!(
+        missing_session_stderr.contains("session_id_missing_or_invalid"),
+        "{missing_session_stderr}"
+    );
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("coordinated push")).unwrap();
@@ -342,6 +371,20 @@ fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
         )
         .unwrap();
     drop(broker);
+    let mismatched_session = Command::new("git")
+        .args(["push", "origin", "HEAD:main"])
+        .current_dir(tmp.path())
+        .env("AETHYME_BROKER_SESSION_ID", (session.id + 1).to_string())
+        .env("AETHYME_BROKER_OPERATION_ID", operation.id.to_string())
+        .output()
+        .unwrap();
+    let mismatched_session_stderr = String::from_utf8_lossy(&mismatched_session.stderr);
+    assert!(!mismatched_session.status.success());
+    assert!(
+        mismatched_session_stderr.contains("session_mismatch"),
+        "{mismatched_session_stderr}"
+    );
+
     let coordinated = Command::new("git")
         .args(["push", "origin", "HEAD:main"])
         .current_dir(tmp.path())
@@ -353,6 +396,11 @@ fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
         coordinated.status.success(),
         "{}",
         String::from_utf8_lossy(&coordinated.stderr)
+    );
+    let coordinated_stderr = String::from_utf8_lossy(&coordinated.stderr);
+    assert!(
+        !coordinated_stderr.contains("could not verify coordinated push"),
+        "valid running write was reported as unproved: {coordinated_stderr}"
     );
 }
 

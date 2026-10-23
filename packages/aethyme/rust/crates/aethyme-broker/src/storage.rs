@@ -507,11 +507,38 @@ struct OwnerSources {
     ledger_claimed: BTreeMap<PathBuf, Vec<i64>>,
     session_branch_inventory_complete: bool,
     session_branches: Vec<StorageBranchEntry>,
+    worktree_root_binding_state: crate::store::repository_binding::RepositoryWorktreeBindingState,
+    worktree_root_binding_path: Option<PathBuf>,
     /// Claimed paths whose every claiming session finished its cleanup.
     retired: BTreeSet<PathBuf>,
 }
 
 impl OwnerSources {
+    /// Whether durable repository state makes this root ineligible for
+    /// empty-root reclamation. Unbound owners do not prove that a discovered
+    /// registered root is obsolete; interrupted reservations remain protected.
+    fn empty_root_retention_reason(&self, root: &Path) -> Option<&'static str> {
+        use crate::store::repository_binding::RepositoryWorktreeBindingState;
+
+        match self.worktree_root_binding_state {
+            RepositoryWorktreeBindingState::LegacyUnbound
+            | RepositoryWorktreeBindingState::FreshUnbound => {
+                Some("repository has no confirmed worktree-root binding")
+            }
+            RepositoryWorktreeBindingState::Bound
+            | RepositoryWorktreeBindingState::FreshReserved
+            | RepositoryWorktreeBindingState::RecoveryRequired
+                if self
+                    .worktree_root_binding_path
+                    .as_deref()
+                    .is_some_and(|bound| normalise(bound) == normalise(root)) =>
+            {
+                Some("repository binding selects or reserves this root")
+            }
+            _ => None,
+        }
+    }
+
     /// Whether some session still holds, or means to keep, a worktree here.
     fn has_unretired_claim(&self) -> bool {
         self.ledger_claimed
@@ -1189,7 +1216,20 @@ fn inspect_root(
     let mut owner_sources = None;
     if let (Some(owner), Some(true)) = (repository_root.as_deref(), owner_exists) {
         match inspect_owner(owner, &path) {
-            Ok(sources) => owner_sources = Some(sources),
+            Ok(sources) => {
+                // Binding protects the root's bookkeeping only when the
+                // directory would otherwise be proposed as an EmptyRoot.
+                // Stray-child cleanup remains independently reviewable.
+                if bookkeeping_only
+                    && disk.is_empty()
+                    && let Some(reason) = sources.empty_root_retention_reason(&path)
+                {
+                    blockers.push(format!(
+                        "durable worktree-root binding: {reason}; keep the root"
+                    ));
+                }
+                owner_sources = Some(sources);
+            }
             Err(error) => blockers.push(error),
         }
     }
@@ -4318,12 +4358,20 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
             store_path.display()
         ));
     }
-    let store = BrokerStore::open_snapshot_at(&store_path).map_err(|source| {
+    let store = BrokerStore::open_snapshot_at_in_repo(owner, &store_path).map_err(|source| {
         format!(
-            "session ledger cannot be inspected at {}: {source}",
+            "owner-scoped session ledger and root binding cannot be inspected at {}: {source}; no root is swept",
             store_path.display()
         )
     })?;
+    let worktree_root_binding = store
+        .repository_worktree_binding()
+        .map_err(|source| {
+            format!(
+                "repository worktree-root binding cannot be inspected at {}: {source}; no root is swept",
+                store_path.display()
+            )
+        })?;
     let mut ledger_claimed = BTreeMap::<PathBuf, Vec<i64>>::new();
     let mut all_cleaned = BTreeMap::<PathBuf, bool>::new();
     let uncleared_sessions = store
@@ -4453,6 +4501,8 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
         ledger_claimed,
         session_branch_inventory_complete,
         session_branches,
+        worktree_root_binding_state: worktree_root_binding.state,
+        worktree_root_binding_path: worktree_root_binding.worktree_root,
         retired,
     })
 }
@@ -4549,6 +4599,11 @@ fn apply_candidate(
                 return Err("owning repository disappeared; review a new plan".into());
             }
             let sources = inspect_owner(&candidate.repository_root, &candidate.path)?;
+            if let Some(reason) = sources.empty_root_retention_reason(&candidate.path) {
+                return Err(format!(
+                    "durable worktree-root binding recheck refused removal: {reason}"
+                ));
+            }
             if !sources.git_registered.is_empty() {
                 return Err("Git worktree registration appeared".into());
             }
@@ -8037,14 +8092,106 @@ mod tests {
     }
 
     #[test]
+    fn durable_binding_retains_empty_root_but_allows_stray_child_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_root = tmp.path().join("repository");
+        init_storage_root_test_repository(&owner_root);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&owner_root).unwrap();
+        broker.prepare_worktree_root_for_submission().unwrap();
+
+        let binding = broker.store().repository_worktree_binding().unwrap();
+        assert_eq!(
+            binding.state,
+            crate::store::repository_binding::RepositoryWorktreeBindingState::Bound
+        );
+        let root = binding.worktree_root.unwrap();
+        let marker_observation = read_marker(&root);
+        let marker = marker_observation.marker.unwrap();
+        let marker_bytes = marker_observation.bytes.unwrap();
+        let stale_empty_candidate = StorageCandidate {
+            kind: StorageCandidateKind::EmptyRoot,
+            path: root.clone(),
+            root_path: root.clone(),
+            repository_key: marker.repository_key,
+            repository_root: owner_root.clone(),
+            git_marker: false,
+            estimated_bytes: None,
+            estimated_inodes: None,
+            reason: "fixture reviewed empty root".into(),
+            marker_sha256: format!("{:x}", Sha256::digest(marker_bytes)),
+        };
+
+        let mut records = crate::measurement::SizeRecords::default();
+        let empty_root = inspect_root(
+            &root,
+            now_ms(),
+            0,
+            crate::SizeScan::Recorded,
+            &mut records,
+            &BTreeSet::new(),
+        );
+        assert!(empty_root.empty);
+        assert!(
+            candidates_for_root(&empty_root, 0)
+                .iter()
+                .all(|candidate| candidate.kind != StorageCandidateKind::EmptyRoot),
+            "a durable binding keeps root bookkeeping out of reclamation candidates"
+        );
+        let error = apply_candidate(
+            &stale_empty_candidate,
+            &StorageRootLayout::DirectRoot(root.clone()),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("durable worktree-root binding recheck"),
+            "{error}"
+        );
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+
+        let stray = root.join("unregistered-child");
+        std::fs::create_dir(&stray).unwrap();
+        let nonempty_root = inspect_root(
+            &root,
+            now_ms(),
+            0,
+            crate::SizeScan::Recorded,
+            &mut records,
+            &BTreeSet::new(),
+        );
+        assert!(!nonempty_root.empty);
+        assert!(
+            candidates_for_root(&nonempty_root, 0)
+                .iter()
+                .any(|candidate| {
+                    candidate.kind == StorageCandidateKind::StrayDirectory
+                        && candidate.path == stray
+                }),
+            "binding a root must not hide an otherwise eligible stray child"
+        );
+    }
+
+    #[test]
     fn empty_root_apply_waits_for_start_lifecycle_claim_and_rechecks() {
         let tmp = tempfile::tempdir().unwrap();
         let owner_root = tmp.path().join("repository");
         let owner = init_storage_root_test_repository(&owner_root);
-        let _store = crate::BrokerStore::open(&owner_root.join(crate::BROKER_DB_RELPATH)).unwrap();
+        // The scoped storage snapshot now requires a valid owner binding row.
+        // Bind another legitimate root so this fixture can still exercise the
+        // reviewed, unselected root's post-lock content recheck.
+        let owner_storage = crate::test_storage::TestStorage::new();
+        let mut broker = owner_storage.open(&owner_root).unwrap();
+        broker.prepare_worktree_root_for_submission().unwrap();
+        let selected_root = broker
+            .store()
+            .repository_worktree_binding()
+            .unwrap()
+            .worktree_root
+            .unwrap();
         let host_state = tmp.path().join("host-state");
         let repository = ThisRepository::observe(&owner_root).unwrap();
         let root = host_state.join(&repository.key);
+        assert_ne!(normalise(&selected_root), normalise(&root));
         std::fs::create_dir_all(root.join(".cargo")).unwrap();
         std::fs::write(
             root.join(".cargo/config.toml"),

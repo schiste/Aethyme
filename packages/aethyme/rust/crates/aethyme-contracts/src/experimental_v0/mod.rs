@@ -5,6 +5,7 @@ pub mod brief;
 pub mod canonical_json;
 pub mod contribution_revision;
 mod digest;
+pub mod project_association;
 pub mod project_identity;
 pub mod record;
 pub mod source_snapshot;
@@ -14,6 +15,9 @@ pub use contribution_revision::{
     BriefReference, ContributionId, ContributionRevision, ContributionRevisionError,
 };
 pub use digest::ID_PREFIX;
+pub use project_association::{
+    ProjectAssociationDescriptor, ProjectAssociationError, ProjectAssociationNonce,
+};
 pub use project_identity::{
     EnrolledFile, FileChange, FileId, FileIdentityTransition, FileNamespaceConflict,
     FileNamespaceConflictKind, FileOperation, FileState, IdentityRelation, ProjectDescriptor,

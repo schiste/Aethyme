@@ -8296,7 +8296,14 @@ mod tests {
         .unwrap();
 
         let storage = crate::test_storage::TestStorage::new();
-        let broker = storage.open(&root).unwrap();
+        let mut broker = storage.open(&root).unwrap();
+        // Startup maintenance is deferred until this repository has an
+        // identity-bound worktree root. Create the binding through the real
+        // managed lifecycle before publishing the debt that the reopen must
+        // recover.
+        let _binding_session = broker
+            .start_worktree("rotation debt fixture", None)
+            .unwrap();
         let cache_root = broker
             .storage_context()
             .preparation_cache_root()
@@ -9420,6 +9427,13 @@ mod tests {
             ("preparation-cache", preparation_cache.path()),
         ] {
             let path = path.canonicalize().unwrap();
+            let path = if name == "worktree-root" {
+                let selected = path.join("worktrees");
+                assert!(!selected.exists());
+                selected
+            } else {
+                path
+            };
             std::fs::write(
                 detached_fixture_marker(root, name),
                 path.to_string_lossy().as_ref(),

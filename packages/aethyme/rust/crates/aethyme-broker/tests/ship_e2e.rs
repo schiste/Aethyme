@@ -6,9 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
     AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker,
-    BrokerOpError, DeliveryExecutionReport, EntryExposureResolutionKind, EntryExposureState,
-    IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance, OperationStatus,
-    RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult, ShipPublicationMode,
+    BrokerOpError, BrokerOpenOptions, DeliveryExecutionReport, EntryExposureResolutionKind,
+    EntryExposureState, IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance,
+    OperationStatus, RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult,
+    ShipPublicationMode,
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -63,7 +64,7 @@ impl Fixture {
         );
         git(&repo, &["push", "-qu", "origin", "main"]);
         Self {
-            host_operations: tmp.path().join("host-state/operations.db"),
+            host_operations: tmp.path().join("host-state/host-operations.db"),
             _tmp: tmp,
             repo,
             remote,
@@ -71,9 +72,11 @@ impl Fixture {
     }
 
     fn broker(&self) -> Broker {
-        Broker::open(&self.repo)
-            .unwrap()
-            .with_host_operation_database(&self.host_operations)
+        let host_state_dir = self.host_operations.parent().unwrap();
+        let options = BrokerOpenOptions::default()
+            .with_host_state_dir(host_state_dir)
+            .with_host_operation_database(&self.host_operations);
+        Broker::open_with_options(&self.repo, options).unwrap()
     }
 
     fn promoted_entry(&self) -> (i64, i64, String) {
@@ -2072,11 +2075,16 @@ fn exposure_plan_cli_is_stable_and_does_not_mutate_lifecycle_state() {
     let output = Command::new(CLI)
         .args(["advanced", "exposures", "plan", "--json"])
         .current_dir(&fixture.repo)
+        .env(
+            "AETHYME_HOST_STATE_DIR",
+            fixture.host_operations.parent().unwrap(),
+        )
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

@@ -19,10 +19,24 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Before declaring a regression missing during issue triage, inspect likely
   test bodies and their assertions, not only test names. An interruption or
   recovery test may already exercise the exact state under a broader name.
+- During issue-status audits, treat plan and architecture prose as a claim:
+  map each acceptance criterion to current implementation and test assertions
+  at the audited commit before marking it absent or complete.
 - Inspect caution zones before changing generated or vendored areas.
 
 ## Validation Checklist
 
+- Before committing a substantive change, use colon-terminated section headings (`Problem:`, `Decision:`, `Rationale:`, `Validation:`) and require `aethyme repo lint-commit-message <file>` to report `Valid: yes`; the linter does not recognize bare headings.
+- For broker SQLite legacy-migration fixtures, restrict schema-downgrade
+  helpers to disposable fixtures and refuse to drop later-schema authority
+  tables that contain rows. Remove empty later-schema objects before lowering
+  the version marker. Seed constraint-valid legacy authority rows in refusal
+  tests, since empty authority tables can classify as fresh.
+- When hardening SQLite filesystem checks on POSIX, account for process-owned
+  locks: closing another descriptor for the same inode can release a live
+  connection's locks, including on a refusal path. Preserve no-follow and
+  metadata checks; verify lock preservation with a separate conflicting writer.
+  A successful integrity check alone does not establish safe descriptor lifetime.
 - Before standalone `rustfmt` or `rustc` validation, resolve the owning
   crate's Cargo edition, including workspace inheritance, and pass that edition.
   Formatting rules vary by edition even when the source compiles in both; a
@@ -90,11 +104,24 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and mirrored-skill parity; never commit a template overwrite blindly.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; the skill-surface parity check enforces this.
+- Before adding broker-owned persistent sidecars, verify each generated path
+  matches `runtime_paths.rs` and the standard runtime `.gitignore` prefix. Add
+  a regression from the path producer to the runtime-path classifier; keep
+  private-file checks strict if an ignore mismatch is found.
 - Choose focused local Cargo checks by compilation target as well as test name.
   A name filter selects cases at runtime; `--lib` still compiles the full unit-test
   target. Start with a relevant integration-test target when available, keep one
   Cargo worker, and retain the remaining unit coverage as pending qualification.
   A resource-stopped compile provides no test result.
+- If CI cancels older runs on push, retain useful in-progress workspace test
+  results before pushing a formatting or diagnostic follow-up. Commit the
+  correction locally while waiting; cancel early when the run is no longer
+  useful. Qualify the final head separately and label evidence by its source head.
+  If a completed job's log is unavailable through the workflow view, fetch
+  `repos/<owner>/<repo>/actions/jobs/<job-id>/logs` with `gh api` while other
+  jobs continue. Capture raw output to a file and strip control sequences before
+  display. If gh refuses escape bytes, use `--allow-escape-sequences` only for
+  that file capture.
 - When reusing a CI build cache, compare the producer and consumer fingerprints,
   including toolchain, lockfiles and environment variables, then confirm the log
   shows a cache restore. A matching shared key alone does not prove reuse.
@@ -107,6 +134,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Cargo `[env]` configuration: Cargo injects those values into test child
   processes, while direct execution does not. Replay and record relevant values
   explicitly, or classify the direct run as non-equivalent.
+- Treat full-repository static audits as validation work during a local build
+  pause; route them to remote checks instead of running them locally. A prebuilt
+  executable can still consume substantial CPU across bulk imports and scans.
 - Smoke-test each binary against its own CLI contract. Run read-only probes
   outside a Git checkout with isolated home/state; preserve an unsupported
   command as a failed probe instead of treating it as a successful smoke check.
@@ -142,7 +172,16 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
-  leave stale Git pointers after teardown. Assert paths and cleanup; avoid
+  leave stale Git pointers after teardown. The environment override is a
+  container: create it before startup, leaving its per-repository child absent
+  so fresh binding can create it. For storage-preparation tests
+  that require broker placement ownership, use `start --task ... --json`
+  to create a managed worktree. Read `worktree_placement.root`,
+  canonicalize it and the returned worktree path, assert containment, and
+  check `.aethyme-worktree-root.json` at the placement root. Derive cache
+  paths from the returned `worktree_path`. `start --adopt` reuses an
+  existing checkout and does not create that placement marker; do not
+  synthesize it in the fixture. Assert paths and cleanup; avoid
   process-wide environment mutation in parallel tests. Filtering
   `std::env::vars_os()` and passing the result to `Command::envs` does not
   clear inherited `GIT_*` variables; it only adds or overrides values. For
@@ -173,7 +212,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   drop/reopen; dropping one broker handle must not delete session checkouts.
   For a CLI launched from another directory or a session checkout, derive
   isolation paths from the owning repository fixture and set its working
-  directory separately.
+  directory separately. Initialize Git before deriving paths under its metadata:
+  a helper called before initialization may select a different fallback directory.
   Complete fixture branch/ref setup before opening the broker whenever
   possible: its live default database may be .aethyme/broker.db, and a later
   git add -A can commit it. Before any post-open branch switch, assert the
@@ -421,7 +461,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   repository's current merge requirements. Distinguish queued optional
   cache-recording jobs from required checks; retain their pending status without
   imposing an extra merge gate. Investigate any failed substantive check even
-  when it is optional, and never bypass a required check.
+  when it is optional, and never bypass a required check. After retargeting a
+  stacked PR, verify required jobs actually ran for the current head and base;
+  a skipped job from an edited-event filter is not passing validation. Inspect
+  workflow triggers and trigger an authorized real run without changing reviewed
+  source or inventing a pass.
 - Before publishing a PR body, run the repository's contract checker against
   that exact body and base. Use its literal checkbox syntax (for example,
   `- [x] **none**`), not prose such as `Contract: none`, and verify the checker
@@ -436,7 +480,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   focused selection. Test bounded output with explicit omission counts; a
   smaller display must still surface the coordination state callers need.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
-  check child output on the intended stream separately. A report may retain
+  check child output on the intended stream separately. Include both stdout
+  and stderr in subprocess failure assertions: a structured refusal can be
+  written to stdout while stderr is empty. A report may retain
   the original command arguments, so searching its serialized text for a child
   marker cannot establish output isolation. Assert command metadata separately.
 - For CLI subprocess-count regressions, trace the complete invoked path,

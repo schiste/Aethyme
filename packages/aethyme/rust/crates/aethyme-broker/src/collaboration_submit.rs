@@ -951,10 +951,12 @@ mod tests {
             origin
         });
         let worktrees = tempfile::tempdir().unwrap();
+        let worktree_root = worktrees.path().join("worktrees");
+        assert!(!worktree_root.exists());
         let state = tempfile::tempdir().unwrap();
         let mut broker = crate::Broker::open(repo.path())
             .unwrap()
-            .with_worktree_root(worktrees.path())
+            .with_worktree_root(worktree_root)
             .with_collaboration_state(state.path());
         let session = broker.start_worktree("work", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
@@ -1251,7 +1253,8 @@ mod tests {
         assert_eq!(
             fence(required.repo.path()),
             Some(crate::CollaborationFence {
-                min_compatible_schema: crate::schema::MIN_COMPATIBLE_SCHEMA,
+                // Fresh identity-bound databases fence older root-unaware writers.
+                min_compatible_schema: 54,
                 reason: crate::schema::COLLABORATION_FENCE_REASON.into(),
                 source: "committed".into(),
                 state: "active",

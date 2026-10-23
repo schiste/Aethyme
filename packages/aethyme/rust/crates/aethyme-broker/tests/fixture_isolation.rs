@@ -39,10 +39,13 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
         }
 
         let expected_root = isolation::worktree_root(fixture.path());
-        std::fs::create_dir_all(&expected_root).unwrap();
-        let expected_root = expected_root.canonicalize().unwrap();
+        assert!(
+            !expected_root.exists(),
+            "fresh fixture root must not preexist"
+        );
         let mut broker = isolation::open(fixture.path());
         let session = broker.start_worktree("retained fixture", None).unwrap();
+        let expected_root = expected_root.canonicalize().unwrap();
         let worktree = PathBuf::from(session.worktree_path);
         assert!(
             worktree.canonicalize().unwrap().starts_with(&expected_root),

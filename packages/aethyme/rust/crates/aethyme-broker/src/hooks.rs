@@ -993,23 +993,57 @@ fn push_is_a_running_coordinated_write(main_root: &Path) -> bool {
         std::env::var(name)
             .ok()
             .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|id| *id > 0)
     };
-    let (Some(operation_id), Some(session_id)) = (
-        id("AETHYME_BROKER_OPERATION_ID"),
-        id("AETHYME_BROKER_SESSION_ID"),
-    ) else {
+    let Some(operation_id) = id("AETHYME_BROKER_OPERATION_ID") else {
+        warn_unproved_coordinated_push("operation_id_missing_or_invalid");
         return false;
     };
-    let Ok(store) = BrokerStore::open_in_repo(main_root) else {
+    let Some(session_id) = id("AETHYME_BROKER_SESSION_ID") else {
+        warn_unproved_coordinated_push("session_id_missing_or_invalid");
         return false;
     };
-    matches!(
-        store.coordinated_operation(operation_id),
-        Ok(Some(operation))
-            if operation.session_id == session_id
-                && operation.status == crate::OperationStatus::Running
-                && operation.effect != crate::OperationEffect::Read
-    )
+    let store = match BrokerStore::open_in_repo(main_root) {
+        Ok(store) => store,
+        Err(error) => {
+            crate::warn_unrecorded::<(), _>(
+                "open the broker store to verify the running coordinated push",
+                Err(error),
+            );
+            return false;
+        }
+    };
+    let operation = match store.coordinated_operation(operation_id) {
+        Ok(operation) => operation,
+        Err(error) => {
+            crate::warn_unrecorded::<(), _>(
+                "read the operation journal to verify the running coordinated push",
+                Err(error),
+            );
+            return false;
+        }
+    };
+    let Some(operation) = operation else {
+        warn_unproved_coordinated_push("operation_row_missing");
+        return false;
+    };
+    if operation.session_id != session_id {
+        warn_unproved_coordinated_push("session_mismatch");
+        return false;
+    }
+    if operation.status != crate::OperationStatus::Running {
+        warn_unproved_coordinated_push("operation_not_running");
+        return false;
+    }
+    if operation.effect == crate::OperationEffect::Read {
+        warn_unproved_coordinated_push("read_effect");
+        return false;
+    }
+    true
+}
+
+fn warn_unproved_coordinated_push(reason: &'static str) {
+    eprintln!("warning: Aethyme pre-push could not verify coordinated push ({reason})");
 }
 
 /// Fail closed at Git's write boundary when this machine has opted into

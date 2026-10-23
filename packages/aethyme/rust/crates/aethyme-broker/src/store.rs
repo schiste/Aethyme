@@ -85,6 +85,7 @@ pub struct BrokerStore {
     path: PathBuf,
     /// Keeps a migrated temporary snapshot alive for the connection lifetime.
     _snapshot_dir: Option<tempfile::TempDir>,
+    pub(crate) binding_scope: Option<repository_identity::RepositoryBindingScope>,
 }
 
 /// One queue-row mutation committed with an integration reconciliation.
@@ -608,6 +609,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn garbage_collection_can_purge_failed_gate_results_without_opening_delete_to_old_writers() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         store
             .conn
@@ -655,7 +657,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn health_row_inventory_keeps_candidates_without_reading_content_fingerprints() {
         let directory = tempfile::tempdir().unwrap();
-        let store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let store = BrokerStore::open(&directory.path().join("state.db")).unwrap();
         store
             .conn
             .execute(
@@ -699,6 +701,10 @@ mod gate_result_clear_metadata_tests {
         assert!(output.status.success(), "git {args:?}");
     }
 
+    fn init_fixture_repository(repo: &Path) {
+        git(repo, &["init", "-q", "-b", "main"]);
+    }
+
     fn insert_gc_fixture_event(store: &mut BrokerStore, kind: &str) -> i64 {
         store
             .conn
@@ -737,6 +743,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn gc_row_revalidation_rejects_candidate_metadata_drift() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         store
             .conn
@@ -779,6 +786,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn gc_row_revalidation_rejects_content_drift_with_identical_candidate_metadata() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         store
             .conn
@@ -823,6 +831,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn gc_row_revalidation_rejects_reused_queue_id_with_same_age_and_size() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         let session_id = insert_gc_fixture_session(&mut store, &directory.path().join("session"));
         store
@@ -887,6 +896,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn legacy_gc_row_candidate_fails_closed_when_its_row_is_still_present() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         let id = insert_gc_fixture_event(&mut store, "gc.fixture.legacy");
         let current = gc_candidate(&store, crate::GcRowKind::Event, id);
@@ -934,6 +944,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn gc_row_revalidation_accepts_missing_rows_on_crash_replay() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         let first_id = insert_gc_fixture_event(&mut store, "advisory.fixture.first");
         let second_id = insert_gc_fixture_event(&mut store, "advisory.fixture.second");
@@ -967,6 +978,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn gc_row_revalidation_rechecks_global_advisory_and_queue_protection() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         let advisory_event_id = insert_gc_fixture_event(&mut store, "advisory.fixture");
         let merge_event_id = insert_gc_fixture_event(&mut store, "merge.fixture");
@@ -1022,6 +1034,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn gc_row_revalidation_filters_queue_parent_and_child_candidates() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         let session_id = insert_gc_fixture_session(&mut store, &directory.path().join("session"));
         store
@@ -1067,6 +1080,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn gc_row_delete_api_rejects_batches_over_the_transaction_limit() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         let id = insert_gc_fixture_event(&mut store, "gc.fixture.oversized");
         let candidate = gc_candidate(&store, crate::GcRowKind::Event, id);
@@ -1227,6 +1241,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn a_cleared_latest_failure_prevents_falling_back_to_an_older_pass() {
         let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         store
             .conn
@@ -1940,6 +1955,7 @@ mod operation_history_tests {
             conn,
             path: PathBuf::from(":memory:"),
             _snapshot_dir: None,
+            binding_scope: None,
         }
     }
 
@@ -2265,6 +2281,7 @@ mod review_ledger_tests {
             conn,
             path: PathBuf::from(":memory:"),
             _snapshot_dir: None,
+            binding_scope: None,
         }
     }
 
@@ -2773,7 +2790,12 @@ mod review_ledger_tests {
 }
 
 mod coordination;
+#[path = "store/fresh_database.rs"]
+pub(crate) mod fresh_database;
 mod open;
 mod pull_requests;
 mod queue;
+#[path = "store/repository_binding.rs"]
+pub(crate) mod repository_binding;
+pub(crate) mod repository_identity;
 mod review;

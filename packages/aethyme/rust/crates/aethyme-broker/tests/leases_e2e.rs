@@ -586,7 +586,10 @@ fn submit_blocks_paths_explicitly_owned_by_another_session() {
 fn adoption_time_foreign_file_blocks_submit_until_explicitly_claimed() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let wt = add_worktree(tmp.path(), "foreign");
+    let worktrees = tempfile::tempdir().unwrap();
+    let worktree_path = worktrees.path().join("foreign");
+    assert!(!worktree_path.exists());
+    let wt = add_worktree_at(tmp.path(), "foreign", &worktree_path);
     std::fs::write(wt.join("foreign.txt"), "preexisting\n").unwrap();
 
     let mut broker = Broker::open(tmp.path()).unwrap();
@@ -614,10 +617,15 @@ fn adoption_time_foreign_file_blocks_submit_until_explicitly_claimed() {
 fn rebase_onto_integration_does_not_inflate_leases() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
+    let worktrees = tempfile::tempdir().unwrap();
+    let wt1_path = worktrees.path().join("one");
+    let wt2_path = worktrees.path().join("two");
+    assert!(!wt1_path.exists());
+    assert!(!wt2_path.exists());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
     // Session 1 promotes work on file_one — integration now contains it.
-    let wt1 = add_worktree(tmp.path(), "one");
+    let wt1 = add_worktree_at(tmp.path(), "one", &wt1_path);
     let s1 = broker.adopt(&wt1, Some("one")).unwrap();
     std::fs::write(wt1.join("file_one.txt"), "one\n").unwrap();
     sh(&wt1, &["add", "-A"]);
@@ -627,7 +635,7 @@ fn rebase_onto_integration_does_not_inflate_leases() {
     // Session 2 rebases onto the integration branch (as the
     // action-required flow instructs), bringing session 1's promoted
     // commit into its history, then does its own work on file_two.
-    let wt2 = add_worktree(tmp.path(), "two");
+    let wt2 = add_worktree_at(tmp.path(), "two", &wt2_path);
     let s2 = broker.adopt(&wt2, Some("two")).unwrap();
     sh(&wt2, &["fetch", ".", "aethyme/integration"]);
     sh(&wt2, &["rebase", "FETCH_HEAD"]);

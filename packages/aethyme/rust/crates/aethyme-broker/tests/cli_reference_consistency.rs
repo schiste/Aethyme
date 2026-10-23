@@ -67,6 +67,9 @@ fn every_documented_broker_flag_appears_in_the_usage_text() {
     let mut usage: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for line in usage_source.lines() {
         if let Some(rest) = line.strip_prefix("  aethyme broker ") {
+            // Compare handler names on both sides: documented public commands
+            // are resolved below, while canonical help can name `advanced`.
+            let rest = rest.strip_prefix("advanced ").unwrap_or(rest);
             let full = format!("aethyme broker {rest}");
             usage
                 .entry(command(&full))

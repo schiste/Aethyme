@@ -7,4 +7,13 @@ exit: 0
       .aethyme/config.toml supersedes the per-user default while it exists,
       is outside the repository and has worktrees.min_free_bytes free;
       otherwise starts use the default and say why.
+  aethyme broker advanced worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]
+      Review an existing legacy root before binding it to this repository.
+      Planning does not discover, create or change a root.
+  aethyme broker advanced worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]
+      Bind only the reviewed legacy root if every planned identity still matches.
+  aethyme broker advanced worktree-root recovery plan [--json]
+      Inspect an incomplete fresh-root reservation and its durable prefixes.
+  aethyme broker advanced worktree-root recovery apply --confirm <sha256> [--json]
+      Complete only the fresh-root reservation bound to the reviewed digest.
 --- stderr

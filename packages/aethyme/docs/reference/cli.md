@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-09-14
+Last Updated: 2026-10-23
 
 ## Install
 
@@ -314,16 +314,67 @@ the command made no state change. Some refusal paths record safe quarantine or
 other maintenance while declining the requested action. Inspect the command's
 report and recovery guidance before retrying.
 
-`broker advanced worktree-root` is a strictly read-only placement plan. It reports the
-canonical checkout identity, the preferred private host-state root, whether
-that root is outside the repository, and the legacy fallback. Normal starts
-use a clone-specific key derived from the canonical Git common directory, so
-same-named independent clones do not share worktrees. macOS uses
+`broker advanced worktree-root` is a placement plan; it does not create or
+bind a worktree root. It reports the canonical checkout identity, the preferred
+private host-state root, whether that root is outside the repository, and the
+legacy fallback. Opening the repository database may enroll the graph write
+fence, apply supported schema migrations, and attach this repository to its
+`legacy_unbound` binding row. Those database operations do not create or bind a
+worktree root. Normal starts use a clone-specific key derived from the canonical
+Git common directory, so same-named independent clones do not share worktrees.
+macOS uses
 `~/Library/Application Support/Aethyme/worktrees/`; other supported Unix hosts
 use their configured Aethyme/XDG state directory. Set `AETHYME_WORKTREE_ROOT`
 to choose another external base. The broker appends the clone key, writes a
 private ownership marker, and refuses a root inside this repository or any
 linked worktree.
+
+`broker advanced worktree-root binding plan <exact-root> <keyed_container|direct_root>
+[--json]` and `apply ... --confirm <sha256> [--json]` explicitly bind an
+existing legacy database to the exact worktree root already present on disk.
+The plan prints a `schema_version: 1` object with repository and Git identity,
+broker database path, requested root/layout/source, parent and root identities,
+and a confirmation digest. It does not change the binding, root, ownership
+marker, or UUID marker. An ordinary open of a database older than schema 54 may
+first run the additive migration and attach this repository to an unbound row.
+The v54 binding table keeps a separate row for each Git common directory even
+when repositories share one `AETHYME_BROKER_DB` path; the first repository uses
+the migration's legacy placeholder and later repositories receive their own
+unbound rows. Apply rechecks the plan and requires its exact digest; it does not
+move or create the root. Explicit binding raises the compatibility floor to 54
+so v53 writers refuse the database. Startup recovery uses the bound identity on
+the next broker open.
+
+Apply JSON prints the binding record directly. Its keys are `state`, `origin`,
+`repository_root`, `git_common_dir`, `repository_key`, `broker_db_path`,
+`bootstrap_nonce`, `worktree_root`, `root_layout`, `root_source`,
+`reservation_digest`, `parent_identity_json`, `worktree_identity_json`, and
+`updated_at_ms`. Inapplicable optional fields are JSON `null`. Enum strings use
+lower snake case: states `legacy_unbound`, `fresh_unbound`, `fresh_reserved`,
+`bound`, `recovery_required`; origins `legacy`, `fresh`; layouts
+`keyed_container`, `direct_root`; and sources `host_state`,
+`repository_config`, `environment_override`, `library_override`,
+`repository_fallback`. The binding plan/apply workflow only adopts
+`legacy_unbound` records. For an interrupted fresh reservation,
+`broker advanced worktree-root recovery plan [--json]` reports the exact supported
+filesystem and registry prefix without settling it. Its explicit recovery open
+can inspect a validated incomplete UUID marker publication; ordinary and
+snapshot opens continue to refuse that prefix. Review the plan, then use
+`broker advanced worktree-root recovery apply --confirm <sha256> [--json]` with its
+digest. Recovery accepts only the reserved root and known durable prefixes: a
+missing or empty root, the exact ownership marker with a valid registry state,
+and exact broker-generated Cargo defaults where they are already present.
+Unknown entries, marker bytes, registry contents, or SQLite sidecar states are
+refused. Recovery does not delete or prune existing data, reset a database, or
+adopt a different root.
+
+Fresh-root creation and recovery serialize cooperating broker processes with
+the repository-binding and worktree-registry locks. They use create-new
+operations for the reserved root and marker, then recheck the directory
+identity through marker publication, registry admission, and binding. These
+checks do not provide an atomic pathname guarantee against an uncooperating
+same-UID process that renames or replaces parent paths between pathname
+operations, or tampers with those directories directly.
 
 If the platform host-state root cannot be prepared, `broker start` uses the
 legacy `.aethyme/worktrees/` location and reports the exact fallback reason in
@@ -499,6 +550,10 @@ stashing multi-worktree changes.
 - `aethyme broker status readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
 - `aethyme broker status [--json] [--compact] [--summary] [--refresh]`
 - `aethyme broker advanced worktree-root [--json]`
+- `aethyme broker advanced worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]`
+- `aethyme broker advanced worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]`
+- `aethyme broker advanced worktree-root recovery plan [--json]`
+- `aethyme broker advanced worktree-root recovery apply --confirm <sha256> [--json]`
 - `aethyme broker start --task "..." --short-name <name> [--pull-request <number>] [--path <repo-path>]... [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
 - `aethyme broker start --task "..." --cmd <command> --short-name <name> [--pull-request <number>] [--agent "<Name> <email>"] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]`
 - Supplying `--pull-request` explicitly refuses the integration-tip lane:

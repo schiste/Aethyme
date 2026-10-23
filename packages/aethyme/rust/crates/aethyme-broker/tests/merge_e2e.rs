@@ -3086,6 +3086,11 @@ fn broker_open_decodes_only_recoverable_queue_states() {
     let mut broker = common::open_fixture_repository_broker(&tmp)
         .unwrap()
         .into_broker();
+    let root_setup = broker
+        .start_worktree("bind root before queue recovery", None)
+        .unwrap();
+    broker.close(root_setup.id).unwrap();
+    broker.cleanup(root_setup.id, false).unwrap();
     let worktree = agent_worktree(tmp.path(), "recovery-query-scope");
     let session = broker
         .adopt(&worktree, Some("recovery query scope"))

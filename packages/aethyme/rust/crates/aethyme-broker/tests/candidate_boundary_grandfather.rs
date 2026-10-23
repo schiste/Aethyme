@@ -47,7 +47,6 @@ fn files(dir: &Path) -> Vec<std::path::PathBuf> {
 fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
-    let host_state = common::fixture_host_state_dir(tmp.owner_path());
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(
@@ -68,6 +67,7 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     std::fs::write(root.join("README.md"), "fixture\n").unwrap();
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
+    let host_state = common::fixture_host_state_dir(root);
     let mut broker = common::open_fixture_repository_broker(&tmp)
         .unwrap()
         .into_broker();

@@ -1637,6 +1637,11 @@ fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
         let mut broker = common::open_fixture_repository_broker(&tmp)
             .unwrap()
             .into_broker();
+        let root_setup = broker
+            .start_worktree("bind root before operation recovery", None)
+            .unwrap();
+        broker.close(root_setup.id).unwrap();
+        broker.cleanup(root_setup.id, false).unwrap();
         let session = broker.adopt(&worktree, None).unwrap();
         let repository = format!("local:{}", broker.main_root().display());
         operation_id = broker

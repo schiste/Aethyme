@@ -1,17 +1,77 @@
 use super::*;
 
+/// Capability proving that a database belongs to the private fresh-stage
+/// bootstrap path. Only this module can construct it, after it has established
+/// exclusive stage ownership and before publishing the final database name.
+pub(super) struct FreshDatabaseStagePermit {
+    _private: (),
+}
+
+#[cfg(unix)]
+pub(super) fn fresh_database_stage_permit() -> FreshDatabaseStagePermit {
+    FreshDatabaseStagePermit { _private: () }
+}
+
+#[cfg(test)]
+pub(super) fn test_fresh_database_stage_permit() -> FreshDatabaseStagePermit {
+    FreshDatabaseStagePermit { _private: () }
+}
+
+fn canonical_main_root(repo_root: &Path) -> Result<PathBuf, BrokerError> {
+    let repo = crate::git::GitRepo::discover(repo_root).map_err(|error| {
+        BrokerError::InvalidRepositoryWorktreeBinding(format!(
+            "could not resolve repository root: {error}"
+        ))
+    })?;
+    let main_root = repo.main_root().map_err(|error| {
+        BrokerError::InvalidRepositoryWorktreeBinding(format!(
+            "could not resolve main repository root: {error}"
+        ))
+    })?;
+    std::fs::canonicalize(&main_root).map_err(|source| BrokerError::Io {
+        path: main_root,
+        source,
+    })
+}
+
 impl BrokerStore {
     /// Open (creating and migrating if needed) the broker database for a
     /// repository root: `<repo>/.aethyme/broker.db`, or wherever
     /// [`crate::BROKER_DB_ENV`] points.
     pub fn open_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = crate::broker_db_path(repo_root)?;
-        Self::open_repository_path(repo_root, &path)
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = crate::broker_db_path(&repository_root)?;
+        Self::open_repository_path(&repository_root, &path)
     }
 
     fn open_repository_path(repo_root: &Path, path: &Path) -> Result<Self, BrokerError> {
-        enroll_repository_graph_fence(repo_root)?;
-        Self::open(path)
+        let repository_root = canonical_main_root(repo_root)?;
+        // Complete the strict, read-only marker and repository-scope checks
+        // before graph-fence enrollment can write any repository metadata.
+        // An ordinary open must refuse an interrupted marker publication
+        // without changing the checkout on its way to that refusal.
+        let binding_scope =
+            super::repository_identity::RepositoryBindingScope::capture(&repository_root, path)?;
+        enroll_repository_graph_fence(&repository_root)?;
+        let mut store = super::fresh_database::open_in_repo(&repository_root, path)?;
+        if store.binding_scope.is_none() {
+            store.binding_scope = Some(binding_scope);
+        }
+        store.ensure_repository_binding_scope()?;
+        Ok(store)
+    }
+
+    /// Open only an existing schema-54 database for explicit worktree-root
+    /// recovery. This path can inspect a fully validated UUID publication
+    /// prefix but never settles it; ordinary and snapshot opens retain their
+    /// strict marker refusal.
+    pub(crate) fn open_for_explicit_root_recovery(repo_root: &Path) -> Result<Self, BrokerError> {
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = crate::broker_db_path(&repository_root)?;
+        let mut store =
+            super::fresh_database::open_existing_for_explicit_recovery(&repository_root, &path)?;
+        store.ensure_repository_binding_scope()?;
+        Ok(store)
     }
 
     /// Open the current broker schema without creating, migrating, or
@@ -19,7 +79,43 @@ impl BrokerStore {
     /// path so an observational command cannot become the write that upgrades
     /// storage or refreshes a session.
     pub fn open_snapshot_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        Self::open_snapshot_at(&crate::broker_db_path(repo_root)?)
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = crate::broker_db_path(&repository_root)?;
+        let mut store = Self::open_snapshot_at(&path)?;
+        store.binding_scope = Some(super::repository_identity::RepositoryBindingScope::capture(
+            &repository_root,
+            &path,
+        )?);
+        Ok(store)
+    }
+
+    /// Open a read-only snapshot for one exact repository database path.
+    /// Storage inventory uses this instead of the ambient broker DB override,
+    /// then requires the selected binding row to carry the full captured owner
+    /// identity before it can authorize root cleanup.
+    pub(crate) fn open_snapshot_at_in_repo(
+        repo_root: &Path,
+        database_path: &Path,
+    ) -> Result<Self, BrokerError> {
+        let repository_root = canonical_main_root(repo_root)?;
+        let scope = super::repository_identity::RepositoryBindingScope::capture(
+            &repository_root,
+            database_path,
+        )?;
+        let mut store = Self::open_snapshot_at(database_path)?;
+        store.binding_scope = Some(scope.clone());
+        let binding = store.repository_worktree_binding()?;
+        if binding.repository_root.as_deref() != Some(scope.repository_root.as_path())
+            || binding.git_common_dir.as_deref() != Some(scope.git_common_dir.as_path())
+            || binding.repository_key.as_deref() != Some(scope.repository_key.as_str())
+            || binding.broker_db_path.as_deref() != Some(scope.broker_db_path.as_path())
+            || binding.repository_uuid != scope.repository_uuid
+        {
+            return Err(BrokerError::InvalidRepositoryWorktreeBinding(
+                "owner snapshot binding does not match the selected repository identity".into(),
+            ));
+        }
+        Ok(store)
     }
 
     /// Open an exact broker database path read-only, without applying the
@@ -36,6 +132,7 @@ impl BrokerStore {
                 conn,
                 path,
                 _snapshot_dir: None,
+                binding_scope: None,
             });
         }
         let conn = Connection::open_with_flags(
@@ -50,6 +147,7 @@ impl BrokerStore {
                 conn,
                 path,
                 _snapshot_dir: None,
+                binding_scope: None,
             });
         }
         if found > crate::SCHEMA_VERSION {
@@ -71,6 +169,7 @@ impl BrokerStore {
                 conn,
                 path,
                 _snapshot_dir: None,
+                binding_scope: None,
             });
         }
 
@@ -92,6 +191,7 @@ impl BrokerStore {
             conn: snapshot,
             path,
             _snapshot_dir: Some(snapshot_dir),
+            binding_scope: None,
         })
     }
 
@@ -100,7 +200,8 @@ impl BrokerStore {
     /// an in-memory database or a migrated temporary copy. Readiness uses it to
     /// keep the absence and age of broker state observable facts.
     pub(crate) fn open_current_read_only_in_repo(repo_root: &Path) -> Result<Self, BrokerError> {
-        let path = crate::broker_db_path(repo_root)?;
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = crate::broker_db_path(&repository_root)?;
         let conn = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -117,6 +218,10 @@ impl BrokerStore {
         conn.pragma_update(None, "query_only", true)?;
         Ok(Self {
             conn,
+            binding_scope: Some(super::repository_identity::RepositoryBindingScope::capture(
+                &repository_root,
+                &path,
+            )?),
             path,
             _snapshot_dir: None,
         })
@@ -139,11 +244,27 @@ impl BrokerStore {
     /// because the redirect ([`crate::BROKER_DB_ENV`]) only helps a harness that
     /// remembers to set it, and the developer in the bug report had not.
     pub fn open_current_in_repo(repo_root: &Path) -> Result<Option<Self>, BrokerError> {
-        let path = crate::broker_db_path(repo_root)?;
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = crate::broker_db_path(&repository_root)?;
+        Self::open_current_repository_path(&repository_root, &path)
+    }
+
+    fn open_current_repository_path(
+        repo_root: &Path,
+        path: &Path,
+    ) -> Result<Option<Self>, BrokerError> {
+        let repository_root = canonical_main_root(repo_root)?;
+        let path = path.to_path_buf();
         if !path.is_file() {
             return Ok(None);
         }
-        enroll_repository_graph_fence(repo_root)?;
+        // Validate the read-only repository identity before graph-fence
+        // enrollment or SQLite opens the database. A malformed/incomplete
+        // UUID publication prefix must not leave repository or DB side effects
+        // when this observational open refuses.
+        let binding_scope =
+            super::repository_identity::RepositoryBindingScope::capture(&repository_root, &path)?;
+        enroll_repository_graph_fence(&repository_root)?;
         // No `SQLITE_OPEN_CREATE`: an absent database stays absent even if it
         // is deleted between the check above and this open.
         let conn = Connection::open_with_flags(
@@ -157,6 +278,7 @@ impl BrokerStore {
         }
         Ok(Some(Self {
             conn,
+            binding_scope: Some(binding_scope),
             path,
             _snapshot_dir: None,
         }))
@@ -206,6 +328,7 @@ impl BrokerStore {
             conn,
             path: db_path.to_path_buf(),
             _snapshot_dir: None,
+            binding_scope: None,
         })
     }
 
@@ -1505,13 +1628,30 @@ fn enroll_repository_graph_fence(repo_root: &Path) -> Result<(), BrokerError> {
 #[cfg(test)]
 mod graph_fence_tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    fn init_git_root(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn direct_mutable_store_with_external_database_enrolls_before_creation() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap().join("repo");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        init_git_root(&root);
         let database = temp.path().join("external/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&root, &database).unwrap();
         assert!(database.is_file());
         assert!(!root.join(crate::BROKER_DB_RELPATH).exists());
@@ -1524,14 +1664,90 @@ mod graph_fence_tests {
         drop(store);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_uuid_marker_refusal_precedes_graph_fence_and_sqlite_sidecars() {
+        use std::io::Write as _;
+
+        fn entries(directory: &Path) -> Vec<String> {
+            let mut names: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("repo");
+        init_git_root(&root);
+        let database = root.join(crate::BROKER_DB_RELPATH);
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        drop(BrokerStore::open(&database).unwrap());
+
+        let git_dir = root.join(".git");
+        let graph_marker =
+            git_dir.join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER);
+        let uuid_temp =
+            git_dir.join(".aethyme-repository-uuid.0123456789abcdef0123456789abcdef.tmp");
+        let uuid_bytes = b"AETHYME-REPO-UUID-V1\nf47ac10b-58cc-4372-a567-0e02b2c3d479\n";
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&uuid_temp)
+            .unwrap();
+        marker.write_all(uuid_bytes).unwrap();
+        marker.sync_all().unwrap();
+        drop(marker);
+
+        let git_entries_before = entries(&git_dir);
+        let db_entries_before = entries(database.parent().unwrap());
+        let database_before = std::fs::read(&database).unwrap();
+        assert!(!graph_marker.exists());
+        assert!(!database_before.is_empty());
+
+        let error = match BrokerStore::open_current_repository_path(&root, &database) {
+            Err(error) => error,
+            Ok(_) => panic!("incomplete repository UUID marker must refuse current open"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("repository UUID marker publication is incomplete"),
+            "unexpected refusal: {error}"
+        );
+
+        assert!(
+            !graph_marker.exists(),
+            "refusal must not enroll a graph fence"
+        );
+        assert_eq!(entries(&git_dir), git_entries_before);
+        assert_eq!(entries(database.parent().unwrap()), db_entries_before);
+        assert_eq!(std::fs::read(&database).unwrap(), database_before);
+        assert_eq!(std::fs::read(&uuid_temp).unwrap(), uuid_bytes);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = database.with_file_name(format!(
+                "{}{suffix}",
+                database.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                !sidecar.exists(),
+                "refusal created SQLite sidecar {}",
+                sidecar.display()
+            );
+        }
+    }
+
     #[test]
     fn nested_repository_path_with_external_database_cannot_bypass_graph_fence() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap().join("repo");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        init_git_root(&root);
         let nested = root.join("nested/output");
         std::fs::create_dir_all(&nested).unwrap();
         let database = temp.path().join("external/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = BrokerStore::open_repository_path(&nested, &database).unwrap();
         assert!(database.is_file());
         assert!(
@@ -1545,10 +1761,182 @@ mod graph_fence_tests {
     }
 
     #[test]
+    fn independent_repositories_get_scoped_rows_in_one_shared_legacy_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_a = temp.path().join("repo-a");
+        let repo_b = temp.path().join("repo-b");
+        init_git_root(&repo_a);
+        init_git_root(&repo_b);
+        let database = temp.path().join("shared/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+
+        // Seed the documented legacy open path before attaching the first repo.
+        drop(BrokerStore::open(&database).unwrap());
+        let mut repo_a_store = BrokerStore::open_repository_path(&repo_a, &database).unwrap();
+        let repo_a_unbound = repo_a_store.repository_worktree_binding().unwrap();
+        assert_eq!(
+            repo_a_unbound.repository_root.as_deref(),
+            Some(repo_a.as_path())
+        );
+        assert_eq!(
+            repo_a_unbound.state,
+            super::super::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound
+        );
+        repo_a_store
+            .conn
+            .execute(
+                "INSERT INTO events (schema_version, ts, kind, payload_json) VALUES (?1, 1, 'fixture.preserved', '{}')",
+                [crate::schema::EVENTS_SCHEMA_VERSION],
+            )
+            .unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let scope = repo_a_store.binding_scope.as_ref().unwrap();
+        let digest = "c3".repeat(32);
+        let confirmation = super::super::repository_binding::LegacyRepositoryRootConfirmation {
+            repository_root: scope.repository_root.clone(),
+            git_common_dir: scope.git_common_dir.clone(),
+            repository_key: scope.repository_key.clone(),
+            broker_db_path: scope.broker_db_path.clone(),
+            worktree_root: repo_a.join(".worktrees"),
+            layout: super::super::repository_binding::RepositoryWorktreeRootLayout::DirectRoot,
+            source: crate::broker::WorktreeRootSource::RepositoryFallback,
+            plan_digest: digest.clone(),
+            confirmed_digest: digest,
+            parent_identity_json: r#"{"device":1,"inode":2}"#.to_owned(),
+            worktree_identity_json: r#"{"device":1,"inode":3}"#.to_owned(),
+        };
+        let repo_a_binding = repo_a_store
+            .bind_legacy_repository_worktree(&confirmation)
+            .unwrap();
+        assert_eq!(
+            repo_a_binding.state,
+            super::super::repository_binding::RepositoryWorktreeBindingState::Bound
+        );
+        assert!(repo_a_binding.repository_uuid.is_some());
+        drop(repo_a_store);
+
+        let repo_b_store = BrokerStore::open_repository_path(&repo_b, &database).unwrap();
+        let repo_b_binding = repo_b_store.repository_worktree_binding().unwrap();
+        assert_eq!(
+            repo_b_binding.repository_root.as_deref(),
+            Some(repo_b.as_path())
+        );
+        assert_eq!(
+            repo_b_binding.state,
+            super::super::repository_binding::RepositoryWorktreeBindingState::LegacyUnbound
+        );
+        assert_ne!(repo_a_binding.binding_id, repo_b_binding.binding_id);
+
+        let (binding_count, ledger_count): (i64, i64) = repo_b_store
+            .conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM repository_worktree_binding),
+                        (SELECT count(*) FROM events WHERE kind = 'fixture.preserved')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(binding_count, 2);
+        assert_eq!(
+            ledger_count, 1,
+            "registering repo B must preserve repo A's ledger"
+        );
+        drop(repo_b_store);
+
+        let reopened_repo_a = BrokerStore::open_repository_path(&repo_a, &database).unwrap();
+        let reopened_binding = reopened_repo_a.repository_worktree_binding().unwrap();
+        assert_eq!(reopened_binding.binding_id, repo_a_binding.binding_id);
+        assert_eq!(
+            reopened_binding.state,
+            super::super::repository_binding::RepositoryWorktreeBindingState::Bound
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_and_linked_worktree_paths_resolve_to_one_repository_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("main-repository");
+        init_git_root(&root);
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(&root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "fixture commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let linked = temp.path().join("linked-worktree");
+        let worktree = std::process::Command::new("git")
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&linked)
+            .arg("HEAD")
+            .current_dir(&root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            worktree.status.success(),
+            "fixture worktree failed: {}",
+            String::from_utf8_lossy(&worktree.stderr)
+        );
+        let nested = root.join("nested/source");
+        std::fs::create_dir_all(&nested).unwrap();
+        let database = temp.path().join("shared/broker.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+
+        let main_store = BrokerStore::open_repository_path(&root, &database).unwrap();
+        let main_binding = main_store.repository_worktree_binding().unwrap();
+        let nested_store = BrokerStore::open_repository_path(&nested, &database).unwrap();
+        let nested_binding = nested_store.repository_worktree_binding().unwrap();
+        let linked_store = BrokerStore::open_repository_path(&linked, &database).unwrap();
+        let linked_binding = linked_store.repository_worktree_binding().unwrap();
+
+        assert_eq!(main_binding.binding_id, nested_binding.binding_id);
+        assert_eq!(main_binding.binding_id, linked_binding.binding_id);
+        assert_eq!(
+            main_binding.repository_root.as_deref(),
+            Some(root.as_path())
+        );
+        assert_eq!(
+            linked_binding.repository_root.as_deref(),
+            Some(root.as_path())
+        );
+        let count: i64 = linked_store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM repository_worktree_binding",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "a linked checkout must reuse its owning repository row"
+        );
+    }
+
+    #[test]
     fn failed_enrollment_leaves_external_database_absent() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap().join("repo");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        init_git_root(&root);
         let marker = root
             .join(".git")
             .join(aethyme_graph_storage::write_guard::BROKER_MANAGED_GRAPH_MARKER);

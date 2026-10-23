@@ -173,6 +173,15 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
 
 fn add_worktree_at(root: &Path, name: &str, revision: &str) -> std::path::PathBuf {
     let path = root.join(".aethyme/worktrees").join(name);
+    add_worktree_at_path(root, name, &path, revision)
+}
+
+fn add_worktree_at_path(
+    root: &Path,
+    name: &str,
+    path: &Path,
+    revision: &str,
+) -> std::path::PathBuf {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     sh(
         root,
@@ -186,7 +195,7 @@ fn add_worktree_at(root: &Path, name: &str, revision: &str) -> std::path::PathBu
             revision,
         ],
     );
-    path
+    path.to_path_buf()
 }
 
 fn refresh_committed_graph(root: &Path) {
@@ -610,7 +619,10 @@ triggers = ["docs/**"]
     );
     commit_all(tmp.path(), "add gates");
 
-    let wt = add_worktree(tmp.path(), "semantic-submit");
+    let worktrees = tempfile::tempdir().unwrap();
+    let worktree_path = worktrees.path().join("semantic-submit");
+    assert!(!worktree_path.exists());
+    let wt = add_worktree_at_path(tmp.path(), "semantic-submit", &worktree_path, "main");
     let mut setup = Broker::open(tmp.path()).unwrap();
     let session = setup.adopt(&wt, None).unwrap();
     drop(setup);

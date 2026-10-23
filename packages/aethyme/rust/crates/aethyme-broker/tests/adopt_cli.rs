@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use aethyme_broker::{Broker, BrokerOpenOptions};
+
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
@@ -973,10 +975,23 @@ fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
 }
 
 fn overlaps(repo: &Path) -> Vec<aethyme_broker::ScopeOverlap> {
-    common::open_fixture_broker(repo, repo.parent().unwrap_or(repo))
-        .unwrap()
-        .scope_overlaps_snapshot()
-        .unwrap()
+    let host_state_dir = common::fixture_host_state_dir(repo);
+    let preparation_cache_root = common::fixture_preparation_cache_root(repo);
+    std::fs::create_dir_all(&preparation_cache_root).unwrap();
+    let preparation_cache_root = preparation_cache_root.canonicalize().unwrap();
+    let broker = Broker::open_with_options(
+        repo,
+        BrokerOpenOptions::default()
+            .with_host_state_dir(host_state_dir.clone())
+            .with_host_cache_dir(common::fixture_host_cache_dir(repo))
+            .with_preparation_cache_root(preparation_cache_root)
+            .with_host_operation_database(host_state_dir.join("host-operations.db"))
+            .with_collaboration_state(host_state_dir.join("collaboration")),
+    )
+    .unwrap();
+    // This observer is read-only. Let the durable repository binding choose
+    // its repository-scoped root instead of pinning the host-state container.
+    broker.scope_overlaps_snapshot().unwrap()
 }
 
 // #285: adopt pasted its capture call inside a string literal, so it recorded

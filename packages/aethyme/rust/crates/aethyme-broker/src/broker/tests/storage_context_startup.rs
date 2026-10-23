@@ -50,7 +50,7 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
 
     // First writable open initializes the opt-in root while it is empty. The
     // test payload is placed only inside the resulting nonce-scoped namespace.
-    let initialized = Broker::open_with_options(
+    let mut initialized = Broker::open_with_options(
         repo.path(),
         BrokerOpenOptions::default()
             .with_host_state_dir(private_state.clone())
@@ -81,6 +81,11 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
     assert_eq!(override_json["version"], 4);
     assert!(override_json["preparation_cache_coordinator_db_path"].is_string());
 
+    // Cache initialization is independent of worktree placement. Startup
+    // maintenance itself requires a root bound through the real lifecycle.
+    initialized
+        .start_worktree("initialize captured startup maintenance", None)
+        .expect("bind the fixture root before testing startup maintenance");
     let private_entry = preparation_entry_under(&private_effective_root);
     let poisoned_entry = preparation_entry(&poisoned_state);
     for entry in [&private_entry, &poisoned_entry] {
@@ -1053,17 +1058,17 @@ fn run_captured_startup_child() {
     let git_common_dir = repo_handle
         .git_common_dir()
         .expect("fixture Git common directory");
-    let root_marker = crate::broker::WorktreeRootMarker {
-        schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
-        repository_key: crate::host_state::repository_key(&repository, Some(&git_common_dir)),
-        repository_root: repository.clone(),
-    };
-    std::fs::create_dir_all(&private_worktrees).expect("private worktree root");
-    std::fs::write(
-        private_worktrees.join(WORKTREE_ROOT_MARKER),
-        serde_json::to_vec(&root_marker).expect("serialize marker"),
+    let root_marker: crate::broker::WorktreeRootMarker = serde_json::from_slice(
+        &std::fs::read(private_worktrees.join(WORKTREE_ROOT_MARKER))
+            .expect("managed start published the private worktree marker"),
     )
-    .expect("write private worktree marker");
+    .expect("decode private worktree marker");
+    assert_eq!(root_marker.schema_version, WORKTREE_ROOT_SCHEMA_VERSION);
+    assert_eq!(root_marker.repository_root, repository);
+    assert_eq!(
+        root_marker.repository_key,
+        crate::host_state::repository_key(&repository, Some(&git_common_dir))
+    );
 
     let repository_fingerprint = crate::gates::git_origin_fingerprint(&repo_handle);
     let (private_lease_id, private_lease_generation) = seed_quarantined_resource_lease(

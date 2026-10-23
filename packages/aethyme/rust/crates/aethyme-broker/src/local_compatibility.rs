@@ -59,9 +59,11 @@ impl Fixture {
         git(repo.path(), &["remote", "set-head", "origin", "main"]);
         let host = tempfile::tempdir().unwrap();
         let worktrees = tempfile::tempdir().unwrap();
+        let worktree_root = worktrees.path().join("worktrees");
+        assert!(!worktree_root.exists());
         let mut broker = Broker::open(repo.path())
             .unwrap()
-            .with_worktree_root(worktrees.path())
+            .with_worktree_root(worktree_root)
             .with_collaboration_state(host.path());
         let session = broker
             .start_worktree("compatibility", Some("disposable Playground compatibility"))

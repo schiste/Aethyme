@@ -8,6 +8,7 @@
 //! observations and two independent origin records.
 
 use super::canonical_json::{self, Object, Value};
+use super::project_identity::{ProjectId, ProjectIdentityError};
 use super::record::{
     FieldKind, FieldSpec, Record, RecordError, RecordId, RecordSchema, StateReading,
 };
@@ -80,7 +81,9 @@ pub static EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA: RecordSchema = RecordSchema 
     name: EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA_NAME,
     fields: &[
         field("authority", true, FieldKind::String),
-        field("project_id", true, FieldKind::String),
+        field("association_record_id", true, FieldKind::String),
+        field("left_project_id", true, FieldKind::String),
+        field("right_project_id", true, FieldKind::String),
         field("left_clone_id", true, FieldKind::String),
         field("right_clone_id", true, FieldKind::String),
         field("left_source_snapshot", true, FieldKind::String),
@@ -135,6 +138,8 @@ pub enum SymbolIdentityError {
     InvalidField(&'static str),
     #[error(transparent)]
     Record(#[from] RecordError),
+    #[error(transparent)]
+    Project(#[from] ProjectIdentityError),
 }
 
 impl SymbolIdentityError {
@@ -144,6 +149,7 @@ impl SymbolIdentityError {
             Self::NonCanonical => "non_canonical",
             Self::InvalidField(_) => "invalid_field",
             Self::Record(error) => error.code(),
+            Self::Project(_) => "invalid_project_id",
         }
     }
 }
@@ -200,7 +206,7 @@ pub fn symbol_scope_kind(record: &Record) -> Option<SymbolScopeKind> {
 fn validate_record(record: &Record) -> Result<(), SymbolIdentityError> {
     match record.schema() {
         SYMBOL_REF_SCHEMA_NAME => {
-            record_id(record, "project_id")?;
+            project_id(record, "project_id")?;
             record_id(record, "clone_id")?;
             validate_scope(record.get("scope"))?;
         }
@@ -213,7 +219,7 @@ fn validate_record(record: &Record) -> Result<(), SymbolIdentityError> {
         }
         SYMBOL_ORIGIN_EVIDENCE_SCHEMA_NAME => {
             advisory(record)?;
-            record_id(record, "project_id")?;
+            project_id(record, "project_id")?;
             record_id(record, "clone_id")?;
             record_id(record, "symbol_ref")?;
             source_id(record, "source_snapshot")?;
@@ -223,7 +229,12 @@ fn validate_record(record: &Record) -> Result<(), SymbolIdentityError> {
         }
         EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA_NAME => {
             advisory(record)?;
-            record_id(record, "project_id")?;
+            record_id(record, "association_record_id")?;
+            let left_project = project_id(record, "left_project_id")?;
+            let right_project = project_id(record, "right_project_id")?;
+            if left_project == right_project {
+                return Err(SymbolIdentityError::InvalidField("right_project_id"));
+            }
             let left_clone = record_id(record, "left_clone_id")?;
             let right_clone = record_id(record, "right_clone_id")?;
             if left_clone == right_clone {
@@ -348,6 +359,10 @@ fn advisory(record: &Record) -> Result<(), SymbolIdentityError> {
 
 fn record_id(record: &Record, field: &'static str) -> Result<RecordId, SymbolIdentityError> {
     RecordId::parse(required_text(record, field)?).map_err(Into::into)
+}
+
+fn project_id(record: &Record, field: &'static str) -> Result<ProjectId, SymbolIdentityError> {
+    ProjectId::parse(required_text(record, field)?).map_err(Into::into)
 }
 
 fn source_id(

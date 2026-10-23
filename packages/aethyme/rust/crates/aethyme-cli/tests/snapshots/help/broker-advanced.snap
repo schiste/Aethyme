@@ -39,7 +39,7 @@ Verbs:
   events           show or prune the append-only event log
   metrics          cost/benefit accounting from local telemetry
   insights         session funnel, time-to-land and gate reliability from local history
-  worktree-root    resolve the external worktree root
+  worktree-root    resolve, bind or recover the external worktree root
   worktrees        list broker-owned worktrees
   scaffold         deterministic only-if-missing broker setup
   quick-test       disposable first-run smoke test
