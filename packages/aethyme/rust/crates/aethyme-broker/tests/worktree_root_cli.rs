@@ -659,6 +659,98 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
 }
 
 #[test]
+fn host_state_inside_a_linked_worktree_falls_back_without_creating_its_worktrees_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("project");
+    let linked_checkout = tmp.path().join("unmanaged-checkout");
+    let cache = tmp.path().join("cache");
+    let database = tmp.path().join("broker.db");
+    let available_bytes = tmp.path().join("available-bytes");
+    fixture_at(&repo);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/unmanaged-checkout",
+            linked_checkout.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let linked_checkout = linked_checkout.canonicalize().unwrap();
+    let host_state = linked_checkout.join(".aethyme/host-state");
+    std::fs::create_dir_all(&host_state).unwrap();
+    let host_state = host_state.canonicalize().unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let plan = json(
+        common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
+            .current_dir(&repo)
+            .env("AETHYME_HOST_STATE_DIR", &host_state)
+            .env("AETHYME_HOST_CACHE_DIR", &cache)
+            .env("AETHYME_BROKER_DB", &database)
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            .env_remove("AETHYME_GATE_BROKER_DATABASES")
+            .output()
+            .unwrap(),
+    );
+    let selected_root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
+    let worktrees_parent = host_state.join("worktrees");
+    assert!(selected_root.starts_with(&host_state));
+    assert!(
+        !worktrees_parent.exists(),
+        "planning created the nested parent"
+    );
+
+    std::fs::write(&available_bytes, "68719476736\n").unwrap();
+    let output = common::broker_cli(
+        CLI,
+        &["start", "--task", "nested host state", "--json"],
+    )
+    .current_dir(&repo)
+    .env("AETHYME_HOST_STATE_DIR", &host_state)
+    .env("AETHYME_HOST_CACHE_DIR", &cache)
+    .env("AETHYME_BROKER_DB", &database)
+    .env_remove("AETHYME_WORKTREE_ROOT")
+    .env_remove("AETHYME_GATE_BROKER_DATABASES")
+    .env(
+        aethyme_broker::TEST_AVAILABLE_BYTES_ENV,
+        format!("@{}", available_bytes.display()),
+    )
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "start should use the safe repository fallback: {}",
+        json_error::message(&output)
+    );
+    let started = json(output);
+    assert_eq!(
+        started["worktree_placement"]["source"],
+        "repository_fallback"
+    );
+    assert!(
+        started["worktree_placement"]["fallback_reason"]
+            .as_str()
+            .unwrap()
+            .contains("refusing nested broker worktree path"),
+        "{started}"
+    );
+    assert!(
+        !worktrees_parent.exists(),
+        "nested host-state worktrees parent was created"
+    );
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    assert!(!worktree.starts_with(&linked_checkout));
+    assert!(
+        git_output(&linked_checkout, &["status", "--porcelain"]).is_empty(),
+        "linked checkout changed"
+    );
+}
+
+#[test]
 fn unavailable_host_placement_uses_reported_registered_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("project");
