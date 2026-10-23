@@ -40,6 +40,12 @@ fn run(repo: &Path, state: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_with_host_state(repo: &Path, state: &Path, args: &[&str]) -> Output {
+    // Fresh placement uses this selected base only when it already exists.
+    std::fs::create_dir_all(state).unwrap();
+    run(repo, state, args)
+}
+
 fn run_with_root(repo: &Path, root: &Path, args: &[&str]) -> Output {
     common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
@@ -91,6 +97,8 @@ fn synthetic_downgrade_legacy_root_fixture(owner: &Path) -> LegacyRootFixture {
     let host_state = owner.join("host-state");
     let preparation_cache = owner.join("preparation-cache");
     fixture_at(&repository);
+    std::fs::create_dir_all(&host_state).unwrap();
+    std::fs::create_dir_all(&preparation_cache).unwrap();
     let started = json(run_with_storage_paths(
         &repository,
         &host_state,
@@ -157,6 +165,8 @@ fn v028_schema52_root_fixture(owner: &Path) -> LegacyRootFixture {
     let host_state = owner.join("host-state");
     let preparation_cache = owner.join("preparation-cache");
     fixture_at(&repository);
+    std::fs::create_dir_all(&host_state).unwrap();
+    std::fs::create_dir_all(&preparation_cache).unwrap();
 
     let started = json(run_with_storage_paths(
         &repository,
@@ -372,7 +382,7 @@ fn start_places_worktree_outside_repository_under_a_private_owned_root() {
     let state = tmp.path().join("state");
     fixture_at(&repo);
 
-    let started = json(run(
+    let started = json(run_with_host_state(
         &repo,
         &state,
         &["start", "--task", "scanner isolation", "--json"],
@@ -446,7 +456,11 @@ fn starts_from_a_broker_worktree_create_siblings_instead_of_nesting() {
     let state = tmp.path().join("state");
     fixture_at(&repo);
 
-    let first = json(run(&repo, &state, &["start", "--task", "first", "--json"]));
+    let first = json(run_with_host_state(
+        &repo,
+        &state,
+        &["start", "--task", "first", "--json"],
+    ));
     let first_path = PathBuf::from(first["worktree_path"].as_str().unwrap());
     let second = json(run(
         &first_path,
@@ -466,7 +480,11 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
     let state = tmp.path().join("state");
     fixture_at(&repo);
 
-    let first = json(run(&repo, &state, &["start", "--task", "owner", "--json"]));
+    let first = json(run_with_host_state(
+        &repo,
+        &state,
+        &["start", "--task", "owner", "--json"],
+    ));
     let first_path = PathBuf::from(first["worktree_path"].as_str().unwrap());
     let output = run_with_root(&repo, &first_path, &["start", "--task", "nested", "--json"]);
 
@@ -631,6 +649,9 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
             let root = tmp.path().join("override-worktrees");
             let sentinel = tmp.path().join("agent-ran");
             fixture_at(&repo);
+            if !override_root {
+                std::fs::create_dir_all(&state).unwrap();
+            }
             let args = if agent {
                 vec![
                     "start",
@@ -762,6 +783,8 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     );
     let actual_root = PathBuf::from(plan["preferred_root"].as_str().unwrap());
     assert!(!root.exists(), "read-only planning allocated the placement");
+    // Environment overrides select an existing container; planning above did not create it.
+    std::fs::create_dir_all(&root).unwrap();
     let output = common::broker_cli(
         CLI,
         &[
@@ -1298,6 +1321,8 @@ fn recovery_plan_inspects_incomplete_repository_uuid_marker_without_settling_it(
     let host_state = owner.path().join("host-state");
     let preparation_cache = owner.path().join("preparation-cache");
     fixture_at(&repository);
+    std::fs::create_dir_all(&host_state).unwrap();
+    std::fs::create_dir_all(&preparation_cache).unwrap();
     let started = json(run_with_storage_paths(
         &repository,
         &host_state,

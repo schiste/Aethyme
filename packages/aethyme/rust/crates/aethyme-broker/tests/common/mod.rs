@@ -138,6 +138,9 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
 pub fn broker_cli_for_fixture(binary: &str, args: &[&str], fixture_root: &Path) -> Command {
     let mut command = broker_cli(binary, args);
     isolate_host_paths(&mut command, fixture_root);
+    // Fresh worktree placement requires the fixture-owned host-state base to exist.
+    std::fs::create_dir_all(fixture_host_state_dir(fixture_root))
+        .expect("create fixture-owned host-state directory");
     command
 }
 
