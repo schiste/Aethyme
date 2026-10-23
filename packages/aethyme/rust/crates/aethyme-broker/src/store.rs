@@ -657,7 +657,7 @@ mod gate_result_clear_metadata_tests {
     #[test]
     fn health_row_inventory_keeps_candidates_without_reading_content_fingerprints() {
         let directory = tempfile::tempdir().unwrap();
-        let store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let store = BrokerStore::open(&directory.path().join("state.db")).unwrap();
         store
             .conn
             .execute(

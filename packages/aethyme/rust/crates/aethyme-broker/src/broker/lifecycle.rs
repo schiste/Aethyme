@@ -4761,6 +4761,9 @@ impl Broker {
                     .storage_context
                     .initialize_preparation_cache_root(&broker.repo)?;
             }
+            // The committed collaboration capture fence is independent of
+            // worktree-root binding and must also protect unbound stores.
+            broker.collaboration_fence_state(FenceTrigger::Open);
             return Ok(broker);
         }
         broker

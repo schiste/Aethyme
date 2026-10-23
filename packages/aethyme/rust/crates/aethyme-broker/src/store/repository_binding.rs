@@ -1880,7 +1880,9 @@ mod tests {
     #[test]
     fn nullable_binding_fields_preserve_null_and_reject_empty_values() {
         let directory = tempfile::tempdir().unwrap();
-        let store = open_store(&directory);
+        // Exercise a raw migrated row before an invoking repository attaches
+        // its scope and fills the nullable identity fields.
+        let store = BrokerStore::open(&directory.path().join("state.db")).unwrap();
         let legacy = store.repository_worktree_binding().unwrap();
         assert_eq!(legacy.state, RepositoryWorktreeBindingState::LegacyUnbound);
         assert_eq!(legacy.origin, Some(RepositoryWorktreeBindingOrigin::Legacy));
