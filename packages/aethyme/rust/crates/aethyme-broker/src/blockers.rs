@@ -292,6 +292,9 @@ impl Broker {
                     .unavailable
                     .push(source_error("broker.db gate_results", error)),
             }
+        }
+        report.blockers.extend(self.pidfile_blockers());
+        if inspect_recovery {
             match self.action_required_blockers() {
                 Ok(found) => report.blockers.extend(found),
                 Err(error) => report
@@ -299,7 +302,6 @@ impl Broker {
                     .push(source_error("session worktrees", error)),
             }
         }
-        report.blockers.extend(self.pidfile_blockers());
         report.paired_recovery = paired_recovery(&report.blockers);
         if report.paired_recovery.is_some() {
             name_the_other_half(&mut report.blockers);
