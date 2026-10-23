@@ -1026,20 +1026,6 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
         ],
     );
     git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
-    std::fs::write(&bytes, "68719476736\n").unwrap();
-    std::fs::write(
-        &upload_pack,
-        "#!/bin/sh\nprintf '0\\n' > \"$AETHYME_TEST_RESERVE_BYTES_PATH\" || exit 1\nexec git-upload-pack \"$@\"\n",
-    ).unwrap();
-    std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700)).unwrap();
-    git(
-        &repo,
-        &[
-            "config",
-            "remote.origin.uploadpack",
-            upload_pack.to_str().unwrap(),
-        ],
-    );
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
     let plan = json(
@@ -1057,6 +1043,21 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     assert!(!root.exists(), "read-only planning allocated the placement");
     // Environment overrides select an existing container; planning above did not create it.
     std::fs::create_dir_all(&root).unwrap();
+    bind_managed_root_fixture(&repo, &state, &cache, &actual_root);
+    std::fs::write(&bytes, "68719476736\n").unwrap();
+    std::fs::write(
+        &upload_pack,
+        "#!/bin/sh\nprintf '0\\n' > \"$AETHYME_TEST_RESERVE_BYTES_PATH\" || exit 1\nexec git-upload-pack \"$@\"\n",
+    ).unwrap();
+    std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().unwrap(),
+        ],
+    );
     let output = common::broker_cli(
         CLI,
         &[
@@ -1199,6 +1200,11 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             }
             #[cfg(unix)]
             if case.ends_with("link") {
+                assert!(
+                    marker.is_file(),
+                    "{case}: managed setup should create a regular marker"
+                );
+                std::fs::remove_file(&marker).unwrap();
                 if case == "valid-link" {
                     let owner = serde_json::json!({
                         "schema_version": 1,
@@ -1564,7 +1570,8 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         &fixture.host_state,
         &fixture.preparation_cache,
         &[
-            "adopt",
+            "start",
+            "--adopt",
             checkout_arg.as_str(),
             "--task",
             "adopt after reviewed binding",
@@ -1752,7 +1759,15 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert!(!fixture.repository_uuid_marker.exists());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);
-    assert_eq!(event_rows(&fixture.database), events_before);
+    let events_after_refusal = event_rows(&fixture.database);
+    assert!(events_after_refusal.starts_with(&events_before));
+    assert_eq!(events_after_refusal.len(), events_before.len() + 1);
+    let failed_start = events_after_refusal.last().unwrap();
+    assert_eq!(failed_start.3, "broker.command.failed");
+    let failed_start_payload: serde_json::Value =
+        serde_json::from_str(failed_start.5.as_deref().unwrap()).unwrap();
+    assert_eq!(failed_start_payload["command_surface"], "broker.start");
+    assert_eq!(failed_start_payload["failure_class"], "command_failed");
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
     assert_eq!(
         std::fs::read(&original_worktree_file).unwrap(),
@@ -1779,7 +1794,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert!(!fixture.repository_uuid_marker.exists());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);
-    assert_eq!(event_rows(&fixture.database), events_before);
+    assert_eq!(event_rows(&fixture.database), events_after_refusal);
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
 
     let bound = json(run_without_preparation_cache(
@@ -1803,7 +1818,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert!(fixture.repository_uuid_marker.is_file());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);
-    assert_eq!(event_rows(&fixture.database), events_before);
+    assert_eq!(event_rows(&fixture.database), events_after_refusal);
     assert_eq!(std::fs::read(&fixture.root_marker).unwrap(), marker_before);
 
     std::fs::create_dir_all(&fixture.preparation_cache).unwrap();
@@ -1816,7 +1831,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert_eq!(started["worktree_placement"]["root"], root_arg);
     assert!(fixture.preparation_cache.is_dir());
     assert!(session_rows(&fixture.database).starts_with(&sessions_before));
-    assert!(event_rows(&fixture.database).starts_with(&events_before));
+    assert!(event_rows(&fixture.database).starts_with(&events_after_refusal));
 
     let checkout_owner = tempfile::tempdir().unwrap();
     let checkout = checkout_owner.path().join("adopted");
@@ -1838,7 +1853,8 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         &fixture.host_state,
         &fixture.preparation_cache,
         &[
-            "adopt",
+            "start",
+            "--adopt",
             checkout_arg.as_str(),
             "--task",
             "adopt after binding",
@@ -1850,7 +1866,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         checkout
     );
     assert!(session_rows(&fixture.database).starts_with(&sessions_before));
-    assert!(event_rows(&fixture.database).starts_with(&events_before));
+    assert!(event_rows(&fixture.database).starts_with(&events_after_refusal));
 }
 
 #[path = "common/json_error.rs"]
