@@ -9592,17 +9592,11 @@ mod unbound_preparation_cache_open_tests {
                 .is_dir()
         );
         assert!(
-            std::fs::read_dir(
-                broker
-                    .storage_context()
-                    .preparation_cache_root()
-                    .unwrap()
-                    .unwrap()
-            )
-            .unwrap()
-            .next()
-            .is_some(),
-            "fresh-unbound open must initialize the explicitly selected cache root"
+            std::fs::read_dir(storage.root().join("preparation-cache"))
+                .unwrap()
+                .next()
+                .is_some(),
+            "fresh-unbound open must write initialization artifacts in the selected cache root"
         );
     }
 
