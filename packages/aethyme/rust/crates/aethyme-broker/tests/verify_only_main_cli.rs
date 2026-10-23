@@ -139,7 +139,7 @@ impl Fixture {
     fn broker(&self) -> Broker {
         Broker::open(&self.repo)
             .unwrap()
-            .with_host_operation_database(self.tmp.path().join("host-state/operations.db"))
+            .with_host_operation_database(self.tmp.path().join("host-state/host-operations.db"))
     }
 
     /// A live session with one committed change to `file`.
