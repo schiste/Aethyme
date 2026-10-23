@@ -1000,12 +1000,29 @@ fn push_is_a_running_coordinated_write(main_root: &Path) -> bool {
     ) else {
         return false;
     };
-    let Ok(store) = BrokerStore::open_in_repo(main_root) else {
-        return false;
+    let store = match BrokerStore::open_in_repo(main_root) {
+        Ok(store) => store,
+        Err(error) => {
+            crate::warn_unrecorded::<(), _>(
+                "open the broker store to verify the running coordinated push",
+                Err(error),
+            );
+            return false;
+        }
+    };
+    let operation = match store.coordinated_operation(operation_id) {
+        Ok(operation) => operation,
+        Err(error) => {
+            crate::warn_unrecorded::<(), _>(
+                "read the operation journal to verify the running coordinated push",
+                Err(error),
+            );
+            return false;
+        }
     };
     matches!(
-        store.coordinated_operation(operation_id),
-        Ok(Some(operation))
+        operation,
+        Some(operation)
             if operation.session_id == session_id
                 && operation.status == crate::OperationStatus::Running
                 && operation.effect != crate::OperationEffect::Read

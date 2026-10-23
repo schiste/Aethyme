@@ -97,12 +97,18 @@ fn worktree_root_registry_path(state: &Path) -> Option<PathBuf> {
     let entries = match std::fs::read_dir(state) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => panic!("cannot inspect host-state fixture {}: {error}", state.display()),
+        Err(error) => panic!(
+            "cannot inspect host-state fixture {}: {error}",
+            state.display()
+        ),
     };
     let mut registries = Vec::new();
     for entry in entries {
         let entry = entry.unwrap_or_else(|error| {
-            panic!("cannot inspect host-state entry under {}: {error}", state.display())
+            panic!(
+                "cannot inspect host-state entry under {}: {error}",
+                state.display()
+            )
         });
         if !entry
             .file_name()
@@ -113,7 +119,10 @@ fn worktree_root_registry_path(state: &Path) -> Option<PathBuf> {
         }
         let path = entry.path();
         let file_type = entry.file_type().unwrap_or_else(|error| {
-            panic!("cannot inspect worktree-root registry path {}: {error}", path.display())
+            panic!(
+                "cannot inspect worktree-root registry path {}: {error}",
+                path.display()
+            )
         });
         assert!(
             file_type.is_dir(),
@@ -142,9 +151,7 @@ fn bind_managed_root_fixture(repo: &Path, state: &Path, cache: &Path, root: &Pat
         .with_host_cache_dir(cache)
         .with_worktree_root(root);
     let mut broker = Broker::open_with_options(repo, options).unwrap();
-    let bootstrap = broker
-        .start_worktree("fixture root binding", None)
-        .unwrap();
+    let bootstrap = broker.start_worktree("fixture root binding", None).unwrap();
     let branch = bootstrap.branch.clone();
     broker.close(bootstrap.id).unwrap();
     broker.cleanup(bootstrap.id, false).unwrap();
@@ -163,11 +170,7 @@ fn run_with_storage_paths(
     run_with_host_paths(repo, host_state, Some(preparation_cache), args)
 }
 
-fn run_without_preparation_cache(
-    repo: &Path,
-    host_state: &Path,
-    args: &[&str],
-) -> Output {
+fn run_without_preparation_cache(repo: &Path, host_state: &Path, args: &[&str]) -> Output {
     run_with_host_paths(repo, host_state, None, args)
 }
 
@@ -815,10 +818,11 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
                 state.join("worktrees")
             };
             std::fs::create_dir_all(&selected_container).unwrap();
-            let mut plan_command = common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
-                .current_dir(&repo)
-                .env("AETHYME_HOST_STATE_DIR", &state)
-                .env("AETHYME_HOST_CACHE_DIR", &cache);
+            let mut plan_command =
+                common::broker_cli(CLI, &["advanced", "worktree-root", "--json"])
+                    .current_dir(&repo)
+                    .env("AETHYME_HOST_STATE_DIR", &state)
+                    .env("AETHYME_HOST_CACHE_DIR", &cache);
             if override_root {
                 plan_command.env("AETHYME_WORKTREE_ROOT", &root_container);
             }
@@ -1138,7 +1142,10 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 .unwrap_or(0);
             if case != "unmarked" {
                 assert!(sessions_before > 0, "{case}: bound fixture has no sessions");
-                assert!(roots_before > 0, "{case}: bound fixture has no registry root");
+                assert!(
+                    roots_before > 0,
+                    "{case}: bound fixture has no registry root"
+                );
             }
             let args = if agent {
                 vec![
@@ -1222,7 +1229,10 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
                 .as_deref()
                 .map(|path| sqlite_count_if_present(path, "SELECT count(*) FROM roots"))
                 .unwrap_or(0);
-            assert_eq!(roots_after, roots_before, "refused root changed ownership history");
+            assert_eq!(
+                roots_after, roots_before,
+                "refused root changed ownership history"
+            );
             let branches = Command::new("git")
                 .args(["for-each-ref", "--format=%(refname)", "refs/heads/agent/"])
                 .current_dir(&repo)

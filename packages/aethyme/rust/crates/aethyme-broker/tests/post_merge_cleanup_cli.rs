@@ -93,16 +93,16 @@ fn run_merge(
         ],
         repo,
     )
-        .env("PATH", prepend_path(fake_bin))
-        .env("AETHYME_TEST_REAL_GIT", real_git())
-        .env("AETHYME_TEST_UPSTREAM_SHA", upstream_sha)
-        .env(
-            "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
-            fixture_owner.join("worktrees"),
-        )
-        .current_dir(repo)
-        .output()
-        .unwrap()
+    .env("PATH", prepend_path(fake_bin))
+    .env("AETHYME_TEST_REAL_GIT", real_git())
+    .env("AETHYME_TEST_UPSTREAM_SHA", upstream_sha)
+    .env(
+        "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
+        fixture_owner.join("worktrees"),
+    )
+    .current_dir(repo)
+    .output()
+    .unwrap()
 }
 
 #[test]
@@ -184,13 +184,7 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
 "#,
     );
 
-    let output = run_merge(
-        &repo,
-        &fake_bin,
-        temp.path(),
-        session.id,
-        &upstream,
-    );
+    let output = run_merge(&repo, &fake_bin, temp.path(), session.id, &upstream);
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",

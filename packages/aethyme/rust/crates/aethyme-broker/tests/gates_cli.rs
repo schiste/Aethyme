@@ -1656,11 +1656,8 @@ fn submit_replays_a_bounded_gate_failure_tail() {
     git(&worktree, &["add", "tracked.txt"]);
     git(&worktree, &["commit", "-qm", "change"]);
 
-    let failed = run_with_managed_worktree_root(
-        &worktree,
-        &root,
-        &["submit", "--session", &session],
-    );
+    let failed =
+        run_with_managed_worktree_root(&worktree, &root, &["submit", "--session", &session]);
     assert!(!failed.status.success());
     let stderr = String::from_utf8(failed.stderr).unwrap();
     assert!(stderr.contains("gate failure output (last 1 line(s))"));
@@ -1953,11 +1950,8 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
     let outcome: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert_eq!(outcome["entry"]["status"], "rejected");
 
-    let rejected_text = run_with_managed_worktree_root(
-        &worktree,
-        &root,
-        &["submit", "--session", &session],
-    );
+    let rejected_text =
+        run_with_managed_worktree_root(&worktree, &root, &["submit", "--session", &session]);
     assert_eq!(
         rejected_text.status.code(),
         Some(i32::from(aethyme_broker::exit_status::VERIFICATION_FAILED)),
