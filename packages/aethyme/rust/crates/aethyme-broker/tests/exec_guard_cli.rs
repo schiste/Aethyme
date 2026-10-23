@@ -156,7 +156,7 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
         repo.path(),
         aethyme_broker::BrokerOpenOptions::default()
             .with_host_state_dir(state.path())
-            .with_worktree_root(state.path().join("worktrees")),
+            .with_worktree_root(Path::new(worktree).parent().unwrap()),
     )
     .unwrap();
     let events = broker.store().events_after(0, i64::MAX).unwrap();

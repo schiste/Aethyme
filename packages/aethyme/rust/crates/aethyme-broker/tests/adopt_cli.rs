@@ -986,10 +986,11 @@ fn overlaps(repo: &Path) -> Vec<aethyme_broker::ScopeOverlap> {
             .with_host_cache_dir(common::fixture_host_cache_dir(repo))
             .with_preparation_cache_root(preparation_cache_root)
             .with_host_operation_database(host_state_dir.join("host-operations.db"))
-            .with_worktree_root(host_state_dir.join("worktrees"))
             .with_collaboration_state(host_state_dir.join("collaboration")),
     )
     .unwrap();
+    // This observer is read-only. Let the durable repository binding choose
+    // its repository-scoped root instead of pinning the host-state container.
     broker.scope_overlaps_snapshot().unwrap()
 }
 
