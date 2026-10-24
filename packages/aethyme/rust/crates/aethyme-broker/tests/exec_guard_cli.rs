@@ -599,3 +599,107 @@ fn rejected_exec_preflight_does_not_create_a_receipt_or_dispatch_the_command() {
     let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(value["receipts"].as_array().unwrap().len(), 0);
 }
+
+/// A terminal adapter may stop waiting while its broker process remains alive.
+/// The running receipt must remain discoverable and later bind to completion.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_early_returning_caller_can_query_the_same_receipt_through_completion() {
+    use std::time::{Duration, Instant};
+    let (repo, state, packed) = fixture();
+    let (id, worktree) = split(&packed);
+    let started = state.path().join("early-return-started");
+    let release = state.path().join("early-return-release");
+    let mut exec = Command::new(CLI)
+        .args([
+            "advanced",
+            "exec",
+            "--session",
+            id,
+            "--non-interactive",
+            "--timeout",
+            "8",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            concat!(
+                "printf started > \"$1\"; i=0; ",
+                "while [ ! -e \"$2\" ] && [ \"$i\" -lt 100 ]; ",
+                "do sleep 0.05; i=$((i + 1)); done"
+            ),
+            "fixture",
+            started.to_str().unwrap(),
+            release.to_str().unwrap(),
+        ])
+        .current_dir(worktree)
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let receipt_id = loop {
+        let status = run(
+            repo.path(),
+            state.path(),
+            &["advanced", "exec-status", "--session", id, "--json"],
+        );
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        if started.is_file()
+            && let Some(receipt) = value["receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|receipt| receipt["phase"] == "running")
+        {
+            assert!(exec.try_wait().unwrap().is_none());
+            break receipt["receipt_id"].as_str().unwrap().to_owned();
+        }
+        if Instant::now() >= deadline {
+            std::fs::write(&release, b"release").unwrap();
+            if exec.try_wait().unwrap().is_none() {
+                exec.kill().unwrap();
+            }
+            let output = exec.wait_with_output().unwrap();
+            panic!(
+                "running receipt not observed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::write(&release, b"release").unwrap();
+    let output = exec.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["execution_receipt_id"], receipt_id);
+    assert_eq!(report["command_success"], true);
+    let status = run(
+        repo.path(),
+        state.path(),
+        &[
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            &receipt_id,
+            "--json",
+        ],
+    );
+    assert!(status.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["receipt"]["receipt_id"], receipt_id);
+    assert_eq!(value["receipt"]["phase"], "completed");
+    assert_eq!(value["receipt"]["process_group_cleanup"], "verified");
+}
