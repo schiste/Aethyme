@@ -1144,11 +1144,7 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     let upload_pack_command = format!("'{quoted_upload_pack}'");
     git(
         &repo,
-        &[
-            "config",
-            "remote.origin.uploadpack",
-            &upload_pack_command,
-        ],
+        &["config", "remote.origin.uploadpack", &upload_pack_command],
     );
     let output = common::broker_cli(
         CLI,
