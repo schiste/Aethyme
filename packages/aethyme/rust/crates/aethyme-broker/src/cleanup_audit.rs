@@ -335,8 +335,8 @@ impl Broker {
         let mut warnings = Vec::new();
         let (mut behind, mut ahead) = (0, 0);
         if let (Some(local), Some(upstream)) = (&local_commit, &upstream_commit) {
-            behind = repo.commit_count_between(local, upstream).unwrap_or(0);
-            ahead = repo.commit_count_between(upstream, local).unwrap_or(0);
+            behind = repo.commit_count_between(local, upstream)?;
+            ahead = repo.commit_count_between(upstream, local)?;
         }
         let (proof_ref, proof_commit) = match (&upstream_commit, &local_commit) {
             (Some(upstream), _) => (upstream_ref.clone(), upstream.clone()),
