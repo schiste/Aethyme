@@ -341,7 +341,7 @@ impl PullRequestWatchProvider for GithubCliPullRequestWatchProvider {
         // can recover either one after the fact — the first poll is already too
         // late to observe the opening, and a merged pull request reports
         // `MERGED` on every poll thereafter.
-        let fields = "number,title,url,state,baseRefName,headRefName,headRefOid,isDraft,comments,reviews,statusCheckRollup,createdAt,mergedAt";
+        let fields = "number,title,url,state,baseRefName,baseRefOid,headRefName,headRefOid,isDraft,mergeStateStatus,comments,reviews,statusCheckRollup,createdAt,mergedAt";
         let mut command = Command::new("gh");
         command.args([
             "pr",
@@ -429,6 +429,27 @@ fn parse_github_snapshot(
         );
     }
     if selected.contains(&PullRequestActivityKind::Check) {
+        // Mergeability is a provider check observation, not an acceptance rule.
+        // Include both immutable tips: an unchanged author head can become
+        // conflicting when the base advances. Unknown/pending data is not clean.
+        let merge_state = json_string(&value, "mergeStateStatus");
+        let base_sha = json_string(&value, "baseRefOid").unwrap_or_default();
+        if let Some(state @ ("DIRTY" | "BEHIND" | "CLEAN" | "BLOCKED" | "UNSTABLE" | "HAS_HOOKS")) =
+            merge_state
+            && base_sha.len() == 40
+            && base_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            let stable = serde_json::to_vec(&(&head_sha, base_sha.to_ascii_lowercase(), state))
+                .expect("serializable merge state");
+            activities.push(PullRequestActivityMetadata {
+                kind: PullRequestActivityKind::Check,
+                provider_id: format!("github:merge-state:{:x}", Sha256::digest(stable)),
+                author: None,
+                state: Some(format!("merge_state:{state}")),
+                url: json_string(&value, "url").map(str::to_string),
+                updated_at: None,
+            });
+        }
         for check in value
             .get("statusCheckRollup")
             .and_then(serde_json::Value::as_array)
@@ -1018,6 +1039,67 @@ mod tests {
         assert!(!encoded.contains("untrusted secret"));
         assert_eq!(snapshot.activities[0].provider_id, "C1");
         assert!(snapshot.is_draft);
+    }
+
+    #[test]
+    fn merge_state_observation_tracks_both_tips_without_inventing_policy() {
+        let mut value = serde_json::json!({
+            "number": 7, "state": "OPEN", "url": "https://github.com/o/r/pull/7",
+            "headRefOid": "a".repeat(40), "baseRefOid": "b".repeat(40),
+            "mergeStateStatus": "CLEAN"
+        });
+        let parse = |value: &serde_json::Value, selected: &[PullRequestActivityKind]| {
+            parse_github_snapshot(&serde_json::to_vec(value).unwrap(), selected).unwrap()
+        };
+        let kinds = &[PullRequestActivityKind::Check];
+        let clean = parse(&value, kinds);
+        value["mergeStateStatus"] = "DIRTY".into();
+        let dirty = parse(&value, kinds);
+        assert_eq!(dirty.activities.len(), 1);
+        assert_eq!(
+            dirty.activities[0].state.as_deref(),
+            Some("merge_state:DIRTY")
+        );
+        assert_eq!(
+            dirty.activities[0].url.as_deref(),
+            Some("https://github.com/o/r/pull/7")
+        );
+        assert_ne!(activity_digest(&clean), activity_digest(&dirty));
+        assert_eq!(dirty, parse(&value, kinds));
+        assert_ne!(
+            clean.activities[0].provider_id,
+            dirty.activities[0].provider_id
+        );
+        value["baseRefOid"] = "c".repeat(40).into();
+        let advanced_base = parse(&value, kinds);
+        assert_ne!(
+            dirty.activities[0].provider_id,
+            advanced_base.activities[0].provider_id
+        );
+        value["headRefOid"] = "d".repeat(40).into();
+        assert_ne!(
+            advanced_base.activities[0].provider_id,
+            parse(&value, kinds).activities[0].provider_id
+        );
+        value["mergeStateStatus"] = "BEHIND".into();
+        assert_eq!(
+            parse(&value, kinds).activities[0].state.as_deref(),
+            Some("merge_state:BEHIND")
+        );
+        assert!(
+            parse(&value, &[PullRequestActivityKind::Comment])
+                .activities
+                .is_empty()
+        );
+        for state in ["UNKNOWN", "", "unexpected"] {
+            value["mergeStateStatus"] = state.into();
+            assert!(parse(&value, kinds).activities.is_empty());
+        }
+        value["mergeStateStatus"] = "CLEAN".into();
+        for base in ["", "short", &"z".repeat(40)] {
+            value["baseRefOid"] = base.into();
+            assert!(parse(&value, kinds).activities.is_empty());
+        }
     }
 
     #[test]
