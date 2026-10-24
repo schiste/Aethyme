@@ -20,6 +20,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+const PROCESS_TABLE_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_TABLE_STREAM_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Environment override for the caller's agent process: a pid, or `0`/`none`
 /// to declare the caller unidentified.
@@ -56,12 +60,28 @@ pub struct ProcessTable {
 }
 
 impl ProcessTable {
-    /// Snapshot the host's process table, or `None` when `ps` is unavailable.
+    /// Snapshot the host's process table, or `None` when the complete
+    /// observation is unavailable. Never parse a timed-out or truncated prefix.
     pub fn snapshot() -> Option<Self> {
-        let output = Command::new("ps")
-            .args(["-A", "-o", "pid=,ppid=,lstart=,args="])
-            .output()
-            .ok()?;
+        let mut command = Command::new("ps");
+        command.args(["-A", "-o", "pid=,ppid=,lstart=,args="]);
+        Self::snapshot_with_budget(
+            &mut command,
+            PROCESS_TABLE_TIMEOUT,
+            PROCESS_TABLE_STREAM_LIMIT,
+        )
+    }
+
+    fn snapshot_with_budget(
+        command: &mut Command,
+        timeout: Duration,
+        stream_limit: usize,
+    ) -> Option<Self> {
+        let crate::bounded_output::LimitedOutput::Completed(output) =
+            crate::bounded_output::output_limited(command, timeout, stream_limit).ok()?
+        else {
+            return None;
+        };
         output
             .status
             .success()
@@ -607,6 +627,70 @@ mod tests {
  2100  2023 Fri Oct  2 15:31:00 2026     /bin/bash -lc git status
  3000     1 Fri Oct  2 15:40:00 2026     /usr/bin/nohup zsh queue.sh
 ";
+
+    #[cfg(unix)]
+    fn snapshot_command(stdout: &str, stderr: &str, status: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$1\"; printf '%s' \"$2\" >&2; exit \"$3\"",
+            "process-fixture",
+            stdout,
+            stderr,
+            status,
+        ]);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_snapshot_requires_complete_success_within_each_stream_budget() {
+        let observe = |stdout: &str, stderr: &str, status: &str| {
+            ProcessTable::snapshot_with_budget(
+                &mut snapshot_command(stdout, stderr, status),
+                Duration::from_secs(2),
+                TABLE.len(),
+            )
+        };
+        let complete = observe(TABLE, "", "0").expect("exact-cap complete snapshot");
+        assert_eq!(
+            complete.process(1977).unwrap().command,
+            "claude --resume 621c2bfc"
+        );
+        assert!(complete.is_alive(&complete.process(1977).unwrap()));
+        assert!(observe(&format!("{TABLE} "), "", "0").is_none());
+        assert!(observe(TABLE, &"x".repeat(TABLE.len() + 1), "0").is_none());
+        assert!(observe(TABLE, "", "7").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_snapshot_deadline_and_spawn_failure_are_unavailable() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s' \"$1\"; exec /bin/sleep 5",
+            "process-fixture",
+            TABLE,
+        ]);
+        assert!(
+            ProcessTable::snapshot_with_budget(
+                &mut command,
+                Duration::from_millis(20),
+                TABLE.len(),
+            )
+            .is_none()
+        );
+        let owner = tempfile::tempdir().unwrap();
+        assert!(
+            ProcessTable::snapshot_with_budget(
+                &mut Command::new(owner.path().join("missing-command")),
+                Duration::from_secs(1),
+                TABLE.len(),
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn operation_provenance_never_keeps_a_token_shaped_program_name() {
