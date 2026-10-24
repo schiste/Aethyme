@@ -82,4 +82,32 @@ fn start_names_the_existing_owner_for_task_path_overlap_without_a_graph() {
             .as_array()
             .is_none_or(|rows| rows.is_empty())
     );
+    let status = common::broker_cli_for_fixture(CLI, &["status", "--json"], fixture.path())
+        .current_dir(fixture.path())
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let pairs: Vec<_> = status["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["id"] == "session.duplicate-work")
+        .collect();
+    assert_eq!(
+        pairs.len(),
+        1,
+        "a shared path produces one canonical pair, not two"
+    );
+    assert_eq!(pairs[0]["session_id"], first["id"]);
+    assert!(
+        pairs[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("session {}", second["id"]))
+    );
 }

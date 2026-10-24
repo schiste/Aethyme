@@ -205,16 +205,18 @@ impl Broker {
     /// them has gone quiet.
     pub(crate) fn duplicate_work_advice(&self, agents: &[AgentView]) -> Vec<StatusAdvice> {
         let prs_by_head = self.cached_open_prs_by_head();
+        // Parse each nonclosed task once, not once per compared pair.
+        let targets = observed_targets(agents, &prs_by_head);
         let mut advice = Vec::new();
-        for agent in agents
-            .iter()
-            .filter(|agent| !agent.derived_status.is_closed())
-        {
-            for duplicate in duplicates_among(&agent.session, agents, &prs_by_head) {
-                // One row per pair: the lower session id speaks for both.
-                if duplicate.session_id < agent.session.id {
-                    continue;
-                }
+        for (agent, mine) in &targets {
+            for duplicate in duplicates_with_targets(
+                &agent.session,
+                mine,
+                targets
+                    .iter()
+                    .filter(|(other, _)| other.session.id > agent.session.id)
+                    .map(|(other, target)| (*other, target)),
+            ) {
                 let both_live = is_live(agent.derived_status) && is_live(duplicate.status);
                 advice.push(StatusAdvice {
                     id: "session.duplicate-work",
@@ -266,12 +268,34 @@ fn duplicates_among(
     prs_by_head: &BTreeMap<String, i64>,
 ) -> Vec<DuplicateWork> {
     let mine = duplicate_target(session, prs_by_head);
-    let mut found = agents
+    let targets = observed_targets(agents, prs_by_head);
+    duplicates_with_targets(
+        session,
+        &mine,
+        targets.iter().map(|(other, target)| (*other, target)),
+    )
+}
+
+fn observed_targets<'a>(
+    agents: &'a [AgentView],
+    prs_by_head: &BTreeMap<String, i64>,
+) -> Vec<(&'a AgentView, Target)> {
+    agents
         .iter()
-        .filter(|other| other.session.id != session.id && !other.derived_status.is_closed())
-        .filter_map(|other| {
-            let theirs = duplicate_target(&other.session, prs_by_head);
-            let (reason, pull_request) = compare(&mine, &theirs)?;
+        .filter(|agent| !agent.derived_status.is_closed())
+        .map(|agent| (agent, duplicate_target(&agent.session, prs_by_head)))
+        .collect()
+}
+
+fn duplicates_with_targets<'a>(
+    session: &Session,
+    mine: &Target,
+    targets: impl Iterator<Item = (&'a AgentView, &'a Target)>,
+) -> Vec<DuplicateWork> {
+    let mut found = targets
+        .filter(|(other, _)| other.session.id != session.id)
+        .filter_map(|(other, theirs)| {
+            let (reason, pull_request) = compare(mine, theirs)?;
             Some(DuplicateWork {
                 session_id: other.session.id,
                 status: other.derived_status,
