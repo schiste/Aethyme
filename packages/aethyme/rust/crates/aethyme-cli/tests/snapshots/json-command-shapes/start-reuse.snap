@@ -8,6 +8,16 @@
   "adoption_base": "string",
   "agent_identity": "null",
   "ai_provider": "null",
+  "base_freshness": {
+    "max_age_seconds": "integer",
+    "observed_at_ms": "integer",
+    "previous_observation_age_seconds": "integer",
+    "previous_observation_stale": "bool",
+    "relation": "string",
+    "source": "string",
+    "target_commit": "string",
+    "target_ref": "string"
+  },
   "branch": "string",
   "cleanup_completed_at": "null",
   "cleanup_state": "string",

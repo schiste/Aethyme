@@ -217,6 +217,18 @@ pub(crate) struct TrackedDefault {
     pub(crate) commit: String,
 }
 
+/// The one default-branch ref inspected during a session-reuse boundary.
+/// `fetched` is false when the comparison used a cached tracking ref after a
+/// failed or unavailable fetch; callers must not treat that cache as current
+/// remote evidence.
+#[derive(Debug, Clone)]
+pub(crate) struct DefaultBranchRefreshEvidence {
+    pub(crate) tracking_ref: String,
+    pub(crate) display_ref: String,
+    pub(crate) commit: Option<String>,
+    pub(crate) fetched: bool,
+}
+
 pub(crate) fn tracked_default(repo: &GitRepo) -> Option<TrackedDefault> {
     let (upstream, commit) = repo.upstream_default()?;
     let (remote, branch) = upstream
@@ -582,7 +594,7 @@ impl Broker {
         // Advisory and best-effort, like the overlap check below: the default
         // branch moved under this session whenever another PR merged, and
         // that is only visible after fetching it.
-        let (default_branch, default_branch_note) = self.fetch_and_measure_default_branch(
+        let (default_branch, default_branch_note, _) = self.fetch_and_measure_default_branch(
             session_id,
             &session.branch,
             &default,
@@ -718,15 +730,26 @@ impl Broker {
         target: Option<&crate::ResolvedRemoteTarget>,
         head: &str,
         main_root: &Path,
-    ) -> (Option<crate::DefaultBranchDrift>, Option<String>) {
-        let mut note = self
+    ) -> (
+        Option<crate::DefaultBranchDrift>,
+        Option<String>,
+        DefaultBranchRefreshEvidence,
+    ) {
+        let fetch_error = self
             .fetch_default_branch(session_id, default, target, main_root)
             .err();
+        let mut note = fetch_error.clone();
         let repo = self.repo_handle();
         let Some(commit) = repo.resolve_ref(&default.tracking_ref) else {
             return (
                 None,
                 Some(format!("{} is not fetched", default.tracking_ref)),
+                DefaultBranchRefreshEvidence {
+                    tracking_ref: default.tracking_ref.clone(),
+                    display_ref: format!("{}/{}", default.remote, default.branch),
+                    commit: None,
+                    fetched: false,
+                },
             );
         };
         let reference = format!("{}/{}", default.remote, default.branch);
@@ -752,7 +775,16 @@ impl Broker {
                 None
             }
         };
-        (drift, note)
+        (
+            drift,
+            note,
+            DefaultBranchRefreshEvidence {
+                tracking_ref: default.tracking_ref.clone(),
+                display_ref: reference,
+                commit: Some(commit),
+                fetched: fetch_error.is_none(),
+            },
+        )
     }
 
     /// Find the open pull request for the session branch, or create one in the

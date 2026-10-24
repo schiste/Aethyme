@@ -1,5 +1,34 @@
 use super::*;
 
+fn write_session_base_observation(
+    tx: &Transaction<'_>,
+    session_id: i64,
+    value: &crate::broker::SessionBaseObservation,
+) -> Result<(), BrokerError> {
+    let value = serde_json::to_string(value)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![
+            crate::broker::SessionBaseObservation::meta_key(session_id),
+            value
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_session_base_observation(
+    tx: &Transaction<'_>,
+    session_id: i64,
+) -> Result<(), BrokerError> {
+    tx.execute(
+        "DELETE FROM meta WHERE key = ?1",
+        [crate::broker::SessionBaseObservation::meta_key(session_id)],
+    )?;
+    Ok(())
+}
+
 /// Capability proving that a database belongs to the private fresh-stage
 /// bootstrap path. Only this module can construct it, after it has established
 /// exclusive stage ownership and before publishing the final database name.
@@ -380,6 +409,25 @@ impl BrokerStore {
             context,
             planned_paths,
             None,
+            None,
+        )
+    }
+
+    pub(crate) fn register_session_with_context_and_leases_and_base_observation(
+        &mut self,
+        verify_only: bool,
+        new: &NewSession,
+        context: &SessionContext,
+        planned_paths: &[String],
+        base_observation: &crate::broker::SessionBaseObservation,
+    ) -> Result<Session, BrokerError> {
+        self.register_session_with_optional_spawn_witness(
+            verify_only,
+            new,
+            context,
+            planned_paths,
+            None,
+            Some(base_observation),
         )
     }
 
@@ -387,13 +435,14 @@ impl BrokerStore {
     /// worktree identity witness in the same transaction as the session row.
     /// `None` is valid on unsupported platforms and deliberately leaves the
     /// session ineligible for automatic checkout removal.
-    pub(crate) fn register_spawned_session_with_context_and_leases(
+    pub(crate) fn register_spawned_session_with_context_and_leases_and_base_observation(
         &mut self,
         verify_only: bool,
         new: &NewSession,
         context: &SessionContext,
         planned_paths: &[String],
         witness: Option<&crate::events::SpawnedWorktreeInstanceWitness>,
+        base_observation: Option<&crate::broker::SessionBaseObservation>,
     ) -> Result<Session, BrokerError> {
         if new.origin != SessionOrigin::Spawned {
             return Err(BrokerError::InvalidSpawnedWorktreeInstanceWitness(
@@ -413,6 +462,7 @@ impl BrokerStore {
             context,
             planned_paths,
             witness,
+            base_observation,
         )
     }
 
@@ -423,6 +473,7 @@ impl BrokerStore {
         context: &SessionContext,
         planned_paths: &[String],
         witness: Option<&crate::events::SpawnedWorktreeInstanceWitness>,
+        base_observation: Option<&crate::broker::SessionBaseObservation>,
     ) -> Result<Session, BrokerError> {
         let now = now_ms();
         let tx = self
@@ -430,6 +481,9 @@ impl BrokerStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         validate_planned_lease_conflicts(&tx, None, planned_paths, now, verify_only)?;
         let id = insert_session(&tx, new, context, now)?;
+        if let Some(base_observation) = base_observation {
+            write_session_base_observation(&tx, id, base_observation)?;
+        }
         if let Some(witness) = witness {
             let witness_json = serde_json::to_string(witness).map_err(|error| {
                 BrokerError::InvalidSpawnedWorktreeInstanceWitness(format!("session {id}: {error}"))
@@ -568,6 +622,34 @@ impl BrokerStore {
         context: &SessionContext,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
+        self.reuse_session_with_context_and_leases_and_base_observation(
+            super::SessionReuseOptions {
+                verify_only,
+                id,
+                task,
+                diff_base,
+                agent_identity,
+                context,
+                planned_paths,
+                base_observation: None,
+            },
+        )
+    }
+
+    pub(crate) fn reuse_session_with_context_and_leases_and_base_observation(
+        &mut self,
+        options: super::SessionReuseOptions<'_>,
+    ) -> Result<Session, BrokerError> {
+        let super::SessionReuseOptions {
+            verify_only,
+            id,
+            task,
+            diff_base,
+            agent_identity,
+            context,
+            planned_paths,
+            base_observation,
+        } = options;
         let now = now_ms();
         let tx = self
             .conn
@@ -598,6 +680,9 @@ impl BrokerStore {
         )?;
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(id));
+        }
+        if let Some(base_observation) = base_observation {
+            write_session_base_observation(&tx, id, base_observation)?;
         }
         insert_event(
             &tx,
@@ -639,6 +724,30 @@ impl BrokerStore {
         context: &SessionContext,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
+        self.replace_session_with_context_and_leases_and_base_observation(
+            super::SessionReplacementOptions {
+                verify_only,
+                replaced_id,
+                new,
+                context,
+                planned_paths,
+                base_observation: None,
+            },
+        )
+    }
+
+    pub(crate) fn replace_session_with_context_and_leases_and_base_observation(
+        &mut self,
+        options: super::SessionReplacementOptions<'_>,
+    ) -> Result<Session, BrokerError> {
+        let super::SessionReplacementOptions {
+            verify_only,
+            replaced_id,
+            new,
+            context,
+            planned_paths,
+            base_observation,
+        } = options;
         let now = now_ms();
         let tx = self
             .conn
@@ -654,6 +763,7 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(replaced_id));
         }
+        delete_session_base_observation(&tx, replaced_id)?;
         release_checkpoint_pin_in_tx(&tx, replaced_id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [replaced_id])?;
         tx.execute(
@@ -662,6 +772,9 @@ impl BrokerStore {
         )?;
         insert_event(&tx, now, "session.cleaned", Some(replaced_id), None)?;
         let id = insert_session(&tx, new, context, now)?;
+        if let Some(base_observation) = base_observation {
+            write_session_base_observation(&tx, id, base_observation)?;
+        }
         insert_session_context_event(&tx, id, context, now)?;
         insert_planned_explicit_leases(&tx, id, planned_paths, now)?;
         tx.commit()?;
@@ -887,6 +1000,7 @@ impl BrokerStore {
         // implicit-lease snapshot behind forever (722 orphaned rows for
         // ~25 sessions observed in the 2026-07-17 dogfood database).
         if status.is_closed() {
+            delete_session_base_observation(&tx, id)?;
             release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
             tx.execute(
@@ -930,6 +1044,7 @@ impl BrokerStore {
             }
             return Err(BrokerError::SessionNotFound(id));
         }
+        delete_session_base_observation(&tx, id)?;
         release_checkpoint_pin_in_tx(&tx, id, now)?;
         release_session_leases_in_tx(&tx, id, now, "finish")?;
         tx.execute(
@@ -976,6 +1091,8 @@ impl BrokerStore {
             return Err(BrokerError::SessionNotFound(id));
         };
         if state == "cleaned" {
+            delete_session_base_observation(&tx, id)?;
+            tx.commit()?;
             return Ok(());
         }
         if state == "open" {
@@ -986,6 +1103,7 @@ impl BrokerStore {
                  WHERE id = ?1",
                 params![id, now],
             )?;
+            delete_session_base_observation(&tx, id)?;
             release_checkpoint_pin_in_tx(&tx, id, now)?;
             release_session_leases_in_tx(&tx, id, now, "finish")?;
             tx.execute(

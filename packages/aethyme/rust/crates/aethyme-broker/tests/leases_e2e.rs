@@ -144,6 +144,7 @@ fn planned_reuse_is_all_or_nothing_and_does_not_retask_on_conflict() {
 fn planned_reuse_is_deduplicated_sorted_and_expired_conflicts_do_not_block() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
+    sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
     let mut broker = Broker::open(tmp.path()).unwrap();
     let owner_worktree = add_worktree(tmp.path(), "expiring-owner");
     let reuse_worktree = add_worktree(tmp.path(), "successful-reuse");

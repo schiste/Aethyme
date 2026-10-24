@@ -234,6 +234,7 @@ mod update_cache;
 mod verification;
 mod verify_loop;
 mod version;
+mod worktree_freshness;
 mod worktree_reconcile;
 
 pub use aethyme_graph_storage::{
@@ -250,15 +251,16 @@ pub use blockers::{
     UnblockRequest,
 };
 pub use broker::{
-    AdoptCarriedOwnership, AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
-    AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
-    Broker, BrokerOpError, BrokerOpenOptions, BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION,
-    CheckpointRecoveryAction, CheckpointRefusalCode, CleanupDisposition, CleanupPlan,
-    CleanupProvenance, CleanupRepresentation, CleanupRetention, CleanupSweepFailure,
-    CleanupSweepReport, CleanupWorktreePlan, DoctorRepairStatus, DoctorReport,
-    FinishCleanupHandoff, FinishCleanupReport, FinishDelivery, FinishGateCacheSource,
-    FinishGateRun, FinishGraphIntegrity, FinishHandoff, FinishLease, FinishLeaseState,
-    FinishOptions, FinishPendingWork, FinishReport, FinishStatus, GuardedExecReport,
+    AdoptBaseFreshness, AdoptBaseFreshnessRelation, AdoptCarriedOwnership, AdoptIntegrationDrift,
+    AdoptIntegrationRelation, AdoptIntegrationSync, AdoptIntegrationSyncOutcome, AdoptMode,
+    AdoptOptions, AdoptOutcome, AdoptReport, AgentView, Broker, BrokerOpError, BrokerOpenOptions,
+    BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION, CheckpointRecoveryAction,
+    CheckpointRefusalCode, CleanupDisposition, CleanupPlan, CleanupProvenance,
+    CleanupRepresentation, CleanupRetention, CleanupSweepFailure, CleanupSweepReport,
+    CleanupWorktreePlan, DoctorRepairStatus, DoctorReport, FinishCleanupHandoff,
+    FinishCleanupReport, FinishDelivery, FinishGateCacheSource, FinishGateRun,
+    FinishGraphIntegrity, FinishHandoff, FinishLease, FinishLeaseState, FinishOptions,
+    FinishPendingWork, FinishReport, FinishStatus, GuardedExecReport,
     HEALTH_CHECK_ELIGIBILITY_BUDGET, IntegrationBypassReason, IntegrationDeliveryState,
     IntegrationLiveSession, IntegrationMovementNotice, IntegrationNextAction,
     IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,

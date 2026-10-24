@@ -61,6 +61,18 @@ fn init_repo(root: &Path) {
     sh(root, &["commit", "-qm", "init"]);
 }
 
+fn set_integration_at_head(root: &Path) {
+    let head = rev(root, "HEAD");
+    sh(
+        root,
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            head.as_str(),
+        ],
+    );
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -284,6 +296,7 @@ fn compatibility_status_snapshot_derives_without_reconciling_state() {
 fn session_creation_pins_repository_contract_and_reuse_does_not_refresh_it() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
+    set_integration_at_head(tmp.path());
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(
         tmp.path().join(".aethyme/repository.json"),
@@ -883,6 +896,7 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
 fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
+    set_integration_at_head(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let first = broker
@@ -993,7 +1007,9 @@ fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
-    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+    let session = broker.start_worktree("first task", None).unwrap();
+    let worktree = Path::new(&session.worktree_path);
+    let session_head = rev(worktree, "HEAD");
 
     sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
     std::fs::write(tmp.path().join("shared.txt"), "integration\n").unwrap();
@@ -1002,15 +1018,15 @@ fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
     let integration_head = rev(tmp.path(), "HEAD");
     sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
     sh(tmp.path(), &["checkout", "-q", "main"]);
-    std::fs::write(tmp.path().join("shared.txt"), "dirty session edit\n").unwrap();
+    std::fs::write(worktree.join("shared.txt"), "dirty session edit\n").unwrap();
 
     let report = broker
-        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse, None)
+        .adopt_with(worktree, Some("follow-up"), AdoptMode::Reuse, None)
         .unwrap();
     assert_eq!(report.session.id, session.id);
     let drift = report.integration_drift.expect("reuse drift");
     assert_eq!(drift.relation, AdoptIntegrationRelation::Behind);
-    assert_eq!(drift.session_head, rev(tmp.path(), "main"));
+    assert_eq!(drift.session_head, session_head);
     assert_eq!(drift.integration_head, integration_head);
     assert_eq!(drift.ahead_commits, 0);
     assert_eq!(drift.behind_commits, 1);
@@ -1027,7 +1043,8 @@ fn adopt_reuse_reports_diverged_commit_counts_and_overlap() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
-    let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
+    let session = broker.start_worktree("first task", None).unwrap();
+    let worktree = Path::new(&session.worktree_path);
 
     sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
     std::fs::write(tmp.path().join("README.md"), "integration\n").unwrap();
@@ -1035,12 +1052,13 @@ fn adopt_reuse_reports_diverged_commit_counts_and_overlap() {
     let integration_head = rev(tmp.path(), "HEAD");
     sh(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
     sh(tmp.path(), &["checkout", "-q", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "session\n").unwrap();
-    sh(tmp.path(), &["commit", "-qam", "session advances"]);
-    let session_head = rev(tmp.path(), "HEAD");
+    std::fs::write(worktree.join("README.md"), "session\n").unwrap();
+    sh(worktree, &["add", "README.md"]);
+    sh(worktree, &["commit", "-qm", "session advances"]);
+    let session_head = rev(worktree, "HEAD");
 
     let report = broker
-        .adopt_with(tmp.path(), Some("follow-up"), AdoptMode::Reuse, None)
+        .adopt_with(worktree, Some("follow-up"), AdoptMode::Reuse, None)
         .unwrap();
     assert_eq!(report.session.id, session.id);
     let drift = report.integration_drift.expect("reuse drift");
@@ -1057,6 +1075,7 @@ fn adopt_reuse_reports_diverged_commit_counts_and_overlap() {
 fn adopt_reuse_reports_ahead_work_and_routes_it_to_submit() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
+    set_integration_at_head(tmp.path());
     let worktree = tmp.path().join("agent-wt");
     sh(
         tmp.path(),
@@ -1143,6 +1162,7 @@ fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
 fn adopt_reuse_sync_reports_an_already_current_checkout() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
+    set_integration_at_head(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
     let head = rev(tmp.path(), "HEAD");

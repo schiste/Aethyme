@@ -220,6 +220,7 @@ fn the_committed_default_branch_config_wins_over_the_working_file() {
 #[test]
 fn reuse_and_adopt_show_the_agreement_too() {
     let fx = fixture();
+    git(&fx.repo, &["branch", "aethyme/integration", "HEAD"]);
     fx.configure("schema = 1\n[session]\nguidance = [\"Reuse agreement.\"]\n");
     let started = fx.start_json("first task");
     let worktree = started["worktree_path"].as_str().unwrap().to_owned();
