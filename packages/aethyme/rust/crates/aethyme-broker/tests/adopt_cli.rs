@@ -886,7 +886,10 @@ fn unavailable_remote_default_ref_is_not_treated_as_local_only() {
     let session = stored_session(&tmp, 1);
     let observation = stored_base_observation(&tmp, 1);
     let before = git_output(tmp.path(), &["worktree", "list", "--porcelain"]);
-    git(tmp.path(), &["update-ref", "-d", "refs/remotes/origin/main"]);
+    git(
+        tmp.path(),
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
     let output = run(tmp.path(), &["start", "--task", "must refuse", "--json"]);
     assert!(!output.status.success());
     assert_eq!(
