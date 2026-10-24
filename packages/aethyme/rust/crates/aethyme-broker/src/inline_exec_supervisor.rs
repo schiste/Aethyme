@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 
-const FLAG: &str = "--aethyme-inline-exec-supervisor-v2";
-const FRAME_MAGIC: &[u8; 4] = b"AIX2";
+const FLAG: &str = "--aethyme-inline-exec-supervisor-v3";
+const FRAME_MAGIC: &[u8; 4] = b"AIX3";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Polling for an idle control channel is short, but once a frame starts the
@@ -61,6 +61,7 @@ enum ParentFrameRef<'a> {
 #[serde(deny_unknown_fields)]
 enum HelperFrame {
     Ready,
+    Started,
     Exited { code: Option<i32> },
     Aborted,
     CommandStartFailed { error: WireCommandStartError },
@@ -278,12 +279,19 @@ pub(crate) struct CommandResult {
     pub exit_code: Option<i32>,
     pub succeeded: bool,
     pub termination: CommandTermination,
+    pub command_started: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandTermination {
     Exited,
     TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandDispatchState {
+    Started,
+    NotStarted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,20 +590,45 @@ impl InlineExecSupervisor {
 
     #[cfg(unix)]
     pub(crate) fn run_with_timeout<F>(
+        self,
+        cwd: &Path,
+        command: &[String],
+        environment: &[(String, String)],
+        command_timeout: Option<std::time::Duration>,
+        heartbeat: F,
+    ) -> Result<CommandResult, InlineExecError>
+    where
+        F: FnMut() -> Result<(), crate::BrokerOpError>,
+    {
+        self.run_with_timeout_and_dispatch(
+            cwd,
+            command,
+            environment,
+            command_timeout,
+            heartbeat,
+            |_| {},
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn run_with_timeout_and_dispatch<F, D>(
         mut self,
         cwd: &Path,
         command: &[String],
         environment: &[(String, String)],
         command_timeout: Option<std::time::Duration>,
         mut heartbeat: F,
+        mut dispatch: D,
     ) -> Result<CommandResult, InlineExecError>
     where
         F: FnMut() -> Result<(), crate::BrokerOpError>,
+        D: FnMut(CommandDispatchState),
     {
         use std::time::{Duration, Instant};
 
         if command.is_empty() || command[0].is_empty() {
             let cleanup = self.terminate_and_verify();
+            dispatch(CommandDispatchState::NotStarted);
             return match cleanup {
                 Ok(()) => Err(InlineExecError::Setup(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -606,6 +639,7 @@ impl InlineExecSupervisor {
         }
         validate_environment(environment).map_err(|error| {
             let cleanup = self.terminate_and_verify();
+            dispatch(CommandDispatchState::NotStarted);
             match cleanup {
                 Ok(()) => InlineExecError::Setup(error),
                 Err(reason) => InlineExecError::CleanupUnknown(reason),
@@ -613,6 +647,7 @@ impl InlineExecSupervisor {
         })?;
         let cwd = cwd.canonicalize().map_err(|error| {
             let cleanup = self.terminate_and_verify();
+            dispatch(CommandDispatchState::NotStarted);
             match cleanup {
                 Ok(()) => InlineExecError::Setup(error),
                 Err(reason) => InlineExecError::CleanupUnknown(reason),
@@ -629,6 +664,7 @@ impl InlineExecSupervisor {
             Instant::now() + READY_TIMEOUT,
         ) {
             let cleanup = self.terminate_and_verify();
+            dispatch(CommandDispatchState::NotStarted);
             return match cleanup {
                 Ok(()) => Err(InlineExecError::Setup(error)),
                 Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
@@ -637,13 +673,14 @@ impl InlineExecSupervisor {
 
         let command_deadline = command_timeout.map(|timeout| Instant::now() + timeout);
         let mut next_ping = Instant::now() + Duration::from_secs(1);
+        let mut command_started = false;
         loop {
             if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return self.timed_out_result();
+                return self.timed_out_result(command_started);
             }
             if let Err(error) = heartbeat() {
                 if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return self.timed_out_result();
+                    return self.timed_out_result(command_started);
                 }
                 let cleanup = self.abort_and_verify();
                 return match cleanup {
@@ -652,7 +689,7 @@ impl InlineExecSupervisor {
                 };
             }
             if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return self.timed_out_result();
+                return self.timed_out_result(command_started);
             }
             let now = Instant::now();
             let read_timeout = command_deadline.map_or(Duration::from_millis(200), |deadline| {
@@ -668,7 +705,7 @@ impl InlineExecSupervisor {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return self.timed_out_result();
+                        return self.timed_out_result(command_started);
                     }
                     if Instant::now() >= next_ping {
                         let ping_deadline = Instant::now() + Duration::from_secs(1);
@@ -680,7 +717,7 @@ impl InlineExecSupervisor {
                             write_deadline,
                         ) {
                             if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                                return self.timed_out_result();
+                                return self.timed_out_result(command_started);
                             }
                             let cleanup = self.terminate_and_verify();
                             return match cleanup {
@@ -696,7 +733,7 @@ impl InlineExecSupervisor {
                 }
                 Err(error) => {
                     if command_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return self.timed_out_result();
+                        return self.timed_out_result(command_started);
                     }
                     let cleanup = self.terminate_and_verify();
                     return match cleanup {
@@ -708,18 +745,43 @@ impl InlineExecSupervisor {
                 }
             };
             return match frame {
+                HelperFrame::Started if !command_started => {
+                    command_started = true;
+                    dispatch(CommandDispatchState::Started);
+                    continue;
+                }
+                HelperFrame::Started => {
+                    self.terminate_and_verify()
+                        .map_err(InlineExecError::CleanupUnknown)?;
+                    Err(InlineExecError::CommandOutcomeUnknown(
+                        "helper reported command start more than once".into(),
+                    ))
+                }
                 HelperFrame::Exited { code } => {
                     self.terminate_and_verify()
                         .map_err(InlineExecError::CleanupUnknown)?;
-                    Ok(CommandResult {
-                        exit_code: code,
-                        succeeded: code == Some(0),
-                        termination: CommandTermination::Exited,
-                    })
+                    if command_started {
+                        Ok(CommandResult {
+                            exit_code: code,
+                            succeeded: code == Some(0),
+                            termination: CommandTermination::Exited,
+                            command_started: true,
+                        })
+                    } else {
+                        Err(InlineExecError::CommandOutcomeUnknown(
+                            "helper reported command exit without a start confirmation".into(),
+                        ))
+                    }
                 }
                 HelperFrame::CommandStartFailed { error } => {
                     self.terminate_and_verify()
                         .map_err(InlineExecError::CleanupUnknown)?;
+                    if command_started {
+                        return Err(InlineExecError::CommandOutcomeUnknown(
+                            "helper reported command-start failure after start confirmation".into(),
+                        ));
+                    }
+                    dispatch(CommandDispatchState::NotStarted);
                     match error.into_io_error() {
                         Ok(error) => Err(InlineExecError::CommandStart(error)),
                         Err(error) => Err(InlineExecError::CommandOutcomeUnknown(format!(
@@ -730,6 +792,12 @@ impl InlineExecSupervisor {
                 HelperFrame::Failed { reason } => {
                     self.terminate_and_verify()
                         .map_err(InlineExecError::CleanupUnknown)?;
+                    if command_started {
+                        return Err(InlineExecError::CommandOutcomeUnknown(format!(
+                            "helper reported a setup failure after start confirmation: {reason}"
+                        )));
+                    }
+                    dispatch(CommandDispatchState::NotStarted);
                     Err(InlineExecError::Setup(io::Error::other(reason)))
                 }
                 HelperFrame::ExecutionUnknown { reason } => {
@@ -780,8 +848,29 @@ impl InlineExecSupervisor {
         )))
     }
 
+    #[cfg(not(unix))]
+    pub(crate) fn run_with_timeout_and_dispatch<F, D>(
+        self,
+        cwd: &Path,
+        command: &[String],
+        environment: &[(String, String)],
+        command_timeout: Option<std::time::Duration>,
+        heartbeat: F,
+        mut dispatch: D,
+    ) -> Result<CommandResult, InlineExecError>
+    where
+        F: FnMut() -> Result<(), crate::BrokerOpError>,
+        D: FnMut(CommandDispatchState),
+    {
+        dispatch(CommandDispatchState::NotStarted);
+        self.run_with_timeout(cwd, command, environment, command_timeout, heartbeat)
+    }
+
     #[cfg(unix)]
-    fn timed_out_result(&mut self) -> Result<CommandResult, InlineExecError> {
+    fn timed_out_result(
+        &mut self,
+        command_started: bool,
+    ) -> Result<CommandResult, InlineExecError> {
         self.abort_and_verify().map_err(|reason| {
             InlineExecError::CleanupUnknown(format!(
                 "the execution deadline elapsed after command dispatch; its cleanup could not be verified: {reason}"
@@ -791,6 +880,7 @@ impl InlineExecSupervisor {
             exit_code: None,
             succeeded: false,
             termination: CommandTermination::TimedOut,
+            command_started,
         })
     }
 
@@ -1031,6 +1121,16 @@ fn run_helper() -> io::Result<u8> {
             return Ok(125);
         }
     };
+    if let Err(error) = write_frame(&mut control, &HelperFrame::Started) {
+        stop_owned_command(&mut child);
+        if let Err(cleanup_error) = terminate_owned_group_from_live_helper() {
+            crate::warn_unrecorded(
+                "stop command after start confirmation could not be delivered",
+                Err::<(), _>(cleanup_error),
+            );
+        }
+        return Err(error);
+    }
     #[cfg(test)]
     if std::env::var_os("AETHYME_TEST_INLINE_FAIL_AFTER_LAUNCH").is_some() {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2138,7 +2238,7 @@ mod tests {
             Some(125)
         );
         assert_eq!(
-            dispatch(&["--aethyme-inline-exec-supervisor-v3".into()]),
+            dispatch(&["--aethyme-inline-exec-supervisor-v2".into()]),
             Some(125)
         );
         assert_eq!(dispatch(&[FLAG.into(), "extra".into()]), Some(125));

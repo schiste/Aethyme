@@ -58,6 +58,7 @@ pub(super) const VALUE_FLAGS: &[&str] = &[
     "--pull-request-limit",
     "--queue-timeout",
     "--reason",
+    "--receipt",
     "--repo",
     "--repo-name",
     "--repo-watch",
@@ -313,6 +314,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         "exec",
         &["--session", "--non-interactive", "--timeout", "--"],
     ),
+    ("exec-status", &["--session", "--receipt", "--limit"]),
     (
         "git",
         &[

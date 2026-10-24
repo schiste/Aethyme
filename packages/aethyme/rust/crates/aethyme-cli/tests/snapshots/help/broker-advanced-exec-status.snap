@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+  aethyme broker advanced exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]
+      Read guarded-exec outcomes for this repository and session. A starting
+      or running receipt is not process-liveness proof; this command never
+      signals, cleans up, or changes session state.
+--- stderr

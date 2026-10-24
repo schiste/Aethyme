@@ -529,18 +529,27 @@ fn exec_ownership_next_actions(report: &crate::GuardedExecReport) -> Vec<String>
 
 /// `broker exec`.
 pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.read_only_snapshot {
+        return Err(read_only_refusal(
+            &parsed,
+            "guarded exec",
+            "run `aethyme broker advanced exec-status`",
+        ));
+    }
     let session = parsed
         .session
         .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
     let requested_timeout = exec_timeout_from_seconds(parsed.timeout_seconds)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = broker.guarded_exec_for_cli(
+    let result = broker.guarded_exec_for_cli(
         session,
         &parsed.exec_command,
         parsed.non_interactive,
         parsed.json,
         requested_timeout,
     )?;
+    let receipt_id = result.receipt_id;
+    let report = result.report;
     let changed_paths = changed_paths_remaining(&report);
     let next_actions = exec_ownership_next_actions(&report);
     if parsed.json {
@@ -562,6 +571,10 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
             "changed_paths_remaining".into(),
             serde_json::to_value(&changed_paths)?,
         );
+        object.insert(
+            "execution_receipt_id".into(),
+            serde_json::Value::String(receipt_id.clone()),
+        );
         out!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         out!(
@@ -580,6 +593,7 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
                 .unwrap_or_default()
         );
         out!("  command ran: yes");
+        out!("  execution receipt: {receipt_id}");
         out!(
             "  ownership audit after execution: {}",
             if report.ownership_ok {
@@ -676,6 +690,88 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         }));
     }
     Ok(())
+}
+
+/// Read one receipt or a bounded recent list. Receipt data is observational:
+/// it never authorizes signaling, cleanup, or a session transition.
+pub(super) fn run_exec_status(parsed: Parsed) -> Result<(), UsageError> {
+    let session = parsed
+        .session
+        .ok_or_else(|| UsageError::Message(EXEC_STATUS_USAGE.into()))?;
+    if parsed.exec_receipt.is_some() && parsed.limit.is_some() {
+        return Err(UsageError::Message(EXEC_STATUS_USAGE.into()));
+    }
+    let mut broker = open_broker(true)?;
+    if let Some(receipt_id) = parsed.exec_receipt {
+        if receipt_id.len() != 32 || !receipt_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(UsageError::Message(
+                "--receipt must be a 32-character hexadecimal receipt id".into(),
+            ));
+        }
+        let receipt = broker
+            .store()
+            .guarded_exec_receipt(session, &receipt_id)?
+            .ok_or_else(|| {
+                UsageError::Message(format!(
+                    "no guarded-exec receipt {receipt_id:?} for session {session} in this repository"
+                ))
+            })?;
+        if parsed.json {
+            out!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": "aethyme.broker-exec-status/v1",
+                    "session_id": session,
+                    "receipt": receipt,
+                }))?
+            );
+        } else {
+            render_exec_receipt(&receipt);
+        }
+    } else {
+        let limit = parsed.limit.unwrap_or(20);
+        if !(1..=100).contains(&limit) {
+            return Err(UsageError::Message(
+                "--limit must be between 1 and 100".into(),
+            ));
+        }
+        let receipts = broker.store().guarded_exec_receipts(session, limit)?;
+        if parsed.json {
+            out!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": "aethyme.broker-exec-status/v1",
+                    "session_id": session,
+                    "receipts": receipts,
+                    "limit": limit,
+                }))?
+            );
+        } else if receipts.is_empty() {
+            out!("no guarded-exec receipts for session {session}");
+        } else {
+            for receipt in &receipts {
+                render_exec_receipt(receipt);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_exec_receipt(receipt: &crate::store::guarded_exec::GuardedExecReceipt) {
+    out!(
+        "exec receipt {} for session {}: phase={}, command_outcome={}, exit_code={}, audit={}, process_group_cleanup={}, process_revalidation={}, updated_at_ms={}",
+        receipt.receipt_id,
+        receipt.session_id,
+        receipt.phase,
+        receipt.command_outcome,
+        receipt
+            .exit_code
+            .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+        receipt.ownership_audit,
+        receipt.process_group_cleanup,
+        receipt.process_revalidation,
+        receipt.updated_at_ms
+    );
 }
 
 fn exec_timeout_from_seconds(
