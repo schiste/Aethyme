@@ -240,7 +240,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `GIT_CONFIG_GLOBAL`, and `GIT_CONFIG_NOSYSTEM=1` on every CLI and Git child
   before initial deployment and `git add`; a host `core.excludesFile` can hide
   generated files from `git add -A`. Keep isolation on each child command and
-  do not compensate with fixture ignore rules or force-adds. If a fixture PATH
+  do not compensate with fixture ignore rules or force-adds. For byte-for-byte
+  Git fixture snapshots, disable automatic maintenance during setup with
+  command-local `maintenance.auto=false` and `gc.auto=0`; an asynchronously
+  removed maintenance lock can otherwise look like a product write. Preserve
+  the complete snapshot assertion rather than excluding Git lock paths. If a fixture PATH
   excludes real provider binaries,
   retain required CLI dependencies: install a prevalidated Git executable beside
   the fake provider instead of removing Git and failing before provider startup.
