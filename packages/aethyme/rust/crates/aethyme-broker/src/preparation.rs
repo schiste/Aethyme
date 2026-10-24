@@ -154,8 +154,8 @@ pub struct PreparationConfig {
     #[serde(default)]
     pub runtimes: Vec<RuntimeProbe>,
     pub steps: Vec<PreparationStep>,
-    /// Optional budget for the repository-shared store. Absent means no
-    /// ceiling, preserving existing behaviour.
+    /// Budget for the repository-shared store. Shared steps receive an 8 GiB
+    /// rotation threshold when this section is absent; explicit zero opts out.
     #[serde(default)]
     pub shared_cache: Option<SharedCacheBudget>,
     /// Opt-in declared growth bounds for managed preparation outputs. The
@@ -243,18 +243,31 @@ pub enum SharedCacheRoot {
 /// write quota: a preparation step can exceed it, and active entries remain
 /// protected while in use. Disabling the threshold preserves the historical
 /// behavior, but does not bound growth across distinct inputs or clones.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SharedCacheBudget {
-    /// Rotate the whole shared cache when it exceeds this many bytes. Zero or
-    /// an omitted value leaves the cache without a size threshold.
-    #[serde(default)]
+    /// Rotate this repository's shared cache above this many logical bytes.
+    /// Omission means 8 GiB; explicit zero disables the threshold.
+    #[serde(default = "default_shared_cache_max_bytes")]
     pub max_bytes: u64,
     /// Select the cache filesystem. The host default preserves existing
     /// placement; worktree-volume uses the selected session's Aethyme-owned
     /// placement root, unless an explicit operator root was captured.
     #[serde(default)]
     pub root: SharedCacheRoot,
+}
+
+fn default_shared_cache_max_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+impl Default for SharedCacheBudget {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_shared_cache_max_bytes(),
+            root: SharedCacheRoot::default(),
+        }
+    }
 }
 
 fn default_cache_policy() -> PreparationCachePolicy {
@@ -1077,11 +1090,19 @@ pub(crate) fn load_config(root: &Path) -> Result<Option<PreparationConfig>, Prep
 /// Parse and validate preparation configuration already read from an exact
 /// source, a checkout file or a committed blob alike.
 pub(crate) fn parse_config(text: &str) -> Result<PreparationConfig, PreparationError> {
-    let config: PreparationConfig =
+    let mut config: PreparationConfig =
         toml::from_str(text).map_err(|error| PreparationError::InvalidConfig {
             path: PREPARATION_CONFIG_RELPATH.into(),
             reason: error.to_string(),
         })?;
+    if config.shared_cache.is_none()
+        && config
+            .steps
+            .iter()
+            .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
+    {
+        config.shared_cache = Some(SharedCacheBudget::default());
+    }
     validate_config(&config)?;
     Ok(config)
 }
@@ -2116,7 +2137,7 @@ fn shared_cache_budget(
             reason: "the broker's captured host resource database path is unavailable".into(),
         })?;
     shared_cache_budget_at_with_resource_db_and_identity_and_binding(
-        budget.filter(|budget| budget.max_bytes > 0),
+        budget,
         &cache_root,
         resource_db_path,
         &repository_identity(broker),
@@ -4070,7 +4091,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worktree_volume_root_selector_does_not_enable_a_budget() {
+    fn a_worktree_volume_root_selector_keeps_the_default_budget() {
         let source = "schema_version = 1\n\
             [[steps]]\n\
             name = \"deps\"\n\
@@ -4083,7 +4104,53 @@ mod tests {
         let parsed = parse_config(source).expect("root selection is independent of the budget");
         let shared_cache = parsed.shared_cache.expect("declared");
         assert_eq!(shared_cache.root, SharedCacheRoot::WorktreeVolume);
-        assert_eq!(shared_cache.max_bytes, 0, "omitted means no size threshold");
+        assert_eq!(shared_cache.max_bytes, 8_589_934_592);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn omitted_shared_budget_rotates_all_digest_keys_above_eight_gib() {
+        let source = shared_budget_config(true, 0);
+        let source = source.split("[shared_cache]").next().unwrap();
+        let parsed = parse_config(source).unwrap();
+        let budget = parsed
+            .shared_cache
+            .expect("shared steps receive a default budget");
+        assert_eq!(budget.max_bytes, 8_589_934_592);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("preparation-cache");
+        let store = root.join(SHARED_CACHE_TEST_REPOSITORY);
+        std::fs::create_dir_all(store.join("old-digest")).unwrap();
+        std::fs::create_dir_all(store.join("new-digest")).unwrap();
+        // Logical bytes are the documented threshold. Sparse files exercise
+        // a real oversized inventory without allocating gigabytes on disk.
+        std::fs::File::create(store.join("old-digest/payload"))
+            .unwrap()
+            .set_len(4_294_967_297)
+            .unwrap();
+        std::fs::File::create(store.join("new-digest/payload"))
+            .unwrap()
+            .set_len(4_294_967_297)
+            .unwrap();
+        let report = shared_cache_budget_at(
+            Some(&budget),
+            &root,
+            SHARED_CACHE_TEST_REPOSITORY,
+            "new-digest",
+        )
+        .unwrap()
+        .expect("omitted configuration must not retain unbounded digest keys");
+        assert!(report.removed);
+        assert_eq!(report.budget_bytes, 8_589_934_592);
+        assert!(!store.join("old-digest").exists());
+        assert!(!store.join("new-digest").exists());
+    }
+
+    #[test]
+    fn local_only_preparation_does_not_acquire_a_shared_cache_budget() {
+        let source = shared_budget_config(false, 0);
+        let source = source.split("[shared_cache]").next().unwrap();
+        assert!(parse_config(source).unwrap().shared_cache.is_none());
     }
 
     /// `0` is the pre-existing behaviour and must stay available: a
@@ -4098,8 +4165,8 @@ mod tests {
         assert!(budget.max_bytes == 0);
     }
 
-    /// Absent means absent: an existing repository's preparation keeps
-    /// behaving exactly as it did before the field existed.
+    /// The low-level recovery primitive can still run without a threshold.
+    /// User-facing shared profiles receive the default during parsing.
     #[test]
     fn an_absent_budget_means_no_rotation() {
         assert!(config().shared_cache.is_none());
