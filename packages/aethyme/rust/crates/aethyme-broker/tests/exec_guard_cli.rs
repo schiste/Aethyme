@@ -6,9 +6,9 @@
 //! leases when the command simply failed on its own.
 
 use std::path::Path;
-use std::process::{Command, Output};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
+use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
@@ -270,7 +270,10 @@ fn failed_to_spawn_command_records_a_not_started_receipt() {
     .current_dir(worktree)
     .env("AETHYME_HOST_STATE_DIR", state.path());
     let out = exec.output().unwrap();
-    assert!(!out.status.success(), "a missing executable must fail to start");
+    assert!(
+        !out.status.success(),
+        "a missing executable must fail to start"
+    );
 
     let status = run(
         repo.path(),
@@ -361,7 +364,9 @@ fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
             break Err("running receipt omitted its identifier".to_owned());
         }
         if Instant::now() >= deadline {
-            break Err("exec never published a running receipt after starting its child".to_owned());
+            break Err(
+                "exec never published a running receipt after starting its child".to_owned(),
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -482,18 +487,15 @@ fn rejected_exec_preflight_does_not_create_a_receipt_or_dispatch_the_command() {
         ],
     );
     assert!(!out.status.success(), "unknown session must be refused");
-    assert!(!marker.exists(), "preflight refusal must not dispatch a child");
+    assert!(
+        !marker.exists(),
+        "preflight refusal must not dispatch a child"
+    );
 
     let status = run(
         repo.path(),
         state.path(),
-        &[
-            "advanced",
-            "exec-status",
-            "--session",
-            "999999",
-            "--json",
-        ],
+        &["advanced", "exec-status", "--session", "999999", "--json"],
     );
     assert!(status.status.success());
     let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();

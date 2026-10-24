@@ -2087,9 +2087,9 @@ impl Broker {
                     return;
                 };
                 let result = match event {
-                    GuardedExecDispatchEvent::Started => self
-                        .store
-                        .mark_guarded_exec_running(session_id, receipt_id),
+                    GuardedExecDispatchEvent::Started => {
+                        self.store.mark_guarded_exec_running(session_id, receipt_id)
+                    }
                     GuardedExecDispatchEvent::NotStarted => self
                         .store
                         .mark_guarded_exec_not_started(session_id, receipt_id),
@@ -2119,11 +2119,8 @@ impl Broker {
                 {
                     crate::warn_unrecorded(
                         "persist guarded exec unknown outcome",
-                        self.store.mark_guarded_exec_outcome_unknown(
-                            session_id,
-                            receipt_id,
-                            "unknown",
-                        ),
+                        self.store
+                            .mark_guarded_exec_outcome_unknown(session_id, receipt_id, "unknown"),
                     );
                 }
                 return Err(error);
@@ -2771,7 +2768,9 @@ mod generic_guarded_exec_tests {
     #[test]
     fn timeout_before_start_confirmation_keeps_receipt_outcome_unknown() {
         let (_repository, _storage, mut broker) = fixture();
-        let session = broker.start_worktree("unconfirmed timeout receipt", None).unwrap();
+        let session = broker
+            .start_worktree("unconfirmed timeout receipt", None)
+            .unwrap();
         let (report, receipt_id) = broker
             .guarded_exec_with_runner(
                 session.id,
@@ -2883,19 +2882,20 @@ mod generic_guarded_exec_tests {
             .unwrap();
         let marker = Path::new(&session.worktree_path).join("must-not-exist");
 
-        let error = broker
-            .guarded_exec_for_cli(
-                session.id,
-                &[
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "printf launched > must-not-exist".into(),
-                ],
-                true,
-                false,
-                None,
-            )
-            .unwrap_err();
+        let error = match broker.guarded_exec_for_cli(
+            session.id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf launched > must-not-exist".into(),
+            ],
+            true,
+            false,
+            None,
+        ) {
+            Ok(_) => panic!("wrong helper must be refused"),
+            Err(error) => error,
+        };
 
         assert!(matches!(error, BrokerOpError::Spawn { .. }), "{error}");
         assert!(

@@ -184,10 +184,7 @@ impl super::BrokerStore {
         Ok(())
     }
 
-    fn prune_terminal_guarded_exec_receipts(
-        &mut self,
-        session_id: i64,
-    ) -> Result<(), BrokerError> {
+    fn prune_terminal_guarded_exec_receipts(&mut self, session_id: i64) -> Result<(), BrokerError> {
         prune_terminal_guarded_exec_receipts(&self.conn, session_id)
     }
 
@@ -226,7 +223,8 @@ impl super::BrokerStore {
             params![session_id, limit.clamp(1, MAX_RECEIPT_LIST_LIMIT)],
             guarded_exec_receipt_from_row,
         )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(BrokerError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(BrokerError::from)
     }
 }
 
@@ -255,21 +253,18 @@ fn prune_terminal_guarded_exec_receipts(
     Ok(())
 }
 
-fn guarded_exec_receipt_from_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<GuardedExecReceipt> {
+fn guarded_exec_receipt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GuardedExecReceipt> {
     let phase: String = row.get(2)?;
     let command_outcome: String = row.get(3)?;
     let process_group_cleanup: String = row.get(6)?;
-    let process_revalidation = if matches!(
-        phase.as_str(),
-        "starting" | "running" | "outcome_unknown"
-    ) || matches!(process_group_cleanup.as_str(), "unverified" | "unknown")
-    {
-        "not_revalidated"
-    } else {
-        "not_applicable"
-    };
+    let process_revalidation =
+        if matches!(phase.as_str(), "starting" | "running" | "outcome_unknown")
+            || matches!(process_group_cleanup.as_str(), "unverified" | "unknown")
+        {
+            "not_revalidated"
+        } else {
+            "not_applicable"
+        };
     Ok(GuardedExecReceipt {
         receipt_id: row.get(0)?,
         session_id: row.get(1)?,
@@ -312,17 +307,12 @@ mod tests {
     fn receipts_preserve_dispatch_and_audit_outcomes_per_session() {
         let mut store = store();
         let receipt_id = store.begin_guarded_exec_receipt(1).unwrap();
-        let starting = store
-            .guarded_exec_receipt(1, &receipt_id)
-            .unwrap()
-            .unwrap();
+        let starting = store.guarded_exec_receipt(1, &receipt_id).unwrap().unwrap();
         assert_eq!(starting.phase, "starting");
         assert_eq!(starting.command_outcome, "unknown");
         assert_eq!(starting.process_revalidation, "not_revalidated");
 
-        store
-            .mark_guarded_exec_running(1, &receipt_id)
-            .unwrap();
+        store.mark_guarded_exec_running(1, &receipt_id).unwrap();
         store
             .complete_guarded_exec_command(1, &receipt_id, "failed", Some(3), "verified")
             .unwrap();
@@ -330,10 +320,7 @@ mod tests {
             .finish_guarded_exec_audit(1, &receipt_id, "passed")
             .unwrap();
 
-        let completed = store
-            .guarded_exec_receipt(1, &receipt_id)
-            .unwrap()
-            .unwrap();
+        let completed = store.guarded_exec_receipt(1, &receipt_id).unwrap().unwrap();
         assert_eq!(completed.phase, "completed");
         assert_eq!(completed.command_outcome, "failed");
         assert_eq!(completed.exit_code, Some(3));
@@ -361,9 +348,7 @@ mod tests {
             if index == 0 {
                 oldest_terminal = Some(receipt_id.clone());
             }
-            store
-                .mark_guarded_exec_not_started(1, &receipt_id)
-                .unwrap();
+            store.mark_guarded_exec_not_started(1, &receipt_id).unwrap();
         }
 
         let terminal_count: i64 = store
@@ -380,10 +365,7 @@ mod tests {
             .guarded_exec_receipt(1, oldest_terminal.as_deref().unwrap())
             .unwrap()
             .is_none());
-        let unresolved = store
-            .guarded_exec_receipt(1, &unresolved)
-            .unwrap()
-            .unwrap();
+        let unresolved = store.guarded_exec_receipt(1, &unresolved).unwrap().unwrap();
         assert_eq!(unresolved.phase, "outcome_unknown");
         assert_eq!(unresolved.process_group_cleanup, "unverified");
         assert_eq!(unresolved.process_revalidation, "not_revalidated");
