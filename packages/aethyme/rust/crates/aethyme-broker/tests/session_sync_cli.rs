@@ -271,9 +271,49 @@ fn an_offline_start_uses_the_cached_copy_and_says_how_old_it_is() {
 }
 
 #[test]
-fn reusing_a_session_reports_how_far_its_worktree_drifted() {
+fn reusing_a_diverged_session_refuses_without_changing_its_checkout_or_task() {
     let fixture = Fixture::new();
-    let (_, worktree) = fixture.session_changing("tracked.txt", "session\n");
+    let (session_id, worktree) = fixture.session_changing("tracked.txt", "session\n");
+    fixture.land_on_remote_only("tracked.txt", "upstream\n");
+    let before = head(&worktree);
+    let store = aethyme_broker::BrokerStore::open_snapshot_in_repo(&fixture.repo).unwrap();
+    let before_task = store.session(session_id).unwrap().task;
+    drop(store);
+
+    let output = fixture.run_in(
+        &worktree,
+        &["start", "--adopt", "--reuse", "--task", "again", "--json"],
+        &fixture.remote,
+    );
+
+    assert!(!output.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(refused["schema"], "aethyme.broker-error/v1");
+    assert_eq!(refused["error"]["code"], 3, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(message.contains("have diverged"), "{refused}");
+    assert!(message.contains("no checkout change was made"), "{refused}");
+    assert_eq!(head(&worktree), before);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+        "session\n"
+    );
+    let store = aethyme_broker::BrokerStore::open_snapshot_in_repo(&fixture.repo).unwrap();
+    assert_eq!(store.session(session_id).unwrap().task, before_task);
+}
+
+#[test]
+fn explicitly_pinned_reuse_reports_upstream_drift_without_moving_the_pin() {
+    let fixture = Fixture::new();
+    let pin = head(&fixture.repo);
+    let started = json(&fixture.run(&[
+        "start", "--task", "pinned", "--base", &pin, "--json",
+    ]));
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree.join("tracked.txt"), "session\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    git(&worktree, &["commit", "-qm", "feat: pinned session change"]);
+    let before = head(&worktree);
     fixture.land_on_remote_only("tracked.txt", "upstream\n");
 
     let reused = json(&fixture.run_in(
@@ -290,6 +330,8 @@ fn reusing_a_session_reports_how_far_its_worktree_drifted() {
         serde_json::json!(["tracked.txt"]),
         "{reused}"
     );
+    assert_eq!(reused["base_freshness"]["target_commit"], pin);
+    assert_eq!(head(&worktree), before);
 }
 
 #[test]
