@@ -1,6 +1,6 @@
 # PR Review Scheduling and Delivery
 
-Last Updated: 2026-10-07
+Last Updated: 2026-10-24
 
 Aethyme keeps pull-request observation durable without running a daemon. The
 broker owns normalized metadata, cursors, retry decisions, activity batches,
@@ -32,6 +32,26 @@ aethyme broker advanced deliveries subscribe \
 Policies are `notify`, `resume`, and `review-and-push`. `review-and-push` is a
 capability request, not publication authority: the host must also retain the
 matching user authorization before it allows a remote write.
+
+## Observe mergeability
+
+GitHub PR watches selecting `checks` also include mergeability metadata in the
+existing check activity stream. These activities have a `github:merge-state:`
+provider ID and a `merge_state:<STATE>` state. `DIRTY` reports a merge conflict;
+`BEHIND` reports the provider's observation that the branch is behind. It does
+not assert that branch protection requires an update, authorize a rebase, or
+change acceptance policy. `CLEAN`, `BLOCKED`, `UNSTABLE`, and `HAS_HOOKS` are also
+observations, not gate results or merge permission.
+
+Identity includes the observed base and author commit IDs plus the state. A base
+advance can therefore notify an unchanged author branch, and repeated identical
+polls create no duplicate activity batch. Unknown mergeability and missing or
+invalid base IDs produce no mergeability activity; they never imply a clean PR.
+Comment-only and review-only watches do not receive these observations. As with
+other check activity, a new observation uses the existing durable batch and
+subscription delivery path. Creating a watch establishes a baseline, so initial
+observations do not replay as new events. A scheduler tick and a delivery adapter
+are still needed; this addition does not install a background scheduler.
 
 ## Subscribe to every pull request of a repository
 

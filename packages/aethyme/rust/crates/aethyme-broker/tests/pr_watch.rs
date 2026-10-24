@@ -117,6 +117,80 @@ fn snapshot(state: &str, sha: char, activity: &[&str]) -> PullRequestSnapshot {
 }
 
 #[test]
+fn merge_state_checks_enqueue_delivery_once_per_observed_identity() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let observe = |id: &str, state: &str| {
+        let mut value = snapshot("open", 'a', &[]);
+        value.activities.push(PullRequestActivityMetadata {
+            kind: PullRequestActivityKind::Check,
+            provider_id: id.into(),
+            author: None,
+            state: Some(format!("merge_state:{state}")),
+            url: Some(value.url.clone()),
+            updated_at: None,
+        });
+        value
+    };
+    let provider = FakeProvider(Mutex::new(VecDeque::from([
+        observe("github:merge-state:clean-base-1", "CLEAN"),
+        observe("github:merge-state:dirty-base-2", "DIRTY"),
+        observe("github:merge-state:dirty-base-2", "DIRTY"),
+        observe("github:merge-state:clean-base-3", "CLEAN"),
+    ])));
+    let watch = broker
+        .start_pull_request_watch(
+            session_id,
+            "Owner/Repo",
+            7,
+            vec![PullRequestActivityKind::Check],
+            60,
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    broker
+        .subscribe_pull_request_delivery(
+            watch.id,
+            "test-adapter",
+            "recipient-1",
+            DeliveryPolicy::Notify,
+            2_000,
+        )
+        .unwrap();
+    let conflict = broker
+        .poll_pull_request_watch(watch.id, &provider, 61_000)
+        .unwrap();
+    assert_eq!(conflict.new_activity_count, 1);
+    let batch = conflict.batch.expect("conflict check is durably batched");
+    assert_eq!(
+        batch.activities[0].metadata.state.as_deref(),
+        Some("merge_state:DIRTY")
+    );
+    let delivery = broker
+        .claim_next_delivery("test-adapter", "worker-1", 120, 61_100)
+        .unwrap()
+        .delivery
+        .expect("conflict is queued for the subscriber");
+    assert_eq!(delivery.batch, batch);
+    let repeat = broker
+        .poll_pull_request_watch(watch.id, &provider, 121_000)
+        .unwrap();
+    assert_eq!(repeat.new_activity_count, 0);
+    assert!(repeat.batch.is_none());
+    let recovered = broker
+        .poll_pull_request_watch(watch.id, &provider, 181_000)
+        .unwrap();
+    assert_eq!(recovered.new_activity_count, 1);
+    assert_eq!(
+        recovered.batch.unwrap().activities[0]
+            .metadata
+            .state
+            .as_deref(),
+        Some("merge_state:CLEAN")
+    );
+}
+
+#[test]
 fn durable_watch_tracks_metadata_changes_and_completes_with_the_pr() {
     let (_root, mut broker, session_id) = broker_fixture();
     let provider = FakeProvider(Mutex::new(VecDeque::from([
