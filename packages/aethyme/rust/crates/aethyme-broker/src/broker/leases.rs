@@ -2752,7 +2752,8 @@ mod generic_guarded_exec_tests {
                 false,
                 Some(Duration::from_millis(100)),
             )
-            .unwrap();
+            .unwrap()
+            .report;
 
         assert!(report.command_timed_out);
         assert_eq!(report.exit_code, None);
