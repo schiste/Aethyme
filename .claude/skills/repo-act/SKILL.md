@@ -172,6 +172,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For read-only GitHub status/check inspection, use `gh --repo` directly without
   opening a broker session. Isolate source research in its task worktree and
   independent reviews in their own read-only snapshot; sessions are for edits.
+- A completed GitHub job can have logs while its workflow is still running.
+  If `gh run view --log-failed` refuses for that reason, fetch the completed
+  job's logs endpoint directly. Capture stdout, stderr and exit status; an empty
+  file after an error is not an empty log. If `gh api` rejects escape sequences,
+  use `--allow-escape-sequences` only into a retained raw file and strip control
+  sequences before displaying a projection. In check rollups, distinguish old
+  failures from refreshed attempts using the latest start time per check name;
+  verify current required checks again before merging.
 - For changed-path tree comparisons, pass each path as a separate argument; use
   NUL-delimited transport when paths need to cross a file boundary. A newline-
   joined list passed as one quoted pathspec can silently match no files. Retain

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use aethyme_graph_schema::{EdgeKind, Node, NodeKind, NodeKindCategory, SourceRange};
 use aethyme_graph_storage::{
     CoverageBytes, CoverageFileStatus, CoverageFiles, ExclusionReason, GraphCoverage, GraphUnit,
-    UnitCoverageStatus, UnitPosition, sort_units,
+    GraphUseEvidence, UnitCoverageStatus, UnitPosition, sort_units,
 };
 
 use crate::context::IndexerContext;
@@ -133,6 +133,66 @@ pub(crate) fn observe_file(
     }
 }
 
+// Reuse the current pass's fragments and language observations. No source
+// rereads, parser calls, or graph-store queries are needed for this projection.
+fn use_evidence(
+    observations: &[FileCoverageObservation],
+    fragments: &[BuiltFragment],
+) -> BTreeMap<String, GraphUseEvidence> {
+    let languages: BTreeMap<&str, &str> = observations
+        .iter()
+        .map(|observation| (observation.path.as_str(), observation.language.as_str()))
+        .collect();
+    let mut evidence: BTreeMap<String, GraphUseEvidence> = BTreeMap::new();
+    for observation in observations {
+        evidence
+            .entry(observation.language.clone())
+            .or_default()
+            .files += 1;
+    }
+    let mut nodes = BTreeMap::new();
+    for fragment in fragments {
+        let language = languages
+            .get(fragment.source_path.as_ref())
+            .copied()
+            .unwrap_or("unknown");
+        for node in fragment.fragment.nodes() {
+            nodes.insert(node.id().as_str(), (language, node.kind()));
+            if is_code_unit_kind(node.kind()) {
+                evidence.entry(language.to_owned()).or_default().symbols += 1;
+            }
+        }
+    }
+    for fragment in fragments {
+        for edge in fragment.fragment.edges() {
+            // Impact follows outgoing code relationships. Test/document links
+            // describe their subject, so attribute them to the destination.
+            let endpoint = match edge.kind() {
+                EdgeKind::Imports | EdgeKind::Calls => edge.src_id(),
+                EdgeKind::Tests | EdgeKind::Documents => edge.dst_id(),
+                _ => continue,
+            };
+            let language = nodes
+                .get(endpoint.as_str())
+                .map_or("unknown", |(language, _)| *language);
+            let bucket = evidence.entry(language.to_owned()).or_default();
+            let resolved = nodes
+                .get(edge.dst_id().as_str())
+                .is_some_and(|(_, kind)| *kind != NodeKind::UnresolvedSymbol);
+            match edge.kind() {
+                EdgeKind::Imports if resolved => bucket.imports += 1,
+                EdgeKind::Imports => bucket.unresolved_imports += 1,
+                EdgeKind::Calls if resolved => bucket.calls += 1,
+                EdgeKind::Calls => bucket.unresolved_calls += 1,
+                EdgeKind::Tests => bucket.tests += 1,
+                EdgeKind::Documents => bucket.documents += 1,
+                _ => unreachable!("only selected use relationships are projected"),
+            }
+        }
+    }
+    evidence
+}
+
 pub(crate) fn assemble(
     ctx: &IndexerContext,
     walk: &FilesystemIndexResult,
@@ -156,6 +216,7 @@ pub(crate) fn assemble(
         },
         bytes: CoverageBytes::default(),
         by_language: BTreeMap::new(),
+        use_evidence_by_language: Some(use_evidence(observations, built_fragments)),
         by_parser: BTreeMap::new(),
         exclusion_reasons: BTreeMap::new(),
         node_counts_by_kind: BTreeMap::new(),
