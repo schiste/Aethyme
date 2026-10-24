@@ -36,35 +36,63 @@ enum SessionPullRequestOpenAs {
     Ready,
 }
 
-impl SessionPullRequestOpenAs {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionPullRequestPolicy {
+    open_as: SessionPullRequestOpenAs,
+    watch_on_start: bool,
+}
+
+impl Default for SessionPullRequestPolicy {
+    fn default() -> Self {
+        Self {
+            open_as: SessionPullRequestOpenAs::Draft,
+            watch_on_start: false,
+        }
+    }
+}
+
+impl SessionPullRequestPolicy {
     fn from_config_text(text: &str) -> Result<Self, String> {
         let value = text
             .parse::<toml::Value>()
             .map_err(|error| format!(".aethyme/config.toml is invalid: {error}"))?;
         let Some(broker) = value.get("broker") else {
-            return Ok(Self::Draft);
+            return Ok(Self::default());
         };
         let broker = broker
             .as_table()
             .ok_or_else(|| "[broker] policy must be a table".to_string())?;
         let Some(pr) = broker.get("pr") else {
-            return Ok(Self::Draft);
+            return Ok(Self::default());
         };
         let pr = pr
             .as_table()
             .ok_or_else(|| "[broker.pr] policy must be a table".to_string())?;
-        if let Some(key) = pr.keys().find(|key| key.as_str() != "open_as") {
+        if let Some(key) = pr
+            .keys()
+            .find(|key| !matches!(key.as_str(), "open_as" | "watch_on_start"))
+        {
             return Err(format!("[broker.pr] has unsupported key {key:?}"));
         }
-        let Some(open_as) = pr.get("open_as") else {
-            return Ok(Self::Draft);
+        let open_as = match pr.get("open_as") {
+            None => SessionPullRequestOpenAs::Draft,
+            Some(value) => match value.as_str() {
+                Some("draft") => SessionPullRequestOpenAs::Draft,
+                Some("ready") => SessionPullRequestOpenAs::Ready,
+                Some(_) => return Err("[broker.pr] open_as must be \"draft\" or \"ready\"".into()),
+                None => return Err("[broker.pr] open_as must be a string".into()),
+            },
         };
-        match open_as.as_str() {
-            Some("draft") => Ok(Self::Draft),
-            Some("ready") => Ok(Self::Ready),
-            Some(_) => Err("[broker.pr] open_as must be \"draft\" or \"ready\"".into()),
-            None => Err("[broker.pr] open_as must be a string".into()),
-        }
+        let watch_on_start = match pr.get("watch_on_start") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| "[broker.pr] watch_on_start must be a boolean".to_string())?,
+        };
+        Ok(Self {
+            open_as,
+            watch_on_start,
+        })
     }
 }
 
@@ -141,6 +169,12 @@ pub struct SessionPushReport {
     pub uncommitted_files: u32,
     pub uncommitted: UncommittedCounts,
     pub pr: Option<SessionPullRequest>,
+    /// Established or existing watch for this session; absent when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_watch_id: Option<i64>,
+    /// Observation failure after a successful remote push.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_watch_note: Option<String>,
     /// Open pull requests whose change overlaps this session's: same files,
     /// and whether the changed lines overlap or nearly touch. Advisory only.
     pub pr_overlaps: Vec<crate::PrOverlap>,
@@ -394,14 +428,14 @@ fn push_authorized(repo: &GitRepo, default: &TrackedDefault) -> Result<bool, Bro
 
 /// Read the requested PR mode from the same trusted default-branch commit as
 /// the push authorization. A worktree or session edit cannot change the mode.
-fn pull_request_open_as(
+fn pull_request_policy(
     repo: &GitRepo,
     default: &TrackedDefault,
-) -> Result<SessionPullRequestOpenAs, BrokerOpError> {
+) -> Result<SessionPullRequestPolicy, BrokerOpError> {
     let Some(text) = repo.file_at_commit(&default.commit, ".aethyme/config.toml")? else {
-        return Ok(SessionPullRequestOpenAs::Draft);
+        return Ok(SessionPullRequestPolicy::default());
     };
-    SessionPullRequestOpenAs::from_config_text(&text).map_err(refused)
+    SessionPullRequestPolicy::from_config_text(&text).map_err(refused)
 }
 
 impl Broker {
@@ -478,7 +512,7 @@ impl Broker {
         // Parse the PR mode before the first remote write. A bad preference
         // must not leave a branch pushed when opening the requested PR refuses.
         let pr_open_as = if open_pr {
-            Some(pull_request_open_as(repo, &default)?)
+            Some(pull_request_policy(repo, &default)?)
         } else {
             None
         };
@@ -566,13 +600,13 @@ impl Broker {
         }
         self.store().meta_set(&pushed_oid_key(session_id), &head)?;
 
-        let pr = if let Some(open_as) = pr_open_as {
+        let pr = if let Some(policy) = pr_open_as {
             Some(self.open_session_pull_request(
                 &session,
                 &default,
                 &target.display_slug,
                 &head,
-                open_as,
+                policy.open_as,
                 &main_root,
             )?)
         } else if crate::ReviewPolicy::load(&main_root).is_ok_and(|policy| policy.run_on_push) {
@@ -589,6 +623,30 @@ impl Broker {
             .flatten()
         } else {
             None
+        };
+
+        // Association happens only after --pr confirms this session's PR.
+        // A push that already succeeded must not become an error if watching fails.
+        let (pr_watch_id, pr_watch_note) = match (pr_open_as, pr.as_ref()) {
+            (Some(policy), Some(pr)) if policy.watch_on_start => {
+                match self.ensure_session_pull_request_watch(
+                    session_id,
+                    &target.display_slug,
+                    pr.number,
+                    &crate::GithubCliPullRequestWatchProvider,
+                    crate::clock::epoch_ms(),
+                ) {
+                    Ok(id) => (Some(id), None),
+                    Err(error) => (
+                        None,
+                        Some(format!(
+                            "push succeeded, but automatic PR watch was not established: {error}; \
+                         retry broker push --session {session_id} --pr"
+                        )),
+                    ),
+                }
+            }
+            _ => (None, None),
         };
 
         // Advisory and best-effort, like the overlap check below: the default
@@ -643,6 +701,8 @@ impl Broker {
             uncommitted_files: u32::try_from(uncommitted.len()).unwrap_or(u32::MAX),
             uncommitted: UncommittedCounts::from(&uncommitted),
             pr,
+            pr_watch_id,
+            pr_watch_note,
             pr_overlaps: overlap.overlaps,
             pr_overlaps_unknown: overlap.unknown_prs,
             pr_overlap_listing_unavailable: overlap.listing_unavailable,
@@ -1042,25 +1102,48 @@ mod tests {
     #[test]
     fn new_pull_request_mode_defaults_to_draft_and_accepts_ready() {
         assert_eq!(
-            SessionPullRequestOpenAs::from_config_text(
+            SessionPullRequestPolicy::from_config_text(
                 "[delivery]\npush_session_branches = true\n"
             )
-            .unwrap(),
+            .unwrap()
+            .open_as,
             SessionPullRequestOpenAs::Draft
         );
         assert_eq!(
-            SessionPullRequestOpenAs::from_config_text("[broker.pr]\n").unwrap(),
+            SessionPullRequestPolicy::from_config_text("[broker.pr]\n")
+                .unwrap()
+                .open_as,
             SessionPullRequestOpenAs::Draft
         );
         assert_eq!(
-            SessionPullRequestOpenAs::from_config_text("[broker.pr]\nopen_as = \"draft\"\n")
-                .unwrap(),
+            SessionPullRequestPolicy::from_config_text("[broker.pr]\nopen_as = \"draft\"\n")
+                .unwrap()
+                .open_as,
             SessionPullRequestOpenAs::Draft
         );
         assert_eq!(
-            SessionPullRequestOpenAs::from_config_text("[broker.pr]\nopen_as = \"ready\"\n")
-                .unwrap(),
+            SessionPullRequestPolicy::from_config_text("[broker.pr]\nopen_as = \"ready\"\n")
+                .unwrap()
+                .open_as,
             SessionPullRequestOpenAs::Ready
+        );
+    }
+
+    #[test]
+    fn automatic_watch_is_opt_in_and_boolean() {
+        assert!(
+            !SessionPullRequestPolicy::from_config_text("")
+                .unwrap()
+                .watch_on_start
+        );
+        assert!(
+            SessionPullRequestPolicy::from_config_text("[broker.pr]\nwatch_on_start = true\n")
+                .unwrap()
+                .watch_on_start
+        );
+        assert!(
+            SessionPullRequestPolicy::from_config_text("[broker.pr]\nwatch_on_start = \"true\"\n")
+                .is_err()
         );
     }
 
@@ -1075,7 +1158,7 @@ mod tests {
             "[broker.pr]\nopen_as = [\"ready\"]\n",
         ] {
             assert!(
-                SessionPullRequestOpenAs::from_config_text(config).is_err(),
+                SessionPullRequestPolicy::from_config_text(config).is_err(),
                 "accepted invalid config: {config}"
             );
         }

@@ -188,3 +188,30 @@ When the Chau7 adapter has a live tab snapshot, `deliveries dispatch` and
 AI provider on the matched broker session. The values make `broker status` and
 lease refusals actionable without making the tab id part of broker ownership or
 delivery authorization.
+
+
+## Opt in to automatic PR association
+
+The fetched default branch may set:
+
+```toml
+[broker.pr]
+watch_on_start = true
+```
+
+A new session has no PR to observe yet. Its first successful
+`broker push --pr` that confirms an open PR establishes the existing durable
+watch automatically. Session/worktree edits cannot enable or disable this
+repository preference. The default is false, with no extra provider request.
+
+Repeated pushes reuse the indexed live watch without resetting its cursor or
+overriding a paused watch. A PR already watched by another session is reported
+instead of reassigned. Provider observation has a three-second deadline and
+a 4 MiB limit per output stream. Failure after a successful remote push leaves
+the push successful and returns `pr_watch_note` plus a human warning; repeat
+`broker push --pr` to retry association. A successful association reports
+`pr_watch_id`.
+
+This preference does not install a scheduler or a delivery adapter. Use the
+explicit scheduler tick and adapter setup above; built-in scheduling, merge
+conflict events and orphan-PR reporting remain separate work under #887.

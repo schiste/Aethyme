@@ -342,17 +342,33 @@ impl PullRequestWatchProvider for GithubCliPullRequestWatchProvider {
         // late to observe the opening, and a merged pull request reports
         // `MERGED` on every poll thereafter.
         let fields = "number,title,url,state,baseRefName,headRefName,headRefOid,isDraft,comments,reviews,statusCheckRollup,createdAt,mergedAt";
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &request.pr_number.to_string(),
-                "--repo",
-                &request.repository,
-                "--json",
-                fields,
-            ])
-            .output()?;
+        let mut command = Command::new("gh");
+        command.args([
+            "pr",
+            "view",
+            &request.pr_number.to_string(),
+            "--repo",
+            &request.repository,
+            "--json",
+            fields,
+        ]);
+        let output = match crate::bounded_output::output_limited(
+            &mut command,
+            std::time::Duration::from_secs(3),
+            4 * 1024 * 1024,
+        )? {
+            crate::bounded_output::LimitedOutput::Completed(output) => output,
+            crate::bounded_output::LimitedOutput::Deadline => {
+                return Err(PullRequestWatchError::Provider(
+                    "PR observation exceeded its three-second deadline".into(),
+                ));
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                return Err(PullRequestWatchError::Provider(
+                    "PR observation exceeded its output budget".into(),
+                ));
+            }
+        };
         if !output.status.success() {
             return Err(PullRequestWatchError::Provider(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -560,6 +576,45 @@ fn json_string<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str>
 }
 
 impl Broker {
+    /// Automatic association never resets an existing cursor or paused choice.
+    pub(crate) fn ensure_session_pull_request_watch(
+        &mut self,
+        session_id: i64,
+        repository: &str,
+        pr_number: i64,
+        provider: &dyn PullRequestWatchProvider,
+        now_ms: i64,
+    ) -> Result<i64, BrokerOpError> {
+        let target = resolve_github_target(repository, &[])?;
+        if let Some(existing) = self
+            .store_ref()
+            .live_pull_request_watch_for_identity(&target.coordination_key, pr_number)?
+        {
+            if existing.session_id != session_id {
+                return Err(PullRequestWatchError::Invalid(format!(
+                    "PR #{pr_number} is already watched by session {}",
+                    existing.session_id
+                ))
+                .into());
+            }
+            return Ok(existing.id);
+        }
+        self.start_pull_request_watch(
+            session_id,
+            repository,
+            pr_number,
+            vec![
+                PullRequestActivityKind::Comment,
+                PullRequestActivityKind::Review,
+                PullRequestActivityKind::Check,
+            ],
+            DEFAULT_PR_WATCH_INTERVAL_SECONDS,
+            provider,
+            now_ms,
+        )
+        .map(|watch| watch.id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn start_pull_request_watch(
         &mut self,
