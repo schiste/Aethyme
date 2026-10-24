@@ -162,8 +162,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   capture one bounded sample from the exact argv and test its real framing and
   context fields alongside malformed and truncated fixtures.
 - Before writing a broker PR body, use the canonical PR-template Contract
-  checkbox: `- [x] **none**` means no product-contract change;
-  `Contract decision: none` is accepted in commit messages, not PR bodies.
+  checkbox (for example, `- [x] **none**`) so the decision is explicit and
+  matches the template. The current parser also recognizes a plain
+  `Contract decision: <label>` line in PR bodies and commit messages; the key
+  must start the line after whitespace. If CI reports an undeclared decision,
+  inspect its exact captured body and `Looked in` output before diagnosing a
+  formatting problem.
   Prepare the exact body file. When local validation is allowed, run the pinned
   CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`
   and retain the result before publication. During a local-check pause, use the
