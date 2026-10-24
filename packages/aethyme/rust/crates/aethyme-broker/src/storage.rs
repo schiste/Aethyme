@@ -6539,7 +6539,7 @@ mod tests {
             let report = recover_preparation_caches_for_bindings(
                 &[binding],
                 &resource_db,
-                Instant::now() + Duration::from_secs(5),
+                std::time::Instant::now() + Duration::from_secs(5),
                 true,
             );
             assert!(report.complete, "present={present}: {report:?}");
