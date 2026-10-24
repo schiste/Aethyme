@@ -207,7 +207,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   formatting problem.
   Prepare the exact body file. When local validation is allowed, run the pinned
   CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`
-  and retain the result before publication. During a local-check pause, use the
+  from that PR's worktree, verify HEAD matches the reviewed source, and retain
+  the result before publication. The body path and base do not select a worktree. During a local-check pause, use the
   PR's remote contract check instead of running it locally. Review each refusal;
   use a `Contract justification:` of at least 24 characters
   only for a verified false-positive, while preserving the actual retirement
@@ -564,6 +565,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Freeze the intended review snapshot before running mutations, or build it
   from the intended commit and selected patch. Exclude an in-flight deliberate
   mutation from the review snapshot so it is not mistaken for proposed code.
+- In Git filesystem-monitor experiments, stop and verify the monitor for each
+  exact owned checkout before removing that checkout, including temporary linked
+  worktrees inside timing loops. A shared repository setting can affect several
+  checkouts; final cleanup of only the primary directory is insufficient. Keep
+  interrupted command receipts separate from completed benchmark results.
 - Before reclaiming a completed worktree, inspect ignored paths for qualification
   records; a clean Git status does not cover them. Preserve irreplaceable
   reports outside the worktree and build target, verify copied file sizes and

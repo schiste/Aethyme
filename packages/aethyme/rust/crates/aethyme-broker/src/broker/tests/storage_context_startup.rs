@@ -18,7 +18,9 @@ const POISONED_POLICY_DIGEST: &str = "AETHYME_TEST_STORAGE_CONTEXT_POISONED_POLI
 /// Broker open runs maintenance before returning. A child process gives this
 /// test poisoned ambient paths without mutating process-wide environment in
 /// the test runner, then proves that startup cleanup stays in the paths
-/// captured by `BrokerOpenOptions`.
+/// captured by `BrokerOpenOptions`. Inline startup work has a short budget;
+/// when it defers, its persisted request must survive for an explicit bounded
+/// continuation using the same captured context.
 #[test]
 fn startup_maintenance_uses_the_broker_captured_storage_context() {
     match std::env::var(CHILD_MODE).as_deref() {
@@ -1109,7 +1111,7 @@ fn run_captured_startup_child() {
         .with_host_operation_database(private_state.join("host-operations.db"))
         .with_worktree_root(private_worktrees.clone())
         .with_preparation_cache_root(private_preparation_root.clone());
-    let broker = Broker::open_with_options(&repository, options).expect("open broker");
+    let mut broker = Broker::open_with_options(&repository, options).expect("open broker");
     let context = broker.storage_context();
     assert_eq!(
         context.host_state_dir.as_deref(),
@@ -1133,6 +1135,7 @@ fn run_captured_startup_child() {
         Some(private_worktrees.clone())
     );
     assert!(private_state.join("host-resources.db").is_file());
+    finish_captured_startup_recovery(&mut broker, &private_entry);
     assert!(!private_entry.exists());
     assert!(
         preparation_entry(&poisoned_state).join("payload").is_file(),
@@ -1254,6 +1257,7 @@ fn run_captured_context_worker() {
             .expect("worker captured preparation root"),
         Some(private_effective_root.clone())
     );
+    finish_captured_startup_recovery(&mut broker, &private_entry);
     assert!(
         !private_entry.exists(),
         "worker must sweep only its captured cache root"
@@ -1357,6 +1361,22 @@ fn run_captured_context_worker() {
         ),
         crate::HostLeaseState::Quarantined
     );
+}
+
+fn finish_captured_startup_recovery(broker: &mut Broker, entry: &Path) {
+    if entry.exists() {
+        assert!(
+            broker.artifact_sweep_recovery_requested().unwrap(),
+            "bounded startup must retain the persisted recovery request"
+        );
+        // Use the real continuation and its existing finite policy budget.
+        // Do not increase the production inline cap or fall back to ambient
+        // host paths merely to satisfy a timing-sensitive fixture.
+        let report = broker
+            .gc_sweep_artifacts()
+            .expect("resume captured cache recovery");
+        assert!(report.budget_ms > 0);
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

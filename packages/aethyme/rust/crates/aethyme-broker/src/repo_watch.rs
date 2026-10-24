@@ -765,21 +765,47 @@ impl Broker {
         tx.commit()?;
 
         if watch.auto_watch {
-            for event in &stored {
-                let live = self
-                    .pull_request_watches(false)?
-                    .into_iter()
-                    .any(|existing| {
-                        existing.canonical_repository == watch.canonical_repository
-                            && existing.pr_number == event.pr_number
-                    });
-                if live {
+            // Recorded events are durable initialization intents. A failed
+            // provider call must not lose that intent merely because the next
+            // complete listing has no new event. Only consider currently open
+            // PRs; a baseline entry without a subscribed event is not an intent.
+            let mut considered = BTreeSet::new();
+            for pr in &open {
+                if !considered.insert(pr.number) {
+                    continue;
+                }
+                let pending: bool = self.store_ref().connection().query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM repository_watch_events
+                         WHERE watch_id = ?1 AND pr_number = ?2
+                     ) AND NOT EXISTS(
+                         SELECT 1 FROM pull_request_watches
+                         WHERE session_id = ?3 AND canonical_repository = ?4
+                             AND pr_number = ?2
+                     )",
+                    params![
+                        watch.id,
+                        pr.number,
+                        watch.session_id,
+                        watch.canonical_repository
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !pending
+                    || self
+                        .store_ref()
+                        .live_pull_request_watch_for_identity(
+                            &watch.canonical_repository,
+                            pr.number,
+                        )?
+                        .is_some()
+                {
                     continue;
                 }
                 match self.start_pull_request_watch(
                     watch.session_id,
                     &watch.display_repository,
-                    event.pr_number,
+                    pr.number,
                     vec![
                         PullRequestActivityKind::Comment,
                         PullRequestActivityKind::Review,
@@ -790,10 +816,16 @@ impl Broker {
                     now_ms,
                 ) {
                     Ok(created) => result.auto_watched.push(created.id),
-                    // The repository event is already recorded and queued; a
-                    // per-PR watch that cannot start is not a reason to lose it.
-                    Err(_) => continue,
+                    // Preserve the event and retry at the next due repository
+                    // poll. Store only a safe code, never provider stderr.
+                    Err(_) => result.error_code = Some("auto_watch_start_failed".into()),
                 }
+            }
+            if let Some(code) = &result.error_code {
+                self.store_ref().connection().execute(
+                    "UPDATE repository_watches SET last_error_code = ?2 WHERE id = ?1",
+                    params![watch.id, code],
+                )?;
             }
         }
         result.events = stored;

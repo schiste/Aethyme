@@ -38,6 +38,61 @@ variant order, one filesystem, small fixtures and two recent clients limit
 the conclusions. There is no broker, dependency-preparation or gate speedup
 claim. The monitor was stopped and its stopped state checked before removal.
 
+## Explicit linked-worktree workloads
+
+The runner also accepts bounded `--files` (12..50000), `--samples` (1..21),
+and `--linked` parameters. Defaults retain the original 1,800-file,
+seven-sample primary-checkout workload. For example:
+
+```sh
+python3 packages/aethyme-eval/benchmarks/performance/git_worktree_options.py \
+  --fixture-parent /safe/local/scratch --output /safe/local/new-report \
+  --files 10000 --samples 7 --linked
+```
+
+The caller chooses an existing scratch parent on the filesystem being measured;
+the runner creates only a new synthetic child and does not enroll that parent.
+The report records topology, actual file count and repetitions. Linked mode
+records repeated detached checkout creation, resolves index paths through Git,
+and asserts that editing the linked checkout leaves its primary clean. Each
+variant has its own repository configuration, enabled before checkout timing.
+
+A filesystem monitor is stopped and its stopped state verified for each temporary
+checkout before removal, including those inside the timing loop. Final cleanup
+also checks the exact primary and linked checkouts. First observations remain
+warmth-unknown; checkout samples include ordinary Git setup costs and do not
+establish cold-cache or broker/gate performance. Interrupted runs retain command
+receipts and their fixture path rather than producing a successful report.
+
+## Matching 10,000-file linked runs
+
+Two sequential macOS 27.2 APFS runs used Git 2.55.0 with Apple Git 2.54.0 as
+an alternate reader/writer: one on the internal Apple Fabric volume and one on
+an external USB volume. Each had 10,000 tracked files, seven samples per status
+state and seven detached checkout-creation samples. Untracked/ignored controls,
+alternate-client index writes, primary-checkout isolation and monitor teardown
+passed. Both complete fixtures were removed. The interrupted earlier external
+attempt is excluded from these results.
+
+Status values below are median / maximum milliseconds, not cold-cache or p99
+measurements. Variants ran sequentially; host and cache order effects remain.
+
+| Volume / variant | Clean | Dirty | Untracked + ignored | Checkout creation |
+|---|---:|---:|---:|---:|
+| Internal / baseline | 36.19 / 46.58 | 36.74 / 43.01 | 35.11 / 48.42 | 1535.35 / 2600.98 |
+| Internal / manyFiles | 91.31 / 126.65 | 24.85 / 39.14 | 27.59 / 31.76 | 1549.43 / 2319.64 |
+| Internal / fsmonitor | 38.37 / 65.85 | 33.32 / 41.93 | 29.75 / 69.88 | 1521.25 / 2438.81 |
+| External / baseline | 49.23 / 58.52 | 49.16 / 54.92 | 34.84 / 42.96 | 2588.72 / 4758.07 |
+| External / manyFiles | 81.90 / 108.15 | 29.35 / 71.42 | 26.81 / 30.06 | 2315.69 / 3715.22 |
+| External / fsmonitor | 44.76 / 50.10 | 41.36 / 50.27 | 30.36 / 74.18 | 2096.40 / 3932.73 |
+
+The baseline index was 880,540 bytes on both volumes; manyFiles reduced it to
+704,252 / 704,341 bytes (internal / external). These runs extend filesystem and
+linked-checkout coverage, but do not qualify older supported clients, IDEs,
+network filesystems, monitor CPU/RSS, controlled cold caches, or actual broker
+and gate latency. The mixed clean-state and tail results support keeping both
+options opt-in. No existing repository setting was changed.
+
 ## Decisions and remaining qualification
 
 ### manyFiles (#902): keep opt-in

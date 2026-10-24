@@ -208,6 +208,9 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
             }
         }
         "tick" => {
+            // One owner covers both provider passes; SQLite transactions alone
+            // do not exclude a second poll while the first waits on GitHub.
+            let _tick_claim = crate::file_lock::acquire_pr_watch_tick_lock(broker.main_root())?;
             let limit = parsed
                 .limit
                 .map(|limit| limit as usize)

@@ -39,6 +39,10 @@ pub(crate) fn acquire_repository_lifecycle_lock(main_root: &Path) -> io::Result<
 }
 
 fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::PathBuf> {
+    repository_runtime_lock_path(main_root, "worktree-lifecycle.lock")
+}
+
+fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std::path::PathBuf> {
     let root = main_root.canonicalize()?;
     let state_dir = root.join(".aethyme");
     ensure_real_directory(&state_dir)?;
@@ -55,7 +59,28 @@ fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::Pat
         ));
     }
 
-    Ok(canonical_run.join("worktree-lifecycle.lock"))
+    Ok(canonical_run.join(name))
+}
+
+/// Claim one complete CLI scheduling pass, including repository watches.
+/// The file remains persistent so a second inode cannot split ownership.
+pub(crate) fn acquire_pr_watch_tick_lock(main_root: &Path) -> io::Result<ExclusiveFileLock> {
+    let path = repository_runtime_lock_path(main_root, "pr-watch-tick.lock")?;
+    let file = open_lock_file_nofollow(&path)?;
+    let lock = ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "another PR watch tick is running; retry after it finishes",
+        )
+    })?;
+    if repository_runtime_lock_path(main_root, "pr-watch-tick.lock")? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker PR watch lock path changed while it was acquired",
+        ));
+    }
+    verify_named_lock_file(&path, &lock.file)?;
+    Ok(lock)
 }
 
 fn acquire_repository_lifecycle_lock_with_wait(
@@ -222,6 +247,50 @@ impl Drop for ExclusiveFileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_watch_claim_excludes_another_tick_and_releases_on_drop() {
+        let repository = tempfile::tempdir().unwrap();
+        let claim = acquire_pr_watch_tick_lock(repository.path()).unwrap();
+        let error = acquire_pr_watch_tick_lock(repository.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        // Checkout lifecycle and watch polling must remain independent.
+        let lifecycle = acquire_repository_lifecycle_lock(repository.path()).unwrap();
+        drop(lifecycle);
+        drop(claim);
+        let resumed = acquire_pr_watch_tick_lock(repository.path()).unwrap();
+        assert!(
+            repository
+                .path()
+                .join(".aethyme/run/pr-watch-tick.lock")
+                .is_file()
+        );
+        drop(resumed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_watch_claim_refuses_redirected_runtime_and_lock_paths() {
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".aethyme")).unwrap();
+        let run = repository.path().join(".aethyme/run");
+        std::os::unix::fs::symlink(outside.path(), &run).unwrap();
+        assert!(acquire_pr_watch_tick_lock(repository.path()).is_err());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+        std::fs::remove_file(&run).unwrap();
+        std::fs::create_dir(&run).unwrap();
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"preserve").unwrap();
+        let path = run.join("pr-watch-tick.lock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(acquire_pr_watch_tick_lock(repository.path()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(acquire_pr_watch_tick_lock(repository.path()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+    }
 
     fn lifecycle_claim_contends_in_order(first: &str, second: &str) {
         let repository = tempfile::tempdir().unwrap();
