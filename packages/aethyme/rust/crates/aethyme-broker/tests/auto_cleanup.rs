@@ -73,6 +73,14 @@ fn fixture() -> Fixture {
         tmp.path(),
         &["clone", "-q", origin.to_str().unwrap(), "repo"],
     );
+    // Most cases exercise immediate cleanup. Grace behavior is covered
+    // explicitly below rather than depending on fixture wall-clock age.
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 0\n",
+    )
+    .unwrap();
     Fixture {
         _tmp: tmp,
         publisher,
@@ -1190,6 +1198,111 @@ fn an_unclaimed_worktree_is_never_removed() {
             .any(|removed| removed.worktree == stray_text),
         "{report:#?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_cleanup_honors_default_close_grace() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::remove_file(fx.repo.join(".aethyme/broker.toml")).unwrap();
+
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("24 hour closed-worktree grace"));
+    assert!(worktree.is_dir());
+    // The same checkout is still eligible for the operator's explicit cleanup.
+    assert!(
+        broker
+            .cleanup_plan()
+            .unwrap()
+            .worktrees
+            .iter()
+            .any(|item| { item.session_id == id && item.eligible() })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_cleanup_rechecks_grace_policy_before_apply() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    assert_eq!(plan.selected_worktrees().len(), 1);
+    std::fs::write(
+        fx.repo.join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 24\n",
+    )
+    .unwrap();
+
+    let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("closed-worktree grace"));
+    assert!(worktree.is_dir());
+
+    std::fs::write(
+        fx.repo.join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 0\n",
+    )
+    .unwrap();
+    let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_cleanup_preserves_checkout_when_retention_becomes_unreadable() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    assert_eq!(plan.selected_worktrees().len(), 1);
+    std::fs::write(fx.repo.join(".aethyme/broker.toml"), "[retention\n").unwrap();
+
+    let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("retention policy unreadable"));
+    assert!(worktree.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_cleanup_releases_checkout_after_grace_expires() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::write(
+        fx.repo.join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 24\n",
+    )
+    .unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("closed-worktree grace"));
+
+    // Move only this fixture's close time beyond the grace window. No sleep
+    // or weakened delivery/ownership proof is needed to make cleanup progress.
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let writer = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+    writer
+        .execute(
+            "UPDATE sessions SET closed_at = ?1 WHERE id = ?2",
+            rusqlite::params![now_ms - 25 * 3_600_000, id],
+        )
+        .unwrap();
+    drop(writer);
+    let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
 }
 
 #[cfg(unix)]

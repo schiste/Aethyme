@@ -184,6 +184,22 @@ impl Default for RetentionPolicy {
 }
 
 impl RetentionPolicy {
+    /// State-only close retains a checkout for inspection. Both reviewed GC
+    /// and unattended removal must honor that same window; explicit cleanup
+    /// remains an operator decision. Missing close times use the row update
+    /// time, and future timestamps conservatively remain within the window.
+    pub(crate) fn closed_worktree_in_grace(
+        &self,
+        session: &crate::Session,
+        evaluated_at_ms: i64,
+    ) -> bool {
+        self.closed_worktree_grace_hours > 0
+            && session.cleanup_state == crate::SessionCleanupState::Closed
+            && session.cleanup_completed_at.is_none()
+            && evaluated_at_ms.saturating_sub(session.closed_at.unwrap_or(session.updated_at))
+                < i64::from(self.closed_worktree_grace_hours).saturating_mul(3_600_000)
+    }
+
     pub fn validate(&self) -> Result<(), RetentionConfigError> {
         if self.schema_version != RETENTION_POLICY_SCHEMA_VERSION {
             return Err(RetentionConfigError::UnsupportedSchema {

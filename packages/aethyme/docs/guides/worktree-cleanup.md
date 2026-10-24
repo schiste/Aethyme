@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-10-08
+Last Updated: 2026-10-24
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -138,6 +138,13 @@ auto_remove = true             # the default; false turns it off
 regenerable = [".gradle/**"]   # extra rebuildable paths
 keep = ["*-investigation"]     # worktrees never removed automatically
 ```
+
+State-only closed checkouts also respect `[retention]
+closed_worktree_grace_hours` in `.aethyme/broker.toml` (24 hours by default;
+`0` disables the window). Automatic cleanup and reviewed GC share this check.
+Automatic apply reloads retention before removal, so a newly raised grace
+period or unreadable policy retains the checkout. Explicit `finish cleanup`
+remains available without waiting for the window.
 
 Build caches of inactive sessions are still reclaimed separately, even when a
 checkout must be kept.

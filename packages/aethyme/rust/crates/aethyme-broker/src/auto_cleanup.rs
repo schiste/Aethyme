@@ -1251,6 +1251,11 @@ impl Broker {
         // Proof 1, re-read: the store may have changed since selection.
         let canonical =
             |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // Reload retention for every verdict, including apply: a policy
+        // changed after selection must take effect before any removal.
+        let retention = crate::load_retention_policy(self.main_root())
+            .map_err(|error| keep(format!("retention policy unreadable: {error}")))?;
+        let evaluated_at_ms = now_ms();
         let mut current_spawned_owner = None;
         for session in &candidate.sessions {
             let current = self
@@ -1262,6 +1267,12 @@ impl Broker {
                     "session {} is not closed ({})",
                     session.id,
                     current.status.as_str()
+                )));
+            }
+            if retention.closed_worktree_in_grace(&current, evaluated_at_ms) {
+                return Err(keep(format!(
+                    "session {} is within the {} hour closed-worktree grace period",
+                    current.id, retention.closed_worktree_grace_hours
                 )));
             }
             if canonical(Path::new(&current.worktree_path)) != candidate.worktree {
