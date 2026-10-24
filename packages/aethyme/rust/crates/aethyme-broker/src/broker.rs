@@ -929,7 +929,7 @@ pub enum AdoptIntegrationSyncOutcome {
     FastForwarded,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AdoptIntegrationSync {
     pub outcome: AdoptIntegrationSyncOutcome,
     pub integration_branch: String,
@@ -954,6 +954,57 @@ pub struct AdoptCarriedOwnership {
     pub pending_owned_commits: usize,
 }
 
+/// The relation rechecked at the explicit task handoff boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdoptBaseFreshnessRelation {
+    /// The selected base commit equals the session HEAD.
+    Current,
+    /// The selected base commit is already contained in the session HEAD.
+    TargetContained,
+    /// The broker fast-forwarded a clean session checkout to the selected base.
+    FastForwarded,
+}
+
+impl AdoptBaseFreshnessRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::TargetContained => "target_contained",
+            Self::FastForwarded => "fast_forwarded",
+        }
+    }
+}
+
+/// Freshness evidence for one explicit session reuse boundary.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdoptBaseFreshness {
+    /// The selected ref, or a descriptive pin when the original source is unknown.
+    pub target_ref: String,
+    /// The exact commit used in the checked relation.
+    pub target_commit: String,
+    /// Omitted for legacy or malformed source provenance. A missing source
+    /// never authorizes automatic checkout movement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SessionStartBaseEvidence>,
+    /// Emitted only for successful reuse. Unknown or unsafe relations return a
+    /// refusal error and do not produce this report.
+    pub relation: AdoptBaseFreshnessRelation,
+    /// Missing when no valid prior observation exists or its timestamp is in
+    /// the future according to this process clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_observation_age_seconds: Option<u64>,
+    /// True when the prior age is unknown or at/above the configured threshold.
+    /// Zero marks every prior observation stale. This is informational;
+    /// current ref and ancestry checks always run.
+    pub previous_observation_stale: bool,
+    /// The reporting threshold from `[worktree_freshness]`.
+    pub max_age_seconds: u64,
+    /// Unix epoch milliseconds when this local base relation was checked.
+    /// This does not imply a remote refresh succeeded.
+    pub observed_at_ms: i64,
+}
+
 /// Adoption result with the session fields kept at the JSON top level.
 #[derive(Debug, serde::Serialize)]
 pub struct AdoptReport {
@@ -964,6 +1015,10 @@ pub struct AdoptReport {
     pub integration_drift: Option<AdoptIntegrationDrift>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration_sync: Option<AdoptIntegrationSync>,
+    /// The selected base checked at this task handoff. Introduced in the
+    /// bounded freshness surface; absent for non-reuse adoption.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_freshness: Option<AdoptBaseFreshness>,
     pub planned_explicit_leases: Vec<crate::Lease>,
     pub preparation: crate::PreparationStatus,
     /// Paths this session still targets that a later promotion renamed. Empty
@@ -1207,7 +1262,7 @@ pub(crate) struct WorktreeRootMarker {
     pub(crate) repository_root: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStartBaseEvidence {
     /// The operator named the base with `--base <ref>`, so no inference ran.
@@ -1230,6 +1285,39 @@ impl SessionStartBaseEvidence {
             Self::RemoteDefaultBranch => "remote default branch",
             Self::ConventionalMain => "conventional main branch",
             Self::ConventionalMaster => "conventional master branch",
+        }
+    }
+}
+
+/// The last selected start base, retained per session for safe reuse.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionBaseObservation {
+    pub(crate) schema_version: u32,
+    pub(crate) target_ref: String,
+    pub(crate) target_commit: String,
+    pub(crate) evidence: Option<SessionStartBaseEvidence>,
+    /// Last time this selected base was confirmed against local repository
+    /// state. Any remote refresh result is reported separately.
+    pub(crate) observed_at_ms: Option<i64>,
+    pub(crate) promote_branch: String,
+    pub(crate) default_ref: Option<String>,
+}
+
+impl SessionBaseObservation {
+    pub(crate) fn meta_key(session_id: i64) -> String {
+        format!("session_base_observation.{session_id}")
+    }
+
+    pub(crate) fn from_start_base(base: &SessionStartBase, promote_branch: String) -> Self {
+        Self {
+            schema_version: 1,
+            target_ref: base.ref_name.clone(),
+            target_commit: base.commit.clone(),
+            evidence: Some(base.evidence),
+            observed_at_ms: Some(crate::clock::epoch_ms()),
+            promote_branch,
+            default_ref: base.default_ref.clone(),
         }
     }
 }

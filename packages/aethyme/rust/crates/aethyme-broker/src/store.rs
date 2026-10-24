@@ -46,6 +46,26 @@ use crate::types::{
     OperationStatus, PrWatchState, Session, SessionCleanupState, SessionContext, SessionNote,
     SessionOrigin, SessionStatus,
 };
+
+pub(crate) struct SessionReuseOptions<'a> {
+    pub(crate) verify_only: bool,
+    pub(crate) id: i64,
+    pub(crate) task: Option<&'a str>,
+    pub(crate) diff_base: Option<&'a str>,
+    pub(crate) agent_identity: Option<&'a str>,
+    pub(crate) context: &'a SessionContext,
+    pub(crate) planned_paths: &'a [String],
+    pub(crate) base_observation: Option<&'a crate::broker::SessionBaseObservation>,
+}
+
+pub(crate) struct SessionReplacementOptions<'a> {
+    pub(crate) verify_only: bool,
+    pub(crate) replaced_id: i64,
+    pub(crate) new: &'a NewSession,
+    pub(crate) context: &'a SessionContext,
+    pub(crate) planned_paths: &'a [String],
+    pub(crate) base_observation: Option<&'a crate::broker::SessionBaseObservation>,
+}
 use crate::types::{NewSessionRepresentation, RepresentationDiscovery, SessionRepresentation};
 
 /// Milliseconds a writer waits on a locked database before erroring.
@@ -729,6 +749,26 @@ mod gate_result_clear_metadata_tests {
             )
             .unwrap();
         store.conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn session_base_observation_is_removed_when_session_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let session_id = insert_gc_fixture_session(
+            &mut store,
+            &directory.path().join("session"),
+        );
+        let key = crate::broker::SessionBaseObservation::meta_key(session_id);
+        store.meta_set(&key, "fixture observation").unwrap();
+        assert_eq!(store.meta_get(&key).unwrap().as_deref(), Some("fixture observation"));
+
+        store
+            .set_session_status(session_id, crate::SessionStatus::Closed, None)
+            .unwrap();
+
+        assert_eq!(store.meta_get(&key).unwrap(), None);
     }
 
     fn gc_candidate(store: &BrokerStore, kind: crate::GcRowKind, id: i64) -> crate::GcRowCandidate {

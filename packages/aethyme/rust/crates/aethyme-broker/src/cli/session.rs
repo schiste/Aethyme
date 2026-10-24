@@ -1278,6 +1278,28 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
                 session.branch
             ),
         }
+        if let Some(freshness) = &report.base_freshness {
+            out!(
+                "Base check: {} at {} ({})",
+                freshness.relation.as_str(),
+                short_commit(&freshness.target_commit),
+                freshness
+                    .source
+                    .map(crate::SessionStartBaseEvidence::as_str)
+                    .unwrap_or("unknown source")
+            );
+            if freshness.previous_observation_stale {
+                match freshness.previous_observation_age_seconds {
+                    Some(age) => out!(
+                        "note: the prior base observation was {age}s old; the selected base was rechecked against the {}s reporting window",
+                        freshness.max_age_seconds
+                    ),
+                    None => out!(
+                        "note: the prior base observation age was unknown; the selected base was checked at this handoff"
+                    ),
+                }
+            }
+        }
         render_tab_rename(&tab_rename);
         if let Some(drift) = &report.default_branch
             && drift.behind > 0

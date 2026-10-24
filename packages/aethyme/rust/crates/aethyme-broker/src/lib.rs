@@ -235,6 +235,7 @@ mod verification;
 mod verify_loop;
 mod version;
 mod worktree_reconcile;
+mod worktree_freshness;
 
 pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
@@ -250,7 +251,8 @@ pub use blockers::{
     UnblockRequest,
 };
 pub use broker::{
-    AdoptCarriedOwnership, AdoptIntegrationDrift, AdoptIntegrationRelation, AdoptIntegrationSync,
+    AdoptBaseFreshness, AdoptBaseFreshnessRelation, AdoptCarriedOwnership, AdoptIntegrationDrift,
+    AdoptIntegrationRelation, AdoptIntegrationSync,
     AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, AdoptOutcome, AdoptReport, AgentView,
     Broker, BrokerOpError, BrokerOpenOptions, BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION,
     CheckpointRecoveryAction, CheckpointRefusalCode, CleanupDisposition, CleanupPlan,

@@ -568,6 +568,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("review", &["trigger", "routing", "reporting", "projection"]),
     ("collaboration", crate::collaboration_submit::KNOWN_SETTINGS),
     ("worktrees", &["root", "min_free_bytes"]),
+    ("worktree_freshness", &["max_age_seconds"]),
     ("session", &["guidance"]),
 ];
 
@@ -1165,6 +1166,8 @@ const CONFIG_TEMPLATE: &str = "\
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
 #   [worktrees] root  absolute directory for session worktrees (default: per-user host state)
 #   [worktrees] min_free_bytes  free space the root must keep (default: gate headroom)
+#   [worktree_freshness] max_age_seconds  prior-observation stale threshold (default 900)
+#     An age at or above the threshold is stale; zero marks all prior observations stale.
 #   [session] guidance  working agreement `broker start` shows (default built in; [] disables)
 # Unknown keys are generally ignored; typed policy sections refuse invalid
 # values before acting. Certify warns on unknown keys.
@@ -1840,5 +1843,14 @@ mod config_key_tests {
     fn worktrees_root_and_floor_are_known_keys() {
         assert!(unknown("[worktrees]\nroot = \"/Volumes/T7/wt\"\nmin_free_bytes = 1\n").is_empty());
         assert_eq!(unknown("[worktrees]\npath = \"/x\"\n"), ["worktrees.path"]);
+    }
+
+    #[test]
+    fn worktree_freshness_policy_is_a_known_key() {
+        assert!(unknown("[worktree_freshness]\nmax_age_seconds = 900\n").is_empty());
+        assert_eq!(
+            unknown("[worktree_freshness]\nmax_age = 900\n"),
+            ["worktree_freshness.max_age"]
+        );
     }
 }

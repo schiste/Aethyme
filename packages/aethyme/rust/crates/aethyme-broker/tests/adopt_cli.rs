@@ -57,6 +57,88 @@ fn fixture() -> common::FixtureRepository {
     tmp
 }
 
+fn stored_session(
+    fixture: &common::FixtureRepository,
+    id: i64,
+) -> aethyme_broker::Session {
+    common::open_fixture_repository_broker(fixture)
+        .unwrap()
+        .store()
+        .session(id)
+        .unwrap()
+}
+
+fn stored_base_observation(
+    fixture: &common::FixtureRepository,
+    session_id: i64,
+) -> serde_json::Value {
+    let mut broker = common::open_fixture_repository_broker(fixture).unwrap();
+    let database = broker.store().db_path().to_path_buf();
+    drop(broker);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let key = format!("session_base_observation.{session_id}");
+    let raw: String = connection
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
+        .unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn delete_stored_base_observation(fixture: &common::FixtureRepository, session_id: i64) {
+    let mut broker = common::open_fixture_repository_broker(fixture).unwrap();
+    let database = broker.store().db_path().to_path_buf();
+    drop(broker);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let key = format!("session_base_observation.{session_id}");
+    connection
+        .execute("DELETE FROM meta WHERE key = ?1", [key])
+        .unwrap();
+}
+
+fn overwrite_stored_base_observation(
+    fixture: &common::FixtureRepository,
+    session_id: i64,
+    raw: &str,
+) {
+    let mut broker = common::open_fixture_repository_broker(fixture).unwrap();
+    let database = broker.store().db_path().to_path_buf();
+    drop(broker);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let key = format!("session_base_observation.{session_id}");
+    let changed = connection
+        .execute("UPDATE meta SET value = ?1 WHERE key = ?2", (raw, key))
+        .unwrap();
+    assert_eq!(
+        changed, 1,
+        "the malformed-observation control must replace an existing row"
+    );
+}
+
+fn set_promote_branch(repo: &Path, branch: &str) {
+    let aethyme = repo.join(".aethyme");
+    std::fs::create_dir_all(&aethyme).unwrap();
+    std::fs::write(
+        aethyme.join("config.toml"),
+        format!("[promote]\nbranch = \"{branch}\"\nmode = \"auto\"\n"),
+    )
+    .unwrap();
+}
+
+fn set_integration_at_head(repo: &Path) -> String {
+    let head = git_output(repo, &["rev-parse", "HEAD"]);
+    git(
+        repo,
+        &["update-ref", "refs/heads/aethyme/integration", &head],
+    );
+    head
+}
+
+fn advance_main(repo: &Path, filename: &str) -> String {
+    std::fs::write(repo.join(filename), "main advanced\n").unwrap();
+    git(repo, &["add", filename]);
+    git(repo, &["commit", "-qm", "advance main"]);
+    git_output(repo, &["rev-parse", "HEAD"])
+}
+
 #[test]
 fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
     let tmp = fixture();
@@ -208,6 +290,7 @@ fn adopted_reused_session_without_a_chau7_tab_skips_mcp_lookup() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = fixture();
+    set_integration_at_head(tmp.path());
     let created = stdout(&run_verbatim(
         tmp.path(),
         &[
@@ -384,6 +467,7 @@ fn an_invalid_short_name_is_refused_before_start_creates_broker_state() {
 #[test]
 fn reuse_without_a_short_name_keeps_the_stored_name() {
     let tmp = fixture();
+    set_integration_at_head(tmp.path());
     stdout(&run_verbatim(
         tmp.path(),
         &[
@@ -414,6 +498,7 @@ fn reuse_without_a_short_name_keeps_the_stored_name() {
 #[test]
 fn reuse_persists_a_new_short_name_but_keeps_tab_attribution() {
     let tmp = fixture();
+    set_integration_at_head(tmp.path());
     let created = stdout(&run(
         tmp.path(),
         &[
@@ -663,6 +748,507 @@ fn start_refuses_a_base_that_does_not_resolve() {
     );
 }
 
+#[test]
+fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
+    let tmp = fixture();
+    let started = stdout(&run(
+        tmp.path(),
+        &["start", "--task", "initial", "--json"],
+    ));
+    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(started["start_base"]["evidence"], "conventional_main");
+    let session = stored_session(&tmp, 1);
+    let worktree = Path::new(&session.worktree_path);
+    let original_head = git_output(worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(Some(original_head.as_str()), session.diff_base.as_deref());
+
+    let current_main = advance_main(tmp.path(), "main-advance.txt");
+    let worktree_arg = session.worktree_path.as_str();
+    let reused = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "follow-up",
+            "--json",
+        ],
+    ));
+    let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+
+    assert_eq!(reused["outcome"], "reused");
+    assert_eq!(reused["base_freshness"]["source"], "conventional_main");
+    assert_eq!(reused["base_freshness"]["relation"], "fast_forwarded");
+    assert_eq!(reused["base_freshness"]["target_ref"], "refs/heads/main");
+    assert_eq!(reused["base_freshness"]["target_commit"], current_main);
+    assert_eq!(reused["diff_base"], current_main);
+    assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), current_main);
+    let updated = stored_session(&tmp, session.id);
+    assert_eq!(updated.task.as_deref(), Some("follow-up"));
+    assert_eq!(updated.diff_base.as_deref(), Some(current_main.as_str()));
+}
+
+#[test]
+fn reuse_uses_a_local_integration_base_when_default_fetch_fails() {
+    let tmp = fixture();
+    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &main);
+    set_integration_at_head(tmp.path());
+    let started = stdout(&run(
+        tmp.path(),
+        &["start", "--task", "initial", "--json"],
+    ));
+    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(started["start_base"]["evidence"], "integration_tip");
+    let session = stored_session(&tmp, 1);
+    let previous_observation = stored_base_observation(&tmp, session.id);
+    let previous_observed_at = previous_observation["observed_at_ms"]
+        .as_i64()
+        .expect("local integration observation has a timestamp");
+
+    let unavailable_remote = tmp.path().join("unavailable-remote");
+    git(
+        tmp.path(),
+        &[
+            "config",
+            "remote.origin.url",
+            unavailable_remote.to_str().unwrap(),
+        ],
+    );
+    let worktree_arg = session.worktree_path.as_str();
+    let reused = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "offline follow-up",
+            "--json",
+        ],
+    ));
+    let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+
+    assert_eq!(reused["base_freshness"]["source"], "integration_tip");
+    assert_eq!(reused["base_freshness"]["relation"], "current");
+    assert!(reused["default_branch_note"]
+        .as_str()
+        .is_some_and(|note| note.contains("used the last fetched copy")));
+    let current_observation = stored_base_observation(&tmp, session.id);
+    let checked_at = reused["base_freshness"]["observed_at_ms"]
+        .as_i64()
+        .expect("freshness report has a local validation timestamp");
+    assert_eq!(
+        current_observation["observed_at_ms"].as_i64(),
+        Some(checked_at),
+        "the stored time records the successful local validation boundary"
+    );
+    assert!(
+        checked_at >= previous_observed_at,
+        "the local observation time must not move backwards"
+    );
+}
+
+#[test]
+fn reuse_refuses_dirty_fast_forward_without_updating_task_or_head() {
+    let tmp = fixture();
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let session = stored_session(&tmp, 1);
+    let worktree = Path::new(&session.worktree_path);
+    let original_head = git_output(worktree, &["rev-parse", "HEAD"]);
+    advance_main(tmp.path(), "main-advance.txt");
+    std::fs::write(worktree.join("README.md"), "dirty session edit\n").unwrap();
+
+    let worktree_arg = session.worktree_path.as_str();
+    let refused = run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "must not be recorded",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused).contains("dirty paths"),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), original_head);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "dirty session edit\n"
+    );
+    let unchanged = stored_session(&tmp, session.id);
+    assert_eq!(unchanged.task.as_deref(), Some("initial"));
+    assert_eq!(unchanged.diff_base, session.diff_base);
+}
+
+#[test]
+fn reuse_retry_repairs_diff_base_after_fast_forward_persistence_failure() {
+    let tmp = fixture();
+    let started = stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+    let session = stored_session(&tmp, started["id"].as_i64().unwrap());
+    let original_diff_base = session.diff_base.clone();
+    let original_adoption_base = session.adoption_base.clone();
+    let worktree = Path::new(&session.worktree_path);
+    let target = advance_main(tmp.path(), "main-advance.txt");
+
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+    let database = broker.store().db_path().to_path_buf();
+    drop(broker);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_reuse_task_update
+             BEFORE UPDATE OF task ON sessions
+             WHEN NEW.task = 'retry after failed persistence'
+             BEGIN
+               SELECT RAISE(ABORT, 'fixture task persistence failure');
+             END;",
+        )
+        .unwrap();
+
+    let worktree_arg = session.worktree_path.as_str();
+    let refused = run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "retry after failed persistence",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused).contains(&format!("checkout was advanced to {target}")),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), target);
+    let after_failure = stored_session(&tmp, session.id);
+    assert_eq!(after_failure.task.as_deref(), Some("initial"));
+    assert_eq!(after_failure.diff_base, original_diff_base);
+    assert_eq!(after_failure.adoption_base, original_adoption_base);
+    assert_eq!(
+        stored_base_observation(&tmp, session.id)["target_commit"],
+        original_diff_base.as_deref().unwrap()
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_reuse_task_update;")
+        .unwrap();
+    let retried = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "retry succeeded",
+            "--json",
+        ],
+    ));
+    let retried: serde_json::Value = serde_json::from_str(&retried).unwrap();
+    assert_eq!(retried["base_freshness"]["relation"], "current");
+    assert_eq!(retried["diff_base"], target);
+    let repaired = stored_session(&tmp, session.id);
+    assert_eq!(repaired.task.as_deref(), Some("retry succeeded"));
+    assert_eq!(repaired.diff_base.as_deref(), Some(target.as_str()));
+    assert_eq!(repaired.adoption_base, original_adoption_base);
+}
+
+#[test]
+fn reuse_keeps_an_explicit_base_pinned_when_its_branch_advances() {
+    let tmp = fixture();
+    let original_base = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--task",
+            "explicit base",
+            "--base",
+            "refs/heads/main",
+            "--json",
+        ],
+    ));
+    let session = stored_session(&tmp, 1);
+    advance_main(tmp.path(), "main-advance.txt");
+
+    let worktree_arg = session.worktree_path.as_str();
+    let reused = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "keep pinned base",
+            "--json",
+        ],
+    ));
+    let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+
+    assert_eq!(reused["base_freshness"]["source"], "explicit_base");
+    assert_eq!(reused["base_freshness"]["relation"], "current");
+    assert_eq!(reused["base_freshness"]["target_commit"], original_base);
+    assert_eq!(
+        git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]),
+        original_base
+    );
+}
+
+#[test]
+fn reuse_refuses_changed_promote_policy_without_changing_checkout_or_task() {
+    let tmp = fixture();
+    let initial = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let recorded_branch = "aethyme/integration-recorded";
+    git(
+        tmp.path(),
+        &[
+            "update-ref",
+            &format!("refs/heads/{recorded_branch}"),
+            &initial,
+        ],
+    );
+    set_promote_branch(tmp.path(), recorded_branch);
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let session = stored_session(&tmp, 1);
+    assert_eq!(session.diff_base.as_deref(), Some(initial.as_str()));
+    let original_head = git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]);
+
+    set_promote_branch(tmp.path(), "aethyme/integration-new-policy");
+    let worktree_arg = session.worktree_path.as_str();
+    let refused = run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "new policy must not be recorded",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused).contains("configured integration branch changed"),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(
+        git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]),
+        original_head
+    );
+    let unchanged = stored_session(&tmp, session.id);
+    assert_eq!(unchanged.task.as_deref(), Some("initial"));
+    assert_eq!(unchanged.diff_base.as_deref(), session.diff_base.as_deref());
+}
+
+#[test]
+fn reuse_refuses_a_missing_recorded_integration_ref_without_fallback() {
+    let tmp = fixture();
+    let initial = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let recorded_branch = "aethyme/integration-recorded";
+    let recorded_ref = format!("refs/heads/{recorded_branch}");
+    git(tmp.path(), &["update-ref", &recorded_ref, &initial]);
+    set_promote_branch(tmp.path(), recorded_branch);
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let session = stored_session(&tmp, 1);
+    let original_head = git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]);
+    git(tmp.path(), &["update-ref", "-d", &recorded_ref]);
+
+    let worktree_arg = session.worktree_path.as_str();
+    let refused = run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "missing ref must not be recorded",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused).contains(
+            "recorded integration ref refs/heads/aethyme/integration-recorded is missing"
+        ),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(
+        git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]),
+        original_head
+    );
+    let unchanged = stored_session(&tmp, session.id);
+    assert_eq!(unchanged.task.as_deref(), Some("initial"));
+    assert_eq!(unchanged.diff_base, session.diff_base);
+}
+
+#[test]
+fn unknown_adopted_base_tracks_current_integration_and_requires_explicit_sync() {
+    let tmp = fixture();
+    let initial = set_integration_at_head(tmp.path());
+    stdout(&run(
+        tmp.path(),
+        &["start", "--adopt", "--task", "initial", "--json"],
+    ));
+    let session = stored_session(&tmp, 1);
+
+    let contained = stdout(&run(
+        tmp.path(),
+        &["start", "--reuse", "--task", "contained base", "--json"],
+    ));
+    let contained: serde_json::Value = serde_json::from_str(&contained).unwrap();
+    assert_eq!(contained["base_freshness"]["target_commit"], initial);
+    assert_eq!(contained["base_freshness"]["relation"], "current");
+    assert!(contained["base_freshness"].get("source").is_none());
+
+    let advanced_integration = integration_ahead_of_main(tmp.path(), 1);
+    let refused = run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            "--task",
+            "must require explicit sync",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused).contains("automatic movement is disabled"),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(git_output(tmp.path(), &["rev-parse", "HEAD"]), initial);
+    let unchanged = stored_session(&tmp, session.id);
+    assert_eq!(unchanged.task.as_deref(), Some("contained base"));
+
+    let synchronized = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            "--sync-integration",
+            "--task",
+            "explicitly synchronized",
+            "--json",
+        ],
+    ));
+    let synchronized: serde_json::Value = serde_json::from_str(&synchronized).unwrap();
+    assert_eq!(
+        synchronized["integration_sync"]["outcome"],
+        "fast_forwarded"
+    );
+    assert_eq!(
+        git_output(tmp.path(), &["rev-parse", "HEAD"]),
+        advanced_integration
+    );
+    assert_eq!(
+        stored_session(&tmp, session.id).task.as_deref(),
+        Some("explicitly synchronized")
+    );
+}
+
+#[test]
+fn unknown_reuse_base_refuses_verify_only_even_when_old_integration_matches_head() {
+    let tmp = fixture();
+    let original_head = set_integration_at_head(tmp.path());
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let session = stored_session(&tmp, 1);
+    let worktree = Path::new(&session.worktree_path);
+    delete_stored_base_observation(&tmp, session.id);
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"verify-only\"\n",
+    )
+    .unwrap();
+    let advanced_main = advance_main(tmp.path(), "new-default.txt");
+    assert_ne!(advanced_main, original_head);
+    assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), original_head);
+    assert_eq!(
+        git_output(tmp.path(), &["rev-parse", "aethyme/integration"]),
+        original_head
+    );
+
+    let refused = run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            &session.worktree_path,
+            "--task",
+            "must not be recorded",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused)
+            .contains("verify-only policy does not select the integration branch"),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), original_head);
+    let unchanged = stored_session(&tmp, session.id);
+    assert_eq!(unchanged.task, session.task);
+    assert_eq!(unchanged.diff_base, session.diff_base);
+    assert_eq!(unchanged.adoption_base, session.adoption_base);
+}
+
+#[test]
+fn unknown_adopted_base_refuses_when_configured_integration_is_missing() {
+    for malformed in [false, true] {
+        let tmp = fixture();
+        stdout(&run(
+            tmp.path(),
+            &["start", "--adopt", "--task", "initial", "--json"],
+        ));
+        let session = stored_session(&tmp, 1);
+        let original_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+        if malformed {
+            overwrite_stored_base_observation(&tmp, session.id, "not-json");
+        } else {
+            delete_stored_base_observation(&tmp, session.id);
+        }
+
+        let refused = run(
+            tmp.path(),
+            &[
+                "start",
+                "--reuse",
+                "--task",
+                "no inferred fallback",
+                "--json",
+            ],
+        );
+        assert!(!refused.status.success());
+        assert!(
+            json_error::message(&refused).contains(
+                "configured integration ref refs/heads/aethyme/integration is missing"
+            ),
+            "{}",
+            json_error::message(&refused)
+        );
+        assert_eq!(git_output(tmp.path(), &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(
+            stored_session(&tmp, session.id).task.as_deref(),
+            Some("initial")
+        );
+    }
+}
+
 /// `start --adopt` registers an existing worktree, so there is no base to choose. The
 /// refusal says so rather than giving the generic "valid only with" list.
 #[test]
@@ -782,6 +1368,7 @@ fn start_does_not_inspect_free_form_task_text_for_pull_request_reviews() {
 #[test]
 fn adopt_cli_distinguishes_created_and_reused_session_identities() {
     let tmp = fixture();
+    set_integration_at_head(tmp.path());
 
     let created = stdout(&run(tmp.path(), &["start", "--adopt", "--task", "first"]));
     assert!(
@@ -811,9 +1398,13 @@ fn adopt_cli_distinguishes_created_and_reused_session_identities() {
 }
 
 #[test]
-fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
+fn reuse_cli_exposes_structured_integration_drift_and_safe_guidance() {
     let tmp = fixture();
-    stdout(&run(tmp.path(), &["start", "--adopt", "--task", "first"]));
+    let started = stdout(&run(tmp.path(), &["start", "--task", "first", "--json"]));
+    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+    assert_eq!(started["start_base"]["evidence"], "conventional_main");
+    let session = stored_session(&tmp, started["id"].as_i64().unwrap());
+    let worktree = Path::new(&session.worktree_path);
 
     git(tmp.path(), &["checkout", "-qb", "integration-work"]);
     std::fs::write(tmp.path().join("shared.txt"), "integration\n").unwrap();
@@ -822,12 +1413,20 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
     let integration_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     git(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
     git(tmp.path(), &["checkout", "-q", "main"]);
-    let session_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    std::fs::write(tmp.path().join("shared.txt"), "dirty session edit\n").unwrap();
+    let session_head = git_output(worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(worktree.join("shared.txt"), "dirty session edit\n").unwrap();
+    let worktree_arg = session.worktree_path.as_str();
 
     let json = stdout(&run(
         tmp.path(),
-        &["start", "--reuse", "--task", "follow-up", "--json"],
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "follow-up",
+            "--json",
+        ],
     ));
     let report: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(report["outcome"], "reused");
@@ -851,7 +1450,13 @@ fn adopt_cli_exposes_structured_reuse_drift_and_safe_guidance() {
 
     let rendered = stdout(&run(
         tmp.path(),
-        &["start", "--reuse", "--task", "render drift"],
+        &[
+            "start",
+            "--reuse",
+            worktree_arg,
+            "--task",
+            "render drift",
+        ],
     ));
     assert!(rendered.contains("Integration drift: behind"), "{rendered}");
     assert!(rendered.contains("Overlapping changed paths:\n  shared.txt"));
@@ -1225,6 +1830,7 @@ fn a_new_session_on_the_main_checkout_is_refused_however_it_is_spelled() {
 #[test]
 fn the_main_checkout_needs_an_explicit_override_and_its_session_stays_reusable() {
     let tmp = fixture();
+    set_integration_at_head(tmp.path());
     let created = stdout(&run_enforced(
         tmp.path(),
         &[

@@ -165,10 +165,14 @@ impl crate::Broker {
     pub(crate) fn reused_session_drift(
         &mut self,
         session: &Session,
-    ) -> (Option<DefaultBranchDrift>, Option<String>) {
+    ) -> (
+        Option<DefaultBranchDrift>,
+        Option<String>,
+        Option<crate::session_push::DefaultBranchRefreshEvidence>,
+    ) {
         let main_root = self.main_root().to_path_buf();
         let Some(default) = tracked_default(self.repo_handle()) else {
-            return (None, None);
+            return (None, None, None);
         };
         let Some(head) = GitRepo::discover(Path::new(&session.worktree_path))
             .ok()
@@ -177,16 +181,18 @@ impl crate::Broker {
             return (
                 None,
                 Some("the session worktree has no readable HEAD".into()),
+                None,
             );
         };
-        self.fetch_and_measure_default_branch(
+        let (drift, note, refresh) = self.fetch_and_measure_default_branch(
             session.id,
             &session.branch,
             &default,
             None,
             &head,
             &main_root,
-        )
+        );
+        (drift, note, Some(refresh))
     }
 
     /// Bring a live session up to the freshly fetched default branch when it
