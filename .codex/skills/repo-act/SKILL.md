@@ -207,7 +207,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   formatting problem.
   Prepare the exact body file. When local validation is allowed, run the pinned
   CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`
-  and retain the result before publication. During a local-check pause, use the
+  from that PR's worktree, verify HEAD matches the reviewed source, and retain
+  the result before publication. The body path and base do not select a worktree. During a local-check pause, use the
   PR's remote contract check instead of running it locally. Review each refusal;
   use a `Contract justification:` of at least 24 characters
   only for a verified false-positive, while preserving the actual retirement
