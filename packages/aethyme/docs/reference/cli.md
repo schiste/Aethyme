@@ -751,8 +751,11 @@ The real reap independently revalidates current holders and fences. Named
 allocations remain quarantined for cleanup review; this operation stops no
 processes or containers. Supervised capacity holds and unresolved preparation
 producers remain protected. An absent registry produces an empty preview
-without creating host state. A nonempty legacy store requires a coordinated
-writable upgrade before preview; the read-only command never migrates it.
+without creating host state. Known managed-storage schemas are read without
+migration; schema-3 producer-linked capacity remains fenced because it lacks
+immutable settlement proof. A retained host-resource schema-1 store requires
+the existing coordinated writable upgrade before preview can inspect supervised
+holds. The read-only command never migrates either schema.
 
 A dev server is a host resource, and agent isolation and operator singularity
 want opposite defaults from it. `console` composes the `resources` primitives

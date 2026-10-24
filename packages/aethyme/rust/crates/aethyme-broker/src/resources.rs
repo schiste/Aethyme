@@ -3135,10 +3135,10 @@ impl HostResourceCoordinator {
                 "reap preview needs a coordinated writable upgrade of this legacy registry; no changes made".into(),
             ));
         }
-        // Existing registries deliberately keep their managed-storage floor
-        // until an operator activates it. Preview must neither migrate them
-        // nor query settlement tables that do not exist yet.
-        validate_managed_storage_schema(&tx)?;
+        // Keep existing managed-storage floors and query only their known
+        // tables. Older producer records without immutable settlement proof
+        // remain fenced; preview never activates a schema.
+        validate_managed_storage_schema_supported(&tx)?;
         for candidate in pending_reap_candidates(&tx)? {
             if !holder_process_is_gone(candidate.holder_pid) {
                 if candidate.quarantined || candidate.expires_at <= now {
@@ -5210,10 +5210,30 @@ struct PendingReapCandidate {
 fn pending_reap_candidates(
     conn: &Connection,
 ) -> Result<Vec<PendingReapCandidate>, HostResourceError> {
-    let unresolved = managed_storage_unresolved_producer_predicate_sql(
-        "resource_leases.lease_id",
-        "resource_leases.generation",
-    );
+    let managed_version: i64 = conn.query_row(
+        "SELECT value FROM managed_storage_meta WHERE key='schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    let unresolved = match managed_version {
+        // Producer records cannot exist in these known schemas.
+        1 | 2 => "0".to_owned(),
+        // Schema 3 has producers but no immutable settlement proofs. Keep
+        // every linked lease fenced, regardless of a legacy terminal label.
+        3 => "EXISTS (SELECT 1 FROM managed_storage_preparation_producers p
+              WHERE p.lease_id=resource_leases.lease_id
+                AND p.generation=resource_leases.generation)"
+            .to_owned(),
+        4 => managed_storage_unresolved_producer_predicate_sql(
+            "resource_leases.lease_id",
+            "resource_leases.generation",
+        ),
+        _ => {
+            return Err(HostResourceError::InvalidRequest(format!(
+                "unsupported managed storage schema {managed_version}"
+            )));
+        }
+    };
     let sql = format!(
         "SELECT lease_id,generation,holder_pid,expires_at,state='quarantined',({unresolved})
          FROM resource_leases
@@ -7426,7 +7446,7 @@ mod tests {
     }
 
     #[test]
-    fn reap_preview_refuses_retained_legacy_registry_without_migration() {
+    fn reap_preview_preserves_known_legacy_managed_registries() {
         for version in 1..=3 {
             let temp = tempfile::tempdir().unwrap();
             let db = temp.path().join("legacy.db");
@@ -7442,51 +7462,91 @@ mod tests {
                 !leases.is_empty(),
                 "legacy fixture must have retained leases"
             );
-            assert!(reader.preview_dead_holders().is_err());
+            let preview = reader.preview_dead_holders().unwrap();
+            assert_eq!(preview.candidates.len(), 1);
+            assert_eq!(preview.would_reclaim_capacity_units, 1);
             assert_eq!(reader.list(true).unwrap(), leases);
             assert_eq!(migration_snapshot(&reader.conn, version), before);
         }
     }
 
     #[test]
-    fn reap_preview_keeps_unsettled_preparation_capacity_fenced() {
+    fn reap_preview_refuses_retained_v1_host_store_without_upgrade() {
         let temp = tempfile::tempdir().unwrap();
-        let db = temp.path().join("unsettled.db");
-        create_managed_schema_fixture(&db, 4);
-        let writer = Connection::open(&db).unwrap();
-        let dead_holder = reaped_pid();
-        let changed = writer
-            .execute(
-                "INSERT INTO resource_leases
-             (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id,
-              generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at)
-             VALUES ('legacy-lease','legacy-request','digest','migration-repo','fixture','run',
-                     7,'token','active',?1,1,9223372036854775807,1)",
-                [dead_holder],
-            )
+        let db = temp.path().join("host-v1.db");
+        let mut writer = Connection::open(&db).unwrap();
+        writer.execute_batch(SCHEMA).unwrap();
+        insert_legacy_v1_capacity(&mut writer, "preview", "preview", 1, 4, Some(reaped_pid()))
             .unwrap();
-        writer
-            .execute(
-                "INSERT INTO resource_allocations
-             (lease_id,resource_key,kind,value,units,capacity_limit)
-             VALUES ('legacy-lease','worker','capacity','preview',1,4)",
-                [],
-            )
-            .unwrap();
-        assert!(
-            changed > 0,
-            "fixture must exercise a producer-linked dead holder"
-        );
         drop(writer);
         let reader = HostResourceCoordinator::open_read_only(&db).unwrap();
         let before = reader.list(true).unwrap();
-        let preview = reader.preview_dead_holders().unwrap();
-        assert!(
-            preview.candidates.is_empty(),
-            "unsettled preparation is not reclaimable"
-        );
-        assert_eq!(preview.would_reclaim_capacity_units, 0);
+        assert!(reader.preview_dead_holders().is_err());
         assert_eq!(reader.list(true).unwrap(), before);
+        assert_eq!(store_schema_version(&reader.conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn reap_preview_keeps_unsettled_preparation_capacity_fenced() {
+        for version in [3, 4] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = temp.path().join("unsettled.db");
+            create_managed_schema_fixture(&db, 2);
+            let mut writer = Connection::open(&db).unwrap();
+            let dead_holder = reaped_pid();
+            // Capacity exists before preparation creates the producer fence.
+            writer
+                .execute(
+                    "INSERT INTO resource_leases
+                 (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id,
+                  generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at)
+                 VALUES ('legacy-lease','legacy-request','digest','migration-repo','fixture','run',
+                         7,'token','active',?1,1,9223372036854775807,1)",
+                    [dead_holder],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO resource_allocations
+                 (lease_id,resource_key,kind,value,units,capacity_limit)
+                 VALUES ('legacy-lease','worker','capacity','preview',1,4)",
+                    [],
+                )
+                .unwrap();
+            writer
+                .execute_batch(MANAGED_STORAGE_PRODUCER_SCHEMA)
+                .unwrap();
+            seed_v3_managed_rows(&writer);
+            writer
+                .execute(
+                    "UPDATE managed_storage_meta SET value=3 WHERE key='schema_version'",
+                    [],
+                )
+                .unwrap();
+            if version == 4 {
+                let tx = writer
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                migrate_managed_storage_schema(&tx).unwrap();
+                tx.commit().unwrap();
+            }
+            drop(writer);
+            let reader = HostResourceCoordinator::open_read_only(&db).unwrap();
+            let before = reader.list(true).unwrap();
+            assert_eq!(
+                before.len(),
+                1,
+                "fixture must retain producer-linked capacity"
+            );
+            assert_eq!(before[0].allocations.len(), 1);
+            let preview = reader.preview_dead_holders().unwrap();
+            assert!(
+                preview.candidates.is_empty(),
+                "v{version}: unsettled preparation is not reclaimable"
+            );
+            assert_eq!(preview.would_reclaim_capacity_units, 0);
+            assert_eq!(reader.list(true).unwrap(), before);
+        }
     }
 
     #[test]
