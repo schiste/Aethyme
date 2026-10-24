@@ -785,17 +785,11 @@ fn reclaim_keeps_active_cache_when_another_session_needs_a_liveness_transition()
                     .is_some_and(|path| path == expected)
             })
             .cloned()
-            .unwrap_or_else(|| {
-                panic!(
-                    "missing reclaim candidate for {}: {plan}",
-                    target.display()
-                )
-            })
+            .unwrap_or_else(|| panic!("missing reclaim candidate for {}: {plan}", target.display()))
     };
     let active_candidate = candidate_for(&active_worktree.join("rust/target"));
     assert_eq!(
-        active_candidate["reclaimable"],
-        false,
+        active_candidate["reclaimable"], false,
         "a fresh active session must retain its cache: {active_candidate}"
     );
     assert!(
@@ -808,8 +802,7 @@ fn reclaim_keeps_active_cache_when_another_session_needs_a_liveness_transition()
 
     let transition_candidate = candidate_for(&transition_worktree.join("rust/target"));
     assert_eq!(
-        transition_candidate["reclaimable"],
-        true,
+        transition_candidate["reclaimable"], true,
         "the positive control proves old indexes and complete process-use inspection: {transition_candidate}"
     );
     assert_eq!(session_status(repo.path(), active_id), "active");
