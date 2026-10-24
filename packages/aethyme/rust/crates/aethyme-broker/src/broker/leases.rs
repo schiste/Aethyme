@@ -2288,9 +2288,8 @@ mod worktree_inventory_scan_tests {
 
         let roots = [root.path().to_path_buf()];
         let mut observed = Vec::new();
-        let complete = scan_worktree_roots(&roots, &mut observed, None, |root| {
-            std::fs::read_dir(root)
-        });
+        let complete =
+            scan_worktree_roots(&roots, &mut observed, None, |root| std::fs::read_dir(root));
 
         assert!(!complete);
         assert_eq!(observed.len(), 1);
