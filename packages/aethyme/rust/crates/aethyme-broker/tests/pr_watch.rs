@@ -843,10 +843,15 @@ fn cli_tick_refuses_a_competing_owner_then_succeeds_after_release() {
     };
     let refused = run();
     assert!(!refused.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(error["schema"], "aethyme.broker-error/v1");
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("another PR watch tick is running"),
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another PR watch tick is running"),
         "{}",
-        String::from_utf8_lossy(&refused.stderr),
+        error,
     );
     drop(claim);
     let resumed = run();
