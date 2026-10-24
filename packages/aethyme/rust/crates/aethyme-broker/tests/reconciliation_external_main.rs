@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+use common::open_fixture_repository_path_broker as fixture_broker;
+
 use aethyme_broker::{
-    AutomaticIntegrationCleanupState, Broker, EntryExposureResolutionKind, EntryExposureState,
+    AutomaticIntegrationCleanupState, EntryExposureResolutionKind, EntryExposureState,
     IntegrationDriftEntryState, IntegrationReconcileClassification,
     IntegrationReconcileCommitOrigin, IntegrationReconcileEquivalence, IntegrationReconcileOptions,
     MergeStatus,
@@ -71,7 +74,7 @@ impl DeployDivergenceFixture {
         );
         git(&repo, &["push", "-qu", "origin", "main"]);
 
-        let mut broker = Broker::open(&repo).unwrap();
+        let mut broker = fixture_broker(&repo).unwrap();
         let session = broker.start_worktree("functional promotion", None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         commit(
@@ -177,7 +180,7 @@ fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream(
     );
     git(&repo, &["push", "-qu", "origin", "main"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = fixture_broker(&repo).unwrap();
     let session = broker.start_worktree("promote feature", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(
@@ -290,7 +293,7 @@ fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream(
 #[test]
 fn reconciliation_plan_classifies_every_relevant_commit_with_full_provenance() {
     let fixture = DeployDivergenceFixture::new();
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture_broker(&fixture.repo).unwrap();
     let assessment = broker
         .assess_integration_drift(
             "origin/main",
@@ -418,6 +421,56 @@ fn reconciliation_plan_classifies_every_relevant_commit_with_full_provenance() {
 }
 
 #[test]
+fn reconciliation_fixture_reopens_with_owned_host_state_and_worktrees() {
+    let fixture = DeployDivergenceFixture::new();
+    let broker = fixture_broker(&fixture.repo).unwrap();
+    let state = broker.storage_context().host_state_dir.clone().unwrap();
+    let expected_state = common::fixture_host_state_dir(&fixture.repo);
+    let repository = fixture.repo.canonicalize().unwrap();
+    assert_eq!(state, expected_state);
+    assert!(state.starts_with(repository.join(".git")));
+    let worktrees = broker.worktree_root().to_path_buf();
+    assert_eq!(
+        worktrees,
+        fixture
+            ._tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("worktrees")
+    );
+    assert!(!worktrees.starts_with(&repository));
+    let sessions = broker
+        .store()
+        .live_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.worktree_path)
+        .collect::<Vec<_>>();
+    assert!(!sessions.is_empty());
+    for path in &sessions {
+        assert!(Path::new(path).starts_with(&worktrees), "{path}");
+    }
+    drop(broker);
+    let reopened = fixture_broker(&fixture.repo).unwrap();
+    assert_eq!(
+        reopened.storage_context().host_state_dir.as_deref(),
+        Some(state.as_path())
+    );
+    assert_eq!(reopened.worktree_root(), worktrees.as_path());
+    assert_eq!(
+        reopened
+            .store()
+            .live_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| session.worktree_path)
+            .collect::<Vec<_>>(),
+        sessions
+    );
+}
+
+#[test]
 fn first_blocked_report_templates_mixed_recorded_and_unrecorded_resolutions() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
@@ -438,7 +491,7 @@ fn first_blocked_report_templates_mixed_recorded_and_unrecorded_resolutions() {
     );
     git(&repo, &["push", "-qu", "origin", "main"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = fixture_broker(&repo).unwrap();
     let session = broker
         .start_worktree("recorded local change", None)
         .unwrap();
@@ -639,7 +692,7 @@ fn reviewed_unrecorded_resolutions_are_commit_bound_and_never_blanket_discards()
         serde_json::to_vec_pretty(&resolution("preserve_and_replay", None)).unwrap(),
     )
     .unwrap();
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture_broker(&fixture.repo).unwrap();
     let preserved = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
@@ -757,7 +810,7 @@ fn confirmed_reconciliation_rebuilds_from_upstream_and_journals_the_reviewed_dig
     )
     .unwrap();
 
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture_broker(&fixture.repo).unwrap();
     let dry_run = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
@@ -868,7 +921,9 @@ fn confirmed_reconciliation_rebuilds_from_upstream_and_journals_the_reviewed_dig
 #[test]
 fn reviewed_unrecorded_work_is_replayed_in_integration_order() {
     let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path();
+    let repository = tmp.path().join("repo");
+    std::fs::create_dir(&repository).unwrap();
+    let repo = repository.as_path();
     git(repo, &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::create_dir_all(repo.join("docs")).unwrap();
@@ -877,7 +932,7 @@ fn reviewed_unrecorded_work_is_replayed_in_integration_order() {
     git(repo, &["add", "."]);
     git(repo, &["commit", "-qm", "initial"]);
 
-    let mut broker = Broker::open(repo).unwrap();
+    let mut broker = fixture_broker(repo).unwrap();
     let session = broker
         .start_worktree("pending functional work", None)
         .unwrap();
@@ -1007,7 +1062,7 @@ fn deploy_written_main_divergence_is_blocked_by_unrecorded_integration_work() {
         "deploy-written release notes are the genuine content divergence"
     );
 
-    let mut broker = Broker::open(&fixture.repo).unwrap();
+    let mut broker = fixture_broker(&fixture.repo).unwrap();
     let report = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
@@ -1065,7 +1120,7 @@ fn upstream_pulled_into_main_after_promotion() -> (tempfile::TempDir, PathBuf, S
     );
     git(&repo, &["push", "-qu", "origin", "main"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = fixture_broker(&repo).unwrap();
     let session = broker.start_worktree("promote feature", None).unwrap();
     commit(
         Path::new(&session.worktree_path),
@@ -1115,7 +1170,7 @@ fn reconcile_is_a_no_op_once_main_and_integration_contain_upstream() {
         &["update-ref", "refs/heads/aethyme/integration", &merged_main],
     );
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = fixture_broker(&repo).unwrap();
     for apply in [false, true] {
         let report = broker
             .reconcile_integration(IntegrationReconcileOptions {
@@ -1174,7 +1229,7 @@ fn reconcile_refuses_when_main_absorbed_upstream_but_integration_did_not() {
     );
     assert_ne!(old_integration, merged_main);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = fixture_broker(&repo).unwrap();
     let report = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
@@ -1220,7 +1275,7 @@ fn a_refusal_names_the_checked_out_branch_rather_than_local_main() {
         &["remote", "add", "origin", remote.to_str().unwrap()],
     );
     git(&repo, &["push", "-qu", "origin", "main"]);
-    drop(Broker::open(&repo).unwrap());
+    drop(fixture_broker(&repo).unwrap());
 
     // Upstream moves on; the primary checkout works on a feature branch.
     git(
@@ -1238,7 +1293,7 @@ fn a_refusal_names_the_checked_out_branch_rather_than_local_main() {
     git(&repo, &["switch", "-q", "-c", "feature/picker"]);
     let feature_head = commit(&repo, "c.txt", "c\n", "feature work");
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = fixture_broker(&repo).unwrap();
     let report = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
