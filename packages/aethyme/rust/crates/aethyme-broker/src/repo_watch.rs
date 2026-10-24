@@ -276,27 +276,51 @@ impl RepositoryWatchProvider for GithubCliRepositoryWatchProvider {
         repository: &str,
         limit: usize,
     ) -> Result<Vec<RepositoryPullRequest>, PullRequestWatchError> {
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--repo",
-                repository,
-                "--state",
-                "open",
-                "--limit",
-                &limit.to_string(),
-                "--json",
-                "number,title,author,url,headRefOid,isDraft",
-            ])
-            .output()?;
-        if !output.status.success() {
+        let mut command = Command::new("gh");
+        command.args([
+            "pr",
+            "list",
+            "--repo",
+            repository,
+            "--state",
+            "open",
+            "--limit",
+            &limit.to_string(),
+            "--json",
+            "number,title,author,url,headRefOid,isDraft",
+        ]);
+        inspect_repository_pr_list(
+            &mut command,
+            std::time::Duration::from_secs(3),
+            4 * 1024 * 1024,
+        )
+    }
+}
+
+fn inspect_repository_pr_list(
+    command: &mut Command,
+    deadline: std::time::Duration,
+    output_budget: usize,
+) -> Result<Vec<RepositoryPullRequest>, PullRequestWatchError> {
+    let output = match crate::bounded_output::output_limited(command, deadline, output_budget)? {
+        crate::bounded_output::LimitedOutput::Completed(output) => output,
+        crate::bounded_output::LimitedOutput::Deadline => {
             return Err(PullRequestWatchError::Provider(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                "repository PR observation exceeded its deadline".into(),
             ));
         }
-        parse_github_pr_list(&output.stdout)
+        crate::bounded_output::LimitedOutput::OutputLimit => {
+            return Err(PullRequestWatchError::Provider(
+                "repository PR observation exceeded its output budget".into(),
+            ));
+        }
+    };
+    if !output.status.success() {
+        return Err(PullRequestWatchError::Provider(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
     }
+    parse_github_pr_list(&output.stdout)
 }
 
 pub(crate) fn parse_github_pr_list(
@@ -1303,6 +1327,49 @@ fn repository_outbox_from_row(row: &rusqlite::Row<'_>) -> RowResult<RepositoryDe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_provider_rejects_valid_json_prefix_over_budget() {
+        let inspect = |script: &str| {
+            inspect_repository_pr_list(
+                Command::new("/bin/sh").args(["-c", script]),
+                std::time::Duration::from_secs(1),
+                2,
+            )
+        };
+        assert!(inspect("printf '[]'").unwrap().is_empty());
+        for script in ["printf '[] '", "printf '[]'; printf 'bad' >&2"] {
+            assert!(
+                matches!(inspect(script), Err(PullRequestWatchError::Provider(reason))
+                if reason.contains("output budget"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_provider_deadline_and_failed_status_are_not_empty_listings() {
+        let result = inspect_repository_pr_list(
+            Command::new("/bin/sh").args(["-c", "exec /bin/sleep 5"]),
+            std::time::Duration::from_millis(20),
+            1024,
+        );
+        assert!(
+            matches!(result, Err(PullRequestWatchError::Provider(reason))
+            if reason.contains("deadline"))
+        );
+        let result = inspect_repository_pr_list(
+            Command::new("/bin/sh")
+                .args(["-c", "printf '[]'; printf 'provider failed' >&2; exit 7"]),
+            std::time::Duration::from_secs(1),
+            1024,
+        );
+        assert!(
+            matches!(result, Err(PullRequestWatchError::Provider(reason))
+            if reason == "provider failed")
+        );
+    }
 
     fn watch(kinds: &[RepositoryEventKind], drafts: bool, excluded: &[&str]) -> RepositoryWatch {
         RepositoryWatch {
