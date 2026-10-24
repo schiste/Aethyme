@@ -290,11 +290,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   root: inventory that root itself, not its children as keyed repositories.
   Test direct-root and keyed-container layouts, preserving existing keyed
   confirmation digests.
-- When building a filesystem inventory, treat an error yielded for any
-  directory entry as an incomplete inventory. Do not silently discard iterator
-  errors while reporting the result as complete; keep partial findings useful
-  for diagnosis, but do not use them as complete evidence for downstream
-  decisions.
+- When building a filesystem inventory, treat directory-iteration, metadata,
+  and required-measurement errors as incomplete. Do not silently skip unknown
+  entries or substitute zero for a failed measurement; keep partial findings
+  useful for diagnosis, but do not use them as complete evidence downstream.
 - Keep authoritative frozen plans, validation helpers, inputs and receipts on
   durable storage before execution; use temporary directories for scratch only.
   Before a long validation, choose a unique durable output directory outside
