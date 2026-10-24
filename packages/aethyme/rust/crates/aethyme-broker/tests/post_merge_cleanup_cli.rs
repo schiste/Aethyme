@@ -137,6 +137,17 @@ fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
     git(&repo, &["config", "branch.main.remote", "origin"]);
     git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
 
+    let remote = temp.path().join("origin.git");
+    git(&repo, &["clone", "--bare", "-q", ".", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", remote.display()),
+            "https://github.com/acme/product.git",
+        ],
+    );
+
     let mut broker = common::open_fixture_broker(&repo, temp.path()).unwrap();
     let session = broker
         .start_worktree("land through pull request", None)

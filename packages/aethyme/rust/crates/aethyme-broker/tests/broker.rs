@@ -1332,6 +1332,7 @@ fn finish_retention_policy_keeps_safe_worktrees_when_disabled_or_invalid() {
 fn a_squash_merged_session_can_be_recorded_and_finished() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
+    sh(tmp.path(), &["remote", "add", "origin", "."]);
     sh(
         tmp.path(),
         &["update-ref", "refs/remotes/origin/main", "HEAD"],

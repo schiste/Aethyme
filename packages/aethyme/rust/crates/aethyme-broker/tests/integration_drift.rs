@@ -293,6 +293,11 @@ fn verify_only_doctor_reports_leftover_integration_work() {
     // missing history must continue to report incomplete health in production.
     let fixture_upstream = git(root, &["rev-parse", "refs/remotes/origin/main"]);
     let fixture_integration = git(root, &["rev-parse", "refs/heads/aethyme/integration"]);
+    let remote_owner = tempfile::tempdir().unwrap();
+    let remote = remote_owner.path().join("origin.git");
+    git(root, &["clone", "--bare", "-q", ".", remote.to_str().unwrap()]);
+    git(&remote, &["update-ref", "refs/heads/main", &fixture_upstream]);
+    git(root, &["remote", "set-url", "origin", remote.to_str().unwrap()]);
     git(
         root,
         &[
@@ -316,9 +321,8 @@ fn verify_only_doctor_reports_leftover_integration_work() {
     assert!(finished.cleanup.worktree_removed, "{finished:?}");
     assert!(finished.cleanup.branch_removed, "{finished:?}");
     assert!(!std::path::Path::new(&seed.worktree_path).exists());
-    // The offline remote is this repository itself: lifecycle refresh may
-    // replace the manually staged tracking ref. Restore scenario inputs before
-    // constructing the leftover commits and taking the read-only snapshots.
+    // Restore the scenario's integration tip after lifecycle initialization,
+    // before constructing leftover commits and taking read-only snapshots.
     git(
         root,
         &["update-ref", "refs/remotes/origin/main", &fixture_upstream],
