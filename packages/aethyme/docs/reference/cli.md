@@ -409,6 +409,18 @@ root = "/Volumes/T7/aethyme-worktrees"
 # min_free_bytes = 8589934592   # default: the 8 GiB a gate needs to start
 ```
 
+New checkout allocation is limited to 32 registered linked worktrees per
+repository by default, across all placement roots. The primary checkout is
+excluded; prunable registrations and manually created linked worktrees count.
+Set `[worktrees].max_checkouts` to change the limit, or explicitly set it to
+zero to disable it. At the limit, reuse remains available and existing
+checkouts are preserved. Run `broker gc plan` to inspect cleanup candidates.
+The count guard runs under the lifecycle claim before root preparation and
+allocation, using one strict Git inventory without walking worktree contents.
+It complements the free-space floor; it is not a byte quota on active commands
+or a bound on unregistered directories.
+
+
 It is read like `[promote]`: from the copy committed on the fetched default
 branch, else the main checkout's working-tree file. `AETHYME_WORKTREE_ROOT` and
 the library override still take precedence, with their existing fail-closed
