@@ -35,6 +35,20 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   fi
   exit 0
 fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if [ -f "${state}.fail-watch" ]; then
+    printf 'synthetic observation failure\n' >&2
+    exit 1
+  fi
+  if [ -f "${state}.slow-watch" ]; then
+    exec sleep 10
+  fi
+  branch=$(sed -n '1p' "$state")
+  draft=$(sed -n '2p' "$state")
+  sha=$(git rev-parse "refs/heads/$branch") || exit 65
+  printf '{"number":7,"url":"https://github.com/acme/project/pull/7","state":"OPEN","baseRefName":"main","headRefName":"%s","headRefOid":"%s","isDraft":%s,"comments":[],"reviews":[],"statusCheckRollup":[]}\n' "$branch" "$sha" "$draft"
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   shift 2
   branch=
@@ -563,6 +577,7 @@ fn malformed_pr_policy_refuses_before_pushing_the_session_branch() {
         "broker = false\n[delivery]\npush_session_branches = true\n",
         "[delivery]\npush_session_branches = true\n[broker.pr]\nother = true\n",
         "[delivery]\npush_session_branches = true\n[broker.pr]\nopen_as = true\n",
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nwatch_on_start = \"true\"\n",
     ] {
         let fixture = Fixture::new();
         fixture.set_config_raw(config);
@@ -842,3 +857,123 @@ fn opted_in_pre_push_refusals_show_hook_stderr_and_path_guidance_on_both_pushes(
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[test]
+fn trusted_pr_watch_is_automatic_idempotent_and_preserves_pause() {
+    let fixture = Fixture::new();
+    fixture.set_config_raw(
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nwatch_on_start = true\n",
+    );
+    let (session, worktree) = fixture.session_with_commit();
+    // Session edits cannot disable the committed repository default.
+    std::fs::write(
+        worktree.join(".aethyme/config.toml"),
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nwatch_on_start = false\n",
+    )
+    .unwrap();
+    let first = json(&fixture.push(session, &["--pr"]));
+    let id = first["pr_watch_id"].as_i64().expect("automatic watch");
+    let mut broker = fixture.broker();
+    let watch = broker.pull_request_watch(id).unwrap();
+    assert_eq!(watch.session_id, session);
+    assert_eq!(watch.pr_number, 7);
+    assert_eq!(watch.head_sha, first["pushed_oid"].as_str().unwrap());
+    let digest = watch.cursor_digest.clone();
+    broker
+        .set_pull_request_watch_status(id, aethyme_broker::PullRequestWatchStatus::Paused, 1_000)
+        .unwrap();
+    drop(broker);
+
+    let second = json(&fixture.push(session, &["--pr"]));
+    assert_eq!(second["pr_watch_id"], id);
+    let broker = fixture.broker();
+    let watch = broker.pull_request_watch(id).unwrap();
+    assert_eq!(watch.status, aethyme_broker::PullRequestWatchStatus::Paused);
+    assert_eq!(watch.cursor_digest, digest);
+    assert_eq!(broker.pull_request_watches(true).unwrap().len(), 1);
+    assert_eq!(
+        fixture.gh_log().matches("pr view").count(),
+        1,
+        "repeated pushes must not inspect the provider or reset the watch"
+    );
+}
+
+#[test]
+fn session_policy_cannot_enable_automatic_pr_watch() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    std::fs::write(
+        worktree.join(".aethyme/config.toml"),
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nwatch_on_start = true\n",
+    )
+    .unwrap();
+    let report = json(&fixture.push(session, &["--pr"]));
+    assert!(report.get("pr_watch_id").is_none());
+    assert!(report.get("pr_watch_note").is_none());
+    assert!(
+        fixture
+            .broker()
+            .pull_request_watches(true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!fixture.gh_log().contains("pr view"));
+}
+
+#[test]
+fn watch_observation_failure_preserves_successful_push_and_allows_retry() {
+    let fixture = Fixture::new();
+    fixture.set_config_raw(
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nwatch_on_start = true\n",
+    );
+    let (session, _) = fixture.session_with_commit();
+    let failure = fixture.storage.owner_path().join("pr-state.fail-watch");
+    std::fs::write(&failure, "").unwrap();
+    let first = json(&fixture.push(session, &["--pr"]));
+    assert!(
+        first["pr_watch_note"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic observation failure")
+    );
+    assert_eq!(
+        fixture.remote_branch(first["branch"].as_str().unwrap()),
+        Some(first["pushed_oid"].as_str().unwrap().to_string())
+    );
+    assert!(
+        fixture
+            .broker()
+            .pull_request_watches(true)
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::remove_file(failure).unwrap();
+    let second = json(&fixture.push(session, &["--pr"]));
+    assert!(second["pr_watch_id"].is_i64());
+    assert!(second.get("pr_watch_note").is_none());
+}
+
+#[test]
+fn automatic_pr_watch_observation_has_a_finite_deadline() {
+    let fixture = Fixture::new();
+    fixture.set_config_raw(
+        "[delivery]\npush_session_branches = true\n[broker.pr]\nwatch_on_start = true\n",
+    );
+    let (session, _) = fixture.session_with_commit();
+    std::fs::write(fixture.storage.owner_path().join("pr-state.slow-watch"), "").unwrap();
+    let report = json(&fixture.push(session, &["--pr"]));
+    assert!(
+        report["pr_watch_note"]
+            .as_str()
+            .unwrap()
+            .contains("three-second deadline")
+    );
+    assert!(
+        fixture
+            .broker()
+            .pull_request_watches(true)
+            .unwrap()
+            .is_empty()
+    );
+}

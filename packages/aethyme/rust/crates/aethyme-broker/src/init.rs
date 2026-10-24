@@ -801,7 +801,7 @@ fn unknown_config_keys(value: &toml::Value) -> Vec<String> {
                         continue;
                     };
                     for leaf in pr.keys() {
-                        if leaf != "open_as" {
+                        if !matches!(leaf.as_str(), "open_as" | "watch_on_start") {
                             unknown.push(format!("broker.pr.{leaf}"));
                         }
                     }
@@ -1204,6 +1204,7 @@ mode = \"auto\"
 # branch; changing it never edits an existing pull request.
 # [broker.pr]
 # open_as = \"draft\" # default; use \"ready\" to open new PRs ready for review
+# watch_on_start = false # opt-in: associate a watch when push --pr confirms the PR
 
 # Where session worktrees are created. The default is the per-user host-state
 # directory. A root set here supersedes it only while it already exists (it is
@@ -1825,6 +1826,7 @@ mod config_key_tests {
     #[test]
     fn broker_pr_open_as_is_a_known_nested_key() {
         assert!(unknown("[broker.pr]\nopen_as = \"ready\"\n").is_empty());
+        assert!(unknown("[broker.pr]\nwatch_on_start = true\n").is_empty());
         assert_eq!(unknown("[broker.pr]\nopen = true\n"), ["broker.pr.open"]);
         assert_eq!(
             unknown("[broker]\nopen_as = \"ready\"\n"),
