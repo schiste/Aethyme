@@ -5,6 +5,40 @@ use super::*;
 /// Default number of items any one plan list prints before summarising.
 pub(super) const GC_LIST_CAP: usize = 5;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ReclaimAction {
+    Plan,
+    Apply { confirm: String },
+}
+
+/// Validate the complete reclaim selector before the CLI opens broker state.
+/// The no-action form remains an alias for `plan` for compatibility.
+pub(super) fn parse_reclaim_action(parsed: &Parsed) -> Result<ReclaimAction, UsageError> {
+    match parsed.positional.as_slice() {
+        [] => Ok(ReclaimAction::Plan),
+        [action] if action.as_str() == "plan" => Ok(ReclaimAction::Plan),
+        [action] if action.as_str() == "apply" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message("reclaim apply requires --confirm <sha256>".into())
+            })?;
+            if !crate::reclaim::is_reclaim_plan_digest(confirm) {
+                return Err(UsageError::Message(
+                    "reclaim apply --confirm must be a 64-character hexadecimal SHA-256".into(),
+                ));
+            }
+            Ok(ReclaimAction::Apply {
+                confirm: confirm.to_string(),
+            })
+        }
+        [action] => Err(UsageError::Message(format!(
+            "unknown reclaim action {action:?}; expected plan or apply"
+        ))),
+        _ => Err(UsageError::Message(
+            "reclaim accepts exactly one action: `plan` or `apply --confirm <sha256>`".into(),
+        )),
+    }
+}
+
 pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
     out!(
         "Host storage plan {}: {} root(s), {} on-disk directory entries, {} host candidate(s), {} reclaimable; {} enrolled primary checkout(s), {} artifact(s), {} artifact candidate(s), {} reclaimable",
@@ -595,23 +629,14 @@ pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
     }
 }
 
-pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
-    let action = parsed
-        .positional
-        .first()
-        .map(String::as_str)
-        .unwrap_or("plan");
+pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), UsageError> {
     let mut broker = open_broker(true)?;
+    let root = broker.require_bound_repository_worktree_root("worktree cache reclamation")?;
     let retention_policy = crate::load_retention_policy(broker.main_root())?;
     // This repository's own worktree directory, not the shared container:
     // reclaiming another repository's build output from here would be a
     // surprise, and that repository's broker knows which of its sessions are
     // live while this one does not.
-    let Some(root) = broker.worktree_root_plan()?.preferred_root else {
-        return Err(UsageError::Message(
-            "this repository has no broker worktree root to reclaim from".into(),
-        ));
-    };
     // Only sessions actually working are protected. An idle or stale session
     // may be one that simply cannot be closed, and those are precisely the
     // worktrees whose build output accumulates.
@@ -663,7 +688,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     };
     // An apply credits what each removal freed and never shows the planned
     // sizes, so it skips measuring every file under every candidate.
-    let sizing = if action == "apply" {
+    let sizing = if matches!(&action, ReclaimAction::Apply { .. }) {
         crate::reclaim::Sizing::Skip
     } else {
         crate::reclaim::Sizing::Measure
@@ -731,7 +756,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     };
     let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     match action {
-        "plan" => {
+        ReclaimAction::Plan => {
             if let Err(error) = crate::reclaim::save_snapshot(
                 &root,
                 scope.as_deref(),
@@ -774,10 +799,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                 }
             }
         }
-        "apply" => {
-            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
-                UsageError::Message("reclaim apply requires --confirm <sha256>".into())
-            })?;
+        ReclaimAction::Apply { confirm } => {
             // The confirmation authorizes what was reviewed. When the fresh
             // scan decides exactly the same, apply it as is. Otherwise the
             // verified saved review names the authorized paths, and each is
@@ -788,7 +810,7 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
             let plan = if confirm == plan.digest {
                 plan
             } else {
-                match crate::reclaim::load_snapshot(&root, confirm) {
+                match crate::reclaim::load_snapshot(&root, &confirm) {
                     // A review covers what it scanned: a one-session review
                     // says nothing about the other worktrees, and a
                     // whole-root review was not made about one session.
@@ -835,6 +857,13 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                     }
                 }
             };
+            let apply_root = broker
+                .require_bound_repository_worktree_root("worktree cache reclamation apply")?;
+            if apply_root != root {
+                return Err(UsageError::Message(
+                    "the bound worktree root changed while preparing this reclaim; re-run the plan and review it again".into(),
+                ));
+            }
             let mut outcome = crate::apply_reclaim(&plan);
             withdrawn.append(&mut outcome.skipped);
             outcome.skipped = withdrawn;
@@ -862,11 +891,6 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                     );
                 }
             }
-        }
-        other => {
-            return Err(UsageError::Message(format!(
-                "unknown reclaim action {other:?}; expected plan or apply"
-            )));
         }
     }
     Ok(())

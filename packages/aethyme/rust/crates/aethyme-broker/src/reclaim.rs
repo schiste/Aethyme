@@ -191,7 +191,7 @@ pub struct ReviewedPlan {
 }
 
 fn snapshot_path(root: &Path, digest: &str) -> io::Result<PathBuf> {
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_reclaim_plan_digest(digest) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "reclaim plan digest must be a 64-character hexadecimal SHA-256",
@@ -200,6 +200,13 @@ fn snapshot_path(root: &Path, digest: &str) -> io::Result<PathBuf> {
     Ok(root.join(format!(
         "{RECLAIM_PLAN_FILENAME_PREFIX}{digest}{RECLAIM_PLAN_FILENAME_SUFFIX}"
     )))
+}
+
+/// Whether a reclaim confirmation has the exact digest syntax used by plan
+/// snapshots. Keep this pure so CLI refusals can happen before opening broker
+/// state or scanning a worktree root.
+pub(crate) fn is_reclaim_plan_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn ensure_regular_snapshot(path: &Path) -> io::Result<()> {
@@ -393,6 +400,14 @@ mod tests {
 
     fn p(value: &str) -> PathBuf {
         PathBuf::from(value)
+    }
+
+    #[test]
+    fn reclaim_plan_digest_syntax_is_shared_with_snapshot_paths() {
+        assert!(is_reclaim_plan_digest(&"a".repeat(64)));
+        assert!(is_reclaim_plan_digest(&"F".repeat(64)));
+        assert!(!is_reclaim_plan_digest(&"a".repeat(63)));
+        assert!(!is_reclaim_plan_digest(&format!("{}x", "a".repeat(63))));
     }
 
     #[test]
