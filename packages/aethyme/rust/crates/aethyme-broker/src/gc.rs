@@ -3798,7 +3798,6 @@ impl Broker {
             .iter()
             .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
-        let grace_ms = i64::from(policy.closed_worktree_grace_hours).saturating_mul(3_600_000);
         let mut worktrees = Vec::new();
         for item in cleanup.worktrees.iter().cloned() {
             let Some(session) = sessions.get(&item.session_id) else {
@@ -3831,9 +3830,7 @@ impl Broker {
             // before second-guessing it. Explicit `finish cleanup` does not.
             if item.eligible()
                 && item.worktree_present
-                && session.cleanup_state == crate::SessionCleanupState::Closed
-                && session.cleanup_completed_at.is_none()
-                && evaluated_at.saturating_sub(closed_at) < grace_ms
+                && policy.closed_worktree_in_grace(session, evaluated_at)
             {
                 let blocker = GcBlocker {
                     kind: "closed_worktree_grace".into(),
