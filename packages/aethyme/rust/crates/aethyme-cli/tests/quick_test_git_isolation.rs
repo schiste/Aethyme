@@ -14,6 +14,8 @@ use serde_json::Value;
 const MAX_CHILD_OUTPUT_BYTES: u64 = 1024 * 1024;
 const MAX_SENTINEL_ENTRIES: usize = 500;
 const MAX_SENTINEL_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CHANGED_SNAPSHOT_PATHS: usize = 24;
+const MAX_CHANGED_SNAPSHOT_PATH_CHARS: usize = 120;
 
 #[derive(Debug, PartialEq, Eq)]
 struct SnapshotEntry {
@@ -101,6 +103,105 @@ fn snapshot(root: &Path) -> Vec<SnapshotEntry> {
     visit(root, root, &mut entries);
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
+}
+
+fn changed_snapshot_paths(before: &[SnapshotEntry], after: &[SnapshotEntry]) -> Vec<String> {
+    fn display_path(path: &Path) -> String {
+        let display = path.display().to_string();
+        if display.chars().count() > MAX_CHANGED_SNAPSHOT_PATH_CHARS {
+            format!(
+                "{}…",
+                display
+                    .chars()
+                    .take(MAX_CHANGED_SNAPSHOT_PATH_CHARS - 1)
+                    .collect::<String>()
+            )
+        } else {
+            display
+        }
+    }
+
+    fn describe(entry: &SnapshotEntry) -> String {
+        format!(
+            "kind={} mode={:04o} length={}",
+            char::from(entry.kind),
+            entry.mode,
+            entry.bytes.len()
+        )
+    }
+
+    fn record_change(paths: &mut Vec<String>, total: &mut usize, description: String) {
+        *total += 1;
+        if paths.len() < MAX_CHANGED_SNAPSHOT_PATHS {
+            paths.push(description);
+        }
+    }
+
+    let mut paths = Vec::new();
+    let mut total = 0;
+    let (mut before_index, mut after_index) = (0, 0);
+    while before_index < before.len() && after_index < after.len() {
+        match before[before_index].path.cmp(&after[after_index].path) {
+            std::cmp::Ordering::Less => {
+                record_change(
+                    &mut paths,
+                    &mut total,
+                    format!(
+                        "removed {} ({})",
+                        display_path(&before[before_index].path),
+                        describe(&before[before_index])
+                    ),
+                );
+                before_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                record_change(
+                    &mut paths,
+                    &mut total,
+                    format!(
+                        "added {} ({})",
+                        display_path(&after[after_index].path),
+                        describe(&after[after_index])
+                    ),
+                );
+                after_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if before[before_index] != after[after_index] {
+                    record_change(
+                        &mut paths,
+                        &mut total,
+                        format!(
+                            "modified {} ({} -> {})",
+                            display_path(&before[before_index].path),
+                            describe(&before[before_index]),
+                            describe(&after[after_index])
+                        ),
+                    );
+                }
+                before_index += 1;
+                after_index += 1;
+            }
+        }
+    }
+    for entry in &before[before_index..] {
+        record_change(
+            &mut paths,
+            &mut total,
+            format!("removed {} ({})", display_path(&entry.path), describe(entry)),
+        );
+    }
+    for entry in &after[after_index..] {
+        record_change(
+            &mut paths,
+            &mut total,
+            format!("added {} ({})", display_path(&entry.path), describe(entry)),
+        );
+    }
+    if total > paths.len() {
+        paths.push(format!("... {} additional changed paths", total - paths.len()));
+    }
+    paths
 }
 
 fn child_output_size(path: &Path) -> u64 {
@@ -307,9 +408,11 @@ fn quick_test_cli_keeps_host_git_context_out_of_its_disposable_repository() {
         parent_git_environment == git_environment_snapshot(),
         "quick-test CLI changed the parent process Git environment"
     );
+    let after = snapshot(&sentinel);
     assert!(
-        before == snapshot(&sentinel),
-        "quick-test CLI changed the unrelated sentinel repository"
+        before == after,
+        "quick-test CLI changed the unrelated sentinel repository; changed paths: {:?}",
+        changed_snapshot_paths(&before, &after)
     );
     assert!(
         !hook_marker.exists(),
