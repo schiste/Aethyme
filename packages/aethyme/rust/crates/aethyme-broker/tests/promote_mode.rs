@@ -284,3 +284,166 @@ fn the_flag_suppresses_promotion_for_one_run_without_changing_policy() {
     let next = commit_work(&mut broker, "next-run");
     assert!(broker.submit(next).unwrap().promoted);
 }
+
+#[test]
+fn configuration_reads_skip_rediscovery_and_recheck_the_current_default_ref() {
+    const PROBE_ROOT: &str = "AETHYME_CONFIG_READ_PROBE_ROOT";
+    const NEXT_COMMIT: &str = "AETHYME_CONFIG_READ_NEXT_COMMIT";
+    const TEST: &str = "configuration_reads_skip_rediscovery_and_recheck_the_current_default_ref";
+    fn isolated_git(root: &Path, home: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        let output = command
+            .args(args)
+            .current_dir(root)
+            .env("HOME", home)
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Config read fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Config read fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+    if let Some(root) = std::env::var_os(PROBE_ROOT) {
+        let root = std::path::PathBuf::from(root);
+        let home = root.parent().unwrap().join("home");
+        assert!(matches!(
+            aethyme_broker::PromoteConfig::load(&root).mode,
+            aethyme_broker::PromoteMode::Manual
+        ));
+        let next = std::env::var(NEXT_COMMIT).unwrap();
+        isolated_git(
+            &root,
+            &home,
+            &["update-ref", "refs/remotes/origin/main", &next],
+        );
+        assert!(matches!(
+            aethyme_broker::PromoteConfig::load(&root).mode,
+            aethyme_broker::PromoteMode::VerifyOnly
+        ));
+        // Dirty local configuration cannot override the newly selected
+        // committed default policy. No cached text or ref is authority.
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[promote]\nmode = \"auto\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            aethyme_broker::PromoteConfig::load(&root).mode,
+            aethyme_broker::PromoteMode::VerifyOnly
+        ));
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("repo");
+    let home = fixture.path().join("home");
+    std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    isolated_git(&root, &home, &["init", "-q", "-b", "main"]);
+    let config = root.join(".aethyme/config.toml");
+    std::fs::write(&config, "[promote]\nmode = \"manual\"\n").unwrap();
+    isolated_git(&root, &home, &["add", ".aethyme/config.toml"]);
+    isolated_git(
+        &root,
+        &home,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "manual policy",
+        ],
+    );
+    let first = isolated_git(&root, &home, &["rev-parse", "HEAD"]);
+    std::fs::write(&config, "[promote]\nmode = \"verify-only\"\n").unwrap();
+    isolated_git(&root, &home, &["add", ".aethyme/config.toml"]);
+    isolated_git(
+        &root,
+        &home,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "verify policy",
+        ],
+    );
+    let next = isolated_git(&root, &home, &["rev-parse", "HEAD"]);
+    isolated_git(
+        &root,
+        &home,
+        &["update-ref", "refs/remotes/origin/main", &first],
+    );
+    isolated_git(
+        &root,
+        &home,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let trace = fixture.path().join("config-read-trace.jsonl");
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            child.env_remove(key);
+        }
+    }
+    let output = child
+        .args(["--exact", TEST, "--nocapture"])
+        .env(PROBE_ROOT, &root)
+        .env(NEXT_COMMIT, next)
+        .env("HOME", &home)
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = std::fs::read_to_string(trace).unwrap();
+    let starts: Vec<serde_json::Value> = events
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "start")
+        .collect();
+    let shows = starts
+        .iter()
+        .filter(|event| event["argv"][1] == "show")
+        .count();
+    assert_eq!(
+        shows, 3,
+        "positive witness: all three policy loads must read committed content"
+    );
+    let discovery = starts
+        .iter()
+        .filter(|event| event["argv"][1] == "rev-parse" && event["argv"][2] == "--show-toplevel")
+        .count();
+    assert_eq!(
+        discovery, 0,
+        "known-root policy reads must not rediscover the checkout"
+    );
+}
