@@ -16,6 +16,16 @@ const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
 const ARTIFACT_SWEEP_NAMESPACE_V2_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v2\0";
 const ARTIFACT_SWEEP_NAMESPACE_V4_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v4\0";
 
+struct CreatedSessionWorktree {
+    slug: String,
+    branch: String,
+    start_base: SessionStartBase,
+    worktree: GitRepo,
+    worktree_placement: WorktreePlacement,
+    selected_promote_branch: String,
+    _lifecycle_claim: crate::file_lock::ExclusiveFileLock,
+}
+
 #[derive(Clone)]
 struct ReusePrefetchedDefaultBranch {
     session_id: i64,
@@ -5770,7 +5780,7 @@ impl Broker {
         Ok(report)
     }
 
-    pub(super) fn adopt_with_options_and_context_unrefreshed(
+    fn adopt_with_options_and_context_unrefreshed(
         &mut self,
         worktree: &Path,
         task: Option<&str>,
@@ -7023,15 +7033,15 @@ impl Broker {
     ) -> Result<StartReport, BrokerOpError> {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
-        let (
-            _slug,
+        let CreatedSessionWorktree {
+            slug: _,
             branch,
             start_base,
             worktree,
             worktree_placement,
             selected_promote_branch,
             _lifecycle_claim,
-        ) = self.create_session_worktree(task, explicit_base, &planned_paths)?;
+        } = self.create_session_worktree(task, explicit_base, &planned_paths)?;
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
             &start_base,
@@ -7154,7 +7164,7 @@ impl Broker {
                 source,
             })?;
         let context = self.session_context(context);
-        let (
+        let CreatedSessionWorktree {
             slug,
             branch,
             start_base,
@@ -7162,7 +7172,7 @@ impl Broker {
             worktree_placement,
             selected_promote_branch,
             _lifecycle_claim,
-        ) = self.create_session_worktree(task, explicit_base, &[])?;
+        } = self.create_session_worktree(task, explicit_base, &[])?;
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
             &start_base,
@@ -7363,23 +7373,12 @@ impl Broker {
         })
     }
 
-    pub(super) fn create_session_worktree(
+    fn create_session_worktree(
         &mut self,
         task: &str,
         explicit_base: Option<&str>,
         planned_paths: &[String],
-    ) -> Result<
-        (
-            String,
-            String,
-            SessionStartBase,
-            GitRepo,
-            WorktreePlacement,
-            String,
-            crate::file_lock::ExclusiveFileLock,
-        ),
-        BrokerOpError,
-    > {
+    ) -> Result<CreatedSessionWorktree, BrokerOpError> {
         let refresh = self.refresh_default_branch_before_start();
         // Verify-only sessions start from the fetched default branch either
         // way; advancing a disposable integration here keeps it from feeding
@@ -7431,15 +7430,15 @@ impl Broker {
                 self.repo.worktree_lock(&worktree_path),
             );
         }
-        Ok((
+        Ok(CreatedSessionWorktree {
             slug,
             branch,
             start_base,
             worktree,
-            placement,
-            selected_promote.branch,
-            lifecycle_claim,
-        ))
+            worktree_placement: placement,
+            selected_promote_branch: selected_promote.branch,
+            _lifecycle_claim: lifecycle_claim,
+        })
     }
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
@@ -9602,7 +9601,7 @@ impl Broker {
 
     /// A `status` row when a promoting integration branch no longer contains
     /// the fetched default branch's tip. New sessions start from upstream in
-    /// that state (see [`Self::select_session_start_base`]), but promotion and
+    /// that state (see [`Self::select_session_start_base_with_promote`]), but promotion and
     /// submit still target integration, so it needs reconciling. Silent in
     /// verify-only repositories, where integration is not used as a base.
     pub(super) fn integration_behind_upstream_advice(&self) -> Option<StatusAdvice> {
@@ -9670,14 +9669,6 @@ impl Broker {
     /// fetches: `create_session_worktree` refreshes the default branch just
     /// before calling it (see `Broker::refresh_default_branch_before_start`),
     /// so the fetched tip it reads is current unless that refresh failed.
-    pub(super) fn select_session_start_base(
-        &self,
-        explicit: Option<&str>,
-    ) -> Result<SessionStartBase, BrokerOpError> {
-        let promote = crate::merge::PromoteConfig::load(&self.main_root);
-        self.select_session_start_base_with_promote(explicit, &promote)
-    }
-
     fn select_session_start_base_with_promote(
         &self,
         explicit: Option<&str>,

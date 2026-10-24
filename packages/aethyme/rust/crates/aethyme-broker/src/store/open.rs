@@ -435,24 +435,6 @@ impl BrokerStore {
     /// worktree identity witness in the same transaction as the session row.
     /// `None` is valid on unsupported platforms and deliberately leaves the
     /// session ineligible for automatic checkout removal.
-    pub(crate) fn register_spawned_session_with_context_and_leases(
-        &mut self,
-        verify_only: bool,
-        new: &NewSession,
-        context: &SessionContext,
-        planned_paths: &[String],
-        witness: Option<&crate::events::SpawnedWorktreeInstanceWitness>,
-    ) -> Result<Session, BrokerError> {
-        self.register_spawned_session_with_context_and_leases_and_base_observation(
-            verify_only,
-            new,
-            context,
-            planned_paths,
-            witness,
-            None,
-        )
-    }
-
     pub(crate) fn register_spawned_session_with_context_and_leases_and_base_observation(
         &mut self,
         verify_only: bool,
