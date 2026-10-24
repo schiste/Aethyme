@@ -62,15 +62,15 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
         .collect::<Vec<_>>();
     assert_eq!(
         rust_conditions.len(),
-        9,
-        "the Rust job has one PR guard, six full-suite guards, one shared parity guard and one performance validation guard"
+        10,
+        "the Rust job has one PR guard, seven full-suite guards, one shared parity guard and one performance validation guard"
     );
     assert_eq!(
         rust_conditions
             .iter()
             .filter(|line| **line == "if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}")
             .count(),
-        6,
+        7,
         "all expensive Rust steps must run when classification fails or selects the full suite"
     );
     assert_eq!(
