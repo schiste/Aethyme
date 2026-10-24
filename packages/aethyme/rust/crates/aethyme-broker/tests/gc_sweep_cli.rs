@@ -346,9 +346,168 @@ fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn legacy_unbound_retained_worktree_fixture(
+    repo: &Path,
+    container: &Path,
+) -> (PathBuf, i64) {
+    let worktree = container.join("legacy-retained");
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "legacy-retained-session",
+            &worktree_arg,
+            "HEAD",
+        ],
+    );
+
+    let database = repo.join(".aethyme/broker.db");
+    let existing = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        existing
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "the disposable bootstrap database must not contain session records"
+    );
+    assert_eq!(
+        existing
+            .query_row(
+                "SELECT COUNT(*) FROM repository_worktree_binding",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "the disposable bootstrap database must not contain root authority"
+    );
+    drop(existing);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", database.display()));
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar).unwrap();
+        }
+    }
+    std::fs::remove_file(&database).unwrap();
+    let repository_uuid_marker = repo.join(".git/aethyme-repository-uuid");
+    if repository_uuid_marker.exists() {
+        std::fs::remove_file(repository_uuid_marker).unwrap();
+    }
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/v028-schema52.sql"))
+        .unwrap();
+    let head = git_output(repo, &["rev-parse", "HEAD"]);
+    assert!(
+        head.status.success(),
+        "read fixture HEAD: {}",
+        String::from_utf8_lossy(&head.stderr)
+    );
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    let worktree_path = worktree.canonicalize().unwrap();
+    let worktree_path_text = worktree_path.to_string_lossy().into_owned();
+    let now = epoch_ms();
+    connection
+        .execute(
+            "INSERT INTO sessions (
+                 worktree_path, branch, origin, status, task, diff_base,
+                 adoption_base, adopted_head, repository_schema,
+                 deployment_state_digest, aethyme_version, gate_definition_digest,
+                 repository_contract_backfilled, pid, command, log_path, exit_code,
+                 agent_identity, repository_name, tab_name, ai_provider, short_name,
+                 created_at, updated_at, last_activity_at
+             ) VALUES (
+                 ?1, 'legacy-retained-session', 'spawned', 'exited',
+                 'legacy retained session', ?2, ?2, ?2, NULL,
+                 'a332ca058fadabb85cc900a167a99df743dd0aa2db949edee7ad064a3ada8343',
+                 '0.8.28', NULL, 0, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL,
+                 'legacy retained fixture', ?3, ?3, ?3
+             )",
+            rusqlite::params![worktree_path_text, head, now],
+        )
+        .unwrap();
+    let session_id = connection.last_insert_rowid();
+    let registered_payload = serde_json::json!({
+        "origin": "spawned",
+        "branch": "legacy-retained-session",
+        "worktree_path": worktree_path,
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO events (schema_version, ts, kind, session_id, payload_json)
+             VALUES (1, ?1, 'session.registered', ?2, ?3)",
+            rusqlite::params![now, session_id, registered_payload],
+        )
+        .unwrap();
+    drop(connection);
+
+    (worktree, session_id)
+}
+
+fn legacy_session_row(
+    repo: &Path,
+    session_id: i64,
+) -> (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<i64>,
+    i64,
+    i64,
+) {
+    let connection = rusqlite::Connection::open_with_flags(
+        repo.join(".aethyme/broker.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    connection
+        .query_row(
+            "SELECT worktree_path, branch, task, diff_base, adoption_base, adopted_head,
+                    status, exit_code, updated_at, last_activity_at
+             FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
 #[test]
 fn reclaim_plan_warns_but_prints_when_snapshot_storage_is_unavailable() {
     let (repo, container) = fixture("");
+    let started = run(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "bind reclaim test root", "--json"],
+    );
+    assert!(
+        started.status.success(),
+        "start: stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
     let root_output = run(
         repo.path(),
         container.path(),
@@ -384,6 +543,94 @@ fn reclaim_plan_warns_but_prints_when_snapshot_storage_is_unavailable() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn reclaim_refuses_legacy_unbound_root_before_planning_or_apply() {
+    let (repo, container) = fixture(
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+    );
+    let (worktree, session_id) =
+        legacy_unbound_retained_worktree_fixture(repo.path(), container.path());
+    let target = worktree.join("rust/target");
+    std::fs::create_dir_all(&target).unwrap();
+    let artifact = target.join("legacy-cache.bin");
+    std::fs::write(&artifact, b"retained legacy worktree cache\n").unwrap();
+    age_worktree_indexes(repo.path());
+
+    let root_marker = container.path().join(".aethyme-worktree-root.json");
+    assert!(!root_marker.exists(), "the legacy root is not durably bound");
+    let has_reclaim_snapshot = || {
+        std::fs::read_dir(container.path())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aethyme-reclaim-plan-")
+            })
+    };
+    assert!(!has_reclaim_snapshot());
+    let session_before = legacy_session_row(repo.path(), session_id);
+    assert_eq!(session_before.6, "exited");
+
+    let plan = run_as_is(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan", "--json"],
+    );
+    let plan_diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    assert!(
+        !plan.status.success(),
+        "legacy plan unexpectedly succeeded: {plan_diagnostic}"
+    );
+    assert!(
+        plan_diagnostic
+            .contains("legacy root requires explicit digest-confirmed binding plan/apply"),
+        "unexpected refusal: {plan_diagnostic}"
+    );
+    assert!(artifact.is_file());
+    assert_eq!(
+        std::fs::read(&artifact).unwrap(),
+        b"retained legacy worktree cache\n"
+    );
+    assert_eq!(legacy_session_row(repo.path(), session_id), session_before);
+    assert!(!has_reclaim_snapshot(), "a refused plan must not write a review snapshot");
+    assert!(!root_marker.exists(), "a refused plan must not create a root marker");
+
+    let confirmation = "a".repeat(64);
+    let apply = run_as_is(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "apply", "--confirm", &confirmation],
+    );
+    let apply_diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert!(
+        !apply.status.success(),
+        "legacy apply unexpectedly succeeded: {apply_diagnostic}"
+    );
+    assert!(
+        apply_diagnostic
+            .contains("legacy root requires explicit digest-confirmed binding plan/apply"),
+        "unexpected refusal: {apply_diagnostic}"
+    );
+    assert!(artifact.is_file());
+    assert_eq!(
+        std::fs::read(&artifact).unwrap(),
+        b"retained legacy worktree cache\n"
+    );
+    assert_eq!(legacy_session_row(repo.path(), session_id), session_before);
+    assert!(!has_reclaim_snapshot(), "a refused apply must not write a review snapshot");
+    assert!(!root_marker.exists(), "a refused apply must not create a root marker");
 }
 
 /// A worktree root left behind by a repository that no longer exists.

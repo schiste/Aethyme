@@ -602,16 +602,12 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .unwrap_or("plan");
     let mut broker = open_broker(true)?;
+    let root = broker.require_bound_repository_worktree_root("worktree cache reclamation")?;
     let retention_policy = crate::load_retention_policy(broker.main_root())?;
     // This repository's own worktree directory, not the shared container:
     // reclaiming another repository's build output from here would be a
     // surprise, and that repository's broker knows which of its sessions are
     // live while this one does not.
-    let Some(root) = broker.worktree_root_plan()?.preferred_root else {
-        return Err(UsageError::Message(
-            "this repository has no broker worktree root to reclaim from".into(),
-        ));
-    };
     // Only sessions actually working are protected. An idle or stale session
     // may be one that simply cannot be closed, and those are precisely the
     // worktrees whose build output accumulates.
@@ -835,6 +831,13 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
                     }
                 }
             };
+            let apply_root = broker
+                .require_bound_repository_worktree_root("worktree cache reclamation apply")?;
+            if apply_root != root {
+                return Err(UsageError::Message(
+                    "the bound worktree root changed while preparing this reclaim; re-run the plan and review it again".into(),
+                ));
+            }
             let mut outcome = crate::apply_reclaim(&plan);
             withdrawn.append(&mut outcome.skipped);
             outcome.skipped = withdrawn;

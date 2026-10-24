@@ -527,7 +527,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   hashes, and check symlink targets before cleanup. Keep regenerable build
   output separate from the evidence archive. For cache reclamation, test ordinary
   files, reserved-cache name collisions, and non-container roots separately; an
-  incomplete liveness inventory must retain cache candidates.
+  incomplete liveness inventory must retain cache candidates. On read-only stores,
+  use a non-mutating liveness snapshot and never turn ownership or observation
+  errors into an empty protection set. Include a real CLI case with both an active
+  session and a stored-active session whose derived status needs a transition;
+  verify the active candidate stays protected and the read-only command leaves the
+  transition row unchanged.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
