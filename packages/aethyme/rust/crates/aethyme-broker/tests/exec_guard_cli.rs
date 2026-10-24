@@ -5,6 +5,7 @@
 //! events. Reporting both as an ownership failure sends the reader to debug
 //! leases when the command simply failed on its own.
 
+use aethyme_broker::BrokerStore;
 use std::path::Path;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
@@ -407,11 +408,52 @@ fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
     assert!(receipt.get("pid").is_none());
 }
 
+fn exec_status_telemetry_state(repo: &Path) -> (Vec<(i64, String)>, Option<Vec<u8>>) {
+    let database = repo.join(".aethyme/broker.db");
+    assert!(database.is_file(), "fixture should create its repository database");
+    let store = BrokerStore::open_snapshot_at(&database).expect("fixture broker database opens");
+    let events = store
+        .events_after(0, 10_000)
+        .expect("read fixture broker events")
+        .into_iter()
+        .map(|event| (event.id, event.kind))
+        .collect();
+    let metrics_path = repo.join(".aethyme/logs/command-metrics.jsonl");
+    let metrics = match std::fs::read(metrics_path) {
+        Ok(metrics) => Some(metrics),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read fixture command metrics: {error}"),
+    };
+    (events, metrics)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn exec_status_refuses_extra_input_and_conflicting_selectors() {
     let (repo, state, packed) = fixture();
     let (id, _) = split(&packed);
+    let telemetry_before = exec_status_telemetry_state(repo.path());
+
+    let valid = common::broker_cli(
+        CLI,
+        &["advanced", "exec-status", "--session", id, "--json"],
+    )
+    .current_dir(repo.path())
+    .env("AETHYME_HOST_STATE_DIR", state.path())
+    .env("AETHYME_MEASURE_OUTPUT", "0")
+    .output()
+    .unwrap();
+    assert!(
+        valid.status.success(),
+        "valid query: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    let valid_json: serde_json::Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(valid_json["schema"], "aethyme.broker-exec-status/v1");
+    assert_eq!(valid_json["session_id"], id.parse::<i64>().unwrap());
+    assert_eq!(valid_json["receipts"].as_array().unwrap().len(), 0);
+    assert_eq!(exec_status_telemetry_state(repo.path()), telemetry_before);
+
     let malformed = [
         vec![
             "advanced",
@@ -443,22 +485,78 @@ fn exec_status_refuses_extra_input_and_conflicting_selectors() {
             "20",
             "--json",
         ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            "not-a-receipt",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--limit",
+            "0",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--task",
+            "ignored",
+            "--json",
+        ],
     ];
+    let unopened_database = state.path().join("must-not-open.db");
+    std::fs::write(&unopened_database, b"leave untouched").unwrap();
+    let unopened_database_before = std::fs::read(&unopened_database).unwrap();
 
     for args in malformed {
-        let out = run(repo.path(), state.path(), &args);
+        let out = common::broker_cli(CLI, &args)
+            .current_dir(repo.path())
+            .env("AETHYME_HOST_STATE_DIR", state.path())
+            .env("AETHYME_BROKER_DB", &unopened_database)
+            .env("AETHYME_MEASURE_OUTPUT", "0")
+            .output()
+            .unwrap();
         assert!(
             !out.status.success(),
             "invalid exec-status form was accepted: {args:?}"
         );
         assert!(
-            out.stdout.is_empty(),
-            "invalid form returned receipt data: {args:?}"
+            out.stderr.is_empty(),
+            "JSON usage error should be on stdout: {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("exec-status"),
-            "invalid form omitted exec-status usage: {args:?}"
+        let error: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("invalid form did not return JSON error: {args:?}"));
+        assert_eq!(error["schema"], "aethyme.broker-error/v1", "{args:?}");
+        assert_eq!(error["error"]["code"], 2, "{args:?}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("exec-status"), "{args:?}: {message}");
+        assert!(error.get("receipt").is_none(), "{args:?}");
+        assert!(error.get("receipts").is_none(), "{args:?}");
+        assert_eq!(
+            std::fs::read(&unopened_database).unwrap(),
+            unopened_database_before,
+            "invalid form touched its configured database: {args:?}"
         );
+        assert_eq!(exec_status_telemetry_state(repo.path()), telemetry_before);
     }
 }
 

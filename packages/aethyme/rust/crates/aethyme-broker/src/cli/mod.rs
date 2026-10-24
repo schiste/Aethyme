@@ -2455,12 +2455,11 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             code: crate::exit_status::USAGE,
         });
     }
-    if subcommand == "exec-status" && !parsed.positional.is_empty() {
-        return Err(UsageError::Exit {
-            message: EXEC_STATUS_USAGE.to_string(),
-            code: crate::exit_status::USAGE,
-        });
-    }
+    let exec_status_request = if subcommand == "exec-status" {
+        Some(validated_exec_status_request(&parsed)?)
+    } else {
+        None
+    };
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
@@ -2486,7 +2485,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "leases" => run_leases(parsed)?,
         "ownership" => run_ownership(parsed)?,
         "exec" => run_exec(parsed)?,
-        "exec-status" => run_exec_status(parsed)?,
+        "exec-status" => {
+            let request = exec_status_request.ok_or_else(|| {
+                UsageError::Message("exec-status request validation was skipped".into())
+            })?;
+            run_exec_status(parsed.json, request)?;
+        }
         "git" | "gh" => run_git_gh(parsed, subcommand)?,
         "merge-chain" => run_merge_chain(parsed)?,
         "advisories" => run_advisories(parsed)?,

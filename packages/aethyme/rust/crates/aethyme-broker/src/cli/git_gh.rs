@@ -692,39 +692,83 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+fn exec_status_usage_error() -> UsageError {
+    exec_status_usage_error_with_detail(None)
+}
+
+fn exec_status_usage_error_with_detail(detail: Option<&str>) -> UsageError {
+    let message = detail.map_or_else(
+        || EXEC_STATUS_USAGE.to_string(),
+        |detail| format!("{EXEC_STATUS_USAGE}\n{detail}"),
+    );
+    UsageError::Exit {
+        message,
+        code: crate::exit_status::USAGE,
+    }
+}
+
+pub(super) struct ExecStatusRequest {
+    session: i64,
+    receipt: Option<String>,
+    limit: u32,
+}
+
+/// Parse and validate all exec-status selectors before the command can open
+/// broker storage. The handler receives only this validated request.
+pub(super) fn validated_exec_status_request(
+    parsed: &Parsed,
+) -> Result<ExecStatusRequest, UsageError> {
+    let Some(session) = parsed.session else {
+        return Err(exec_status_usage_error());
+    };
+    if !parsed.positional.is_empty()
+        || !parsed.exec_command.is_empty()
+        || (parsed.exec_receipt.is_some() && parsed.limit.is_some())
+    {
+        return Err(exec_status_usage_error());
+    }
+    if parsed.exec_receipt.as_ref().is_some_and(|receipt| {
+        receipt.len() != 32 || !receipt.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(exec_status_usage_error_with_detail(Some(
+            "--receipt must be a 32-character hexadecimal receipt id",
+        )));
+    }
+    if parsed.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+        return Err(exec_status_usage_error_with_detail(Some(
+            "--limit must be between 1 and 100",
+        )));
+    }
+    Ok(ExecStatusRequest {
+        session,
+        receipt: parsed.exec_receipt.clone(),
+        limit: parsed.limit.unwrap_or(20),
+    })
+}
+
 /// Read one receipt or a bounded recent list. Receipt data is observational:
 /// it never authorizes signaling, cleanup, or a session transition.
-pub(super) fn run_exec_status(parsed: Parsed) -> Result<(), UsageError> {
-    let session = parsed
-        .session
-        .ok_or_else(|| UsageError::Message(EXEC_STATUS_USAGE.into()))?;
-    if !parsed.positional.is_empty() || !parsed.exec_command.is_empty() {
-        return Err(UsageError::Message(EXEC_STATUS_USAGE.into()));
-    }
-    if parsed.exec_receipt.is_some() && parsed.limit.is_some() {
-        return Err(UsageError::Message(EXEC_STATUS_USAGE.into()));
-    }
+pub(super) fn run_exec_status(
+    json: bool,
+    request: ExecStatusRequest,
+) -> Result<(), UsageError> {
     let mut broker = open_broker(true)?;
-    if let Some(receipt_id) = parsed.exec_receipt {
-        if receipt_id.len() != 32 || !receipt_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(UsageError::Message(
-                "--receipt must be a 32-character hexadecimal receipt id".into(),
-            ));
-        }
+    if let Some(receipt_id) = request.receipt {
         let receipt = broker
             .store()
-            .guarded_exec_receipt(session, &receipt_id)?
+            .guarded_exec_receipt(request.session, &receipt_id)?
             .ok_or_else(|| {
                 UsageError::Message(format!(
-                    "no guarded-exec receipt {receipt_id:?} for session {session} in this repository"
+                    "no guarded-exec receipt {receipt_id:?} for session {} in this repository",
+                    request.session
                 ))
             })?;
-        if parsed.json {
+        if json {
             out!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "schema": "aethyme.broker-exec-status/v1",
-                    "session_id": session,
+                    "session_id": request.session,
                     "receipt": receipt,
                 }))?
             );
@@ -732,25 +776,21 @@ pub(super) fn run_exec_status(parsed: Parsed) -> Result<(), UsageError> {
             render_exec_receipt(&receipt);
         }
     } else {
-        let limit = parsed.limit.unwrap_or(20);
-        if !(1..=100).contains(&limit) {
-            return Err(UsageError::Message(
-                "--limit must be between 1 and 100".into(),
-            ));
-        }
-        let receipts = broker.store().guarded_exec_receipts(session, limit)?;
-        if parsed.json {
+        let receipts = broker
+            .store()
+            .guarded_exec_receipts(request.session, request.limit)?;
+        if json {
             out!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "schema": "aethyme.broker-exec-status/v1",
-                    "session_id": session,
+                    "session_id": request.session,
                     "receipts": receipts,
-                    "limit": limit,
+                    "limit": request.limit,
                 }))?
             );
         } else if receipts.is_empty() {
-            out!("no guarded-exec receipts for session {session}");
+            out!("no guarded-exec receipts for session {}", request.session);
         } else {
             for receipt in &receipts {
                 render_exec_receipt(receipt);

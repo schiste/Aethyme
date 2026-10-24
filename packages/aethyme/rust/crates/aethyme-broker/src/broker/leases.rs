@@ -2128,11 +2128,8 @@ impl Broker {
                         self.store
                             .mark_guarded_exec_not_started(session_id, receipt_id)
                     } else {
-                        self.store.mark_guarded_exec_outcome_unknown(
-                            session_id,
-                            receipt_id,
-                            "unknown",
-                        )
+                        self.store
+                            .mark_guarded_exec_outcome_unknown(session_id, receipt_id, "unknown")
                     };
                     if let Err(persist_error) = result {
                         crate::warn_unrecorded(
@@ -2142,8 +2139,9 @@ impl Broker {
                         if known_not_started {
                             crate::warn_unrecorded(
                                 "persist guarded exec unknown outcome",
-                                self.store
-                                    .mark_guarded_exec_outcome_unknown(session_id, receipt_id, "unknown"),
+                                self.store.mark_guarded_exec_outcome_unknown(
+                                    session_id, receipt_id, "unknown",
+                                ),
                             );
                         }
                     }
@@ -2859,14 +2857,11 @@ mod generic_guarded_exec_tests {
                             command: "fake-command".into(),
                             source: std::io::Error::other("supervisor setup failed"),
                         },
-                        Failure::CleanupUnknown => {
-                            BrokerOpError::GuardedExecCleanupUnknown {
-                                session_id: session.id,
-                                reason: "helper cleanup could not be verified".into(),
-                            }
-                        }
-                        Failure::CommandUnknown
-                        | Failure::CommandUnknownWithVerifiedCleanup => {
+                        Failure::CleanupUnknown => BrokerOpError::GuardedExecCleanupUnknown {
+                            session_id: session.id,
+                            reason: "helper cleanup could not be verified".into(),
+                        },
+                        Failure::CommandUnknown | Failure::CommandUnknownWithVerifiedCleanup => {
                             BrokerOpError::GuardedExecOutcomeUnknown {
                                 session_id: session.id,
                                 reason: "command result was not confirmed".into(),
