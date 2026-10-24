@@ -20,6 +20,127 @@ fn lease_claim_preparation_budget_ms() -> u64 {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeDirectoryScan {
+    Complete,
+    Incomplete,
+    DeadlineReached,
+}
+
+fn collect_worktree_directory_entries<I>(
+    entries: I,
+    observed: &mut Vec<crate::worktree_reconcile::ObservedDirectory>,
+    deadline: Option<std::time::Instant>,
+) -> WorktreeDirectoryScan
+where
+    I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
+    let mut complete = true;
+    for entry in entries {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return WorktreeDirectoryScan::DeadlineReached;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                // `read_dir` may open successfully and then fail for one
+                // entry. Preserve what was observed, but never call that a
+                // complete inventory.
+                complete = false;
+                continue;
+            }
+        };
+        if is_worktree_root_infrastructure(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                // A listed path can disappear or become unreadable before its
+                // type is checked; it is not safe to treat that as a
+                // confirmed non-directory.
+                complete = false;
+                continue;
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let git_marker = match std::fs::metadata(path.join(".git")) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => {
+                complete = false;
+                false
+            }
+        };
+        observed.push(crate::worktree_reconcile::ObservedDirectory {
+            path: path.to_string_lossy().into_owned(),
+            git_marker,
+            estimated_bytes: None,
+        });
+    }
+    if complete {
+        WorktreeDirectoryScan::Complete
+    } else {
+        WorktreeDirectoryScan::Incomplete
+    }
+}
+
+fn scan_worktree_roots<I, F>(
+    roots: &[PathBuf],
+    observed: &mut Vec<crate::worktree_reconcile::ObservedDirectory>,
+    deadline: Option<std::time::Instant>,
+    mut read_root: F,
+) -> bool
+where
+    I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    F: FnMut(&Path) -> std::io::Result<I>,
+{
+    let mut complete = true;
+    for root in roots {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return false;
+        }
+        let entries = match read_root(root) {
+            Ok(entries) => entries,
+            Err(_) => {
+                // An unreadable root is not drift; claiming it held nothing
+                // would understate the problem this sweep exists to surface.
+                complete = false;
+                continue;
+            }
+        };
+        match collect_worktree_directory_entries(entries, observed, deadline) {
+            WorktreeDirectoryScan::Complete => {}
+            WorktreeDirectoryScan::Incomplete => complete = false,
+            WorktreeDirectoryScan::DeadlineReached => return false,
+        }
+    }
+    complete
+}
+
+fn size_unclaimed_directories<F>(
+    entries: &mut [crate::worktree_reconcile::ReconciledDirectory],
+    mut size_directory: F,
+) -> bool
+where
+    F: FnMut(&Path) -> std::io::Result<u64>,
+{
+    let mut complete = true;
+    for entry in entries.iter_mut().filter(|entry| entry.unclaimed()) {
+        match size_directory(Path::new(&entry.path)) {
+            Ok(bytes) => entry.estimated_bytes = Some(bytes),
+            Err(_) => {
+                entry.estimated_bytes = None;
+                complete = false;
+            }
+        }
+    }
+    complete
+}
+
 /// The deadline for the read-only and Git-backed preparation before an
 /// explicit lease claim is committed. The SQLite claim transaction itself is
 /// not interrupted: the deadline is checked immediately before that write.
@@ -205,40 +326,14 @@ impl Broker {
             .collect();
 
         let mut observed = Vec::new();
-        let mut complete = true;
-        for root in &roots {
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                complete = false;
-                break;
-            }
-            let Ok(entries) = std::fs::read_dir(root) else {
-                // An unreadable root is not drift; claiming it held nothing
-                // would understate the problem this sweep exists to surface.
-                complete = false;
-                continue;
-            };
-            for entry in entries.flatten() {
-                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                    complete = false;
-                    break;
-                }
-                let path = entry.path();
-                if !is_real_directory(&path) || is_worktree_root_infrastructure(&entry.file_name())
-                {
-                    continue;
-                }
-                observed.push(crate::worktree_reconcile::ObservedDirectory {
-                    path: path.to_string_lossy().into_owned(),
-                    git_marker: path.join(".git").exists(),
-                    estimated_bytes: None,
-                });
-            }
-        }
+        let mut complete = scan_worktree_roots(&roots, &mut observed, deadline, |root| {
+            std::fs::read_dir(root)
+        });
 
         let mut reconciled = crate::worktree_reconcile::reconcile(&observed, &claims);
         if sized {
-            for entry in reconciled.iter_mut().filter(|entry| entry.unclaimed()) {
-                if let Some(deadline) = deadline {
+            if let Some(deadline) = deadline {
+                for entry in reconciled.iter_mut().filter(|entry| entry.unclaimed()) {
                     entry.estimated_bytes = crate::disk_headroom::directory_usage_bounded(
                         Path::new(&entry.path),
                         deadline,
@@ -248,11 +343,12 @@ impl Broker {
                         complete = false;
                         break;
                     }
-                } else {
-                    entry.estimated_bytes = Some(
-                        directory_size_without_following_links(Path::new(&entry.path)).unwrap_or(0),
-                    );
                 }
+            } else if !size_unclaimed_directories(
+                &mut reconciled,
+                directory_size_without_following_links,
+            ) {
+                complete = false;
             }
         }
         let mut summary = crate::worktree_reconcile::summarise(&reconciled, roots.len());
@@ -2303,6 +2399,150 @@ fn map_preparation_exec_supervisor_error(
                 source,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod worktree_inventory_scan_tests {
+    use super::*;
+
+    #[test]
+    fn iterator_error_preserves_later_directories_and_marks_inventory_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let first_path = root.path().join("first");
+        let later_path = root.path().join("later");
+        std::fs::create_dir(&first_path).unwrap();
+        std::fs::create_dir(&later_path).unwrap();
+
+        let read_entries = || {
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let roots = [root.path().to_path_buf()];
+        let mut complete_observations = Vec::new();
+        assert!(scan_worktree_roots(
+            &roots,
+            &mut complete_observations,
+            None,
+            |root| std::fs::read_dir(root)
+        ));
+        assert_eq!(complete_observations.len(), 2);
+
+        let mut entries = read_entries().into_iter();
+        let first = entries.next().unwrap();
+        let later = entries.next().unwrap();
+        let injected: Vec<std::io::Result<std::fs::DirEntry>> = vec![
+            Ok(first),
+            Err(std::io::Error::other("injected directory-entry failure")),
+            Ok(later),
+        ];
+        let mut injected = Some(injected);
+        let mut partial_observations = Vec::new();
+        let complete = scan_worktree_roots(&roots, &mut partial_observations, None, |_| {
+            Ok(injected.take().unwrap().into_iter())
+        });
+        assert!(!complete);
+        let observed_paths: std::collections::BTreeSet<_> = partial_observations
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        let expected_paths: std::collections::BTreeSet<_> = [first_path, later_path]
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(observed_paths, expected_paths);
+    }
+
+    #[test]
+    fn metadata_error_for_a_listed_entry_marks_inventory_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let removed_path = root.path().join("removed");
+        std::fs::create_dir(&removed_path).unwrap();
+        let entry = std::fs::read_dir(root.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir(&removed_path).unwrap();
+
+        let roots = [root.path().to_path_buf()];
+        let mut injected = Some(vec![Ok(entry)]);
+        let mut observed = Vec::new();
+        let complete = scan_worktree_roots(&roots, &mut observed, None, |_| {
+            Ok(injected.take().unwrap().into_iter())
+        });
+        assert!(!complete);
+        assert!(observed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_marker_metadata_error_marks_inventory_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::os::unix::fs::symlink(".git", worktree.join(".git")).unwrap();
+
+        let roots = [root.path().to_path_buf()];
+        let mut observed = Vec::new();
+        let complete =
+            scan_worktree_roots(&roots, &mut observed, None, |root| std::fs::read_dir(root));
+
+        assert!(!complete);
+        assert_eq!(observed.len(), 1);
+        assert!(!observed[0].git_marker);
+    }
+
+    #[test]
+    fn expired_deadline_stops_before_a_stream_of_entry_errors() {
+        let mut observed = Vec::new();
+        let errors: [std::io::Result<std::fs::DirEntry>; 2] = [
+            Err(std::io::Error::other("injected directory-entry failure")),
+            Err(std::io::Error::other("injected directory-entry failure")),
+        ];
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            collect_worktree_directory_entries(errors, &mut observed, Some(expired)),
+            WorktreeDirectoryScan::DeadlineReached
+        );
+        assert!(observed.is_empty());
+    }
+
+    #[test]
+    fn failed_unbounded_size_is_unknown_not_zero_and_does_not_hide_later_sizes() {
+        let mut entries = vec![
+            crate::worktree_reconcile::ReconciledDirectory {
+                path: "/unreadable".into(),
+                claim: crate::worktree_reconcile::DirectoryClaim::Unclaimed,
+                git_marker: false,
+                estimated_bytes: None,
+            },
+            crate::worktree_reconcile::ReconciledDirectory {
+                path: "/readable".into(),
+                claim: crate::worktree_reconcile::DirectoryClaim::Unclaimed,
+                git_marker: false,
+                estimated_bytes: None,
+            },
+        ];
+        let mut calls = 0;
+        let complete = size_unclaimed_directories(&mut entries, |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected sizing failure",
+                ))
+            } else {
+                Ok(7)
+            }
+        });
+
+        assert!(!complete);
+        assert_eq!(entries[0].estimated_bytes, None);
+        assert_eq!(entries[1].estimated_bytes, Some(7));
     }
 }
 
