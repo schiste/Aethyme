@@ -728,6 +728,98 @@ fn a_reviewed_worktree_that_became_active_is_skipped() {
     );
 }
 
+/// A failed transition in a read-only broker must not discard other active
+/// sessions from the reclaim plan.
+#[test]
+fn reclaim_keeps_active_cache_when_another_session_needs_a_liveness_transition() {
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
+    let (active_id, active_worktree) = quiet_open_session(repo.path(), container.path(), 0);
+    let (transition_id, transition_worktree) =
+        quiet_open_session(repo.path(), container.path(), 24);
+
+    // Give one row fresh liveness and another a deterministic transition from
+    // stored Active to derived Idle/Stale. `run()` ages every Git index before
+    // planning, so the cache decisions cannot use the recent-index guard.
+    let fresh_at = epoch_ms();
+    let stale_at = fresh_at - 24 * HOUR_MS;
+    let db = rusqlite::Connection::open(repo.path().join(".aethyme/broker.db")).unwrap();
+    db.execute(
+        "UPDATE sessions SET status = 'active', last_activity_at = ?2, created_at = ?2 WHERE id = ?1",
+        rusqlite::params![active_id, fresh_at],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE sessions SET status = 'active', last_activity_at = ?2, created_at = ?2 WHERE id = ?1",
+        rusqlite::params![transition_id, stale_at],
+    )
+    .unwrap();
+    drop(db);
+
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan", "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "reclaim plan: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("process-use inspection is incomplete"),
+        "the process-use snapshot must be complete for this regression: {stderr}"
+    );
+
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let candidates = plan["candidates"].as_array().unwrap();
+    let candidate_for = |target: &Path| {
+        let expected = target.canonicalize().unwrap();
+        candidates
+            .iter()
+            .find(|candidate| {
+                candidate["path"]
+                    .as_str()
+                    .and_then(|path| Path::new(path).canonicalize().ok())
+                    .is_some_and(|path| path == expected)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing reclaim candidate for {}: {plan}",
+                    target.display()
+                )
+            })
+    };
+    let active_candidate = candidate_for(&active_worktree.join("rust/target"));
+    assert_eq!(
+        active_candidate["reclaimable"],
+        false,
+        "a fresh active session must retain its cache: {active_candidate}"
+    );
+    assert!(
+        active_candidate["reason"]
+            .as_str()
+            .unwrap()
+            .contains("still active"),
+        "the active-session guard, not another fence, must retain the cache: {active_candidate}"
+    );
+
+    let transition_candidate = candidate_for(&transition_worktree.join("rust/target"));
+    assert_eq!(
+        transition_candidate["reclaimable"],
+        true,
+        "the positive control proves old indexes and complete process-use inspection: {transition_candidate}"
+    );
+    assert_eq!(session_status(repo.path(), active_id), "active");
+    assert_eq!(
+        session_status(repo.path(), transition_id),
+        "active",
+        "read-only reclaim planning must not persist the derived Idle/Stale transition"
+    );
+}
+
 /// Without a saved review there is nothing to narrow to.
 #[test]
 fn a_missing_review_still_requires_the_exact_digest() {
