@@ -4113,7 +4113,9 @@ mod tests {
         let source = shared_budget_config(true, 0);
         let source = source.split("[shared_cache]").next().unwrap();
         let parsed = parse_config(source).unwrap();
-        let budget = parsed.shared_cache.expect("shared steps receive a default budget");
+        let budget = parsed
+            .shared_cache
+            .expect("shared steps receive a default budget");
         assert_eq!(budget.max_bytes, 8_589_934_592);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap().join("preparation-cache");
