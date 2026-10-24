@@ -410,7 +410,10 @@ fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
 
 fn exec_status_telemetry_state(repo: &Path) -> (Vec<(i64, String)>, Option<Vec<u8>>) {
     let database = repo.join(".aethyme/broker.db");
-    assert!(database.is_file(), "fixture should create its repository database");
+    assert!(
+        database.is_file(),
+        "fixture should create its repository database"
+    );
     let store = BrokerStore::open_snapshot_at(&database).expect("fixture broker database opens");
     let events = store
         .events_after(0, 10_000)
@@ -434,15 +437,12 @@ fn exec_status_refuses_extra_input_and_conflicting_selectors() {
     let (id, _) = split(&packed);
     let telemetry_before = exec_status_telemetry_state(repo.path());
 
-    let valid = common::broker_cli(
-        CLI,
-        &["advanced", "exec-status", "--session", id, "--json"],
-    )
-    .current_dir(repo.path())
-    .env("AETHYME_HOST_STATE_DIR", state.path())
-    .env("AETHYME_MEASURE_OUTPUT", "0")
-    .output()
-    .unwrap();
+    let valid = common::broker_cli(CLI, &["advanced", "exec-status", "--session", id, "--json"])
+        .current_dir(repo.path())
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .env("AETHYME_MEASURE_OUTPUT", "0")
+        .output()
+        .unwrap();
     assert!(
         valid.status.success(),
         "valid query: {}",

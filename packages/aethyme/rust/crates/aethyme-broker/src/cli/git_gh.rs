@@ -734,7 +734,10 @@ pub(super) fn validated_exec_status_request(
             "--receipt must be a 32-character hexadecimal receipt id",
         )));
     }
-    if parsed.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+    if parsed
+        .limit
+        .is_some_and(|limit| !(1..=100).contains(&limit))
+    {
         return Err(exec_status_usage_error_with_detail(Some(
             "--limit must be between 1 and 100",
         )));
@@ -748,10 +751,7 @@ pub(super) fn validated_exec_status_request(
 
 /// Read one receipt or a bounded recent list. Receipt data is observational:
 /// it never authorizes signaling, cleanup, or a session transition.
-pub(super) fn run_exec_status(
-    json: bool,
-    request: ExecStatusRequest,
-) -> Result<(), UsageError> {
+pub(super) fn run_exec_status(json: bool, request: ExecStatusRequest) -> Result<(), UsageError> {
     let mut broker = open_broker(true)?;
     if let Some(receipt_id) = request.receipt {
         let receipt = broker

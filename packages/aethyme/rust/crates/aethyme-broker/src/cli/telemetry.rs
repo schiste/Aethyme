@@ -312,12 +312,15 @@ pub(super) fn output_measurement_opted_in() -> bool {
 
 pub(super) fn command_records_metric(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
+        // Quick-test owns a temporary repository that is removed before the
+        // dispatcher records telemetry; there is no durable repository target.
+        Some("quick-test") => false,
         // `insights` reads the same history `metrics` accounts for. Polling it
         // from cron must not write a telemetry line, or the report would be one
         // of the things it reports on.
         Some(
-            "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff"
-            | "exec-status" | "worktree-root",
+            "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff" | "exec-status"
+            | "worktree-root",
         ) => false,
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
@@ -388,6 +391,11 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
 /// special case: its candidate set may rewrite this same metrics file, so
 /// recording the plan afterward would invalidate the digest it just produced.
 fn command_metric_enabled(args: &[String], opted_in: bool, has_details: bool) -> bool {
+    // Explicit output measurement cannot make this temporary smoke command
+    // write telemetry into the unrelated repository that invoked it.
+    if args.first().map(String::as_str) == Some("quick-test") {
+        return false;
+    }
     if matches!(
         (
             args.first().map(String::as_str),
@@ -473,6 +481,14 @@ mod tests {
         assert!(!command_records_metric(&args));
         assert!(!command_records_outcome(&args));
         assert!(command_metric_enabled(&args, true, false));
+    }
+
+    #[test]
+    fn quick_test_does_not_write_invoking_repository_telemetry() {
+        let quick_test = ["quick-test"].map(str::to_string);
+        assert!(!command_records_metric(&quick_test));
+        assert!(!command_records_outcome(&quick_test));
+        assert!(!command_metric_enabled(&quick_test, true, true));
     }
 
     #[test]
