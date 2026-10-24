@@ -372,16 +372,17 @@ fn legacy_unbound_retained_worktree_fixture(repo: &Path, container: &Path) -> (P
         0,
         "the disposable bootstrap database must not contain session records"
     );
+    let bootstrap_binding: (String, Option<Vec<u8>>) = existing
+        .query_row(
+            "SELECT state, worktree_root FROM repository_worktree_binding",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(
-        existing
-            .query_row(
-                "SELECT COUNT(*) FROM repository_worktree_binding",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-        0,
-        "the disposable bootstrap database must not contain root authority"
+        bootstrap_binding,
+        ("fresh_unbound".to_owned(), None),
+        "the disposable bootstrap row must not carry root authority"
     );
     drop(existing);
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -1285,11 +1286,23 @@ fn a_session_plan_for_a_removed_worktree_has_nothing_to_reclaim() {
 #[test]
 fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadable() {
     let (repo, container) = fixture("");
+    let started = run(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "bind digest mismatch test root", "--json"],
+    );
+    assert!(
+        started.status.success(),
+        "start: stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
     let root_output = run(
         repo.path(),
         container.path(),
         &["advanced", "worktree-root", "--json"],
     );
+    assert!(root_output.status.success());
     let worktree_root =
         serde_json::from_slice::<serde_json::Value>(&root_output.stdout).unwrap()["preferred_root"]
             .as_str()
