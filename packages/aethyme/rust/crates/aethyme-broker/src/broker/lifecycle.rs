@@ -6145,15 +6145,11 @@ impl Broker {
             None
         } else if let Some(display_ref) = expected_default {
             Some(self.require_fresh_default(prefetched, &display_ref)?)
-        } else if self
-            .repo
-            .has_configured_remote_default()
-            .map_err(|error| {
-                reuse_freshness_refusal(format!(
-                    "could not verify remote-default configuration: {error}"
-                ))
-            })?
-        {
+        } else if self.repo.has_configured_remote_default().map_err(|error| {
+            reuse_freshness_refusal(format!(
+                "could not verify remote-default configuration: {error}"
+            ))
+        })? {
             return Err(reuse_freshness_refusal(
                 "the configured remote default ref is unavailable; fetch the default branch and repair its tracking configuration before retrying",
             ));
