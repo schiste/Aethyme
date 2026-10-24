@@ -448,21 +448,21 @@ fn legacy_unbound_retained_worktree_fixture(repo: &Path, container: &Path) -> (P
     (worktree, session_id)
 }
 
-fn legacy_session_row(
-    repo: &Path,
-    session_id: i64,
-) -> (
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    String,
-    Option<i64>,
-    i64,
-    i64,
-) {
+#[derive(Debug, Eq, PartialEq)]
+struct LegacySessionSnapshot {
+    worktree_path: String,
+    branch: String,
+    task: Option<String>,
+    diff_base: Option<String>,
+    adoption_base: Option<String>,
+    adopted_head: Option<String>,
+    status: String,
+    exit_code: Option<i64>,
+    updated_at: i64,
+    last_activity_at: i64,
+}
+
+fn legacy_session_row(repo: &Path, session_id: i64) -> LegacySessionSnapshot {
     let connection = rusqlite::Connection::open_with_flags(
         repo.join(".aethyme/broker.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -475,18 +475,18 @@ fn legacy_session_row(
              FROM sessions WHERE id = ?1",
             [session_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
+                Ok(LegacySessionSnapshot {
+                    worktree_path: row.get(0)?,
+                    branch: row.get(1)?,
+                    task: row.get(2)?,
+                    diff_base: row.get(3)?,
+                    adoption_base: row.get(4)?,
+                    adopted_head: row.get(5)?,
+                    status: row.get(6)?,
+                    exit_code: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    last_activity_at: row.get(9)?,
+                })
             },
         )
         .unwrap()
@@ -573,7 +573,7 @@ fn reclaim_refuses_legacy_unbound_root_before_planning_or_apply() {
     };
     assert!(!has_reclaim_snapshot());
     let session_before = legacy_session_row(repo.path(), session_id);
-    assert_eq!(session_before.6, "exited");
+    assert_eq!(session_before.status, "exited");
 
     let plan = run_as_is(
         repo.path(),
