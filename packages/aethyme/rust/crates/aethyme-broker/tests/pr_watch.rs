@@ -819,6 +819,52 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
     assert_eq!(command_events(&mut broker), 2);
 }
 
+#[test]
+fn cli_tick_refuses_a_competing_owner_then_succeeds_after_release() {
+    const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+    let (root, broker, _session_id) = broker_fixture();
+    let run_dir = root.path().join(".aethyme/run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let claim = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(run_dir.join("pr-watch-tick.lock"))
+        .unwrap();
+    claim.lock().unwrap();
+    let run = || {
+        let mut command = common::broker_cli(CLI, &["advanced", "watch", "pr", "tick", "--json"]);
+        command.current_dir(root.path());
+        broker
+            .configure_storage_context_for_child(&mut command)
+            .unwrap();
+        command.output().unwrap()
+    };
+    let refused = run();
+    assert!(!refused.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(error["schema"], "aethyme.broker-error/v1");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another PR watch tick is running"),
+        "{}",
+        error,
+    );
+    drop(claim);
+    let resumed = run();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["attempted_watch_count"], 0);
+    assert_eq!(report["repository_watches"]["polled_watch_count"], 0);
+}
+
 struct FakeRepositoryProvider(Mutex<VecDeque<Vec<aethyme_broker::RepositoryPullRequest>>>);
 
 fn repository_pr() -> aethyme_broker::RepositoryPullRequest {
