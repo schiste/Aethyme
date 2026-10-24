@@ -7027,7 +7027,7 @@ mod graph_snapshot_tests {
                     "the active isolating guard must permit its own Git commands"
                 );
                 let other_thread_refusal =
-                    std::thread::spawn(|| graph_verification_environment_refusal())
+                    std::thread::spawn(graph_verification_environment_refusal)
                         .join()
                         .unwrap();
                 assert!(
