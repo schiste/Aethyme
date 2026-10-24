@@ -45,6 +45,7 @@ jobs:
           set -euo pipefail
           bash .github/scripts/test-docs-fast-lane.sh
           bash .github/scripts/test-performance-fast-lane.sh
+          bash .github/scripts/test-oss-ci-rustfmt-preflight.sh
 
       - name: Classify changed paths
         id: classify
@@ -126,6 +127,10 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
+
+      - name: Check formatting before Rust work
+        working-directory: packages/aethyme/rust
+        run: cargo fmt --all -- --check
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -274,6 +279,10 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Check formatting before Rust work
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
+        run: cargo fmt --all -- --check
+
       # Restores the cache `warm-rust-cache` saves from main. Pull requests do
       # not save: a cache written by a pull request is visible only to that
       # pull request, and would evict main's.
@@ -362,6 +371,9 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Check formatting before Rust work
+        run: cargo fmt --all -- --check
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -437,6 +449,9 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Check formatting before Rust work
+        run: cargo fmt --all -- --check
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -485,7 +500,34 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
+        id: format_check
         run: cargo fmt --all -- --check
+
+      - name: Materialize rustfmt patch
+        id: rustfmt_patch
+        if: ${{ failure() && steps.format_check.outcome == 'failure' }}
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/rustfmt.patch"
+          available=false
+          if cargo fmt --all; then
+            git diff --binary -- . >"$patch"
+            if [[ -s "$patch" ]]; then
+              available=true
+            fi
+          else
+            echo "cargo fmt could not materialize a proposed patch" >&2
+          fi
+          printf 'available=%s\n' "$available" >>"$GITHUB_OUTPUT"
+
+      - name: Upload suggested rustfmt patch
+        if: ${{ failure() && steps.rustfmt_patch.outputs.available == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rustfmt-patch-${{ github.run_id }}
+          path: ${{ runner.temp }}/rustfmt.patch
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
