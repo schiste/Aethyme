@@ -947,7 +947,7 @@ fn reuse_refuses_dirty_fast_forward_without_updating_task_or_head() {
     let session = stored_session(&tmp, 1);
     let worktree = Path::new(&session.worktree_path);
     let original_head = git_output(worktree, &["rev-parse", "HEAD"]);
-    advance_main(tmp.path(), "main-advance.txt");
+    let target = advance_main(tmp.path(), "main-advance.txt");
     std::fs::write(worktree.join("README.md"), "dirty session edit\n").unwrap();
 
     let worktree_arg = session.worktree_path.as_str();
@@ -967,6 +967,23 @@ fn reuse_refuses_dirty_fast_forward_without_updating_task_or_head() {
         json_error::message(&refused).contains("dirty paths"),
         "{}",
         json_error::message(&refused)
+    );
+    let message = json_error::message(&refused);
+    for detail in [
+        format!("checkout_head={original_head}"),
+        format!("recorded_base_sha={original_head}"),
+        format!("target_sha={target}"),
+        "target_ref=refs/heads/main".to_owned(),
+        "ahead=0 behind=1".to_owned(),
+        "prior_observation_age_seconds=".to_owned(),
+        "max_age_seconds=900".to_owned(),
+        "next: preserve local changes".to_owned(),
+    ] {
+        assert!(message.contains(&detail), "missing {detail}: {message}");
+    }
+    assert!(
+        !message.contains("prior_observation_age_seconds=unknown"),
+        "{message}"
     );
     assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), original_head);
     assert_eq!(
@@ -1994,3 +2011,48 @@ fn a_linked_worktree_is_still_adoptable() {
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[test]
+fn divergent_reuse_reports_exact_base_target_counts_and_age_without_moving_work() {
+    let tmp = fixture();
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let session = stored_session(&tmp, 1);
+    let worktree = Path::new(&session.worktree_path);
+    let base = git_output(worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(worktree.join("session-only.txt"), "owned source\n").unwrap();
+    git(worktree, &["add", "session-only.txt"]);
+    git(worktree, &["commit", "-qm", "test: session diverges"]);
+    let head = git_output(worktree, &["rev-parse", "HEAD"]);
+    let target = advance_main(tmp.path(), "main-advance.txt");
+    let refused = run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            &session.worktree_path,
+            "--task",
+            "must not be recorded",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success());
+    let message = json_error::message(&refused);
+    for detail in [
+        "have diverged".to_owned(),
+        format!("checkout_head={head}"),
+        format!("recorded_base_sha={base}"),
+        format!("target_sha={target}"),
+        "ahead=1 behind=1".to_owned(),
+        "prior_observation_age_seconds=".to_owned(),
+    ] {
+        assert!(message.contains(&detail), "missing {detail}: {message}");
+    }
+    assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("session-only.txt")).unwrap(),
+        "owned source\n"
+    );
+    let unchanged = stored_session(&tmp, session.id);
+    assert_eq!(unchanged.task, session.task);
+    assert_eq!(unchanged.diff_base, session.diff_base);
+}
