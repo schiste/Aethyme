@@ -72,6 +72,7 @@ fn run_merge(
     fixture_owner: &Path,
     session_id: i64,
     upstream_sha: &str,
+    race_target: Option<&str>,
 ) -> Output {
     common::broker_cli_for_fixture(
         CLI,
@@ -96,6 +97,8 @@ fn run_merge(
     .env("PATH", prepend_path(fake_bin))
     .env("AETHYME_TEST_REAL_GIT", real_git())
     .env("AETHYME_TEST_UPSTREAM_SHA", upstream_sha)
+    .env("AETHYME_TEST_RACE_TARGET", race_target.unwrap_or(""))
+    .env("AETHYME_TEST_RACE_MARKER", fixture_owner.join("cas-raced"))
     .env(
         "AETHYME_BROKER_OPEN_WORKTREE_ROOT",
         fixture_owner.join("worktrees"),
@@ -107,6 +110,20 @@ fn run_merge(
 
 #[test]
 fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
+    run_landing_case(None);
+}
+
+#[test]
+fn concurrent_exact_target_advance_finishes_the_prepared_reconciliation() {
+    run_landing_case(Some(true));
+}
+
+#[test]
+fn concurrent_different_target_keeps_its_ref_and_queue_unchanged() {
+    run_landing_case(Some(false));
+}
+
+fn run_landing_case(same_target_race: Option<bool>) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let fake_bin = temp.path().join("fake-bin");
@@ -195,11 +212,29 @@ if [ "$1" = "fetch" ]; then
   "$AETHYME_TEST_REAL_GIT" update-ref refs/remotes/origin/main "$AETHYME_TEST_UPSTREAM_SHA"
   exit $?
 fi
+if [ -n "$AETHYME_TEST_RACE_TARGET" ] && [ "$1" = "update-ref" ] && [ "$2" = "refs/heads/aethyme/integration" ] && [ "$3" = "$AETHYME_TEST_UPSTREAM_SHA" ] && [ ! -e "$AETHYME_TEST_RACE_MARKER" ]; then
+  "$AETHYME_TEST_REAL_GIT" update-ref "$2" "$AETHYME_TEST_RACE_TARGET" "$4" || exit $?
+  : > "$AETHYME_TEST_RACE_MARKER"
+fi
 exec "$AETHYME_TEST_REAL_GIT" "$@"
 "#,
     );
 
-    let output = run_merge(&repo, &fake_bin, temp.path(), session.id, &upstream);
+    let race_target = same_target_race.map(|same| {
+        if same {
+            upstream.as_str()
+        } else {
+            initial.as_str()
+        }
+    });
+    let output = run_merge(
+        &repo,
+        &fake_bin,
+        temp.path(),
+        session.id,
+        &upstream,
+        race_target,
+    );
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -208,6 +243,25 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["operation"]["status"], "succeeded");
+    assert_eq!(
+        temp.path().join("cas-raced").exists(),
+        same_target_race.is_some(),
+        "the requested interleaving must actually run"
+    );
+    if same_target_race == Some(false) {
+        assert_eq!(report["post_merge_cleanup"]["state"], "deferred");
+        assert_eq!(git(&repo, &["rev-parse", "aethyme/integration"]), initial);
+        let mut broker = common::open_fixture_broker(&repo, temp.path()).unwrap();
+        let entry = broker
+            .store()
+            .merge_queue()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == promoted.entry.id)
+            .unwrap();
+        assert_eq!(entry.status, MergeStatus::Promoted);
+        return;
+    }
     assert_eq!(report["post_merge_cleanup"]["state"], "cleaned");
     assert_eq!(
         report["post_merge_cleanup"]["cleanup"]["cleaned_queue_entry_ids"],
