@@ -26,6 +26,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Validate a command's complete action, arity, and required confirmation before
+  opening broker state or scanning host or worktree inventories. Add a CLI
+  regression that checks the structured refusal and confirms no repository or
+  host state or review snapshot was created; isolate optional telemetry so it
+  cannot invalidate that boundary check.
 - Before committing a substantive change, use colon-terminated section headings (`Problem:`, `Decision:`, `Rationale:`, `Validation:`) and require `aethyme repo lint-commit-message <file>` to report `Valid: yes`; the linter does not recognize bare headings.
 - For broker SQLite legacy-migration fixtures, restrict schema-downgrade
   helpers to disposable fixtures and refuse to drop later-schema authority
