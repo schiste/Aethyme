@@ -130,6 +130,11 @@ pub fn run_broker_quick_test_with_options(
         });
     }
 
+    // Every Git command below belongs to this disposable smoke-test repo.
+    // Keep inherited repository selectors and config from redirecting those
+    // commands into the invoking process's repository.
+    let _git_environment = crate::git::graph_verification_git_guard();
+
     let temp_repo = TempRepo::create()?;
     let mut steps = Vec::new();
     steps.push(step(

@@ -121,8 +121,9 @@ impl Drop for RestoreGraphVerificationGit {
 }
 
 /// Suppress inherited Git environment and global/system configuration for
-/// synchronous graph verification, restoring any outer scope on drop. The
-/// source repository's local `.git/config` remains in effect.
+/// synchronous graph verification and disposable quick tests, restoring any
+/// outer scope on drop. The repository's local `.git/config` remains in
+/// effect.
 pub(crate) struct GraphVerificationGitGuard {
     _restore: RestoreGraphVerificationGit,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -1103,11 +1104,14 @@ fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
 }
 
 /// Refuse ambient repository/path/history selectors before graph verification
-/// can snapshot anything. Scoped Git commands also strip every inherited
-/// `GIT_*` variable, so harmless configuration, pager, and trace settings can
-/// be accepted here without affecting the verification boundary. Diagnostics
-/// deliberately contain no environment values.
+/// can snapshot anything, unless its isolating scope is already active.
+/// Scoped Git commands strip every inherited `GIT_*` variable, so harmless
+/// configuration, pager, and trace settings can be accepted without affecting
+/// the boundary. Diagnostics deliberately contain no environment values.
 pub(crate) fn graph_verification_environment_refusal() -> Option<&'static str> {
+    if graph_verification_git_enabled() {
+        return None;
+    }
     std::env::vars_os()
         .any(|(key, _)| unsafe_graph_git_environment_key(&key))
         .then_some("graph verification refuses inherited Git routing/history overrides")
@@ -7011,6 +7015,35 @@ mod graph_snapshot_tests {
             let foreign = root.join("foreign/.git");
             let source_before = metadata_bytes(&source.root.join(".git"));
             let foreign_before = metadata_bytes(&foreign);
+            assert!(
+                graph_verification_environment_refusal().is_some(),
+                "an unguarded graph entrypoint must refuse inherited repository selectors"
+            );
+            {
+                let _guard = graph_verification_git_guard();
+                assert!(graph_verification_git_enabled());
+                assert!(
+                    graph_verification_environment_refusal().is_none(),
+                    "the active isolating guard must permit its own Git commands"
+                );
+                let other_thread_refusal = std::thread::spawn(|| {
+                    graph_verification_environment_refusal()
+                })
+                .join()
+                .unwrap();
+                assert!(
+                    other_thread_refusal.is_some(),
+                    "the isolating guard must not change refusal in another thread"
+                );
+            }
+            assert!(
+                !graph_verification_git_enabled(),
+                "dropping the isolating guard must restore its prior scope"
+            );
+            assert!(
+                graph_verification_environment_refusal().is_some(),
+                "dropping the isolating guard must restore refusal of inherited selectors"
+            );
             // This source commit has no graph policy, and would otherwise
             // resolve to the disabled default. An inherited redirect must be
             // refused before reading that authoritative config from another
