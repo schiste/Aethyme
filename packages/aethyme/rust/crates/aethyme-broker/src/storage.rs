@@ -28,7 +28,9 @@ pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 3;
 pub const STORAGE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 
 const DAY_MS: i64 = 86_400_000;
+#[cfg(test)]
 const PREPARATION_SWEEP_MAX_DISCOVERY_PATHS: usize = 4096;
+#[cfg(test)]
 const PREPARATION_SWEEP_MAX_MARKER_BYTES: u64 = 64 * 1024;
 const PREPARATION_RETIRED_STORE_MAX_KEYS: usize = 4096;
 const PREPARATION_ROTATION_DEBT_MAX_ENTRIES: usize = 100_000;
@@ -3272,6 +3274,7 @@ fn current_preparation_keys(
     Ok(keys)
 }
 
+#[cfg(test)]
 fn read_worktree_marker_for_liveness(
     root: &Path,
     deadline: std::time::Instant,
