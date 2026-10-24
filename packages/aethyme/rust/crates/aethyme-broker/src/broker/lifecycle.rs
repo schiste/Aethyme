@@ -6134,14 +6134,13 @@ impl Broker {
             && previous.as_ref().is_some_and(|observation| {
                 observation.evidence == Some(crate::SessionStartBaseEvidence::ExplicitBase)
             });
-        let confirmed_default = if !pinned
-            && let Some(default) = crate::session_push::tracked_default(&self.repo)
-        {
-            let display_ref = format!("{}/{}", default.remote, default.branch);
-            Some(self.require_fresh_default(prefetched, &display_ref)?)
-        } else {
-            None
-        };
+        let confirmed_default =
+            if !pinned && let Some(default) = crate::session_push::tracked_default(&self.repo) {
+                let display_ref = format!("{}/{}", default.remote, default.branch);
+                Some(self.require_fresh_default(prefetched, &display_ref)?)
+            } else {
+                None
+            };
 
         let promote = crate::PromoteConfig::load(&self.main_root);
         let mut integration_sync = None;
@@ -6668,11 +6667,21 @@ impl Broker {
         let Some(default) = confirmed_default else {
             return Ok(());
         };
-        if !self.repo.has_complete_unmodified_history().map_err(|error| {
-            reuse_freshness_refusal(format!("could not verify selected base history: {error}"))
-        })? || !self.repo.is_ancestor_checked(default, base).map_err(|error| {
-            reuse_freshness_refusal(format!("could not verify selected base ancestry: {error}"))
-        })? {
+        if !self
+            .repo
+            .has_complete_unmodified_history()
+            .map_err(|error| {
+                reuse_freshness_refusal(format!("could not verify selected base history: {error}"))
+            })?
+            || !self
+                .repo
+                .is_ancestor_checked(default, base)
+                .map_err(|error| {
+                    reuse_freshness_refusal(format!(
+                        "could not verify selected base ancestry: {error}"
+                    ))
+                })?
+        {
             return Err(reuse_freshness_refusal(
                 "the selected base does not provably contain the freshly fetched default branch; reconcile integration or create a new session from the default branch. No checkout movement was authorized",
             ));

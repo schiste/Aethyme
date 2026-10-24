@@ -797,11 +797,22 @@ fn reuse_refuses_an_unconfirmed_integration_base_without_changing_the_session() 
     let worktree = Path::new(&session.worktree_path);
     let before = git_output(worktree, &["rev-parse", "HEAD"]);
     let unavailable_remote = tmp.path().join("unavailable-remote");
-    git(tmp.path(), &["config", "remote.origin.url", unavailable_remote.to_str().unwrap()]);
+    git(
+        tmp.path(),
+        &[
+            "config",
+            "remote.origin.url",
+            unavailable_remote.to_str().unwrap(),
+        ],
+    );
     for sync in [false, true] {
         let mut args = vec![
-            "start", "--reuse", session.worktree_path.as_str(),
-            "--task", "offline follow-up", "--json",
+            "start",
+            "--reuse",
+            session.worktree_path.as_str(),
+            "--task",
+            "offline follow-up",
+            "--json",
         ];
         if sync {
             args.push("--sync-integration");
@@ -834,8 +845,12 @@ fn reuse_refuses_a_stale_integration_even_with_unknown_provenance() {
     advance_main(tmp.path(), "remote-advance.txt");
     for sync in [false, true] {
         let mut args = vec![
-            "start", "--reuse", session.worktree_path.as_str(),
-            "--task", "stale follow-up", "--json",
+            "start",
+            "--reuse",
+            session.worktree_path.as_str(),
+            "--task",
+            "stale follow-up",
+            "--json",
         ];
         if sync {
             args.push("--sync-integration");

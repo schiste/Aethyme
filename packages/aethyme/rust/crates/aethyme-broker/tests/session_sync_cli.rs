@@ -251,7 +251,14 @@ fn an_offline_implicit_start_refuses_before_creating_a_worktree() {
     fixture.land_on_remote_only("other.txt", "moved on\n");
     let output = fixture.run_in(
         &fixture.repo,
-        &["start", "--task", "offline", "--short-name", "offline", "--json"],
+        &[
+            "start",
+            "--task",
+            "offline",
+            "--short-name",
+            "offline",
+            "--json",
+        ],
         &fixture.unreachable(),
     );
     assert!(!output.status.success());
@@ -283,7 +290,10 @@ fn an_offline_explicit_start_keeps_the_pin_and_reports_the_failed_fetch() {
     assert_eq!(started["start_base"]["fetched"], false);
     assert!(started["start_base"]["fetch_error"].is_string());
     assert_eq!(started["start_base"]["commit"], pinned);
-    assert_eq!(head(Path::new(started["worktree_path"].as_str().unwrap())), pinned);
+    assert_eq!(
+        head(Path::new(started["worktree_path"].as_str().unwrap())),
+        pinned
+    );
 }
 
 #[test]
