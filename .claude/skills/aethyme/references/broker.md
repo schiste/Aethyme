@@ -168,8 +168,15 @@ blocked.
    merging, marking a PR ready, or pushing any other ref. `broker status` and
    `broker doctor` report sessions with unpushed commits, and
    `aethyme broker finish` refuses to close a session while its commits are
-   unpushed. If the work should genuinely not be kept, say so explicitly with
-   `aethyme broker finish --session <id> --abandon --reason "<why>"`.
+   unpushed. `--abandon --reason "<why>"` relaxes that unpushed-work
+   check; it does not bypass landing checks for unrepresented commits.
+   For explicitly authorized retirement of superseded work, use
+   `aethyme broker finish close --session <id> --abandon --reason "<why>"`
+   to close the session while retaining its worktree and branch. Before
+   cleanup, inspect tracked, untracked and ignored files and verify a recovery
+   copy of any work to preserve. Then use the broker's cleanup workflow;
+   closing a session alone does not remove its checkout. Never manufacture
+   landing evidence for work that was superseded rather than merged.
    Each push also fetches the default branch and reports how far your branch
    is behind it and whether merging would conflict, with the command to catch
    up; `broker status` shows the same as `session.behind-main`. Catch up with
