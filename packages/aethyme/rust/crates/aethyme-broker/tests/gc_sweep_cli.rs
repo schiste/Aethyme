@@ -1289,7 +1289,12 @@ fn reclaim_confirmation_keeps_digest_mismatch_primary_when_snapshot_is_unreadabl
     let started = run(
         repo.path(),
         container.path(),
-        &["start", "--task", "bind digest mismatch test root", "--json"],
+        &[
+            "start",
+            "--task",
+            "bind digest mismatch test root",
+            "--json",
+        ],
     );
     assert!(
         started.status.success(),
