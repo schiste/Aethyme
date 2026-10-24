@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shlex
 import shutil
 import signal
 import stat
@@ -636,7 +637,7 @@ def setup_scenario(name, binary, git, output, receipts):
                 'main', str(remote))
         run_git(runner, git, repo, f'{name}:init-repo', 'init', '-q', '--template=', '-b', 'main')
         run_git(runner, git, repo, f'{name}:config-ssh', 'config', 'core.sshCommand',
-                str(tools / 'ssh'))
+                shlex.quote(str(tools / 'ssh')))
         run_git(runner, git, repo, f'{name}:config-identity-name', 'config', 'user.name',
                 'Concurrent Submit Fixture')
         run_git(runner, git, repo, f'{name}:config-identity-email', 'config', 'user.email',
