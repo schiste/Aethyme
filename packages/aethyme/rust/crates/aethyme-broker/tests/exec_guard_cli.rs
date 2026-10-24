@@ -651,16 +651,15 @@ fn an_early_returning_caller_can_query_the_same_receipt_through_completion() {
             String::from_utf8_lossy(&status.stderr)
         );
         let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-        if started.is_file() {
-            if let Some(receipt) = value["receipts"]
+        if started.is_file()
+            && let Some(receipt) = value["receipts"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|receipt| receipt["phase"] == "running")
-            {
-                assert!(exec.try_wait().unwrap().is_none());
-                break receipt["receipt_id"].as_str().unwrap().to_owned();
-            }
+        {
+            assert!(exec.try_wait().unwrap().is_none());
+            break receipt["receipt_id"].as_str().unwrap().to_owned();
         }
         if Instant::now() >= deadline {
             std::fs::write(&release, b"release").unwrap();
