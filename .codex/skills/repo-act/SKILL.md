@@ -26,6 +26,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Validate a command's complete action, arity, and required confirmation before
+  opening broker state or scanning host or worktree inventories. Add a CLI
+  regression that checks the structured refusal and confirms no repository or
+  host state or review snapshot was created; isolate optional telemetry so it
+  cannot invalidate that boundary check.
 - Before committing a substantive change, use colon-terminated section headings (`Problem:`, `Decision:`, `Rationale:`, `Validation:`) and require `aethyme repo lint-commit-message <file>` to report `Valid: yes`; the linter does not recognize bare headings.
 - For broker SQLite legacy-migration fixtures, restrict schema-downgrade
   helpers to disposable fixtures and refuse to drop later-schema authority
@@ -538,7 +543,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   hashes, and check symlink targets before cleanup. Keep regenerable build
   output separate from the evidence archive. For cache reclamation, test ordinary
   files, reserved-cache name collisions, and non-container roots separately; an
-  incomplete liveness inventory must retain cache candidates.
+  incomplete liveness inventory must retain cache candidates. On read-only stores,
+  use a non-mutating liveness snapshot and never turn ownership or observation
+  errors into an empty protection set. Include a real CLI case with both an active
+  session and a stored-active session whose derived status needs a transition;
+  verify the active candidate stays protected and the read-only command leaves the
+  transition row unchanged.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.

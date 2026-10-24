@@ -2463,6 +2463,11 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
+    let reclaim_action = if subcommand == "reclaim" {
+        Some(parse_reclaim_action(&parsed)?)
+    } else {
+        None
+    };
     surface_command_advisories(subcommand, &parsed);
     admit_session_holder(subcommand, &parsed)?;
 
@@ -2475,7 +2480,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "report" => run_report(parsed)?,
         "quality-report" => run_quality_report(parsed)?,
         "external-events" => run_external_events(parsed)?,
-        "reclaim" => run_reclaim(parsed)?,
+        "reclaim" => {
+            let action = reclaim_action.ok_or_else(|| {
+                UsageError::Message("reclaim action validation was skipped".into())
+            })?;
+            run_reclaim(parsed, action)?;
+        }
         "deliveries" => run_deliveries(parsed)?,
         "review" => run_review(parsed)?,
         "prepare" => run_prepare(parsed)?,
