@@ -126,16 +126,31 @@ fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
     let initial = git(&repo, &["rev-parse", "HEAD"]);
     git(
         &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/acme/product.git",
-        ],
+        &["remote", "add", "origin", "git@github.com:acme/product.git"],
     );
     git(&repo, &["update-ref", "refs/remotes/origin/main", &initial]);
     git(&repo, &["config", "branch.main.remote", "origin"]);
     git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+
+    let remote = temp.path().join("origin.git");
+    git(
+        &repo,
+        &["clone", "--bare", "-q", ".", remote.to_str().unwrap()],
+    );
+    let ssh = temp.path().join("fixture-ssh");
+    write_executable(
+        &ssh,
+        r#"#!/bin/sh
+case "$*" in
+  *git-upload-pack*) exec git-upload-pack "$(dirname "$0")/origin.git" ;;
+  *git-receive-pack*) exec git-receive-pack "$(dirname "$0")/origin.git" ;;
+esac
+exit 64
+"#,
+    );
+    let quoted_ssh = ssh.to_str().unwrap().replace('\'', "'\\''");
+    let ssh_command = format!("sh '{quoted_ssh}'");
+    git(&repo, &["config", "core.sshCommand", &ssh_command]);
 
     let mut broker = common::open_fixture_broker(&repo, temp.path()).unwrap();
     let session = broker

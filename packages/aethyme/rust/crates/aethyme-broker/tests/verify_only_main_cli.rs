@@ -22,9 +22,10 @@ use aethyme_broker::{Broker, BrokerOpenOptions, BrokerStore, GitRepo, NewSession
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
 const FAKE_SSH: &str = r#"#!/bin/sh
+remote=${AETHYME_TEST_GIT_REMOTE:-$(dirname "$0")/../remote.git}
 case "$*" in
-  *git-upload-pack*) exec git-upload-pack "$AETHYME_TEST_GIT_REMOTE" ;;
-  *git-receive-pack*) exec git-receive-pack "$AETHYME_TEST_GIT_REMOTE" ;;
+  *git-upload-pack*) exec git-upload-pack "$remote" ;;
+  *git-receive-pack*) exec git-receive-pack "$remote" ;;
 esac
 exit 64
 "#;
@@ -104,14 +105,10 @@ impl Fixture {
             &repo,
             &["remote", "add", "origin", "git@github.com:acme/project.git"],
         );
-        git(
-            &repo,
-            &[
-                "config",
-                "core.sshCommand",
-                bin.join("ssh").to_str().unwrap(),
-            ],
-        );
+        let ssh = bin.join("ssh");
+        let quoted_ssh = ssh.to_str().unwrap().replace('\'', "'\\''");
+        let ssh_command = format!("sh '{quoted_ssh}'");
+        git(&repo, &["config", "core.sshCommand", &ssh_command]);
         let fixture = Self {
             tmp,
             repo,

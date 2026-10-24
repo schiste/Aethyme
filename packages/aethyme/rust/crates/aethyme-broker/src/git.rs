@@ -2335,6 +2335,26 @@ impl GitRepo {
         Some((upstream, commit))
     }
 
+    /// Whether remote-default configuration exists even when its fetched ref
+    /// is missing. Unlike `tracking_upstream`, this needs no upstream object.
+    pub(crate) fn has_configured_remote_default(&self) -> Result<bool, GitError> {
+        if self.symbolic_ref("refs/remotes/origin/HEAD").is_some() {
+            return Ok(true);
+        }
+        let branch = self.current_branch()?;
+        let reference = format!("refs/heads/{branch}");
+        let upstream = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(upstream)",
+                &reference,
+            ],
+        )?;
+        Ok(upstream.starts_with("refs/remotes/"))
+    }
+
     /// The fetched default branch, as `(<remote>/<branch>, commit)`.
     ///
     /// Prefers `refs/remotes/origin/HEAD`, which names the remote's default

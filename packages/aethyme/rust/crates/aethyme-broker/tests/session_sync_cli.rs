@@ -245,12 +245,11 @@ fn start_begins_from_a_commit_pushed_after_the_last_fetch() {
 }
 
 #[test]
-fn an_offline_start_uses_the_cached_copy_and_says_how_old_it_is() {
+fn an_offline_implicit_start_refuses_before_creating_a_worktree() {
     let fixture = Fixture::new();
-    let cached = git_output(&fixture.repo, &["rev-parse", "origin/main"]);
+    let before = git_output(&fixture.repo, &["worktree", "list", "--porcelain"]);
     fixture.land_on_remote_only("other.txt", "moved on\n");
-
-    let started = json(&fixture.run_in(
+    let output = fixture.run_in(
         &fixture.repo,
         &[
             "start",
@@ -261,13 +260,40 @@ fn an_offline_start_uses_the_cached_copy_and_says_how_old_it_is() {
             "--json",
         ],
         &fixture.unreachable(),
-    ));
+    );
+    assert!(!output.status.success());
+    let error = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(error.contains("not freshly confirmed"), "{error}");
+    assert!(error.contains("--base <commit>"), "{error}");
+    assert_eq!(
+        git_output(&fixture.repo, &["worktree", "list", "--porcelain"]),
+        before,
+        "failed refresh must not allocate another checkout"
+    );
+}
 
-    let base = &started["start_base"];
-    assert_eq!(base["fetched"], false, "{started}");
-    assert!(base["fetch_error"].is_string(), "{started}");
-    assert!(base["cached_ref_age_seconds"].is_u64(), "{started}");
-    assert_eq!(base["commit"], cached, "{started}");
+#[test]
+fn an_offline_explicit_start_keeps_the_pin_and_reports_the_failed_fetch() {
+    let fixture = Fixture::new();
+    let pinned = git_output(&fixture.repo, &["rev-parse", "origin/main"]);
+    fixture.land_on_remote_only("other.txt", "moved on\n");
+    let started = json(&fixture.run_in(
+        &fixture.repo,
+        &["start", "--task", "pinned", "--base", &pinned, "--json"],
+        &fixture.unreachable(),
+    ));
+    assert_eq!(started["start_base"]["evidence"], "explicit_base");
+    assert_eq!(started["start_base"]["fetched"], false);
+    assert!(started["start_base"]["fetch_error"].is_string());
+    assert_eq!(started["start_base"]["commit"], pinned);
+    assert_eq!(
+        head(Path::new(started["worktree_path"].as_str().unwrap())),
+        pinned
+    );
 }
 
 #[test]
