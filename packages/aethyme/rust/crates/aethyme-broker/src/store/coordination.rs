@@ -1185,6 +1185,24 @@ impl BrokerStore {
             })
     }
 
+    /// Indexed lookup without scanning historical sessions or watches.
+    pub(crate) fn live_pull_request_watch_for_identity(
+        &self,
+        canonical_repository: &str,
+        pr_number: i64,
+    ) -> Result<Option<PullRequestWatch>, BrokerError> {
+        self.conn
+            .query_row(
+                &(PULL_REQUEST_WATCH_SELECT.to_owned()
+                    + " WHERE provider = 'github' AND canonical_repository = ?1 \
+                   AND pr_number = ?2 AND status IN ('active', 'paused')"),
+                params![canonical_repository, pr_number],
+                pull_request_watch_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
     pub fn pull_request_watch(&self, id: i64) -> Result<Option<PullRequestWatch>, BrokerError> {
         self.conn
             .query_row(

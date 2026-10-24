@@ -1025,6 +1025,12 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             out!("  Catch up with: {command}");
         }
     }
+    if let Some(id) = report.pr_watch_id {
+        out!("  PR watch #{id} is associated with this session");
+    }
+    if let Some(note) = &report.pr_watch_note {
+        out!("  Warning: {note}");
+    }
     if let Some(note) = &report.default_branch_note {
         out!("  Note: {note}");
     }
@@ -1648,6 +1654,8 @@ mod review_on_push_tests {
             duplicate_work: Vec::new(),
             default_branch: None,
             default_branch_note: None,
+            pr_watch_id: None,
+            pr_watch_note: None,
             pr_size: None,
             review_run: None,
             repository: "acme/product".into(),
