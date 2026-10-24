@@ -92,6 +92,11 @@ fn startup_maintenance_uses_the_broker_captured_storage_context() {
         std::fs::create_dir_all(entry).expect("cache entry directory");
         std::fs::write(entry.join("payload"), b"cache data").expect("cache payload");
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    publish_captured_cache_rotation(
+        &private_effective_root,
+        &private_state.join("host-resources.db"),
+    );
 
     let output = Command::new(std::env::current_exe().expect("test executable"))
         .args([
@@ -1136,6 +1141,11 @@ fn run_captured_startup_child() {
     std::fs::create_dir_all(&private_entry).expect("reseed captured preparation cache");
     std::fs::write(private_entry.join("payload"), b"worker cache data")
         .expect("seed worker cache entry");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    publish_captured_cache_rotation(
+        &private_effective_root,
+        &private_state.join("host-resources.db"),
+    );
     assert!(
         poisoned_state.join("host-resources.db").is_file(),
         "the poison resource database is a seeded sentinel"
@@ -1347,6 +1357,29 @@ fn run_captured_context_worker() {
         ),
         crate::HostLeaseState::Quarantined
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_captured_cache_rotation(cache_root: &Path, resource_db: &Path) {
+    let repository = "a".repeat(64);
+    let store = cache_root.join(&repository);
+    let root_identity =
+        crate::preparation::rotation_debt::DirectoryIdentity::capture(cache_root).unwrap();
+    let debt = crate::preparation::rotation_debt::RotationDebt::new(
+        &repository,
+        &crate::preparation::rotation_debt::new_transaction_id(),
+        root_identity.clone(),
+        crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+    )
+    .unwrap();
+    crate::preparation::rotation_journal::publish(
+        resource_db,
+        cache_root,
+        &root_identity.encode().unwrap(),
+        &repository,
+        &crate::preparation::rotation_debt::encode(&debt).unwrap(),
+    )
+    .unwrap();
 }
 
 fn preparation_entry(host_state: &Path) -> PathBuf {

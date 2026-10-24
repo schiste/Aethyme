@@ -28,7 +28,9 @@ pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 3;
 pub const STORAGE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 
 const DAY_MS: i64 = 86_400_000;
+#[cfg(test)]
 const PREPARATION_SWEEP_MAX_DISCOVERY_PATHS: usize = 4096;
+#[cfg(test)]
 const PREPARATION_SWEEP_MAX_MARKER_BYTES: u64 = 64 * 1024;
 const PREPARATION_RETIRED_STORE_MAX_KEYS: usize = 4096;
 const PREPARATION_ROTATION_DEBT_MAX_ENTRIES: usize = 100_000;
@@ -1481,6 +1483,15 @@ pub(crate) struct PreparationCacheSweepReport {
     /// interrupted or failed removals that must resume at the same tree.
     pub(crate) filesystem_entries_reclaimed: usize,
     pub(crate) complete: bool,
+    pub(crate) coverage_deferral: Option<PreparationCacheCoverageDeferral>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparationCacheCoverageDeferral {
+    HostConsumersNotEnumerated,
+    ExplicitRootConsumersNotEnumerated,
+    WorktreeVolumeConsumersNotProven,
+    CacheBindingsNotFullyEnumerated,
 }
 
 impl PreparationCacheSweepReport {
@@ -1490,6 +1501,7 @@ impl PreparationCacheSweepReport {
             bytes_reclaimed: 0,
             filesystem_entries_reclaimed: 0,
             complete: true,
+            coverage_deferral: None,
         }
     }
 
@@ -1512,6 +1524,7 @@ fn preparation_cache_sweep_report(
         bytes_reclaimed,
         filesystem_entries_reclaimed,
         complete,
+        coverage_deferral: None,
     }
 }
 
@@ -1614,6 +1627,40 @@ fn preparation_rotation_journal_root_identity(
     Ok(identity)
 }
 
+// Absence or an observed empty directory needs no consumer census: there
+// are no generic entries to prune. This never authorizes removal and must
+// not treat a failed or truncated inventory as empty.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn preparation_cache_is_observed_empty(
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    deadline: std::time::Instant,
+) -> bool {
+    if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+        return false;
+    }
+    let before = match preparation_rotation_journal_root_identity(
+        cache_root,
+        expected_root_identity,
+        deadline,
+    ) {
+        Ok(identity) => identity,
+        Err(()) => return false,
+    };
+    if before.is_some() {
+        let Ok(mut entries) = std::fs::read_dir(cache_root) else {
+            return false;
+        };
+        if entries.next().is_some() {
+            return false;
+        }
+    }
+    root_binding.is_none_or(|binding| binding.validate().is_ok())
+        && preparation_rotation_journal_root_identity(cache_root, expected_root_identity, deadline)
+            == Ok(before)
+}
+
 /// Test adapter retaining the historical tuple result for fixture assertions.
 #[cfg(test)]
 fn sweep_preparation_cache_at(
@@ -1697,6 +1744,7 @@ pub(crate) fn sweep_preparation_cache_for_roots_with_binding(
 
 /// Sweep every captured preparation-cache namespace while proving liveness
 /// against the same complete set of marker-bound worktree-volume roots.
+#[cfg(test)]
 pub(crate) fn sweep_preparation_caches_for_roots_with_bindings(
     main_root: &Path,
     worktree_roots: &[PathBuf],
@@ -1715,6 +1763,7 @@ pub(crate) fn sweep_preparation_caches_for_roots_with_bindings(
         bytes_reclaimed: 0,
         filesystem_entries_reclaimed: 0,
         complete: true,
+        coverage_deferral: None,
     };
     for binding in bindings {
         if check_preparation_sweep_deadline(deadline).is_err() || binding.validate().is_err() {
@@ -1749,6 +1798,73 @@ pub(crate) fn sweep_preparation_caches_for_roots_with_bindings(
     total
 }
 
+/// Recover independently witnessed cache-rotation work without treating the
+/// caller's repository roots as a complete consumer inventory for the cache
+/// namespaces. Root-plan or binding-discovery failure leaves known bindings
+/// usable for recovery, but keeps the aggregate result incomplete.
+pub(crate) fn recover_preparation_caches_for_bindings(
+    bindings: &[crate::broker::PreparationCacheRootBinding],
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+    bindings_fully_enumerated: bool,
+) -> PreparationCacheSweepReport {
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return PreparationCacheSweepReport::incomplete_empty();
+    }
+    let mut total = PreparationCacheSweepReport::complete_empty();
+    if bindings.is_empty() {
+        total.complete = false;
+        total.coverage_deferral =
+            Some(PreparationCacheCoverageDeferral::CacheBindingsNotFullyEnumerated);
+        return total;
+    }
+    for binding in bindings {
+        if check_preparation_sweep_deadline(deadline).is_err() {
+            total.complete = false;
+            break;
+        }
+        if binding.validate().is_err() {
+            total.complete = false;
+            continue;
+        }
+        let reason = if binding
+            .root_guard
+            .as_ref()
+            .is_some_and(|guard| guard.placement_root.is_some())
+        {
+            PreparationCacheCoverageDeferral::WorktreeVolumeConsumersNotProven
+        } else if binding.instance_nonce.is_some() {
+            PreparationCacheCoverageDeferral::ExplicitRootConsumersNotEnumerated
+        } else {
+            PreparationCacheCoverageDeferral::HostConsumersNotEnumerated
+        };
+        let report = sweep_preparation_cache_recovery_only(
+            &binding.path,
+            binding.identity.as_deref(),
+            Some(binding),
+            resource_db_path,
+            deadline,
+            reason,
+        );
+        total.entries_removed = total.entries_removed.saturating_add(report.entries_removed);
+        total.bytes_reclaimed = total.bytes_reclaimed.saturating_add(report.bytes_reclaimed);
+        total.filesystem_entries_reclaimed = total
+            .filesystem_entries_reclaimed
+            .saturating_add(report.filesystem_entries_reclaimed);
+        total.complete &= report.complete;
+        if total.coverage_deferral.is_none() {
+            total.coverage_deferral = report.coverage_deferral;
+        }
+    }
+    if !bindings_fully_enumerated {
+        total.complete = false;
+        total.coverage_deferral =
+            Some(PreparationCacheCoverageDeferral::CacheBindingsNotFullyEnumerated);
+    }
+    total
+}
+
+#[cfg(test)]
 fn sweep_preparation_cache_with_discovery(
     cache_root: &Path,
     expected_root_identity: Option<&[u8]>,
@@ -1768,15 +1884,63 @@ fn sweep_preparation_cache_with_discovery(
     )
 }
 
+#[cfg(test)]
 fn sweep_preparation_cache_with_discovery_and_observer(
     cache_root: &Path,
     expected_root_identity: Option<&[u8]>,
     root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
     resource_db_path: &Path,
     deadline: std::time::Instant,
-    mut discover_live_roots: impl FnMut(std::time::Instant) -> Result<Vec<PathBuf>, StorageError>,
+    discover_live_roots: impl FnMut(std::time::Instant) -> Result<Vec<PathBuf>, StorageError>,
     before_mutation_observer: &mut impl FnMut() -> std::io::Result<()>,
 ) -> PreparationCacheSweepReport {
+    sweep_preparation_cache_with_coverage_and_observer(
+        cache_root,
+        expected_root_identity,
+        root_binding,
+        resource_db_path,
+        deadline,
+        (None, discover_live_roots),
+        before_mutation_observer,
+    )
+}
+
+fn sweep_preparation_cache_recovery_only(
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+    reason: PreparationCacheCoverageDeferral,
+) -> PreparationCacheSweepReport {
+    sweep_preparation_cache_with_coverage_and_observer(
+        cache_root,
+        expected_root_identity,
+        root_binding,
+        resource_db_path,
+        deadline,
+        (Some(reason), |_| {
+            Err(StorageError::Unavailable {
+                reason: "consumer inventory is incomplete".into(),
+            })
+        }),
+        &mut || Ok(()),
+    )
+}
+
+fn sweep_preparation_cache_with_coverage_and_observer(
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+    coverage: (
+        Option<PreparationCacheCoverageDeferral>,
+        impl FnMut(std::time::Instant) -> Result<Vec<PathBuf>, StorageError>,
+    ),
+    before_mutation_observer: &mut impl FnMut() -> std::io::Result<()>,
+) -> PreparationCacheSweepReport {
+    let (coverage_deferral, mut discover_live_roots) = coverage;
     let mut removed = 0_usize;
     let mut bytes = 0_u64;
     let mut filesystem_entries_reclaimed = 0_usize;
@@ -2109,6 +2273,31 @@ fn sweep_preparation_cache_with_discovery_and_observer(
         }
     }
 
+    if let Some(reason) = coverage_deferral {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let observed_empty = preparation_cache_is_observed_empty(
+            cache_root,
+            expected_root_identity,
+            root_binding,
+            deadline,
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let observed_empty = false;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(lap) = rotation_journal_lap.as_mut() {
+            // Recovery settlement is independent of the consumer census.
+            // Nonempty unwitnessed cache content remains deferred.
+            lap.finish(complete);
+        }
+        return PreparationCacheSweepReport {
+            entries_removed: removed,
+            bytes_reclaimed: bytes,
+            filesystem_entries_reclaimed,
+            complete: complete && observed_empty,
+            coverage_deferral: (!observed_empty).then_some(reason),
+        };
+    }
+
     let live_roots = match discover_live_roots(deadline) {
         Ok(roots) => roots,
         Err(_) => {
@@ -2208,6 +2397,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                 bytes_reclaimed: bytes,
                 filesystem_entries_reclaimed,
                 complete: false,
+                coverage_deferral: None,
             };
         };
         let Some((lease_repository, retired)) =
@@ -2247,6 +2437,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
+                        coverage_deferral: None,
                     };
                 }
                 Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
@@ -2255,6 +2446,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
+                        coverage_deferral: None,
                     };
                 }
             };
@@ -2373,6 +2565,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
+                        coverage_deferral: None,
                     };
                 }
             }
@@ -2396,6 +2589,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                     bytes_reclaimed: bytes,
                     filesystem_entries_reclaimed,
                     complete: false,
+                    coverage_deferral: None,
                 };
             }
             let Ok(entry) = entry else {
@@ -2404,6 +2598,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                     bytes_reclaimed: bytes,
                     filesystem_entries_reclaimed,
                     complete: false,
+                    coverage_deferral: None,
                 };
             };
             let Ok(file_type) = entry.file_type() else {
@@ -2412,6 +2607,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                     bytes_reclaimed: bytes,
                     filesystem_entries_reclaimed,
                     complete: false,
+                    coverage_deferral: None,
                 };
             };
             if file_type.is_symlink() || !file_type.is_dir() {
@@ -2446,6 +2642,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
+                        coverage_deferral: None,
                     };
                 }
                 Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
@@ -2454,6 +2651,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
+                        coverage_deferral: None,
                     };
                 }
             };
@@ -2587,6 +2785,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
+                        coverage_deferral: None,
                     };
                 }
             }
@@ -2603,6 +2802,7 @@ fn sweep_preparation_cache_with_discovery_and_observer(
         bytes_reclaimed: bytes,
         filesystem_entries_reclaimed,
         complete,
+        coverage_deferral: None,
     }
 }
 
@@ -2964,6 +3164,7 @@ fn discover_preparation_live_roots(
 /// Broker's captured storage context. Each candidate is the repository root
 /// that carries the ownership marker; unlike the environment-default scanner,
 /// no parent directory is re-resolved from process state.
+#[cfg(test)]
 fn discover_preparation_live_roots_from_roots(
     main_root: &Path,
     worktree_roots: &[PathBuf],
@@ -3114,6 +3315,7 @@ fn current_preparation_keys(
     Ok(keys)
 }
 
+#[cfg(test)]
 fn read_worktree_marker_for_liveness(
     root: &Path,
     deadline: std::time::Instant,
@@ -6275,6 +6477,267 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn publish_external_rotation_journal_debt(
+        cache_root: &Path,
+        resource_db_path: &Path,
+        repository: &str,
+    ) -> Vec<u8> {
+        let store = cache_root.join(repository);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("old-cache"), b"interrupted before recovery").unwrap();
+        let root_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(cache_root).unwrap();
+        let debt = crate::preparation::rotation_debt::RotationDebt::new(
+            repository,
+            &crate::preparation::rotation_debt::new_transaction_id(),
+            root_identity.clone(),
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        let payload = crate::preparation::rotation_debt::encode(&debt).unwrap();
+        let encoded_root_identity = root_identity.encode().unwrap();
+        crate::preparation::rotation_journal::publish(
+            resource_db_path,
+            cache_root,
+            &encoded_root_identity,
+            repository,
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            crate::preparation::rotation_debt::read(cache_root, repository)
+                .unwrap()
+                .is_none(),
+            "fixture represents a crash after external publication but before the in-cache witness"
+        );
+        encoded_root_identity
+    }
+
+    fn unguarded_host_cache_binding(
+        cache_root: &Path,
+    ) -> crate::broker::PreparationCacheRootBinding {
+        crate::broker::PreparationCacheRootBinding {
+            path: cache_root.to_path_buf(),
+            identity: None,
+            instance_nonce: None,
+            root_guard: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_only_completes_observed_empty_or_absent_cache_without_creating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let resource_db = root.join("host-resources.db");
+        let cache_root = root.join("cache");
+        for present in [false, true] {
+            if present {
+                std::fs::create_dir(&cache_root).unwrap();
+            }
+            let binding = unguarded_host_cache_binding(&cache_root);
+            let report = recover_preparation_caches_for_bindings(
+                &[binding],
+                &resource_db,
+                std::time::Instant::now() + Duration::from_secs(5),
+                true,
+            );
+            assert!(report.complete, "present={present}: {report:?}");
+            assert_eq!(report.coverage_deferral, None);
+            assert_eq!(report.filesystem_entries_reclaimed, 0);
+            assert_eq!(cache_root.exists(), present);
+            assert!(!resource_db.exists());
+        }
+    }
+
+    #[test]
+    fn recovery_only_retains_other_repository_and_same_origin_clone_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let cache_root = root.join("preparation-cache");
+        let same_origin_key = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("aaaaaaaaaaaa");
+        let other_repository_key = cache_root.join("b".repeat(64)).join("bbbbbbbbbbbb");
+        let retired = cache_root.join(format!("{TEST_PREPARATION_REPOSITORY}.retired"));
+        for entry in [&same_origin_key, &other_repository_key, &retired] {
+            std::fs::create_dir_all(entry).unwrap();
+            std::fs::write(
+                entry.join("cache.bin"),
+                b"another consumer still needs this",
+            )
+            .unwrap();
+        }
+        let binding = unguarded_host_cache_binding(&cache_root);
+        let resource_db_path = test_host_resource_db(&root);
+        let report = recover_preparation_caches_for_bindings(
+            &[binding],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
+        );
+        assert!(!report.complete, "known roots do not prove all consumers");
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.filesystem_entries_reclaimed, 0);
+        assert_eq!(
+            report.coverage_deferral,
+            Some(PreparationCacheCoverageDeferral::HostConsumersNotEnumerated)
+        );
+        for entry in [&same_origin_key, &other_repository_key, &retired] {
+            assert_eq!(
+                std::fs::read(entry.join("cache.bin")).unwrap(),
+                b"another consumer still needs this"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_only_acknowledges_completed_journal_without_consumer_pruning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let cache_root = root.join("preparation-cache");
+        let resource_db_path = test_host_resource_db(&root);
+        let identity = publish_external_rotation_journal_debt(
+            &cache_root,
+            &resource_db_path,
+            TEST_PREPARATION_REPOSITORY,
+        );
+        let protected = cache_root.join("b".repeat(64)).join("bbbbbbbbbbbb");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("payload"), b"live elsewhere").unwrap();
+        let report = recover_preparation_caches_for_bindings(
+            &[unguarded_host_cache_binding(&cache_root)],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            false,
+        );
+        assert!(
+            !report.complete,
+            "binding discovery and consumer coverage remain incomplete"
+        );
+        assert!(
+            report.filesystem_entries_reclaimed > 0,
+            "known binding recovery must still progress"
+        );
+        assert!(
+            !cache_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("old-cache")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(protected.join("payload")).unwrap(),
+            b"live elsewhere"
+        );
+        assert!(
+            matches!(
+                crate::preparation::rotation_journal::probe(
+                    &resource_db_path,
+                    &cache_root,
+                    Some(&identity)
+                )
+                .unwrap(),
+                Some(crate::preparation::rotation_journal::JournalProbe::NoDebt)
+            ),
+            "complete recovery must acknowledge its lap independently of consumer deferral"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_only_busy_journal_stays_pending_then_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let cache_root = root.join("preparation-cache");
+        let resource_db_path = test_host_resource_db(&root);
+        let identity = publish_external_rotation_journal_debt(
+            &cache_root,
+            &resource_db_path,
+            TEST_PREPARATION_REPOSITORY,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let request =
+            preparation_cache_lease_request(TEST_PREPARATION_REPOSITORY, &cache_root, deadline)
+                .unwrap();
+        let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
+        let grant = writer.acquire(&request).unwrap();
+        let binding = unguarded_host_cache_binding(&cache_root);
+        let blocked = recover_preparation_caches_for_bindings(
+            std::slice::from_ref(&binding),
+            &resource_db_path,
+            deadline,
+            true,
+        );
+        assert!(!blocked.complete);
+        assert_eq!(blocked.filesystem_entries_reclaimed, 0);
+        assert!(
+            cache_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("old-cache")
+                .is_file()
+        );
+        assert!(matches!(
+            crate::preparation::rotation_journal::probe(
+                &resource_db_path,
+                &cache_root,
+                Some(&identity)
+            )
+            .unwrap(),
+            Some(crate::preparation::rotation_journal::JournalProbe::Pending)
+        ));
+        writer
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+        let recovered = recover_preparation_caches_for_bindings(
+            &[binding],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
+        );
+        assert!(!recovered.complete);
+        assert!(recovered.filesystem_entries_reclaimed > 0);
+        assert!(matches!(
+            crate::preparation::rotation_journal::probe(
+                &resource_db_path,
+                &cache_root,
+                Some(&identity)
+            )
+            .unwrap(),
+            Some(crate::preparation::rotation_journal::JournalProbe::NoDebt)
+        ));
+    }
+
+    #[test]
+    fn recovery_only_empty_or_expired_inventory_is_incomplete_without_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let resource_db_path = test_host_resource_db(&root);
+        let empty = recover_preparation_caches_for_bindings(
+            &[],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
+        );
+        assert!(!empty.complete);
+        assert_eq!(empty.filesystem_entries_reclaimed, 0);
+        let cache_root = root.join("preparation-cache");
+        let expired = recover_preparation_caches_for_bindings(
+            &[unguarded_host_cache_binding(&cache_root)],
+            &resource_db_path,
+            std::time::Instant::now(),
+            true,
+        );
+        assert!(!expired.complete);
+        assert_eq!(expired.filesystem_entries_reclaimed, 0);
+        assert!(!cache_root.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn initialized_storage_cache_root_binding(
         cache_root: &Path,
         resource_db_path: &Path,
@@ -6334,6 +6797,48 @@ mod tests {
                 .into_owned(),
         );
         std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_only_invalid_binding_does_not_block_another_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let resource_db_path = test_host_resource_db(&root);
+        let invalid_root = root.join("invalid-cache");
+        std::fs::create_dir_all(&invalid_root).unwrap();
+        let invalid = initialized_storage_cache_root_binding(&invalid_root, &resource_db_path);
+        let protected = invalid_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("aaaaaaaaaaaa");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("payload"), b"invalid authority").unwrap();
+        change_cache_root_coordinator(&invalid);
+        assert!(invalid.validate().is_err());
+        let valid_root = root.join("valid-cache");
+        publish_external_rotation_journal_debt(
+            &valid_root,
+            &resource_db_path,
+            TEST_PREPARATION_REPOSITORY,
+        );
+        let report = recover_preparation_caches_for_bindings(
+            &[invalid, unguarded_host_cache_binding(&valid_root)],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
+        );
+        assert!(!report.complete);
+        assert!(report.filesystem_entries_reclaimed > 0);
+        assert!(
+            !valid_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("old-cache")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(protected.join("payload")).unwrap(),
+            b"invalid authority"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
