@@ -30,6 +30,10 @@ pub enum DuplicateWorkReason {
     /// Both tasks name the same PR number. A weaker signal: a task can
     /// mention a PR it does not change.
     TaskMentionsPr,
+    /// Both task descriptions explicitly name a common relative file path.
+    TaskMentionsPath,
+    /// Both descriptions have the same bounded, normalized multiword text.
+    SameTask,
 }
 
 impl DuplicateWorkReason {
@@ -38,6 +42,8 @@ impl DuplicateWorkReason {
             Self::SameBranch => "same_branch",
             Self::SamePr => "same_pr",
             Self::TaskMentionsPr => "task_mentions_pr",
+            Self::TaskMentionsPath => "task_mentions_path",
+            Self::SameTask => "same_task",
         }
     }
 
@@ -48,6 +54,8 @@ impl DuplicateWorkReason {
             (Self::SamePr, None) => "works on the same pull request".into(),
             (Self::TaskMentionsPr, Some(pr)) => format!("has a task that also names PR #{pr}"),
             (Self::TaskMentionsPr, None) => "has a task that names the same PR".into(),
+            (Self::TaskMentionsPath, _) => "has a task naming a common file path".into(),
+            (Self::SameTask, _) => "has the same normalized task description".into(),
         }
     }
 }
@@ -121,12 +129,52 @@ struct Target {
     /// listing `broker push` records. `status` never asks GitHub.
     own_pr: Option<i64>,
     task_prs: BTreeSet<i64>,
+    task_paths: BTreeSet<String>,
+    task_words: Vec<String>,
+}
+
+// Bound text work independently of user-controlled description length. This
+// is lexical evidence only: never infer incident ownership or block an edit.
+fn task_evidence(task: &str) -> (BTreeSet<String>, Vec<String>) {
+    let mut characters = task.chars();
+    let bounded: String = characters.by_ref().take(8192).collect();
+    let truncated = characters.next().is_some();
+    let paths = bounded
+        .split_whitespace()
+        .filter_map(|word| {
+            let path = word.trim_matches(['`', '\'', '"', '(', ')', '[', ']', ',', ';', ':']);
+            let path = path.strip_prefix("./").unwrap_or(path);
+            if !path.contains('/')
+                || path.contains("://")
+                || path.starts_with('/')
+                || path.contains('\\')
+                || path.split('/').any(|part| matches!(part, ".." | "." | ""))
+                || !path.rsplit('/').next().is_some_and(|name| {
+                    name.split_once('.')
+                        .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+                })
+            {
+                return None;
+            }
+            Some(path.to_owned())
+        })
+        .take(64)
+        .collect();
+    let words = bounded
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    (paths, if truncated { Vec::new() } else { words })
 }
 
 fn duplicate_target(session: &Session, prs_by_head: &BTreeMap<String, i64>) -> Target {
+    let (task_paths, task_words) = task_evidence(session.task.as_deref().unwrap_or_default());
     Target {
         branch: session.branch.clone(),
         own_pr: prs_by_head.get(&session.branch).copied(),
+        task_paths,
+        task_words,
         task_prs: session
             .task
             .as_deref()
@@ -175,7 +223,7 @@ impl Broker {
                     } else {
                         StatusAdviceSeverity::Info
                     },
-                    reason: "two sessions appear to work on the same pull request or branch",
+                    reason: "sessions share a branch, PR, explicit task path or normalized task",
                     summary: format!(
                         "session {} ({}) and session {} ({}): session {} {}; their changes will \
                          keep conflicting until one of them stops or they divide the work",
@@ -259,10 +307,16 @@ fn compare(mine: &Target, theirs: &Target) -> Option<(DuplicateWorkReason, Optio
     {
         return Some((DuplicateWorkReason::SamePr, Some(pr)));
     }
-    mine.task_prs
-        .intersection(&theirs.task_prs)
-        .next()
-        .map(|pr| (DuplicateWorkReason::TaskMentionsPr, Some(*pr)))
+    if let Some(pr) = mine.task_prs.intersection(&theirs.task_prs).next() {
+        return Some((DuplicateWorkReason::TaskMentionsPr, Some(*pr)));
+    }
+    if !mine.task_paths.is_disjoint(&theirs.task_paths) {
+        return Some((DuplicateWorkReason::TaskMentionsPath, None));
+    }
+    if mine.task_words.len() >= 4 && mine.task_words == theirs.task_words {
+        return Some((DuplicateWorkReason::SameTask, None));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -293,7 +347,10 @@ mod tests {
     }
 
     fn target(branch: &str, own_pr: Option<i64>, task: &str) -> Target {
+        let (task_paths, task_words) = task_evidence(task);
         Target {
+            task_paths,
+            task_words,
             branch: branch.into(),
             own_pr,
             task_prs: pr_numbers_in_task(task),
@@ -326,6 +383,52 @@ mod tests {
             compare(&x, &y),
             Some((DuplicateWorkReason::TaskMentionsPr, Some(1122)))
         );
+    }
+
+    #[test]
+    fn task_paths_and_exact_normalized_text_work_without_a_graph_or_pr() {
+        let a = target("agent/a", None, "repair `config/decoupling/inventory.json`");
+        let b = target(
+            "agent/b",
+            None,
+            "Regenerate ./config/decoupling/inventory.json",
+        );
+        assert_eq!(
+            compare(&a, &b),
+            Some((DuplicateWorkReason::TaskMentionsPath, None))
+        );
+        let c = target("agent/c", None, "Repair broken default branch gates!");
+        let d = target("agent/d", None, "repair BROKEN default branch gates");
+        assert_eq!(compare(&c, &d), Some((DuplicateWorkReason::SameTask, None)));
+        assert_eq!(
+            compare(
+                &target("a", None, "fix tests"),
+                &target("b", None, "Fix tests")
+            ),
+            None
+        );
+        assert_eq!(
+            compare(&a, &target("b", None, "repair config/other/inventory.json")),
+            None
+        );
+        assert_eq!(
+            compare(
+                &a,
+                &target(
+                    "b",
+                    None,
+                    "see https://host/config/decoupling/inventory.json"
+                )
+            ),
+            None
+        );
+        assert!(
+            task_evidence("../secret.txt /absolute/file.rs")
+                .0
+                .is_empty()
+        );
+        let long = format!("{} hidden/source.rs", "x ".repeat(8192));
+        assert!(task_evidence(&long).0.is_empty());
     }
 
     #[test]
