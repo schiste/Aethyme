@@ -5,7 +5,8 @@ fn write_session_base_observation(
     session_id: i64,
     value: &crate::broker::SessionBaseObservation,
 ) -> Result<(), BrokerError> {
-    let value = serde_json::to_string(value)?;
+    let value = serde_json::to_string(value)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     tx.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

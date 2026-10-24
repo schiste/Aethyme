@@ -6736,7 +6736,7 @@ impl Broker {
                 };
                 return Err(BrokerOpError::ReuseSyncNotFastForward {
                     session_head: before_head,
-                    integration_head,
+                    integration_head: integration_head.to_owned(),
                     relation: relation.as_str(),
                 });
             }
