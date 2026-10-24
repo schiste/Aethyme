@@ -1162,7 +1162,7 @@ fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
 fn adopt_reuse_sync_reports_an_already_current_checkout() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    git(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+    set_integration_at_head(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
     let head = rev(tmp.path(), "HEAD");
