@@ -122,6 +122,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   jobs continue. Capture raw output to a file and strip control sequences before
   display. If gh refuses escape bytes, use `--allow-escape-sequences` only for
   that file capture.
+- For formatter failures, use the complete formatter output or, when available,
+  a CI-generated patch bound to the exact head. Do not reconstruct edits from
+  truncated excerpts or treat `git diff --check` as formatter validation; during
+  a local-check pause, use that remote evidence and rerun remote checks on the
+  corrected head.
 - When reusing a CI build cache, compare the producer and consumer fingerprints,
   including toolchain, lockfiles and environment variables, then confirm the log
   shows a cache restore. A matching shared key alone does not prove reuse.
@@ -161,9 +166,18 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   syntactically valid truncated prefix. For command-specific field protocols,
   capture one bounded sample from the exact argv and test its real framing and
   context fields alongside malformed and truncated fixtures.
-- Before writing a broker PR body, prepare the exact body file and run the
-  pinned CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`.
-  Review each refusal; use a `Contract justification:` of at least 24 characters
+- Before writing a broker PR body, use the canonical PR-template Contract
+  checkbox (for example, `- [x] **none**`) so the decision is explicit and
+  matches the template. The current parser also recognizes a plain
+  `Contract decision: <label>` line in PR bodies and commit messages; the key
+  must start the line after whitespace. If CI reports an undeclared decision,
+  inspect its exact captured body and `Looked in` output before diagnosing a
+  formatting problem.
+  Prepare the exact body file. When local validation is allowed, run the pinned
+  CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`
+  and retain the result before publication. During a local-check pause, use the
+  PR's remote contract check instead of running it locally. Review each refusal;
+  use a `Contract justification:` of at least 24 characters
   only for a verified false-positive, while preserving the actual retirement
   label. Confirm the actual verdict is `none` or every reported symbol has an
   accurate contract decision; exit status or help output alone is not evidence.
