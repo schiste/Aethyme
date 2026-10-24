@@ -1101,9 +1101,10 @@ mod tests {
             activity.provider_id,
             parse(&value).activities[0].provider_id
         );
+        let later_head = parse(&value);
         value["statusCheckRollup"][0]["context"] = "different-ci".into();
         assert_ne!(
-            activity.provider_id,
+            later_head.activities[0].provider_id,
             parse(&value).activities[0].provider_id
         );
     }
