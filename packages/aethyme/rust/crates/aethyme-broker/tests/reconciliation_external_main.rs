@@ -422,9 +422,23 @@ fn reconciliation_plan_classifies_every_relevant_commit_with_full_provenance() {
 
 #[test]
 fn reconciliation_fixture_reopens_with_owned_host_state_and_worktrees() {
+    let captured_state = |broker: &aethyme_broker::Broker| {
+        let mut command = Command::new("not-launched-context-probe");
+        broker
+            .configure_storage_context_for_child(&mut command)
+            .unwrap();
+        command
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == "AETHYME_HOST_STATE_DIR")
+                    .then(|| value.map(PathBuf::from))
+                    .flatten()
+            })
+            .expect("configured child receives the fixture-owned host state")
+    };
     let fixture = DeployDivergenceFixture::new();
     let broker = fixture_broker(&fixture.repo).unwrap();
-    let state = broker.storage_context().host_state_dir.clone().unwrap();
+    let state = captured_state(&broker);
     let expected_state = common::fixture_host_state_dir(&fixture.repo);
     let repository = fixture.repo.canonicalize().unwrap();
     assert_eq!(state, expected_state);
@@ -453,10 +467,7 @@ fn reconciliation_fixture_reopens_with_owned_host_state_and_worktrees() {
     }
     drop(broker);
     let reopened = fixture_broker(&fixture.repo).unwrap();
-    assert_eq!(
-        reopened.storage_context().host_state_dir.as_deref(),
-        Some(state.as_path())
-    );
+    assert_eq!(captured_state(&reopened), state);
     assert_eq!(reopened.worktree_root(), worktrees.as_path());
     assert_eq!(
         reopened
