@@ -30,6 +30,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   contain shell commands. Quote embedded executable paths for that shell,
   separately from the argv used to set the value. Exercise transport fixtures
   under paths containing spaces and apostrophes, even when CI paths are simple.
+  After a quoting failure, audit sibling transport command setters before
+  starting another CI or local qualification cycle.
+- Cargo integration tests can replace a previously built CLI artifact. Record
+  binary hashes before and after tests; matching source revisions alone do not
+  prove that the bytes stayed unchanged. Qualify the exact artifacts selected
+  for deployment separately from test-built outputs.
 - When local compilation is deferred, read each fixture helper's declared
   return type and the asserted fields' definitions before adding regressions.
   Preserve optional-value types in assertions; a compile failure supplies no
