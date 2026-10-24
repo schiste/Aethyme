@@ -312,7 +312,9 @@ pub(crate) fn repository_config_with_source(main_root: &Path) -> Option<(String,
 /// `.aethyme/config.toml` as committed on the fetched default branch, if there
 /// is one and it holds the file.
 fn committed_config_text(main_root: &Path) -> Option<String> {
-    let repo = GitRepo::discover(main_root).ok()?;
+    // The caller already supplies the main checkout root. Reuse that path
+    // without another discovery process; ref and content reads remain fresh.
+    let repo = GitRepo::at_known_root(main_root);
     let (_, commit) = repo.upstream_default()?;
     repo.file_at_commit(&commit, ".aethyme/config.toml")
         .ok()
