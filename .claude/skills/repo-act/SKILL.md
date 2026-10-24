@@ -122,6 +122,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   jobs continue. Capture raw output to a file and strip control sequences before
   display. If gh refuses escape bytes, use `--allow-escape-sequences` only for
   that file capture.
+- For formatter failures, use the complete formatter output or, when available,
+  a CI-generated patch bound to the exact head. Do not reconstruct edits from
+  truncated excerpts or treat `git diff --check` as formatter validation; during
+  a local-check pause, use that remote evidence and rerun remote checks on the
+  corrected head.
 - When reusing a CI build cache, compare the producer and consumer fingerprints,
   including toolchain, lockfiles and environment variables, then confirm the log
   shows a cache restore. A matching shared key alone does not prove reuse.
