@@ -2080,6 +2080,7 @@ impl Broker {
         } else {
             None
         };
+        let mut pending_not_started_dispatch = false;
         let mut terminal_dispatch_recorded = false;
         let run_result = {
             let mut dispatch = |event| {
@@ -2087,19 +2088,23 @@ impl Broker {
                     return;
                 };
                 let result = match event {
+                    GuardedExecDispatchEvent::NotStarted => {
+                        pending_not_started_dispatch = true;
+                        return;
+                    }
                     GuardedExecDispatchEvent::Started => {
+                        pending_not_started_dispatch = false;
                         self.store.mark_guarded_exec_running(session_id, receipt_id)
                     }
-                    GuardedExecDispatchEvent::NotStarted => self
-                        .store
-                        .mark_guarded_exec_not_started(session_id, receipt_id),
-                    GuardedExecDispatchEvent::OutcomeUnknown(cleanup) => self
-                        .store
-                        .mark_guarded_exec_outcome_unknown(session_id, receipt_id, cleanup),
+                    GuardedExecDispatchEvent::OutcomeUnknown(cleanup) => {
+                        pending_not_started_dispatch = false;
+                        self.store
+                            .mark_guarded_exec_outcome_unknown(session_id, receipt_id, cleanup)
+                    }
                 };
                 match result {
                     Ok(()) => {
-                        if !matches!(event, GuardedExecDispatchEvent::Started) {
+                        if matches!(event, GuardedExecDispatchEvent::OutcomeUnknown(_)) {
                             terminal_dispatch_recorded = true;
                         }
                     }
@@ -2117,11 +2122,31 @@ impl Broker {
                 if let Some(receipt_id) = receipt_id.as_deref()
                     && !terminal_dispatch_recorded
                 {
-                    crate::warn_unrecorded(
-                        "persist guarded exec unknown outcome",
+                    let known_not_started = pending_not_started_dispatch
+                        && matches!(&error, BrokerOpError::Spawn { .. });
+                    let result = if known_not_started {
                         self.store
-                            .mark_guarded_exec_outcome_unknown(session_id, receipt_id, "unknown"),
-                    );
+                            .mark_guarded_exec_not_started(session_id, receipt_id)
+                    } else {
+                        self.store.mark_guarded_exec_outcome_unknown(
+                            session_id,
+                            receipt_id,
+                            "unknown",
+                        )
+                    };
+                    if let Err(persist_error) = result {
+                        crate::warn_unrecorded(
+                            "persist guarded exec dispatch status",
+                            Err::<(), _>(persist_error),
+                        );
+                        if known_not_started {
+                            crate::warn_unrecorded(
+                                "persist guarded exec unknown outcome",
+                                self.store
+                                    .mark_guarded_exec_outcome_unknown(session_id, receipt_id, "unknown"),
+                            );
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -2798,6 +2823,106 @@ mod generic_guarded_exec_tests {
         assert_eq!(receipt.command_outcome, "unknown");
         assert_eq!(receipt.process_group_cleanup, "verified");
         assert_eq!(receipt.process_revalidation, "not_revalidated");
+    }
+
+    #[test]
+    fn not_started_dispatch_is_finalized_from_the_runner_result() {
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Setup,
+            CleanupUnknown,
+            CommandUnknown,
+            CommandUnknownWithVerifiedCleanup,
+        }
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("deferred exec receipt", None)
+            .unwrap();
+        for failure in [
+            Failure::Setup,
+            Failure::CleanupUnknown,
+            Failure::CommandUnknown,
+            Failure::CommandUnknownWithVerifiedCleanup,
+        ] {
+            let result = broker.guarded_exec_with_runner(
+                session.id,
+                &["fake-command".into()],
+                true,
+                |_session, dispatch| {
+                    dispatch(GuardedExecDispatchEvent::NotStarted);
+                    if matches!(failure, Failure::CommandUnknownWithVerifiedCleanup) {
+                        dispatch(GuardedExecDispatchEvent::OutcomeUnknown("verified"));
+                    }
+                    Err(match failure {
+                        Failure::Setup => BrokerOpError::Spawn {
+                            command: "fake-command".into(),
+                            source: std::io::Error::other("supervisor setup failed"),
+                        },
+                        Failure::CleanupUnknown => {
+                            BrokerOpError::GuardedExecCleanupUnknown {
+                                session_id: session.id,
+                                reason: "helper cleanup could not be verified".into(),
+                            }
+                        }
+                        Failure::CommandUnknown
+                        | Failure::CommandUnknownWithVerifiedCleanup => {
+                            BrokerOpError::GuardedExecOutcomeUnknown {
+                                session_id: session.id,
+                                reason: "command result was not confirmed".into(),
+                            }
+                        }
+                    })
+                },
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("simulated runner failure must be returned"),
+            };
+
+            let receipt = broker
+                .store
+                .guarded_exec_receipts(session.id, 100)
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("the pre-dispatch receipt should remain queryable");
+            match failure {
+                Failure::Setup => {
+                    assert!(matches!(error, BrokerOpError::Spawn { .. }));
+                    assert_eq!(receipt.phase, "not_started");
+                    assert_eq!(receipt.command_outcome, "not_started");
+                    assert_eq!(receipt.process_group_cleanup, "not_applicable");
+                }
+                Failure::CleanupUnknown => {
+                    assert!(matches!(
+                        error,
+                        BrokerOpError::GuardedExecCleanupUnknown { .. }
+                    ));
+                    assert_eq!(receipt.phase, "outcome_unknown");
+                    assert_eq!(receipt.command_outcome, "unknown");
+                    assert_eq!(receipt.process_group_cleanup, "unknown");
+                }
+                Failure::CommandUnknown => {
+                    assert!(matches!(
+                        error,
+                        BrokerOpError::GuardedExecOutcomeUnknown { .. }
+                    ));
+                    assert_eq!(receipt.phase, "outcome_unknown");
+                    assert_eq!(receipt.command_outcome, "unknown");
+                    assert_eq!(receipt.process_group_cleanup, "unknown");
+                }
+                Failure::CommandUnknownWithVerifiedCleanup => {
+                    assert!(matches!(
+                        error,
+                        BrokerOpError::GuardedExecOutcomeUnknown { .. }
+                    ));
+                    assert_eq!(receipt.phase, "outcome_unknown");
+                    assert_eq!(receipt.command_outcome, "unknown");
+                    assert_eq!(receipt.process_group_cleanup, "verified");
+                }
+            }
+        }
     }
 
     #[test]

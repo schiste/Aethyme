@@ -327,10 +327,12 @@ mod tests {
         assert_eq!(completed.ownership_audit, "passed");
         assert_eq!(completed.process_group_cleanup, "verified");
         assert_eq!(completed.process_revalidation, "not_applicable");
-        assert!(store
-            .guarded_exec_receipt(2, &receipt_id)
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .guarded_exec_receipt(2, &receipt_id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -361,10 +363,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(terminal_count, RETAIN_TERMINAL_RECEIPTS_PER_SESSION);
-        assert!(store
-            .guarded_exec_receipt(1, oldest_terminal.as_deref().unwrap())
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .guarded_exec_receipt(1, oldest_terminal.as_deref().unwrap())
+                .unwrap()
+                .is_none()
+        );
         let unresolved = store.guarded_exec_receipt(1, &unresolved).unwrap().unwrap();
         assert_eq!(unresolved.phase, "outcome_unknown");
         assert_eq!(unresolved.process_group_cleanup, "unverified");
