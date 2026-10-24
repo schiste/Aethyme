@@ -802,7 +802,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
 - `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. It reports what it left behind the way `git status` shows it: changed tracked paths, and each untracked directory as one entry (JSON `uncommitted.modified`, `uncommitted.untracked_entries`, `uncommitted.sample`). After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)), then fetches exactly the default branch and reports `default_branch` (`reference`, `commit`, `head`, `behind`, `ahead`, `would_conflict`, `conflicting_paths` (up to five), `suggested_command`) from a `git merge-tree` simulation; a failed fetch compares the last fetched copy and sets `default_branch_note`. Neither ever fails the push. In a `[promote] mode = "verify-only"` repository, `broker submit` simulates and gates against the fetched default branch instead of the integration branch and reports the base as `verified_against` (`source`, `reference`, `commit`, `fallback_reason`); see [broker workflows](../guides/broker-workflows.md).
 - `aethyme broker sync --session <id> [--json]` — bring a live session up to the default branch, fetched first, when that is safe. It refuses (exit code for refusals, nothing changed) a dirty tree (each untracked directory counts as one entry, ignored files never count), a rebase, merge, cherry-pick or revert already in progress, a closed session, or a repository without a fetched default branch. It simulates the catch-up with `git merge-tree`: when that would conflict it changes nothing, lists up to five conflicting paths and the manual commands, and exits with the refusal code; otherwise it rebases an unpublished branch onto the default branch, or merges the default branch into a published one (a branch already on the remote), so a pull request's history is never rewritten. JSON: `session_id`, `branch`, `outcome` (`already_current`, `synced`, `conflict`), `strategy` (`rebase`, `merge`, `none`), `before`, `after`, `default_ref`, `default_commit`, `behind_before`, `ahead`, `conflicts`, `fetched`, optional `fetch_note`, `manual_commands` and `next_action` (the `broker push` command, present after `synced`: sync is local only and never pushes). Emits `broker.session.synced` when it changes the branch.
-- `broker start` fetches exactly the default branch from its remote (one ref, at most ten seconds) before choosing the base, so a new worktree starts from the remote's tip. `start_base` gains `fetched`, `fetch_error` and, when the fetch failed and the base came from the cached copy, `cached_ref_age_seconds` (how long ago that copy last moved). `start --reuse` and `start --adopt` refresh it too and report `default_branch` / `default_branch_note`, the comparison `push` makes. Successful reuse of an existing registered broker session with a selected base via `start --reuse --json` also includes the `base_freshness` report described below.
+- `broker start` fetches exactly the default branch from its remote (one ref, at most ten seconds) before choosing the base, so a new worktree starts from the remote's tip. `start_base` gains `fetched`, `fetch_error` and, for an intentional explicit base after a failed fetch, `cached_ref_age_seconds` (how long ago that copy last moved). `start --reuse` and `start --adopt` refresh it too and report `default_branch` / `default_branch_note`, the comparison `push` makes. Successful reuse of an existing registered broker session with a selected base via `start --reuse --json` also includes the `base_freshness` report described below.
 - `aethyme broker advanced repair --session <id> [--json]`
 - `aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]`
 - `aethyme broker advanced representation scan --session <id> [--json]`
@@ -1096,8 +1096,11 @@ checkout's file is used. Zero makes every prior observation stale. This age is
 diagnostic only: reuse always resolves the selected ref and rechecks the
 checkout's current ancestry, whether the old observation is stale or fresh.
 `observed_at_ms` records the successful local base check at this reuse boundary;
-it does not claim that a remote fetch succeeded. A failed fetch remains visible
-through `default_branch_note`.
+it does not replace remote confirmation. A repository with a tracked remote
+requires a successful fetch at each implicit start and reuse boundary. Failed
+fetches refuse before allocating a checkout or updating the reused task. Use
+`--base <commit>` for intentional pinned work; an existing explicit base remains
+pinned on plain reuse. Repositories without a tracked remote use local refs.
 
 On plain reuse, recorded `--base` choices stay pinned to their selected
 commit. Under normal promotion policy, a session with unknown legacy/adopted
@@ -1108,9 +1111,9 @@ is behind, reuse is refused unless the caller explicitly chooses
 is refused because that policy does not select the integration branch; create a
 new session with an explicit base. The explicit `--sync-integration` path uses the current integration ref and
 still requires a clean, fast-forwardable checkout. A recorded fetched-default
-base still requires a successful bounded fetch at reuse. When an integration
-base is locally available but that fetch fails, reuse checks the local
-integration ref and reports the fetch failure separately. Any automatic
+base and an integration base both require a successful bounded fetch at reuse.
+This includes `--sync-integration`; a failed fetch never refreshes the stored
+observation or moves the checkout. Any automatic
 fast-forward requires a known non-explicit base source and a clean checkout;
 dirty or diverged checkouts are left in place.
 

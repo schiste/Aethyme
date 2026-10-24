@@ -6127,6 +6127,22 @@ impl Broker {
             policy.max_age_seconds,
         );
 
+        // Require remote confirmation before any checkout movement or task
+        // update. A pinned explicit base is intentionally independent of the
+        // remote, unless the caller explicitly selects integration instead.
+        let pinned = !sync_integration
+            && previous.as_ref().is_some_and(|observation| {
+                observation.evidence == Some(crate::SessionStartBaseEvidence::ExplicitBase)
+            });
+        let confirmed_default = if !pinned
+            && let Some(default) = crate::session_push::tracked_default(&self.repo)
+        {
+            let display_ref = format!("{}/{}", default.remote, default.branch);
+            Some(self.require_fresh_default(prefetched, &display_ref)?)
+        } else {
+            None
+        };
+
         let promote = crate::PromoteConfig::load(&self.main_root);
         let mut integration_sync = None;
         let target = if sync_integration {
@@ -6136,6 +6152,7 @@ impl Broker {
                     "configured integration ref {integration_ref} is missing; it was not created. Restore it or choose an explicit session base"
                 ))
             })?;
+            self.require_base_contains_default(&integration_head, confirmed_default.as_deref())?;
             let sync = self.synchronize_reuse_checkout(
                 checkout,
                 &promote.branch,
@@ -6176,6 +6193,7 @@ impl Broker {
             self.resolve_unknown_reuse_target(None, &promote)?
         };
 
+        self.require_base_contains_default(&target.commit, confirmed_default.as_deref())?;
         if target.verify_ref
             && self.repo.resolve_ref(&target.reference).as_deref() != Some(target.commit.as_str())
         {
@@ -6414,10 +6432,8 @@ impl Broker {
                     ))
                 })?;
                 if let Some(default_ref) = observation.default_ref.as_deref() {
-                    // The fetch note remains in the report. When this
-                    // boundary cannot refresh, the successful check below
-                    // observes the local integration ref only and makes no
-                    // new claim about the remote default.
+                    // The task boundary already required a fresh default.
+                    // Also ensure integration contains that confirmed tip.
                     if prefetched
                         .refresh
                         .as_ref()
@@ -6642,6 +6658,26 @@ impl Broker {
             ));
         }
         Ok(observed.to_string())
+    }
+
+    fn require_base_contains_default(
+        &self,
+        base: &str,
+        confirmed_default: Option<&str>,
+    ) -> Result<(), BrokerOpError> {
+        let Some(default) = confirmed_default else {
+            return Ok(());
+        };
+        if !self.repo.has_complete_unmodified_history().map_err(|error| {
+            reuse_freshness_refusal(format!("could not verify selected base history: {error}"))
+        })? || !self.repo.is_ancestor_checked(default, base).map_err(|error| {
+            reuse_freshness_refusal(format!("could not verify selected base ancestry: {error}"))
+        })? {
+            return Err(reuse_freshness_refusal(
+                "the selected base does not provably contain the freshly fetched default branch; reconcile integration or create a new session from the default branch. No checkout movement was authorized",
+            ));
+        }
+        Ok(())
     }
 
     fn default_branch_after_reuse(
@@ -7380,6 +7416,7 @@ impl Broker {
         planned_paths: &[String],
     ) -> Result<CreatedSessionWorktree, BrokerOpError> {
         let refresh = self.refresh_default_branch_before_start();
+        refresh.require_fresh_implicit_base(explicit_base)?;
         // Verify-only sessions start from the fetched default branch either
         // way; advancing a disposable integration here keeps it from feeding
         // a stale copy of main to this session's submit and finish (#352).

@@ -786,63 +786,71 @@ fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
 }
 
 #[test]
-fn reuse_uses_a_local_integration_base_when_default_fetch_fails() {
+fn reuse_refuses_an_unconfirmed_integration_base_without_changing_the_session() {
     let tmp = fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     set_integration_at_head(tmp.path());
-    let started = stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
-    let started: serde_json::Value = serde_json::from_str(&started).unwrap();
-    assert_eq!(started["start_base"]["evidence"], "integration_tip");
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
     let session = stored_session(&tmp, 1);
     let previous_observation = stored_base_observation(&tmp, session.id);
-    let previous_observed_at = previous_observation["observed_at_ms"]
-        .as_i64()
-        .expect("local integration observation has a timestamp");
-
+    let worktree = Path::new(&session.worktree_path);
+    let before = git_output(worktree, &["rev-parse", "HEAD"]);
     let unavailable_remote = tmp.path().join("unavailable-remote");
-    git(
-        tmp.path(),
-        &[
-            "config",
-            "remote.origin.url",
-            unavailable_remote.to_str().unwrap(),
-        ],
-    );
-    let worktree_arg = session.worktree_path.as_str();
-    let reused = stdout(&run(
-        tmp.path(),
-        &[
-            "start",
-            "--reuse",
-            worktree_arg,
-            "--task",
-            "offline follow-up",
-            "--json",
-        ],
-    ));
-    let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+    git(tmp.path(), &["config", "remote.origin.url", unavailable_remote.to_str().unwrap()]);
+    for sync in [false, true] {
+        let mut args = vec![
+            "start", "--reuse", session.worktree_path.as_str(),
+            "--task", "offline follow-up", "--json",
+        ];
+        if sync {
+            args.push("--sync-integration");
+        }
+        let output = run(tmp.path(), &args);
+        assert!(!output.status.success());
+        let error = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(error.contains("not freshly confirmed"), "{error}");
+        assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
+        assert_eq!(stored_session(&tmp, 1).task, "initial");
+        assert_eq!(stored_base_observation(&tmp, 1), previous_observation);
+    }
+}
 
-    assert_eq!(reused["base_freshness"]["source"], "integration_tip");
-    assert_eq!(reused["base_freshness"]["relation"], "current");
-    assert!(
-        reused["default_branch_note"]
-            .as_str()
-            .is_some_and(|note| note.contains("used the last fetched copy"))
-    );
-    let current_observation = stored_base_observation(&tmp, session.id);
-    let checked_at = reused["base_freshness"]["observed_at_ms"]
-        .as_i64()
-        .expect("freshness report has a local validation timestamp");
-    assert_eq!(
-        current_observation["observed_at_ms"].as_i64(),
-        Some(checked_at),
-        "the stored time records the successful local validation boundary"
-    );
-    assert!(
-        checked_at >= previous_observed_at,
-        "the local observation time must not move backwards"
-    );
+#[test]
+fn reuse_refuses_a_stale_integration_even_with_unknown_provenance() {
+    let tmp = fixture();
+    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &main);
+    set_integration_at_head(tmp.path());
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let session = stored_session(&tmp, 1);
+    delete_stored_base_observation(&tmp, session.id);
+    let worktree = Path::new(&session.worktree_path);
+    let before = git_output(worktree, &["rev-parse", "HEAD"]);
+    advance_main(tmp.path(), "remote-advance.txt");
+    for sync in [false, true] {
+        let mut args = vec![
+            "start", "--reuse", session.worktree_path.as_str(),
+            "--task", "stale follow-up", "--json",
+        ];
+        if sync {
+            args.push("--sync-integration");
+        }
+        let output = run(tmp.path(), &args);
+        assert!(!output.status.success());
+        let error = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(error.contains("freshly fetched default branch"), "{error}");
+        assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
+        assert_eq!(stored_session(&tmp, 1).task, "initial");
+    }
 }
 
 #[test]

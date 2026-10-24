@@ -10,8 +10,9 @@
 //! Two things close that:
 //!
 //! - `start` fetches exactly the default branch before choosing a base, so a
-//!   new worktree starts from the remote's tip; if the fetch fails it starts
-//!   from the cached copy and says how old that is. `start --reuse` and
+//!   new worktree starts from the remote's tip; if the fetch fails an implicit
+//!   start is refused. An explicit `--base` permits intentional pinned work.
+//!   `start --reuse` and
 //!   `--adopt` refresh it too and report how far the worktree has drifted, the
 //!   same comparison `push` makes (#462).
 //! - `broker sync` brings a session up to the fetched default branch when that
@@ -96,8 +97,8 @@ fn sync_refused(reason: impl Into<String>) -> BrokerOpError {
 }
 
 /// How long `start` waits for its default-branch refresh. Starting a session
-/// must cost seconds, not a network timeout; the cached copy is always a safe
-/// fallback, and the report says how old it is.
+/// must cost seconds, not a network timeout. A failed refresh cannot authorize
+/// an implicit start from a cached remote-tracking ref.
 const START_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What `start` learned refreshing the default branch before choosing a base.
@@ -108,6 +109,21 @@ pub(crate) struct StartRefresh {
 }
 
 impl StartRefresh {
+    pub(crate) fn require_fresh_implicit_base(
+        &self,
+        explicit_base: Option<&str>,
+    ) -> Result<(), BrokerOpError> {
+        if explicit_base.is_none() && self.fetched == Some(false) {
+            return Err(BrokerOpError::StartBaseUnavailable {
+                reason: format!(
+                    "the remote default branch was not freshly confirmed: {}. No worktree was created. Retry after fetch succeeds, or use --base <commit> for intentional pinned work; cached ref age is not proof of remote freshness",
+                    self.error.as_deref().unwrap_or("fetch failed")
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Copy the refresh outcome onto the chosen base.
     pub(crate) fn record(self, base: &mut SessionStartBase) {
         base.fetched = self.fetched;
@@ -127,8 +143,8 @@ impl crate::Broker {
     /// moved after the fact. It is a bounded read of one remote-tracking ref,
     /// which Git's own ref locking keeps safe against a concurrent fetch.
     /// `push`, `sync` and `start --reuse/--adopt` have a session and use the
-    /// coordinated lane. A failure is never fatal: the base comes from the
-    /// cached copy and the report says how old it is.
+    /// coordinated lane. Implicit creation requires this fetch to succeed;
+    /// explicit pinned bases retain the refresh diagnostic without failing.
     pub(crate) fn refresh_default_branch_before_start(&self) -> StartRefresh {
         let repo = self.repo_handle();
         let Some(default) = tracked_default(repo) else {
