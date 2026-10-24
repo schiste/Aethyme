@@ -346,10 +346,7 @@ fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn legacy_unbound_retained_worktree_fixture(
-    repo: &Path,
-    container: &Path,
-) -> (PathBuf, i64) {
+fn legacy_unbound_retained_worktree_fixture(repo: &Path, container: &Path) -> (PathBuf, i64) {
     let worktree = container.join("legacy-retained");
     let worktree_arg = worktree.to_string_lossy().into_owned();
     git(
@@ -369,7 +366,8 @@ fn legacy_unbound_retained_worktree_fixture(
     let existing = rusqlite::Connection::open(&database).unwrap();
     assert_eq!(
         existing
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get::<_, i64>(0))
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                .get::<_, i64>(0))
             .unwrap(),
         0,
         "the disposable bootstrap database must not contain session records"
@@ -547,9 +545,8 @@ fn reclaim_plan_warns_but_prints_when_snapshot_storage_is_unavailable() {
 
 #[test]
 fn reclaim_refuses_legacy_unbound_root_before_planning_or_apply() {
-    let (repo, container) = fixture(
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
-    );
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (worktree, session_id) =
         legacy_unbound_retained_worktree_fixture(repo.path(), container.path());
     let target = worktree.join("rust/target");
@@ -559,7 +556,10 @@ fn reclaim_refuses_legacy_unbound_root_before_planning_or_apply() {
     age_worktree_indexes(repo.path());
 
     let root_marker = container.path().join(".aethyme-worktree-root.json");
-    assert!(!root_marker.exists(), "the legacy root is not durably bound");
+    assert!(
+        !root_marker.exists(),
+        "the legacy root is not durably bound"
+    );
     let has_reclaim_snapshot = || {
         std::fs::read_dir(container.path())
             .unwrap()
@@ -600,8 +600,14 @@ fn reclaim_refuses_legacy_unbound_root_before_planning_or_apply() {
         b"retained legacy worktree cache\n"
     );
     assert_eq!(legacy_session_row(repo.path(), session_id), session_before);
-    assert!(!has_reclaim_snapshot(), "a refused plan must not write a review snapshot");
-    assert!(!root_marker.exists(), "a refused plan must not create a root marker");
+    assert!(
+        !has_reclaim_snapshot(),
+        "a refused plan must not write a review snapshot"
+    );
+    assert!(
+        !root_marker.exists(),
+        "a refused plan must not create a root marker"
+    );
 
     let confirmation = "a".repeat(64);
     let apply = run_as_is(
@@ -629,8 +635,14 @@ fn reclaim_refuses_legacy_unbound_root_before_planning_or_apply() {
         b"retained legacy worktree cache\n"
     );
     assert_eq!(legacy_session_row(repo.path(), session_id), session_before);
-    assert!(!has_reclaim_snapshot(), "a refused apply must not write a review snapshot");
-    assert!(!root_marker.exists(), "a refused apply must not create a root marker");
+    assert!(
+        !has_reclaim_snapshot(),
+        "a refused apply must not write a review snapshot"
+    );
+    assert!(
+        !root_marker.exists(),
+        "a refused apply must not create a root marker"
+    );
 }
 
 /// A worktree root left behind by a repository that no longer exists.
