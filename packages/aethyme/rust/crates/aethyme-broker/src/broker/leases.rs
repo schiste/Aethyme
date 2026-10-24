@@ -50,9 +50,10 @@ impl LeaseClaimPreparation {
     }
 }
 
-struct GuardedExecOutput {
+struct GuardedExecOptions {
     stdout: std::process::Stdio,
     supervised_timeout: std::time::Duration,
+    record_receipt: bool,
 }
 
 pub(crate) struct GuardedExecCliReport {
@@ -1700,11 +1701,11 @@ impl Broker {
             &[],
             || Ok(()),
             move || mode,
-            GuardedExecOutput {
+            GuardedExecOptions {
                 stdout,
                 supervised_timeout,
+                record_receipt: true,
             },
-            true,
         )?;
         let receipt_id = receipt_id.expect("CLI guarded exec always records a receipt");
         Ok(GuardedExecCliReport { report, receipt_id })
@@ -1756,11 +1757,11 @@ impl Broker {
             environment,
             heartbeat,
             select_mode,
-            GuardedExecOutput {
+            GuardedExecOptions {
                 stdout: std::process::Stdio::inherit(),
                 supervised_timeout: crate::inline_exec_supervisor::DEFAULT_GUARDED_EXEC_TIMEOUT,
+                record_receipt: false,
             },
-            false,
         )
         .map(|(report, _)| report)
     }
@@ -1772,16 +1773,16 @@ impl Broker {
         environment: &[(String, String)],
         mut heartbeat: F,
         select_mode: M,
-        output: GuardedExecOutput,
-        record_receipt: bool,
+        output: GuardedExecOptions,
     ) -> Result<(GuardedExecReport, Option<String>), BrokerOpError>
     where
         F: FnMut() -> Result<(), BrokerOpError>,
         M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
     {
-        let GuardedExecOutput {
+        let GuardedExecOptions {
             stdout,
             supervised_timeout,
+            record_receipt,
         } = output;
         let supervisor_executable = self.agent_supervisor_executable.clone();
         self.guarded_exec_with_runner(
