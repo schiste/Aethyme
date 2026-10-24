@@ -1318,3 +1318,156 @@ fn acquire_dead_exclusive_holder_is_structured_and_immediately_nonretryable() {
     );
     assert!(!String::from_utf8_lossy(&blocked.stdout).contains("ownership_token"));
 }
+
+#[test]
+fn reap_dry_run_projects_capacity_only_and_keeps_all_registry_rows_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let database = state.join("host-resources.db");
+    let mut coordinator = HostResourceCoordinator::open(&database).unwrap();
+    let request = |id: &str, named: bool| {
+        let mut resources = vec![HostResourceRequirement {
+            key: "workers".into(),
+            resource: HostResourceKind::Capacity {
+                pool: "preview".into(),
+                units: 1,
+                limit: 4,
+            },
+        }];
+        if named {
+            resources.push(HostResourceRequirement {
+                key: "database".into(),
+                resource: HostResourceKind::ExclusiveKey {
+                    name: format!("db-{id}"),
+                },
+            });
+        }
+        HostResourceRequest {
+            schema_version: 1,
+            request_id: id.into(),
+            repository: "owner/repo".into(),
+            worktree_fingerprint: id.into(),
+            run_id: id.into(),
+            ttl_seconds: 60,
+            holder_pid: Some(std::process::id()),
+            resources,
+        }
+    };
+    // Seed every lease while its holder is live, so later acquire calls do
+    // not legitimately reconcile earlier dead holders before the preview.
+    let capacity = coordinator.acquire(&request("capacity", false)).unwrap();
+    let named = coordinator.acquire(&request("named", true)).unwrap();
+    let held = coordinator.acquire(&request("held", false)).unwrap();
+    let live = coordinator.acquire(&request("live", false)).unwrap();
+    coordinator
+        .quarantine(
+            &live.lease.lease_id,
+            live.lease.generation,
+            &live.ownership_token,
+        )
+        .unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    for grant in [&capacity, &named, &held] {
+        writer
+            .execute(
+                "UPDATE resource_leases SET holder_pid=?1 WHERE lease_id=?2",
+                rusqlite::params![dead_pid, grant.lease.lease_id],
+            )
+            .unwrap();
+    }
+    writer
+        .execute(
+            "INSERT INTO resource_supervised_capacity_holds(lease_id,generation,created_at)
+             VALUES (?1,?2,1)",
+            rusqlite::params![held.lease.lease_id, held.lease.generation],
+        )
+        .unwrap();
+    let before = coordinator.list(true).unwrap();
+    drop(writer);
+    drop(coordinator);
+
+    let output = run(temp.path(), &state, &["gc", "reap", "--dry-run", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["schema"], "aethyme.host-resource-reap-preview/v1");
+    assert_eq!(preview["would_reclaim_capacity_units"], 2);
+    let candidates = preview["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().any(|item| {
+        item["lease_id"] == capacity.lease.lease_id && item["state"] == "released"
+    }));
+    assert!(candidates.iter().any(|item| {
+        item["lease_id"] == named.lease.lease_id && item["state"] == "quarantined"
+    }));
+    assert!(
+        candidates
+            .iter()
+            .all(|item| item["lease_id"] != held.lease.lease_id)
+    );
+    assert!(
+        preview["not_reaped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["lease_id"] == live.lease.lease_id && item["reason"] == "not_proven_gone"
+            })
+    );
+    let after = HostResourceCoordinator::open_read_only(&database)
+        .unwrap()
+        .list(true)
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "a preview must not mutate leases or allocations"
+    );
+    let reader = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let observations: i64 = reader
+        .query_row(
+            "SELECT COUNT(*) FROM resource_reap_observations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        observations, 0,
+        "a preview must not write reap observations"
+    );
+    drop(reader);
+
+    let applied = run(temp.path(), &state, &["gc", "reap", "--json"]);
+    assert!(applied.status.success(), "{applied:?}");
+    let report: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(
+        report["reclaimed_capacity_units"],
+        preview["would_reclaim_capacity_units"]
+    );
+    assert_eq!(report["leases"], preview["candidates"]);
+    let repeated = run(temp.path(), &state, &["gc", "reap", "--dry-run", "--json"]);
+    assert!(repeated.status.success(), "{repeated:?}");
+    let preview: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(preview["would_reclaim_capacity_units"], 0);
+    assert!(preview["candidates"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn reap_dry_run_does_not_create_a_missing_host_registry() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("absent-state");
+    let output = run(temp.path(), &state, &["gc", "reap", "--dry-run", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["would_reclaim_capacity_units"], 0);
+    assert!(preview["candidates"].as_array().unwrap().is_empty());
+    assert!(
+        !state.exists(),
+        "a preview must not initialize shared state"
+    );
+}

@@ -1128,6 +1128,39 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 }
             }
         }
+        "reap" if parsed.dry_run => {
+            let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
+            let preview = coordinator.preview_dead_holders()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&preview)?);
+            } else {
+                out!(
+                    "Dry run: {} dead-holder lease(s); {} capacity unit(s) could be reclaimed. No changes made.",
+                    preview.candidates.len(),
+                    preview.would_reclaim_capacity_units,
+                );
+                for lease in &preview.candidates {
+                    out!(
+                        "  lease {} generation {} pid {} — {} capacity unit(s), projected {}",
+                        lease.lease_id,
+                        lease.generation,
+                        lease.holder_pid,
+                        lease.capacity_units,
+                        lease.state.as_str(),
+                    );
+                }
+                for lease in &preview.not_reaped {
+                    out!(
+                        "  lease {} retained — {}",
+                        lease.lease_id,
+                        lease.reason.as_str()
+                    );
+                }
+                out!(
+                    "Named resources remain quarantined. This preview stops no processes or containers."
+                );
+            }
+        }
         "reap" => {
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
             let report = coordinator.reap_dead_holders_with_diagnostics()?;

@@ -1344,6 +1344,19 @@ pub struct HostResourceReapReport {
     pub leases: Vec<HostResourceReapLease>,
 }
 
+/// Read-only projection of dead-holder capacity reconciliation. The entries
+/// describe what a fresh reap could do, not a cleanup grant or completed work.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HostResourceReapPreview {
+    pub schema: &'static str,
+    pub evaluated_at_ms: i64,
+    pub would_reclaim_capacity_units: u32,
+    /// `state` is the projected state after capacity reconciliation. Named
+    /// allocations are retained; no process or container is signalled.
+    pub candidates: Vec<HostResourceReapLease>,
+    pub not_reaped: Vec<HostResourceNotReapedLease>,
+}
+
 /// The legacy reap counters plus diagnostics for candidate leases that were
 /// kept because the holder's absence could not be proven.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3091,6 +3104,80 @@ impl HostResourceCoordinator {
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.into()))?;
         tx.commit()?;
         Ok(lease)
+    }
+
+    /// Preview the existing capacity reaper without changing lease states,
+    /// allocations or observations. Apply never consumes this projection:
+    /// it independently rechecks holder absence and generation-bound fences.
+    pub fn preview_dead_holders(&self) -> Result<HostResourceReapPreview, HostResourceError> {
+        let now = now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let mut preview = HostResourceReapPreview {
+            schema: "aethyme.host-resource-reap-preview/v1",
+            evaluated_at_ms: now,
+            would_reclaim_capacity_units: 0,
+            candidates: Vec::new(),
+            not_reaped: Vec::new(),
+        };
+        let any_retained_lease: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM resource_leases WHERE state!='released')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !any_retained_lease {
+            // First-use read-only opens use a v1 in-memory registry. There is
+            // nothing to reconcile and no need to initialize newer tables.
+            tx.commit()?;
+            return Ok(preview);
+        }
+        if validate_schema(&tx)? != HOST_RESOURCE_STORE_SCHEMA_VERSION {
+            return Err(HostResourceError::InvalidRequest(
+                "reap preview needs a coordinated writable upgrade of this legacy registry; no changes made".into(),
+            ));
+        }
+        // Existing registries deliberately keep their managed-storage floor
+        // until an operator activates it. Preview must neither migrate them
+        // nor query settlement tables that do not exist yet.
+        validate_managed_storage_schema(&tx)?;
+        for candidate in pending_reap_candidates(&tx)? {
+            if !holder_process_is_gone(candidate.holder_pid) {
+                if candidate.quarantined || candidate.expires_at <= now {
+                    preview.not_reaped.push(HostResourceNotReapedLease {
+                        lease_id: candidate.lease_id,
+                        reason: HostResourceNotReapedReason::NotProvenGone,
+                    });
+                }
+                continue;
+            }
+            if candidate.unresolved_preparation {
+                // The real reaper's insertion trigger keeps this fence. Its
+                // projection must not promise capacity that cannot be freed.
+                continue;
+            }
+            let (capacity_units, named_allocations): (u32, u64) = tx.query_row(
+                "SELECT COALESCE(SUM(CASE WHEN kind='capacity' THEN units ELSE 0 END), 0),
+                        COUNT(CASE WHEN kind!='capacity' THEN 1 END)
+                 FROM resource_allocations WHERE lease_id=?1",
+                [&candidate.lease_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            preview.would_reclaim_capacity_units = preview
+                .would_reclaim_capacity_units
+                .saturating_add(capacity_units);
+            preview.candidates.push(HostResourceReapLease {
+                lease_id: candidate.lease_id,
+                generation: candidate.generation,
+                holder_pid: candidate.holder_pid as u32,
+                capacity_units,
+                state: if named_allocations == 0 {
+                    HostLeaseState::Released
+                } else {
+                    HostLeaseState::Quarantined
+                },
+            });
+        }
+        tx.commit()?;
+        Ok(preview)
     }
 
     /// Reclaim capacity held by quarantined leases whose holder process is
@@ -5106,6 +5193,55 @@ fn quarantine_reclaimable_with_diagnostics(
     quarantine_expired(conn, now)?;
     quarantine_dead_holders(conn, now)?;
     reclaim_dead_capacity_with_diagnostics(conn, now)
+}
+
+struct PendingReapCandidate {
+    lease_id: String,
+    generation: u64,
+    holder_pid: i64,
+    expires_at: i64,
+    quarantined: bool,
+    unresolved_preparation: bool,
+}
+
+/// Project active-to-quarantined transitions without writing. Use the same
+/// settlement predicate as the insertion fence authorizing actual reclamation;
+/// leave the existing reaper's legacy-registry behavior unchanged.
+fn pending_reap_candidates(
+    conn: &Connection,
+) -> Result<Vec<PendingReapCandidate>, HostResourceError> {
+    let unresolved = managed_storage_unresolved_producer_predicate_sql(
+        "resource_leases.lease_id",
+        "resource_leases.generation",
+    );
+    let sql = format!(
+        "SELECT lease_id,generation,holder_pid,expires_at,state='quarantined',({unresolved})
+         FROM resource_leases
+         WHERE state IN ('quarantined','active') AND holder_pid IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM resource_reap_observations r
+               WHERE r.lease_id=resource_leases.lease_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM resource_supervised_capacity_holds h
+               WHERE h.lease_id=resource_leases.lease_id
+                 AND h.generation=resource_leases.generation
+           )
+         ORDER BY generation"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    Ok(stmt
+        .query_map([], |row| {
+            Ok(PendingReapCandidate {
+                lease_id: row.get(0)?,
+                generation: row.get::<_, i64>(1)? as u64,
+                holder_pid: row.get(2)?,
+                expires_at: row.get(3)?,
+                quarantined: row.get(4)?,
+                unresolved_preparation: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Reclaim only the allocation that becomes meaningless with the holder's
@@ -7287,6 +7423,70 @@ mod tests {
             coordinator.acquire_inner(&generic, true),
             Err(HostResourceError::IdempotencyMismatch(_))
         ));
+    }
+
+    #[test]
+    fn reap_preview_refuses_retained_legacy_registry_without_migration() {
+        for version in 1..=3 {
+            let temp = tempfile::tempdir().unwrap();
+            let db = temp.path().join("legacy.db");
+            create_managed_schema_fixture(&db, version);
+            let mut writer = Connection::open(&db).unwrap();
+            insert_legacy_v1_capacity(&mut writer, "preview", "preview", 1, 4, Some(reaped_pid()))
+                .unwrap();
+            let before = migration_snapshot(&writer, version);
+            drop(writer);
+            let reader = HostResourceCoordinator::open_read_only(&db).unwrap();
+            let leases = reader.list(true).unwrap();
+            assert!(
+                !leases.is_empty(),
+                "legacy fixture must have retained leases"
+            );
+            assert!(reader.preview_dead_holders().is_err());
+            assert_eq!(reader.list(true).unwrap(), leases);
+            assert_eq!(migration_snapshot(&reader.conn, version), before);
+        }
+    }
+
+    #[test]
+    fn reap_preview_keeps_unsettled_preparation_capacity_fenced() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("unsettled.db");
+        create_managed_schema_fixture(&db, 4);
+        let writer = Connection::open(&db).unwrap();
+        let dead_holder = reaped_pid();
+        let changed = writer
+            .execute(
+                "INSERT INTO resource_leases
+             (lease_id,request_id,request_digest,repository,worktree_fingerprint,run_id,
+              generation,ownership_token,state,holder_pid,created_at,expires_at,updated_at)
+             VALUES ('legacy-lease','legacy-request','digest','migration-repo','fixture','run',
+                     7,'token','active',?1,1,9223372036854775807,1)",
+                [dead_holder],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO resource_allocations
+             (lease_id,resource_key,kind,value,units,capacity_limit)
+             VALUES ('legacy-lease','worker','capacity','preview',1,4)",
+                [],
+            )
+            .unwrap();
+        assert!(
+            changed > 0,
+            "fixture must exercise a producer-linked dead holder"
+        );
+        drop(writer);
+        let reader = HostResourceCoordinator::open_read_only(&db).unwrap();
+        let before = reader.list(true).unwrap();
+        let preview = reader.preview_dead_holders().unwrap();
+        assert!(
+            preview.candidates.is_empty(),
+            "unsettled preparation is not reclaimable"
+        );
+        assert_eq!(preview.would_reclaim_capacity_units, 0);
+        assert_eq!(reader.list(true).unwrap(), before);
     }
 
     #[test]

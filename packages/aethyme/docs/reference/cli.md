@@ -737,11 +737,22 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker advanced resources renew <grant.json> --ttl <seconds> [--json]`
 - `aethyme broker advanced resources release <grant.json> [--json]`
 - `aethyme broker advanced resources list [--all] [--json]`
-- `aethyme broker gc reap [--json]`
+- `aethyme broker gc reap [--dry-run] [--json]`
 - `aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]`
 - `aethyme broker advanced console [status|list] [--json]`
 - `aethyme broker advanced console plan [--allow-parallel] [--json]`
 - `aethyme broker advanced console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
+
+`gc reap --dry-run` opens the host registry read-only and projects dead-holder
+capacity reconciliation. Its JSON uses `aethyme.host-resource-reap-preview/v1`:
+`evaluated_at_ms`, `would_reclaim_capacity_units`, `candidates[]` (lease id,
+generation, holder PID, capacity units and projected state), and `not_reaped[]`.
+The real reap independently revalidates current holders and fences. Named
+allocations remain quarantined for cleanup review; this operation stops no
+processes or containers. Supervised capacity holds and unresolved preparation
+producers remain protected. An absent registry produces an empty preview
+without creating host state. A nonempty legacy store requires a coordinated
+writable upgrade before preview; the read-only command never migrates it.
 
 A dev server is a host resource, and agent isolation and operator singularity
 want opposite defaults from it. `console` composes the `resources` primitives
