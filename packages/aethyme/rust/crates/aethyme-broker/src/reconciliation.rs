@@ -1316,15 +1316,32 @@ impl Broker {
             report.plan_digest.as_deref().unwrap_or_default(),
             &updates,
         )?;
-        if let Err(ref_error) = self.repo_handle().update_branch_ref_checked(
+        let ref_written_by_us = match self.repo_handle().update_branch_ref_checked(
             &branch,
             &report.new_integration,
             &old_integration,
         ) {
-            self.store().abort_integration_reconciliation()?;
-            return Err(ref_error.into());
-        }
+            Ok(()) => true,
+            Err(ref_error) => {
+                // The prepared journal already binds the exact plan and queue
+                // updates. As in crash recovery, an exact desired tip permits
+                // finalization; any other concurrent target still refuses.
+                if self.repo_handle().resolve_ref(&branch).as_deref()
+                    != Some(report.new_integration.as_str())
+                {
+                    self.store().abort_integration_reconciliation()?;
+                    return Err(ref_error.into());
+                }
+                false
+            }
+        };
         if let Err(store_error) = self.store().finalize_integration_reconciliation() {
+            if !ref_written_by_us {
+                // Another writer installed this tip. Leave its ref and our
+                // prepared journal intact for the existing recovery path;
+                // rolling back would undo an advance we did not perform.
+                return Err(store_error.into());
+            }
             if let Err(rollback_error) = self.repo_handle().update_branch_ref_checked(
                 &branch,
                 &old_integration,
