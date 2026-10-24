@@ -616,9 +616,11 @@ pub(super) fn run_reclaim(parsed: Parsed) -> Result<(), UsageError> {
     // may be one that simply cannot be closed, and those are precisely the
     // worktrees whose build output accumulates.
     let now = now_ms();
+    // This command opened a read-only snapshot. Use its non-mutating liveness
+    // view and fail closed if that inventory cannot be read; a transition
+    // write through `agents()` would fail here and must not erase all guards.
     let active: Vec<std::path::PathBuf> = broker
-        .agents(now)
-        .unwrap_or_default()
+        .agents_snapshot(now)?
         .into_iter()
         .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
         .map(|agent| std::path::PathBuf::from(agent.session.worktree_path.clone()))
