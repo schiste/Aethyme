@@ -188,7 +188,11 @@ fn changed_snapshot_paths(before: &[SnapshotEntry], after: &[SnapshotEntry]) -> 
         record_change(
             &mut paths,
             &mut total,
-            format!("removed {} ({})", display_path(&entry.path), describe(entry)),
+            format!(
+                "removed {} ({})",
+                display_path(&entry.path),
+                describe(entry)
+            ),
         );
     }
     for entry in &after[after_index..] {
@@ -199,7 +203,10 @@ fn changed_snapshot_paths(before: &[SnapshotEntry], after: &[SnapshotEntry]) -> 
         );
     }
     if total > paths.len() {
-        paths.push(format!("... {} additional changed paths", total - paths.len()));
+        paths.push(format!(
+            "... {} additional changed paths",
+            total - paths.len()
+        ));
     }
     paths
 }
@@ -380,7 +387,8 @@ fn quick_test_cli_keeps_host_git_context_out_of_its_disposable_repository() {
         .env_remove("AETHYME_REPO")
         .env("AETHYME_CHAU7_MCP_BRIDGE", "/__aethyme_no_chau7_bridge__")
         .env("AETHYME_QUICK_TEST_HOOK_MARKER", &hook_marker)
-        .env("AETHYME_GIT_TIMEOUT_SECS", "120");
+        .env("AETHYME_GIT_TIMEOUT_SECS", "120")
+        .env("AETHYME_MEASURE_OUTPUT", "1");
     clear_git_environment(&mut command);
     command
         .env("GIT_DIR", &git_dir)
