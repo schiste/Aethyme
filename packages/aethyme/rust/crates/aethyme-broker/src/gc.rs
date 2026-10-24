@@ -7650,7 +7650,7 @@ mod tests {
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
         std::fs::write(
             repo.join(".aethyme/broker.toml"),
-            "[retention]\nartifact_sweep_budget_ms = 0\n",
+            "[retention]\nartifact_sweep_budget_ms = 0\nclosed_worktree_grace_hours = 0\n",
         )
         .unwrap();
 
