@@ -5902,13 +5902,8 @@ impl Broker {
                             "reuse updated the session task, but preparation status could not be read ({error}); retry reuse to refresh the report"
                         ))
                     })?;
-                    let (default_branch, default_branch_note) =
-                        self.default_branch_after_reuse(
-                            &checkout,
-                            &session,
-                            prefetched,
-                            &freshness,
-                        );
+                    let (default_branch, default_branch_note) = self
+                        .default_branch_after_reuse(&checkout, &session, prefetched, &freshness);
                     return Ok(AdoptReport {
                         session,
                         outcome: AdoptOutcome::Reused,
@@ -5965,18 +5960,19 @@ impl Broker {
             .as_ref()
             .map(|carried| carried.baseline.clone())
             .or_else(|| diff_base.clone());
-        let adopted_base_observation = ownership_base
-            .clone()
-            .or_else(|| diff_base.clone())
-            .map(|target_commit| crate::broker::SessionBaseObservation {
-                schema_version: 1,
-                target_ref: "adopted_baseline".into(),
-                target_commit,
-                evidence: None,
-                observed_at_ms: Some(crate::clock::epoch_ms()),
-                promote_branch: crate::merge::PromoteConfig::load(&self.main_root).branch,
-                default_ref: None,
-            });
+        let adopted_base_observation =
+            ownership_base
+                .clone()
+                .or_else(|| diff_base.clone())
+                .map(|target_commit| crate::broker::SessionBaseObservation {
+                    schema_version: 1,
+                    target_ref: "adopted_baseline".into(),
+                    target_commit,
+                    evidence: None,
+                    observed_at_ms: Some(crate::clock::epoch_ms()),
+                    promote_branch: crate::merge::PromoteConfig::load(&self.main_root).branch,
+                    default_ref: None,
+                });
         let new_session = NewSession {
             worktree_path,
             branch,
@@ -6004,15 +6000,15 @@ impl Broker {
                         base_observation: Some(observation),
                     },
                 )?,
-            (Some(replaced_session_id), None) => self
-                .store
-                .replace_session_with_context_and_leases(
+            (Some(replaced_session_id), None) => {
+                self.store.replace_session_with_context_and_leases(
                     LeaseRefusalPolicy::verify_only_at(&self.main_root),
                     replaced_session_id,
                     &new_session,
                     &context,
                     &planned_paths,
-                )?,
+                )?
+            }
             (None, Some(observation)) => self
                 .store
                 .register_session_with_context_and_leases_and_base_observation(
@@ -6103,7 +6099,9 @@ impl Broker {
             .store
             .meta_get(&crate::broker::SessionBaseObservation::meta_key(session.id))?;
         let previous = raw_observation
-            .and_then(|raw| serde_json::from_str::<crate::broker::SessionBaseObservation>(&raw).ok())
+            .and_then(|raw| {
+                serde_json::from_str::<crate::broker::SessionBaseObservation>(&raw).ok()
+            })
             .filter(|observation| {
                 observation.schema_version == 1
                     && !observation.target_ref.trim().is_empty()
@@ -6113,12 +6111,11 @@ impl Broker {
             .as_ref()
             .and_then(|observation| observation.observed_at_ms);
         let now = crate::clock::epoch_ms();
-        let previous_observation_age =
-            crate::worktree_freshness::classify_prior_observation(
-                previous_observed_at,
-                now,
-                policy.max_age_seconds,
-            );
+        let previous_observation_age = crate::worktree_freshness::classify_prior_observation(
+            previous_observed_at,
+            now,
+            policy.max_age_seconds,
+        );
 
         let promote = crate::PromoteConfig::load(&self.main_root);
         let mut integration_sync = None;
@@ -6156,12 +6153,9 @@ impl Broker {
             target
         } else if let Some(previous) = previous.as_ref() {
             match previous.evidence {
-                Some(evidence) => self.resolve_observed_reuse_target(
-                    previous,
-                    evidence,
-                    prefetched,
-                    &promote,
-                )?,
+                Some(evidence) => {
+                    self.resolve_observed_reuse_target(previous, evidence, prefetched, &promote)?
+                }
                 None => self.resolve_unknown_reuse_target(Some(previous), &promote)?,
             }
         } else {
@@ -6173,8 +6167,7 @@ impl Broker {
         };
 
         if target.verify_ref
-            && self.repo.resolve_ref(&target.reference).as_deref()
-                != Some(target.commit.as_str())
+            && self.repo.resolve_ref(&target.reference).as_deref() != Some(target.commit.as_str())
         {
             return Err(reuse_freshness_refusal(format!(
                 "selected base {} changed before checkout validation; retry the task handoff",
@@ -6182,37 +6175,38 @@ impl Broker {
             )));
         }
 
-        let (relation, validated_head, checkout_moved_to) =
-            if let Some(sync) = integration_sync.as_ref() {
-                let relation = match sync.outcome {
-                    AdoptIntegrationSyncOutcome::AlreadyCurrent => {
-                        crate::AdoptBaseFreshnessRelation::Current
-                    }
-                    AdoptIntegrationSyncOutcome::FastForwarded => {
-                        crate::AdoptBaseFreshnessRelation::FastForwarded
-                    }
-                };
-                let checkout_moved_to = (sync.outcome == AdoptIntegrationSyncOutcome::FastForwarded)
-                    .then(|| sync.after_head.clone());
-                (relation, sync.after_head.clone(), checkout_moved_to)
-            } else {
-                let head = checkout.head_commit()?;
-                let mut validated_head = head.clone();
-                let mut checkout_moved_to = None;
-                let branch = checkout.current_branch()?;
-                let expected_head_ref = format!("refs/heads/{branch}");
-                if branch != session.branch
-                    || checkout.symbolic_ref("HEAD").as_deref()
-                        != Some(expected_head_ref.as_str())
-                {
-                    return Err(reuse_freshness_refusal(
-                        "the session checkout is detached or no longer on its recorded branch",
-                    ));
-                }
-                let relation = if head == target.commit {
+        let (relation, validated_head, checkout_moved_to) = if let Some(sync) =
+            integration_sync.as_ref()
+        {
+            let relation = match sync.outcome {
+                AdoptIntegrationSyncOutcome::AlreadyCurrent => {
                     crate::AdoptBaseFreshnessRelation::Current
-                } else {
-                    let history_is_complete = checkout
+                }
+                AdoptIntegrationSyncOutcome::FastForwarded => {
+                    crate::AdoptBaseFreshnessRelation::FastForwarded
+                }
+            };
+            let checkout_moved_to = (sync.outcome == AdoptIntegrationSyncOutcome::FastForwarded)
+                .then(|| sync.after_head.clone());
+            (relation, sync.after_head.clone(), checkout_moved_to)
+        } else {
+            let head = checkout.head_commit()?;
+            let mut validated_head = head.clone();
+            let mut checkout_moved_to = None;
+            let branch = checkout.current_branch()?;
+            let expected_head_ref = format!("refs/heads/{branch}");
+            if branch != session.branch
+                || checkout.symbolic_ref("HEAD").as_deref() != Some(expected_head_ref.as_str())
+            {
+                return Err(reuse_freshness_refusal(
+                    "the session checkout is detached or no longer on its recorded branch",
+                ));
+            }
+            let relation = if head == target.commit {
+                crate::AdoptBaseFreshnessRelation::Current
+            } else {
+                let history_is_complete =
+                    checkout
                         .has_complete_unmodified_history()
                         .map_err(|error| {
                             reuse_freshness_refusal(format!(
@@ -6220,82 +6214,80 @@ impl Broker {
                                 target.reference
                             ))
                         })?;
-                    if !history_is_complete {
+                if !history_is_complete {
+                    return Err(reuse_freshness_refusal(format!(
+                        "the repository has shallow or replaced history, so {} cannot be checked safely; no checkout change was made",
+                        target.reference
+                    )));
+                }
+                if checkout
+                    .is_ancestor_checked(&target.commit, &head)
+                    .map_err(|error| {
+                        reuse_freshness_refusal(format!(
+                            "could not verify whether {} is contained in the session: {error}",
+                            target.reference
+                        ))
+                    })?
+                {
+                    crate::AdoptBaseFreshnessRelation::TargetContained
+                } else if checkout
+                    .is_ancestor_checked(&head, &target.commit)
+                    .map_err(|error| {
+                        reuse_freshness_refusal(format!(
+                            "could not verify whether the session can fast-forward to {}: {error}",
+                            target.reference
+                        ))
+                    })?
+                {
+                    if !target.evidence.is_some_and(|evidence| {
+                        evidence != crate::SessionStartBaseEvidence::ExplicitBase
+                    }) {
                         return Err(reuse_freshness_refusal(format!(
-                            "the repository has shallow or replaced history, so {} cannot be checked safely; no checkout change was made",
+                            "the session checkout is behind the selected base {}; automatic movement is disabled for unknown or explicit base provenance. Recreate the session from that base, or explicitly use --sync-integration if integration is the intended base",
                             target.reference
                         )));
                     }
-                    if checkout
-                        .is_ancestor_checked(&target.commit, &head)
-                        .map_err(|error| {
-                            reuse_freshness_refusal(format!(
-                                "could not verify whether {} is contained in the session: {error}",
-                                target.reference
-                            ))
-                        })?
+                    let dirty_paths = checkout.dirty_paths()?;
+                    if !dirty_paths.is_empty() {
+                        return Err(BrokerOpError::ReuseSyncDirty { paths: dirty_paths });
+                    }
+                    let branch = checkout.current_branch()?;
+                    let expected_head_ref = format!("refs/heads/{branch}");
+                    if branch != session.branch
+                        || checkout.symbolic_ref("HEAD").as_deref()
+                            != Some(expected_head_ref.as_str())
                     {
-                        crate::AdoptBaseFreshnessRelation::TargetContained
-                    } else if checkout
-                        .is_ancestor_checked(&head, &target.commit)
-                        .map_err(|error| {
-                            reuse_freshness_refusal(format!(
-                                "could not verify whether the session can fast-forward to {}: {error}",
-                                target.reference
-                            ))
-                        })?
+                        return Err(reuse_freshness_refusal(
+                            "the session checkout is no longer on its recorded branch; no checkout change was made",
+                        ));
+                    }
+                    checkout.fast_forward_checkout_from(&branch, &head, &target.commit)?;
+                    let after = checkout.head_commit()?;
+                    if after != target.commit
+                        || self.repo.resolve_ref(&target.reference).as_deref()
+                            != Some(target.commit.as_str())
                     {
-                        if !target
-                            .evidence
-                            .is_some_and(|evidence| evidence != crate::SessionStartBaseEvidence::ExplicitBase)
-                        {
-                            return Err(reuse_freshness_refusal(format!(
-                                "the session checkout is behind the selected base {}; automatic movement is disabled for unknown or explicit base provenance. Recreate the session from that base, or explicitly use --sync-integration if integration is the intended base",
-                                target.reference
-                            )));
-                        }
-                        let dirty_paths = checkout.dirty_paths()?;
-                        if !dirty_paths.is_empty() {
-                            return Err(BrokerOpError::ReuseSyncDirty { paths: dirty_paths });
-                        }
-                        let branch = checkout.current_branch()?;
-                        let expected_head_ref = format!("refs/heads/{branch}");
-                        if branch != session.branch
-                            || checkout.symbolic_ref("HEAD").as_deref()
-                                != Some(expected_head_ref.as_str())
-                        {
-                            return Err(reuse_freshness_refusal(
-                                "the session checkout is no longer on its recorded branch; no checkout change was made",
-                            ));
-                        }
-                        checkout.fast_forward_checkout_from(&branch, &head, &target.commit)?;
-                        let after = checkout.head_commit()?;
-                        if after != target.commit
-                            || self.repo.resolve_ref(&target.reference).as_deref()
-                                != Some(target.commit.as_str())
-                        {
-                            return Err(reuse_freshness_refusal(format!(
-                                "the selected base {} changed during fast-forward; the checkout was moved only to the preflighted commit and must be inspected before reuse",
-                                target.reference
-                            )));
-                        }
-                        validated_head = after;
-                        checkout_moved_to = Some(target.commit.clone());
-                        crate::AdoptBaseFreshnessRelation::FastForwarded
-                    } else {
                         return Err(reuse_freshness_refusal(format!(
-                            "the session and selected base {} have diverged; no checkout change was made",
+                            "the selected base {} changed during fast-forward; the checkout was moved only to the preflighted commit and must be inspected before reuse",
                             target.reference
                         )));
                     }
-                };
-                (relation, validated_head, checkout_moved_to)
+                    validated_head = after;
+                    checkout_moved_to = Some(target.commit.clone());
+                    crate::AdoptBaseFreshnessRelation::FastForwarded
+                } else {
+                    return Err(reuse_freshness_refusal(format!(
+                        "the session and selected base {} have diverged; no checkout change was made",
+                        target.reference
+                    )));
+                }
             };
+            (relation, validated_head, checkout_moved_to)
+        };
 
         if integration_sync.is_none()
             && target.verify_ref
-            && self.repo.resolve_ref(&target.reference).as_deref()
-                != Some(target.commit.as_str())
+            && self.repo.resolve_ref(&target.reference).as_deref() != Some(target.commit.as_str())
         {
             return Err(reuse_freshness_refusal(format!(
                 "selected base {} changed while reuse was being checked; retry the task handoff",
@@ -6338,9 +6330,9 @@ impl Broker {
         let refresh_diff_base = (relation == crate::AdoptBaseFreshnessRelation::FastForwarded
             || (relation == crate::AdoptBaseFreshnessRelation::Current
                 && target.commit == final_head
-                && target
-                    .evidence
-                    .is_some_and(|evidence| evidence != crate::SessionStartBaseEvidence::ExplicitBase)
+                && target.evidence.is_some_and(|evidence| {
+                    evidence != crate::SessionStartBaseEvidence::ExplicitBase
+                })
                 && session.diff_base.as_deref() != Some(target.commit.as_str())))
         .then(|| target.commit.clone());
         Ok(ReuseFreshnessDecision {
@@ -6421,7 +6413,8 @@ impl Broker {
                         .as_ref()
                         .is_some_and(|refresh| refresh.fetched)
                     {
-                        let current_default = self.require_fresh_default(prefetched, default_ref)?;
+                        let current_default =
+                            self.require_fresh_default(prefetched, default_ref)?;
                         let history_is_complete = self
                             .repo
                             .has_complete_unmodified_history()
@@ -6491,12 +6484,13 @@ impl Broker {
                     .target_ref
                     .strip_prefix("refs/heads/")
                     .ok_or_else(|| {
-                        reuse_freshness_refusal(
-                            "the recorded local default ref is malformed",
-                        )
+                        reuse_freshness_refusal("the recorded local default ref is malformed")
                     })?;
                 let expected_remote_head = format!("refs/remotes/origin/{branch}");
-                if self.repo.symbolic_ref("refs/remotes/origin/HEAD").as_deref()
+                if self
+                    .repo
+                    .symbolic_ref("refs/remotes/origin/HEAD")
+                    .as_deref()
                     != Some(expected_remote_head.as_str())
                     || observation.target_ref != format!("refs/heads/{branch}")
                 {
@@ -6504,12 +6498,15 @@ impl Broker {
                         "origin/HEAD no longer selects the recorded local default branch",
                     ));
                 }
-                let commit = self.repo.resolve_ref(&observation.target_ref).ok_or_else(|| {
-                    reuse_freshness_refusal(format!(
-                        "the recorded local default ref {} is missing",
-                        observation.target_ref
-                    ))
-                })?;
+                let commit = self
+                    .repo
+                    .resolve_ref(&observation.target_ref)
+                    .ok_or_else(|| {
+                        reuse_freshness_refusal(format!(
+                            "the recorded local default ref {} is missing",
+                            observation.target_ref
+                        ))
+                    })?;
                 ReuseTarget {
                     reference: observation.target_ref.clone(),
                     commit,
@@ -7065,8 +7062,7 @@ impl Broker {
                 &planned_paths,
                 worktree_instance_witness.as_ref(),
                 Some(&base_observation),
-            )
-        {
+            ) {
             Ok(session) => session,
             Err(error) => {
                 let worktree_path = worktree.root().to_path_buf();
@@ -7241,26 +7237,26 @@ impl Broker {
         let registration = self
             .store
             .register_spawned_session_with_context_and_leases_and_base_observation(
-            LeaseRefusalPolicy::verify_only_at(&self.main_root),
-            &NewSession {
-                worktree_path: worktree_path_string.clone(),
-                branch: branch.clone(),
-                origin: SessionOrigin::Spawned,
-                task: Some(task.to_string()),
-                adoption_base: Some(base.clone()),
-                adopted_head: Some(base.clone()),
-                diff_base: Some(base.clone()),
-                repository_contract: Some(repository_contract),
-                pid: Some(pid as i64),
-                command: Some(command.to_string()),
-                log_path: Some(log_path_string.clone()),
-                agent_identity: agent_identity.map(str::to_string),
-            },
-            &context,
-            &[],
-            worktree_instance_witness.as_ref(),
-            Some(&base_observation),
-        );
+                LeaseRefusalPolicy::verify_only_at(&self.main_root),
+                &NewSession {
+                    worktree_path: worktree_path_string.clone(),
+                    branch: branch.clone(),
+                    origin: SessionOrigin::Spawned,
+                    task: Some(task.to_string()),
+                    adoption_base: Some(base.clone()),
+                    adopted_head: Some(base.clone()),
+                    diff_base: Some(base.clone()),
+                    repository_contract: Some(repository_contract),
+                    pid: Some(pid as i64),
+                    command: Some(command.to_string()),
+                    log_path: Some(log_path_string.clone()),
+                    agent_identity: agent_identity.map(str::to_string),
+                },
+                &context,
+                &[],
+                worktree_instance_witness.as_ref(),
+                Some(&base_observation),
+            );
         let session = match registration {
             Ok(session) => session,
             Err(registration_error) => {
@@ -7390,10 +7386,8 @@ impl Broker {
         // a stale copy of main to this session's submit and finish (#352).
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Start);
         let selected_promote = crate::merge::PromoteConfig::load(&self.main_root);
-        let mut start_base = self.select_session_start_base_with_promote(
-            explicit_base,
-            &selected_promote,
-        )?;
+        let mut start_base =
+            self.select_session_start_base_with_promote(explicit_base, &selected_promote)?;
         refresh.record(&mut start_base);
         // Refresh may wait on another process or a remote. Acquire the
         // repository lifecycle claim only after that work. Root preparation

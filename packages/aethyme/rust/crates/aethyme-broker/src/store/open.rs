@@ -9,7 +9,10 @@ fn write_session_base_observation(
     tx.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![crate::broker::SessionBaseObservation::meta_key(session_id), value],
+        params![
+            crate::broker::SessionBaseObservation::meta_key(session_id),
+            value
+        ],
     )?;
     Ok(())
 }
@@ -440,7 +443,12 @@ impl BrokerStore {
         witness: Option<&crate::events::SpawnedWorktreeInstanceWitness>,
     ) -> Result<Session, BrokerError> {
         self.register_spawned_session_with_context_and_leases_and_base_observation(
-            verify_only, new, context, planned_paths, witness, None,
+            verify_only,
+            new,
+            context,
+            planned_paths,
+            witness,
+            None,
         )
     }
 

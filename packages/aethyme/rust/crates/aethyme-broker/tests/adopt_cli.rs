@@ -57,10 +57,7 @@ fn fixture() -> common::FixtureRepository {
     tmp
 }
 
-fn stored_session(
-    fixture: &common::FixtureRepository,
-    id: i64,
-) -> aethyme_broker::Session {
+fn stored_session(fixture: &common::FixtureRepository, id: i64) -> aethyme_broker::Session {
     common::open_fixture_repository_broker(fixture)
         .unwrap()
         .store()
@@ -78,7 +75,9 @@ fn stored_base_observation(
     let connection = rusqlite::Connection::open(database).unwrap();
     let key = format!("session_base_observation.{session_id}");
     let raw: String = connection
-        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| row.get(0))
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
         .unwrap();
     serde_json::from_str(&raw).unwrap()
 }
@@ -751,10 +750,7 @@ fn start_refuses_a_base_that_does_not_resolve() {
 #[test]
 fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
     let tmp = fixture();
-    let started = stdout(&run(
-        tmp.path(),
-        &["start", "--task", "initial", "--json"],
-    ));
+    let started = stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
     let started: serde_json::Value = serde_json::from_str(&started).unwrap();
     assert_eq!(started["start_base"]["evidence"], "conventional_main");
     let session = stored_session(&tmp, 1);
@@ -795,10 +791,7 @@ fn reuse_uses_a_local_integration_base_when_default_fetch_fails() {
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     set_integration_at_head(tmp.path());
-    let started = stdout(&run(
-        tmp.path(),
-        &["start", "--task", "initial", "--json"],
-    ));
+    let started = stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
     let started: serde_json::Value = serde_json::from_str(&started).unwrap();
     assert_eq!(started["start_base"]["evidence"], "integration_tip");
     let session = stored_session(&tmp, 1);
@@ -832,9 +825,11 @@ fn reuse_uses_a_local_integration_base_when_default_fetch_fails() {
 
     assert_eq!(reused["base_freshness"]["source"], "integration_tip");
     assert_eq!(reused["base_freshness"]["relation"], "current");
-    assert!(reused["default_branch_note"]
-        .as_str()
-        .is_some_and(|note| note.contains("used the last fetched copy")));
+    assert!(
+        reused["default_branch_note"]
+            .as_str()
+            .is_some_and(|note| note.contains("used the last fetched copy"))
+    );
     let current_observation = stored_base_observation(&tmp, session.id);
     let checked_at = reused["base_freshness"]["observed_at_ms"]
         .as_i64()
@@ -1235,13 +1230,15 @@ fn unknown_adopted_base_refuses_when_configured_integration_is_missing() {
         );
         assert!(!refused.status.success());
         assert!(
-            json_error::message(&refused).contains(
-                "configured integration ref refs/heads/aethyme/integration is missing"
-            ),
+            json_error::message(&refused)
+                .contains("configured integration ref refs/heads/aethyme/integration is missing"),
             "{}",
             json_error::message(&refused)
         );
-        assert_eq!(git_output(tmp.path(), &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(
+            git_output(tmp.path(), &["rev-parse", "HEAD"]),
+            original_head
+        );
         assert_eq!(
             stored_session(&tmp, session.id).task.as_deref(),
             Some("initial")
@@ -1450,13 +1447,7 @@ fn reuse_cli_exposes_structured_integration_drift_and_safe_guidance() {
 
     let rendered = stdout(&run(
         tmp.path(),
-        &[
-            "start",
-            "--reuse",
-            worktree_arg,
-            "--task",
-            "render drift",
-        ],
+        &["start", "--reuse", worktree_arg, "--task", "render drift"],
     ));
     assert!(rendered.contains("Integration drift: behind"), "{rendered}");
     assert!(rendered.contains("Overlapping changed paths:\n  shared.txt"));

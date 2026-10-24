@@ -756,13 +756,13 @@ mod gate_result_clear_metadata_tests {
         let directory = tempfile::tempdir().unwrap();
         init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
-        let session_id = insert_gc_fixture_session(
-            &mut store,
-            &directory.path().join("session"),
-        );
+        let session_id = insert_gc_fixture_session(&mut store, &directory.path().join("session"));
         let key = crate::broker::SessionBaseObservation::meta_key(session_id);
         store.meta_set(&key, "fixture observation").unwrap();
-        assert_eq!(store.meta_get(&key).unwrap().as_deref(), Some("fixture observation"));
+        assert_eq!(
+            store.meta_get(&key).unwrap().as_deref(),
+            Some("fixture observation")
+        );
 
         store
             .set_session_status(session_id, crate::SessionStatus::Closed, None)

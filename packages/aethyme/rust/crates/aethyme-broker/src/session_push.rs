@@ -735,7 +735,9 @@ impl Broker {
         Option<String>,
         DefaultBranchRefreshEvidence,
     ) {
-        let fetch_error = self.fetch_default_branch(session_id, default, target, main_root).err();
+        let fetch_error = self
+            .fetch_default_branch(session_id, default, target, main_root)
+            .err();
         let mut note = fetch_error.clone();
         let repo = self.repo_handle();
         let Some(commit) = repo.resolve_ref(&default.tracking_ref) else {

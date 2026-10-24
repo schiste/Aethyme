@@ -96,14 +96,16 @@ mod tests {
 
     #[test]
     fn policy_refuses_unknown_keys_and_non_unsigned_values() {
-        assert!(WorktreeFreshnessPolicy::from_config_text(
-            "[worktree_freshness]\nmax_age = 900\n"
-        )
-        .is_err());
-        assert!(WorktreeFreshnessPolicy::from_config_text(
-            "[worktree_freshness]\nmax_age_seconds = -1\n"
-        )
-        .is_err());
+        assert!(
+            WorktreeFreshnessPolicy::from_config_text("[worktree_freshness]\nmax_age = 900\n")
+                .is_err()
+        );
+        assert!(
+            WorktreeFreshnessPolicy::from_config_text(
+                "[worktree_freshness]\nmax_age_seconds = -1\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
