@@ -8,6 +8,8 @@ use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
+#[path = "common/json_error.rs"]
+mod json_error;
 
 fn git_output(repo: &Path, args: &[&str]) -> Output {
     git_output_with_env(
@@ -276,6 +278,73 @@ fn run_from_fixture(owner: &Path, cwd: &Path, container: &Path, args: &[&str]) -
     command_from_fixture(owner, cwd, container, args)
         .output()
         .unwrap()
+}
+
+fn assert_reclaim_usage_refusal_before_state_creation(args: &[&str], expected: &str) {
+    let owner = tempfile::tempdir().unwrap();
+    let container = tempfile::tempdir().unwrap();
+    let output = command_from_fixture_with_env(
+        owner.path(),
+        owner.path(),
+        container.path(),
+        args,
+        [("AETHYME_MEASURE_OUTPUT".into(), "0".into())],
+    )
+    .output()
+    .unwrap();
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    assert!(output.stderr.is_empty(), "unexpected stderr: {output:?}");
+    let message = json_error::message(&output);
+    assert!(message.contains(expected), "{message}");
+
+    assert!(
+        !owner.path().join(".aethyme").exists(),
+        "reclaim selector refusal must precede repository database creation"
+    );
+    assert!(
+        !owner.path().join(".git/aethyme-test-state").exists(),
+        "reclaim selector refusal must precede host-state snapshot creation"
+    );
+    assert!(
+        !owner.path().join(".git/aethyme-test-cache").exists(),
+        "reclaim selector refusal must precede host-cache creation"
+    );
+    assert!(
+        std::fs::read_dir(container.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "reclaim selector refusal must precede root scanning or review-snapshot writes"
+    );
+}
+
+#[test]
+fn invalid_reclaim_selectors_are_refused_before_opening_state_or_scanning_the_root() {
+    assert_reclaim_usage_refusal_before_state_creation(
+        &["gc", "reclaim", "purge", "--json"],
+        "unknown reclaim action",
+    );
+    assert_reclaim_usage_refusal_before_state_creation(
+        &["gc", "reclaim", "apply", "--json"],
+        "requires --confirm",
+    );
+    assert_reclaim_usage_refusal_before_state_creation(
+        &["gc", "reclaim", "plan", "extra", "--json"],
+        "exactly one action",
+    );
+
+    let malformed_digest = format!("{}x", "a".repeat(63));
+    assert_reclaim_usage_refusal_before_state_creation(
+        &[
+            "gc",
+            "reclaim",
+            "apply",
+            "--confirm",
+            malformed_digest.as_str(),
+            "--json",
+        ],
+        "64-character hexadecimal SHA-256",
+    );
 }
 
 /// Date every linked worktree's index four hours back.
