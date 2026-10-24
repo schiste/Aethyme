@@ -102,6 +102,46 @@ fn item_for(audit: &CleanupAudit, session_id: i64) -> &aethyme_broker::AuditItem
 }
 
 #[test]
+fn unavailable_history_count_is_an_error_instead_of_zero() {
+    let (_tmp, publisher, repo) = fixture();
+    let shared_parent = git_out(&repo, &["rev-parse", "HEAD"]);
+    commit(&repo, "local.txt", "local\n", "local work");
+    commit(&publisher, "remote.txt", "remote\n", "remote work");
+    git(&publisher, &["push", "-q", "origin", "main"]);
+    git(&repo, &["fetch", "-q", "origin"]);
+    let broker = isolation::open(&repo);
+    let target = broker.cleanup_audit_target().unwrap();
+    assert_eq!(target.local_ahead_upstream, 1);
+    assert_eq!(target.local_behind_upstream, 1);
+
+    // Both tip commits remain readable; only their common ancestor is missing.
+    // Rev-parse can still name the refs, while rev-list must refuse the count.
+    let object = repo
+        .join(".git/objects")
+        .join(&shared_parent[..2])
+        .join(&shared_parent[2..]);
+    assert!(object.is_file(), "fixture parent must be a loose object");
+    let saved = std::fs::read(&object).unwrap();
+    std::fs::remove_file(&object).unwrap();
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "main^{commit}"]),
+        target.local_commit.unwrap()
+    );
+    assert_eq!(
+        git_out(&repo, &["rev-parse", "origin/main^{commit}"]),
+        target.upstream_commit.unwrap()
+    );
+    assert!(matches!(
+        broker.cleanup_audit_target(),
+        Err(aethyme_broker::BrokerOpError::Git(_))
+    ));
+    std::fs::write(&object, saved).unwrap();
+    let restored = broker.cleanup_audit_target().unwrap();
+    assert_eq!(restored.local_ahead_upstream, 1);
+    assert_eq!(restored.local_behind_upstream, 1);
+}
+
+#[test]
 fn squash_landing_is_in_target_against_upstream_while_local_main_is_stale() {
     let (_tmp, publisher, repo) = fixture();
     let mut broker = isolation::open(&repo);
