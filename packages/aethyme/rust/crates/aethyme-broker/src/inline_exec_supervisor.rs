@@ -1991,6 +1991,10 @@ mod tests {
         assert_eq!(result.termination, CommandTermination::TimedOut);
         assert_eq!(result.exit_code, None);
         assert!(!result.succeeded);
+        assert!(
+            !result.command_started,
+            "deadline expiry before the parent reads Started must remain unconfirmed"
+        );
     }
 
     #[test]

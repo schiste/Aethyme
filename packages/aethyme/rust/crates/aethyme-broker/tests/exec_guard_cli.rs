@@ -252,11 +252,64 @@ fn completed_cli_exec_exposes_a_queryable_receipt_without_command_details() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn failed_to_spawn_command_records_a_not_started_receipt() {
+    let (repo, state, packed) = fixture();
+    let (id, worktree) = split(&packed);
+    let missing = state.path().join("missing-exec-command");
+    let mut exec = Command::new(CLI);
+    exec.args([
+        "advanced",
+        "exec",
+        "--session",
+        id,
+        "--non-interactive",
+        "--json",
+        "--",
+    ])
+    .arg(missing)
+    .current_dir(worktree)
+    .env("AETHYME_HOST_STATE_DIR", state.path());
+    let out = exec.output().unwrap();
+    assert!(!out.status.success(), "a missing executable must fail to start");
+
+    let status = run(
+        repo.path(),
+        state.path(),
+        &["advanced", "exec-status", "--session", id, "--json"],
+    );
+    assert!(
+        status.status.success(),
+        "exec-status: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let receipt = value["receipts"]
+        .as_array()
+        .and_then(|receipts| receipts.first())
+        .expect("failed spawn remains queryable");
+    assert_eq!(receipt["phase"], "not_started");
+    assert_eq!(receipt["command_outcome"], "not_started");
+    assert_eq!(receipt["ownership_audit"], "not_run");
+    assert_eq!(receipt["process_group_cleanup"], "not_applicable");
+    assert!(receipt["exit_code"].is_null());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
     use std::time::{Duration, Instant};
 
     let (repo, state, packed) = fixture();
     let (id, worktree) = split(&packed);
+    let started_marker = state.path().join("exec-child-started");
+    let release_marker = state.path().join("exec-child-release");
+    // Keep the supervised child alive until the test disconnects its broker
+    // client. The loop has a hard bound as a fallback if cleanup regresses.
+    let wait_for_release = concat!(
+        "printf started > \"$AETHYME_TEST_EXEC_STARTED\"; ",
+        "i=0; while [ ! -e \"$AETHYME_TEST_EXEC_RELEASE\" ] ",
+        "&& [ \"$i\" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done"
+    );
     let mut exec = Command::new(CLI)
         .args([
             "advanced",
@@ -265,47 +318,62 @@ fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
             id,
             "--non-interactive",
             "--timeout",
-            "10",
+            "40",
             "--",
             "sh",
             "-c",
-            "sleep 2",
+            wait_for_release,
         ])
         .current_dir(worktree)
         .env("AETHYME_HOST_STATE_DIR", state.path())
+        .env("AETHYME_TEST_EXEC_STARTED", &started_marker)
+        .env("AETHYME_TEST_EXEC_RELEASE", &release_marker)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let receipt_id = loop {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let receipt_result = loop {
         let status = run(
             repo.path(),
             state.path(),
             &["advanced", "exec-status", "--session", id, "--json"],
         );
-        assert!(
-            status.status.success(),
-            "exec-status: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-        let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        if !status.status.success() {
+            break Err(format!(
+                "exec-status: {}",
+                String::from_utf8_lossy(&status.stderr)
+            ));
+        }
+        let value: serde_json::Value = match serde_json::from_slice(&status.stdout) {
+            Ok(value) => value,
+            Err(error) => break Err(format!("exec-status returned invalid JSON: {error}")),
+        };
         if let Some(receipt) = value["receipts"]
             .as_array()
             .and_then(|receipts| receipts.first())
-            .filter(|receipt| receipt["phase"] == "running")
+            .filter(|receipt| receipt["phase"] == "running" && started_marker.is_file())
         {
-            break receipt["receipt_id"].as_str().unwrap().to_owned();
+            if let Some(receipt_id) = receipt["receipt_id"].as_str() {
+                break Ok(receipt_id.to_owned());
+            }
+            break Err("running receipt omitted its identifier".to_owned());
         }
-        assert!(Instant::now() < deadline, "exec never published its running receipt");
+        if Instant::now() >= deadline {
+            break Err("exec never published a running receipt after starting its child".to_owned());
+        }
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    exec.kill().unwrap();
+    if matches!(exec.try_wait(), Ok(None)) {
+        exec.kill().unwrap();
+    }
     let _ = exec.wait().unwrap();
-
-    std::thread::sleep(Duration::from_secs(3));
+    // Let the synthetic child exit if the supervisor did not already stop it
+    // when the client disconnected.
+    std::fs::write(&release_marker, b"release\n").unwrap();
+    let receipt_id = receipt_result.unwrap_or_else(|reason| panic!("{reason}"));
 
     let status = run(
         repo.path(),

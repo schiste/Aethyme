@@ -11,6 +11,7 @@ use super::*;
 use crate::broker::WorktreeRootSource;
 
 const BINDING_RECORD_SCHEMA_VERSION: i64 = 1;
+const REPOSITORY_BINDING_SCHEMA_VERSION: i64 = 54;
 const MAX_IDENTITY_JSON_BYTES: usize = 4096;
 const MAX_REPOSITORY_KEY_BYTES: usize = 1024;
 const BOOTSTRAP_NONCE_HEX_BYTES: usize = 64;
@@ -231,7 +232,7 @@ impl BrokerStore {
             return Ok(());
         }
         with_durable_binding_transaction(&mut self.conn, |tx| {
-            ensure_current_v54(tx)?;
+            ensure_current_binding_schema(tx)?;
             let current = read_repository_worktree_binding_optional(tx, Some(&scope))?;
             match current {
                 Some(current) if current.git_common_dir.is_some() => Ok(()),
@@ -311,7 +312,7 @@ impl BrokerStore {
         validate_repository_identity(identity)?;
         let binding_scope = self.binding_scope.clone();
         with_durable_binding_transaction(&mut self.conn, |tx| {
-            ensure_current_v54(tx)?;
+            ensure_current_binding_schema(tx)?;
             let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             ensure_state(
                 current.state,
@@ -370,7 +371,7 @@ impl BrokerStore {
         validate_reservation(reservation)?;
         let binding_scope = self.binding_scope.clone();
         with_durable_binding_transaction(&mut self.conn, |tx| {
-            ensure_current_v54(tx)?;
+            ensure_current_binding_schema(tx)?;
             let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             ensure_state(
                 current.state,
@@ -423,7 +424,7 @@ impl BrokerStore {
         validate_hex_digest(reservation_digest, "reservation digest")?;
         let binding_scope = self.binding_scope.clone();
         with_durable_binding_transaction(&mut self.conn, |tx| {
-            ensure_current_v54(tx)?;
+            ensure_current_binding_schema(tx)?;
             let current = read_repository_worktree_binding(tx, binding_scope.as_ref())?;
             ensure_state(
                 current.state,
@@ -505,7 +506,7 @@ impl BrokerStore {
         binding_scope.repository_uuid = Some(uuid.clone());
         self.binding_scope = Some(binding_scope.clone());
         with_durable_binding_transaction(&mut self.conn, |tx| {
-            ensure_current_v54(tx)?;
+            ensure_current_binding_schema(tx)?;
             let current = read_repository_worktree_binding(tx, Some(&binding_scope))?;
             if !matches!(
                 current.state,
@@ -598,7 +599,7 @@ impl BrokerStore {
         binding_scope.repository_uuid = Some(uuid.clone());
         self.binding_scope = Some(binding_scope.clone());
         with_durable_binding_transaction(&mut self.conn, |tx| {
-            ensure_current_v54(tx)?;
+            ensure_current_binding_schema(tx)?;
             let current = read_repository_worktree_binding(tx, Some(&binding_scope))?;
             ensure_state(
                 current.state,
@@ -1081,11 +1082,13 @@ fn validate_binding_record(
     Ok(())
 }
 
-fn ensure_current_v54(conn: &Connection) -> Result<(), BrokerError> {
+fn ensure_current_binding_schema(conn: &Connection) -> Result<(), BrokerError> {
     let found = crate::schema::current_version(conn)?;
-    if found != crate::schema::SCHEMA_VERSION || found != 54 {
+    if found != crate::schema::SCHEMA_VERSION || found < REPOSITORY_BINDING_SCHEMA_VERSION {
         return Err(invalid_binding(format!(
-            "transition requires schema 54, found {found}"
+            "transition requires current schema {} (repository bindings were introduced in schema {}), found {found}",
+            crate::schema::SCHEMA_VERSION,
+            REPOSITORY_BINDING_SCHEMA_VERSION,
         )));
     }
     Ok(())
@@ -1319,6 +1322,29 @@ fn invalid_binding(message: impl Into<String>) -> BrokerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_transitions_accept_current_additive_schema_but_keep_introduction_floor() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        assert_eq!(
+            crate::schema::current_version(&store.conn).unwrap(),
+            crate::schema::SCHEMA_VERSION
+        );
+        assert_eq!(floor(&store), "52");
+        ensure_current_binding_schema(&store.conn).unwrap();
+        assert_eq!(floor(&store), "52");
+
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [REPOSITORY_BINDING_SCHEMA_VERSION - 1],
+            )
+            .unwrap();
+        assert!(ensure_current_binding_schema(&store.conn).is_err());
+        assert_eq!(floor(&store), "52");
+    }
 
     #[test]
     fn binding_json_uses_documented_snake_case_enum_values() {

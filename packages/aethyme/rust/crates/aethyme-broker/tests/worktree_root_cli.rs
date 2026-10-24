@@ -1423,7 +1423,10 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
     );
     assert!(!refused_start.status.success(), "{refusal_text}");
     assert!(refusal_text.contains("legacy"), "{refusal_text}");
-    assert_eq!(read_meta(&fixture.database, "schema_version"), "54");
+    assert_eq!(
+        read_meta(&fixture.database, "schema_version"),
+        aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
+    );
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
     assert_eq!(
         read_meta(&fixture.database, "fixture.legacy-retained"),
@@ -1482,7 +1485,10 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
             .collect::<std::collections::BTreeSet<_>>(),
         root_entries_before
     );
-    assert_eq!(read_meta(&fixture.database, "schema_version"), "54");
+    assert_eq!(
+        read_meta(&fixture.database, "schema_version"),
+        aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
+    );
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
     assert_eq!(session_rows(&fixture.database), session_rows_before);
 
@@ -1503,7 +1509,10 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         &apply_args,
     ));
     assert_eq!(binding["state"], "bound");
-    assert_eq!(read_meta(&fixture.database, "schema_version"), "54");
+    assert_eq!(
+        read_meta(&fixture.database, "schema_version"),
+        aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
+    );
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "54");
     assert_eq!(
         read_meta(&fixture.database, "fixture.legacy-retained"),
@@ -1750,7 +1759,10 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     );
     assert!(!refused_start.status.success(), "{refusal_text}");
     assert!(refusal_text.contains("legacy"), "{refusal_text}");
-    assert_eq!(read_meta(&fixture.database, "schema_version"), "54");
+    assert_eq!(
+        read_meta(&fixture.database, "schema_version"),
+        aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
+    );
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
     assert!(has_table(&fixture.database, "repository_worktree_binding"));
     assert!(!fixture.repository_uuid_marker.exists());
@@ -1786,7 +1798,10 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         ],
     ));
     let digest = plan["digest"].as_str().unwrap();
-    assert_eq!(read_meta(&fixture.database, "schema_version"), "54");
+    assert_eq!(
+        read_meta(&fixture.database, "schema_version"),
+        aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
+    );
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
     assert!(!fixture.repository_uuid_marker.exists());
     assert!(!fixture.preparation_cache.exists());
@@ -1810,7 +1825,10 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         ],
     ));
     assert_eq!(bound["state"], "bound");
-    assert_eq!(read_meta(&fixture.database, "schema_version"), "54");
+    assert_eq!(
+        read_meta(&fixture.database, "schema_version"),
+        aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
+    );
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "54");
     assert!(fixture.repository_uuid_marker.is_file());
     assert!(!fixture.preparation_cache.exists());

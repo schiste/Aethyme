@@ -2769,6 +2769,39 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
+    fn timeout_before_start_confirmation_keeps_receipt_outcome_unknown() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("unconfirmed timeout receipt", None).unwrap();
+        let (report, receipt_id) = broker
+            .guarded_exec_with_runner(
+                session.id,
+                &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                true,
+                |_session, _dispatch| {
+                    Ok(GuardedCommandResult {
+                        exit_code: None,
+                        succeeded: false,
+                        timed_out: true,
+                        command_started: false,
+                        process_group_cleanup: "verified",
+                    })
+                },
+            )
+            .unwrap();
+
+        assert!(report.command_timed_out);
+        let receipt = broker
+            .store
+            .guarded_exec_receipt(session.id, receipt_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.phase, "outcome_unknown");
+        assert_eq!(receipt.command_outcome, "unknown");
+        assert_eq!(receipt.process_group_cleanup, "verified");
+        assert_eq!(receipt.process_revalidation, "not_revalidated");
+    }
+
+    #[test]
     fn generic_heartbeat_abort_marks_outcome_unknown_and_stops_descendant() {
         use std::time::Duration;
 
