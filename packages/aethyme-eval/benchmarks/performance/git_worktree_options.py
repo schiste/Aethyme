@@ -60,6 +60,13 @@ class Experiment:
             raise RuntimeError(json.dumps(receipt))
         return receipt
 
+    def stop_monitor(self, repo):
+        # Stop by the exact owned checkout, never by process-name matching.
+        self.run(repo, "fsmonitor--daemon", "stop", required=False)
+        status = self.run(repo, "fsmonitor--daemon", "status", required=False)
+        if status["returncode"] == 0:
+            raise RuntimeError("owned fixture monitor is still running")
+
     def init(self, name, extra=()):
         repo = self.root / name
         repo.mkdir()
@@ -74,10 +81,11 @@ def distribution(rows):
                 child_cpu_ms=[row["child_cpu_ms"] for row in rows])
 
 
-def run(root, git, other, output):
+def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False):
     ex = Experiment(root, git, output)
     report = dict(schema="aethyme.git-worktree-options/v1", platform=platform.platform(),
-                  files=FILES, repetitions=SAMPLES,
+                  files=files, repetitions=samples,
+                  topology="linked_worktree" if linked else "primary_checkout",
                   limitations=["first observation is not cold-cache",
                                "small synthetic Git-only workload; no broker or gate speedup claim",
                                "fsmonitor daemon CPU/RSS is not included in child CPU samples",
@@ -87,10 +95,12 @@ def run(root, git, other, output):
         report["other_git"] = ex.run(root, "--version", git=other)["stdout"].strip()
     variants = {}
     for mode in ("baseline", "many-files", "fsmonitor"):
-        repo = ex.init(mode)
+        primary = ex.init(mode)
+        repo = primary
+        checkout_rows = []
         try:
             (repo / ".gitignore").write_text("target/\n")
-            for i in range(FILES):
+            for i in range(files):
                 target = repo / f"package-{i % 12}" / f"file-{i}.txt"
                 target.parent.mkdir(exist_ok=True)
                 target.write_text(f"synthetic tracked file {i}\n")
@@ -101,6 +111,15 @@ def run(root, git, other, output):
                 ex.run(repo, "update-index", "--index-version", "4")
             if mode == "fsmonitor":
                 ex.run(repo, "config", "core.fsmonitor", "true")
+            if linked:
+                repo = root / f"{mode}-linked"
+                for _ in range(samples):
+                    checkout_rows.append(ex.run(
+                        primary, "worktree", "add", "--detach", str(repo), "HEAD"))
+                    if mode == "fsmonitor":
+                        ex.stop_monitor(repo)
+                    ex.run(primary, "worktree", "remove", str(repo))
+                ex.run(primary, "worktree", "add", "--detach", str(repo), "HEAD")
             first = ex.run(repo, "status", "--porcelain=v1")
             states = {}
             for state in ("clean", "dirty", "untracked-and-ignored"):
@@ -114,7 +133,7 @@ def run(root, git, other, output):
                     for i in range(200):
                         (ignored / f"ignored-{i}").write_bytes(b"x" * 1024)
                 rows = [ex.run(repo, "status", "--porcelain=v1")
-                        for _ in range(SAMPLES)]
+                        for _ in range(samples)]
                 outputs = {row["stdout"] for row in rows}
                 if len(outputs) != 1:
                     raise RuntimeError("status changed during a stable state")
@@ -136,17 +155,32 @@ def run(root, git, other, output):
                 if ex.run(repo, "status", "--porcelain=v1")["stdout"] != before:
                     raise RuntimeError("alternate client index write changed status")
             cache_probe = ex.run(repo, "update-index", "--test-untracked-cache", required=False)
+            index_path = Path(ex.run(repo, "rev-parse", "--git-path", "index")["stdout"].strip())
+            if not index_path.is_absolute():
+                index_path = repo / index_path
+            index_path = index_path.resolve(strict=True)
+            if not index_path.is_relative_to(root):
+                raise RuntimeError("index escaped the owned Playground")
+            primary_unchanged = None
+            if linked:
+                primary_unchanged = not ex.run(
+                    primary, "-c", "core.fsmonitor=false", "status", "--porcelain=v1")["stdout"]
+                if not primary_unchanged:
+                    raise RuntimeError("linked edits changed the primary checkout")
             variants[mode] = dict(first_observation_ms=first["elapsed_ms"], states=states,
                                   index_write_ms=write["elapsed_ms"],
-                                  index_bytes=(repo / ".git/index").stat().st_size,
+                                  index_bytes=index_path.stat().st_size,
+                                  linked_checkout=distribution(checkout_rows) if linked else None,
+                                  primary_checkout_unchanged=primary_unchanged,
                                   untracked_cache_test_returncode=cache_probe["returncode"])
         finally:
             if mode == "fsmonitor":
                 # Exact fixture only; never signal arbitrary host processes.
-                ex.run(repo, "fsmonitor--daemon", "stop", required=False)
-                status = ex.run(repo, "fsmonitor--daemon", "status", required=False)
-                if status["returncode"] == 0:
-                    raise RuntimeError("owned fixture monitor is still running")
+                for checkout in dict.fromkeys([repo, primary]):
+                    # Creation can fail before a linked directory exists.
+                    if not checkout.is_dir():
+                        continue
+                    ex.stop_monitor(checkout)
     for state in ("clean", "dirty", "untracked-and-ignored"):
         if len({v["states"][state]["status_sha256"] for v in variants.values()}) != 1:
             raise RuntimeError(f"Git options changed status semantics: {state}")
@@ -196,7 +230,12 @@ def main():
     parser.add_argument("--fixture-parent", type=Path, required=True)
     parser.add_argument("--git", type=Path, default=Path("/opt/homebrew/bin/git"))
     parser.add_argument("--other-git", type=Path)
+    parser.add_argument("--files", type=int, default=FILES)
+    parser.add_argument("--samples", type=int, default=SAMPLES)
+    parser.add_argument("--linked", action="store_true")
     args = parser.parse_args()
+    if not 12 <= args.files <= 50000 or not 1 <= args.samples <= 21:
+        parser.error("files must be 12..50000 and samples must be 1..21")
     output = args.output
     if not output.is_absolute() or output.exists() or output.is_symlink():
         parser.error("output must be a new absolute directory")
@@ -209,7 +248,8 @@ def main():
     report = None
     try:
         report = run(root, str(args.git.resolve(strict=True)),
-                     str(args.other_git.resolve(strict=True)) if args.other_git else None, output)
+                     str(args.other_git.resolve(strict=True)) if args.other_git else None, output,
+                     files=args.files, samples=args.samples, linked=args.linked)
         report["harness_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         report["fixture_root"] = str(root)
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
