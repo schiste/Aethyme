@@ -821,6 +821,168 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
 
 struct FakeRepositoryProvider(Mutex<VecDeque<Vec<aethyme_broker::RepositoryPullRequest>>>);
 
+fn repository_pr() -> aethyme_broker::RepositoryPullRequest {
+    aethyme_broker::RepositoryPullRequest {
+        number: 7,
+        title: "Review me".into(),
+        author: Some("reviewer".into()),
+        url: Some("https://github.com/owner/repo/pull/7".into()),
+        head_sha: "a".repeat(40),
+        is_draft: false,
+    }
+}
+
+#[test]
+fn repository_auto_watch_retries_a_persisted_event_without_replaying_it() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let provider = FakeRepositoryProvider(Mutex::new(VecDeque::from([
+        vec![repository_pr()],
+        vec![repository_pr()],
+        vec![repository_pr()],
+    ])));
+    let watch = broker
+        .start_repository_watch(
+            session_id,
+            "owner/repo",
+            &aethyme_broker::RepositoryWatchOptions {
+                include_existing: true,
+                auto_watch: true,
+                poll_interval_seconds: 15,
+                ..Default::default()
+            },
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    let pr_provider = ResultProvider(Mutex::new(VecDeque::from([
+        Err(PullRequestWatchError::Provider(
+            "private provider diagnostic".into(),
+        )),
+        Ok(snapshot("open", 'a', &[])),
+    ])));
+    let failed = broker
+        .tick_repository_watches(&provider, &pr_provider, 16_000, 1)
+        .unwrap();
+    assert_eq!(failed.event_count, 1);
+    assert_eq!(failed.failed_watch_count, 1);
+    assert_eq!(
+        failed.results[0].error_code.as_deref(),
+        Some("auto_watch_start_failed")
+    );
+    assert_eq!(
+        broker
+            .repository_watch(watch.id)
+            .unwrap()
+            .last_error_code
+            .as_deref(),
+        Some("auto_watch_start_failed")
+    );
+    assert!(broker.pull_request_watches(true).unwrap().is_empty());
+    let retried = broker
+        .tick_repository_watches(&provider, &pr_provider, 31_000, 1)
+        .unwrap();
+    assert_eq!(retried.event_count, 0, "the original event must not replay");
+    assert_eq!(retried.polled_watch_count, 1);
+    assert_eq!(retried.results[0].auto_watched.len(), 1);
+    assert_eq!(broker.repository_watch_events(watch.id).unwrap().len(), 1);
+    assert!(
+        broker
+            .repository_watch(watch.id)
+            .unwrap()
+            .last_error_code
+            .is_none()
+    );
+    let repeated = broker
+        .tick_repository_watches(&provider, &pr_provider, 46_000, 1)
+        .unwrap();
+    assert_eq!(repeated.event_count, 0);
+    assert_eq!(repeated.polled_watch_count, 1);
+    assert!(repeated.results[0].auto_watched.is_empty());
+    assert_eq!(broker.pull_request_watches(true).unwrap().len(), 1);
+    assert!(pr_provider.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn repository_auto_watch_preserves_an_explicit_pause_or_stop() {
+    for status in [
+        PullRequestWatchStatus::Paused,
+        PullRequestWatchStatus::Stopped,
+    ] {
+        let (_root, mut broker, session_id) = broker_fixture();
+        let pr_provider = FakeProvider(Mutex::new(VecDeque::from([snapshot("open", 'a', &[])])));
+        let existing = broker
+            .start_pull_request_watch(
+                session_id,
+                "owner/repo",
+                7,
+                vec![PullRequestActivityKind::Check],
+                15,
+                &pr_provider,
+                1_000,
+            )
+            .unwrap();
+        broker
+            .set_pull_request_watch_status(existing.id, status, 2_000)
+            .unwrap();
+        let provider = FakeRepositoryProvider(Mutex::new(VecDeque::from([vec![repository_pr()]])));
+        broker
+            .start_repository_watch(
+                session_id,
+                "owner/repo",
+                &aethyme_broker::RepositoryWatchOptions {
+                    include_existing: true,
+                    auto_watch: true,
+                    poll_interval_seconds: 15,
+                    ..Default::default()
+                },
+                &provider,
+                3_000,
+            )
+            .unwrap();
+        let tick = broker
+            .tick_repository_watches(&provider, &pr_provider, 18_000, 1)
+            .unwrap();
+        assert_eq!(tick.event_count, 1);
+        assert_eq!(tick.polled_watch_count, 1);
+        assert!(tick.results[0].auto_watched.is_empty());
+        let watches = broker.pull_request_watches(true).unwrap();
+        assert_eq!(watches.len(), 1);
+        assert_eq!(watches[0].id, existing.id);
+        assert_eq!(watches[0].status, status);
+    }
+}
+
+#[test]
+fn repository_auto_watch_does_not_enroll_excluded_baseline_prs() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let provider = FakeRepositoryProvider(Mutex::new(VecDeque::from([
+        vec![repository_pr()],
+        vec![repository_pr()],
+    ])));
+    let watch = broker
+        .start_repository_watch(
+            session_id,
+            "owner/repo",
+            &aethyme_broker::RepositoryWatchOptions {
+                auto_watch: true,
+                poll_interval_seconds: 15,
+                ..Default::default()
+            },
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    let pr_provider = FakeProvider(Mutex::new(VecDeque::new()));
+    let tick = broker
+        .tick_repository_watches(&provider, &pr_provider, 16_000, 1)
+        .unwrap();
+    assert_eq!(tick.polled_watch_count, 1);
+    assert_eq!(tick.event_count, 0);
+    assert!(tick.results[0].auto_watched.is_empty());
+    assert!(broker.repository_watch_events(watch.id).unwrap().is_empty());
+    assert!(broker.pull_request_watches(true).unwrap().is_empty());
+}
+
 impl aethyme_broker::RepositoryWatchProvider for FakeRepositoryProvider {
     fn list_open(
         &self,
