@@ -312,10 +312,9 @@ exit 64
         let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&ssh, permissions).unwrap();
-        git(
-            &self.repo,
-            &["config", "core.sshCommand", ssh.to_str().unwrap()],
-        );
+        let quoted_ssh = ssh.to_str().unwrap().replace('\'', "'\\''");
+        let ssh_command = format!("sh '{quoted_ssh}'");
+        git(&self.repo, &["config", "core.sshCommand", &ssh_command]);
 
         let state = self._tmp.path().join("fake-pr-state");
         let gh = fake_bin.join("gh");

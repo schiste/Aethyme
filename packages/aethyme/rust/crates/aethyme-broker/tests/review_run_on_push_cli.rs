@@ -179,14 +179,10 @@ impl Fixture {
             &repo,
             &["remote", "add", "origin", "git@github.com:acme/project.git"],
         );
-        git(
-            &repo,
-            &[
-                "config",
-                "core.sshCommand",
-                bin.join("ssh").to_str().unwrap(),
-            ],
-        );
+        let ssh = bin.join("ssh");
+        let quoted_ssh = ssh.to_str().unwrap().replace('\'', "'\\''");
+        let ssh_command = format!("sh '{quoted_ssh}'");
+        git(&repo, &["config", "core.sshCommand", &ssh_command]);
         let base = git(&repo, &["rev-parse", "main"]);
         let fixture = Self {
             tmp,

@@ -64,7 +64,10 @@ impl Fixture {
     /// A verify-only repository with the push lane enabled, pushed to a bare
     /// remote, with `origin/HEAD` set so the default branch is tracked.
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("sync path's ")
+            .tempdir()
+            .unwrap();
         let repo = tmp.path().join("repo");
         let remote = tmp.path().join("remote.git");
         let bin = tmp.path().join("bin");
@@ -97,14 +100,10 @@ impl Fixture {
             &repo,
             &["remote", "add", "origin", "git@github.com:acme/project.git"],
         );
-        git(
-            &repo,
-            &[
-                "config",
-                "core.sshCommand",
-                bin.join("ssh").to_str().unwrap(),
-            ],
-        );
+        let ssh = bin.join("ssh");
+        let quoted_ssh = ssh.to_str().unwrap().replace('\'', "'\\''");
+        let ssh_command = format!("sh '{quoted_ssh}'");
+        git(&repo, &["config", "core.sshCommand", &ssh_command]);
         let fixture = Self {
             tmp,
             repo,
