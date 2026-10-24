@@ -306,9 +306,7 @@ fn reusing_a_diverged_session_refuses_without_changing_its_checkout_or_task() {
 fn explicitly_pinned_reuse_reports_upstream_drift_without_moving_the_pin() {
     let fixture = Fixture::new();
     let pin = head(&fixture.repo);
-    let started = json(&fixture.run(&[
-        "start", "--task", "pinned", "--base", &pin, "--json",
-    ]));
+    let started = json(&fixture.run(&["start", "--task", "pinned", "--base", &pin, "--json"]));
     let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
     std::fs::write(worktree.join("tracked.txt"), "session\n").unwrap();
     git(&worktree, &["add", "tracked.txt"]);
