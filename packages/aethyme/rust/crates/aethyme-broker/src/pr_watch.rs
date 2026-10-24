@@ -456,15 +456,35 @@ fn parse_github_snapshot(
             .into_iter()
             .flatten()
         {
-            let name = json_string(check, "name").unwrap_or("check");
-            let url = json_string(check, "detailsUrl").map(str::to_string);
-            let state = json_string(check, "conclusion")
-                .or_else(|| json_string(check, "status"))
+            // Rollup nodes are either CheckRun or legacy StatusContext.
+            // https://docs.github.com/en/graphql/reference/commits#statuscontext
+            let field = |name| json_string(check, name).filter(|text| !text.is_empty());
+            let legacy = field("__typename") == Some("StatusContext")
+                || (field("context").is_some() && field("name").is_none());
+            let name = field("name")
+                .or_else(|| field("context"))
+                .unwrap_or("check");
+            let url = field("detailsUrl")
+                .or_else(|| field("targetUrl"))
                 .map(str::to_string);
-            let stable = serde_json::to_vec(&(name, &url, &state)).expect("serializable check");
+            let state = field("conclusion")
+                .or_else(|| field("status"))
+                .or_else(|| field("state"))
+                .map(str::to_string);
+            let provider_id = if legacy {
+                // Legacy status URLs often stay the same across commits. A
+                // prior failure must not suppress a failure on a later head.
+                let stable = serde_json::to_vec(&(&head_sha, name, &url, &state))
+                    .expect("serializable status context");
+                format!("status-context:{:x}", Sha256::digest(stable))
+            } else {
+                // Keep existing CheckRun identities to avoid replaying them.
+                let stable = serde_json::to_vec(&(name, &url, &state)).expect("serializable check");
+                format!("check:{:x}", Sha256::digest(stable))
+            };
             activities.push(PullRequestActivityMetadata {
                 kind: PullRequestActivityKind::Check,
-                provider_id: format!("check:{:x}", Sha256::digest(stable)),
+                provider_id,
                 author: None,
                 state,
                 url,
@@ -1039,6 +1059,88 @@ mod tests {
         assert!(!encoded.contains("untrusted secret"));
         assert_eq!(snapshot.activities[0].provider_id, "C1");
         assert!(snapshot.is_draft);
+    }
+
+    #[test]
+    fn legacy_status_context_preserves_state_link_and_head_identity() {
+        let mut value = serde_json::json!({
+            "number": 7, "headRefOid": "a".repeat(40),
+            "statusCheckRollup": [{
+                "__typename": "StatusContext", "context": "external-ci",
+                "state": "FAILURE", "targetUrl": "https://ci.example/build",
+                "description": "untrusted provider text"
+            }]
+        });
+        let parse = |value: &serde_json::Value| {
+            parse_github_snapshot(
+                &serde_json::to_vec(value).unwrap(),
+                &[PullRequestActivityKind::Check],
+            )
+            .unwrap()
+        };
+        let failed = parse(&value);
+        assert_eq!(failed.activities.len(), 1);
+        let activity = &failed.activities[0];
+        assert_eq!(activity.state.as_deref(), Some("FAILURE"));
+        assert_eq!(activity.url.as_deref(), Some("https://ci.example/build"));
+        assert!(activity.provider_id.starts_with("status-context:"));
+        assert_eq!(failed, parse(&value));
+        assert!(
+            !serde_json::to_string(&failed)
+                .unwrap()
+                .contains("untrusted provider text")
+        );
+        value["statusCheckRollup"][0]["state"] = "SUCCESS".into();
+        assert_ne!(
+            activity.provider_id,
+            parse(&value).activities[0].provider_id
+        );
+        value["statusCheckRollup"][0]["state"] = "FAILURE".into();
+        value["headRefOid"] = "b".repeat(40).into();
+        assert_ne!(
+            activity.provider_id,
+            parse(&value).activities[0].provider_id
+        );
+        let later_head = parse(&value);
+        value["statusCheckRollup"][0]["context"] = "different-ci".into();
+        assert_ne!(
+            later_head.activities[0].provider_id,
+            parse(&value).activities[0].provider_id
+        );
+    }
+
+    #[test]
+    fn check_run_identity_stays_compatible_and_empty_conclusion_uses_status() {
+        let mut value = serde_json::json!({
+            "number": 7, "headRefOid": "a".repeat(40),
+            "statusCheckRollup": [{"__typename": "CheckRun", "name": "CI",
+                "conclusion": "SUCCESS", "status": "COMPLETED", "detailsUrl": "https://ci.example/1"}]
+        });
+        let parse = |value: &serde_json::Value| {
+            parse_github_snapshot(
+                &serde_json::to_vec(value).unwrap(),
+                &[PullRequestActivityKind::Check],
+            )
+            .unwrap()
+        };
+        let stable =
+            serde_json::to_vec(&("CI", Some("https://ci.example/1"), Some("SUCCESS"))).unwrap();
+        let current = parse(&value);
+        assert_eq!(
+            current.activities[0].provider_id,
+            format!("check:{:x}", Sha256::digest(stable))
+        );
+        value["statusCheckRollup"][0]["conclusion"] = "".into();
+        value["statusCheckRollup"][0]["status"] = "IN_PROGRESS".into();
+        assert_eq!(
+            parse(&value).activities[0].state.as_deref(),
+            Some("IN_PROGRESS")
+        );
+        value["statusCheckRollup"][0]["conclusion"] = serde_json::Value::Null;
+        assert_eq!(
+            parse(&value).activities[0].state.as_deref(),
+            Some("IN_PROGRESS")
+        );
     }
 
     #[test]
