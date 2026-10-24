@@ -1304,3 +1304,54 @@ fn automatic_cleanup_releases_checkout_after_grace_expires() {
     assert_eq!(report.removed.len(), 1, "{report:#?}");
     assert!(!worktree.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn apply_preserves_selected_checkout_after_cleanup_policy_changes() {
+    for change in ["disabled", "pinned", "withdrawn_regenerable", "unreadable"] {
+        let fx = fixture();
+        let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+        let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+        let config = fx.repo.join(".aethyme/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let initial = "[cleanup]\nregenerable = [\".gradle-cache\"]\n[retention]\nclosed_worktree_grace_hours = 0\n";
+        std::fs::write(&config, initial).unwrap();
+        let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+        assert_eq!(
+            plan.selected_worktrees(),
+            vec![worktree.to_string_lossy().into_owned()],
+            "{change}: must actually select the checkout"
+        );
+        let replacement = match change {
+            "disabled" => "[cleanup]\nauto_remove = false\n".to_owned(),
+            "pinned" => format!(
+                "[cleanup]\nkeep = [\"{}\"]\n",
+                worktree.file_name().unwrap().to_string_lossy()
+            ),
+            "withdrawn_regenerable" => "[cleanup]\nregenerable = []\n".to_owned(),
+            "unreadable" => "[cleanup\n".to_owned(),
+            _ => unreachable!(),
+        };
+        std::fs::write(&config, replacement).unwrap();
+        let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+        assert!(report.removed.is_empty(), "{change}: {report:#?}");
+        assert!(
+            worktree.exists(),
+            "{change}: changed policy must retain source"
+        );
+        let reason = kept_reason(&report, &worktree);
+        assert!(
+            reason.contains("cleanup policy") && reason.contains("before removal"),
+            "{change}: {reason}"
+        );
+        if change == "disabled" || change == "unreadable" {
+            assert!(!report.enabled, "{change}: {report:#?}");
+        }
+        assert_eq!(report.config_error.is_some(), change == "unreadable");
+        // A changed plan never becomes authority later. Only a fresh plan
+        // under the restored policy may remove the eligible checkout.
+        std::fs::write(&config, initial).unwrap();
+        assert_eq!(run(&mut broker).removed.len(), 1, "{change}");
+        assert!(!worktree.exists(), "{change}");
+    }
+}

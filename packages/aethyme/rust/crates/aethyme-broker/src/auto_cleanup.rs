@@ -1642,6 +1642,29 @@ impl Broker {
                 keep_it(&mut report, reason);
                 continue;
             }
+            // Selection is not authority to keep using an old cleanup policy.
+            // Recheck under the lifecycle lock for each candidate, including
+            // opt-out, newly pinned paths and withdrawn regenerable globs.
+            match AutoCleanupPolicy::load(self.main_root()) {
+                Ok(current) if current == policy => {}
+                Ok(current) => {
+                    report.enabled = current.auto_remove;
+                    keep_it(
+                        &mut report,
+                        "cleanup policy changed before removal; create a fresh plan".into(),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    report.enabled = false;
+                    report.config_error = Some(error.clone());
+                    keep_it(
+                        &mut report,
+                        format!("cleanup policy unreadable before removal: {error}"),
+                    );
+                    continue;
+                }
+            }
             // Revalidate every proof now, under the lock, right before removal.
             let proof = match self.auto_cleanup_verdict(
                 &candidate,
