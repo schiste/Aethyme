@@ -869,6 +869,58 @@ fn reuse_refuses_a_stale_integration_even_with_unknown_provenance() {
 }
 
 #[test]
+fn unavailable_remote_default_ref_is_not_treated_as_local_only() {
+    let tmp = fixture();
+    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &main);
+    git(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    set_integration_at_head(tmp.path());
+    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+    let session = stored_session(&tmp, 1);
+    let observation = stored_base_observation(&tmp, 1);
+    let before = git_output(tmp.path(), &["worktree", "list", "--porcelain"]);
+    git(tmp.path(), &["update-ref", "-d", "refs/remotes/origin/main"]);
+    let output = run(tmp.path(), &["start", "--task", "must refuse", "--json"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        git_output(tmp.path(), &["worktree", "list", "--porcelain"]),
+        before
+    );
+    for unknown_provenance in [false, true] {
+        if unknown_provenance {
+            delete_stored_base_observation(&tmp, 1);
+        }
+        let output = run(
+            tmp.path(),
+            &[
+                "start",
+                "--reuse",
+                session.worktree_path.as_str(),
+                "--task",
+                "must refuse",
+                "--json",
+            ],
+        );
+        assert!(!output.status.success());
+        assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("initial"));
+        assert_eq!(
+            git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]),
+            main
+        );
+        if !unknown_provenance {
+            assert_eq!(stored_base_observation(&tmp, 1), observation);
+        }
+    }
+}
+
+#[test]
 fn reuse_refuses_dirty_fast_forward_without_updating_task_or_head() {
     let tmp = fixture();
     stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));

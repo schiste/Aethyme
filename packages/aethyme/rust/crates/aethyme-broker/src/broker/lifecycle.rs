@@ -6134,13 +6134,24 @@ impl Broker {
             && previous.as_ref().is_some_and(|observation| {
                 observation.evidence == Some(crate::SessionStartBaseEvidence::ExplicitBase)
             });
-        let confirmed_default =
-            if !pinned && let Some(default) = crate::session_push::tracked_default(&self.repo) {
-                let display_ref = format!("{}/{}", default.remote, default.branch);
-                Some(self.require_fresh_default(prefetched, &display_ref)?)
-            } else {
-                None
-            };
+        let expected_default = crate::session_push::tracked_default(&self.repo)
+            .map(|default| format!("{}/{}", default.remote, default.branch))
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|observation| observation.default_ref.clone())
+            });
+        let confirmed_default = if pinned {
+            None
+        } else if let Some(display_ref) = expected_default {
+            Some(self.require_fresh_default(prefetched, &display_ref)?)
+        } else if self.repo.symbolic_ref("refs/remotes/origin/HEAD").is_some() {
+            return Err(reuse_freshness_refusal(
+                "the configured remote default ref is unavailable; fetch the default branch and restore origin/HEAD before retrying",
+            ));
+        } else {
+            None
+        };
 
         let promote = crate::PromoteConfig::load(&self.main_root);
         let mut integration_sync = None;

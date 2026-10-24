@@ -1100,7 +1100,9 @@ it does not replace remote confirmation. A repository with a tracked remote
 requires a successful fetch at each implicit start and reuse boundary. Failed
 fetches refuse before allocating a checkout or updating the reused task. Use
 `--base <commit>` for intentional pinned work; an existing explicit base remains
-pinned on plain reuse. Repositories without a tracked remote use local refs.
+pinned on plain reuse. Repositories without a tracked remote use local refs. A dangling configured
+remote default or missing recorded remote base is refused rather than treated
+as local-only.
 
 On plain reuse, recorded `--base` choices stay pinned to their selected
 commit. Under normal promotion policy, a session with unknown legacy/adopted
