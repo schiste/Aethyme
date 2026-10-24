@@ -69,8 +69,9 @@ pub const WORKTREE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorktreeReconciliation {
     pub schema_version: u32,
-    /// False when a bounded report stopped before it finished reading all
-    /// roots. Counts then describe only the observed prefix.
+    /// False when enumeration, metadata inspection, sizing, or the deadline
+    /// prevented a complete report. Reports with `complete = false` are not
+    /// exhaustive.
     #[serde(default = "default_complete", skip_serializing_if = "is_complete")]
     pub complete: bool,
     /// Broker-owned roots actually scanned. Zero means the sweep found no root
