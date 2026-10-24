@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import sys
 import tempfile
 import time
@@ -24,10 +25,12 @@ from broker_concurrent_submit import (
     output_tree_size,
     parse_trace2,
     scenario_fixture,
+    setup_scenario,
     terminate_owned_group,
     tree_size,
     validate_output_path,
     validate_submit_outcome,
+    validate_shared_history,
 )
 
 
@@ -83,6 +86,22 @@ class SyntheticWorkloadTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'fixture traversal denied'):
                         tree_function(root)
 
+    def test_seed_content_accepts_merge_linear_and_content_promotions(self):
+        seeds = ['a', 'b', 'c', 'd']
+        validate_shared_history(seeds, ['merge'], seeds + ['merge'], 'merge', 'tree', 'tree')
+        validate_shared_history(seeds, seeds, seeds, 'd', 'tree', 'tree')
+        validate_shared_history(seeds, ['content'], ['content'], 'content', 'tree', 'tree')
+        for first_parent, reachable, tip, tree in (
+                ([], seeds, 'd', 'tree'),
+                (['merge'], seeds + ['merge'], 'other', 'tree'),
+                (['merge', 'merge'], seeds + ['merge'], 'merge', 'tree'),
+                (['merge'], seeds + ['merge', 'merge'], 'merge', 'tree'),
+                (['merge'], seeds, 'merge', 'tree'),
+                (['content'], ['content'], 'content', 'changed-tree')):
+            with self.subTest(first_parent=first_parent, reachable=reachable, tip=tip, tree=tree):
+                with self.assertRaisesRegex(RuntimeError, 'bounded seed content'):
+                    validate_shared_history(seeds, first_parent, reachable, tip, 'tree', tree)
+
     def test_policy_is_manual_without_gate_configuration(self):
         self.assertIn('[promote]\nmode = "manual"', POLICY_TEXT)
         self.assertNotIn('[gates]', POLICY_TEXT)
@@ -102,6 +121,27 @@ class SyntheticWorkloadTests(unittest.TestCase):
                 validate_output_path(result, source)
             with self.assertRaisesRegex(RuntimeError, 'new absolute'):
                 validate_output_path(Path('relative'), source)
+
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('git'), 'requires POSIX Git')
+    def test_transport_handles_output_paths_with_spaces_and_apostrophes(self):
+        # Exercise the real setup through its first successful local push,
+        # then stop before starting a broker or any measured command.
+        with tempfile.TemporaryDirectory(prefix="aethyme's transport ") as temporary:
+            output = Path(temporary).resolve()
+            git = str(Path(shutil.which('git')).resolve())
+            binary = output / 'unused-binary'
+            receipts = ReceiptLog(output)
+            with mock.patch('broker_concurrent_submit.start_session',
+                            side_effect=RuntimeError('transport-qualified-stop')) as start:
+                with self.assertRaisesRegex(RuntimeError, 'transport-qualified-stop'):
+                    with setup_scenario('quoted-path', binary, git, output, receipts):
+                        self.fail('setup must stop before any broker session starts')
+            start.assert_called_once()
+            commands = json.loads((output / 'commands.json').read_text())
+            push = [row for row in commands if row['label'] == 'quoted-path:push-default']
+            self.assertEqual(len(push), 1)
+            self.assertEqual(push[0]['exit_code'], 0)
+            self.assertFalse(any(path.name.startswith('.fixture-') for path in output.iterdir()))
 
     def test_child_environment_does_not_inherit_test_trust_escape(self):
         with tempfile.TemporaryDirectory() as temporary:

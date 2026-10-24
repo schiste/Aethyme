@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shlex
 import shutil
 import signal
 import stat
@@ -595,6 +596,21 @@ def start_session(runner, binary, repo, root, scenario, role, baseline):
             'branch': payload.get('branch'), 'start_base': start_base}
 
 
+def validate_shared_history(seed_commits, first_parent_commits, reachable_commits,
+                            integration, seed_tree, integration_tree):
+    # Content promotion may rewrite source commits; preserve the exact seed
+    # tree and record ancestry independently of first-parent patch candidates.
+    if (not first_parent_commits or len(first_parent_commits) > 16
+            or first_parent_commits[-1] != integration
+            or len(reachable_commits) > MAX_HISTORY_COMMITS + 16
+            or len(set(seed_commits)) != MAX_HISTORY_COMMITS
+            or len(set(first_parent_commits)) != len(first_parent_commits)
+            or len(set(reachable_commits)) != len(reachable_commits)
+            or not set(first_parent_commits) <= set(reachable_commits)
+            or not seed_tree or integration_tree != seed_tree):
+        raise RuntimeError('promoted shared history did not preserve bounded seed content')
+
+
 def commit_file(runner, git, worktree, relative_path, data, message, label):
     path = worktree / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -636,7 +652,7 @@ def setup_scenario(name, binary, git, output, receipts):
                 'main', str(remote))
         run_git(runner, git, repo, f'{name}:init-repo', 'init', '-q', '--template=', '-b', 'main')
         run_git(runner, git, repo, f'{name}:config-ssh', 'config', 'core.sshCommand',
-                str(tools / 'ssh'))
+                shlex.quote(str(tools / 'ssh')))
         run_git(runner, git, repo, f'{name}:config-identity-name', 'config', 'user.name',
                 'Concurrent Submit Fixture')
         run_git(runner, git, repo, f'{name}:config-identity-email', 'config', 'user.email',
@@ -690,8 +706,15 @@ def setup_scenario(name, binary, git, output, receipts):
         shared_commits = run_git(
             runner, git, repo, f'{name}:shared-first-parent-candidates', 'rev-list',
             '--first-parent', '--reverse', integration, '--not', baseline).splitlines()
-        if not set(seed_commits) <= set(shared_commits) or len(shared_commits) > 16:
-            raise RuntimeError('promoted shared history did not contain the bounded seed commits')
+        reachable_commits = run_git(
+            runner, git, repo, f'{name}:shared-reachable-commits', 'rev-list',
+            '--reverse', integration, '--not', baseline).splitlines()
+        seed_tree = run_git(runner, git, repo, f'{name}:seed-tree',
+                            'rev-parse', f'{seed_commits[-1]}^{{tree}}').strip()
+        integration_tree = run_git(runner, git, repo, f'{name}:integration-tree',
+                                   'rev-parse', f'{integration}^{{tree}}').strip()
+        validate_shared_history(seed_commits, shared_commits, reachable_commits,
+                                integration, seed_tree, integration_tree)
 
         worker_commits = {}
         for role in ('worker-a', 'worker-b'):
@@ -723,6 +746,10 @@ def setup_scenario(name, binary, git, output, receipts):
             'worker_sessions': {role: sessions[role] for role in ('worker-a', 'worker-b')},
             'seed_commits': seed_commits,
             'shared_first_parent_candidate_commits': shared_commits,
+            'shared_reachable_commits': reachable_commits,
+            'seed_tree': seed_tree,
+            'integration_tree': integration_tree,
+            'seed_content_preserved': True,
             'worker_commits': worker_commits,
             'binary_payload_bytes_each': BINARY_BYTES_PER_COMMIT,
             'binary_payload_count': MAX_HISTORY_COMMITS,
