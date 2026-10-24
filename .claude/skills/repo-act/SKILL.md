@@ -26,6 +26,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- When local compilation is deferred, read each fixture helper's declared
+  return type and the asserted fields' definitions before adding regressions.
+  Preserve optional-value types in assertions; a compile failure supplies no
+  runtime test evidence and needlessly repeats the remote validation cycle.
 - Validate a command's complete action, arity, and required confirmation before
   opening broker state or scanning host or worktree inventories. Add a CLI
   regression that checks the structured refusal and confirms no repository or
