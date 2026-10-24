@@ -26,6 +26,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Git configuration values such as `remote.*.uploadpack` and `core.sshCommand`
+  contain shell commands. Quote embedded executable paths for that shell,
+  separately from the argv used to set the value. Exercise transport fixtures
+  under paths containing spaces and apostrophes, even when CI paths are simple.
 - When local compilation is deferred, read each fixture helper's declared
   return type and the asserted fields' definitions before adding regressions.
   Preserve optional-value types in assertions; a compile failure supplies no

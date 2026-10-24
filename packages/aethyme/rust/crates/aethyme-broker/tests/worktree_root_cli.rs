@@ -1087,7 +1087,10 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
 fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("reserve path's ")
+        .tempdir()
+        .unwrap();
     let repo = tmp.path().join("project");
     let origin = tmp.path().join("origin.git");
     let state = tmp.path().join("state");
@@ -1136,13 +1139,12 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
         "#!/bin/sh\nprintf '0\\n' > \"$AETHYME_TEST_RESERVE_BYTES_PATH\" || exit 1\nexec git-upload-pack \"$@\"\n",
     ).unwrap();
     std::fs::set_permissions(&upload_pack, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Git interprets uploadpack as a shell command, not an executable pathname.
+    let quoted_upload_pack = upload_pack.to_str().unwrap().replace('\'', "'\\''");
+    let upload_pack_command = format!("'{quoted_upload_pack}'");
     git(
         &repo,
-        &[
-            "config",
-            "remote.origin.uploadpack",
-            upload_pack.to_str().unwrap(),
-        ],
+        &["config", "remote.origin.uploadpack", &upload_pack_command],
     );
     let output = common::broker_cli(
         CLI,
