@@ -30,6 +30,7 @@ from broker_concurrent_submit import (
     tree_size,
     validate_output_path,
     validate_submit_outcome,
+    validate_shared_history,
 )
 
 
@@ -84,6 +85,20 @@ class SyntheticWorkloadTests(unittest.TestCase):
                         'broker_concurrent_submit.os.walk', side_effect=denied_walk):
                     with self.assertRaisesRegex(RuntimeError, 'fixture traversal denied'):
                         tree_function(root)
+
+    def test_seed_ancestry_accepts_merge_and_linear_promotions_but_not_lost_history(self):
+        seeds = ['a', 'b', 'c', 'd']
+        validate_shared_history(seeds, ['merge'], seeds + ['merge'], 'merge')
+        validate_shared_history(seeds, seeds, seeds, 'd')
+        for first_parent, reachable, tip in (
+                ([], seeds, 'd'),
+                (['merge'], ['merge'], 'merge'),
+                (['merge'], seeds + ['merge'], 'other'),
+                (['merge', 'merge'], seeds + ['merge'], 'merge'),
+                (['merge'], seeds + ['merge', 'merge'], 'merge')):
+            with self.subTest(first_parent=first_parent, reachable=reachable, tip=tip):
+                with self.assertRaisesRegex(RuntimeError, 'bounded seed ancestry'):
+                    validate_shared_history(seeds, first_parent, reachable, tip)
 
     def test_policy_is_manual_without_gate_configuration(self):
         self.assertIn('[promote]\nmode = "manual"', POLICY_TEXT)
