@@ -53,7 +53,8 @@ exit: 0
       registered here, or its name is this repository's key. --apply writes
       the marker for those it can prove, removing nothing; review a new
       storage plan afterwards. A root it cannot prove is never marked.
-  aethyme broker gc reap [--json]
+  aethyme broker gc reap [--dry-run] [--json]
       Reclaim ordinary capacity from quarantined leases whose holder is gone;
       supervised capacity holds remain until clean release or reconciliation.
+      --dry-run projects capacity reconciliation without changing registry rows.
 --- stderr
