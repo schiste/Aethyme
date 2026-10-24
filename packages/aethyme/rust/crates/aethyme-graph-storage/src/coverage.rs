@@ -107,6 +107,20 @@ pub struct CoverageBytes {
     pub source_read: u64,
 }
 
+/// Observed inputs for graph uses, attributed to a language at index time.
+/// Counts describe emitted evidence, not completeness or gate authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphUseEvidence {
+    pub files: u64,
+    pub symbols: u64,
+    pub imports: u64,
+    pub calls: u64,
+    pub tests: u64,
+    pub documents: u64,
+    pub unresolved_imports: u64,
+    pub unresolved_calls: u64,
+}
+
 /// Content-free graph coverage recorded at index time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphCoverage {
@@ -131,6 +145,10 @@ pub struct GraphCoverage {
     pub files: CoverageFiles,
     pub bytes: CoverageBytes,
     pub by_language: BTreeMap<String, CoverageBucket>,
+    /// None means the producer did not measure use evidence. Some(empty)
+    /// means a current producer observed no languages. Zero is not unknown.
+    #[serde(default)]
+    pub use_evidence_by_language: Option<BTreeMap<String, GraphUseEvidence>>,
     pub by_parser: BTreeMap<String, CoverageBucket>,
     pub exclusion_reasons: BTreeMap<ExclusionReason, u64>,
     pub node_counts_by_kind: BTreeMap<String, u64>,
@@ -156,6 +174,7 @@ impl GraphCoverage {
             files: CoverageFiles::default(),
             bytes: CoverageBytes::default(),
             by_language: BTreeMap::new(),
+            use_evidence_by_language: None,
             by_parser: BTreeMap::new(),
             exclusion_reasons: BTreeMap::new(),
             node_counts_by_kind: BTreeMap::new(),

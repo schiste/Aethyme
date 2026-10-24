@@ -54,6 +54,20 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
     assert!(summary.total_edges >= 11);
     assert!(!summary.coverage.report.safe_to_use);
     assert!(summary.coverage.report.edge_counts_by_kind["tests"] > 0);
+    let uses = summary
+        .coverage
+        .report
+        .use_evidence_by_language
+        .as_ref()
+        .unwrap();
+    assert_eq!(uses["python"].files, 4);
+    assert_eq!(uses["python"].tests, 1);
+    assert!(uses["python"].documents > 0);
+    // A Markdown source documenting Python contributes to Python readiness;
+    // it does not imply that Markdown has code test-selection evidence.
+    assert_eq!(uses["markdown"].tests, 0);
+    assert_eq!(uses["markdown"].documents, 0);
+    assert_eq!(uses["typescript"].tests, 0);
     assert!(
         !summary
             .coverage

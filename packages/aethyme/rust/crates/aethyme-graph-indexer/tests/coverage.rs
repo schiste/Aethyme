@@ -31,6 +31,25 @@ fn revision_bound_artifacts_are_content_free_and_exactly_digest_units() {
     let units = read_units(temporary.path()).unwrap();
 
     assert!(coverage.available);
+    let evidence = coverage.use_evidence_by_language.as_ref().unwrap();
+    assert_eq!(evidence.len(), 1);
+    let python = &evidence["python"];
+    assert_eq!(python.files, 1);
+    assert_eq!(python.symbols, 1);
+    assert_eq!(python.tests, 0);
+    assert_eq!(python.documents, 0);
+    let mut legacy = serde_json::to_value(&coverage).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("use_evidence_by_language");
+    let legacy: aethyme_graph_storage::GraphCoverage = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.use_evidence_by_language.is_none());
+    assert!(
+        aethyme_graph_storage::GraphCoverage::unavailable("test")
+            .use_evidence_by_language
+            .is_none()
+    );
     assert_eq!(coverage.source_revision.as_deref(), Some(REVISION));
     assert_eq!(coverage.indexed_revision.as_deref(), Some(REVISION));
     assert_eq!(

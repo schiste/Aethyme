@@ -80,8 +80,8 @@ pub use cache::{
 pub use coverage::{
     CoverageArtifactError, CoverageBucket, CoverageBytes, CoverageFileStatus, CoverageFiles,
     ExclusionReason, GRAPH_COVERAGE_RELPATH, GRAPH_COVERAGE_SCHEMA_VERSION, GRAPH_UNITS_RELPATH,
-    GraphCoverage, GraphUnit, UnitCoverageStatus, UnitPosition, decode_units, read_coverage,
-    read_units, sort_units, write_coverage_artifacts,
+    GraphCoverage, GraphUnit, GraphUseEvidence, UnitCoverageStatus, UnitPosition, decode_units,
+    read_coverage, read_units, sort_units, write_coverage_artifacts,
 };
 pub use disk::{
     FragmentReadError, FragmentWriteError, IndexShardReadError, IndexShardWriteError,
