@@ -1778,9 +1778,8 @@ pub(crate) fn recover_preparation_caches_for_bindings(
     let mut total = PreparationCacheSweepReport::complete_empty();
     if bindings.is_empty() {
         total.complete = false;
-        total.coverage_deferral = Some(
-            PreparationCacheCoverageDeferral::CacheBindingsNotFullyEnumerated,
-        );
+        total.coverage_deferral =
+            Some(PreparationCacheCoverageDeferral::CacheBindingsNotFullyEnumerated);
         return total;
     }
     for binding in bindings {
@@ -2355,7 +2354,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                 bytes_reclaimed: bytes,
                 filesystem_entries_reclaimed,
                 complete: false,
-            coverage_deferral: None,
+                coverage_deferral: None,
             };
         };
         let Some((lease_repository, retired)) =
@@ -2395,7 +2394,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
-                    coverage_deferral: None,
+                        coverage_deferral: None,
                     };
                 }
                 Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
@@ -2404,7 +2403,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
-                    coverage_deferral: None,
+                        coverage_deferral: None,
                     };
                 }
             };
@@ -2523,7 +2522,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
-                    coverage_deferral: None,
+                        coverage_deferral: None,
                     };
                 }
             }
@@ -2547,7 +2546,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                     bytes_reclaimed: bytes,
                     filesystem_entries_reclaimed,
                     complete: false,
-                coverage_deferral: None,
+                    coverage_deferral: None,
                 };
             }
             let Ok(entry) = entry else {
@@ -2556,7 +2555,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                     bytes_reclaimed: bytes,
                     filesystem_entries_reclaimed,
                     complete: false,
-                coverage_deferral: None,
+                    coverage_deferral: None,
                 };
             };
             let Ok(file_type) = entry.file_type() else {
@@ -2565,7 +2564,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                     bytes_reclaimed: bytes,
                     filesystem_entries_reclaimed,
                     complete: false,
-                coverage_deferral: None,
+                    coverage_deferral: None,
                 };
             };
             if file_type.is_symlink() || !file_type.is_dir() {
@@ -2600,7 +2599,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
-                    coverage_deferral: None,
+                        coverage_deferral: None,
                     };
                 }
                 Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
@@ -2609,7 +2608,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
-                    coverage_deferral: None,
+                        coverage_deferral: None,
                     };
                 }
             };
@@ -2743,7 +2742,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                         bytes_reclaimed: bytes,
                         filesystem_entries_reclaimed,
                         complete: false,
-                    coverage_deferral: None,
+                        coverage_deferral: None,
                     };
                 }
             }
@@ -6470,7 +6469,9 @@ mod tests {
         encoded_root_identity
     }
 
-    fn unguarded_host_cache_binding(cache_root: &Path) -> crate::broker::PreparationCacheRootBinding {
+    fn unguarded_host_cache_binding(
+        cache_root: &Path,
+    ) -> crate::broker::PreparationCacheRootBinding {
         crate::broker::PreparationCacheRootBinding {
             path: cache_root.to_path_buf(),
             identity: None,
@@ -6484,12 +6485,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let cache_root = root.join("preparation-cache");
-        let same_origin_key = cache_root.join(TEST_PREPARATION_REPOSITORY).join("aaaaaaaaaaaa");
+        let same_origin_key = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("aaaaaaaaaaaa");
         let other_repository_key = cache_root.join("b".repeat(64)).join("bbbbbbbbbbbb");
         let retired = cache_root.join(format!("{TEST_PREPARATION_REPOSITORY}.retired"));
         for entry in [&same_origin_key, &other_repository_key, &retired] {
             std::fs::create_dir_all(entry).unwrap();
-            std::fs::write(entry.join("cache.bin"), b"another consumer still needs this").unwrap();
+            std::fs::write(
+                entry.join("cache.bin"),
+                b"another consumer still needs this",
+            )
+            .unwrap();
         }
         let binding = unguarded_host_cache_binding(&cache_root);
         let resource_db_path = test_host_resource_db(&root);
@@ -6502,9 +6509,15 @@ mod tests {
         assert!(!report.complete, "known roots do not prove all consumers");
         assert_eq!(report.entries_removed, 0);
         assert_eq!(report.filesystem_entries_reclaimed, 0);
-        assert_eq!(report.coverage_deferral, Some(PreparationCacheCoverageDeferral::HostConsumersNotEnumerated));
+        assert_eq!(
+            report.coverage_deferral,
+            Some(PreparationCacheCoverageDeferral::HostConsumersNotEnumerated)
+        );
         for entry in [&same_origin_key, &other_repository_key, &retired] {
-            assert_eq!(std::fs::read(entry.join("cache.bin")).unwrap(), b"another consumer still needs this");
+            assert_eq!(
+                std::fs::read(entry.join("cache.bin")).unwrap(),
+                b"another consumer still needs this"
+            );
         }
     }
 
@@ -6516,7 +6529,9 @@ mod tests {
         let cache_root = root.join("preparation-cache");
         let resource_db_path = test_host_resource_db(&root);
         let identity = publish_external_rotation_journal_debt(
-            &cache_root, &resource_db_path, TEST_PREPARATION_REPOSITORY,
+            &cache_root,
+            &resource_db_path,
+            TEST_PREPARATION_REPOSITORY,
         );
         let protected = cache_root.join("b".repeat(64)).join("bbbbbbbbbbbb");
         std::fs::create_dir_all(&protected).unwrap();
@@ -6527,14 +6542,36 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(5),
             false,
         );
-        assert!(!report.complete, "binding discovery and consumer coverage remain incomplete");
-        assert!(report.filesystem_entries_reclaimed > 0, "known binding recovery must still progress");
-        assert!(!cache_root.join(TEST_PREPARATION_REPOSITORY).join("old-cache").exists());
-        assert_eq!(std::fs::read(protected.join("payload")).unwrap(), b"live elsewhere");
-        assert!(matches!(
-            crate::preparation::rotation_journal::probe(&resource_db_path, &cache_root, Some(&identity)).unwrap(),
-            Some(crate::preparation::rotation_journal::JournalProbe::NoDebt)
-        ), "complete recovery must acknowledge its lap independently of consumer deferral");
+        assert!(
+            !report.complete,
+            "binding discovery and consumer coverage remain incomplete"
+        );
+        assert!(
+            report.filesystem_entries_reclaimed > 0,
+            "known binding recovery must still progress"
+        );
+        assert!(
+            !cache_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("old-cache")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(protected.join("payload")).unwrap(),
+            b"live elsewhere"
+        );
+        assert!(
+            matches!(
+                crate::preparation::rotation_journal::probe(
+                    &resource_db_path,
+                    &cache_root,
+                    Some(&identity)
+                )
+                .unwrap(),
+                Some(crate::preparation::rotation_journal::JournalProbe::NoDebt)
+            ),
+            "complete recovery must acknowledge its lap independently of consumer deferral"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6545,31 +6582,62 @@ mod tests {
         let cache_root = root.join("preparation-cache");
         let resource_db_path = test_host_resource_db(&root);
         let identity = publish_external_rotation_journal_debt(
-            &cache_root, &resource_db_path, TEST_PREPARATION_REPOSITORY,
+            &cache_root,
+            &resource_db_path,
+            TEST_PREPARATION_REPOSITORY,
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let request = preparation_cache_lease_request(TEST_PREPARATION_REPOSITORY, &cache_root, deadline).unwrap();
+        let request =
+            preparation_cache_lease_request(TEST_PREPARATION_REPOSITORY, &cache_root, deadline)
+                .unwrap();
         let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
         let grant = writer.acquire(&request).unwrap();
         let binding = unguarded_host_cache_binding(&cache_root);
         let blocked = recover_preparation_caches_for_bindings(
-            std::slice::from_ref(&binding), &resource_db_path, deadline, true,
+            std::slice::from_ref(&binding),
+            &resource_db_path,
+            deadline,
+            true,
         );
         assert!(!blocked.complete);
         assert_eq!(blocked.filesystem_entries_reclaimed, 0);
-        assert!(cache_root.join(TEST_PREPARATION_REPOSITORY).join("old-cache").is_file());
+        assert!(
+            cache_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("old-cache")
+                .is_file()
+        );
         assert!(matches!(
-            crate::preparation::rotation_journal::probe(&resource_db_path, &cache_root, Some(&identity)).unwrap(),
+            crate::preparation::rotation_journal::probe(
+                &resource_db_path,
+                &cache_root,
+                Some(&identity)
+            )
+            .unwrap(),
             Some(crate::preparation::rotation_journal::JournalProbe::Pending)
         ));
-        writer.release(&grant.lease.lease_id, grant.lease.generation, &grant.ownership_token).unwrap();
+        writer
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
         let recovered = recover_preparation_caches_for_bindings(
-            &[binding], &resource_db_path, std::time::Instant::now() + Duration::from_secs(5), true,
+            &[binding],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
         );
         assert!(!recovered.complete);
         assert!(recovered.filesystem_entries_reclaimed > 0);
         assert!(matches!(
-            crate::preparation::rotation_journal::probe(&resource_db_path, &cache_root, Some(&identity)).unwrap(),
+            crate::preparation::rotation_journal::probe(
+                &resource_db_path,
+                &cache_root,
+                Some(&identity)
+            )
+            .unwrap(),
             Some(crate::preparation::rotation_journal::JournalProbe::NoDebt)
         ));
     }
@@ -6580,13 +6648,19 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let resource_db_path = test_host_resource_db(&root);
         let empty = recover_preparation_caches_for_bindings(
-            &[], &resource_db_path, std::time::Instant::now() + Duration::from_secs(5), true,
+            &[],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
         );
         assert!(!empty.complete);
         assert_eq!(empty.filesystem_entries_reclaimed, 0);
         let cache_root = root.join("preparation-cache");
         let expired = recover_preparation_caches_for_bindings(
-            &[unguarded_host_cache_binding(&cache_root)], &resource_db_path, std::time::Instant::now(), true,
+            &[unguarded_host_cache_binding(&cache_root)],
+            &resource_db_path,
+            std::time::Instant::now(),
+            true,
         );
         assert!(!expired.complete);
         assert_eq!(expired.filesystem_entries_reclaimed, 0);
@@ -6653,6 +6727,48 @@ mod tests {
                 .into_owned(),
         );
         std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_only_invalid_binding_does_not_block_another_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let resource_db_path = test_host_resource_db(&root);
+        let invalid_root = root.join("invalid-cache");
+        std::fs::create_dir_all(&invalid_root).unwrap();
+        let invalid = initialized_storage_cache_root_binding(&invalid_root, &resource_db_path);
+        let protected = invalid_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("aaaaaaaaaaaa");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("payload"), b"invalid authority").unwrap();
+        change_cache_root_coordinator(&invalid);
+        assert!(invalid.validate().is_err());
+        let valid_root = root.join("valid-cache");
+        publish_external_rotation_journal_debt(
+            &valid_root,
+            &resource_db_path,
+            TEST_PREPARATION_REPOSITORY,
+        );
+        let report = recover_preparation_caches_for_bindings(
+            &[invalid, unguarded_host_cache_binding(&valid_root)],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
+        );
+        assert!(!report.complete);
+        assert!(report.filesystem_entries_reclaimed > 0);
+        assert!(
+            !valid_root
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("old-cache")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(protected.join("payload")).unwrap(),
+            b"invalid authority"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

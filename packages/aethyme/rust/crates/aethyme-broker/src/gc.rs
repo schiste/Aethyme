@@ -8288,9 +8288,15 @@ mod tests {
             let storage = crate::test_storage::TestStorage::new();
             let mut broker = storage.open(&root).unwrap();
             if bound {
-                broker.start_worktree("bind only this repository", None).unwrap();
+                broker
+                    .start_worktree("bind only this repository", None)
+                    .unwrap();
             }
-            let cache_root = broker.storage_context().preparation_cache_root().unwrap().unwrap();
+            let cache_root = broker
+                .storage_context()
+                .preparation_cache_root()
+                .unwrap()
+                .unwrap();
             let other_repository = "b".repeat(64);
             let protected = cache_root.join(&other_repository).join("bbbbbbbbbbbb");
             std::fs::create_dir_all(&protected).unwrap();
@@ -8299,30 +8305,54 @@ mod tests {
             let store = cache_root.join(&repository);
             std::fs::create_dir_all(&store).unwrap();
             std::fs::write(store.join("old-cache"), b"witnessed rotation").unwrap();
-            let resource_db_path = broker.storage_context().host_resource_db_path.clone().unwrap();
-            let identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+            let resource_db_path = broker
+                .storage_context()
+                .host_resource_db_path
+                .clone()
+                .unwrap();
+            let identity =
+                crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
             let debt = crate::preparation::rotation_debt::RotationDebt::new(
                 &repository,
                 &crate::preparation::rotation_debt::new_transaction_id(),
                 identity.clone(),
                 crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             crate::preparation::rotation_journal::publish(
-                &resource_db_path, &cache_root, &identity.encode().unwrap(), &repository,
+                &resource_db_path,
+                &cache_root,
+                &identity.encode().unwrap(),
+                &repository,
                 &crate::preparation::rotation_debt::encode(&debt).unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let policy = RetentionPolicy {
                 artifact_sweep_budget_ms: 5000,
                 ..RetentionPolicy::default()
             };
-            let (outcome, entries) = broker.sweep_artifacts_autonomously_with_deadlines(
-                &policy, ArtifactSweepScope::Drain, None, None,
-                ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
-            ).unwrap();
-            assert!(!outcome.complete, "consumer coverage remains unproven even when bound={bound}");
-            assert!(entries > 0, "independent witnessed recovery must progress when bound={bound}");
+            let (outcome, entries) = broker
+                .sweep_artifacts_autonomously_with_deadlines(
+                    &policy,
+                    ArtifactSweepScope::Drain,
+                    None,
+                    None,
+                    ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+                )
+                .unwrap();
+            assert!(
+                !outcome.complete,
+                "consumer coverage remains unproven even when bound={bound}"
+            );
+            assert!(
+                entries > 0,
+                "independent witnessed recovery must progress when bound={bound}"
+            );
             assert!(!store.join("old-cache").exists());
-            assert_eq!(std::fs::read(protected.join("payload")).unwrap(), b"live in another repository");
+            assert_eq!(
+                std::fs::read(protected.join("payload")).unwrap(),
+                b"live in another repository"
+            );
         }
     }
 
