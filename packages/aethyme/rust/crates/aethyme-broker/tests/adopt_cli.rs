@@ -750,6 +750,12 @@ fn start_refuses_a_base_that_does_not_resolve() {
 #[test]
 fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
     let tmp = fixture();
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[worktree_freshness]\nmax_age_seconds = 86400\n",
+    )
+    .unwrap();
     let started = stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
     let started: serde_json::Value = serde_json::from_str(&started).unwrap();
     assert_eq!(started["start_base"]["evidence"], "conventional_main");
@@ -776,6 +782,15 @@ fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
     assert_eq!(reused["outcome"], "reused");
     assert_eq!(reused["base_freshness"]["source"], "conventional_main");
     assert_eq!(reused["base_freshness"]["relation"], "fast_forwarded");
+    assert_eq!(reused["base_freshness"]["max_age_seconds"], 86400);
+    assert_eq!(
+        reused["base_freshness"]["previous_observation_stale"], false,
+        "a recent observation must never skip the fresh ancestry check"
+    );
+    assert!(reused["base_freshness"]["previous_observation_age_seconds"].is_u64());
+    let observation = stored_base_observation(&tmp, session.id);
+    assert_eq!(observation["target_commit"], current_main);
+    assert!(observation["observed_at_ms"].is_i64());
     assert_eq!(reused["base_freshness"]["target_ref"], "refs/heads/main");
     assert_eq!(reused["base_freshness"]["target_commit"], current_main);
     assert_eq!(reused["diff_base"], current_main);

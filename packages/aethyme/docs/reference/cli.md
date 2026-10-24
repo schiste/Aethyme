@@ -737,11 +737,25 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker advanced resources renew <grant.json> --ttl <seconds> [--json]`
 - `aethyme broker advanced resources release <grant.json> [--json]`
 - `aethyme broker advanced resources list [--all] [--json]`
-- `aethyme broker gc reap [--json]`
+- `aethyme broker gc reap [--dry-run] [--json]`
 - `aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]`
 - `aethyme broker advanced console [status|list] [--json]`
 - `aethyme broker advanced console plan [--allow-parallel] [--json]`
 - `aethyme broker advanced console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
+
+`gc reap --dry-run` opens the host registry read-only and projects dead-holder
+capacity reconciliation. Its JSON uses `aethyme.host-resource-reap-preview/v1`:
+`evaluated_at_ms`, `would_reclaim_capacity_units`, `candidates[]` (lease id,
+generation, holder PID, capacity units and projected state), and `not_reaped[]`.
+The real reap independently revalidates current holders and fences. Named
+allocations remain quarantined for cleanup review; this operation stops no
+processes or containers. Supervised capacity holds and unresolved preparation
+producers remain protected. An absent registry produces an empty preview
+without creating host state. Known managed-storage schemas are read without
+migration; schema-3 producer-linked capacity remains fenced because it lacks
+immutable settlement proof. A retained host-resource schema-1 store requires
+the existing coordinated writable upgrade before preview can inspect supervised
+holds. The read-only command never migrates either schema.
 
 A dev server is a host resource, and agent isolation and operator singularity
 want opposite defaults from it. `console` composes the `resources` primitives
@@ -1130,6 +1144,14 @@ This includes `--sync-integration`; a failed fetch never refreshes the stored
 observation or moves the checkout. Any automatic
 fast-forward requires a known non-explicit base source and a clean checkout;
 dirty or diverged checkouts are left in place.
+
+Freshness is enforced at explicit task handoffs (`start` and `start --reuse`),
+not by rewriting a checkout underneath an already running agent. Before a new
+task, reuse the existing session through that boundary; after an upstream push
+reports drift, run `broker sync --session <id>` and resolve its reported
+blockers. The selected integration ref comes from `[promote] branch`; verify-only
+repositories use the fetched default branch unless an explicit base is chosen.
+A recent successful observation never suppresses the next ancestry check.
 
 Registration and reuse accept an optional `--short-name`, the concise tab label;
 without it a new session's label is derived from its task.

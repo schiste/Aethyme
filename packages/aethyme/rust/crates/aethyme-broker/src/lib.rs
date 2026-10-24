@@ -541,7 +541,7 @@ pub use resources::{
     HostResourceAllocation, HostResourceBlocker, HostResourceConflict, HostResourceCoordinator,
     HostResourceError, HostResourceExplanation, HostResourceGrant, HostResourceHolder,
     HostResourceKind, HostResourceLease, HostResourceNotReapedLease, HostResourceNotReapedReason,
-    HostResourcePlan, HostResourceReapLease, HostResourceReapReport,
+    HostResourcePlan, HostResourceReapLease, HostResourceReapPreview, HostResourceReapReport,
     HostResourceReapReportWithDiagnostics, HostResourceRequest, HostResourceRequirement,
     HostResourceRunError, HostResourceRunReport, HostResourceWaitAdvice,
     default_host_resource_db_path, resource_environment_key, validate_host_resource_requirements,

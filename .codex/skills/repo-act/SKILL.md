@@ -68,6 +68,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- In promoted-history fixtures, separate source-content preservation,
+  all-parent reachability and first-parent candidate enumeration. Promotion
+  may rewrite source ancestry; verify the exact expected tree and record both
+  commit sets rather than assuming a merge topology from a commit subject.
+  Retain those checks with the measurement provenance.
 - For startup profiling, use Git Trace2 event logs to count actual Git
   subprocess starts and group repeated argv. Stack-sample counts measure time in
   sampled frames, not invocation counts; keep instrumented traces and timings

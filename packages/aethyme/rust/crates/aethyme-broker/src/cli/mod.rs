@@ -306,9 +306,10 @@ Usage:
       read from the file rather than command arguments or broker telemetry.
   aethyme broker resources list [--all] [--json]
       Read-only inventory. Ownership tokens are never included.
-  aethyme broker resources reap [--json]
+  aethyme broker resources reap [--dry-run] [--json]
       Reclaim ordinary capacity from quarantined leases whose holder is gone;
       supervised capacity holds remain until clean release or reconciliation.
+      --dry-run projects capacity reconciliation without changing registry rows.
   aethyme broker resources reconcile <lease-id> --confirm <generation> [--json]
       Release an expired, quarantined allocation after reviewing host cleanup.
       The generation confirmation fences stale cleanup commands.

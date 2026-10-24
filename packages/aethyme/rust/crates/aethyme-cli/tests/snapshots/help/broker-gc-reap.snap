@@ -1,6 +1,7 @@
 exit: 0
 --- stdout
-  aethyme broker gc reap [--json]
+  aethyme broker gc reap [--dry-run] [--json]
       Reclaim ordinary capacity from quarantined leases whose holder is gone;
       supervised capacity holds remain until clean release or reconciliation.
+      --dry-run projects capacity reconciliation without changing registry rows.
 --- stderr
