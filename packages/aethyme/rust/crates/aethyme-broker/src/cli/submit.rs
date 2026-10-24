@@ -1054,6 +1054,9 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             duplicate.status.as_str(),
             match (duplicate.reason, duplicate.pull_request) {
                 (crate::DuplicateWorkReason::SameBranch, _) => "the same branch".to_string(),
+                (crate::DuplicateWorkReason::TaskMentionsPath, _) =>
+                    "a file path named in both tasks".to_string(),
+                (crate::DuplicateWorkReason::SameTask, _) => "the same normalized task".to_string(),
                 (_, Some(pr)) => format!("PR #{pr}"),
                 (_, None) => "the same pull request".to_string(),
             },
