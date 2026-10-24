@@ -7451,6 +7451,7 @@ impl Broker {
         // claim as storage's empty-root removal; otherwise a confirmed sweep
         // could delete a root prepared before this final claim.
         let lifecycle_claim = self.claim_worktree_lifecycle()?;
+        self.preflight_worktree_checkout_count()?;
         let placement = self.prepare_broker_worktree_root()?;
         // Choose the unique branch and recheck the destination immediately
         // before the checkout is allocated. The returned guard stays held
@@ -9471,6 +9472,33 @@ impl Broker {
                 path: self.main_root.join(".aethyme/config.toml"),
                 reason,
             })
+    }
+
+    fn preflight_worktree_checkout_count(&self) -> Result<(), BrokerOpError> {
+        // Invalid placement configuration already has a documented host-root
+        // fallback and diagnostic. Keep that behavior, with the bounded
+        // default rather than letting invalid policy disable admission.
+        let config = match crate::worktree_location::WorktreeLocationConfig::load(&self.main_root) {
+            Ok(Some(config)) => config,
+            Ok(None) | Err(_) => crate::worktree_location::WorktreeLocationConfig::default(),
+        };
+        let maximum = config.max_checkouts();
+        if maximum == 0 {
+            return Ok(());
+        }
+        // Git's strict inventory includes its primary checkout. Count every
+        // other registration, including prunable ones and other placement
+        // roots, without opening or recursively sizing any checkout.
+        let count = self.repo.worktree_inventory()?.len().saturating_sub(1);
+        if count >= maximum as usize {
+            return Err(BrokerOpError::WorktreeRootUnavailable {
+                path: self.main_root.clone(),
+                reason: format!(
+                    "linked checkout limit reached ({count}/{maximum}); no checkout was allocated. Reuse an existing worktree with broker start --reuse <worktree>, finish delivered sessions, or inspect broker gc plan. Configure [worktrees].max_checkouts to change the limit; explicit zero disables it"
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn preflight_session_checkout_storage(

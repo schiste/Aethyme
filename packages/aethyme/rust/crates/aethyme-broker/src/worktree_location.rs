@@ -24,9 +24,16 @@ pub struct WorktreeLocationConfig {
     /// Free space the root must keep before a new session is placed there.
     /// Defaults to the headroom a gate needs to start.
     pub min_free_bytes: Option<u64>,
+    /// Maximum registered linked checkouts, across all placement roots.
+    /// Omission means 32; explicit zero disables this allocation guard.
+    pub max_checkouts: Option<u32>,
 }
 
 impl WorktreeLocationConfig {
+    pub fn max_checkouts(&self) -> u32 {
+        self.max_checkouts.unwrap_or(32)
+    }
+
     pub fn min_free_bytes(&self) -> u64 {
         self.min_free_bytes
             .unwrap_or(crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES)
@@ -193,6 +200,7 @@ mod tests {
             config.min_free_bytes(),
             crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
         );
+        assert_eq!(config.max_checkouts(), 32);
         assert_eq!(
             WorktreeLocationConfig::from_config_text("schema = 1\n").unwrap(),
             None

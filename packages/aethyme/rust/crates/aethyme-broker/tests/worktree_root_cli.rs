@@ -509,6 +509,95 @@ fn json(output: Output) -> serde_json::Value {
 }
 
 #[test]
+fn checkout_limit_counts_other_roots_and_preserves_reuse_without_allocating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("project");
+    let state = tmp.path().join("state");
+    fixture_at(&repo);
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[worktrees]\nmax_checkouts = 2\n",
+    )
+    .unwrap();
+    let started = json(run_with_host_state(
+        &repo,
+        &state,
+        &["start", "--task", "first", "--json"],
+    ));
+    let existing = started["worktree_path"].as_str().unwrap();
+    let other = tmp.path().join("another-root/checkout");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            other.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let before = git_output(&repo, &["worktree", "list", "--porcelain"]);
+    let refused = run(&repo, &state, &["start", "--task", "over limit", "--json"]);
+    assert!(!refused.status.success());
+    let error = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        error.contains("linked checkout limit reached (2/2)"),
+        "{error}"
+    );
+    assert!(error.contains("--reuse"), "{error}");
+    assert_eq!(
+        git_output(&repo, &["worktree", "list", "--porcelain"]),
+        before
+    );
+    assert!(other.exists(), "admission never removes another checkout");
+    let reused = json(run(
+        &repo,
+        &state,
+        &["start", "--reuse", existing, "--task", "reuse", "--json"],
+    ));
+    assert_eq!(reused["outcome"], "reused");
+    assert_eq!(
+        git_output(&repo, &["worktree", "list", "--porcelain"]),
+        before
+    );
+}
+
+#[test]
+fn explicit_zero_checkout_limit_permits_new_allocations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("project");
+    let state = tmp.path().join("state");
+    fixture_at(&repo);
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[worktrees]\nmax_checkouts = 0\n",
+    )
+    .unwrap();
+    for task in ["first", "second"] {
+        json(run_with_host_state(
+            &repo,
+            &state,
+            &["start", "--task", task, "--json"],
+        ));
+    }
+    assert_eq!(
+        git_output(&repo, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        3,
+        "two linked checkouts plus the primary"
+    );
+}
+
+#[test]
 fn start_places_worktree_outside_repository_under_a_private_owned_root() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("project");
