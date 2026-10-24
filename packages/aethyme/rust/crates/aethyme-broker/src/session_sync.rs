@@ -148,11 +148,11 @@ impl crate::Broker {
     pub(crate) fn refresh_default_branch_before_start(&self) -> StartRefresh {
         let repo = self.repo_handle();
         let Some(default) = tracked_default(repo) else {
-            if repo.symbolic_ref("refs/remotes/origin/HEAD").is_some() {
+            if !matches!(repo.has_configured_remote_default(), Ok(false)) {
                 return StartRefresh {
                     fetched: Some(false),
                     error: Some(
-                        "the configured remote default ref is unavailable; fetch the default branch and restore origin/HEAD before retrying".into(),
+                        "the configured remote default ref is unavailable or its configuration could not be verified; fetch the default branch and repair its tracking configuration before retrying".into(),
                     ),
                     cached_ref_age_seconds: None,
                 };
