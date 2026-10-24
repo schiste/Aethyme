@@ -1410,6 +1410,7 @@ impl Broker {
         }
         // Several sessions on one PR conflict by construction; name it.
         advice.extend(self.duplicate_work_advice(&agents));
+        advice.extend(self.inactive_pr_owner_advice(now_ms, &agents));
         // Who is driving a release or another named operation, and whether
         // they still are: two drivers race each other's merges and tags.
         let ownership_claims = self.ownership_claim_views(&agents, now_ms)?;
