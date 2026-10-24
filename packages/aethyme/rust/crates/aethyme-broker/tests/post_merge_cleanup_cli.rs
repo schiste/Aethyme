@@ -126,12 +126,7 @@ fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
     let initial = git(&repo, &["rev-parse", "HEAD"]);
     git(
         &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:acme/product.git",
-        ],
+        &["remote", "add", "origin", "git@github.com:acme/product.git"],
     );
     git(&repo, &["update-ref", "refs/remotes/origin/main", &initial]);
     git(&repo, &["config", "branch.main.remote", "origin"]);
