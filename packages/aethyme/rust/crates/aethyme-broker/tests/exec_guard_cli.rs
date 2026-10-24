@@ -336,6 +336,61 @@ fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn exec_status_refuses_extra_input_and_conflicting_selectors() {
+    let (repo, state, packed) = fixture();
+    let (id, _) = split(&packed);
+    let malformed = [
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "unexpected",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            "0123456789abcdef0123456789abcdef",
+            "--limit",
+            "20",
+            "--json",
+        ],
+    ];
+
+    for args in malformed {
+        let out = run(repo.path(), state.path(), &args);
+        assert!(
+            !out.status.success(),
+            "invalid exec-status form was accepted: {args:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "invalid form returned receipt data: {args:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("exec-status"),
+            "invalid form omitted exec-status usage: {args:?}"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn rejected_exec_preflight_does_not_create_a_receipt_or_dispatch_the_command() {
     let (repo, state, _) = fixture();
     let marker = state.path().join("exec-preflight-must-not-run");

@@ -698,6 +698,9 @@ pub(super) fn run_exec_status(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or_else(|| UsageError::Message(EXEC_STATUS_USAGE.into()))?;
+    if !parsed.positional.is_empty() || !parsed.exec_command.is_empty() {
+        return Err(UsageError::Message(EXEC_STATUS_USAGE.into()));
+    }
     if parsed.exec_receipt.is_some() && parsed.limit.is_some() {
         return Err(UsageError::Message(EXEC_STATUS_USAGE.into()));
     }
