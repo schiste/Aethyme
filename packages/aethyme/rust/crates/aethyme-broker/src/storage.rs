@@ -1627,6 +1627,40 @@ fn preparation_rotation_journal_root_identity(
     Ok(identity)
 }
 
+// Absence or an observed empty directory needs no consumer census: there
+// are no generic entries to prune. This never authorizes removal and must
+// not treat a failed or truncated inventory as empty.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn preparation_cache_is_observed_empty(
+    cache_root: &Path,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    deadline: std::time::Instant,
+) -> bool {
+    if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+        return false;
+    }
+    let before = match preparation_rotation_journal_root_identity(
+        cache_root,
+        expected_root_identity,
+        deadline,
+    ) {
+        Ok(identity) => identity,
+        Err(()) => return false,
+    };
+    if before.is_some() {
+        let Ok(mut entries) = std::fs::read_dir(cache_root) else {
+            return false;
+        };
+        if entries.next().is_some() {
+            return false;
+        }
+    }
+    root_binding.is_none_or(|binding| binding.validate().is_ok())
+        && preparation_rotation_journal_root_identity(cache_root, expected_root_identity, deadline)
+            == Ok(before)
+}
+
 /// Test adapter retaining the historical tuple result for fixture assertions.
 #[cfg(test)]
 fn sweep_preparation_cache_at(
@@ -2241,19 +2275,26 @@ fn sweep_preparation_cache_with_coverage_and_observer(
 
     if let Some(reason) = coverage_deferral {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let observed_empty = preparation_cache_is_observed_empty(
+            cache_root,
+            expected_root_identity,
+            root_binding,
+            deadline,
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let observed_empty = false;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(lap) = rotation_journal_lap.as_mut() {
-            // A complete recovery lap may be acknowledged even though this
-            // namespace cannot safely enter generic consumer-based pruning.
-            // The public result remains incomplete due to unknown consumers;
-            // finish records recovery failures and retains its own pending bit.
+            // Recovery settlement is independent of the consumer census.
+            // Nonempty unwitnessed cache content remains deferred.
             lap.finish(complete);
         }
         return PreparationCacheSweepReport {
             entries_removed: removed,
             bytes_reclaimed: bytes,
             filesystem_entries_reclaimed,
-            complete: false,
-            coverage_deferral: Some(reason),
+            complete: complete && observed_empty,
+            coverage_deferral: (!observed_empty).then_some(reason),
         };
     }
 
@@ -6480,6 +6521,32 @@ mod tests {
             identity: None,
             instance_nonce: None,
             root_guard: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_only_completes_observed_empty_or_absent_cache_without_creating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let resource_db = root.join("host-resources.db");
+        let cache_root = root.join("cache");
+        for present in [false, true] {
+            if present {
+                std::fs::create_dir(&cache_root).unwrap();
+            }
+            let binding = unguarded_host_cache_binding(&cache_root);
+            let report = recover_preparation_caches_for_bindings(
+                &[binding],
+                &resource_db,
+                Instant::now() + Duration::from_secs(5),
+                true,
+            );
+            assert!(report.complete, "present={present}: {report:?}");
+            assert_eq!(report.coverage_deferral, None);
+            assert_eq!(report.filesystem_entries_reclaimed, 0);
+            assert_eq!(cache_root.exists(), present);
+            assert!(!resource_db.exists());
         }
     }
 
