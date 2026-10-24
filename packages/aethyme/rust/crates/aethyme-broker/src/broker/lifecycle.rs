@@ -6244,6 +6244,32 @@ impl Broker {
                     "the session checkout is detached or no longer on its recorded branch",
                 ));
             }
+            // Extra history counts are paid only when refusing a task handoff.
+            // A failed count remains unknown and cannot weaken the refusal.
+            let stale_refusal = |reason: String| {
+                let display_count = |result: Result<u64, crate::GitError>| match result {
+                    Ok(count) => count.to_string(),
+                    Err(error) => format!("unknown ({error})"),
+                };
+                let ahead = display_count(checkout.commit_count_between(&target.commit, &head));
+                let behind = display_count(checkout.commit_count_between(&head, &target.commit));
+                let recorded = previous
+                    .as_ref()
+                    .map(|observation| observation.target_commit.as_str())
+                    .unwrap_or("unknown");
+                let age = previous_observation_age
+                    .age_seconds
+                    .map(|seconds| seconds.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                reuse_freshness_refusal(format!(
+                    "{reason}; checkout_head={head}; recorded_base_sha={recorded}; \
+                     target_ref={}; target_sha={}; ahead={ahead} behind={behind}; \
+                     prior_observation_age_seconds={age}; max_age_seconds={}; \
+                     next: preserve local changes, inspect and reconcile the session branch \
+                     with the selected base, then retry the explicit task handoff",
+                    target.reference, target.commit, policy.max_age_seconds,
+                ))
+            };
             let relation = if head == target.commit {
                 crate::AdoptBaseFreshnessRelation::Current
             } else {
@@ -6284,14 +6310,16 @@ impl Broker {
                     if !target.evidence.is_some_and(|evidence| {
                         evidence != crate::SessionStartBaseEvidence::ExplicitBase
                     }) {
-                        return Err(reuse_freshness_refusal(format!(
+                        return Err(stale_refusal(format!(
                             "the session checkout is behind the selected base {}; automatic movement is disabled for unknown or explicit base provenance. Recreate the session from that base, or explicitly use --sync-integration if integration is the intended base",
                             target.reference
                         )));
                     }
                     let dirty_paths = checkout.dirty_paths()?;
                     if !dirty_paths.is_empty() {
-                        return Err(BrokerOpError::ReuseSyncDirty { paths: dirty_paths });
+                        return Err(stale_refusal(format!(
+                            "reuse synchronization requires a clean worktree; dirty paths: {dirty_paths:?}; no checkout change was made"
+                        )));
                     }
                     let branch = checkout.current_branch()?;
                     let expected_head_ref = format!("refs/heads/{branch}");
@@ -6318,7 +6346,7 @@ impl Broker {
                     checkout_moved_to = Some(target.commit.clone());
                     crate::AdoptBaseFreshnessRelation::FastForwarded
                 } else {
-                    return Err(reuse_freshness_refusal(format!(
+                    return Err(stale_refusal(format!(
                         "the session and selected base {} have diverged; no checkout change was made",
                         target.reference
                     )));
