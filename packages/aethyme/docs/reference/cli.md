@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-10-23
+Last Updated: 2026-10-24
 
 ## Install
 
@@ -309,6 +309,22 @@ need terminal interaction; terminal reads or job-control operations may stop
 or fail. If the helper cannot start, the command is not dispatched and the
 broker does not fall back to the unsupervised runner.
 
+Each CLI `advanced exec` commits an opaque receipt before dispatch and includes
+its id in the final human or JSON report. Use
+`aethyme broker advanced exec-status --session <id>` to inspect the newest 20
+receipts, or add `--limit <1..100>` / `--receipt <32-hex-id>` for a bounded list
+or one receipt. Receipts contain outcomes and audit/cleanup states, not command
+arguments, environment, output, or process ids. A `starting`, `running`, or
+`outcome_unknown` row is only the last persisted phase; `exec-status` does not
+check whether a process still exists and never signals or cleans one up.
+Legacy terminal mode records direct-child completion with descendant cleanup
+`unverified`. After a client disconnect, the last receipt can remain unresolved;
+status reports that uncertainty. The store keeps the newest 100 terminal
+receipts per session. A known direct-child completion can be pruned even when
+descendant cleanup is unverified; pruning does not prove that descendants
+stopped. Starting/running rows and unknown outcomes without verified cleanup
+remain until session deletion.
+
 Exit code 3 means the requested action was refused; it does not guarantee that
 the command made no state change. Some refusal paths record safe quarantine or
 other maintenance while declining the requested action. Inspect the command's
@@ -573,6 +589,7 @@ a reason.
 - `aethyme broker submit prepare status --session <id> [--json]`
 - `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]`
 - `aethyme broker advanced exec --session <id> [--non-interactive] [--json] -- <command>`
+- `aethyme broker advanced exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]`
 - `aethyme broker advanced git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <git-args>`
 - `aethyme broker advanced gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <gh-args>`
 - `aethyme broker advanced operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`

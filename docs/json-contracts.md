@@ -770,6 +770,29 @@ remain available. Human output likewise states that the audit happens after the
 command and prints recovery guidance. Arbitrary argv does not declare a write
 set, so the guard cannot infer every generated path before running it.
 
+CLI exec reports add `execution_receipt_id`, a random 32-character hexadecimal
+identifier committed before dispatch. It contains no command, arguments,
+environment, output, or process id. Query it with
+`aethyme broker advanced exec-status --session <id> --receipt <receipt-id>
+--json`. The status envelope is `aethyme.broker-exec-status/v1` and contains
+the selected `session_id` plus one `receipt`; without `--receipt`, it contains
+a bounded `receipts` list and the applied `limit` (default 20, maximum 100).
+Rows report the last persisted phase, command outcome, exit code, ownership
+audit, process-group cleanup, timestamps, and whether process status has been
+revalidated. `starting` or `running` means only that phase was last recorded;
+the query never probes or signals a process. Legacy terminal execution reports
+direct-child completion separately from unverified descendant cleanup.
+
+The store retains the newest 100 terminal receipts per session. A not-started
+receipt or a completed direct-child outcome is terminal for retention; an
+`outcome_unknown` receipt is terminal only when process-group cleanup was
+verified. Thus a legacy completed receipt can be pruned while its
+`process_group_cleanup: "unverified"` value remains part of the last 100
+records. Pruning a receipt is not process cleanup or proof that descendants
+stopped. Starting/running receipts and unknown outcomes without verified
+cleanup are retained until session deletion. Session deletion cascades to its
+receipts.
+
 ### `broker advanced resources acquire --json` (stable conflict codes)
 
 The acquire failure object keeps its existing fields: `code`, `request_id`,

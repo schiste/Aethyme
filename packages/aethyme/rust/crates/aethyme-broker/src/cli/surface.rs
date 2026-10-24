@@ -96,6 +96,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
         "exec",
         "run a command in a session worktree under the dirty-path guard",
     ),
+    (
+        "exec-status",
+        "inspect a guarded-exec receipt without signaling or reconciling processes",
+    ),
     ("ship", "plan or execute a reviewed full-SHA publication"),
     ("review", "plan, run, record and route pull request reviews"),
     ("gates", "validate, draft, scope, run and diagnose gates"),

@@ -126,6 +126,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         // Trust writes only host state, and it is how a refused repository
         // recovers, so compatibility policy must not stand in its way.
         (Some("trust"), Some("status")) => CommandCapability::DiagnosticRead,
+        (Some("exec-status"), _) => CommandCapability::DiagnosticRead,
         (Some("trust"), _) => CommandCapability::RecoveryWrite,
         (Some("checkpoint"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
@@ -1111,6 +1112,10 @@ mod compatibility_command_tests {
     fn parsed_commands_cover_every_compatibility_capability() {
         let cases = [
             (&["broker", "status"][..], CommandCapability::DiagnosticRead),
+            (
+                &["broker", "advanced", "exec-status", "--session", "7"][..],
+                CommandCapability::DiagnosticRead,
+            ),
             (
                 &["broker", "gc", "storage"][..],
                 CommandCapability::DiagnosticRead,

@@ -23,9 +23,10 @@ Breaking releases: [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
 
-Unreleased migration note: [schema 54 worktree-root binding](#unreleased-schema-54-worktree-root-binding).
+Unreleased migration note: [schema 55 guarded-exec receipts and schema 54
+worktree-root binding](#unreleased-schema-55-guarded-exec-receipts-and-schema-54-worktree-root-binding).
 
-## Unreleased: schema 54 worktree-root binding
+## Unreleased: schema 55 guarded-exec receipts and schema 54 worktree-root binding
 
 These notes describe the implementation on main; no release version has been
 assigned. They are not a report that an existing database has been migrated or
@@ -33,23 +34,31 @@ that rollout has occurred.
 
 ### Compatibility
 
-The broker schema is now version 54. The additive v54 migration creates the
-per-repository worktree-root binding table and, when needed, one unscoped
-`legacy_unbound` row. A normal writable open may attach that row to the current
-Git common directory. The migration does not inspect the filesystem, choose a
-worktree root, create a repository UUID marker, or bind a root. Existing
-session, operation, and queue rows are retained. A placement or binding plan
-can open the database and therefore may run this migration and attach its
-unbound row, even though the plan does not create or bind a worktree root.
+Schema 54 introduced the per-repository worktree-root binding table and, when
+needed, one unscoped `legacy_unbound` row. A normal writable open may attach
+that row to the current Git common directory. The v54 migration does not
+inspect the filesystem, choose a worktree root, create a repository UUID
+marker, or bind a root. Existing session, operation, and queue rows are
+retained.
 
-`MIN_COMPATIBLE_SCHEMA` remains 52. A schema-52-compatible writer can continue
-to use a schema-54 database while its stored compatibility floor remains 52
-and no other feature has raised that floor. Explicitly binding a legacy root or
-reserving a fresh root raises the stored floor to 54 in the same durable state
-transition. After that transition, writers that support only schemas below 54
-refuse the database. When repositories share one `AETHYME_BROKER_DB`, each
-Git common directory has its own binding row, but the compatibility floor
-applies to the shared database.
+The current broker schema is version 55. Its additive migration creates
+observational receipts for guarded `broker exec`; receipts do not authorize
+process cleanup or session transitions and contain no command, environment, or
+output data. This migration does not raise `MIN_COMPATIBLE_SCHEMA`. A
+schema-52-compatible writer can continue to use a schema-55 database while its
+stored compatibility floor remains 52 and no other feature has raised that
+floor.
+Explicitly binding a legacy root or reserving a fresh root raises the stored
+floor to 54 in the same durable state transition. After that transition,
+writers that support only schemas below 54 refuse the database. When
+repositories share one `AETHYME_BROKER_DB`, each Git common directory has its
+own binding row, but the compatibility floor applies to the shared database.
+
+A placement or binding plan can open the database and therefore may apply
+pending migrations and attach its unbound row, even though the plan does not
+create or bind a worktree root. These notes describe source behavior only; no
+live broker database was migrated and no deployment has occurred for the
+schema-55 change.
 
 ### Before migrating or binding
 
@@ -58,14 +67,15 @@ Resolve the database path for every repository, including any
 database; independent repositories that point at one path share a database.
 Before its first writable open, stop all processes that can write each distinct
 database and make a WAL-aware backup. Install the same router and engine pair
-wherever that database can be opened before applying a root binding. Preserve
-the repository's Git common directory, selected worktree root, and host
-worktree registry; the binding workflow does not relocate them.
+wherever that database can be opened, before applying a migration or root
+binding. Preserve the repository's Git common directory, selected worktree
+root, and host worktree registry; the binding workflow does not relocate them.
 
 ### Migrate and bind
 
-The first normal writable open applies the additive v54 migration. It does not
-bind a legacy root. Inspect the selected placement with
+The first normal writable open applies the additive v55 migration and any
+earlier pending migrations. It does not bind a legacy root. Inspect the selected
+placement with
 `aethyme broker advanced worktree-root --json`. For an existing legacy root,
 review `aethyme broker advanced worktree-root binding plan <exact-root>
 <keyed_container|direct_root> --json`, then apply only its displayed digest:

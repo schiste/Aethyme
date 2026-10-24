@@ -5,7 +5,10 @@
 //! events. Reporting both as an ownership failure sends the reader to debug
 //! leases when the command simply failed on its own.
 
+use aethyme_broker::BrokerStore;
 use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Stdio;
 use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -181,4 +184,418 @@ fn a_write_outside_ownership_is_reported_as_a_refusal() {
             .is_some_and(|payload| payload.contains("runtime.sock") && !payload.contains(worktree))
     );
     drop(repo);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn completed_cli_exec_exposes_a_queryable_receipt_without_command_details() {
+    let (repo, state, packed) = fixture();
+    let (id, worktree) = split(&packed);
+    let out = Command::new(CLI)
+        .args([
+            "advanced",
+            "exec",
+            "--session",
+            id,
+            "--non-interactive",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ])
+        .current_dir(worktree)
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "exec: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let receipt_id = report["execution_receipt_id"].as_str().unwrap();
+    assert_eq!(receipt_id.len(), 32);
+
+    let status = run(
+        repo.path(),
+        state.path(),
+        &[
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            receipt_id,
+            "--json",
+        ],
+    );
+    assert!(
+        status.status.success(),
+        "exec-status: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["schema"], "aethyme.broker-exec-status/v1");
+    assert_eq!(value["session_id"].as_i64().unwrap().to_string(), id);
+    assert_eq!(value["receipt"]["receipt_id"], receipt_id);
+    assert_eq!(value["receipt"]["phase"], "completed");
+    assert_eq!(value["receipt"]["command_outcome"], "succeeded");
+    assert_eq!(value["receipt"]["ownership_audit"], "passed");
+    assert_eq!(value["receipt"]["process_group_cleanup"], "verified");
+    for secret_or_authority_field in ["pid", "command", "argv", "environment", "output"] {
+        assert!(
+            value["receipt"].get(secret_or_authority_field).is_none(),
+            "receipt must not expose {secret_or_authority_field}"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn failed_to_spawn_command_records_a_not_started_receipt() {
+    let (repo, state, packed) = fixture();
+    let (id, worktree) = split(&packed);
+    let missing = state.path().join("missing-exec-command");
+    let mut exec = Command::new(CLI);
+    exec.args([
+        "advanced",
+        "exec",
+        "--session",
+        id,
+        "--non-interactive",
+        "--json",
+        "--",
+    ])
+    .arg(missing)
+    .current_dir(worktree)
+    .env("AETHYME_HOST_STATE_DIR", state.path());
+    let out = exec.output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a missing executable must fail to start"
+    );
+
+    let status = run(
+        repo.path(),
+        state.path(),
+        &["advanced", "exec-status", "--session", id, "--json"],
+    );
+    assert!(
+        status.status.success(),
+        "exec-status: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let receipt = value["receipts"]
+        .as_array()
+        .and_then(|receipts| receipts.first())
+        .expect("failed spawn remains queryable");
+    assert_eq!(receipt["phase"], "not_started");
+    assert_eq!(receipt["command_outcome"], "not_started");
+    assert_eq!(receipt["ownership_audit"], "not_run");
+    assert_eq!(receipt["process_group_cleanup"], "not_applicable");
+    assert!(receipt["exit_code"].is_null());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
+    use std::time::{Duration, Instant};
+
+    let (repo, state, packed) = fixture();
+    let (id, worktree) = split(&packed);
+    let started_marker = state.path().join("exec-child-started");
+    let release_marker = state.path().join("exec-child-release");
+    // Keep the supervised child alive until the test disconnects its broker
+    // client. The loop has a hard bound as a fallback if cleanup regresses.
+    let wait_for_release = concat!(
+        "printf started > \"$AETHYME_TEST_EXEC_STARTED\"; ",
+        "i=0; while [ ! -e \"$AETHYME_TEST_EXEC_RELEASE\" ] ",
+        "&& [ \"$i\" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done"
+    );
+    let mut exec = Command::new(CLI)
+        .args([
+            "advanced",
+            "exec",
+            "--session",
+            id,
+            "--non-interactive",
+            "--timeout",
+            "40",
+            "--",
+            "sh",
+            "-c",
+            wait_for_release,
+        ])
+        .current_dir(worktree)
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .env("AETHYME_TEST_EXEC_STARTED", &started_marker)
+        .env("AETHYME_TEST_EXEC_RELEASE", &release_marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let receipt_result = loop {
+        let status = run(
+            repo.path(),
+            state.path(),
+            &["advanced", "exec-status", "--session", id, "--json"],
+        );
+        if !status.status.success() {
+            break Err(format!(
+                "exec-status: {}",
+                String::from_utf8_lossy(&status.stderr)
+            ));
+        }
+        let value: serde_json::Value = match serde_json::from_slice(&status.stdout) {
+            Ok(value) => value,
+            Err(error) => break Err(format!("exec-status returned invalid JSON: {error}")),
+        };
+        if let Some(receipt) = value["receipts"]
+            .as_array()
+            .and_then(|receipts| receipts.first())
+            .filter(|receipt| receipt["phase"] == "running" && started_marker.is_file())
+        {
+            if let Some(receipt_id) = receipt["receipt_id"].as_str() {
+                break Ok(receipt_id.to_owned());
+            }
+            break Err("running receipt omitted its identifier".to_owned());
+        }
+        if Instant::now() >= deadline {
+            break Err(
+                "exec never published a running receipt after starting its child".to_owned(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    if matches!(exec.try_wait(), Ok(None)) {
+        exec.kill().unwrap();
+    }
+    let _ = exec.wait().unwrap();
+    // Let the synthetic child exit if the supervisor did not already stop it
+    // when the client disconnected.
+    std::fs::write(&release_marker, b"release\n").unwrap();
+    let receipt_id = receipt_result.unwrap_or_else(|reason| panic!("{reason}"));
+
+    let status = run(
+        repo.path(),
+        state.path(),
+        &[
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            &receipt_id,
+            "--json",
+        ],
+    );
+    assert!(
+        status.status.success(),
+        "exec-status: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let receipt = &value["receipt"];
+    assert_eq!(receipt["receipt_id"], receipt_id);
+    assert_eq!(receipt["phase"], "running");
+    assert_eq!(receipt["command_outcome"], "unknown");
+    assert_eq!(receipt["process_revalidation"], "not_revalidated");
+    assert!(receipt.get("pid").is_none());
+}
+
+fn exec_status_telemetry_state(repo: &Path) -> (Vec<(i64, String)>, Option<Vec<u8>>) {
+    let database = repo.join(".aethyme/broker.db");
+    assert!(
+        database.is_file(),
+        "fixture should create its repository database"
+    );
+    let store = BrokerStore::open_snapshot_at(&database).expect("fixture broker database opens");
+    let events = store
+        .events_after(0, 10_000)
+        .expect("read fixture broker events")
+        .into_iter()
+        .map(|event| (event.id, event.kind))
+        .collect();
+    let metrics_path = repo.join(".aethyme/logs/command-metrics.jsonl");
+    let metrics = match std::fs::read(metrics_path) {
+        Ok(metrics) => Some(metrics),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read fixture command metrics: {error}"),
+    };
+    (events, metrics)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn exec_status_refuses_extra_input_and_conflicting_selectors() {
+    let (repo, state, packed) = fixture();
+    let (id, _) = split(&packed);
+    let telemetry_before = exec_status_telemetry_state(repo.path());
+
+    let valid = common::broker_cli(CLI, &["advanced", "exec-status", "--session", id, "--json"])
+        .current_dir(repo.path())
+        .env("AETHYME_HOST_STATE_DIR", state.path())
+        .env("AETHYME_MEASURE_OUTPUT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "valid query: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    let valid_json: serde_json::Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(valid_json["schema"], "aethyme.broker-exec-status/v1");
+    assert_eq!(valid_json["session_id"], id.parse::<i64>().unwrap());
+    assert_eq!(valid_json["receipts"].as_array().unwrap().len(), 0);
+    assert_eq!(exec_status_telemetry_state(repo.path()), telemetry_before);
+
+    let malformed = [
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "unexpected",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            "0123456789abcdef0123456789abcdef",
+            "--limit",
+            "20",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            "not-a-receipt",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--receipt",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--limit",
+            "0",
+            "--json",
+        ],
+        vec![
+            "advanced",
+            "exec-status",
+            "--session",
+            id,
+            "--task",
+            "ignored",
+            "--json",
+        ],
+    ];
+    let unopened_database = state.path().join("must-not-open.db");
+    std::fs::write(&unopened_database, b"leave untouched").unwrap();
+    let unopened_database_before = std::fs::read(&unopened_database).unwrap();
+
+    for args in malformed {
+        let out = common::broker_cli(CLI, &args)
+            .current_dir(repo.path())
+            .env("AETHYME_HOST_STATE_DIR", state.path())
+            .env("AETHYME_BROKER_DB", &unopened_database)
+            .env("AETHYME_MEASURE_OUTPUT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "invalid exec-status form was accepted: {args:?}"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "JSON usage error should be on stdout: {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let error: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("invalid form did not return JSON error: {args:?}"));
+        assert_eq!(error["schema"], "aethyme.broker-error/v1", "{args:?}");
+        assert_eq!(error["error"]["code"], 2, "{args:?}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("exec-status"), "{args:?}: {message}");
+        assert!(error.get("receipt").is_none(), "{args:?}");
+        assert!(error.get("receipts").is_none(), "{args:?}");
+        assert_eq!(
+            std::fs::read(&unopened_database).unwrap(),
+            unopened_database_before,
+            "invalid form touched its configured database: {args:?}"
+        );
+        assert_eq!(exec_status_telemetry_state(repo.path()), telemetry_before);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rejected_exec_preflight_does_not_create_a_receipt_or_dispatch_the_command() {
+    let (repo, state, _) = fixture();
+    let marker = state.path().join("exec-preflight-must-not-run");
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let out = run(
+        repo.path(),
+        state.path(),
+        &[
+            "advanced",
+            "exec",
+            "--session",
+            "999999",
+            "--non-interactive",
+            "--json",
+            "--",
+            "sh",
+            "-c",
+            "touch \"$1\"",
+            "sh",
+            &marker_arg,
+        ],
+    );
+    assert!(!out.status.success(), "unknown session must be refused");
+    assert!(
+        !marker.exists(),
+        "preflight refusal must not dispatch a child"
+    );
+
+    let status = run(
+        repo.path(),
+        state.path(),
+        &["advanced", "exec-status", "--session", "999999", "--json"],
+    );
+    assert!(status.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["receipts"].as_array().unwrap().len(), 0);
 }

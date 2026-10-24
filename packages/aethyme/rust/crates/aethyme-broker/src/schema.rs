@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 54;
+pub const SCHEMA_VERSION: i64 = 55;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -87,6 +87,9 @@ pub const SCHEMA_VERSION: i64 = 54;
 ///   stored in the Git common directory; unbound rows may be scoped by that
 ///   directory without granting root authority. The table is excluded from
 ///   repair because recreating a missing row could erase identity evidence.
+/// - v55: adds observational guarded-exec receipts. Older compatible writers
+///   ignore the new table; it does not authorize cleanup or session changes,
+///   so the global compatibility floor remains v52.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 52;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -1823,6 +1826,32 @@ INSERT INTO repository_worktree_binding (
   WHERE NOT EXISTS (SELECT 1 FROM repository_worktree_binding);
 ";
 
+/// v55: observational outcome receipts for `broker exec`. These rows never
+/// authorize process signaling, cleanup, or session transitions.
+const MIGRATION_V55: &str = "
+CREATE TABLE IF NOT EXISTS guarded_exec_receipts (
+    receipt_id TEXT PRIMARY KEY CHECK (length(receipt_id) = 32),
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL CHECK (phase IN (
+        'starting', 'running', 'completed', 'not_started', 'outcome_unknown'
+    )),
+    command_outcome TEXT NOT NULL CHECK (command_outcome IN (
+        'unknown', 'succeeded', 'failed', 'timed_out', 'not_started'
+    )),
+    exit_code INTEGER,
+    ownership_audit TEXT NOT NULL CHECK (ownership_audit IN (
+        'not_run', 'passed', 'failed', 'unknown'
+    )),
+    process_group_cleanup TEXT NOT NULL CHECK (process_group_cleanup IN (
+        'not_applicable', 'verified', 'unverified', 'unknown'
+    )),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms)
+);
+CREATE INDEX IF NOT EXISTS guarded_exec_receipts_session_latest
+    ON guarded_exec_receipts(session_id, created_at_ms DESC, receipt_id DESC);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1878,6 +1907,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V52,
     MIGRATION_V53,
     MIGRATION_V54,
+    MIGRATION_V55,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -1904,6 +1934,7 @@ const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
     ),
     (50, MIGRATION_V50, &["verification_candidates"]),
     (53, MIGRATION_V53, &["spawned_worktree_instances"]),
+    (55, MIGRATION_V55, &["guarded_exec_receipts"]),
 ];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
@@ -2540,6 +2571,28 @@ mod tests {
         assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 51).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 42).unwrap());
+    }
+
+    #[test]
+    fn v55_observational_exec_receipts_keep_the_v52_compatibility_floor() {
+        let conn = migrated_through(54);
+        set_meta(&conn, "min_compatible_schema", 52);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 55);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
+        assert!(table_exists(&conn, "guarded_exec_receipts").unwrap());
+        assert!(schema_is_compatible_with(&conn, 55, 52).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 55, 51).unwrap());
+        let floor: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, "52");
     }
 
     #[test]

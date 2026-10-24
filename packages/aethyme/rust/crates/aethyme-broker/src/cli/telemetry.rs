@@ -31,6 +31,7 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "start-agent",
     "worktree-root",
     "exec",
+    "exec-status",
     "git",
     "gh",
     "merge-chain",
@@ -318,7 +319,7 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         // from cron must not write a telemetry line, or the report would be one
         // of the things it reports on.
         Some(
-            "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff"
+            "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff" | "exec-status"
             | "worktree-root",
         ) => false,
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
@@ -471,6 +472,15 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>();
         assert!(command_records_outcome(&run));
+    }
+
+    #[test]
+    fn exec_status_is_read_only_but_can_be_measured_when_opted_in() {
+        let args = ["exec-status", "--session", "7"].map(str::to_string);
+        assert_eq!(safe_command_surface(&args).as_deref(), Some("exec-status"));
+        assert!(!command_records_metric(&args));
+        assert!(!command_records_outcome(&args));
+        assert!(command_metric_enabled(&args, true, false));
     }
 
     #[test]

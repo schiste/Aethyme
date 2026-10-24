@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-23
+Last Updated: 2026-10-24
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -282,14 +282,17 @@ An unavailable or incompatible helper refuses before the command request is
 sent; the broker never retries through direct spawn after helper failure.
 
 The inline-exec wire protocol uses the reserved
---aethyme-inline-exec-supervisor-v2 entrypoint and AIX2 frame marker. A v1
-helper rejects the v2 entrypoint during readiness, before it can receive a
-command request. The spawn-failure frame carries a stable tag for known std::io::ErrorKind
-values plus an optional raw OS error code, preserving NotFound,
-PermissionDenied, InvalidInput, and the underlying OS code. A kind without a
-stable wire tag is sent with an explicit diagnostic; the receiver reconstructs
-it from a raw OS code when available, or maps it conservatively to Other
-without one. An unknown wire tag fails closed as an uncertain command result.
+`--aethyme-inline-exec-supervisor-v3` entrypoint and `AIX3` frame marker. The
+v3 helper emits a `Started` frame only after the child process has spawned;
+older v1/v2 helpers reject the v3 entrypoint before receiving a command. Keep
+the entrypoint suffix and frame marker in sync when changing this private wire
+protocol. The spawn-failure frame carries a stable tag for known
+`std::io::ErrorKind` values plus an optional raw OS error code, preserving
+NotFound, PermissionDenied, InvalidInput, and the underlying OS code. A kind
+without a stable wire tag is sent with an explicit diagnostic; the receiver
+reconstructs it from a raw OS code when available, or maps it conservatively
+to Other without one. An unknown wire tag fails closed as an uncertain
+command result.
 
 When a controlling terminal is present, its probe is inconclusive, or the OS
 is unsupported, the broker preserves the legacy direct runner and prints a
@@ -812,6 +815,22 @@ paths in full. Human output says whether the command ran and whether edits
 remain, and shows at most eight changed paths. An ownership refusal can come
 after the command has already changed files, so a consumer must inspect the
 reported paths before retrying.
+
+CLI exec also commits an opaque receipt before command dispatch and adds its id
+to the final text/JSON report. `broker advanced exec-status --session <id>`
+reads one receipt by `--receipt` or a bounded latest list (`--limit`, default
+20, maximum 100). The record contains only phase, command outcome, exit code,
+ownership audit, process-group cleanup, timestamps and whether process status
+was revalidated; it stores no command, argv, environment, output, or PID. This
+is an observational status surface: it never signals or cleans a process and
+does not make an unresolved receipt authoritative for session cleanup. A client
+disconnect can leave `starting` or `running` as the last persisted phase;
+legacy terminal mode records direct-child exit while descendant cleanup stays
+unverified. Keep the newest 100 terminal receipts per session. A known
+direct-child completion can be pruned even when descendant cleanup is
+unverified; pruning does not prove descendants stopped. Starting/running rows
+and unknown outcomes without verified cleanup remain until the owning session
+is deleted, which cascades to its receipts.
 
 `aethyme broker advanced exec --non-interactive` opts that invocation into
 the supervised process-group runner even when the caller has a controlling

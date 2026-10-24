@@ -64,6 +64,7 @@ const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker advanced operati
 const OPERATIONS_SHOW_USAGE: &str =
     "usage: aethyme broker advanced operations show <id|host-operation-id> [--json]";
 const OPERATIONS_STATS_USAGE: &str = "usage: aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
+const EXEC_STATUS_USAGE: &str = "usage: aethyme broker advanced exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]";
 const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advanced advisories show <id> [--json]";
 const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advanced advisories ack <id> [--json]";
 const ADVISORIES_SUPPRESS_USAGE: &str =
@@ -358,6 +359,10 @@ Usage:
       --timeout is refused in that mode. Combine it with --non-interactive
       only for a command that does not need terminal interaction.
       If the supervised helper cannot start, the child is not dispatched.
+  aethyme broker exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]
+      Read guarded-exec outcomes for this repository and session. A starting
+      or running receipt is not process-liveness proof; this command never
+      signals, cleans up, or changes session state.
   aethyme broker git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive [--cross-session <id>]] [--no-wait|--queue-timeout <seconds>] [--json] -- <git-args>
       Run Git through the durable operation coordinator. Remote Git commands
       require an exact --repo. Repository writes are serialized, journaled,
@@ -1460,6 +1465,8 @@ struct Parsed {
     cross_session: Option<i64>,
     ref_write_acknowledged: bool,
     note_id: Option<i64>,
+    /// Opaque durable guarded-exec receipt id.
+    exec_receipt: Option<String>,
     message: Option<String>,
     entry: Option<i64>,
     confirm: Option<String>,
@@ -1614,6 +1621,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         cross_session: None,
         ref_write_acknowledged: false,
         note_id: None,
+        exec_receipt: None,
         message: None,
         entry: None,
         confirm: None,
@@ -2251,6 +2259,13 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                     UsageError::Message("--session must be an integer session id".into())
                 })?);
             }
+            "--receipt" => {
+                parsed.exec_receipt = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--receipt requires a value".into()))?
+                        .clone(),
+                );
+            }
             "--ref-write-acknowledged" => parsed.ref_write_acknowledged = true,
             "--cross-session" => {
                 let value = iter.next().ok_or(UsageError::Message(
@@ -2419,6 +2434,9 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         parsed.read_only_snapshot = true;
         parsed.read_only_compatibility = Some(compatibility.clone());
     }
+    if subcommand == "exec-status" {
+        parsed.read_only_snapshot = true;
+    }
     // `start` is the one public verb that merges by flag: registering an
     // existing worktree and spawning a process keep their own handlers.
     let subcommand = &match subcommand.as_str() {
@@ -2437,6 +2455,11 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             code: crate::exit_status::USAGE,
         });
     }
+    let exec_status_request = if subcommand == "exec-status" {
+        Some(validated_exec_status_request(&parsed)?)
+    } else {
+        None
+    };
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
@@ -2462,6 +2485,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "leases" => run_leases(parsed)?,
         "ownership" => run_ownership(parsed)?,
         "exec" => run_exec(parsed)?,
+        "exec-status" => {
+            let request = exec_status_request.ok_or_else(|| {
+                UsageError::Message("exec-status request validation was skipped".into())
+            })?;
+            run_exec_status(parsed.json, request)?;
+        }
         "git" | "gh" => run_git_gh(parsed, subcommand)?,
         "merge-chain" => run_merge_chain(parsed)?,
         "advisories" => run_advisories(parsed)?,

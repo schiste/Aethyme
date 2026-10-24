@@ -50,9 +50,22 @@ impl LeaseClaimPreparation {
     }
 }
 
-struct GuardedExecOutput {
+struct GuardedExecOptions {
     stdout: std::process::Stdio,
     supervised_timeout: std::time::Duration,
+    record_receipt: bool,
+}
+
+pub(crate) struct GuardedExecCliReport {
+    pub report: GuardedExecReport,
+    pub receipt_id: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GuardedExecDispatchEvent {
+    Started,
+    NotStarted,
+    OutcomeUnknown(&'static str),
 }
 
 impl Broker {
@@ -1663,7 +1676,7 @@ impl Broker {
         force_supervised: bool,
         json_mode: bool,
         requested_timeout: Option<std::time::Duration>,
-    ) -> Result<GuardedExecReport, BrokerOpError> {
+    ) -> Result<GuardedExecCliReport, BrokerOpError> {
         let mode = select_guarded_exec_mode(
             force_supervised,
             crate::inline_exec_supervisor::generic_exec_mode,
@@ -1682,17 +1695,20 @@ impl Broker {
         } else {
             std::process::Stdio::inherit()
         };
-        self.guarded_exec_with_env_heartbeat_mode_and_output(
+        let (report, receipt_id) = self.guarded_exec_with_env_heartbeat_mode_and_output(
             session_id,
             command,
             &[],
             || Ok(()),
             move || mode,
-            GuardedExecOutput {
+            GuardedExecOptions {
                 stdout,
                 supervised_timeout,
+                record_receipt: true,
             },
-        )
+        )?;
+        let receipt_id = receipt_id.expect("CLI guarded exec always records a receipt");
+        Ok(GuardedExecCliReport { report, receipt_id })
     }
 
     pub(crate) fn guarded_exec_with_env(
@@ -1741,11 +1757,13 @@ impl Broker {
             environment,
             heartbeat,
             select_mode,
-            GuardedExecOutput {
+            GuardedExecOptions {
                 stdout: std::process::Stdio::inherit(),
                 supervised_timeout: crate::inline_exec_supervisor::DEFAULT_GUARDED_EXEC_TIMEOUT,
+                record_receipt: false,
             },
         )
+        .map(|(report, _)| report)
     }
 
     fn guarded_exec_with_env_heartbeat_mode_and_output<F, M>(
@@ -1755,116 +1773,176 @@ impl Broker {
         environment: &[(String, String)],
         mut heartbeat: F,
         select_mode: M,
-        output: GuardedExecOutput,
-    ) -> Result<GuardedExecReport, BrokerOpError>
+        output: GuardedExecOptions,
+    ) -> Result<(GuardedExecReport, Option<String>), BrokerOpError>
     where
         F: FnMut() -> Result<(), BrokerOpError>,
         M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
     {
-        let GuardedExecOutput {
+        let GuardedExecOptions {
             stdout,
             supervised_timeout,
+            record_receipt,
         } = output;
         let supervisor_executable = self.agent_supervisor_executable.clone();
-        self.guarded_exec_with_runner(session_id, command, move |session| {
-            let mut execution_environment = vec![
-                (
-                    "AETHYME_BROKER_SESSION_ID".to_owned(),
-                    session_id.to_string(),
-                ),
-                (
-                    "AETHYME_GATE_WORKER_ID".to_owned(),
-                    format!("s{session_id}-exec"),
-                ),
-                (
-                    "AETHYME_TEST_DB_SUFFIX".to_owned(),
-                    format!("s{session_id}-exec"),
-                ),
-            ];
-            execution_environment.extend_from_slice(environment);
+        self.guarded_exec_with_runner(
+            session_id,
+            command,
+            record_receipt,
+            move |session, dispatch| {
+                let mut execution_environment = vec![
+                    (
+                        "AETHYME_BROKER_SESSION_ID".to_owned(),
+                        session_id.to_string(),
+                    ),
+                    (
+                        "AETHYME_GATE_WORKER_ID".to_owned(),
+                        format!("s{session_id}-exec"),
+                    ),
+                    (
+                        "AETHYME_TEST_DB_SUFFIX".to_owned(),
+                        format!("s{session_id}-exec"),
+                    ),
+                ];
+                execution_environment.extend_from_slice(environment);
 
-            let result = match select_mode() {
-                crate::inline_exec_supervisor::GenericExecMode::Supervised => {
-                    let executable = crate::agent_supervisor::resolve_executable(
-                        supervisor_executable.as_deref(),
-                    )
-                    .map_err(|source| BrokerOpError::Spawn {
-                        command: command.join(" "),
-                        source,
-                    })?;
-                    let supervisor =
-                        crate::inline_exec_supervisor::InlineExecSupervisor::start_inheriting_stdin(
+                let result = match select_mode() {
+                    crate::inline_exec_supervisor::GenericExecMode::Supervised => {
+                        let executable = match crate::agent_supervisor::resolve_executable(
+                            supervisor_executable.as_deref(),
+                        ) {
+                            Ok(executable) => executable,
+                            Err(source) => {
+                                dispatch(GuardedExecDispatchEvent::NotStarted);
+                                return Err(BrokerOpError::Spawn {
+                                    command: command.join(" "),
+                                    source,
+                                });
+                            }
+                        };
+                        let supervisor = match crate::inline_exec_supervisor::InlineExecSupervisor::start_inheriting_stdin(
                             &executable,
                             stdout,
-                        )
-                        .map_err(|error| map_guarded_exec_supervisor_error(session_id, command, error))?;
-                    let result = supervisor
-                        .run_with_timeout(
+                        ) {
+                            Ok(supervisor) => supervisor,
+                            Err(error) => {
+                                dispatch(GuardedExecDispatchEvent::NotStarted);
+                                return Err(map_guarded_exec_supervisor_error(
+                                    session_id, command, error,
+                                ));
+                            }
+                        };
+                        let result = match supervisor.run_with_timeout_and_dispatch(
                             Path::new(&session.worktree_path),
                             command,
                             &execution_environment,
                             Some(supervised_timeout),
                             &mut heartbeat,
-                        )
-                        .map_err(|error| map_guarded_exec_supervisor_error(session_id, command, error))?;
-                    GuardedCommandResult {
-                        exit_code: result.exit_code,
-                        succeeded: result.succeeded,
-                        timed_out: result.termination
-                            == crate::inline_exec_supervisor::CommandTermination::TimedOut,
-                    }
-                }
-                crate::inline_exec_supervisor::GenericExecMode::Legacy(reason) => {
-                    eprintln!(
-                        "warning: guarded exec for session {session_id} is using the legacy unsupervised runner ({reason}); descendant cleanup is not verified"
-                    );
-                    let mut child = Command::new(&command[0]);
-                    child
-                        .args(&command[1..])
-                        .current_dir(&session.worktree_path)
-                        .stdout(stdout);
-                    for (name, value) in &execution_environment {
-                        child.env(name, value);
-                    }
-                    let mut child = child.spawn().map_err(|source| BrokerOpError::Spawn {
-                        command: command.join(" "),
-                        source,
-                    })?;
-                    let status = loop {
-                        if let Some(status) = child.try_wait().map_err(|source| {
-                            BrokerOpError::Spawn {
-                                command: command.join(" "),
-                                source,
+                            |state| match state {
+                                crate::inline_exec_supervisor::CommandDispatchState::Started => {
+                                    dispatch(GuardedExecDispatchEvent::Started)
+                                }
+                                crate::inline_exec_supervisor::CommandDispatchState::NotStarted => {
+                                    dispatch(GuardedExecDispatchEvent::NotStarted)
+                                }
+                            },
+                        ) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                match &error {
+                                    crate::inline_exec_supervisor::InlineExecError::CleanupUnknown(_) => {
+                                        dispatch(GuardedExecDispatchEvent::OutcomeUnknown("unknown"));
+                                    }
+                                    crate::inline_exec_supervisor::InlineExecError::CommandOutcomeUnknown(_)
+                                    | crate::inline_exec_supervisor::InlineExecError::OperationAfterDispatch(_) => {
+                                        dispatch(GuardedExecDispatchEvent::OutcomeUnknown("verified"));
+                                    }
+                                    crate::inline_exec_supervisor::InlineExecError::Setup(_)
+                                    | crate::inline_exec_supervisor::InlineExecError::CommandStart(_) => {}
+                                }
+                                return Err(map_guarded_exec_supervisor_error(
+                                    session_id, command, error,
+                                ));
                             }
-                        })? {
-                            break status;
+                        };
+                        GuardedCommandResult {
+                            exit_code: result.exit_code,
+                            succeeded: result.succeeded,
+                            timed_out: result.termination
+                                == crate::inline_exec_supervisor::CommandTermination::TimedOut,
+                            command_started: result.command_started,
+                            process_group_cleanup: "verified",
                         }
-                        if let Err(error) = heartbeat() {
-                            if let Err(cleanup_error) = child.kill() {
-                                crate::warn_unrecorded(
-                                    "stop guarded command after heartbeat failure",
-                                    Err::<(), _>(cleanup_error),
-                                );
-                            }
-                            if let Err(cleanup_error) = child.wait() {
-                                crate::warn_unrecorded(
-                                    "reap guarded command after heartbeat failure",
-                                    Err::<(), _>(cleanup_error),
-                                );
-                            }
-                            return Err(error);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    };
-                    GuardedCommandResult {
-                        exit_code: status.code(),
-                        succeeded: status.success(),
-                        timed_out: false,
                     }
-                }
-            };
-            Ok(result)
-        })
+                    crate::inline_exec_supervisor::GenericExecMode::Legacy(reason) => {
+                        eprintln!(
+                            "warning: guarded exec for session {session_id} is using the legacy unsupervised runner ({reason}); descendant cleanup is not verified"
+                        );
+                        let mut child = Command::new(&command[0]);
+                        child
+                            .args(&command[1..])
+                            .current_dir(&session.worktree_path)
+                            .stdout(stdout);
+                        for (name, value) in &execution_environment {
+                            child.env(name, value);
+                        }
+                        let mut child = match child.spawn() {
+                            Ok(child) => child,
+                            Err(source) => {
+                                dispatch(GuardedExecDispatchEvent::NotStarted);
+                                return Err(BrokerOpError::Spawn {
+                                    command: command.join(" "),
+                                    source,
+                                });
+                            }
+                        };
+                        dispatch(GuardedExecDispatchEvent::Started);
+                        let status = loop {
+                            match child.try_wait() {
+                                Ok(Some(status)) => break status,
+                                Ok(None) => {}
+                                Err(source) => {
+                                    dispatch(GuardedExecDispatchEvent::OutcomeUnknown(
+                                        "unverified",
+                                    ));
+                                    return Err(BrokerOpError::Spawn {
+                                        command: command.join(" "),
+                                        source,
+                                    });
+                                }
+                            }
+                            if let Err(error) = heartbeat() {
+                                if let Err(cleanup_error) = child.kill() {
+                                    crate::warn_unrecorded(
+                                        "stop guarded command after heartbeat failure",
+                                        Err::<(), _>(cleanup_error),
+                                    );
+                                }
+                                if let Err(cleanup_error) = child.wait() {
+                                    crate::warn_unrecorded(
+                                        "reap guarded command after heartbeat failure",
+                                        Err::<(), _>(cleanup_error),
+                                    );
+                                }
+                                dispatch(GuardedExecDispatchEvent::OutcomeUnknown(
+                                    "unverified",
+                                ));
+                                return Err(error);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        };
+                        GuardedCommandResult {
+                            exit_code: status.code(),
+                            succeeded: status.success(),
+                            timed_out: false,
+                            command_started: true,
+                            process_group_cleanup: "unverified",
+                        }
+                    }
+                };
+                Ok(result)
+            },
+        )
     }
 
     pub(crate) fn start_preparation_exec_supervisor(
@@ -1943,7 +2021,7 @@ impl Broker {
             ),
         ];
         execution_environment.extend_from_slice(environment);
-        self.guarded_exec_with_runner(session_id, command, move |session| {
+        self.guarded_exec_with_runner(session_id, command, false, move |session, _dispatch| {
             let result = supervisor
                 .run(
                     Path::new(&session.worktree_path),
@@ -1959,18 +2037,25 @@ impl Broker {
                 succeeded: result.succeeded,
                 timed_out: result.termination
                     == crate::inline_exec_supervisor::CommandTermination::TimedOut,
+                command_started: result.command_started,
+                process_group_cleanup: "verified",
             })
         })
+        .map(|(report, _)| report)
     }
 
     fn guarded_exec_with_runner<F>(
         &mut self,
         session_id: i64,
         command: &[String],
+        record_receipt: bool,
         run: F,
-    ) -> Result<GuardedExecReport, BrokerOpError>
+    ) -> Result<(GuardedExecReport, Option<String>), BrokerOpError>
     where
-        F: FnOnce(&crate::types::Session) -> Result<GuardedCommandResult, BrokerOpError>,
+        F: FnOnce(
+            &crate::types::Session,
+            &mut dyn FnMut(GuardedExecDispatchEvent),
+        ) -> Result<GuardedCommandResult, BrokerOpError>,
     {
         if command.is_empty() {
             return Err(BrokerOpError::MissingExecCommand);
@@ -1991,7 +2076,111 @@ impl Broker {
             .collect::<std::collections::BTreeSet<_>>();
         let before_identities = snapshot_path_identities(checkout.root(), &before_dirty)?;
 
-        let status = run(&session)?;
+        let receipt_id = if record_receipt {
+            Some(self.store.begin_guarded_exec_receipt(session_id)?)
+        } else {
+            None
+        };
+        let mut pending_not_started_dispatch = false;
+        let mut terminal_dispatch_recorded = false;
+        let run_result = {
+            let mut dispatch = |event| {
+                let Some(receipt_id) = receipt_id.as_deref() else {
+                    return;
+                };
+                let result = match event {
+                    GuardedExecDispatchEvent::NotStarted => {
+                        pending_not_started_dispatch = true;
+                        return;
+                    }
+                    GuardedExecDispatchEvent::Started => {
+                        pending_not_started_dispatch = false;
+                        self.store.mark_guarded_exec_running(session_id, receipt_id)
+                    }
+                    GuardedExecDispatchEvent::OutcomeUnknown(cleanup) => {
+                        pending_not_started_dispatch = false;
+                        self.store
+                            .mark_guarded_exec_outcome_unknown(session_id, receipt_id, cleanup)
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        if matches!(event, GuardedExecDispatchEvent::OutcomeUnknown(_)) {
+                            terminal_dispatch_recorded = true;
+                        }
+                    }
+                    Err(error) => crate::warn_unrecorded(
+                        "persist guarded exec dispatch status",
+                        Err::<(), _>(error),
+                    ),
+                }
+            };
+            run(&session, &mut dispatch)
+        };
+        let status = match run_result {
+            Ok(status) => status,
+            Err(error) => {
+                if let Some(receipt_id) = receipt_id.as_deref()
+                    && !terminal_dispatch_recorded
+                {
+                    let known_not_started = pending_not_started_dispatch
+                        && matches!(&error, BrokerOpError::Spawn { .. });
+                    let result = if known_not_started {
+                        self.store
+                            .mark_guarded_exec_not_started(session_id, receipt_id)
+                    } else {
+                        self.store
+                            .mark_guarded_exec_outcome_unknown(session_id, receipt_id, "unknown")
+                    };
+                    if let Err(persist_error) = result {
+                        crate::warn_unrecorded(
+                            "persist guarded exec dispatch status",
+                            Err::<(), _>(persist_error),
+                        );
+                        if known_not_started {
+                            crate::warn_unrecorded(
+                                "persist guarded exec unknown outcome",
+                                self.store.mark_guarded_exec_outcome_unknown(
+                                    session_id, receipt_id, "unknown",
+                                ),
+                            );
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        if let Some(receipt_id) = receipt_id.as_deref() {
+            if status.command_started {
+                let command_outcome = if status.timed_out {
+                    "timed_out"
+                } else if status.succeeded {
+                    "succeeded"
+                } else {
+                    "failed"
+                };
+                crate::warn_unrecorded(
+                    "persist guarded exec command outcome",
+                    self.store.complete_guarded_exec_command(
+                        session_id,
+                        receipt_id,
+                        command_outcome,
+                        status.exit_code,
+                        status.process_group_cleanup,
+                    ),
+                );
+            } else {
+                crate::warn_unrecorded(
+                    "persist guarded exec unconfirmed dispatch outcome",
+                    self.store.mark_guarded_exec_outcome_unknown(
+                        session_id,
+                        receipt_id,
+                        status.process_group_cleanup,
+                    ),
+                );
+            }
+        }
 
         let (mut after_dirty, after_untracked) = checkout.dirty_and_untracked_paths()?;
         after_dirty.sort();
@@ -2031,6 +2220,16 @@ impl Broker {
             false,
             false,
         )?;
+        if let Some(receipt_id) = receipt_id.as_deref() {
+            crate::warn_unrecorded(
+                "persist guarded exec ownership audit",
+                self.store.finish_guarded_exec_audit(
+                    session_id,
+                    receipt_id,
+                    if audit.ok { "passed" } else { "failed" },
+                ),
+            );
+        }
         let command_success = status.succeeded;
         let ok = command_success && audit.ok;
         let report = GuardedExecReport {
@@ -2069,7 +2268,7 @@ impl Broker {
                 )),
             )?;
         }
-        Ok(report)
+        Ok((report, receipt_id))
     }
 }
 
@@ -2197,6 +2396,8 @@ struct GuardedCommandResult {
     exit_code: Option<i32>,
     succeeded: bool,
     timed_out: bool,
+    command_started: bool,
+    process_group_cleanup: &'static str,
 }
 
 /// The paths a lease refresh records as `session`'s implicit leases, or
@@ -2572,7 +2773,8 @@ mod generic_guarded_exec_tests {
                 false,
                 Some(Duration::from_millis(100)),
             )
-            .unwrap();
+            .unwrap()
+            .report;
 
         assert!(report.command_timed_out);
         assert_eq!(report.exit_code, None);
@@ -2585,6 +2787,138 @@ mod generic_guarded_exec_tests {
             std::fs::read_to_string(Path::new(&session.worktree_path).join("tracked.txt")).unwrap(),
             "before-timeout"
         );
+    }
+
+    #[test]
+    fn timeout_before_start_confirmation_keeps_receipt_outcome_unknown() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("unconfirmed timeout receipt", None)
+            .unwrap();
+        let (report, receipt_id) = broker
+            .guarded_exec_with_runner(
+                session.id,
+                &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                true,
+                |_session, _dispatch| {
+                    Ok(GuardedCommandResult {
+                        exit_code: None,
+                        succeeded: false,
+                        timed_out: true,
+                        command_started: false,
+                        process_group_cleanup: "verified",
+                    })
+                },
+            )
+            .unwrap();
+
+        assert!(report.command_timed_out);
+        let receipt = broker
+            .store
+            .guarded_exec_receipt(session.id, receipt_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.phase, "outcome_unknown");
+        assert_eq!(receipt.command_outcome, "unknown");
+        assert_eq!(receipt.process_group_cleanup, "verified");
+        assert_eq!(receipt.process_revalidation, "not_revalidated");
+    }
+
+    #[test]
+    fn not_started_dispatch_is_finalized_from_the_runner_result() {
+        #[derive(Clone, Copy)]
+        enum Failure {
+            Setup,
+            CleanupUnknown,
+            CommandUnknown,
+            CommandUnknownWithVerifiedCleanup,
+        }
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("deferred exec receipt", None)
+            .unwrap();
+        for failure in [
+            Failure::Setup,
+            Failure::CleanupUnknown,
+            Failure::CommandUnknown,
+            Failure::CommandUnknownWithVerifiedCleanup,
+        ] {
+            let result = broker.guarded_exec_with_runner(
+                session.id,
+                &["fake-command".into()],
+                true,
+                |_session, dispatch| {
+                    dispatch(GuardedExecDispatchEvent::NotStarted);
+                    if matches!(failure, Failure::CommandUnknownWithVerifiedCleanup) {
+                        dispatch(GuardedExecDispatchEvent::OutcomeUnknown("verified"));
+                    }
+                    Err(match failure {
+                        Failure::Setup => BrokerOpError::Spawn {
+                            command: "fake-command".into(),
+                            source: std::io::Error::other("supervisor setup failed"),
+                        },
+                        Failure::CleanupUnknown => BrokerOpError::GuardedExecCleanupUnknown {
+                            session_id: session.id,
+                            reason: "helper cleanup could not be verified".into(),
+                        },
+                        Failure::CommandUnknown | Failure::CommandUnknownWithVerifiedCleanup => {
+                            BrokerOpError::GuardedExecOutcomeUnknown {
+                                session_id: session.id,
+                                reason: "command result was not confirmed".into(),
+                            }
+                        }
+                    })
+                },
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("simulated runner failure must be returned"),
+            };
+
+            let receipt = broker
+                .store
+                .guarded_exec_receipts(session.id, 100)
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("the pre-dispatch receipt should remain queryable");
+            match failure {
+                Failure::Setup => {
+                    assert!(matches!(error, BrokerOpError::Spawn { .. }));
+                    assert_eq!(receipt.phase, "not_started");
+                    assert_eq!(receipt.command_outcome, "not_started");
+                    assert_eq!(receipt.process_group_cleanup, "not_applicable");
+                }
+                Failure::CleanupUnknown => {
+                    assert!(matches!(
+                        error,
+                        BrokerOpError::GuardedExecCleanupUnknown { .. }
+                    ));
+                    assert_eq!(receipt.phase, "outcome_unknown");
+                    assert_eq!(receipt.command_outcome, "unknown");
+                    assert_eq!(receipt.process_group_cleanup, "unknown");
+                }
+                Failure::CommandUnknown => {
+                    assert!(matches!(
+                        error,
+                        BrokerOpError::GuardedExecOutcomeUnknown { .. }
+                    ));
+                    assert_eq!(receipt.phase, "outcome_unknown");
+                    assert_eq!(receipt.command_outcome, "unknown");
+                    assert_eq!(receipt.process_group_cleanup, "unknown");
+                }
+                Failure::CommandUnknownWithVerifiedCleanup => {
+                    assert!(matches!(
+                        error,
+                        BrokerOpError::GuardedExecOutcomeUnknown { .. }
+                    ));
+                    assert_eq!(receipt.phase, "outcome_unknown");
+                    assert_eq!(receipt.command_outcome, "unknown");
+                    assert_eq!(receipt.process_group_cleanup, "verified");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2669,19 +3003,20 @@ mod generic_guarded_exec_tests {
             .unwrap();
         let marker = Path::new(&session.worktree_path).join("must-not-exist");
 
-        let error = broker
-            .guarded_exec_for_cli(
-                session.id,
-                &[
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "printf launched > must-not-exist".into(),
-                ],
-                true,
-                false,
-                None,
-            )
-            .unwrap_err();
+        let error = match broker.guarded_exec_for_cli(
+            session.id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf launched > must-not-exist".into(),
+            ],
+            true,
+            false,
+            None,
+        ) {
+            Ok(_) => panic!("wrong helper must be refused"),
+            Err(error) => error,
+        };
 
         assert!(matches!(error, BrokerOpError::Spawn { .. }), "{error}");
         assert!(
@@ -2755,7 +3090,7 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
-    fn v1_helper_refuses_v2_before_the_guarded_command_can_write() {
+    fn v1_helper_refuses_v3_before_the_guarded_command_can_write() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let (_repository, _storage, mut broker) = fixture();
@@ -2764,7 +3099,7 @@ mod generic_guarded_exec_tests {
             .unwrap();
         let old_helper = tempfile::tempdir().unwrap();
         let executable = old_helper.path().join("v1-helper");
-        // A v1 helper's reserved-prefix dispatcher exits 125 for the v2 flag
+        // A v1 helper's reserved-prefix dispatcher exits 125 for the v3 flag
         // before sending Ready or receiving a Run frame.
         let helper_arg = old_helper.path().join("received-flag");
         std::fs::write(
@@ -2804,7 +3139,7 @@ mod generic_guarded_exec_tests {
         );
         assert_eq!(
             std::fs::read_to_string(helper_arg).unwrap(),
-            "--aethyme-inline-exec-supervisor-v2"
+            "--aethyme-inline-exec-supervisor-v3"
         );
         assert!(!marker.exists(), "the command ran with an old v1 helper");
     }
