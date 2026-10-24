@@ -4670,7 +4670,7 @@ impl GitRepo {
             &self.root,
             &["rev-list", "--count", "HEAD", "--not", "--remotes"],
         )?;
-        Ok(count.trim().parse().unwrap_or(0))
+        parse_commit_count(&count)
     }
 
     /// Unix seconds of HEAD's commit time, for reporting how long a checkout
@@ -4687,7 +4687,7 @@ impl GitRepo {
             &self.root,
             &["rev-list", "--count", &format!("{base}..HEAD")],
         )?;
-        Ok(count.parse().unwrap_or(0))
+        parse_commit_count(&count)
     }
 
     /// Commits reachable from `head` that no remote-tracking ref holds, newest
@@ -4740,7 +4740,7 @@ impl GitRepo {
             &self.root,
             &["rev-list", "--count", &format!("{from}..{to}")],
         )?;
-        Ok(count.parse().unwrap_or(0))
+        parse_commit_count(&count)
     }
 
     /// Non-merge commits on `head` since it forked from `target` whose patch
@@ -4759,7 +4759,7 @@ impl GitRepo {
                 &format!("{target}...{head}"),
             ],
         )?;
-        Ok(count.parse().unwrap_or(0))
+        parse_commit_count(&count)
     }
 
     /// Create a linked worktree at `dest` on new branch `branch` starting
@@ -5033,6 +5033,101 @@ fn worktree_path_from_bytes(path: &[u8]) -> PathBuf {
     #[cfg(not(unix))]
     {
         PathBuf::from(String::from_utf8_lossy(path).into_owned())
+    }
+}
+
+// A missing or malformed observation is unknown, never evidence of zero.
+// Do not include provider stdout in the diagnostic: it may contain unrelated
+// wrapper output, control characters or sensitive host information.
+fn parse_commit_count<T: std::str::FromStr>(text: &str) -> Result<T, GitError> {
+    let text = text.trim();
+    let invalid = || GitError::UntrustedOutput {
+        detail: "git rev-list returned an invalid commit count".to_string(),
+    };
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    text.parse().map_err(|_| invalid())
+}
+
+#[cfg(test)]
+mod commit_count_tests {
+    use super::{GitError, GitRepo, parse_commit_count, run_git};
+
+    #[test]
+    fn unknown_count_output_never_becomes_zero() {
+        for invalid in [
+            "",
+            " ",
+            "-1",
+            "+1",
+            "zero",
+            "0\nextra",
+            "0 1",
+            "18446744073709551616",
+        ] {
+            assert!(
+                matches!(
+                    parse_commit_count::<u64>(invalid),
+                    Err(GitError::UntrustedOutput { .. })
+                ),
+                "accepted {invalid:?}"
+            );
+        }
+        assert_eq!(parse_commit_count::<u64>("0\n").unwrap(), 0);
+        assert_eq!(parse_commit_count::<u64>("12").unwrap(), 12);
+        assert_eq!(
+            parse_commit_count::<u64>("18446744073709551615").unwrap(),
+            u64::MAX
+        );
+        assert!(parse_commit_count::<u8>("256").is_err());
+    }
+
+    #[test]
+    fn real_git_count_readers_preserve_zero_and_nonzero() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        run_git(root, &["init", "-q", "-b", "main"]).unwrap();
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "base",
+            ],
+        )
+        .unwrap();
+        let base = run_git(root, &["rev-parse", "HEAD"]).unwrap();
+        run_git(root, &["update-ref", "refs/remotes/origin/main", &base]).unwrap();
+        let repo = GitRepo::at_known_root(root);
+        assert_eq!(repo.commits_not_on_any_remote().unwrap(), 0);
+        assert_eq!(repo.unmerged_commit_count(&base).unwrap(), 0);
+        assert_eq!(repo.commit_count_between(&base, "HEAD").unwrap(), 0);
+        assert_eq!(repo.patch_unique_commit_count(&base, "HEAD").unwrap(), 0);
+        std::fs::write(root.join("change.txt"), "new content\n").unwrap();
+        run_git(root, &["add", "change.txt"]).unwrap();
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "change",
+            ],
+        )
+        .unwrap();
+        assert_eq!(repo.commits_not_on_any_remote().unwrap(), 1);
+        assert_eq!(repo.unmerged_commit_count(&base).unwrap(), 1);
+        assert_eq!(repo.commit_count_between(&base, "HEAD").unwrap(), 1);
+        assert_eq!(repo.patch_unique_commit_count(&base, "HEAD").unwrap(), 1);
     }
 }
 
