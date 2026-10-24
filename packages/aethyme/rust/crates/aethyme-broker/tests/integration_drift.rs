@@ -295,9 +295,18 @@ fn verify_only_doctor_reports_leftover_integration_work() {
     let fixture_integration = git(root, &["rev-parse", "refs/heads/aethyme/integration"]);
     let remote_owner = tempfile::tempdir().unwrap();
     let remote = remote_owner.path().join("origin.git");
-    git(root, &["clone", "--bare", "-q", ".", remote.to_str().unwrap()]);
-    git(&remote, &["update-ref", "refs/heads/main", &fixture_upstream]);
-    git(root, &["remote", "set-url", "origin", remote.to_str().unwrap()]);
+    git(
+        root,
+        &["clone", "--bare", "-q", ".", remote.to_str().unwrap()],
+    );
+    git(
+        &remote,
+        &["update-ref", "refs/heads/main", &fixture_upstream],
+    );
+    git(
+        root,
+        &["remote", "set-url", "origin", remote.to_str().unwrap()],
+    );
     git(
         root,
         &[

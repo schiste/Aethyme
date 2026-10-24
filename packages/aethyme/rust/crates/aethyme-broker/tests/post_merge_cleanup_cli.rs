@@ -138,7 +138,10 @@ fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
     git(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
 
     let remote = temp.path().join("origin.git");
-    git(&repo, &["clone", "--bare", "-q", ".", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &["clone", "--bare", "-q", ".", remote.to_str().unwrap()],
+    );
     git(
         &repo,
         &[
