@@ -2455,6 +2455,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             code: crate::exit_status::USAGE,
         });
     }
+    if subcommand == "exec-status" && !parsed.positional.is_empty() {
+        return Err(UsageError::Exit {
+            message: EXEC_STATUS_USAGE.to_string(),
+            code: crate::exit_status::USAGE,
+        });
+    }
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
