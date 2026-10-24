@@ -161,9 +161,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   syntactically valid truncated prefix. For command-specific field protocols,
   capture one bounded sample from the exact argv and test its real framing and
   context fields alongside malformed and truncated fixtures.
-- Before writing a broker PR body, prepare the exact body file and run the
-  pinned CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`.
-  Review each refusal; use a `Contract justification:` of at least 24 characters
+- Before writing a broker PR body, use the canonical PR-template Contract
+  checkbox: `- [x] **none**` means no product-contract change;
+  `Contract decision: none` is accepted in commit messages, not PR bodies.
+  Prepare the exact body file. When local validation is allowed, run the pinned
+  CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`
+  and retain the result before publication. During a local-check pause, use the
+  PR's remote contract check instead of running it locally. Review each refusal;
+  use a `Contract justification:` of at least 24 characters
   only for a verified false-positive, while preserving the actual retirement
   label. Confirm the actual verdict is `none` or every reported symbol has an
   accurate contract decision; exit status or help output alone is not evidence.
