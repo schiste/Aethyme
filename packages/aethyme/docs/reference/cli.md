@@ -1131,6 +1131,14 @@ observation or moves the checkout. Any automatic
 fast-forward requires a known non-explicit base source and a clean checkout;
 dirty or diverged checkouts are left in place.
 
+Freshness is enforced at explicit task handoffs (`start` and `start --reuse`),
+not by rewriting a checkout underneath an already running agent. Before a new
+task, reuse the existing session through that boundary; after an upstream push
+reports drift, run `broker sync --session <id>` and resolve its reported
+blockers. The selected integration ref comes from `[promote] branch`; verify-only
+repositories use the fetched default branch unless an explicit base is chosen.
+A recent successful observation never suppresses the next ancestry check.
+
 Registration and reuse accept an optional `--short-name`, the concise tab label;
 without it a new session's label is derived from its task.
 Session registration also accepts optional human-facing context for host
