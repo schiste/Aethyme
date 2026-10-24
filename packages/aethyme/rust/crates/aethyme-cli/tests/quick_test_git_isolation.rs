@@ -201,7 +201,11 @@ fn quick_test_cli_keeps_host_git_context_out_of_its_disposable_repository() {
             OsStr::new("sentinel commit"),
         ],
     );
-    fs::write(sentinel.join("tracked.txt"), b"uncommitted sentinel bytes\n").unwrap();
+    fs::write(
+        sentinel.join("tracked.txt"),
+        b"uncommitted sentinel bytes\n",
+    )
+    .unwrap();
 
     let hooks = sentinel.join(".git/hooks");
     let hook_marker = owner.path().join("sentinel-hook-ran");
@@ -291,8 +295,8 @@ fn quick_test_cli_keeps_host_git_context_out_of_its_disposable_repository() {
     let output = run_cli_bounded(command, owner.path());
 
     assert!(output.status.success(), "quick-test CLI did not succeed");
-    let report: Value = serde_json::from_slice(&output.stdout)
-        .expect("quick-test CLI emitted a JSON report");
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("quick-test CLI emitted a JSON report");
     assert_eq!(report["ok"], true, "quick-test report did not pass");
     assert_eq!(
         report["temp_repo_removed"], true,

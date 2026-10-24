@@ -7026,11 +7026,10 @@ mod graph_snapshot_tests {
                     graph_verification_environment_refusal().is_none(),
                     "the active isolating guard must permit its own Git commands"
                 );
-                let other_thread_refusal = std::thread::spawn(|| {
-                    graph_verification_environment_refusal()
-                })
-                .join()
-                .unwrap();
+                let other_thread_refusal =
+                    std::thread::spawn(|| graph_verification_environment_refusal())
+                        .join()
+                        .unwrap();
                 assert!(
                     other_thread_refusal.is_some(),
                     "the isolating guard must not change refusal in another thread"
