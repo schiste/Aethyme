@@ -38,6 +38,32 @@ variant order, one filesystem, small fixtures and two recent clients limit
 the conclusions. There is no broker, dependency-preparation or gate speedup
 claim. The monitor was stopped and its stopped state checked before removal.
 
+## Explicit linked-worktree workloads
+
+The runner also accepts bounded `--files` (12..50000), `--samples` (1..21),
+and `--linked` parameters. Defaults retain the original 1,800-file,
+seven-sample primary-checkout workload. For example:
+
+```sh
+python3 packages/aethyme-eval/benchmarks/performance/git_worktree_options.py \
+  --fixture-parent /safe/local/scratch --output /safe/local/new-report \
+  --files 10000 --samples 7 --linked
+```
+
+The caller chooses an existing scratch parent on the filesystem being measured;
+the runner creates only a new synthetic child and does not enroll that parent.
+The report records topology, actual file count and repetitions. Linked mode
+records repeated detached checkout creation, resolves index paths through Git,
+and asserts that editing the linked checkout leaves its primary clean. Each
+variant has its own repository configuration, enabled before checkout timing.
+
+A filesystem monitor is stopped and its stopped state verified for each temporary
+checkout before removal, including those inside the timing loop. Final cleanup
+also checks the exact primary and linked checkouts. First observations remain
+warmth-unknown; checkout samples include ordinary Git setup costs and do not
+establish cold-cache or broker/gate performance. Interrupted runs retain command
+receipts and their fixture path rather than producing a successful report.
+
 ## Decisions and remaining qualification
 
 ### manyFiles (#902): keep opt-in
