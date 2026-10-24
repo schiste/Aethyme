@@ -310,7 +310,10 @@ fn assert_reclaim_usage_refusal_before_state_creation(args: &[&str], expected: &
         "reclaim selector refusal must precede host-cache creation"
     );
     assert!(
-        std::fs::read_dir(container.path()).unwrap().next().is_none(),
+        std::fs::read_dir(container.path())
+            .unwrap()
+            .next()
+            .is_none(),
         "reclaim selector refusal must precede root scanning or review-snapshot writes"
     );
 }
