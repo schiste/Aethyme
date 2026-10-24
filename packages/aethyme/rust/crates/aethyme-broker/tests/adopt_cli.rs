@@ -826,7 +826,7 @@ fn reuse_refuses_an_unconfirmed_integration_base_without_changing_the_session() 
         );
         assert!(error.contains("not freshly confirmed"), "{error}");
         assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
-        assert_eq!(stored_session(&tmp, 1).task, "initial");
+        assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("initial"));
         assert_eq!(stored_base_observation(&tmp, 1), previous_observation);
     }
 }
@@ -864,7 +864,7 @@ fn reuse_refuses_a_stale_integration_even_with_unknown_provenance() {
         );
         assert!(error.contains("freshly fetched default branch"), "{error}");
         assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
-        assert_eq!(stored_session(&tmp, 1).task, "initial");
+        assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("initial"));
     }
 }
 
