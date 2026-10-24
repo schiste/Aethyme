@@ -208,6 +208,7 @@ fn quick_test_cli_keeps_host_git_context_out_of_its_disposable_repository() {
     .unwrap();
 
     let hooks = sentinel.join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
     let hook_marker = owner.path().join("sentinel-hook-ran");
     let post_commit = hooks.join("post-commit");
     fs::write(
