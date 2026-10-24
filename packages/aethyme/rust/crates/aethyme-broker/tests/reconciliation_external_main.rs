@@ -437,7 +437,7 @@ fn reconciliation_fixture_reopens_with_owned_host_state_and_worktrees() {
             .expect("configured child receives the fixture-owned host state")
     };
     let fixture = DeployDivergenceFixture::new();
-    let broker = fixture_broker(&fixture.repo).unwrap();
+    let mut broker = fixture_broker(&fixture.repo).unwrap();
     let state = captured_state(&broker);
     let expected_state = common::fixture_host_state_dir(&fixture.repo);
     let repository = fixture.repo.canonicalize().unwrap();
@@ -466,7 +466,7 @@ fn reconciliation_fixture_reopens_with_owned_host_state_and_worktrees() {
         assert!(Path::new(path).starts_with(&worktrees), "{path}");
     }
     drop(broker);
-    let reopened = fixture_broker(&fixture.repo).unwrap();
+    let mut reopened = fixture_broker(&fixture.repo).unwrap();
     assert_eq!(captured_state(&reopened), state);
     assert_eq!(reopened.worktree_root(), worktrees.as_path());
     assert_eq!(
