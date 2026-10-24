@@ -5,6 +5,16 @@ broker. Other agents may be working in sibling worktrees right now. The
 `aethyme` router and its engine sibling are installed once for the user;
 check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
+
+For an existing-repository runtime upgrade, take consistent database backups
+before opening live state with the new binary. A schema migration does not
+adopt a legacy worktree root: if start requires a binding, review
+`broker advanced worktree-root binding plan <exact-root> <layout> --json`
+and apply only its reviewed digest. Binding can raise the compatibility floor,
+so verify which executable resumed agents will use; the repo-local selector
+does not change their PATH. Preserve concurrent work and never automatically
+restore a pre-upgrade database over newer activity.
+
 Follow this protocol:
 
 When `aethyme broker advanced hooks install` is active (or its pre-commit command is
