@@ -275,6 +275,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
   is unchanged. Refusal must preserve the previous identity record and data.
+- Before pruning a shared cache, prove that consumer discovery covers the
+  cache's entire namespace. A bound repository root proves ownership, not all
+  consumers; other repositories and same-origin clones may share cache keys.
+  Without complete coverage, retain generic entries and unproven retired stores,
+  while allowing independently witnessed rotation recovery under its existing
+  identity and lease checks. Track recovery completion separately from consumer
+  deferral so safe recovery can settle without claiming pruning completed.
 - For session-worktree cleanup, treat creation provenance separately from current
   adoption records. Require a retained `Spawned` session as owner, exclude rows
   marked `Cleaned` because the path may have been reused, and recheck that row

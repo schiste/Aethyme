@@ -5478,46 +5478,42 @@ impl Broker {
         let mut preparation_entries_reclaimed = 0usize;
         let mut scan_completed = true;
         if closed_session_id.is_none() {
-            // The shared preparation cache is content-addressed: an entry no
-            // checkout computes is unreadable forever, so it needs no operator
-            // review. It was reachable only from the manual lane, which is why a
-            // hand reclaim of 13.3 GB returned as 15 GB within three days.
+            // Cache roots are shared across repositories and clones, while the
+            // selected worktree roots belong to this repository. Recover
+            // witnessed rotations from independently validated bindings, but
+            // do not infer a complete cache consumer set from this repo alone.
             let storage_context = self.storage_context().clone();
-            let worktree_roots = self
-                .worktree_root_plan()
-                .ok()
-                .map(|plan| {
-                    crate::broker::lifecycle::worktree_root_candidates_for(&plan)
-                        .into_iter()
-                        .map(|(root, _source)| root)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let preparation_sweep = if worktree_roots.is_empty() {
-                crate::storage::PreparationCacheSweepReport {
+            let mut cache_bindings = Vec::new();
+            let mut bindings_fully_enumerated = true;
+            match storage_context.preparation_cache_root_binding() {
+                Ok(Some(binding)) => cache_bindings.push(binding),
+                Ok(None) => {}
+                Err(_) => bindings_fully_enumerated = false,
+            }
+            match self.worktree_volume_preparation_cache_root_bindings() {
+                Ok(bindings) => cache_bindings.extend(bindings),
+                Err(_) => bindings_fully_enumerated = false,
+            }
+            cache_bindings.sort_by(|left, right| left.path.cmp(&right.path));
+            cache_bindings.dedup_by(|left, right| left.path == right.path);
+            let preparation_sweep = match storage_context.host_resource_db_path.as_deref() {
+                Some(resource_db_path) => {
+                    crate::storage::recover_preparation_caches_for_bindings(
+                        &cache_bindings,
+                        resource_db_path,
+                        deadline,
+                        bindings_fully_enumerated,
+                    )
+                }
+                None => crate::storage::PreparationCacheSweepReport {
                     entries_removed: 0,
                     bytes_reclaimed: 0,
                     filesystem_entries_reclaimed: 0,
                     complete: false,
-                }
-            } else if let (Some(resource_db_path), Ok(cache_bindings)) = (
-                storage_context.host_resource_db_path.as_deref(),
-                self.preparation_cache_root_bindings_for_maintenance(),
-            ) {
-                crate::storage::sweep_preparation_caches_for_roots_with_bindings(
-                    &main_root,
-                    &worktree_roots,
-                    &cache_bindings,
-                    resource_db_path,
-                    deadline,
-                )
-            } else {
-                crate::storage::PreparationCacheSweepReport {
-                    entries_removed: 0,
-                    bytes_reclaimed: 0,
-                    filesystem_entries_reclaimed: 0,
-                    complete: false,
-                }
+                    coverage_deferral: Some(
+                        crate::storage::PreparationCacheCoverageDeferral::CacheBindingsNotFullyEnumerated,
+                    ),
+                },
             };
             preparation_entries_reclaimed = preparation_sweep.filesystem_entries_reclaimed;
             scan_completed = preparation_sweep.complete;
@@ -8277,6 +8273,57 @@ mod tests {
         assert!(plan.rows.is_empty());
         assert!(plan.files.is_empty());
         assert!(plan.gate_caches.is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn artifact_sweep_preserves_shared_consumers_with_or_without_a_bound_worktree_root() {
+        for bound in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+            git(&root, &["add", "README.md"]);
+            git(&root, &["commit", "-qm", "fixture"]);
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&root).unwrap();
+            if bound {
+                broker.start_worktree("bind only this repository", None).unwrap();
+            }
+            let cache_root = broker.storage_context().preparation_cache_root().unwrap().unwrap();
+            let other_repository = "b".repeat(64);
+            let protected = cache_root.join(&other_repository).join("bbbbbbbbbbbb");
+            std::fs::create_dir_all(&protected).unwrap();
+            std::fs::write(protected.join("payload"), b"live in another repository").unwrap();
+            let repository = "a".repeat(64);
+            let store = cache_root.join(&repository);
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join("old-cache"), b"witnessed rotation").unwrap();
+            let resource_db_path = broker.storage_context().host_resource_db_path.clone().unwrap();
+            let identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+            let debt = crate::preparation::rotation_debt::RotationDebt::new(
+                &repository,
+                &crate::preparation::rotation_debt::new_transaction_id(),
+                identity.clone(),
+                crate::preparation::rotation_debt::DirectoryIdentity::capture(&store).unwrap(),
+            ).unwrap();
+            crate::preparation::rotation_journal::publish(
+                &resource_db_path, &cache_root, &identity.encode().unwrap(), &repository,
+                &crate::preparation::rotation_debt::encode(&debt).unwrap(),
+            ).unwrap();
+            let policy = RetentionPolicy {
+                artifact_sweep_budget_ms: 5000,
+                ..RetentionPolicy::default()
+            };
+            let (outcome, entries) = broker.sweep_artifacts_autonomously_with_deadlines(
+                &policy, ArtifactSweepScope::Drain, None, None,
+                ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+            ).unwrap();
+            assert!(!outcome.complete, "consumer coverage remains unproven even when bound={bound}");
+            assert!(entries > 0, "independent witnessed recovery must progress when bound={bound}");
+            assert!(!store.join("old-cache").exists());
+            assert_eq!(std::fs::read(protected.join("payload")).unwrap(), b"live in another repository");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
