@@ -36,8 +36,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   binary hashes before and after tests; matching source revisions alone do not
   prove that the bytes stayed unchanged. Qualify the exact artifacts selected
   for deployment separately from test-built outputs.
-- When local compilation is deferred, read each fixture helper's declared
-  return type and the asserted fields' definitions before adding regressions.
+- When local compilation is deferred, verify API visibility from the test
+  crate, receiver mutability, helper return types and asserted field definitions
+  before adding regressions. Integration tests cannot call crate-private APIs.
   Preserve optional-value types in assertions; a compile failure supplies no
   runtime test evidence and needlessly repeats the remote validation cycle.
 - Validate a command's complete action, arity, and required confirmation before

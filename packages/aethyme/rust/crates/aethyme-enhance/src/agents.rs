@@ -331,6 +331,10 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 
 Other agents may be working in sibling worktrees.
 
+Before starting or delegating a shared CI or generated-file fix, check
+`aethyme broker status --json` and open PRs on the affected paths.
+Coordinate with the owning session before duplicating its work.
+
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
    session's worktree.
@@ -356,6 +360,10 @@ read it first. Leases, gates, advisories and recovery: `references/broker.md`."#
 const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an edit
 
 Other agents may be working in sibling worktrees.
+
+Before starting or delegating a shared CI or generated-file fix, check
+`aethyme broker status --json` and open PRs on the affected paths.
+Coordinate with the owning session before duplicating its work.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -418,6 +426,14 @@ broker. Other agents may be working in sibling worktrees right now. The
 `aethyme` router and its engine sibling are installed once for the user;
 check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
+Before starting or delegating a fix for shared CI failures or generated
+files, check `aethyme broker status --json` and open PRs on the affected
+paths. Read the matching task, claimed paths and PR diff even when the graph
+is unavailable. Coordinate with the owning session before starting duplicate
+work; use `aethyme broker advanced note send --to-session <id>` for a broker
+note. A known base failure still needs verification at its exact base commit;
+an overlap warning does not waive gates.
+
 Follow this protocol:
 
 When `aethyme broker advanced hooks install` is active (or its pre-commit command is
@@ -1177,6 +1193,16 @@ mod tests {
                 doc.contains("reports and follow the working agreement it prints."),
                 "{tag}: missing the working-agreement pointer:\n{doc}"
             );
+            for required in [
+                "Before starting or delegating a shared CI or generated-file fix",
+                "`aethyme broker status --json` and open PRs on the affected paths.",
+                "Coordinate with the owning session before duplicating its work.",
+            ] {
+                assert!(
+                    doc.contains(required),
+                    "{tag}: missing {required:?}:\n{doc}"
+                );
+            }
             // The agreement itself lives in `broker start` output only.
             assert!(
                 !doc.contains("shared component, helper or pattern"),
@@ -1218,6 +1244,10 @@ mod tests {
     fn broker_reference_documents_the_push_lane_and_its_limits() {
         let reference = render_broker_reference();
         for needle in [
+            "Before starting or delegating a fix for shared CI failures or generated",
+            "Read the matching task, claimed paths and PR diff even when the graph",
+            "Coordinate with the owning session before starting duplicate",
+            "an overlap warning does not waive gates.",
             "[delivery] push_session_branches = true",
             "aethyme broker push --session <your-session-id>\n",
             "aethyme broker push --session <your-session-id> --pr",
@@ -1262,9 +1292,11 @@ mod tests {
         assert!(doc.contains("## Aethyme Override Status"));
         let validation = validate_agents_overrides(&repo);
         let errors = validation.get("errors").unwrap().as_array().unwrap();
-        assert!(errors.iter().any(|error| error
-            .as_str()
-            .is_some_and(|error| error.contains("unknown field $.unknown_key"))));
+        assert!(errors.iter().any(|error| {
+            error
+                .as_str()
+                .is_some_and(|error| error.contains("unknown field $.unknown_key"))
+        }));
         std::fs::remove_dir_all(&repo).unwrap();
     }
 
