@@ -7,22 +7,92 @@ pub(super) const HOST_RESOURCE_INPUT_MAX_BYTES: u64 = 1024 * 1024;
 pub(super) fn read_resource_json<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
 ) -> Result<T, UsageError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+    read_resource_json_with_hook(path, || {})
+}
+
+fn read_resource_json_with_hook<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    after_open: impl FnOnce(),
+) -> Result<T, UsageError> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Inspect the reparse point itself rather than following it.
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(UsageError::Message(
+        "resource input verification is unsupported on this platform".into(),
+    ));
+
+    let file = options.open(path).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot open resource input {}: {error}",
+            path.display()
+        ))
+    })?;
+    let before = file.metadata().map_err(|error| {
         UsageError::Message(format!("cannot inspect {}: {error}", path.display()))
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    #[cfg(windows)]
+    let reparse_point = {
+        use std::os::windows::fs::MetadataExt as _;
+        before.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    };
+    #[cfg(not(windows))]
+    let reparse_point = false;
+    if !before.is_file() || reparse_point {
         return Err(UsageError::Message(format!(
             "resource input must be a regular, non-symlink file: {}",
             path.display()
         )));
     }
-    if metadata.len() > HOST_RESOURCE_INPUT_MAX_BYTES {
+    if before.len() > HOST_RESOURCE_INPUT_MAX_BYTES {
         return Err(UsageError::Message(format!(
             "resource input exceeds {HOST_RESOURCE_INPUT_MAX_BYTES} bytes"
         )));
     }
-    let bytes = std::fs::read(path)
+    after_open();
+    let mut bytes = Vec::new();
+    (&file)
+        .take(HOST_RESOURCE_INPUT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| UsageError::Message(format!("cannot read {}: {error}", path.display())))?;
+    if bytes.len() as u64 > HOST_RESOURCE_INPUT_MAX_BYTES {
+        return Err(UsageError::Message(format!(
+            "resource input exceeds {HOST_RESOURCE_INPUT_MAX_BYTES} bytes"
+        )));
+    }
+    let after = file.metadata().map_err(|error| {
+        UsageError::Message(format!("cannot recheck {}: {error}", path.display()))
+    })?;
+    let stable = before.len() == after.len()
+        && bytes.len() as u64 == before.len()
+        && before
+            .modified()
+            .ok()
+            .zip(after.modified().ok())
+            .is_some_and(|(before, after)| before == after);
+    #[cfg(unix)]
+    let stable = {
+        use std::os::unix::fs::MetadataExt as _;
+        stable && before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec()
+    };
+    if !stable {
+        return Err(UsageError::Message(format!(
+            "resource input changed while reading {}",
+            path.display()
+        )));
+    }
     serde_json::from_slice(&bytes).map_err(|error| {
         UsageError::Message(format!("invalid JSON in {}: {error}", path.display()))
     })
@@ -1312,6 +1382,105 @@ mod tests {
     use crate::{
         ConsoleCheckoutStatus, ConsoleHealth, ConsoleStaleReason, HostLeaseState, HostResourceLease,
     };
+
+    #[test]
+    fn resource_json_reads_regular_files_and_rejects_invalid_or_oversize_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        std::fs::write(&path, br#"{"request_id":"owned"}"#).unwrap();
+        let value: serde_json::Value = super::read_resource_json(&path).unwrap();
+        assert_eq!(value["request_id"], "owned");
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(super::read_resource_json::<serde_json::Value>(&path).is_err());
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(super::HOST_RESOURCE_INPUT_MAX_BYTES + 1)
+            .unwrap();
+        let error = super::read_resource_json::<serde_json::Value>(&path).unwrap_err();
+        assert!(
+            matches!(error, super::UsageError::Message(ref message) if message.contains("exceeds")),
+            "{error:?}"
+        );
+        assert!(super::read_resource_json::<serde_json::Value>(dir.path()).is_err());
+    }
+
+    #[test]
+    fn resource_json_rejects_growth_after_descriptor_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let error = super::read_resource_json_with_hook::<serde_json::Value>(&path, || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(super::HOST_RESOURCE_INPUT_MAX_BYTES + 1)
+                .unwrap();
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, super::UsageError::Message(ref message) if message.contains("exceeds")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn resource_json_rejects_same_size_mutation_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        std::fs::write(&path, b"[1]").unwrap();
+        let error = super::read_resource_json_with_hook::<serde_json::Value>(&path, || {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            std::io::Write::write_all(&mut file, b"[2]").unwrap();
+            // Set an explicit distinct timestamp; no timing-based filesystem assumption.
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(42))
+                .unwrap();
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, super::UsageError::Message(ref message) if message.contains("changed while reading")),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_json_rejects_symlinks_and_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(super::read_resource_json::<serde_json::Value>(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a live NUL-terminated buffer in our private directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(super::read_resource_json::<serde_json::Value>(&worker_path).is_err())
+                .unwrap();
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(3));
+        // An implementation that blocks opening the FIFO must still terminate the test.
+        let unblock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        if result.is_err() {
+            // Keep the rescue endpoint open until the worker confirms it returned.
+            // A second finite wait also avoids joining an unexpectedly stuck worker.
+            receive
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }
+        drop(unblock);
+        worker.join().unwrap();
+        assert!(result.unwrap());
+    }
 
     #[test]
     fn pressure_action_resolves_through_the_public_advanced_surface() {
