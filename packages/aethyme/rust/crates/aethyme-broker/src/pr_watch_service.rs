@@ -91,12 +91,42 @@ fn executable(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn binary_digest(path: &Path) -> io::Result<String> {
-    let file = std::fs::File::open(path)?;
-    if file.metadata()?.len() > MAX_BINARY_BYTES {
+    binary_digest_with_hook(path, || Ok(()))
+}
+
+fn same_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mode() == b.mode()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
+}
+
+fn binary_digest_with_hook(
+    path: &Path,
+    after_open: impl FnOnce() -> io::Result<()>,
+) -> io::Result<String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.mode() & 0o111 == 0 {
+        return Err(invalid(
+            "service identity requires an executable regular file",
+        ));
+    }
+    if before.len() > MAX_BINARY_BYTES {
         return Err(invalid("service executable exceeds the identity budget"));
     }
+    after_open()?;
     let mut hash = Sha256::new();
-    let mut read = file.take(MAX_BINARY_BYTES + 1);
+    let mut read = (&file).take(MAX_BINARY_BYTES + 1);
     let mut bytes = [0; 64 * 1024];
     let mut total = 0;
     loop {
@@ -111,6 +141,13 @@ fn binary_digest(path: &Path) -> io::Result<String> {
             ));
         }
         hash.update(&bytes[..size]);
+    }
+    let after = file.metadata()?;
+    let named = std::fs::symlink_metadata(path)?;
+    if total != before.len() || !same_identity(&before, &after) || !same_identity(&after, &named) {
+        return Err(invalid(
+            "service executable changed during identity verification",
+        ));
     }
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -331,5 +368,55 @@ mod tests {
         assert!(Plan::new(&repo, UUID, &home, Path::new("relative"), &broker, 300, 501).is_err());
         std::fs::set_permissions(&broker, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(Plan::new(&repo, UUID, &home, &broker, &broker, 300, 501).is_err());
+    }
+    #[test]
+    fn identity_reader_refuses_links_and_nonregular_files_without_waiting() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let (_owner, _repo, _home, broker) = fixture();
+        let linked = broker.with_file_name("linked executable");
+        std::os::unix::fs::symlink(&broker, &linked).unwrap();
+        assert!(binary_digest(&linked).is_err());
+        let fifo = broker.with_file_name("named pipe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid terminated path, retained through mkfifo.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o700) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(binary_digest(&fifo)).unwrap();
+        });
+        let error = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("nonregular identity input must not block opening")
+            .unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+        assert!(binary_digest(broker.parent().unwrap()).is_err());
+    }
+
+    #[test]
+    fn identity_reader_rejects_named_path_replacement_after_open() {
+        let (_owner, _repo, _home, broker) = fixture();
+        let backup = broker.with_file_name("original executable");
+        let error = binary_digest_with_hook(&broker, || {
+            std::fs::rename(&broker, &backup)?;
+            std::fs::write(&broker, std::fs::read(&backup)?)?;
+            std::fs::set_permissions(&broker, std::fs::Permissions::from_mode(0o700))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed during identity"));
+    }
+
+    #[test]
+    fn identity_reader_rejects_content_and_permission_changes_after_open() {
+        let (_owner, _repo, _home, broker) = fixture();
+        let error = binary_digest_with_hook(&broker, || {
+            std::fs::write(&broker, b"changed and differently sized executable bytes")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed during identity"));
+        let error = binary_digest_with_hook(&broker, || {
+            std::fs::set_permissions(&broker, std::fs::Permissions::from_mode(0o600))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("changed during identity"));
     }
 }
