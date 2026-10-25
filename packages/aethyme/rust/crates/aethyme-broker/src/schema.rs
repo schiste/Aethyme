@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 55;
+pub const SCHEMA_VERSION: i64 = 56;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -1852,6 +1852,34 @@ CREATE INDEX IF NOT EXISTS guarded_exec_receipts_session_latest
     ON guarded_exec_receipts(session_id, created_at_ms DESC, receipt_id DESC);
 ";
 
+/// Observational base-failure ownership only. No gate bypass, cache authority,
+/// process authority or existing writer contract changes; compatibility floor
+/// stays unchanged. Snapshot fields survive ordinary gate/session history GC.
+const MIGRATION_V56: &str = "
+CREATE TABLE IF NOT EXISTS base_failure_incidents (
+    id INTEGER PRIMARY KEY,
+    base_commit TEXT NOT NULL,
+    tree_hash TEXT NOT NULL,
+    gate_name TEXT NOT NULL,
+    definition_hash TEXT NOT NULL,
+    execution_profile_hash TEXT NOT NULL,
+    owner_session_id INTEGER NOT NULL,
+    repair_pr INTEGER CHECK (repair_pr > 0),
+    test_ids_json TEXT NOT NULL CHECK (length(test_ids_json) <= 16384),
+    confirmed_run_id INTEGER NOT NULL,
+    confirmed_run_created_at INTEGER NOT NULL,
+    confirmed_at INTEGER NOT NULL,
+    resolved_run_id INTEGER,
+    resolved_base_commit TEXT,
+    resolved_at INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS base_failure_incidents_open_identity
+    ON base_failure_incidents(base_commit, gate_name, definition_hash, execution_profile_hash)
+    WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS base_failure_incidents_open_base
+    ON base_failure_incidents(base_commit, resolved_at, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1908,6 +1936,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V53,
     MIGRATION_V54,
     MIGRATION_V55,
+    MIGRATION_V56,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -1935,6 +1964,7 @@ const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
     (50, MIGRATION_V50, &["verification_candidates"]),
     (53, MIGRATION_V53, &["spawned_worktree_instances"]),
     (55, MIGRATION_V55, &["guarded_exec_receipts"]),
+    (56, MIGRATION_V56, &["base_failure_incidents"]),
 ];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
@@ -2580,7 +2610,7 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        assert_eq!(current_version(&conn).unwrap(), 55);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
         assert!(table_exists(&conn, "guarded_exec_receipts").unwrap());
         assert!(schema_is_compatible_with(&conn, 55, 52).unwrap());
