@@ -1099,16 +1099,16 @@ fn run_service_plan(parsed: &Parsed) -> Result<(), UsageError> {
                 "service planning requires an existing absolute HOME directory".into(),
             ));
         }
-        let broker = open_broker(true)?;
+        let mut broker = open_broker(true)?;
         let uuid = broker.store().binding_scope.as_ref()
-            .and_then(|scope| scope.repository_uuid.as_deref())
+            .and_then(|scope| scope.repository_uuid.clone())
             .ok_or_else(|| UsageError::Message("service planning requires an existing repository UUID; complete broker repository binding first".into()))?;
         // Read-only identity lookup: this command never creates a UUID or a service.
         // SAFETY: geteuid has no pointer arguments and only reads the effective uid.
         let uid = unsafe { libc::geteuid() };
         let plan = crate::pr_watch_service::Plan::new(
             broker.main_root(),
-            uuid,
+            &uuid,
             &home,
             binary,
             Path::new("/usr/bin/python3"),
