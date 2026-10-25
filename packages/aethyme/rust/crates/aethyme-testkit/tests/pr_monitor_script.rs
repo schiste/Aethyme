@@ -11,6 +11,7 @@ fn the_monitor_starts_the_delivery_adapter_only_when_the_outbox_has_work() {
     let output = Command::new("python3")
         .arg(script)
         .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("AETHYME_PR_MONITOR_RECORD_HEALTH")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -34,6 +35,7 @@ fn the_delivery_adapter_protocol_and_budget_controls_pass() {
     let output = Command::new("python3")
         .arg(script)
         .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("AETHYME_PR_MONITOR_RECORD_HEALTH")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -56,5 +58,28 @@ fn the_delivery_adapter_protocol_and_budget_controls_pass() {
             stderr.contains(name),
             "missing selected control {name}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn the_monitor_health_controls_are_private_bounded_and_do_not_claim_delivery() {
+    let script = aethyme_testkit::paths::repo_root()
+        .join("packages/aethyme/scripts/adapters/test_pr_monitor_health.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("AETHYME_PR_MONITOR_RECORD_HEALTH")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("Ran 8 tests"), "{stderr}");
+    for name in [
+        "test_repeated_passes_replace_one_bounded_private_record",
+        "test_symlinks_hardlinks_directories_and_oversized_records_are_refused",
+        "test_failed_atomic_publication_preserves_previous_record_and_cleans_temp",
+        "test_zero_adapter_exit_is_attempted_and_never_claims_sent",
+    ] {
+        assert!(stderr.contains(name), "missing control {name}: {stderr}");
     }
 }

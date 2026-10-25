@@ -13,6 +13,9 @@ import contextlib
 import importlib.util
 import json
 import os
+import secrets
+import stat
+import time
 from pathlib import Path
 import socket
 import sys
@@ -45,7 +48,9 @@ class PassLog:
         self.stream.flush()
 
 
-def run_pass(repo, broker, worker, limit, budget=None):
+def run_pass(repo, broker, worker, limit, budget=None, report=None):
+    report = report if report is not None else {}
+    report.update(tick="unknown", outbox="unknown", delivery="not_started")
     if not 1 <= limit <= 100:
         raise ValueError("monitor limit must be between 1 and 100")
     if not Path(repo).is_dir():
@@ -56,9 +61,11 @@ def run_pass(repo, broker, worker, limit, budget=None):
         tick = adapter.run_broker(
             [broker, "broker", "advanced", "watch", "pr", "tick", "--limit", str(limit)],
             repo, budget=budget, call_seconds=TICK_SECONDS)
+        report["tick"] = "failed" if tick.returncode else "completed"
         if tick.returncode:
             print("tick failed; continuing to delivery")
     except (OSError, RuntimeError, ValueError) as error:
+        report["tick"] = "failed"
         print(f"tick failed; continuing to delivery: {str(error)[:512]}")
 
     try:
@@ -70,6 +77,7 @@ def run_pass(repo, broker, worker, limit, budget=None):
         pending = json.loads(listing.stdout)
         if not isinstance(pending, list):
             raise ValueError("outbox listing is not an array")
+        report["outbox"] = "pending" if pending else "empty"
         if not pending:
             print("no delivery pending; adapter not started")
             return
@@ -79,20 +87,86 @@ def run_pass(repo, broker, worker, limit, budget=None):
     budget.remaining()  # Refuse before opening a transport after expiry.
     delivery_budget = adapter.Deadline(adapter.PASS_SECONDS, budget.clock)
     delivery_budget.expires = min(delivery_budget.expires, budget.expires)
+    report["delivery"] = "attempted"  # A zero exit also means unavailable; never claim sent.
     adapter.main(["--worker", worker, "--repo", repo, "--broker", broker],
                  budget=delivery_budget)
 
 
+HEALTH_BYTES = 4096
+HEALTH_FIELDS = {"schema", "finished_unix_ms", "outcome", "tick", "outbox", "delivery", "failure_kind"}
+
+
+def write_health(report):
+    """Replace one small private sibling record; never append or follow links.
+
+    The opt-in is intended for an installed private helper directory. A trusted
+    directory descriptor anchors checks and publication across path renames.
+    This reports pass progress, not provider freshness or delivery completion.
+    """
+    record = {key: value for key, value in report.items() if key in HEALTH_FIELDS}
+    payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if len(payload) > HEALTH_BYTES:
+        raise ValueError("monitor health exceeds the record budget")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    directory = os.open(Path(__file__).absolute().parent, flags)
+    temporary = None
+    try:
+        metadata = os.fstat(directory)
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+            raise ValueError("monitor health requires a private user-owned helper directory")
+        try:
+            old = os.stat("health.json", dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            old = None
+        if old is not None and (not stat.S_ISREG(old.st_mode) or
+                                old.st_uid != os.geteuid() or old.st_mode & 0o077 or
+                                old.st_nlink != 1 or old.st_size > HEALTH_BYTES):
+            raise ValueError("existing monitor health is not a bounded private regular file")
+        temporary = ".health-" + secrets.token_hex(16)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW |
+                             os.O_CLOEXEC, 0o600, dir_fd=directory)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, "health.json", src_dir_fd=directory, dst_dir_fd=directory)
+        temporary = None
+        os.fsync(directory)
+    finally:
+        try:
+            if temporary is not None:
+                os.unlink(temporary, dir_fd=directory)
+        finally:
+            os.close(directory)
+
+
 def main():
     log = PassLog(sys.stdout)
+    health = os.environ.get("AETHYME_PR_MONITOR_RECORD_HEALTH") == "1"
+    report = {"schema": "aethyme.pr-monitor-health/v1", "outcome": "stopped",
+              "tick": "unknown", "outbox": "unknown", "delivery": "not_started",
+              "failure_kind": None}
     with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
         try:
-            run_pass(os.environ["AETHYME_PR_MONITOR_REPO"],
-                     os.environ.get("AETHYME_BROKER_BIN") or "aethyme",
-                     os.environ.get("AETHYME_PR_MONITOR_WORKER") or "launchd-" + socket.gethostname().split(".")[0],
-                     int(os.environ.get("AETHYME_PR_MONITOR_LIMIT") or "20"))
+            arguments = (os.environ["AETHYME_PR_MONITOR_REPO"],
+                         os.environ.get("AETHYME_BROKER_BIN") or "aethyme",
+                         os.environ.get("AETHYME_PR_MONITOR_WORKER") or "launchd-" + socket.gethostname().split(".")[0],
+                         int(os.environ.get("AETHYME_PR_MONITOR_LIMIT") or "20"))
+            if health:
+                run_pass(*arguments, report=report)
+            else:
+                run_pass(*arguments)
+            report["outcome"] = "completed"
         except (OSError, RuntimeError, ValueError, KeyError) as error:
+            report["failure_kind"] = type(error).__name__
             print(f"monitor stopped: {str(error)[:512]}")
+        finally:
+            if health:
+                report["finished_unix_ms"] = time.time_ns() // 1_000_000
+                try:
+                    write_health(report)
+                except (OSError, ValueError) as error:
+                    print(f"monitor health unavailable: {type(error).__name__}")
     if log.truncated:
         print("PR monitor log truncated; pending deliveries remain broker-owned")
     return 0
