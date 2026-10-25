@@ -126,3 +126,20 @@ from the trusted PR base. Rust, manifests, locks, shared Git experiment helpers,
 workflow changes outside the existing exact performance entry, deletions, mode
 changes and unlisted paths still select the full suite. This extension must
 itself land through full CI before later experiment-only PRs can use it.
+
+## Contract-check build reuse
+
+The PR contract check builds its native policy checker from the event's pinned
+base commit before checking out the exact PR head. This matches the protected-main
+Rust cache instead of recompiling changed product crates for every report edit.
+The copied executable lives outside the checkout, is hashed before the head
+switch, and is verified before execution. The comparison still uses the PR head,
+its merge base, registry, body and commit decisions; product changes receive the
+separate Rust lint and workspace checks. Both checkout steps disable persisted
+credentials. This changes the checker policy source, not the compared source.
+
+A cold or missing base cache can still require compilation. Record cache restore,
+build step and complete job durations before claiming a timing gain; an unchanged
+workflow or shared cache key alone is insufficient evidence. A body edit still
+runs the required contract check. The workflow does not reuse an old PR verdict
+or skip the exact head/body comparison.
