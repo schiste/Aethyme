@@ -72,3 +72,33 @@ plus an explicit Python import and call. Its fragment counts must equal the
 coverage projection. This is producer evidence, not proof of complete semantics
 or coverage in every language. Existing language-specific and negative-resolution
 tests remain necessary, as do question-specific query qualifications.
+
+
+## Revision-bound documentation query
+
+`aethyme graph impact --repo . --revision HEAD --diff changed-paths.txt
+--mode documents --json` projects direct incoming `Documents` links into
+`impact.documents`, alongside `direct` evidence and the existing coverage,
+revision, provenance and limit fields. Human output also lists document paths.
+The shared analysis envelope uses the versioned `graph-impact-documents` legacy
+profile and the same `documents` array; other relationship arrays stay empty.
+
+Seeds include every indexed node kind at each exact changed path, so file,
+function and class references are considered without a prefix scan. Document
+paths are deduplicated. The query bounds exact changed-path lookups as well as raw adjacency rows,
+nodes and results. Missing paths consume the lookup allowance; reaching it leaves
+the result incomplete without probing later paths. Missing subjects, malformed document endpoints or exhausted limits
+make the result incomplete; stale or unavailable results expose no paths.
+Documentation mode requires an explicit `documents` coverage entry, including
+zero, but does not require test relationships. Revision-bound partial paths
+are advisory only. No result narrows mandatory gates or proves unlinked prose
+unaffected, and no nightly scheduler or documentation rewrite runs here.
+
+The real CLI regression starts from a synthetic source and Markdown reference,
+refreshes persisted fragments, materializes the graph, queries documentation
+impact and checks stale-revision withholding. Separate store/provider controls
+cover file/function/class targets, exact-path isolation, duplicate links,
+reverse links, missing subjects, node/result/depth limits and coverage semantics.
+These qualify a consumer of produced links; they do not claim every prose
+reference or language is semantically resolved. CI sizing and session-bootstrap
+qualification remain separate work under #213.
