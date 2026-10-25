@@ -1158,7 +1158,7 @@ fn import_frontier(
     store: &ReadOnlyGraphStore,
     query: &GraphImpactQuery<'_>,
 ) -> Result<GraphImpactLookup, GraphStoreError> {
-    let changed_files = query.changed_files.iter().collect::<BTreeSet<_>>();
+    let changed_files = query.changed_files.iter().cloned().collect::<BTreeSet<_>>();
     let mut state = ImportFrontierState::default();
     for (path_index, path) in changed_files.iter().enumerate() {
         if path_index >= query.max_nodes || state.visited.len() >= query.max_nodes {
@@ -1178,7 +1178,9 @@ fn import_frontier(
             &mut state.truncated,
         )?;
         for (_, importer_file) in importers {
-            if state.expanded_files.contains(&importer_file) {
+            if changed_files.contains(&importer_file)
+                || state.expanded_files.contains(&importer_file)
+            {
                 continue;
             }
             if current.depth >= query.max_depth
@@ -2159,6 +2161,37 @@ mod tests {
             "missing paths must consume lookup allowance"
         );
         assert!(missing.impacted_paths.is_empty());
+    }
+
+    #[test]
+    fn imports_do_not_report_changed_files_omitted_by_the_lookup_budget() {
+        let root = symbol_import_fixture();
+        let changed = std::iter::once("src/core.rs".to_string())
+            .chain((0..7).map(|n| format!("src/czzz{n}.rs")))
+            .chain(std::iter::once("src/service.rs".into()))
+            .collect::<Vec<_>>();
+        let lookup = GraphStoreImpactProvider.lookup(&GraphImpactQuery {
+            repo_root: root.path(),
+            changed_files: &changed,
+            mode: GraphImpactMode::Imports,
+            max_depth: 4,
+            max_nodes: 8,
+            max_results: 16,
+        });
+        assert!(lookup.truncated);
+        assert!(
+            lookup
+                .impacted_paths
+                .iter()
+                .any(|path| path == "src/adapter.rs")
+        );
+        assert!(
+            !lookup
+                .impacted_paths
+                .iter()
+                .any(|path| path == "src/service.rs"),
+            "changed paths are never importer results, even if not seeded"
+        );
     }
 
     #[test]
