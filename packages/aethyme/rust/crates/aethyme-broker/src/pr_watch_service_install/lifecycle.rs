@@ -385,16 +385,22 @@ mod tests {
         let original = fs::read(&manifest).unwrap();
         let mut forged: Value = serde_json::from_slice(&original).unwrap();
         forged["label"] = json!("other.service");
+        // A valid content digest must not authorize a different service target.
+        forged["digest"] = json!("");
+        let signed = format!("{:x}", Sha256::digest(serde_json::to_vec(&forged).unwrap()));
+        forged["digest"] = json!(signed);
         fs::write(&manifest, serde_json::to_vec(&forged).unwrap()).unwrap();
         assert!(
             control_with(
                 &plan.home,
                 &plan.repository_uuid,
                 "deactivate",
-                Some(&plan.digest),
+                Some(&signed),
                 |_| panic!("must refuse forged target")
             )
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("namespace")
         );
         fs::write(
             &manifest,
