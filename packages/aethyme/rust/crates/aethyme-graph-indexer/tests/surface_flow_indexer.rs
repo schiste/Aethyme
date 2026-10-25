@@ -1,5 +1,8 @@
 //! Surface/Flow extractor fixture coverage.
 
+#[path = "support/surface_fixture.rs"]
+mod surface_fixture;
+
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk};
 use aethyme_graph_schema::{EdgeKind, NodeKind};
 use aethyme_graph_storage::read_fragment;
@@ -35,76 +38,7 @@ fn edge_kinds(root: &std::path::Path, rel: &str) -> Vec<EdgeKind> {
 #[test]
 fn persists_expected_routes_proxy_middleware_workers_and_auth_tests() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "backend/urls.py",
-        r#"
-from django.urls import path, re_path
-
-urlpatterns = [
-    path("api/token/", token_view),
-    re_path(r"^api/profile/$", profile_view),
-]
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/settings.py",
-        r#"
-MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "core.auth.TokenAuditMiddleware",
-]
-
-REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.TokenAuthentication",
-    ],
-    "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.IsAuthenticated",
-    ],
-}
-
-"#,
-    );
-    write(
-        tmp.path(),
-        "edge/worker.mjs",
-        r#"
-export default {
-  async fetch(request, env) {
-    const headers = new Headers(request.headers)
-    const issued = jwt.sign({ sub: "u1" }, env.JWT_SECRET)
-    await tokenStore.save(issued)
-    headers.set("Authorization", `Bearer ${env.API_TOKEN}`)
-    return fetch("https://api.example.com/token", { headers })
-  }
-}
-"#,
-    );
-    write(
-        tmp.path(),
-        "netlify.toml",
-        r#"
-[[redirects]]
-from = "/api/*"
-to = "https://backend.example.com/:splat"
-status = 200
-force = true
-
-[build.environment]
-JWT_AUDIENCE = "internal-api"
-"#,
-    );
-    write(
-        tmp.path(),
-        "backend/tests/test_auth_flow.py",
-        r#"
-def test_token_route_requires_bearer(client):
-    response = client.get("/api/token/", HTTP_AUTHORIZATION="Bearer test-token")
-    assert response.status_code == 200
-"#,
-    );
+    surface_fixture::write_surface_fixture(tmp.path());
 
     let summary = index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
     assert_eq!(

@@ -230,12 +230,20 @@ class Chau7Client:
         result = self._request("tools/call", {"name": name, "arguments": arguments})
         if not isinstance(result, dict):
             raise Chau7Error(f"{name} returned a non-object result")
-        if result.get("isError"):
+        is_error = result.get("isError", False)
+        if not isinstance(is_error, bool):
+            raise Chau7Error(f"{name} returned a non-boolean isError")
+        if is_error:
             raise Chau7Error(f"{name} returned an error: {result}")
-        content = result.get("content") or []
+        content = result.get("content", [])
+        if not isinstance(content, list) or any(not isinstance(block, dict) for block in content):
+            raise Chau7Error(f"{name} returned malformed content")
+        for block in content:
+            if block.get("type") == "text" and not isinstance(block.get("text"), str):
+                raise Chau7Error(f"{name} returned non-text text content")
         for block in content:
             if block.get("type") == "text":
-                text = block.get("text", "")
+                text = block["text"]
                 try:
                     return json.loads(text)
                 except json.JSONDecodeError:

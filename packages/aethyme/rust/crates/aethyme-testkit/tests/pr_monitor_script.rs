@@ -101,7 +101,7 @@ fn the_delivery_adapter_protocol_and_budget_controls_pass() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
-        stderr.contains("Ran 12 tests"),
+        stderr.contains("Ran 16 tests"),
         "expected all offline controls: {stderr}"
     );
     for name in [
@@ -110,6 +110,9 @@ fn the_delivery_adapter_protocol_and_budget_controls_pass() {
         "test_broker_output_overflow_is_not_treated_as_a_valid_prefix",
         "test_broker_timeout_stops_and_reaps_only_its_owned_child",
         "test_main_shares_one_pass_budget_and_closes_the_client",
+        "test_failed_send_never_submits_or_acknowledges_delivery",
+        "test_failed_submit_is_not_acknowledged_as_delivered",
+        "test_tool_result_shapes_fail_with_typed_protocol_errors",
     ] {
         assert!(
             stderr.contains(name),
