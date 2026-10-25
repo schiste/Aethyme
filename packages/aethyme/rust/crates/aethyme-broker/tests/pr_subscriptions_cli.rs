@@ -165,8 +165,9 @@ impl Fixture {
         path
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        common::broker_cli(CLI, args)
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = common::broker_cli(CLI, args);
+        command
             .current_dir(self.repo.path())
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
             .env(
@@ -179,9 +180,12 @@ impl Fixture {
             )
             .env("AETHYME_FAKE_GH_LOG", self.fake("log"))
             .env("AETHYME_FAKE_GH_VIEW", self.fake("view.json"))
-            .env("AETHYME_FAKE_GH_LIST", self.fake("list.json"))
-            .output()
-            .unwrap()
+            .env("AETHYME_FAKE_GH_LIST", self.fake("list.json"));
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
 
     /// Make every watch due now: the minimum interval is 15 seconds, and a
@@ -474,4 +478,152 @@ fn a_configured_review_prompt_renders_only_allowlisted_metadata() {
         "{prompt}"
     );
     assert!(prompt.contains("untrusted"), "{prompt}");
+}
+
+/// Exercise the frozen monitor-to-native-broker boundary without a live socket.
+/// Scheduler loading is covered separately; this never claims an OS tick fired.
+#[test]
+fn frozen_monitor_turns_a_red_check_into_session_work_without_live_transport() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::new();
+    let home = tempfile::tempdir().unwrap();
+    fixture.set_view(&[]);
+    let watch = json(&fixture.run(&[
+        "advanced",
+        "watch",
+        "pr",
+        "start",
+        "--session",
+        &fixture.session,
+        "--repo",
+        "schiste/Aethyme",
+        "--pr",
+        "7",
+        "--json",
+    ]));
+    let watch_id = watch["id"].as_i64().unwrap().to_string();
+    json(&fixture.run(&[
+        "advanced",
+        "deliveries",
+        "subscribe",
+        "--watch",
+        &watch_id,
+        "--adapter",
+        "chau7",
+        "--target",
+        "tab_9",
+        "--policy",
+        "notify",
+        "--json",
+    ]));
+    // The tiny pinned stand-in avoids depending on the debug binary's size;
+    // it delegates every command to the actual compiled broker entrypoint.
+    let router = fixture.bin.path().join("fixture-router");
+    std::fs::write(
+        &router,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", CLI.replace('\'', "'\\''")),
+    )
+    .unwrap();
+    std::fs::set_permissions(&router, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let plan = json(
+        &fixture
+            .command(&[
+                "advanced",
+                "watch",
+                "pr",
+                "service",
+                "plan",
+                "--broker-bin",
+                router.to_str().unwrap(),
+                "--json",
+            ])
+            .env("HOME", home.path())
+            .output()
+            .unwrap(),
+    );
+    let directory = PathBuf::from(plan["directory"].as_str().unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (name, bytes) in [
+        (
+            "aethyme-pr-monitor.py",
+            include_str!("../../../../scripts/adapters/aethyme-pr-monitor.py"),
+        ),
+        (
+            "chau7-delivery-adapter.py",
+            include_str!("../../../../scripts/adapters/chau7-delivery-adapter.py"),
+        ),
+    ] {
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let run_monitor = || {
+        let configured = fixture.command(&[]);
+        let mut command = Command::new("python3");
+        command
+            .env_clear()
+            .envs(
+                configured
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .current_dir(fixture.repo.path())
+            .args(["-I", "-B"])
+            .arg(directory.join("aethyme-pr-monitor.py"))
+            .env("HOME", home.path())
+            .env("AETHYME_PR_MONITOR_REPO", fixture.repo.path())
+            .env("AETHYME_BROKER_BIN", &router)
+            .env(
+                "AETHYME_PR_MONITOR_GENERATION",
+                plan["generation"].as_str().unwrap(),
+            )
+            .env(
+                "AETHYME_PR_MONITOR_BROKER_SHA256",
+                plan["broker_sha256"].as_str().unwrap(),
+            )
+            .env("AETHYME_PR_MONITOR_RECORD_HEALTH", "1");
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("health.json")).unwrap()).unwrap();
+        assert_eq!(report["identity"], "verified");
+        assert_eq!(report["generation"], plan["generation"]);
+        assert_eq!(report["tick"], "completed", "{report}");
+        assert!(!directory.join("__pycache__").exists());
+        report
+    };
+    let mut red: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.fake("view.json")).unwrap()).unwrap();
+    red["statusCheckRollup"] = serde_json::json!([{"__typename":"StatusContext","context":"fixture-required-ci","state":"FAILURE","targetUrl":"https://ci.invalid/synthetic"}]);
+    std::fs::write(fixture.fake("view.json"), red.to_string()).unwrap();
+    fixture.make_due();
+    let report = run_monitor();
+    assert_eq!(report["outbox"], "pending");
+    assert_eq!(report["delivery"], "attempted");
+    assert!(!home.path().join(".chau7/mcp.sock").exists());
+    assert_eq!(fixture.pending(), 1);
+    let batches = json(&fixture.run(&[
+        "advanced", "watch", "pr", "batches", "--id", &watch_id, "--all", "--json",
+    ]));
+    let batches = batches.as_array().unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0]["activities"][0]["kind"], "check");
+    assert_eq!(batches[0]["activities"][0]["state"], "FAILURE");
+    let dispatched = fixture.dispatch();
+    assert_eq!(dispatched["claimed"], true);
+    assert_eq!(dispatched["action"]["action"], "send");
+    assert_eq!(dispatched["action"]["tab_id"], "tab_9");
+    // Synthetic acknowledgement only: no socket and no real user was notified.
+    assert_eq!(fixture.complete(&dispatched)["status"], "delivered");
+    fixture.make_due();
+    let report = run_monitor();
+    assert_eq!(report["outbox"], "empty");
+    assert_eq!(report["delivery"], "not_started");
+    assert_eq!(fixture.pending(), 0);
 }
