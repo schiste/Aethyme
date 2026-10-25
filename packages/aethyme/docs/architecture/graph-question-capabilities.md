@@ -48,3 +48,17 @@ no-op, with an empty capability report and no content claim. This instrument is
 one part of #213; question-specific query qualification, producer guardrails
 and integration of content readiness into lifecycle health remain open. It is
 not evidence that the entire graph redesign is complete.
+
+The `aethyme-graph-indexer` integration test `edge_production` exhaustively
+classifies every schema `EdgeKind`. Seventeen kinds require positive witnesses
+read back from persisted Playground fragments; nine are explicitly not produced
+by the default indexers, with reasons tracked in #213: `Implements`, `Inherits`,
+`Reads`, `Uses`, `Writes`, `Mocks`, `Configures`, `Decides` and `Deprecates`.
+A new enum variant requires a compile-time classification; an emitted kind
+missing its witness fails the test. A formerly unsupported kind observed in the
+fixture also fails until its declaration is updated. The fixture includes the
+existing documentation/test relationships and unchanged surface-flow inputs,
+plus an explicit Python import and call. Its fragment counts must equal the
+coverage projection. This is producer evidence, not proof of complete semantics
+or coverage in every language. Existing language-specific and negative-resolution
+tests remain necessary, as do question-specific query qualifications.
