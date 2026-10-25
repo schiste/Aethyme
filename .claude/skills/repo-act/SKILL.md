@@ -578,6 +578,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   a skipped job from an edited-event filter is not passing validation. Inspect
   workflow triggers and trigger an authorized real run without changing reviewed
   source or inventing a pass.
+- For partial delivery, avoid issue-closing keywords immediately before an
+  issue reference, even in a negative sentence. After publishing the exact
+  body, inspect `closingIssuesReferences`; unfinished issues must not be linked
+  for automatic closure. Verify their state again after merging.
 - Before publishing a PR body, run the repository's contract checker against
   that exact body and base. Use its literal checkbox syntax (for example,
   `- [x] **none**`), not prose such as `Contract: none`, and verify the checker
