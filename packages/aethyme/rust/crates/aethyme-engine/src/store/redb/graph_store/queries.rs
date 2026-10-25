@@ -56,7 +56,8 @@ impl GraphStore {
         docs_for_from(&self.db, id)
     }
 
-    /// Return configs attached to a node through `configures` or
+    /// Return configs attached through explicit incoming value references,
+    /// `configures` or
     /// `entrypoint_for` edges.
     pub fn configs_for(&self, id: &str) -> Result<Vec<ConfigNode>, GraphStoreError> {
         configs_for_from(&self.db, id)
@@ -333,7 +334,8 @@ impl ReadOnlyGraphStore {
         docs_for_from(&self.db, id)
     }
 
-    /// Return configs attached to a node through `configures` or
+    /// Return configs attached through explicit incoming value references,
+    /// `configures` or
     /// `entrypoint_for` edges.
     pub fn configs_for(&self, id: &str) -> Result<Vec<ConfigNode>, GraphStoreError> {
         configs_for_from(&self.db, id)

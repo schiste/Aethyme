@@ -3368,3 +3368,53 @@ fn disposable_fast_only_publishes_after_successful_metadata_write() {
         "public store must still reflect the pre-failure index"
     );
 }
+
+#[test]
+fn configuration_references_survive_relocation_in_cli_and_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let original = tmp.path().join("indexed-config");
+    let relocated = tmp.path().join("relocated-config");
+    write(&original, "app.py", b"def answer():\n    return 42\n");
+    write(
+        &original,
+        "config/runtime.toml",
+        b"[server]\nhandler = \"app.answer\"\nfallback = \"answer\"\n",
+    );
+    write(
+        &original,
+        "config/runtime.json",
+        br#"{"handler":"app.answer","fallback":"answer"}"#,
+    );
+    let root = original.canonicalize().unwrap();
+    bootstrap_repo(&root, "test-engine").unwrap();
+    let ctx = IndexerContext::new("ConfigFixture", root, "test-engine").unwrap();
+    assert_eq!(
+        index_repo_to_disk(&ctx, &WalkOptions::default())
+            .unwrap()
+            .total_files,
+        3
+    );
+    link_repo(&ctx).unwrap();
+    std::fs::rename(&original, &relocated).unwrap();
+    let output = run_engine([
+        "index",
+        "--repo",
+        relocated.to_str().unwrap(),
+        "--from-fragments",
+    ]);
+    assert_success(&output);
+    let (map, _) = RepositoryMap::build_from_fragments(&relocated).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(&aethyme_engine::json::graph_relation(
+        &configs_view(&map, "answer"),
+    ))
+    .unwrap();
+    let actual = graph_cli_json(&relocated, "graph-configs", "answer");
+    assert_eq!(actual, expected);
+    let items = actual["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        2,
+        "unqualified fallback must not become a reference"
+    );
+    assert!(items.iter().all(|item| item["kind"] == "config"));
+}
