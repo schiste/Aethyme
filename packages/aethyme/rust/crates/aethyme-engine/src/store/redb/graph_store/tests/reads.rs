@@ -782,6 +782,61 @@ fn read_api_relation_docs_configs_and_risks() {
 }
 
 #[test]
+fn config_relations_accept_only_typed_values_as_incoming_references() {
+    let fixture = read_api_fixture(function_name!());
+    let store = GraphStore::open(&fixture.root).unwrap();
+    let mut value = fixture.config.clone();
+    value.id.push_str("#value:handler");
+    value.value = Some(crate::model::config::ConfigValueLocation {
+        config_path: "server.handler".into(),
+        value_hash: "a".repeat(64),
+        start_line: 2,
+        end_line: 2,
+    });
+    let mut non_value = fixture.config.clone();
+    non_value.id.push_str("#untyped-reference");
+    let mut session = store.begin_index().unwrap();
+    insert_config(&mut session, &value).unwrap();
+    insert_config(&mut session, &non_value).unwrap();
+    for source in [
+        value.id.as_str(),
+        non_value.id.as_str(),
+        fixture.doc.id.as_str(),
+    ] {
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                source,
+                fixture.function.id.as_str(),
+                EdgeKind::References,
+                1000,
+                "fixture",
+            ),
+        )
+        .unwrap();
+    }
+    session.commit().unwrap();
+    drop(store);
+    let readonly = fixture.read_only();
+    let got = readonly.configs_for(fixture.function.id.as_str()).unwrap();
+    assert_eq!(
+        got.len(),
+        2,
+        "existing Configures plus the typed value only"
+    );
+    assert!(got.contains(&fixture.config));
+    assert!(got.contains(&value));
+    let view = readonly
+        .relation_view(fixture.function.id.as_str(), GraphRelation::Configs)
+        .unwrap();
+    assert_eq!(
+        view.items.len(),
+        2,
+        "untyped and document mentions are excluded"
+    );
+}
+
+#[test]
 fn read_api_task_anchor_and_usage_boundary_candidates_are_bounded() {
     let fixture = read_api_fixture(function_name!());
     let readonly = fixture.read_only();
