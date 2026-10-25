@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Private temporary health files only; no provider, socket, model or live repo."""
 import contextlib
+import fcntl
 import importlib.util
 import io
 import json
@@ -34,28 +35,29 @@ class HealthControls(unittest.TestCase):
             self.assertNotIn("secret", data)
             self.assertLess(path.stat().st_size, monitor.HEALTH_BYTES)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual([p.name for p in Path(directory).iterdir()], ["health.json"])
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), [".health.lock", "health.json"])
             original = path.read_bytes()
             with self.assertRaisesRegex(ValueError, "record budget"):
                 monitor.write_health(self.record(failure_kind="x" * 4097))
             self.assertEqual(path.read_bytes(), original)
 
     def test_symlinks_hardlinks_directories_and_oversized_records_are_refused(self):
-        for kind in ["symlink", "hardlink", "directory", "oversized", "public"]:
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory, \
-                 patch.object(monitor, "__file__", str(Path(directory) / "monitor.py")):
-                root = Path(directory); target = root / "target"
-                target.write_bytes(b"unchanged"); target.chmod(0o600)
-                health = root / "health.json"
-                if kind == "symlink": health.symlink_to(target)
-                elif kind == "hardlink": os.link(target, health)
-                elif kind == "directory": health.mkdir()
-                else:
-                    health.write_bytes(b"x" * (4097 if kind == "oversized" else 1))
-                    health.chmod(0o644 if kind == "public" else 0o600)
-                with self.assertRaisesRegex(ValueError, "bounded private"):
-                    monitor.write_health(self.record())
-                self.assertEqual(target.read_bytes(), b"unchanged")
+        for name in ["health.json", ".health.pending", ".health.lock"]:
+            for kind in ["symlink", "hardlink", "directory", "oversized", "public"]:
+                with self.subTest(name=name, kind=kind), tempfile.TemporaryDirectory() as directory, \
+                     patch.object(monitor, "__file__", str(Path(directory) / "monitor.py")):
+                    root = Path(directory); target = root / "target"
+                    target.write_bytes(b"unchanged"); target.chmod(0o600)
+                    health = root / name
+                    if kind == "symlink": health.symlink_to(target)
+                    elif kind == "hardlink": os.link(target, health)
+                    elif kind == "directory": health.mkdir()
+                    else:
+                        health.write_bytes(b"x" * (4097 if kind == "oversized" else 1))
+                        health.chmod(0o644 if kind == "public" else 0o600)
+                    with self.assertRaises((OSError, ValueError)):
+                        monitor.write_health(self.record())
+                    self.assertEqual(target.read_bytes(), b"unchanged")
 
     def test_shared_or_symlinked_helper_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -69,7 +71,7 @@ class HealthControls(unittest.TestCase):
                     monitor.write_health(self.record())
             self.assertFalse((real / "health.json").exists())
 
-    def test_failed_atomic_publication_preserves_previous_record_and_cleans_temp(self):
+    def test_failed_atomic_publication_preserves_previous_record_and_resumes_scratch(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(monitor, "__file__", str(Path(directory) / "monitor.py")):
             monitor.write_health(self.record()); path = Path(directory) / "health.json"
@@ -77,7 +79,29 @@ class HealthControls(unittest.TestCase):
             with patch.object(monitor.os, "replace", side_effect=OSError("synthetic refusal")):
                 with self.assertRaises(OSError): monitor.write_health(self.record(outcome="stopped"))
             self.assertEqual(path.read_bytes(), original)
-            self.assertEqual([p.name for p in Path(directory).iterdir()], ["health.json"])
+            self.assertEqual(sorted(p.name for p in Path(directory).iterdir()),
+                             [".health.lock", ".health.pending", "health.json"])
+            # Repeated crash-equivalent rename failures reuse one scratch file.
+            for _ in range(20):
+                with patch.object(monitor.os, "replace", side_effect=OSError("synthetic refusal")):
+                    with self.assertRaises(OSError): monitor.write_health(self.record())
+            self.assertEqual(len(list(Path(directory).iterdir())), 3)
+            monitor.write_health(self.record(finished_unix_ms=2000))
+            self.assertEqual(json.loads(path.read_text())["finished_unix_ms"], 2000)
+            self.assertFalse((Path(directory) / ".health.pending").exists())
+
+    def test_writer_lock_refuses_contention_without_touching_an_active_scratch(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(monitor, "__file__", str(Path(directory) / "monitor.py")):
+            lock = Path(directory) / ".health.lock"; lock.touch(mode=0o600)
+            scratch = Path(directory) / ".health.pending"
+            scratch.write_bytes(b"active writer"); scratch.chmod(0o600)
+            with lock.open("r+b") as owner:
+                fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(BlockingIOError): monitor.write_health(self.record())
+            self.assertEqual(scratch.read_bytes(), b"active writer")
+            monitor.write_health(self.record())
+            self.assertFalse(scratch.exists())
 
     def test_health_is_off_by_default_and_reports_only_failure_type(self):
         with patch.dict(os.environ, {"AETHYME_PR_MONITOR_REPO": "fixture",

@@ -13,7 +13,6 @@ import contextlib
 import importlib.util
 import json
 import os
-import secrets
 import stat
 import time
 from pathlib import Path
@@ -103,41 +102,50 @@ def write_health(report):
     directory descriptor anchors checks and publication across path renames.
     This reports pass progress, not provider freshness or delivery completion.
     """
+    import fcntl  # Health is Unix-only; keep the default-off import path unchanged.
+
     record = {key: value for key, value in report.items() if key in HEALTH_FIELDS}
     payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
     if len(payload) > HEALTH_BYTES:
         raise ValueError("monitor health exceeds the record budget")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     directory = os.open(Path(__file__).absolute().parent, flags)
-    temporary = None
+    def private_file(metadata, maximum):
+        return (stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.geteuid() and
+                not metadata.st_mode & 0o077 and metadata.st_nlink == 1 and
+                metadata.st_size <= maximum)
+
     try:
         metadata = os.fstat(directory)
         if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
             raise ValueError("monitor health requires a private user-owned helper directory")
-        try:
-            old = os.stat("health.json", dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            old = None
-        if old is not None and (not stat.S_ISREG(old.st_mode) or
-                                old.st_uid != os.geteuid() or old.st_mode & 0o077 or
-                                old.st_nlink != 1 or old.st_size > HEALTH_BYTES):
-            raise ValueError("existing monitor health is not a bounded private regular file")
-        temporary = ".health-" + secrets.token_hex(16)
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW |
-                             os.O_CLOEXEC, 0o600, dir_fd=directory)
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, "health.json", src_dir_fd=directory, dst_dir_fd=directory)
-        temporary = None
-        os.fsync(directory)
+        lock_fd = os.open(".health.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW |
+                          os.O_CLOEXEC, 0o600, dir_fd=directory)
+        with os.fdopen(lock_fd, "r+b") as lock:
+            if not private_file(os.fstat(lock.fileno()), 0):
+                raise ValueError("monitor health lock is not a private empty regular file")
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                old = os.stat("health.json", dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                old = None
+            if old is not None and not private_file(old, HEALTH_BYTES):
+                raise ValueError("existing monitor health is not a bounded private regular file")
+            # This fixed scratch name belongs to the health protocol. The writer
+            # lock serializes reuse after a crash; it is never unlinked or rotated.
+            pending_fd = os.open(".health.pending", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW |
+                                 os.O_CLOEXEC, 0o600, dir_fd=directory)
+            with os.fdopen(pending_fd, "r+b") as output:
+                if not private_file(os.fstat(output.fileno()), HEALTH_BYTES):
+                    raise ValueError("monitor health scratch is not a bounded private regular file")
+                os.ftruncate(output.fileno(), 0)
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(".health.pending", "health.json", src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
     finally:
-        try:
-            if temporary is not None:
-                os.unlink(temporary, dir_fd=directory)
-        finally:
-            os.close(directory)
+        os.close(directory)
 
 
 def main():

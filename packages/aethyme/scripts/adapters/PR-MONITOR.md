@@ -43,12 +43,14 @@ monitor script. It is off by default and intended for a separately installed
 private helper directory, not the shared source checkout. The directory must
 be user-owned with no group/other permissions. Existing health files must be
 private, user-owned regular files with one link and at most 4 KiB; symlinks,
-hard links, directories and oversized files are refused. Publication uses an
-exclusive temporary file, fsync and atomic replacement through a directory
-descriptor. Repeated passes replace one mode-0600 file rather than appending.
-Temporary files are removed after publication failure; a process crash can
-leave a small temporary file, which is not automatically removed without an
-ownership proof. This option does not rotate existing manual scheduler logs.
+hard links, directories and oversized files are refused. Publication uses a persistent private writer lock, one fixed private scratch
+file, fsync and atomic replacement through a directory descriptor. Concurrent
+writers refuse without touching the active scratch file. After an interrupted
+write the next pass validates and reuses that same scratch file under the lock;
+repeated failures cannot accumulate temporary names. Storage is bounded to one
+4 KiB health record, one 4 KiB scratch record and one empty persistent lock.
+Repeated successful passes leave only the health record and empty lock. This
+option does not rotate existing manual scheduler logs.
 
 The JSON contract is `aethyme.pr-monitor-health/v1` with these fields:
 

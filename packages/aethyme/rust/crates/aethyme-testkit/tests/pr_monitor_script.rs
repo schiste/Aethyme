@@ -73,11 +73,11 @@ fn the_monitor_health_controls_are_private_bounded_and_do_not_claim_delivery() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(stderr.contains("Ran 8 tests"), "{stderr}");
+    assert!(stderr.contains("Ran 9 tests"), "{stderr}");
     for name in [
         "test_repeated_passes_replace_one_bounded_private_record",
         "test_symlinks_hardlinks_directories_and_oversized_records_are_refused",
-        "test_failed_atomic_publication_preserves_previous_record_and_cleans_temp",
+        "test_failed_atomic_publication_preserves_previous_record_and_resumes_scratch",
         "test_zero_adapter_exit_is_attempted_and_never_claims_sent",
     ] {
         assert!(stderr.contains(name), "missing control {name}: {stderr}");
