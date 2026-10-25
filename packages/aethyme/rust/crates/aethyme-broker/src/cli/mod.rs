@@ -551,6 +551,9 @@ Usage:
   aethyme broker watch pr service plan --broker-bin <absolute-router> [--seconds <120..3600>] [--json]
       Read-only macOS service plan. Does not install or activate a scheduler.
   aethyme broker watch pr service install --broker-bin <absolute-router> --confirm <plan-digest> [--seconds <120..3600>] [--json]
+  aethyme broker watch pr service activate --confirm <installed-plan-digest> [--json]
+  aethyme broker watch pr service deactivate --confirm <installed-plan-digest> [--json]
+  aethyme broker watch pr service status [--json]
       macOS only: install exact service files without loading a scheduler.
   aethyme broker watch pr batches --id <watch-id> [--all] [--json]
   aethyme broker watch pr ack --id <batch-id> --outcome <addressed|stale|non-actionable|superseded> --reason <text> [--json]
