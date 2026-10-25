@@ -459,6 +459,11 @@ Usage:
       next broker command; event payloads never contain message text.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
+  aethyme broker advanced gates incidents list [--json]
+  aethyme broker advanced gates incidents confirm <failed-run-id> <test-id>... --session <id> [--pr <n>] [--json]
+  aethyme broker advanced gates incidents resolve <incident-id> <passing-run-id> [--json]
+      Record or resolve bounded advisory ownership of a confirmed base failure;
+      never skips gates. Confirmation requires exact base/definition/profile evidence.
   aethyme broker gates manifest [--head <ref>] [--json]
       Emit a versioned content-free gate-selection manifest from exact
       committed policy (default head: HEAD). Commands are never included.

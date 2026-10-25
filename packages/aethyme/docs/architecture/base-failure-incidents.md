@@ -60,13 +60,26 @@ pass adopts or repairs the new table idempotently.
 
 ## Delivery and qualification
 
-This change is the registry and broker-library boundary. CLI confirmation,
-current-base classification, start/pre-push/gate notices, ownership handoff and
-automatic resolution after a proven base run still need integration. Issue #760
-remains open. The existing path-overlap warnings and generated-file claims do
+The operator boundary adds `aethyme broker advanced gates incidents list`,
+`confirm <failed-run-id> <test-id>... --session <id> [--pr <number>]`, and
+`resolve <incident-id> <passing-run-id>`, each with optional `--json`. JSON is
+an array for every action, including a singleton confirmation or resolution;
+an empty list means no retained records, never that the base passes. Arity,
+positive IDs, identifier bounds and per-action flags are checked before broker
+state opens. Mutations refuse a read-only snapshot.
+
+Routine brief and full status show at most eight unresolved incidents plus an
+explicit omission count. Empty registries add no Git subprocesses. Each notice
+names the original owner and separates a matching fetched base from an earlier
+or unknown base. A matching commit does not establish profile equivalence with
+the current agent. Missing owner inventory is reported as absent, not dead.
+Opening an ordinary CLI broker still follows normal startup policy.
+
+Start/pre-push/gate notices, ownership handoff and automatic resolution after a
+proven base run still need integration. Issue #760 remains open. The existing path-overlap warnings and generated-file claims do
 not provide those incident notices.
 
 Deterministic tests cover duplicate ownership, unqualified/mismatched proof
-refusals, matching resolution and retry, open capacity, and schema repair. Native
+refusals, matching resolution and retry, open capacity, and schema repair. Broker CLI fixtures additionally cover profile-encoded confirmation, JSON/list parity, current-base advice, advancing the fetched base without changing prior records, and malformed-command refusal before broker state opens. Native
 execution is deferred to remote CI and the final combined local qualification;
 no local Cargo or live base-failure experiment is claimed by source inspection.

@@ -518,10 +518,11 @@ pub(super) fn run_gates(parsed: Parsed) -> Result<(), UsageError> {
         .first()
         .map(String::as_str)
         .ok_or(UsageError::Message(
-            "gates requires an action: draft, validate, doctor, manifest, scope, affected, semantic, run, or pre-push"
+            "gates requires an action: incidents, draft, validate, doctor, manifest, scope, affected, semantic, run, or pre-push"
                 .into(),
         ))?;
     match action {
+        "incidents" => run_gate_incidents(&parsed)?,
         "draft" => {
             let cwd = std::env::current_dir()
                 .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
@@ -954,7 +955,7 @@ pub(super) fn run_gates(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown gates action {other:?} — expected draft, validate, manifest, scope, affected, semantic, run, or pre-push"
+                "unknown gates action {other:?} — expected incidents, draft, validate, manifest, scope, affected, semantic, run, or pre-push"
             )));
         }
     }
@@ -1083,6 +1084,96 @@ pub(super) fn run_verify_loop(parsed: Parsed) -> Result<(), UsageError> {
         render_verify_loop_report(&report);
         if !report.ok {
             return Err(UsageError::Message("broker verify-loop failed".into()));
+        }
+    }
+    Ok(())
+}
+
+fn run_gate_incidents(parsed: &Parsed) -> Result<(), UsageError> {
+    const USAGE: &str = "gates incidents: list; confirm <failed-run-id> <test-id>... --session <id> [--pr <n>]; resolve <incident-id> <passing-run-id>";
+    let action = parsed
+        .positional
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| UsageError::Message(USAGE.into()))?;
+    let positive_id = |index: usize| -> Result<i64, UsageError> {
+        parsed
+            .positional
+            .get(index)
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(|| UsageError::Message(USAGE.into()))
+    };
+    // Validate the whole command before opening writable broker state.
+    match action {
+        "list" if parsed.positional.len() == 2 => {}
+        "confirm" if (4..=67).contains(&parsed.positional.len()) => {
+            positive_id(2)?;
+            if parsed.session.is_none_or(|id| id <= 0) || parsed.pr_number.is_some_and(|id| id <= 0)
+            {
+                return Err(UsageError::Message(USAGE.into()));
+            }
+            crate::base_incidents::normalize_test_ids(&parsed.positional[3..])
+                .map_err(|error| UsageError::Message(error.to_string()))?;
+        }
+        "resolve" if parsed.positional.len() == 4 => {
+            positive_id(2)?;
+            positive_id(3)?;
+        }
+        _ => return Err(UsageError::Message(USAGE.into())),
+    }
+    if parsed.read_only_snapshot && action != "list" {
+        return Err(UsageError::Message(
+            "incident mutations are unavailable in a read-only snapshot".into(),
+        ));
+    }
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let records = match action {
+        "list" => broker.base_failure_incidents()?,
+        "confirm" => vec![broker.confirm_base_failure_incident(
+            parsed.session.expect("validated session"),
+            positive_id(2)?,
+            &parsed.positional[3..],
+            parsed.pr_number,
+        )?],
+        "resolve" => vec![broker.resolve_base_failure_incident(positive_id(2)?, positive_id(3)?)?],
+        _ => unreachable!("validated action"),
+    };
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&records)?);
+    } else if records.is_empty() {
+        out!("No retained base-failure incidents. This does not establish a passing base.");
+    } else {
+        for record in records {
+            out!(
+                "incident {}: {} gate={} base={} owner=session {} repair_pr={}",
+                record.id,
+                if record.resolved_at.is_some() {
+                    "resolved"
+                } else {
+                    "unresolved"
+                },
+                record.gate_name,
+                record.base_commit,
+                record.owner_session_id,
+                record
+                    .repair_pr
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unassigned".into())
+            );
+            out!(
+                "  test ids (operator supplied): {}",
+                record.test_ids.join(", ")
+            );
+            out!(
+                "  profile={} confirmed_run={} resolved_run={}",
+                record.execution_profile_hash,
+                record.confirmed_run_id,
+                record
+                    .resolved_run_id
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "none".into())
+            );
         }
     }
     Ok(())
