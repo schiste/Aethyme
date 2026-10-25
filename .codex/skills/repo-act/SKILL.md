@@ -87,6 +87,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Verify primary and existing linked checkouts at each interruption checkpoint,
   including explicit core.worktree and a bare primary; keep new session settings
   isolated and distinguish quiescent byte rollback from safe live migration.
+  Stage core.repositoryformatversion=1 with the extension when relying on
+  unknown-extension refusal, and verify refusal plus exact-byte restoration.
+  A probe with a current client does not qualify an actual unsupported client;
+  test the real older executable separately, never a substituted version string.
 - For Git ref-backend benchmarks, compare both loose and packed files-backend
   refs with reftable at matching counts. Record actual ref layout and shared
   object history; the backend name alone does not define a fair baseline.
