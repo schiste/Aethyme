@@ -1,4 +1,5 @@
-//! Synthetic, fully owned repository. No gate execution or provider calls.
+//! Synthetic, fully owned repositories. No provider calls.
+//! Most cases use recorded proof rows; the final case executes a tiny shell gate.
 use aethyme_broker::{
     GateCacheProvenance, GateEnvironment, GateFailureClass, GateStatus, NewGateResult, NewSession,
     SessionOrigin,
@@ -57,6 +58,10 @@ fn json(output: Output) -> serde_json::Value {
 }
 
 fn fixture() -> (common::FixtureRepository, i64, i64) {
+    fixture_with_gates("[[gate]]\nname='unit'\ncommand='exit 1'\n")
+}
+
+fn fixture_with_gates(gates: &str) -> (common::FixtureRepository, i64, i64) {
     let root = common::FixtureRepository::new();
     std::fs::create_dir_all(root.owner_path().join("home")).unwrap();
     std::fs::write(root.owner_path().join("empty-global"), "").unwrap();
@@ -69,9 +74,13 @@ fn fixture() -> (common::FixtureRepository, i64, i64) {
         "[cleanup]\nauto_remove=false\n[graph]\nauthority='disabled'\n",
     )
     .unwrap();
-    let gates = "[[gate]]\nname='unit'\ncommand='exit 1'\n";
     std::fs::write(root.path().join(".aethyme/gates.toml"), gates).unwrap();
     std::fs::write(root.path().join("tracked.txt"), "base\n").unwrap();
+    std::fs::write(
+        root.path().join(".gitignore"),
+        "/.aethyme/*\n!/.aethyme/gates.toml\n!/.aethyme/config.toml\n",
+    )
+    .unwrap();
     git(
         &root,
         &[
@@ -79,6 +88,7 @@ fn fixture() -> (common::FixtureRepository, i64, i64) {
             ".aethyme/gates.toml",
             ".aethyme/config.toml",
             "tracked.txt",
+            ".gitignore",
         ],
     );
     git(&root, &["commit", "-qm", "fixture"]);
@@ -365,4 +375,83 @@ fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_livene
         // an owner. The notices must not turn either refusal into success.
         assert!(!result.status.success());
     }
+}
+
+#[test]
+fn executed_gate_resolves_only_after_passing_tree_is_the_fetched_default() {
+    // A deterministic synthetic command, not a Cargo build or a real project
+    // test. The marker lives under .git and cannot change the source tree.
+    let gates = "[[gate]]\nname='unit'\ncommand=\"if test -f .git/allow-pass; then exit 0; else echo 'test failed'; exit 1; fi\"\n";
+    let (root, owner, _) = fixture_with_gates(gates);
+    let mut broker = common::open_fixture_repository_broker(&root).unwrap();
+    let failed = broker
+        .run_all_gates_with_policy(root.path(), aethyme_broker::CachePolicy::Bypass)
+        .unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].status, GateStatus::Fail);
+    assert!(!failed[0].cached);
+    let base_tree = git(&root, &["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(
+        failed[0].tree_hash, base_tree,
+        "fixture must run the exact base tree"
+    );
+    let profile = failed[0]
+        .cache_provenance
+        .as_ref()
+        .unwrap()
+        .execution_profile_digest
+        .clone()
+        .expect("complete production execution profile");
+    let incident = broker
+        .confirm_base_failure_incident(
+            owner,
+            failed[0].run_id.unwrap(),
+            &["unit::synthetic".into()],
+            None,
+        )
+        .unwrap();
+    assert_eq!(incident.execution_profile_hash, profile);
+
+    std::fs::write(root.path().join("tracked.txt"), "feature repair\n").unwrap();
+    git(&root, &["add", "tracked.txt"]);
+    git(&root, &["commit", "-qm", "fixture feature repair"]);
+    std::fs::write(root.path().join(".git/allow-pass"), "pass\n").unwrap();
+    let passed = broker
+        .run_all_gates_with_policy(root.path(), aethyme_broker::CachePolicy::Bypass)
+        .unwrap();
+    assert_eq!(passed.len(), 1);
+    assert_eq!(passed[0].status, GateStatus::Pass);
+    assert!(!passed[0].cached);
+    assert_eq!(
+        passed[0]
+            .cache_provenance
+            .as_ref()
+            .unwrap()
+            .execution_profile_digest
+            .as_deref(),
+        Some(profile.as_str())
+    );
+    assert_eq!(
+        broker.base_failure_incidents().unwrap(),
+        vec![incident.clone()],
+        "feature pass must not resolve a base incident"
+    );
+
+    let next = git(&root, &["rev-parse", "HEAD"]);
+    git(&root, &["update-ref", "refs/remotes/origin/main", &next]);
+    let proven = broker
+        .run_all_gates_with_policy(root.path(), aethyme_broker::CachePolicy::Bypass)
+        .unwrap();
+    assert_eq!(proven.len(), 1);
+    assert_eq!(proven[0].status, GateStatus::Pass);
+    assert!(!proven[0].cached);
+    let records = broker.base_failure_incidents().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].resolved_run_id, proven[0].run_id);
+    assert_eq!(
+        records[0].resolved_base_commit.as_deref(),
+        Some(next.as_str())
+    );
+    assert!(records[0].resolved_at.is_some());
+    assert_eq!(records[0].owner_session_id, owner);
 }

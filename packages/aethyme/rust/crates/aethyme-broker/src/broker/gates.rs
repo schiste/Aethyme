@@ -762,7 +762,7 @@ impl Broker {
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
         let storage = self.storage_context().gate_storage_locations();
-        crate::gates::run_affected_in(
+        let outcomes = crate::gates::run_affected_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -771,7 +771,9 @@ impl Broker {
             Some(session_id),
             cache_policy,
             storage,
-        )
+        )?;
+        self.settle_base_failure_incidents(&outcomes);
+        Ok(outcomes)
     }
 
     /// Run one configured gate for a session, regardless of whether its
@@ -786,7 +788,7 @@ impl Broker {
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
         let storage = self.storage_context().gate_storage_locations();
-        crate::gates::run_named_in(
+        let outcomes = crate::gates::run_named_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -796,7 +798,9 @@ impl Broker {
             Some(session_id),
             cache_policy,
             storage,
-        )
+        )?;
+        self.settle_base_failure_incidents(&outcomes);
+        Ok(outcomes)
     }
 
     /// Test/non-CLI entrypoint for gate runs with injectable progress
@@ -822,7 +826,7 @@ impl Broker {
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
         let storage = self.storage_context().gate_storage_locations();
-        crate::gates::run_affected_with_progress_in(
+        let outcomes = crate::gates::run_affected_with_progress_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -834,7 +838,9 @@ impl Broker {
                 progress,
             },
             storage,
-        )
+        )?;
+        self.settle_base_failure_incidents(&outcomes);
+        Ok(outcomes)
     }
 
     /// Cancel this session's in-flight gate runs whose tree differs from
@@ -880,7 +886,7 @@ impl Broker {
         self.warn_base_failure_incidents();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let storage = self.storage_context().gate_storage_locations();
-        crate::gates::run_all_in(
+        let outcomes = crate::gates::run_all_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -888,7 +894,9 @@ impl Broker {
             None,
             cache_policy,
             storage,
-        )
+        )?;
+        self.settle_base_failure_incidents(&outcomes);
+        Ok(outcomes)
     }
 
     /// Run one configured gate against the checkout containing `dir`.
@@ -904,7 +912,7 @@ impl Broker {
         self.warn_base_failure_incidents();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let storage = self.storage_context().gate_storage_locations();
-        crate::gates::run_named_in(
+        let outcomes = crate::gates::run_named_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -914,7 +922,9 @@ impl Broker {
             None,
             cache_policy,
             storage,
-        )
+        )?;
+        self.settle_base_failure_incidents(&outcomes);
+        Ok(outcomes)
     }
 
     /// Validate Git's exact outgoing tip, then run the repository's complete
@@ -963,7 +973,7 @@ impl Broker {
         self.warn_base_failure_incidents();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let storage = self.storage_context().gate_storage_locations();
-        crate::gates::run_all_with_progress_in(
+        let outcomes = crate::gates::run_all_with_progress_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -972,7 +982,9 @@ impl Broker {
             cache_policy,
             progress,
             storage,
-        )
+        )?;
+        self.settle_base_failure_incidents(&outcomes);
+        Ok(outcomes)
     }
 
     pub(super) fn gate_inputs(

@@ -34,8 +34,9 @@ An immediate SQLite transaction checks the live owner and gate row and chooses
 the incident identity `(base commit, gate name, definition hash, profile hash)`.
 The first confirmation owns it. Duplicate confirmation returns that exact
 incident, preserving its owner, test identifiers and PR annotation. A quiet or
-closed owner is never silently replaced. Explicit ownership handoff is available through the operator boundary below;
-a closed session does not erase an unresolved incident.
+closed owner is never silently replaced. Explicit ownership handoff is available
+through the operator boundary below; a closed session does not erase an
+unresolved incident.
 
 ## Resolution and retention
 
@@ -89,8 +90,14 @@ explicit local operator action; quiet/absent status never triggers it. Other
 proof fields and the original confirmation remain unchanged. Event history is
 subject to its normal retention policy.
 
-Automatic resolution after a proven base run still needs integration. Issue
-#760 remains open. The existing path-overlap warnings and generated-file claims do
+Session/all/named gate execution also reconciles newly executed passing results
+against unresolved incidents after the gate runner records them. A matching
+current fetched-default tree, gate definition and execution profile are required;
+the transaction rechecks the stored proof and chronology. Cache hits cannot
+trigger this automatic settlement. Registry errors emit diagnostics and preserve
+the gate outcomes. Submit/ship paths that call the lower-level runner directly
+are outside this hook; explicit resolution remains available. Issue #760 remains
+open until end-to-end qualification and remaining execution paths are assessed. The existing path-overlap warnings and generated-file claims do
 not provide those incident notices.
 
 Deterministic tests cover duplicate ownership, unqualified/mismatched proof
