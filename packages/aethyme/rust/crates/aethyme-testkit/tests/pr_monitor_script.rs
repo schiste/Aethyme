@@ -12,6 +12,8 @@ fn the_monitor_starts_the_delivery_adapter_only_when_the_outbox_has_work() {
         .arg(script)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("AETHYME_PR_MONITOR_RECORD_HEALTH")
+        .env_remove("AETHYME_PR_MONITOR_BROKER_SHA256")
+        .env_remove("AETHYME_PR_MONITOR_GENERATION")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -36,6 +38,8 @@ fn the_delivery_adapter_protocol_and_budget_controls_pass() {
         .arg(script)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("AETHYME_PR_MONITOR_RECORD_HEALTH")
+        .env_remove("AETHYME_PR_MONITOR_BROKER_SHA256")
+        .env_remove("AETHYME_PR_MONITOR_GENERATION")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -69,6 +73,8 @@ fn the_monitor_health_controls_are_private_bounded_and_do_not_claim_delivery() {
         .arg(script)
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("AETHYME_PR_MONITOR_RECORD_HEALTH")
+        .env_remove("AETHYME_PR_MONITOR_BROKER_SHA256")
+        .env_remove("AETHYME_PR_MONITOR_GENERATION")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -79,6 +85,30 @@ fn the_monitor_health_controls_are_private_bounded_and_do_not_claim_delivery() {
         "test_symlinks_hardlinks_directories_and_oversized_records_are_refused",
         "test_failed_atomic_publication_preserves_previous_record_and_resumes_scratch",
         "test_zero_adapter_exit_is_attempted_and_never_claims_sent",
+    ] {
+        assert!(stderr.contains(name), "missing control {name}: {stderr}");
+    }
+}
+
+#[test]
+fn the_monitor_identity_controls_refuse_changed_runtime_before_dispatch() {
+    let script = aethyme_testkit::paths::repo_root()
+        .join("packages/aethyme/scripts/adapters/test_pr_monitor_identity.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("AETHYME_PR_MONITOR_RECORD_HEALTH")
+        .env_remove("AETHYME_PR_MONITOR_BROKER_SHA256")
+        .env_remove("AETHYME_PR_MONITOR_GENERATION")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("Ran 10 tests"), "{stderr}");
+    for name in [
+        "test_changed_broker_stops_provider_and_records_failed_bound_generation",
+        "test_named_path_replacement_during_hashing_cannot_borrow_old_identity",
+        "test_real_isolated_helper_pair_writes_bound_health_without_bytecode",
     ] {
         assert!(stderr.contains(name), "missing control {name}: {stderr}");
     }

@@ -10,6 +10,7 @@ work for the next scheduled invocation, without retrying this pass.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -92,7 +93,7 @@ def run_pass(repo, broker, worker, limit, budget=None, report=None):
 
 
 HEALTH_BYTES = 4096
-HEALTH_FIELDS = {"schema", "finished_unix_ms", "outcome", "tick", "outbox", "delivery", "failure_kind"}
+HEALTH_FIELDS = {"schema", "finished_unix_ms", "outcome", "tick", "outbox", "delivery", "failure_kind", "generation", "identity"}
 
 
 def write_health(report):
@@ -148,22 +149,70 @@ def write_health(report):
         os.close(directory)
 
 
+MAX_BINARY_BYTES = 256 * 1024 * 1024
+
+
+def sha256_token(value):
+    return len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def verify_broker_identity(broker, expected, budget):
+    """Check a pinned regular executable before dispatch, within the pass budget."""
+    if not sha256_token(expected) or not Path(broker).is_absolute():
+        raise ValueError("broker identity requires an absolute path and SHA-256")
+    if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC")):
+        raise ValueError("broker identity pinning requires a Unix host")
+    budget.remaining()
+    descriptor = os.open(broker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode) or not before.st_mode & 0o111 or before.st_size > MAX_BINARY_BYTES:
+            raise ValueError("pinned broker is not a bounded regular executable")
+        identity = hashlib.sha256()
+        total = 0
+        while True:
+            budget.remaining()
+            chunk = source.read(min(64 * 1024, MAX_BINARY_BYTES + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_BINARY_BYTES:
+                raise ValueError("pinned broker grew beyond the identity budget")
+            identity.update(chunk)
+        after = os.fstat(source.fileno())
+    named = os.stat(broker, follow_symlinks=False)
+    stamp = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    budget.remaining()
+    if stamp(before) != stamp(after) or stamp(after) != stamp(named) or identity.hexdigest() != expected:
+        raise ValueError("pinned broker identity changed; review and reinstall the service")
+
+
 def main():
     log = PassLog(sys.stdout)
     health = os.environ.get("AETHYME_PR_MONITOR_RECORD_HEALTH") == "1"
     report = {"schema": "aethyme.pr-monitor-health/v1", "outcome": "stopped",
               "tick": "unknown", "outbox": "unknown", "delivery": "not_started",
-              "failure_kind": None}
+              "failure_kind": None, "generation": None, "identity": "not_configured"}
     with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
         try:
             arguments = (os.environ["AETHYME_PR_MONITOR_REPO"],
                          os.environ.get("AETHYME_BROKER_BIN") or "aethyme",
                          os.environ.get("AETHYME_PR_MONITOR_WORKER") or "launchd-" + socket.gethostname().split(".")[0],
                          int(os.environ.get("AETHYME_PR_MONITOR_LIMIT") or "20"))
-            if health:
-                run_pass(*arguments, report=report)
-            else:
-                run_pass(*arguments)
+            expected = os.environ.get("AETHYME_PR_MONITOR_BROKER_SHA256") or ""
+            generation = os.environ.get("AETHYME_PR_MONITOR_GENERATION") or ""
+            options = {"report": report} if health else {}
+            if expected or generation:
+                report["identity"] = "failed"
+                if sha256_token(generation):
+                    report["generation"] = generation
+                if not sha256_token(generation) or not sha256_token(expected):
+                    raise ValueError("service generation and broker identity must be configured together")
+                budget = adapter.Deadline(PASS_SECONDS)
+                verify_broker_identity(arguments[1], expected, budget)
+                report["identity"] = "verified"
+                options["budget"] = budget
+            run_pass(*arguments, **options)
             report["outcome"] = "completed"
         except (OSError, RuntimeError, ValueError, KeyError) as error:
             report["failure_kind"] = type(error).__name__
