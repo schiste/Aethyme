@@ -91,9 +91,10 @@ python3 broker_reuse.py --binary /pinned/bin/aethyme \
   --fixture-root /absolute/Playground --output /new/durable/report --run
 ```
 
-The fixture and output must not overlap. CLI/engine bytes are hashed before
+The fixture and output must not overlap. CLI/engine bytes and the three-file harness helper closure are hashed before
 execution and rechecked afterwards. The source baseline, Git common directory,
-origin and lockfile pins are verified. A retained exclusive attempt record
+origin and lockfile pins are verified; each measured checkout is rechecked
+before and after its phase, and gate evidence must name the frozen source tree. A retained exclusive attempt record
 prevents treating a partial run as a fresh cold sample. On failure inspect all
 receipts; create a new fixture for a new sample. No automatic retries, forced
 cleanup, source publication, notifications or provider calls are added.

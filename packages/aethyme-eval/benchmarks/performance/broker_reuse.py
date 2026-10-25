@@ -105,8 +105,8 @@ def load_fixture(root, source_root):
 
 
 def session_payload(payload, root, expected=None):
-    # `start` flattens the session; `start --reuse` serializes AdoptReport.
-    session = payload.get('session', payload) if isinstance(payload, dict) else {}
+    # Both SessionStartReport and AdoptReport flatten the session fields.
+    session = payload if isinstance(payload, dict) else {}
     identity = session.get('id')
     raw = session.get('worktree_path')
     if isinstance(identity, bool) or not isinstance(identity, int) or identity <= 0 or not isinstance(raw, str):
@@ -190,6 +190,8 @@ def matrix(command, binary, root, spec, verify_checkout):
 def run(binary, root, output, timeout):
     source = Path(__file__).resolve().parents[4]
     root, spec = load_fixture(root, source)
+    helpers = {name: hash_file(Path(__file__).with_name(name), 2 * 1024**2)
+               for name in ('broker_reuse.py', 'broker_concurrent_submit.py', 'broker_latency.py')}
     output = Path(output)
     if output.resolve().is_relative_to(root) or root.is_relative_to(output.resolve()):
         raise ValueError('receipts and measured fixture storage must be separate')
@@ -293,7 +295,7 @@ def run(binary, root, output, timeout):
                 raise RuntimeError('measured dependency lockfile changed')
 
     result = {'schema_version': 1, 'enforcement': 'diagnostic_only', 'binary': identity,
-              'fixture': spec, 'harness': hash_file(Path(__file__), 1024**2),
+              'fixture': spec, 'harness_helpers': helpers,
               'rows': matrix(command, str(binary), root, spec, verify_checkout),
               'limits': ['managed-store initial/warm order; OS page caches are uncontrolled',
                          'profile representativeness is an operator declaration, not automatically proven',
@@ -301,6 +303,9 @@ def run(binary, root, output, timeout):
                          'fixtures retained; do not share mutable dependency trees between worktrees',
                          'command wall intervals include spawn, output drain and owned-group settlement',
                          'the transport shims are not an OS network sandbox']}
+    for name, expected in helpers.items():
+        if hash_file(Path(__file__).with_name(name), 2 * 1024**2) != expected:
+            raise RuntimeError('measurement helper source changed during execution')
     if identity['engine'] is not None and hash_file(engine, MAX_BINARY_BYTES)['sha256'] != identity['engine']['sha256']:
         raise RuntimeError('engine binary changed during measurement')
     if hash_file(binary, MAX_BINARY_BYTES)['sha256'] != identity['sha256']:

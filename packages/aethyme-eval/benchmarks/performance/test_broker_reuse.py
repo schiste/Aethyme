@@ -1,5 +1,8 @@
 """Offline reuse protocol controls. No Cargo, broker, gates or preparation."""
 import copy
+import contextlib
+import io
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -7,7 +10,7 @@ import unittest
 from unittest import mock
 
 from broker_reuse import (PHASES, load_fixture, matrix, session_payload,
-                          storage, validate_gate, validate_preparation)
+                          storage, validate_gate, validate_preparation, main)
 
 
 class ReuseProtocolTests(unittest.TestCase):
@@ -66,7 +69,8 @@ class ReuseProtocolTests(unittest.TestCase):
             worktree.mkdir(parents=True)
             payload = {'id': 1, 'worktree_path': str(worktree)}
             self.assertEqual(session_payload(payload, root), (1, str(worktree)))
-            self.assertEqual(session_payload({'session': payload}, root), (1, str(worktree)))
+            with self.assertRaises(RuntimeError):
+                session_payload({'session': payload}, root)
             with self.assertRaisesRegex(RuntimeError, 'identity'):
                 session_payload(payload, root, expected=(2, str(worktree)))
             with self.assertRaises(RuntimeError):
@@ -124,6 +128,36 @@ class ReuseProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'different source tree'):
                 matrix(command, '/fake/aethyme', root, {'gate': 'verify', 'tree': 'other'},
                        lambda *args: None)
+
+    def test_read_only_plan_and_shim_stage_start_no_subprocess(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ('repo', 'home', 'tmp', 'remote.git'):
+                (root / name).mkdir()
+            (root / 'repo' / 'Cargo.lock').write_bytes(b'frozen dependency fixture')
+            marker = {'schema_version': 1, 'synthetic': True, 'profile': 'rust-heavy',
+                      'workload_description': 'Synthetic dependency workload for protocol controls only; not a representative timing result.',
+                      'baseline': 'a' * 40, 'gate': 'verify',
+                      'lockfiles': {'Cargo.lock': hashlib.sha256(b'frozen dependency fixture').hexdigest()}}
+            (root / 'PLAYGROUND.json').write_text(json.dumps(marker))
+            argv = ['broker_reuse.py', '--binary', '/not-executed/aethyme',
+                    '--fixture-root', str(root)]
+            initial = sorted(path.name for path in root.iterdir())
+            for stage in (False, True):
+                captured = io.StringIO()
+                with mock.patch('sys.argv', argv + (['--stage-shims'] if stage else [])), \
+                        mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected child')), \
+                        contextlib.redirect_stdout(captured):
+                    main()
+                result = json.loads(captured.getvalue())
+                self.assertEqual(result['native_commands_started'], 0)
+                self.assertFalse(result['execute'])
+                if not stage:
+                    self.assertEqual(sorted(path.name for path in root.iterdir()), initial)
+            self.assertTrue((root / 'bin' / 'ssh').is_file())
+            (root / 'repo' / 'Cargo.lock').write_bytes(b'drift')
+            with self.assertRaisesRegex(ValueError, 'pin'):
+                load_fixture(root, Path(__file__).parent)
 
     def test_marker_is_required_and_source_checkout_is_never_a_fixture(self):
         with tempfile.TemporaryDirectory() as temporary:
