@@ -339,6 +339,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   can block an ordinary read-only open before the type check. Verify bounded,
   stable bytes through that same descriptor; include a finite FIFO refusal
   control that cannot start the expensive work.
+- Recheck a long-lived controller's compatibility after acquiring a mutation
+  lock; an open-time check can go stale during the wait. State the transition
+  protocol separately: this check does not serialize migrations or protect
+  clients that predate it. Exercise the real mutation entrypoint with a
+  deterministic floor change at the lock boundary and assert data preservation.
 - Before adding strict validation or recovery for persisted data, inspect every
   production writer and test its exact serialized bytes. Accept only known
   producer encodings, and bind the exact observed bytes across plan/apply when
