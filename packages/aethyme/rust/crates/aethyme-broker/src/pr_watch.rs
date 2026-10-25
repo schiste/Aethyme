@@ -220,6 +220,8 @@ pub struct GithubCliPullRequestWatchProvider;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PullRequestWatchError {
+    #[error("watch tick provider budget exhausted; observation deferred")]
+    TickBudgetExhausted,
     #[error("invalid pull request watch: {0}")]
     Invalid(String),
     #[error("pull request watch {0} was not found")]
@@ -290,6 +292,7 @@ pub enum PullRequestSchedulerDisposition {
     Polled,
     Failed,
     DeferredByRateLimit,
+    DeferredByBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,6 +338,15 @@ impl PullRequestWatchProvider for GithubCliPullRequestWatchProvider {
         &self,
         request: &PullRequestWatchRequest,
     ) -> Result<PullRequestSnapshot, PullRequestWatchError> {
+        Self::inspect_with_deadline(request, std::time::Duration::from_secs(3))
+    }
+}
+
+impl GithubCliPullRequestWatchProvider {
+    pub(crate) fn inspect_with_deadline(
+        request: &PullRequestWatchRequest,
+        deadline: std::time::Duration,
+    ) -> Result<PullRequestSnapshot, PullRequestWatchError> {
         // `createdAt` and `mergedAt` are requested for `broker advanced
         // insights`, not for the snapshot: they are the provider's own record
         // of when the pull request opened and merged, and no amount of polling
@@ -352,23 +364,26 @@ impl PullRequestWatchProvider for GithubCliPullRequestWatchProvider {
             "--json",
             fields,
         ]);
-        let output = match crate::bounded_output::output_limited(
-            &mut command,
-            std::time::Duration::from_secs(3),
-            4 * 1024 * 1024,
-        )? {
-            crate::bounded_output::LimitedOutput::Completed(output) => output,
-            crate::bounded_output::LimitedOutput::Deadline => {
-                return Err(PullRequestWatchError::Provider(
-                    "PR observation exceeded its three-second deadline".into(),
-                ));
-            }
-            crate::bounded_output::LimitedOutput::OutputLimit => {
-                return Err(PullRequestWatchError::Provider(
-                    "PR observation exceeded its output budget".into(),
-                ));
-            }
-        };
+        let output =
+            match crate::bounded_output::output_limited(&mut command, deadline, 4 * 1024 * 1024)? {
+                crate::bounded_output::LimitedOutput::Completed(output) => output,
+                crate::bounded_output::LimitedOutput::Deadline => {
+                    let reason = if deadline == std::time::Duration::from_secs(3) {
+                        "PR observation exceeded its three-second deadline".to_string()
+                    } else {
+                        format!(
+                            "PR observation exceeded its {}ms deadline",
+                            deadline.as_millis()
+                        )
+                    };
+                    return Err(PullRequestWatchError::Provider(reason));
+                }
+                crate::bounded_output::LimitedOutput::OutputLimit => {
+                    return Err(PullRequestWatchError::Provider(
+                        "PR observation exceeded its output budget".into(),
+                    ));
+                }
+            };
         if !output.status.success() {
             return Err(PullRequestWatchError::Provider(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -859,6 +874,23 @@ impl Broker {
                     retry_at: poll.watch.next_poll_at,
                     poll: Some(poll),
                 }),
+                Err(BrokerOpError::PullRequestWatch(
+                    PullRequestWatchError::TickBudgetExhausted,
+                )) => {
+                    // No provider dispatch occurred. Preserve the due cursor and
+                    // previous error verbatim so the next tick can resume.
+                    results.push(PullRequestSchedulerWatchResult {
+                        watch_id: watch.id,
+                        canonical_repository: watch.canonical_repository,
+                        pr_number: watch.pr_number,
+                        due_at,
+                        attempted: false,
+                        disposition: PullRequestSchedulerDisposition::DeferredByBudget,
+                        error_code: Some("tick_budget_exhausted".into()),
+                        retry_at: watch.next_poll_at,
+                        poll: None,
+                    });
+                }
                 Err(BrokerOpError::PullRequestWatch(error)) => {
                     let (error_code, is_rate_limit, retry_at) =
                         scheduler_failure(&error, &watch, now_ms);
@@ -913,7 +945,11 @@ impl Broker {
             deferred_watch_count: results
                 .iter()
                 .filter(|item| {
-                    item.disposition == PullRequestSchedulerDisposition::DeferredByRateLimit
+                    matches!(
+                        item.disposition,
+                        PullRequestSchedulerDisposition::DeferredByRateLimit
+                            | PullRequestSchedulerDisposition::DeferredByBudget
+                    )
                 })
                 .count(),
             rate_limit_until,
@@ -985,6 +1021,9 @@ fn scheduler_failure(
 ) -> (&'static str, bool, i64) {
     let base_seconds = watch.poll_interval_seconds.max(15);
     let (code, rate_limited, retry_seconds) = match error {
+        PullRequestWatchError::TickBudgetExhausted => {
+            unreachable!("handled before failure recording")
+        }
         PullRequestWatchError::Spawn(_) => ("provider_unavailable", false, base_seconds * 2),
         PullRequestWatchError::Json(_) => ("invalid_provider_payload", false, 300),
         PullRequestWatchError::Invalid(_) | PullRequestWatchError::NotFound(_) => {

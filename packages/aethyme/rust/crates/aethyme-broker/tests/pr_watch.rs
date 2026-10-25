@@ -822,7 +822,16 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
 #[test]
 fn cli_tick_refuses_a_competing_owner_then_succeeds_after_release() {
     const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
-    let (root, broker, _session_id) = broker_fixture();
+    let (root, mut broker, session_id) = broker_fixture();
+    let repository = broker
+        .start_repository_watch(
+            session_id,
+            "owner/future",
+            &aethyme_broker::RepositoryWatchOptions::default(),
+            &FakeRepositoryProvider(Mutex::new(VecDeque::from([vec![]]))),
+            4_000_000_000_000,
+        )
+        .unwrap();
     let run_dir = root.path().join(".aethyme/run");
     std::fs::create_dir_all(&run_dir).unwrap();
     let claim = std::fs::OpenOptions::new()
@@ -863,6 +872,11 @@ fn cli_tick_refuses_a_competing_owner_then_succeeds_after_release() {
     let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
     assert_eq!(report["attempted_watch_count"], 0);
     assert_eq!(report["repository_watches"]["polled_watch_count"], 0);
+    assert_eq!(report["provider_budget"]["max_calls"], 8);
+    assert_eq!(report["provider_budget"]["max_calls_per_phase"], 4);
+    assert_eq!(report["provider_budget"]["deadline_ms"], 30_000);
+    assert_eq!(report["provider_budget"]["calls"], 0);
+    assert_eq!(report["next_tick_at"], repository.next_poll_at.unwrap());
 }
 
 struct FakeRepositoryProvider(Mutex<VecDeque<Vec<aethyme_broker::RepositoryPullRequest>>>);
@@ -1133,4 +1147,166 @@ fn repository_delivery_uses_shared_backoff_and_generation_fencing() {
         )
         .unwrap();
     assert_eq!(delivered.status, DeliveryStatus::Delivered);
+}
+
+#[test]
+fn scheduler_budget_defers_without_mutating_due_watch_and_resumes_it_first() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let seed = ResultProvider(Mutex::new(VecDeque::from([
+        Ok(snapshot("open", 'a', &[])),
+        Ok(snapshot("open", 'b', &[])),
+    ])));
+    let mut watches = Vec::new();
+    for repository in ["Owner/Alpha", "Owner/Beta"] {
+        watches.push(
+            broker
+                .start_pull_request_watch(
+                    session_id,
+                    repository,
+                    7,
+                    vec![PullRequestActivityKind::Comment],
+                    15,
+                    &seed,
+                    1_000,
+                )
+                .unwrap(),
+        );
+    }
+    let provider = ResultProvider(Mutex::new(VecDeque::from([
+        Err(PullRequestWatchError::TickBudgetExhausted),
+        Ok(snapshot("open", 'b', &[])),
+        Ok(snapshot("open", 'a', &["later"])),
+    ])));
+    let tick = broker
+        .tick_pull_request_watches(&provider, 16_000, 10)
+        .unwrap();
+    assert_eq!(tick.failed_watch_count, 0);
+    assert_eq!(tick.attempted_watch_count, 1);
+    assert_eq!(tick.deferred_watch_count, 1);
+    assert_eq!(
+        tick.results[0].disposition,
+        aethyme_broker::PullRequestSchedulerDisposition::DeferredByBudget
+    );
+    assert!(!tick.results[0].attempted);
+    assert_eq!(
+        broker.pull_request_watch(watches[0].id).unwrap(),
+        watches[0]
+    );
+    assert_eq!(tick.next_tick_at, Some(16_000));
+    let resumed = broker
+        .tick_pull_request_watches(&provider, 16_001, 10)
+        .unwrap();
+    assert_eq!(resumed.due_watch_count, 1);
+    assert_eq!(resumed.results[0].watch_id, watches[0].id);
+    assert_eq!(resumed.successful_watch_count, 1);
+    assert!(provider.0.lock().unwrap().is_empty());
+}
+
+struct ResultRepositoryProvider(
+    Mutex<VecDeque<Result<Vec<aethyme_broker::RepositoryPullRequest>, PullRequestWatchError>>>,
+);
+
+impl aethyme_broker::RepositoryWatchProvider for ResultRepositoryProvider {
+    fn list_open(
+        &self,
+        _repository: &str,
+        _limit: usize,
+    ) -> Result<Vec<aethyme_broker::RepositoryPullRequest>, PullRequestWatchError> {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected provider call")
+    }
+}
+
+#[test]
+fn repository_listing_budget_preserves_watch_cursor_and_existing_event() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    // include_existing skips the initial listing: the first provider call is
+    // the tick being deferred, not watch creation.
+    let provider = ResultRepositoryProvider(Mutex::new(VecDeque::from([
+        Err(PullRequestWatchError::TickBudgetExhausted),
+        Ok(vec![repository_pr()]),
+    ])));
+    let watch = broker
+        .start_repository_watch(
+            session_id,
+            "owner/repo",
+            &aethyme_broker::RepositoryWatchOptions {
+                include_existing: true,
+                poll_interval_seconds: 15,
+                ..Default::default()
+            },
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    let pr_provider = ResultProvider(Mutex::new(VecDeque::new()));
+    let deferred = broker
+        .tick_repository_watches(&provider, &pr_provider, 16_000, 1)
+        .unwrap();
+    assert_eq!(deferred.failed_watch_count, 0);
+    assert_eq!(deferred.polled_watch_count, 0);
+    assert_eq!(deferred.deferred_watch_count, 1);
+    assert!(deferred.results[0].budget_deferred);
+    assert!(deferred.results[0].error_code.is_none());
+    assert_eq!(broker.repository_watch(watch.id).unwrap(), watch);
+    let resumed = broker
+        .tick_repository_watches(&provider, &pr_provider, 16_001, 1)
+        .unwrap();
+    assert_eq!(resumed.polled_watch_count, 1);
+    assert_eq!(resumed.event_count, 1);
+    assert_eq!(broker.repository_watch_events(watch.id).unwrap().len(), 1);
+    assert!(provider.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn repository_auto_watch_budget_keeps_durable_intent_for_next_tick() {
+    let (_root, mut broker, session_id) = broker_fixture();
+    let provider = FakeRepositoryProvider(Mutex::new(VecDeque::from([
+        vec![repository_pr()],
+        vec![repository_pr()],
+        vec![repository_pr()],
+    ])));
+    let watch = broker
+        .start_repository_watch(
+            session_id,
+            "owner/repo",
+            &aethyme_broker::RepositoryWatchOptions {
+                include_existing: true,
+                auto_watch: true,
+                poll_interval_seconds: 15,
+                ..Default::default()
+            },
+            &provider,
+            1_000,
+        )
+        .unwrap();
+    let pr_provider = ResultProvider(Mutex::new(VecDeque::from([
+        Err(PullRequestWatchError::TickBudgetExhausted),
+        Ok(snapshot("open", 'a', &[])),
+    ])));
+    let deferred = broker
+        .tick_repository_watches(&provider, &pr_provider, 16_000, 1)
+        .unwrap();
+    assert_eq!(deferred.event_count, 1);
+    assert_eq!(deferred.failed_watch_count, 0);
+    assert_eq!(deferred.deferred_watch_count, 1);
+    assert!(deferred.results[0].budget_deferred);
+    assert!(deferred.results[0].error_code.is_none());
+    assert!(
+        broker
+            .repository_watch(watch.id)
+            .unwrap()
+            .last_error_code
+            .is_none()
+    );
+    assert!(broker.pull_request_watches(true).unwrap().is_empty());
+    let resumed = broker
+        .tick_repository_watches(&provider, &pr_provider, 31_000, 1)
+        .unwrap();
+    assert_eq!(resumed.event_count, 0, "durable events must not replay");
+    assert_eq!(resumed.results[0].auto_watched.len(), 1);
+    assert_eq!(broker.repository_watch_events(watch.id).unwrap().len(), 1);
 }
