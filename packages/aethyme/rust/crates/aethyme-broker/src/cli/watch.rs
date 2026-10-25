@@ -86,6 +86,9 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                     .into(),
             )
         })?;
+    if action == "service" {
+        return run_service_plan(&parsed);
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
         "monitoring" => {
@@ -1064,4 +1067,71 @@ pub(super) fn run_pr(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+// Validate the entire request before opening even a read-only broker snapshot.
+fn run_service_plan(parsed: &Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 3 || parsed.positional[2] != "plan" {
+        return Err(UsageError::Message(
+            "watch pr service requires plan --broker-bin <absolute-router>".into(),
+        ));
+    }
+    let binary = parsed
+        .broker_bin
+        .as_deref()
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| {
+            UsageError::Message("service plan requires --broker-bin <absolute-router>".into())
+        })?;
+    let seconds = parsed.seconds.unwrap_or(300);
+    if !(120..=3600).contains(&seconds) {
+        return Err(UsageError::Message(
+            "service interval must be 120..3600 seconds".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+            UsageError::Message("service planning requires an absolute HOME".into())
+        })?;
+        if !home.is_absolute() || !home.is_dir() {
+            return Err(UsageError::Message(
+                "service planning requires an existing absolute HOME directory".into(),
+            ));
+        }
+        let broker = open_broker(true)?;
+        let uuid = broker.store().binding_scope.as_ref()
+            .and_then(|scope| scope.repository_uuid.as_deref())
+            .ok_or_else(|| UsageError::Message("service planning requires an existing repository UUID; complete broker repository binding first".into()))?;
+        // Read-only identity lookup: this command never creates a UUID or a service.
+        // SAFETY: geteuid has no pointer arguments and only reads the effective uid.
+        let uid = unsafe { libc::geteuid() };
+        let plan = crate::pr_watch_service::Plan::new(
+            broker.main_root(),
+            uuid,
+            &home,
+            binary,
+            Path::new("/usr/bin/python3"),
+            seconds,
+            uid,
+        )?;
+        if parsed.json {
+            out!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            out!("macOS PR-watch service plan: {}", plan.digest);
+            out!("Repository: {}", plan.repository.display());
+            out!("Unit: {}", plan.unit_path.display());
+            out!("Helpers: {}", plan.directory.display());
+            out!("Interval: {} seconds", plan.interval_seconds);
+            out!("Plan only: installation, health reporting and activation are not available yet.");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let (_binary, _seconds) = (binary, seconds);
+        Err(UsageError::Message(
+            "macOS service planning requires a Unix host".into(),
+        ))
+    }
 }

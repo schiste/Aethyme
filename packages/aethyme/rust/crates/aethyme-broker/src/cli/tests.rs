@@ -1605,3 +1605,61 @@ fn a_partial_report_write_suppresses_fallback_json_and_keeps_its_exit_code() {
     assert_eq!(code, crate::exit_status::REFUSED);
     assert_eq!(rendering, ErrorRendering::Diagnostic(recovery.into()));
 }
+
+#[test]
+fn service_plan_flags_are_scoped_to_the_read_only_plan_command() {
+    let args = [
+        "pr",
+        "service",
+        "plan",
+        "--broker-bin",
+        "/pinned/router",
+        "--seconds",
+        "300",
+        "--json",
+    ]
+    .map(str::to_owned);
+    let parsed = super::parse(&args).unwrap();
+    super::validate_flags("watch", &parsed).unwrap();
+    assert_eq!(
+        parsed.broker_bin.as_deref(),
+        Some(std::path::Path::new("/pinned/router"))
+    );
+    assert_eq!(parsed.seconds, Some(300));
+    assert!(parsed.json);
+    let args = ["pr", "tick", "--broker-bin", "/pinned/router"].map(str::to_owned);
+    let parsed = super::parse(&args).unwrap();
+    assert!(super::validate_flags("watch", &parsed).is_err());
+}
+
+#[test]
+fn invalid_service_plan_requests_refuse_before_broker_discovery() {
+    for (args, expected) in [
+        (vec!["pr", "service", "activate"], "requires plan"),
+        (vec!["pr", "service", "plan", "extra"], "requires plan"),
+        (vec!["pr", "service", "plan"], "requires --broker-bin"),
+        (
+            vec!["pr", "service", "plan", "--broker-bin", "relative"],
+            "requires --broker-bin",
+        ),
+        (
+            vec![
+                "pr",
+                "service",
+                "plan",
+                "--broker-bin",
+                "/missing",
+                "--seconds",
+                "119",
+            ],
+            "120..3600",
+        ),
+    ] {
+        let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let parsed = super::parse(&args).unwrap();
+        let Err(UsageError::Message(message)) = super::watch::run_pull_request_watch(parsed) else {
+            panic!("invalid service plan must refuse before repository lookup");
+        };
+        assert!(message.contains(expected), "{message}");
+    }
+}
