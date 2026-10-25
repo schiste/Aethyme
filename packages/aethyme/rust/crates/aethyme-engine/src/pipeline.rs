@@ -121,7 +121,11 @@ pub fn build_context_pack(root: &Path, map: &RepositoryMap, task: TaskInput) -> 
             functions_count: map.functions.len(),
             classes_count: map.classes.len(),
             docs_count: map.docs.len(),
-            configs_count: map.configs.len(),
+            configs_count: map
+                .configs
+                .iter()
+                .filter(|config| config.value.is_none())
+                .count(),
         },
         signals,
         overview,

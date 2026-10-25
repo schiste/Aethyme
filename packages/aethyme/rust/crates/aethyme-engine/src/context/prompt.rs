@@ -119,6 +119,7 @@ fn build_overview_context(root: &Path, map: &RepositoryMap) -> String {
     let manifests: Vec<&str> = map
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|c| {
             !c.path.contains('/')
                 && matches!(
@@ -429,6 +430,7 @@ fn build_testing_context(root: &Path, map: &RepositoryMap) -> String {
     let test_configs: Vec<&str> = map
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|c| {
             let name = c.path.rsplit('/').next().unwrap_or(&c.path);
             name.contains("test")
@@ -539,12 +541,19 @@ fn build_docs_context(_root: &Path, map: &RepositoryMap) -> String {
 fn build_configs_context(root: &Path, map: &RepositoryMap) -> String {
     let mut sections = Vec::new();
 
-    sections.push(format!("**Configuration files:** {}\n", map.configs.len()));
+    sections.push(format!(
+        "**Configuration files:** {}\n",
+        map.configs
+            .iter()
+            .filter(|config| config.value.is_none())
+            .count()
+    ));
 
     // Root-level configs with excerpts
     let root_configs: Vec<&str> = map
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|c| !c.path.contains('/'))
         .map(|c| c.path.as_str())
         .collect();

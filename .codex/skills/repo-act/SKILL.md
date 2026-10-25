@@ -39,6 +39,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   named checkout before materialization. Overlay identities can depend on the
   current checkout name while fragment identities retain the indexing name.
   Invalidate derived caches when correcting their persisted semantic projection.
+  When adding finer-grained nodes to an existing collection, audit every
+  consumer's granularity: file counts, overview ranking, excerpts and file
+  diagnostics must not count each key or section as another physical file.
+  Add a regression comparing file-level behavior with those extra nodes removed.
 - For commands protected by repository-relative artifact claims, verify that
   the named session owns the checkout and the generator runs at its root. Test
   nested-directory and wrong-worktree refusals before dispatch; a normalized

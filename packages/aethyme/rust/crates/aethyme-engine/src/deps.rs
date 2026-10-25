@@ -12,7 +12,7 @@ pub struct ExternalDep {
 
 pub fn extract_external_deps(root: &Path, configs: &[ConfigNode]) -> Vec<ExternalDep> {
     let mut deps = Vec::new();
-    for config in configs {
+    for config in configs.iter().filter(|config| config.value.is_none()) {
         let contents = fs::read_to_string(root.join(&config.path)).unwrap_or_default();
         match config.config_type.as_str() {
             "cargo" => deps.extend(extract_cargo_deps(&contents, &config.path)),

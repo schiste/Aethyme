@@ -1024,8 +1024,20 @@ fn doc(doc: &DocNode) -> String {
 }
 
 fn config(config: &ConfigNode) -> String {
+    let value = config.value.as_ref().map_or_else(
+        || "null".to_string(),
+        |value| {
+            format!(
+                "{{\"config_path\":{},\"value_hash\":{},\"start_line\":{},\"end_line\":{}}}",
+                string(&value.config_path),
+                string(&value.value_hash),
+                value.start_line,
+                value.end_line,
+            )
+        },
+    );
     format!(
-        "{{\"id\":{},\"file_id\":{},\"path\":{},\"config_type\":{},\"area_id\":{}}}",
+        "{{\"id\":{},\"file_id\":{},\"path\":{},\"config_type\":{},\"area_id\":{},\"value\":{}}}",
         string(&config.id),
         string(&config.file_id),
         string(&config.path),
@@ -1034,7 +1046,8 @@ fn config(config: &ConfigNode) -> String {
             .area_id
             .as_deref()
             .map(string)
-            .unwrap_or_else(|| "null".to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        value,
     )
 }
 
@@ -1239,6 +1252,25 @@ mod tests {
     //! Cargo tests now guard against regression.
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn configuration_json_matches_typed_projection() {
+        let mut node = ConfigNode::new(
+            "fixture",
+            "file:config",
+            "config/runtime.toml",
+            "toml",
+            None,
+        );
+        assert_eq!(parse(&config(&node)), serde_json::to_value(&node).unwrap());
+        node.value = Some(crate::model::config::ConfigValueLocation {
+            config_path: "server.\"handler\"".into(),
+            value_hash: "b".repeat(64),
+            start_line: 2,
+            end_line: 3,
+        });
+        assert_eq!(parse(&config(&node)), serde_json::to_value(&node).unwrap());
+    }
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap_or_else(|e| panic!("expected valid JSON, got {s:?}: {e}"))

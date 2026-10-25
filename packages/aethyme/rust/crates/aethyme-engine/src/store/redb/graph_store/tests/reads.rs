@@ -782,6 +782,61 @@ fn read_api_relation_docs_configs_and_risks() {
 }
 
 #[test]
+fn config_relations_accept_only_typed_values_as_incoming_references() {
+    let fixture = read_api_fixture(function_name!());
+    let store = GraphStore::open(&fixture.root).unwrap();
+    let mut value = fixture.config.clone();
+    value.id.push_str("#value:handler");
+    value.value = Some(crate::model::config::ConfigValueLocation {
+        config_path: "server.handler".into(),
+        value_hash: "a".repeat(64),
+        start_line: 2,
+        end_line: 2,
+    });
+    let mut non_value = fixture.config.clone();
+    non_value.id.push_str("#untyped-reference");
+    let mut session = store.begin_index().unwrap();
+    insert_config(&mut session, &value).unwrap();
+    insert_config(&mut session, &non_value).unwrap();
+    for source in [
+        value.id.as_str(),
+        non_value.id.as_str(),
+        fixture.doc.id.as_str(),
+    ] {
+        insert_edge(
+            &mut session,
+            &Edge::new(
+                source,
+                fixture.function.id.as_str(),
+                EdgeKind::References,
+                1000,
+                "fixture",
+            ),
+        )
+        .unwrap();
+    }
+    session.commit().unwrap();
+    drop(store);
+    let readonly = fixture.read_only();
+    let got = readonly.configs_for(fixture.function.id.as_str()).unwrap();
+    assert_eq!(
+        got.len(),
+        2,
+        "existing Configures plus the typed value only"
+    );
+    assert!(got.contains(&fixture.config));
+    assert!(got.contains(&value));
+    let view = readonly
+        .relation_view(fixture.function.id.as_str(), GraphRelation::Configs)
+        .unwrap();
+    assert_eq!(
+        view.items.len(),
+        2,
+        "untyped and document mentions are excluded"
+    );
+}
+
+#[test]
 fn read_api_task_anchor_and_usage_boundary_candidates_are_bounded() {
     let fixture = read_api_fixture(function_name!());
     let readonly = fixture.read_only();
@@ -1101,7 +1156,33 @@ fn schema_v11_store_is_rejected_without_relocated_file_endpoint_binding() {
         GraphStore::open(&root),
         Err(GraphStoreError::SchemaMismatch {
             found: 11,
-            expected: 12
+            expected: 13
+        })
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn schema_v12_store_is_rejected_without_configuration_value_endpoints() {
+    let root = tmp_root(function_name!());
+    let _ = GraphStore::open(&root).expect("open current schema");
+    {
+        let db_path = root.join(".aethyme").join(DB_FILE_NAME);
+        let db = Database::create(&db_path).expect("open raw db");
+        let txn = db.begin_write().expect("write txn");
+        {
+            let mut meta = txn.open_table(META).expect("META");
+            meta.insert(META_KEY_SCHEMA_VERSION, &12u32.to_le_bytes()[..])
+                .expect("set prior schema");
+        }
+        txn.commit().expect("commit old version");
+    }
+
+    assert!(matches!(
+        GraphStore::open(&root),
+        Err(GraphStoreError::SchemaMismatch {
+            found: 12,
+            expected: 13
         })
     ));
     let _ = std::fs::remove_dir_all(&root);

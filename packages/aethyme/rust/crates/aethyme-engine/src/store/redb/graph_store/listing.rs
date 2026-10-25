@@ -382,7 +382,12 @@ pub(super) fn list_configs_from<D: ReadableDatabase>(
     let mut out = Vec::new();
     for entry in t.iter()? {
         let (_, value) = entry?;
-        out.push(bincode::deserialize::<ConfigNode>(value.value())?);
+        let config = bincode::deserialize::<ConfigNode>(value.value())?;
+        // Overview inventories count files; addressable keys remain queryable
+        // through typed nodes and incoming References.
+        if config.value.is_none() {
+            out.push(config);
+        }
     }
     out.sort_by(|left, right| {
         left.path
