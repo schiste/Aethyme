@@ -158,6 +158,7 @@ fn cli_confirms_lists_and_status_reports_real_profile_encoded_base_failure() {
     let first = json(cli(
         &root,
         &[
+            "advanced",
             "gates",
             "incidents",
             "confirm",
@@ -177,7 +178,10 @@ fn cli_confirms_lists_and_status_reports_real_profile_encoded_base_failure() {
         first[0]["execution_profile_hash"],
         format!("sha256:{}", "c".repeat(64))
     );
-    let list = json(cli(&root, &["gates", "incidents", "list", "--json"]));
+    let list = json(cli(
+        &root,
+        &["advanced", "gates", "incidents", "list", "--json"],
+    ));
     assert_eq!(list, first);
     let status = json(cli(&root, &["status", "--summary", "--json"]));
     let advice = status["advice"].as_array().unwrap();
@@ -208,7 +212,10 @@ fn cli_confirms_lists_and_status_reports_real_profile_encoded_base_failure() {
             .any(|a| a["reason"] == "prior_base_failure_not_requalified")
     );
     assert_eq!(
-        json(cli(&root, &["gates", "incidents", "list", "--json"])),
+        json(cli(
+            &root,
+            &["advanced", "gates", "incidents", "list", "--json"]
+        )),
         first
     );
 }
@@ -218,6 +225,7 @@ fn malformed_incident_commands_are_refused_before_broker_state_is_opened() {
     let root = common::FixtureRepository::new();
     for args in [
         vec![
+            "advanced",
             "gates",
             "incidents",
             "confirm",
@@ -226,11 +234,21 @@ fn malformed_incident_commands_are_refused_before_broker_state_is_opened() {
             "--session",
             "1",
         ],
-        vec!["gates", "incidents", "resolve", "1", "-2"],
-        vec!["gates", "incidents", "list", "unexpected"],
-        vec!["gates", "incidents", "list", "--session", "1"],
-        vec!["gates", "incidents", "handoff", "1", "1", "--session", "2"],
+        vec!["advanced", "gates", "incidents", "resolve", "1", "-2"],
+        vec!["advanced", "gates", "incidents", "list", "unexpected"],
+        vec!["advanced", "gates", "incidents", "list", "--session", "1"],
         vec![
+            "advanced",
+            "gates",
+            "incidents",
+            "handoff",
+            "1",
+            "1",
+            "--session",
+            "2",
+        ],
+        vec![
+            "advanced",
             "gates",
             "incidents",
             "handoff",
@@ -244,6 +262,12 @@ fn malformed_incident_commands_are_refused_before_broker_state_is_opened() {
     ] {
         let output = cli(&root, &args);
         assert!(!output.status.success());
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!diagnostic.contains("was removed"), "{diagnostic}");
         assert!(!root.path().join(".aethyme/broker.db").exists());
     }
 }
@@ -254,6 +278,7 @@ fn cli_refuses_feature_pass_until_that_tree_is_the_fetched_default() {
     let incident = json(cli(
         &root,
         &[
+            "advanced",
             "gates",
             "incidents",
             "confirm",
@@ -303,6 +328,7 @@ fn cli_refuses_feature_pass_until_that_tree_is_the_fetched_default() {
         .unwrap();
     drop(broker);
     let args = [
+        "advanced",
         "gates",
         "incidents",
         "resolve",
@@ -312,7 +338,10 @@ fn cli_refuses_feature_pass_until_that_tree_is_the_fetched_default() {
     ];
     assert!(!cli(&root, &args).status.success());
     assert_eq!(
-        json(cli(&root, &["gates", "incidents", "list", "--json"])),
+        json(cli(
+            &root,
+            &["advanced", "gates", "incidents", "list", "--json"]
+        )),
         incident
     );
     git(
@@ -340,6 +369,7 @@ fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_livene
     json(cli(
         &root,
         &[
+            "advanced",
             "gates",
             "incidents",
             "confirm",
@@ -351,7 +381,7 @@ fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_livene
         ],
     ));
     for args in [
-        vec!["gates", "run", "--all", "--json"],
+        vec!["advanced", "gates", "run", "--all", "--json"],
         vec![
             "start",
             "--adopt",
