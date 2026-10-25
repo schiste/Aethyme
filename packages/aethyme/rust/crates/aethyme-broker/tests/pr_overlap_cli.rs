@@ -1128,3 +1128,94 @@ fn push_refreshes_a_future_dated_pr_listing() {
     .unwrap();
     assert!(refreshed["fetched_at_ms"].as_i64().unwrap() < i64::MAX);
 }
+
+#[test]
+fn status_reports_cached_prs_only_when_all_recorded_owners_are_inactive() {
+    use aethyme_broker::SessionStatus;
+    let fixture = Fixture::new();
+    let mut broker = fixture.broker();
+    let first = broker.start_worktree("first PR owner", None).unwrap();
+    let second = broker.start_worktree("second PR owner", None).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for id in [first.id, second.id] {
+        broker
+            .store()
+            .record_pull_request_opened("acme/project", 12, Some(id), now)
+            .unwrap();
+    }
+    let mut listing = serde_json::json!({
+        "repository": "acme/project", "fetched_at_ms": now, "base": "main",
+        "prs": [{"number":12,"url":"https://github.com/acme/project/pull/12","head":"author-branch","head_oid":null}]
+    });
+    broker
+        .store()
+        .meta_set("pr_overlap.open_prs", &listing.to_string())
+        .unwrap();
+    broker
+        .store()
+        .set_session_status(first.id, SessionStatus::Closed, None)
+        .unwrap();
+    drop(broker);
+    let warning = |value: &serde_json::Value| {
+        value["advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "pr.inactive-recorded-owners")
+    };
+    fixture.clear_gh_log();
+    assert!(
+        !warning(&fixture.status()),
+        "an active co-owner protects the PR"
+    );
+    let mut broker = fixture.broker();
+    broker
+        .store()
+        .set_session_status(second.id, SessionStatus::Closed, None)
+        .unwrap();
+    drop(broker);
+    let status = fixture.status();
+    assert!(warning(&status), "{status}");
+    let row = status["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "pr.inactive-recorded-owners")
+        .unwrap();
+    assert!(row["summary"].as_str().unwrap().contains("#12"));
+    assert!(
+        row["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("cached listing timestamp"))
+    );
+    assert_eq!(
+        fixture.gh_log(),
+        "",
+        "cached ownership advice must remain offline"
+    );
+    // The same PR number in a different repository is not ownership evidence.
+    for (repository, timestamp) in [
+        (Some("other/project"), now),
+        (None, now),
+        (Some("acme/project"), now - 25 * 3_600_000),
+        (Some("acme/project"), now + 24 * 3_600_000),
+    ] {
+        listing["repository"] = serde_json::json!(repository);
+        listing["fetched_at_ms"] = serde_json::json!(timestamp);
+        fixture
+            .broker()
+            .store()
+            .meta_set("pr_overlap.open_prs", &listing.to_string())
+            .unwrap();
+        assert!(
+            !warning(&fixture.status()),
+            "unknown namespace or stale/future listing is not current ownership evidence"
+        );
+    }
+    assert_eq!(fixture.gh_log(), "");
+}

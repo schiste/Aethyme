@@ -129,6 +129,8 @@ struct OpenPr {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OpenPrListing {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
     fetched_at_ms: i64,
     base: String,
     prs: Vec<OpenPr>,
@@ -558,7 +560,8 @@ impl Broker {
         };
         let listing = match self.cached_listing() {
             Some(listing)
-                if listing.base == default.branch
+                if listing.repository.as_deref() == Some(repository)
+                    && listing.base == default.branch
                     && listing.fetched_at_ms <= now_ms
                     && now_ms.saturating_sub(listing.fetched_at_ms) < LIST_REUSE_MS =>
             {
@@ -584,6 +587,7 @@ impl Broker {
                     cwd,
                 )
                 .map(|stdout| OpenPrListing {
+                    repository: Some(repository.to_owned()),
                     fetched_at_ms: now_ms,
                     base: default.branch.clone(),
                     prs: parse_open_prs(&stdout),
@@ -801,6 +805,70 @@ impl Broker {
             .collect()
     }
 
+    /// Cached observations only. Unknown or oversized owner sets are not
+    /// evidence that nobody is tending a PR. No session-history/branch scan.
+    pub(crate) fn inactive_pr_owner_advice(
+        &self,
+        now_ms: i64,
+        agents: &[crate::AgentView],
+    ) -> Vec<StatusAdvice> {
+        let Some(listing) = self.cached_listing() else {
+            return Vec::new();
+        };
+        if listing.fetched_at_ms <= 0
+            || listing.fetched_at_ms > now_ms
+            || now_ms.saturating_sub(listing.fetched_at_ms) > LIST_STALE_MS
+        {
+            return Vec::new();
+        }
+        let Some(repository) = listing
+            .repository
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        else {
+            return Vec::new();
+        };
+        let derived = agents
+            .iter()
+            .map(|agent| (agent.session.id, agent.derived_status))
+            .collect();
+        let active_branches = agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    agent.derived_status,
+                    crate::SessionStatus::Active | crate::SessionStatus::Idle
+                )
+            })
+            .map(|agent| agent.session.branch.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+        listing.prs.iter().take(MAX_OPEN_PRS).filter_map(|pr| {
+            if !seen.insert(pr.number) || pr.number <= 0 || active_branches.contains(pr.head.as_str()) {
+                return None;
+            }
+            let owners = self.store_ref().pull_request_owner_cleanup_states(repository, pr.number).ok()?;
+            if !all_pr_owners_inactive(&owners, &derived) {
+                return None;
+            }
+            Some(StatusAdvice {
+                id: "pr.inactive-recorded-owners",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "all recorded PR owners are inactive",
+                summary: format!("cached open PR #{} has no active recorded owner; review or reassign it", pr.number),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: vec![
+                    format!("repository: {repository}; PR #{}; head branch: {}", pr.number, pr.head),
+                    format!("cached listing timestamp: {}; checked at most {MAX_OPEN_PRS} PRs; listing may be incomplete", listing.fetched_at_ms),
+                    format!("recorded owner sessions: {}", owners.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(", ")),
+                    "Closed, cleaned, stale or exited recorded owners; this cached observation does not establish that the PR remains open now.".into(),
+                ],
+                commands: Vec::new(),
+            })
+        }).collect()
+    }
+
     pub(crate) fn pr_overlap_advice(&self, now_ms: i64) -> Vec<StatusAdvice> {
         let Ok(sessions) = self.store_ref().live_sessions() else {
             return Vec::new();
@@ -825,6 +893,22 @@ impl Broker {
     pub(crate) fn pr_overlap_heads_up(&self, session: &crate::Session) -> Option<String> {
         heads_up(&self.cached_pr_overlaps(session, crate::clock::epoch_ms())?)
     }
+}
+
+fn all_pr_owners_inactive(
+    owners: &[(i64, Option<crate::SessionCleanupState>)],
+    derived: &BTreeMap<i64, crate::SessionStatus>,
+) -> bool {
+    !owners.is_empty()
+        && owners.len() <= 100
+        && owners.iter().all(|(id, state)| match state {
+            Some(crate::SessionCleanupState::Closed | crate::SessionCleanupState::Cleaned) => true,
+            Some(crate::SessionCleanupState::Open) => matches!(
+                derived.get(id),
+                Some(crate::SessionStatus::Stale | crate::SessionStatus::Exited)
+            ),
+            None => false,
+        })
 }
 
 /// The one-line heads-up text, when there is anything to say.
@@ -937,6 +1021,38 @@ fn overlap_advice(session_id: i64, check: &PrOverlapCheck) -> Option<StatusAdvic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_owner_advice_requires_complete_known_inactive_ownership() {
+        use crate::{SessionCleanupState as Cleanup, SessionStatus as Status};
+        let closed = (1, Some(Cleanup::Closed));
+        let open = (2, Some(Cleanup::Open));
+        let mut derived = BTreeMap::new();
+        assert!(!all_pr_owners_inactive(&[], &derived));
+        assert!(all_pr_owners_inactive(
+            &[closed, (3, Some(Cleanup::Cleaned))],
+            &derived
+        ));
+        assert!(!all_pr_owners_inactive(&[closed, (3, None)], &derived));
+        assert!(!all_pr_owners_inactive(&[closed, open], &derived));
+        for status in [
+            Status::Active,
+            Status::Idle,
+            Status::Closed,
+            Status::Cleaned,
+        ] {
+            derived.insert(2, status);
+            assert!(!all_pr_owners_inactive(&[closed, open], &derived));
+        }
+        for status in [Status::Stale, Status::Exited] {
+            derived.insert(2, status);
+            assert!(all_pr_owners_inactive(&[closed, open], &derived));
+        }
+        assert!(all_pr_owners_inactive(&vec![closed; 100], &derived));
+        assert!(!all_pr_owners_inactive(&vec![closed; 101], &derived));
+        let legacy: OpenPrListing = serde_json::from_str(INVALIDATED_OPEN_PRS).unwrap();
+        assert!(legacy.repository.is_none());
+    }
 
     #[test]
     fn a_truncated_github_read_is_not_passed_to_listing_or_diff_parsers() {

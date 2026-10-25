@@ -477,6 +477,36 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Bounded, indexed ownership evidence for cached PR status advice.
+    /// The extra row lets the caller reject incomplete owner sets.
+    pub(crate) fn pull_request_owner_cleanup_states(
+        &self,
+        repository: &str,
+        pr_number: i64,
+    ) -> Result<Vec<(i64, Option<SessionCleanupState>)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.session_id, s.cleanup_state
+             FROM pull_request_session_links l LEFT JOIN sessions s ON s.id = l.session_id
+             WHERE l.repository = ?1 AND l.pr_number = ?2
+             ORDER BY l.session_id LIMIT 101",
+        )?;
+        let rows = stmt.query_map(params![repository, pr_number], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(id, state)| {
+                Ok((
+                    id,
+                    state
+                        .as_deref()
+                        .map(SessionCleanupState::parse)
+                        .transpose()?,
+                ))
+            })
+            .collect()
+    }
+
     /// Record when a pull request opened, first sighting wins.
     ///
     /// Idempotent on the pull request, because several observers can report the
