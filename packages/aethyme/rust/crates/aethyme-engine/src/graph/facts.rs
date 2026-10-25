@@ -306,7 +306,12 @@ mod tests {
         assert_eq!(usage.docs_config_references, Vec::<String>::new());
 
         let usage_with_docs = function_usage_fact(&map, &fact, "src/indexing", &[]);
-        assert_eq!(usage_with_docs.docs_config_references, Vec::<String>::new());
+        assert_eq!(
+            usage_with_docs.docs_config_references,
+            vec!["doc:docs/notes.md".to_string()]
+        );
+        assert_eq!(usage_with_docs.internal_callers, usage.internal_callers);
+        assert_eq!(usage_with_docs.external_callers, usage.external_callers);
 
         let _ = fs::remove_dir_all(&root);
     }
