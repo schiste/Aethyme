@@ -192,6 +192,20 @@ impl ExecutionProfile {
         }
     }
 
+    /// Fixed complete evidence for tests of consumers, not tool observation.
+    #[cfg(test)]
+    pub(crate) fn fixture_complete() -> Self {
+        Self {
+            digest: Some(digest(&ProfileFingerprint {
+                schema_version: 1,
+                os: "fixture",
+                architecture: "fixture",
+                environment: BTreeMap::new(),
+                tools: BTreeMap::new(),
+            })),
+        }
+    }
+
     pub(crate) fn digest(&self) -> Option<&str> {
         self.digest.as_deref()
     }
