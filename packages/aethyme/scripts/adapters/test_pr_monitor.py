@@ -121,6 +121,16 @@ class MonitorControls(unittest.TestCase):
         self.assertIn("log truncated", output.getvalue())
         self.assertLess(len(output.getvalue()), monitor.LOG_CHARACTERS + 100)
 
+    def test_empty_optional_environment_keeps_shell_default_semantics(self):
+        with patch.dict(os.environ, {"AETHYME_PR_MONITOR_REPO": "synthetic",
+                                     "AETHYME_BROKER_BIN": "",
+                                     "AETHYME_PR_MONITOR_WORKER": "",
+                                     "AETHYME_PR_MONITOR_LIMIT": ""}), \
+             patch.object(monitor.socket, "gethostname", return_value="fixture.example"), \
+             patch.object(monitor, "run_pass") as run:
+            self.assertEqual(monitor.main(), 0)
+        run.assert_called_once_with("synthetic", "aethyme", "launchd-fixture", 20)
+
     def test_real_shell_entrypoint_reaches_only_synthetic_empty_broker(self):
         with tempfile.TemporaryDirectory(prefix="monitor fixture '") as directory:
             repo = Path(directory)

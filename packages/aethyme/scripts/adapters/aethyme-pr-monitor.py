@@ -88,9 +88,9 @@ def main():
     with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
         try:
             run_pass(os.environ["AETHYME_PR_MONITOR_REPO"],
-                     os.environ.get("AETHYME_BROKER_BIN", "aethyme"),
-                     os.environ.get("AETHYME_PR_MONITOR_WORKER", "launchd-" + socket.gethostname().split(".")[0]),
-                     int(os.environ.get("AETHYME_PR_MONITOR_LIMIT", "20")))
+                     os.environ.get("AETHYME_BROKER_BIN") or "aethyme",
+                     os.environ.get("AETHYME_PR_MONITOR_WORKER") or "launchd-" + socket.gethostname().split(".")[0],
+                     int(os.environ.get("AETHYME_PR_MONITOR_LIMIT") or "20"))
         except (OSError, RuntimeError, ValueError, KeyError) as error:
             print(f"monitor stopped: {str(error)[:512]}")
     if log.truncated:

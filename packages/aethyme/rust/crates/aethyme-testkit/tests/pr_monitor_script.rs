@@ -15,7 +15,7 @@ fn the_monitor_starts_the_delivery_adapter_only_when_the_outbox_has_work() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert!(stderr.contains("Ran 9 tests"), "{stderr}");
+    assert!(stderr.contains("Ran 10 tests"), "{stderr}");
     for name in [
         "test_verified_empty_outbox_starts_no_transport",
         "test_expired_pass_cannot_spawn_or_open_transport",
