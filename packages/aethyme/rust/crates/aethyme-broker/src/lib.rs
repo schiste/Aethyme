@@ -181,6 +181,7 @@ pub mod renamed_targets;
 mod repo_watch;
 mod report;
 mod report_filing;
+mod watch_tick_budget;
 pub use chau7_tabs::{
     Chau7DispatchAction, Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness,
     dispatch_action, resolve_session_tab, workspace_tab_ids,
