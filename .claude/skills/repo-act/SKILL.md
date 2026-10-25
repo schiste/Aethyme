@@ -16,6 +16,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Run Aethyme Explore on the user task before broad manual search.
 - Verify answer candidates before concluding when trust_policy is not answer-safe.
 - Identify the nearest fast test or validation command before editing.
+- For implementation and version audits, search production source and maintained
+  guides before archived qualification payloads or raw logs. Frozen transcripts
+  can match unrelated version strings and overwhelm source results; search them
+  separately only when they are the evidence being requested.
 - Before declaring a regression missing during issue triage, inspect likely
   test bodies and their assertions, not only test names. An interruption or
   recovery test may already exercise the exact state under a broader name.
@@ -73,6 +77,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- For Git ref-backend benchmarks, compare both loose and packed files-backend
+  refs with reftable at matching counts. Record actual ref layout and shared
+  object history; the backend name alone does not define a fair baseline.
 - In promoted-history fixtures, separate source-content preservation,
   all-parent reachability and first-parent candidate enumeration. Promotion
   may rewrite source ancestry; verify the exact expected tree and record both
