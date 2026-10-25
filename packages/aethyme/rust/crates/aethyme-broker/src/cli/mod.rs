@@ -459,6 +459,12 @@ Usage:
       next broker command; event payloads never contain message text.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
+  aethyme broker gates incidents list [--json]
+  aethyme broker gates incidents confirm <failed-run-id> <test-id>... --session <id> [--pr <n>] [--json]
+  aethyme broker gates incidents resolve <incident-id> <passing-run-id> [--json]
+  aethyme broker gates incidents handoff <incident-id> <expected-owner> --session <new-owner> --reason <text> [--json]
+      Record or resolve bounded advisory ownership of a confirmed base failure;
+      never skips gates. Confirmation requires exact base/definition/profile evidence.
   aethyme broker gates manifest [--head <ref>] [--json]
       Emit a versioned content-free gate-selection manifest from exact
       committed policy (default head: HEAD). Commands are never included.
@@ -2391,6 +2397,7 @@ fn open_broker_for_explicit_worktree_root_recovery() -> Result<Broker, UsageErro
 /// stale installed broker. The check is advisory and writes to stderr so a
 /// `--json` session report remains machine-readable.
 fn warn_stale_broker_binary(broker: &Broker) {
+    broker.warn_base_failure_incidents();
     if let Some(warning) = crate::version::broker_start_warning(broker.main_root()) {
         eprintln!("warning: {warning}");
     }

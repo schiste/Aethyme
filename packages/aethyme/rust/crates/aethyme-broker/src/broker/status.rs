@@ -2071,7 +2071,7 @@ impl Broker {
         let (promotes, promote_config_warning) = promotion;
         let (integration_branch, integration_head) = integration;
 
-        let mut advice = Vec::new();
+        let mut advice = self.base_failure_incident_status_advice(Some(agents));
         if let Some(warning) = promote_config_warning {
             advice.push(StatusAdvice {
                 id: "promote.mode-invalid",

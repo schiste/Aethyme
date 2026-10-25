@@ -877,6 +877,7 @@ impl Broker {
         let checkout = GitRepo::discover(dir)?;
         self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
+        self.warn_base_failure_incidents();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let storage = self.storage_context().gate_storage_locations();
         crate::gates::run_all_in(
@@ -900,6 +901,7 @@ impl Broker {
         let checkout = GitRepo::discover(dir)?;
         self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
+        self.warn_base_failure_incidents();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let storage = self.storage_context().gate_storage_locations();
         crate::gates::run_named_in(
@@ -958,6 +960,7 @@ impl Broker {
         let checkout = GitRepo::discover(dir)?;
         self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
+        self.warn_base_failure_incidents();
         let gates = self.load_and_sync_gates_from(&config_root)?;
         let storage = self.storage_context().gate_storage_locations();
         crate::gates::run_all_with_progress_in(
@@ -976,6 +979,7 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
+        self.warn_base_failure_incidents();
         self.gate_inputs_with_integrity(session_id, true)
     }
 

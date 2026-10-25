@@ -34,8 +34,9 @@ An immediate SQLite transaction checks the live owner and gate row and chooses
 the incident identity `(base commit, gate name, definition hash, profile hash)`.
 The first confirmation owns it. Duplicate confirmation returns that exact
 incident, preserving its owner, test identifiers and PR annotation. A quiet or
-closed owner is never silently replaced. Explicit ownership handoff is future
-work; a closed session does not erase an unresolved incident.
+closed owner is never silently replaced. Explicit ownership handoff is available
+through the operator boundary below; a closed session does not erase an
+unresolved incident.
 
 ## Resolution and retention
 
@@ -60,13 +61,46 @@ pass adopts or repairs the new table idempotently.
 
 ## Delivery and qualification
 
-This change is the registry and broker-library boundary. CLI confirmation,
-current-base classification, start/pre-push/gate notices, ownership handoff and
-automatic resolution after a proven base run still need integration. Issue #760
-remains open. The existing path-overlap warnings and generated-file claims do
+The operator boundary adds `aethyme broker advanced gates incidents list`,
+`confirm <failed-run-id> <test-id>... --session <id> [--pr <number>]`, and
+`resolve <incident-id> <passing-run-id>`, each with optional `--json`. JSON is
+an array for every action, including a singleton confirmation or resolution;
+an empty list means no retained records, never that the base passes. Arity,
+positive IDs, identifier bounds and per-action flags are checked before broker
+state opens. Mutations refuse a read-only snapshot.
+
+Routine brief and full status show at most eight unresolved incidents plus an
+explicit omission count. Empty registries add no Git subprocesses. Each notice
+names the original owner and separates a matching fetched base from an earlier
+or unknown base. A matching commit does not establish profile equivalence with
+the current agent. Missing owner inventory is reported as absent, not dead.
+Opening an ordinary CLI broker still follows normal startup policy.
+
+Start/adopt entrypoints and session/all/named gate execution print the same
+bounded notices on stderr without probing owner liveness. Valid pre-push content
+gates use the all-gates path; deletion-only pushes run no content gates. Notices
+preserve existing argument, policy-trust, selection and gate-result refusals.
+`handoff <incident-id> <expected-owner> --session <new-owner> --reason <text>`
+transfers ownership only if the incident is unresolved, the expected owner
+still matches, the new owner is open, and the bounded reason is valid. It records
+the previous/new owners and reason in the existing event journal atomically;
+a failed audit write rolls back the handoff. Repeating a stale expected owner
+refuses and requires inspection, rather than silently retrying. This is an
+explicit local operator action; quiet/absent status never triggers it. Other
+proof fields and the original confirmation remain unchanged. Event history is
+subject to its normal retention policy.
+
+The shared gate runner also reconciles newly executed passing results
+against unresolved incidents after the gate runner records them. A matching
+current fetched-default tree, gate definition and execution profile are required;
+the transaction rechecks the stored proof and chronology. Cache hits cannot
+trigger this automatic settlement. Registry errors emit diagnostics and preserve
+the gate outcomes. Session, checkout, submit, ship and native gate paths share this hook; explicit
+resolution remains available. Issue #760 remains
+open until end-to-end qualification is complete. The existing path-overlap warnings and generated-file claims do
 not provide those incident notices.
 
 Deterministic tests cover duplicate ownership, unqualified/mismatched proof
-refusals, matching resolution and retry, open capacity, and schema repair. Native
+refusals, matching resolution and retry, open capacity, and schema repair. Broker CLI fixtures additionally cover profile-encoded confirmation, JSON/list parity, current-base advice, advancing the fetched base without changing prior records, and malformed-command refusal before broker state opens. Native
 execution is deferred to remote CI and the final combined local qualification;
 no local Cargo or live base-failure experiment is claimed by source inspection.

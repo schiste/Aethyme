@@ -288,6 +288,61 @@ impl super::BrokerStore {
     }
 }
 
+impl super::BrokerStore {
+    pub(crate) fn handoff_base_incident(
+        &mut self,
+        id: i64,
+        expected_owner: i64,
+        next_owner: i64,
+        reason: &str,
+    ) -> Result<BaseFailureIncident, BrokerError> {
+        if id <= 0 || expected_owner <= 0 || next_owner <= 0 || expected_owner == next_owner {
+            return Err(invalid(
+                "handoff requires positive incident and distinct owner ids",
+            ));
+        }
+        if reason.trim().is_empty() || reason.len() > 1000 || reason.chars().any(char::is_control) {
+            return Err(invalid(
+                "handoff requires a reason of at most 1000 bytes without control characters",
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = get(&tx, id)?;
+        if record.resolved_at.is_some() || record.owner_session_id != expected_owner {
+            return Err(invalid(
+                "incident resolved or owner changed; inspect current record before retrying handoff",
+            ));
+        }
+        let next_open: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1 AND status <> 'cleaned')",
+            [next_owner],
+            |row| row.get(0),
+        )?;
+        if !next_open {
+            return Err(invalid("new repair owner must be an open session"));
+        }
+        tx.execute("UPDATE base_failure_incidents SET owner_session_id = ?2 WHERE id = ?1 AND owner_session_id = ?3 AND resolved_at IS NULL",
+            params![id, next_owner, expected_owner])?;
+        let payload = serde_json::json!({
+            "incident_id": id, "previous_owner_session_id": expected_owner,
+            "owner_session_id": next_owner, "reason": reason,
+        })
+        .to_string();
+        super::insert_event(
+            &tx,
+            super::now_ms(),
+            "base_failure.handoff",
+            Some(next_owner),
+            Some(&payload),
+        )?;
+        let updated = get(&tx, id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +636,64 @@ mod tests {
         let records = store.base_incidents().unwrap();
         assert_eq!(records.len(), 1 + RETAIN_RESOLVED_BASE_FAILURE_INCIDENTS);
         assert_eq!(records.iter().find(|r| r.id == open.id), Some(&open));
+    }
+
+    #[test]
+    fn handoff_is_explicit_cas_preserves_proof_and_rolls_back_when_audit_fails() {
+        let mut store = fixture();
+        let failed = run(
+            &store,
+            "fail",
+            &"b".repeat(40),
+            Some(&format!("sha256:{}", "c".repeat(64))),
+            Some("test_failure"),
+        );
+        let first = confirm(&mut store, 1, failed).unwrap();
+        assert!(
+            store
+                .handoff_base_incident(first.id, 99, 2, "operator handoff")
+                .is_err()
+        );
+        assert!(
+            store
+                .handoff_base_incident(first.id, 1, 99, "operator handoff")
+                .is_err()
+        );
+        assert!(
+            store
+                .handoff_base_incident(first.id, 1, 2, "bad\nreason")
+                .is_err()
+        );
+        assert_eq!(store.base_incidents().unwrap(), vec![first.clone()]);
+        let handed = store
+            .handoff_base_incident(first.id, 1, 2, "operator handoff")
+            .unwrap();
+        let mut expected = first.clone();
+        expected.owner_session_id = 2;
+        assert_eq!(handed, expected);
+        let events = store.events_after(0, 1000).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.kind == "base_failure.handoff")
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(event.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["previous_owner_session_id"], 1);
+        assert_eq!(payload["owner_session_id"], 2);
+        assert_eq!(payload["reason"], "operator handoff");
+        assert!(
+            store
+                .handoff_base_incident(first.id, 1, 2, "stale retry")
+                .is_err()
+        );
+        store.conn.execute_batch("CREATE TRIGGER refuse_incident_handoff BEFORE INSERT ON events
+            WHEN NEW.kind = 'base_failure.handoff' BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END;").unwrap();
+        assert!(
+            store
+                .handoff_base_incident(first.id, 2, 1, "audit must persist")
+                .is_err()
+        );
+        assert_eq!(store.base_incidents().unwrap(), vec![handed]);
     }
 
     #[test]
