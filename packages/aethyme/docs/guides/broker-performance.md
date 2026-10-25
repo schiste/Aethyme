@@ -127,19 +127,25 @@ workflow changes outside the existing exact performance entry, deletions, mode
 changes and unlisted paths still select the full suite. This extension must
 itself land through full CI before later experiment-only PRs can use it.
 
-## Contract-check build reuse
+## Distinguish dependency cache hits from workspace reuse
 
-The PR contract check builds its native policy checker from the event's pinned
-base commit before checking out the exact PR head. This matches the protected-main
-Rust cache instead of recompiling changed product crates for every report edit.
-The copied executable lives outside the checkout, is hashed before the head
-switch, and is verified before execution. The comparison still uses the PR head,
-its merge base, registry, body and commit decisions; product changes receive the
-separate Rust lint and workspace checks. Both checkout steps disable persisted
-credentials. This changes the checker policy source, not the compared source.
+The pinned `Swatinem/rust-cache` action defaults `cache-workspace-crates` to
+false. The current main warmer and read-only PR consumers do not override it.
+A shared-key cache hit therefore does not establish that Aethyme workspace
+crates or its CLI executable were restored. Inspect the exact action version's
+input defaults, effective producer/consumer settings and hosted build logs.
 
-A cold or missing base cache can still require compilation. Record cache restore,
-build step and complete job durations before claiming a timing gain; an unchanged
-workflow or shared cache key alone is insufficient evidence. A body edit still
-runs the required contract check. The workflow does not reuse an old PR verdict
-or skip the exact head/body comparison.
+A synthetic workflow trial compiled the checker from the pinned default base,
+then ran it against the exact PR head and body. Its hosted cache hit restored
+about 253 MiB, but the build still took 70 seconds; the policy execution took
+about four seconds. This is one diagnostic observation, not a controlled speed
+comparison. The proposed two-checkout workflow was withdrawn rather than
+claiming a timing benefit. The current workflow still builds its checker from
+the PR source and does not reuse a cached verdict.
+
+Before changing cache policy, measure archive size, restore/compile/upload time,
+cache writer trust and bounded retention. Workspace artifact caching can trade
+compilation cost for much larger archives; enabling it is not established as an
+improvement by a dependency-cache hit. A future lightweight checker should share
+the existing policy implementation and qualify both verdict parity and complete
+job timing before replacing the current path.

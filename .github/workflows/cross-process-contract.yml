@@ -10,7 +10,7 @@ name: Cross-Process Contract Check
 # check didn't exist; now it does.
 #
 # The checker is native since python-retirement Phase 6 (2026-08-01):
-# `aethyme broker check-contract`, built from the pinned protected base. It had to
+# `aethyme broker check-contract`, built from this checkout. It had to
 # be ported BEFORE `src/` was deleted, or the migration's biggest
 # deletion would have landed with its own guard switched off.
 
@@ -31,24 +31,14 @@ jobs:
     if: github.event.action != 'edited' || github.event.changes.body
     runs-on: ubuntu-latest
     steps:
-      - name: Verify default-branch policy source
-        env:
-          POLICY_BASE_REF: ${{ github.base_ref }}
-          POLICY_DEFAULT_REF: ${{ github.event.repository.default_branch }}
-        run: |
-          if [ "$POLICY_BASE_REF" != "$POLICY_DEFAULT_REF" ]; then
-            echo "ERROR: policy checker must come from the default branch." >&2
-            exit 2
-          fi
-
-      - name: Checkout pinned base for the policy checker
+      - name: Checkout PR (full history for diff)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Compile unchanged policy code against the protected-main cache,
-          # rather than rebuilding the product's changed PR code on body edits.
-          ref: ${{ github.event.pull_request.base.sha }}
+          # Check the PR head itself, then compare it with the merge base
+          # against the target branch. This keeps main-only commits out of
+          # the PR's contract diff when the branch is behind.
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -64,69 +54,47 @@ jobs:
           shared-key: rust-tests
           save-if: false
 
-      - name: Build and pin the base policy checker
-        env:
-          CHECKER_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$CHECKER_BASE_SHA"
-          cargo build --locked --quiet \
-            --manifest-path packages/aethyme/rust/Cargo.toml \
-            -p aethyme-cli --bin aethyme
-          CONTRACT_TARGET="$(cargo metadata --locked --no-deps --format-version 1 \
-            --manifest-path packages/aethyme/rust/Cargo.toml | jq -r '.target_directory')"
-          install -m 0700 "$CONTRACT_TARGET/debug/aethyme" "$RUNNER_TEMP/aethyme-contract-checker"
-          sha256sum "$RUNNER_TEMP/aethyme-contract-checker" > "$RUNNER_TEMP/aethyme-contract-checker.sha256"
-          printf 'Policy checker source: %s\n' "$CHECKER_BASE_SHA"
-
-      - name: Checkout exact PR head for the contract diff
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Capture PR body
         # Write the PR body to a file so the checker can parse the
         # `Contract:` checkbox. We avoid interpolating the body
         # into a shell command (injection-safe) by reading it from
         # the GitHub event payload via jq.
         run: |
-          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/aethyme-pr-body.md"
-          echo "PR body captured ($(wc -c < "$RUNNER_TEMP/aethyme-pr-body.md") bytes)"
+          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > /tmp/pr-body.md
+          echo "PR body captured ($(wc -c < /tmp/pr-body.md) bytes)"
 
       - name: Run cross-process contract check
-        # PR head and base SHA are read from env, not interpolated into the run
+        # PR head and `BASE_REF` are read from env, not interpolated into the run
         # script — this is the safe pattern for untrusted-ish
         # context fields. github.base_ref is set by GitHub from the
         # branch protection target and isn't directly user-supplied,
         # but the same hygiene applies.
         #
-        # The executable is pinned from the base, but registry, diff and commit
-        # decisions are read from this exact PR checkout. Product changes still
-        # receive the separate full Rust CI. Keep cwd at the PR repository root.
+        # `cargo run` from the repo root: the checker resolves the
+        # registry and the diff relative to the current worktree, so
+        # cwd must stay at the repository root.
         #
         # `--commit-messages` gives this check the same decision sources as
         # the `cross-process-contract` gate, which reads the merged commits
         # and the merged PR's body on main: a decision accepted here is
         # accepted again on the merge commit.
         env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.base_ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Keep any startup-path broker access isolated even though the checker
-          # comes from the pinned base rather than unreviewed PR migrations.
+          # The checker is built from the PR tree. Keep any broker access by
+          # its startup path or dependencies away from a runner's repository
+          # state; an unreviewed schema migration must be disposable (#232).
           AETHYME_BROKER_DB: ${{ runner.temp }}/aethyme-broker-contract-check.db
         run: |
-          if ! CONTRACT_BASE="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"; then
+          if ! CONTRACT_BASE="$(git merge-base "origin/${BASE_REF}" "${PR_HEAD_SHA}")"; then
             echo "ERROR: could not find a common ancestor for the PR head and base." >&2
             exit 2
           fi
           printf 'PR comparison base: %s\n' "$CONTRACT_BASE"
-          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
-          sha256sum --check "$RUNNER_TEMP/aethyme-contract-checker.sha256"
-          "$RUNNER_TEMP/aethyme-contract-checker" broker check-contract \
+          cargo run --locked --quiet \
+            --manifest-path packages/aethyme/rust/Cargo.toml \
+            -p aethyme-cli --bin aethyme -- \
+            broker check-contract \
             --base "$CONTRACT_BASE" \
-            --pr-body "$RUNNER_TEMP/aethyme-pr-body.md" \
+            --pr-body /tmp/pr-body.md \
             --commit-messages
-
-      - name: Check checker workflow isolation controls
-        run: python3 .github/scripts/test-contract-checker-workflow.py

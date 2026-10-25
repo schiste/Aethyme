@@ -185,7 +185,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   corrected head.
 - When reusing a CI build cache, compare the producer and consumer fingerprints,
   including toolchain, lockfiles and environment variables, then confirm the log
-  shows a cache restore. A matching shared key alone does not prove reuse.
+  shows a cache restore. Inspect the pinned action's defaults and effective
+  artifact policy too: a dependency-only hit does not prove workspace crates or
+  executables were restored. Record archive size and restore, compile and total
+  job durations before claiming a gain; a matching shared key alone is insufficient.
 - For package-manager cache growth, inspect the effective store path from the
   package manager's install metadata and compare its filesystem with the
   worktree's. A shared configured path can still cause per-worktree copies when
