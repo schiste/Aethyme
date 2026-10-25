@@ -66,13 +66,13 @@ class Deadline:
         return left
 
 
-def run_broker(command, repo, payload=None, budget=None):
+def run_broker(command, repo, payload=None, budget=None, call_seconds=CALL_SECONDS):
     """Bound one owned direct child, input, combined output and pipe draining.
 
     This does not establish process-group or escaped-descendant cleanup.
     """
     budget = budget or Deadline()
-    end = min(budget.expires, budget.clock() + CALL_SECONDS)
+    end = min(budget.expires, budget.clock() + call_seconds)
     budget.remaining(end)  # Refuse before spawning after the pass deadline.
     data = payload.encode() if payload is not None else b""
     if len(data) > MAX_WIRE_BYTES:
@@ -292,7 +292,7 @@ def complete(broker: str, repo: str | None, delivery_id: int, worker: str,
         raise RuntimeError(f"deliveries complete failed: {result.stderr.strip()}")
 
 
-def main() -> int:
+def main(argv=None, budget=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", required=True, help="stable id fencing this worker's claims")
     parser.add_argument("--repo", default=None, help="repository to run the broker in")
@@ -300,9 +300,9 @@ def main() -> int:
     parser.add_argument("--max", type=int, default=10, help="deliveries per invocation")
     parser.add_argument("--dry-run", action="store_true",
                         help="decide and report, but perform no transport")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    budget = Deadline()
+    budget = budget or Deadline()
     try:
         client = Chau7Client(budget=budget)
     except Chau7Error as error:
