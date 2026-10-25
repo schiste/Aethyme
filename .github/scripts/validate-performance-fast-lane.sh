@@ -9,6 +9,10 @@ workflow="$repo_root/.github/workflows/product-performance.yml"
 for path in \
   "$benchmark_dir/broker_latency.py" \
   "$benchmark_dir/test_broker_latency.py" \
+  "$benchmark_dir/git_worktree_config.py" \
+  "$benchmark_dir/test_git_worktree_config.py" \
+  "$benchmark_dir/git_worktree_options.py" \
+  "$repo_root/packages/aethyme/docs/architecture/git-worktree-config-assessment.md" \
   "$benchmark_dir/broker-budgets.json" \
   "$repo_root/packages/aethyme/docs/guides/broker-performance.md" \
   "$workflow"; do
@@ -32,6 +36,9 @@ allowed_stdlib = sys.stdlib_module_names
 sources = {
     "broker_latency.py": set(),
     "test_broker_latency.py": {"broker_latency"},
+    "git_worktree_config.py": {"git_worktree_options"},
+    "test_git_worktree_config.py": {"git_worktree_config"},
+    "git_worktree_options.py": set(),
 }
 required_tests = {
     "test_approved_limits_and_warning_policy",
@@ -42,6 +49,12 @@ required_tests = {
     "test_missing_or_unknown_action_is_invalid",
     "test_overruns_are_warnings_and_keep_raw_samples",
     "test_unknown_schema_or_hard_enforcement_is_rejected",
+    "test_normal_primary_refuses_unknown_extension_and_rolls_back",
+    "test_explicit_core_worktree_preserves_existing_checkouts",
+    "test_bare_primary_preserves_existing_checkouts",
+    "test_missing_format_write_is_not_accepted",
+    "test_supported_client_is_not_misreported_as_legacy",
+    "test_exhausted_command_budget_dispatches_nothing",
 }
 for filename, allowed_local in sources.items():
     path = benchmark_dir / filename
@@ -60,8 +73,10 @@ for filename, allowed_local in sources.items():
                 raise SystemExit(f"{path}: non-stdlib import is not allowed: {module}")
 
 sys.path.insert(0, str(benchmark_dir))
-suite = unittest.defaultTestLoader.discover(
-    str(benchmark_dir), pattern="test_broker_latency.py", top_level_dir=str(benchmark_dir)
+suite = unittest.TestSuite(
+    unittest.defaultTestLoader.discover(str(benchmark_dir), pattern=pattern,
+                                       top_level_dir=str(benchmark_dir))
+    for pattern in ("test_broker_latency.py", "test_git_worktree_config.py")
 )
 
 def iter_test_cases(test_suite):
@@ -79,29 +94,34 @@ if missing_tests:
 budget_path = benchmark_dir / "broker-budgets.json"
 json.loads(budget_path.read_text(encoding="utf-8"))
 
-# Mirror docs_hygiene::documentation_has_last_updated for the one curated guide
-# in this fast class. Keep a negative control so removing the metadata cannot
-# silently make this lightweight lane weaker than the full suite.
+# Mirror documentation freshness for each curated guide admitted by this lane.
 repo_root = benchmark_dir.parents[3]
-guide = repo_root / "packages" / "aethyme" / "docs" / "guides" / "broker-performance.md"
-guide_text = guide.read_text(encoding="utf-8")
+guides = (
+    repo_root / "packages/aethyme/docs/guides/broker-performance.md",
+    repo_root / "packages/aethyme/docs/architecture/git-worktree-config-assessment.md",
+)
 
 def has_freshness_marker(text):
     return "Last Updated:" in text or "Last Reviewed:" in text
 
-if not has_freshness_marker(guide_text):
-    raise SystemExit(f"{guide}: missing Last Updated: or Last Reviewed:")
+for guide in guides:
+    guide_text = guide.read_text(encoding="utf-8")
+    if not has_freshness_marker(guide_text):
+        raise SystemExit(f"{guide}: missing Last Updated: or Last Reviewed:")
+    without_markers = "\n".join(
+        line for line in guide_text.splitlines()
+        if "Last Updated:" not in line and "Last Reviewed:" not in line
+    )
+    if has_freshness_marker(without_markers):
+        raise SystemExit("documentation freshness negative control unexpectedly passed")
 
-without_markers = "\n".join(
-    line for line in guide_text.splitlines()
-    if "Last Updated:" not in line and "Last Reviewed:" not in line
-)
-if has_freshness_marker(without_markers):
-    raise SystemExit("documentation freshness negative control unexpectedly passed")
 PY
 
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s "$benchmark_dir" -p 'test_broker_latency.py' -v
+
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s "$benchmark_dir" -p 'test_git_worktree_config.py' -v
 
 # Use a versioned upstream tool through Go's module verifier; do not install a
 # mutable action tag or run the benchmark workflow's Cargo commands here.
