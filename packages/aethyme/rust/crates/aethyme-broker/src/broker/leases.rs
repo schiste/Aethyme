@@ -397,11 +397,43 @@ impl Broker {
             .unwrap_or(0)
     }
 
+    /// Explicit read-only diagnostics; never called by routine status or admission.
+    pub(crate) fn resource_pressure_report(
+        &self,
+    ) -> Result<crate::resource_pressure::Report, BrokerOpError> {
+        let sessions = self.store.live_sessions()?;
+        let count = sessions.len();
+        if count > crate::resource_pressure::SESSION_LIMIT {
+            return Ok(crate::resource_pressure::Report::over_budget(count));
+        }
+        let now = now_ms();
+        let mut owners = Vec::new();
+        for view in self.agent_views(sessions, now)? {
+            owners.push(crate::resource_pressure::Owner {
+                session_id: view.session.id,
+                inactive: matches!(
+                    view.derived_status,
+                    SessionStatus::Idle | SessionStatus::Stale | SessionStatus::Exited
+                ),
+                idle_ms: now.saturating_sub(view.activity_at).max(0),
+                holder: crate::session_holder::recorded_holder(&self.store, view.session.id)?,
+            });
+        }
+        Ok(crate::resource_pressure::Report::capture(owners))
+    }
+
     /// Derive current liveness without persisting status transitions. This is
     /// deliberately allowed to inspect PIDs and worktree metadata, but never
     /// changes a session row or appends an event.
     pub fn agents_snapshot(&self, now_ms: i64) -> Result<Vec<AgentView>, BrokerOpError> {
-        let sessions = self.store.live_sessions()?;
+        self.agent_views(self.store.live_sessions()?, now_ms)
+    }
+
+    fn agent_views(
+        &self,
+        sessions: Vec<Session>,
+        now_ms: i64,
+    ) -> Result<Vec<AgentView>, BrokerOpError> {
         let mut views = Vec::with_capacity(sessions.len());
         for session in sessions {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);

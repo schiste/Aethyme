@@ -871,11 +871,21 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-            "resources requires plan, explain, acquire, run, artifact-run, renew, release, list, or reconcile"
+            "resources requires plan, explain, pressure, acquire, run, artifact-run, renew, release, list, or reconcile"
                 .into(),
         )
         })?;
     match action {
+        "pressure" => {
+            if parsed.positional.len() != 1 {
+                return Err(UsageError::Message(
+                    "resources pressure takes no positional arguments".into(),
+                ));
+            }
+            let report = open_broker(true)?.resource_pressure_report()?;
+            // Both modes retain explicit null/omission semantics and scope.
+            out!("{}", serde_json::to_string_pretty(&report)?);
+        }
         "plan" | "explain" | "acquire" => {
             let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
                 UsageError::Message(format!("resources {action} requires <request.json>"))
@@ -1238,7 +1248,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown resources action {other:?}; expected plan, explain, acquire, run, artifact-run, renew, release, list, reap, or reconcile"
+                "unknown resources action {other:?}; expected plan, explain, pressure, acquire, run, artifact-run, renew, release, list, reap, or reconcile"
             )));
         }
     }
@@ -1252,6 +1262,14 @@ mod tests {
     use crate::{
         ConsoleCheckoutStatus, ConsoleHealth, ConsoleStaleReason, HostLeaseState, HostResourceLease,
     };
+
+    #[test]
+    fn pressure_action_resolves_through_the_public_advanced_surface() {
+        let args = ["advanced", "resources", "pressure", "--json"].map(str::to_owned);
+        let resolution = crate::cli::surface::resolve(&args);
+        assert!(resolution.refusal.is_none(), "{:?}", resolution.refusal);
+        assert_eq!(resolution.args, ["resources", "pressure", "--json"]);
+    }
 
     const PROVEN: ConsoleHolderIdentity = ConsoleHolderIdentity::Proven;
 

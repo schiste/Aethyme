@@ -289,6 +289,10 @@ Usage:
   aethyme broker resources explain <request.json> [--json]
       Read-only diagnosis joining each blocked resource to its exact lease,
       holder process, liveness, and wait/reconcile guidance.
+  aethyme broker resources pressure [--json]
+      Read-only inactive-agent diagnosis, grouped by recorded holder identity.
+      RSS sums are observational, shared pages may repeat; swap is unmeasured.
+      Unknown evidence stays null. Never signals processes or reaps resources.
   aethyme broker resources acquire <request.json> [--wait <duration>] [--grant-out <path>] [--json]
       Atomically reserve the full bundle. --wait bounds contention retries.
       --grant-out atomically creates a mode-0600 private grant and keeps the
