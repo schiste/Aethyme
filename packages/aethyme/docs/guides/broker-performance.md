@@ -1,6 +1,6 @@
 # Broker latency budgets
 
-Last Updated: 2026-10-22
+Last Updated: 2026-10-25
 
 The machine-readable source is
 [`broker-budgets.json`](../../../aethyme-eval/benchmarks/performance/broker-budgets.json).
@@ -110,3 +110,19 @@ released counts, seeding status and, when enabled,
 method. `commands.json` retains setup and sample receipts, with the release
 grant token redacted. These fields describe synthetic fixture state, not the
 operator's repository or real production load.
+
+## Lightweight checks for standalone Git config controls
+
+The exact performance fast lane also accepts regular non-executable changes to
+`git_worktree_config.py`, its `test_git_worktree_config.py` controls and the
+worktree-config assessment, optionally with mirrored skill Markdown. Its bounded
+Git Playgrounds verify three primary layouts, unknown-extension refusal, exact
+rollback, a rejected modern-as-legacy claim and the command budget. These checks
+run without building or invoking Aethyme; they do not qualify a legacy client,
+change production Git settings or provide native runtime evidence.
+
+The classifier and validator remain outside their own allowlist and are read
+from the trusted PR base. Rust, manifests, locks, shared Git experiment helpers,
+workflow changes outside the existing exact performance entry, deletions, mode
+changes and unlisted paths still select the full suite. This extension must
+itself land through full CI before later experiment-only PRs can use it.
