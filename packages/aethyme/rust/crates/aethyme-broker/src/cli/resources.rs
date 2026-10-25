@@ -645,7 +645,7 @@ fn console_stop_refusal(
     };
     if health.holder_alive == Some(false) {
         return Some(format!(
-            "holder pid {pid} is already gone; reclaim the lease with `aethyme broker advanced resources reap`"
+            "holder pid {pid} is already gone; reclaim the lease with `aethyme broker gc reap`"
         ));
     }
     // An expired lease means nobody renewed it, so the live pid is not
@@ -1320,6 +1320,16 @@ mod tests {
         let lease = lease(HostLeaseState::Active, Some(42));
         let health = health(ConsoleCheckoutStatus::Missing, Some(false));
         let refusal = console_stop_refusal(&lease, &health, true, PROVEN).unwrap();
-        assert!(refusal.contains("resources reap"), "{refusal}");
+        let command = refusal.split('`').nth(1).expect("recovery command");
+        assert_eq!(command, "aethyme broker gc reap");
+        let args = command
+            .strip_prefix("aethyme broker ")
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let resolved = crate::cli::surface::resolve(&args);
+        assert_eq!(resolved.refusal, None);
+        assert_eq!(resolved.args, ["resources", "reap"]);
     }
 }
