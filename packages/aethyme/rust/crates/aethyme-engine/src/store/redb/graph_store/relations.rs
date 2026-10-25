@@ -303,7 +303,13 @@ pub(super) fn relation_specs(relation: GraphRelation) -> Vec<(NeighborDirection,
             ),
             (
                 NeighborDirection::Incoming,
-                vec![EdgeKind::Configures, EdgeKind::EntrypointFor],
+                // ConfigValue references are explicit qualified symbol links,
+                // not a claim that the symbol reads this value at runtime.
+                vec![
+                    EdgeKind::Configures,
+                    EdgeKind::EntrypointFor,
+                    EdgeKind::References,
+                ],
             ),
         ],
         GraphRelation::Imports => vec![(NeighborDirection::Outgoing, vec![EdgeKind::Imports])],
@@ -365,6 +371,14 @@ pub(super) fn relation_items_from<D: ReadableDatabase>(
         let Some(node) = display_from_id_in_txn(&txn, edge.other.as_str())? else {
             continue;
         };
+        if relation == GraphRelation::Configs && edge.kind == EdgeKind::References {
+            let Some(config) = read_table_node::<ConfigNode>(&txn, CONFIGS, &node.id)? else {
+                continue;
+            };
+            if config.value.is_none() {
+                continue;
+            }
+        }
         if let Some(expected) = kind_filter
             && node.kind != expected
         {

@@ -160,9 +160,16 @@ pub fn docs_view(map: &RepositoryMap, target: &str) -> GraphRelationView {
 }
 
 pub fn configs_view(map: &RepositoryMap, target: &str) -> GraphRelationView {
+    let value_ids = map
+        .configs
+        .iter()
+        .filter(|config| config.value.is_some())
+        .map(|config| config.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     relation_view(map, target, "configs", |kind, from, to, seed| {
-        matches!(kind, EdgeKind::Configures | EdgeKind::EntrypointFor)
-            && (from == seed || to == seed)
+        (matches!(kind, EdgeKind::Configures | EdgeKind::EntrypointFor)
+            && (from == seed || to == seed))
+            || (matches!(kind, EdgeKind::References) && to == seed && value_ids.contains(from))
     })
 }
 
@@ -1375,7 +1382,7 @@ fn repo_navigation_seed(map: &RepositoryMap) -> Vec<String> {
             seed.push(function.file_path.to_string());
         }
     }
-    for config in &map.configs {
+    for config in map.configs.iter().filter(|config| config.value.is_none()) {
         if !seed.contains(&config.path) {
             seed.push(config.path.clone());
         }

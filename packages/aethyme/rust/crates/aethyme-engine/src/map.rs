@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::model::area::AreaNode;
 use crate::model::class::ClassNode;
-use crate::model::config::ConfigNode;
+use crate::model::config::{ConfigNode, ConfigValueLocation};
 use crate::model::directory::DirectoryNode;
 use crate::model::doc::DocNode;
 use crate::model::edge::{Edge, EdgeKind};
@@ -570,6 +570,52 @@ impl RepositoryMap {
                 }
             }
         }
+
+        // Actual fragment owner identities survive relocation. Map config
+        // owners by exact indexed path before translating value endpoints.
+        let config_files_by_path = configs
+            .iter()
+            .map(|config| (config.path.as_str(), config.id.clone()))
+            .collect::<HashMap<_, _>>();
+        for fragment in &fragments {
+            for node in fragment.nodes() {
+                if let Node::NonCodeFile(file) = node
+                    && file.path() == fragment.file_path()
+                    && let Some(id) = config_files_by_path.get(file.path())
+                {
+                    model_id_by_schema.insert(file.id().as_str().to_string(), id.clone());
+                }
+            }
+        }
+        let config_files_by_id = configs
+            .iter()
+            .map(|config| (config.id.clone(), config.clone()))
+            .collect::<HashMap<_, _>>();
+        for fragment in &fragments {
+            for node in fragment.nodes() {
+                let Node::ConfigValue(value) = node else {
+                    continue;
+                };
+                let Some(parent) = model_id_by_schema
+                    .get(value.enclosing_non_code_file_id().as_str())
+                    .and_then(|id| config_files_by_id.get(id))
+                else {
+                    continue;
+                };
+                let mut config = parent.clone();
+                config.id = format!("{}#value:{}", parent.id, value.id().hash_suffix());
+                config.value = Some(ConfigValueLocation {
+                    config_path: value.config_path().to_string(),
+                    value_hash: value.value_hash().to_string(),
+                    start_line: value.source_range().start_line(),
+                    end_line: value.source_range().end_line(),
+                });
+                model_id_by_schema.insert(value.id().as_str().to_string(), config.id.clone());
+                configs.push(config);
+            }
+        }
+        configs.sort();
+        configs.dedup();
 
         // Persist structured documentation sections as distinct Doc nodes.
         // Documents edges originate at section ids; keeping only the file
@@ -1257,7 +1303,7 @@ fn compatibility_overlay_edges(docs: &[DocNode], configs: &[ConfigNode]) -> Vec<
             "docs",
         ));
     }
-    for config in configs {
+    for config in configs.iter().filter(|config| config.value.is_none()) {
         edges.push(Edge::new(
             &config.file_id,
             &config.id,
@@ -1767,10 +1813,19 @@ fn build_graph_with_profile(map: &RepositoryMap) -> (NormalizedGraph, GraphBuild
     for config in &map.configs {
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("config_type".to_string(), config.config_type.clone());
+        if let Some(value) = &config.value {
+            metadata.insert("config_path".into(), value.config_path.clone());
+            metadata.insert("value_hash".into(), value.value_hash.clone());
+            metadata.insert("start_line".into(), value.start_line.to_string());
+            metadata.insert("end_line".into(), value.end_line.to_string());
+        }
         nodes.push(GraphNode {
             id: config.id.clone(),
             kind: GraphNodeKind::Config,
-            label: config.config_type.clone(),
+            label: config.value.as_ref().map_or_else(
+                || config.config_type.clone(),
+                |value| value.config_path.clone(),
+            ),
             path: Some(config.path.clone()),
             language: None,
             confidence: 900,
@@ -1895,6 +1950,72 @@ mod tests {
         );
         for doc in docs {
             assert!(store.get_node(&doc.id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn persisted_configuration_values_remain_queryable_after_relocation() {
+        use crate::store::redb::graph_store::GraphStore;
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("indexed-name");
+        let relocated = temp.path().join("materialized-name");
+        fs::create_dir_all(original.join("config")).unwrap();
+        fs::write(original.join("app.py"), "def answer():\n    return 42\n").unwrap();
+        fs::write(
+            original.join("config/runtime.toml"),
+            "[server]\nhandler = \"app.answer\"\nfallback = \"answer\"\n",
+        )
+        .unwrap();
+        fs::write(
+            original.join("config/runtime.json"),
+            r#"{"handler":"app.answer","fallback":"answer"}"#,
+        )
+        .unwrap();
+        RepositoryMap::build_from_fragments(&original).unwrap();
+        fs::rename(&original, &relocated).unwrap();
+        let (map, _) = RepositoryMap::build_from_fragments(&relocated).unwrap();
+        let values = map
+            .configs
+            .iter()
+            .filter(|config| config.value.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 4);
+        assert!(values.iter().all(|config| {
+            let value = config.value.as_ref().unwrap();
+            value.start_line > 0
+                && value.end_line >= value.start_line
+                && value.value_hash.len() == 64
+        }));
+        let answer = map
+            .functions
+            .iter()
+            .find(|function| function.name == "answer")
+            .unwrap();
+        let linked = crate::graph::navigation::configs_view(&map, answer.id.as_str());
+        assert_eq!(
+            linked.items.len(),
+            2,
+            "bare fallback text is not a symbol reference"
+        );
+        let (again, _) = RepositoryMap::build_from_fragments(&relocated).unwrap();
+        assert_eq!(map.configs, again.configs);
+        crate::index_store::materialize_graph_store(&relocated, &map, "fixture").unwrap();
+        let store = GraphStore::open_read_only(&relocated).unwrap();
+        let overview = store.overview_v2(Default::default()).unwrap();
+        assert_eq!(overview.configs.len(), 2);
+        assert!(overview.configs.iter().all(|config| config.value.is_none()));
+        let configs = store.configs_for(answer.id.as_str()).unwrap();
+        assert_eq!(configs.len(), 2);
+        let keys = configs
+            .iter()
+            .map(|config| config.value.as_ref().unwrap().config_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["handler", "server.handler"])
+        );
+        for config in configs {
+            assert!(store.get_node(&config.id).unwrap().is_some());
         }
     }
 

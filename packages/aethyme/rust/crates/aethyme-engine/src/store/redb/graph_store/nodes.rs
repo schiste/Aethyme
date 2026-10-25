@@ -277,7 +277,9 @@ pub(super) fn node_display_from_node(node: StoredNode) -> NodeDisplay {
             id: node.id,
             kind: StoredNodeKind::Config,
             display: node.path.clone(),
-            name: node.config_type,
+            name: node
+                .value
+                .map_or(node.config_type, |value| value.config_path),
             path: Some(node.path),
             language: None,
             area_id: node.area_id,

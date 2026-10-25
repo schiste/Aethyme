@@ -1101,7 +1101,33 @@ fn schema_v11_store_is_rejected_without_relocated_file_endpoint_binding() {
         GraphStore::open(&root),
         Err(GraphStoreError::SchemaMismatch {
             found: 11,
-            expected: 12
+            expected: 13
+        })
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn schema_v12_store_is_rejected_without_configuration_value_endpoints() {
+    let root = tmp_root(function_name!());
+    let _ = GraphStore::open(&root).expect("open current schema");
+    {
+        let db_path = root.join(".aethyme").join(DB_FILE_NAME);
+        let db = Database::create(&db_path).expect("open raw db");
+        let txn = db.begin_write().expect("write txn");
+        {
+            let mut meta = txn.open_table(META).expect("META");
+            meta.insert(META_KEY_SCHEMA_VERSION, &12u32.to_le_bytes()[..])
+                .expect("set prior schema");
+        }
+        txn.commit().expect("commit old version");
+    }
+
+    assert!(matches!(
+        GraphStore::open(&root),
+        Err(GraphStoreError::SchemaMismatch {
+            found: 12,
+            expected: 13
         })
     ));
     let _ = std::fs::remove_dir_all(&root);

@@ -49,7 +49,8 @@ use crate::model::unresolved::UnresolvedNode;
 /// rather than try to migrate.
 // v11 requires section endpoints; old derived stores must be rematerialized.
 // Schema 12 additionally binds actual persisted File endpoints after relocation.
-const SCHEMA_VERSION: u32 = 12;
+// Schema 13 materializes configuration-value endpoints and their typed locations.
+const SCHEMA_VERSION: u32 = 13;
 
 /// Public compatibility identity used by the immutable materialization cache.
 pub const GRAPH_STORE_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
