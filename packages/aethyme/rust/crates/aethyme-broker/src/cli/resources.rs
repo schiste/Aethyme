@@ -871,7 +871,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-            "resources requires plan, explain, acquire, run, renew, release, list, or reconcile"
+            "resources requires plan, explain, acquire, run, artifact-run, renew, release, list, or reconcile"
                 .into(),
         )
         })?;
@@ -1027,16 +1027,36 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 render_host_lease(&grant.lease);
             }
         }
-        "run" => {
-            let path = parsed.positional.get(1).map(PathBuf::from).ok_or_else(|| {
-                UsageError::Message("resources run requires <request.json>".into())
+        "run" | "artifact-run" => {
+            let argument = parsed.positional.get(1).ok_or_else(|| {
+                UsageError::Message(if action == "artifact-run" {
+                    "resources artifact-run requires <path>".into()
+                } else {
+                    "resources run requires <request.json>".into()
+                })
             })?;
             if parsed.exec_command.is_empty() {
-                return Err(UsageError::Message(
-                    "resources run requires -- <command> [args...]".into(),
-                ));
+                return Err(UsageError::Message(format!(
+                    "resources {action} requires -- <command> [args...]"
+                )));
             }
-            let request: crate::HostResourceRequest = read_resource_json(&path)?;
+            let request: crate::HostResourceRequest = if action == "artifact-run" {
+                if parsed.positional.len() != 2 {
+                    return Err(UsageError::Message(
+                        "artifact-run requires exactly one repository-relative artifact path"
+                            .into(),
+                    ));
+                }
+                let session = parsed.session.ok_or_else(|| {
+                    UsageError::Message("artifact-run requires --session <id>".into())
+                })?;
+                let cwd = std::env::current_dir()
+                    .map_err(|error| UsageError::Message(error.to_string()))?;
+                crate::artifact_claim::request(&open_broker(true)?, &cwd, session, argument)
+                    .map_err(|error| UsageError::Message(error.to_string()))?
+            } else {
+                read_resource_json(Path::new(argument))?
+            };
             let wait = parsed
                 .wait
                 .as_deref()
@@ -1218,7 +1238,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown resources action {other:?}; expected plan, explain, acquire, run, renew, release, list, reap, or reconcile"
+                "unknown resources action {other:?}; expected plan, explain, acquire, run, artifact-run, renew, release, list, reap, or reconcile"
             )));
         }
     }
