@@ -43,7 +43,10 @@ adds an operator-only read-only macOS launchd planning surface. Optional
 `--seconds 120..3600` defaults to 300; `--json` emits the versioned
 `aethyme.pr-watch-service-plan/v1` schema. The canonical plan digest binds
 repository/user identity, executable and embedded helper hashes, paths and
-unit content. No installation or activation consumer exists yet. See
+unit content. The explicit macOS `service install` command requires the exact
+recomputed digest via `--confirm` and emits `aethyme.pr-watch-service-install/v1`
+with created paths, no activation and an unobserved scheduler state. It never
+loads a unit or replaces differing files. No activation consumer exists yet. See
 `docs/guides/pr-watch-service.md` for fields, digest construction and limits.
 
 ## Direct-child helper observations (#713)

@@ -87,7 +87,7 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
             )
         })?;
     if action == "service" {
-        return run_service_plan(&parsed);
+        return run_service(&parsed);
     }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
@@ -1070,10 +1070,11 @@ pub(super) fn run_pr(parsed: Parsed) -> Result<(), UsageError> {
 }
 
 // Validate the entire request before opening even a read-only broker snapshot.
-fn run_service_plan(parsed: &Parsed) -> Result<(), UsageError> {
-    if parsed.positional.len() != 3 || parsed.positional[2] != "plan" {
+fn run_service(parsed: &Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 3 || !matches!(parsed.positional[2].as_str(), "plan" | "install")
+    {
         return Err(UsageError::Message(
-            "watch pr service requires plan --broker-bin <absolute-router>".into(),
+            "watch pr service requires plan or install --broker-bin <absolute-router>".into(),
         ));
     }
     let binary = parsed
@@ -1087,6 +1088,30 @@ fn run_service_plan(parsed: &Parsed) -> Result<(), UsageError> {
     if !(120..=3600).contains(&seconds) {
         return Err(UsageError::Message(
             "service interval must be 120..3600 seconds".into(),
+        ));
+    }
+    let installing = parsed.positional[2] == "install";
+    if installing {
+        if parsed.confirm.as_deref().is_none_or(|value| {
+            value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        }) {
+            return Err(UsageError::Message(
+                "service install requires --confirm <exact-plan-digest>".into(),
+            ));
+        }
+        if parsed.read_only_snapshot {
+            return Err(read_only_refusal(
+                parsed,
+                "service installation",
+                "broker advanced watch pr service plan --broker-bin <absolute-router> --json",
+            ));
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(UsageError::Message(
+            "service installation is available on macOS only".into(),
         ));
     }
     #[cfg(unix)]
@@ -1115,6 +1140,31 @@ fn run_service_plan(parsed: &Parsed) -> Result<(), UsageError> {
             seconds,
             uid,
         )?;
+        #[cfg(target_os = "macos")]
+        if installing {
+            let confirmation = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message("service installation confirmation disappeared".into())
+            })?;
+            let created = crate::pr_watch_service_install::install(&plan, confirmation)?;
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": "aethyme.pr-watch-service-install/v1",
+                        "plan_digest": plan.digest, "created_files": created,
+                        "activation_performed": false, "scheduler_state": "not_observed",
+                    }))?
+                );
+            } else {
+                out!(
+                    "Service files installed: {} created; plan {}",
+                    created.len(),
+                    plan.digest
+                );
+                out!("No activation performed; scheduler state not observed.");
+            }
+            return Ok(());
+        }
         if parsed.json {
             out!("{}", serde_json::to_string_pretty(&plan)?);
         } else {
@@ -1123,7 +1173,9 @@ fn run_service_plan(parsed: &Parsed) -> Result<(), UsageError> {
             out!("Unit: {}", plan.unit_path.display());
             out!("Helpers: {}", plan.directory.display());
             out!("Interval: {} seconds", plan.interval_seconds);
-            out!("Plan only: installation, health reporting and activation are not available yet.");
+            out!(
+                "Plan only: use explicit install with this digest to create files. Activation is not available yet."
+            );
         }
         Ok(())
     }
