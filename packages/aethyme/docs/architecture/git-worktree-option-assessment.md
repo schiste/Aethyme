@@ -1,6 +1,6 @@
 # Git options for broker worktrees
 
-Last Updated: 2026-10-24
+Last Updated: 2026-10-25
 
 This assessment covers #901, #902, #904, #906 and #907. It does not
 enable repository settings. The bounded experiment is
@@ -116,14 +116,15 @@ monitor before deleting a fixture; never use broad process matching.
 
 ### reftable (#904): defer migration
 
-A newly initialized reftable fixture was readable by both installed clients,
-and Git verified its recovery bundle. This is only a capability/recovery
-smoke. It does not establish an end-to-end gain, old-client refusal, IDE
-support, recovery coverage, or a safe existing-repository migration.
-The current submit diagnostic instead found repeated Git subprocess work.
-Keep existing files-backend repositories unchanged. A future benchmark
-needs controlled ref counts, lookup/enumeration/fetch/worktree distributions
-and a tested rollback. Do not enable the unrelated experimental bundle.
+The [ref-heavy follow-up](git-ref-backend-assessment.md) now measures 2,000
+agent refs on internal and external APFS with both installed clients. Ref
+enumeration improved against loose refs, while packing files refs largely closed
+the gap; lookup and worktree results were mixed. Exact branch-ref,
+alternate-reader, local-fetch, bundle-to-files restoration and non-concurrent
+conversion round trips passed. These are Git-only observations, not broker,
+minimum-client, IDE or interrupted-migration qualification. Keep existing
+files-backend repositories unchanged and do not enable the experimental bundle.
+The runtime still declares Git 2.38; the two recent clients do not qualify it.
 
 ### worktreeConfig (#906): defer a broker migration
 
