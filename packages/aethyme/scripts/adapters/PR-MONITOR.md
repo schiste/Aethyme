@@ -35,3 +35,38 @@ Run the offline controls with `python3 test_pr_monitor.py` and
 `python3 test_chau7_delivery_adapter.py`. They use synthetic subprocesses and
 mock transports, and require no live Chau7, GitHub, broker, model or credentials.
 The Rust testkit wrapper runs both suites in CI.
+
+## Optional bounded last-pass health
+
+`AETHYME_PR_MONITOR_RECORD_HEALTH=1` enables one `health.json` beside the
+monitor script. It is off by default and intended for a separately installed
+private helper directory, not the shared source checkout. The directory must
+be user-owned with no group/other permissions. Existing health files must be
+private, user-owned regular files with one link and at most 4 KiB; symlinks,
+hard links, directories and oversized files are refused. Publication uses a persistent private writer lock, one fixed private scratch
+file, fsync and atomic replacement through a directory descriptor. Concurrent
+writers refuse without touching the active scratch file. After an interrupted
+write the next pass validates and reuses that same scratch file under the lock;
+repeated failures cannot accumulate temporary names. Storage is bounded to one
+4 KiB health record, one 4 KiB scratch record and one empty persistent lock.
+Repeated successful passes leave only the health record and empty lock. This
+option does not rotate existing manual scheduler logs.
+
+The JSON contract is `aethyme.pr-monitor-health/v1` with these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | Versioned record identity above |
+| `finished_unix_ms` | Wall-clock time when the pass exited; consumers must check staleness and clock skew |
+| `outcome` | `completed` means the pass returned; `stopped` means it did not. Neither proves successful provider polling |
+| `tick` | `completed`, `failed`, or `unknown` for the tick command |
+| `outbox` | Verified `empty`, `pending`, or `unknown` |
+| `delivery` | `not_started` or `attempted`; never a claim of send or acknowledgement |
+| `failure_kind` | Exception class only, or null; no exception messages, provider output or transcripts |
+
+A zero adapter exit can mean Chau7 was unavailable, so health never promotes it
+to delivered. A failed tick remains visible even if the outbox is empty. Health
+write failure is reported without replacing the monitor result. Records do not
+authorize retries, process cleanup, lease release, provider freshness, or
+exactly-once delivery. Service generation binding, freshness interpretation and
+scheduler lifecycle status remain future installer responsibilities for #887.
