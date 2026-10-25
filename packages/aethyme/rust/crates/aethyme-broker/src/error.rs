@@ -29,6 +29,9 @@ pub enum BrokerError {
     )]
     SchemaTooNew { found: i64, supported: i64 },
 
+    #[error("broker database compatibility metadata is missing or invalid: {0}")]
+    InvalidSchemaMetadata(String),
+
     /// A gate child resolved, or was pointed at, broker state the gate
     /// protects. Refused before any connection is opened (#361).
     #[error("gate refused the broker database: {0}")]

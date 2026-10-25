@@ -64,6 +64,12 @@ fn canonical_main_root(repo_root: &Path) -> Result<PathBuf, BrokerError> {
 }
 
 impl BrokerStore {
+    /// A controller may outlive a compatible open and then wait behind an
+    /// upgrade. Re-read compatibility before changing checkout ownership.
+    pub(crate) fn require_live_schema_compatible(&self) -> Result<(), BrokerError> {
+        schema::require_live_schema_compatible(&self.conn)
+    }
+
     /// Open (creating and migrating if needed) the broker database for a
     /// repository root: `<repo>/.aethyme/broker.db`, or wherever
     /// [`crate::BROKER_DB_ENV`] points.

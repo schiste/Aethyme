@@ -217,6 +217,39 @@ pub(crate) fn schema_is_compatible_with(
     Ok(minimum.is_some_and(|minimum| supported >= minimum))
 }
 
+/// Revalidate an already-open controller before a checkout lifecycle mutation.
+/// Read both markers in one SQLite statement, without repair or migration.
+/// A compatible additive future schema remains usable; an unreadable marker
+/// must never silently turn into permission to mutate a checkout.
+pub(crate) fn require_live_schema_compatible(conn: &Connection) -> Result<(), BrokerError> {
+    let (version, minimum): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT (SELECT value FROM meta WHERE key='schema_version'),
+                (SELECT value FROM meta WHERE key='min_compatible_schema')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let parse = |name: &str, value: Option<String>| -> Result<i64, BrokerError> {
+        value
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| BrokerError::InvalidSchemaMetadata(name.into()))
+    };
+    let found = parse("schema_version", version)?;
+    let minimum = parse("min_compatible_schema", minimum)?;
+    if minimum > SCHEMA_VERSION {
+        return Err(BrokerError::SchemaTooNew {
+            found: found.max(minimum),
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if minimum > found || found < SCHEMA_VERSION {
+        return Err(BrokerError::InvalidSchemaMetadata(
+            "lifecycle controller observed a rewound or inconsistent schema".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Version stamped on every event row written by this binary.
 pub const EVENTS_SCHEMA_VERSION: i64 = 1;
 
@@ -2197,6 +2230,59 @@ pub(crate) fn record_min_compatible_schema_floor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_compatibility_recheck_accepts_additive_schema_without_mutating_it() {
+        let conn = migrated();
+        require_live_schema_compatible(&conn).unwrap();
+        let future = SCHEMA_VERSION + 1;
+        conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='schema_version'",
+            [future.to_string()],
+        )
+        .unwrap();
+        require_live_schema_compatible(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), future);
+        record_min_compatible_schema_floor(&conn, future).unwrap();
+        assert!(
+            matches!(require_live_schema_compatible(&conn), Err(BrokerError::SchemaTooNew { found, supported })
+            if found == future && supported == SCHEMA_VERSION)
+        );
+        assert_eq!(current_version(&conn).unwrap(), future);
+    }
+
+    #[test]
+    fn live_compatibility_recheck_refuses_missing_invalid_and_rewound_metadata() {
+        for key in ["schema_version", "min_compatible_schema"] {
+            for value in [None, Some("invalid"), Some("0"), Some("-1")] {
+                let conn = migrated();
+                if let Some(value) = value {
+                    conn.execute("UPDATE meta SET value=?2 WHERE key=?1", [key, value])
+                        .unwrap();
+                } else {
+                    conn.execute("DELETE FROM meta WHERE key=?1", [key])
+                        .unwrap();
+                }
+                assert!(
+                    matches!(
+                        require_live_schema_compatible(&conn),
+                        Err(BrokerError::InvalidSchemaMetadata(_))
+                    ),
+                    "{key} {value:?}"
+                );
+            }
+        }
+        let conn = migrated();
+        conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='schema_version'",
+            [(SCHEMA_VERSION - 1).to_string()],
+        )
+        .unwrap();
+        assert!(matches!(
+            require_live_schema_compatible(&conn),
+            Err(BrokerError::InvalidSchemaMetadata(_))
+        ));
+    }
 
     fn migrated() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
