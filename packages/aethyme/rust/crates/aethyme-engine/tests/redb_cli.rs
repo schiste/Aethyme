@@ -2073,10 +2073,16 @@ fn redb_activation_expands_tiny_relation_fixture() {
     ]);
     let impact_items = impact.as_array().expect("impact array");
     assert!(
-        impact_items.iter().any(|item| item
+        impact_items
+            .iter()
+            .any(|item| item.as_str() == Some("src/web/handler.py")),
+        "the typed import source should render its exact file path: {impact_items:?}"
+    );
+    assert!(
+        !impact_items.iter().any(|item| item
             .as_str()
             .is_some_and(|value| value.starts_with("file:"))),
-        "import-adjacent impact should include at least one file frontier item"
+        "resolved File endpoints must not fall back to raw schema ids: {impact_items:?}"
     );
 }
 

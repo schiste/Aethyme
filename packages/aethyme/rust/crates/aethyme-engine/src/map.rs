@@ -553,6 +553,53 @@ impl RepositoryMap {
             docs.push(doc);
         }
 
+        // Fragment repository names survive relocation, whereas overlay model
+        // ids use the current checkout name. Join actual non-code owner ids
+        // through their exact indexed path before mapping section endpoints.
+        let doc_files_by_path = docs
+            .iter()
+            .map(|doc| (doc.path.as_str(), doc.id.clone()))
+            .collect::<HashMap<_, _>>();
+        for fragment in &fragments {
+            for node in fragment.nodes() {
+                if let Node::NonCodeFile(file) = node
+                    && file.path() == fragment.file_path()
+                    && let Some(id) = doc_files_by_path.get(file.path())
+                {
+                    model_id_by_schema.insert(file.id().as_str().to_string(), id.clone());
+                }
+            }
+        }
+
+        // Persist structured documentation sections as distinct Doc nodes.
+        // Documents edges originate at section ids; keeping only the file
+        // overlay leaves their endpoints unreadable after materialization.
+        let doc_files_by_id = docs
+            .iter()
+            .map(|doc| (doc.id.clone(), doc.clone()))
+            .collect::<HashMap<_, _>>();
+        for fragment in &fragments {
+            for node in fragment.nodes() {
+                let Node::DocSection(section) = node else {
+                    continue;
+                };
+                let Some(parent) = model_id_by_schema
+                    .get(section.enclosing_non_code_file_id().as_str())
+                    .and_then(|id| doc_files_by_id.get(id))
+                else {
+                    continue;
+                };
+                let mut doc = parent.clone();
+                doc.id = format!("{}#section:{}", parent.id, section.id().hash_suffix());
+                doc.title = section.heading().to_string();
+                doc.doc_type = "section".into();
+                model_id_by_schema.insert(section.id().as_str().to_string(), doc.id.clone());
+                docs.push(doc);
+            }
+        }
+        docs.sort();
+        docs.dedup();
+
         let risks_overlay = RisksProducer.produce(&ctx).map_err(|e| e.to_string())?;
         let risk_flags: Vec<RiskFlag> = risks_overlay
             .payload()
@@ -1789,6 +1836,66 @@ mod tests {
             schema_edge_kind_to_model(SchemaEdgeKind::Mocks),
             EdgeKind::References
         );
+    }
+
+    #[test]
+    fn persisted_document_sections_remain_queryable_after_materialization() {
+        use crate::store::redb::graph_store::GraphStore;
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original-name");
+        let relocated = temp.path().join("materialization-checkout");
+        fs::create_dir(&original).unwrap();
+        let root = original.as_path();
+        fs::write(root.join("app.py"), "def answer():\n    return 42\n").unwrap();
+        fs::write(root.join("README.md"),
+            "# API\n\nUse `answer()`; [code](app.py#answer).\n\n# API\n\nAlso use `answer()`.\n\n# Narrative\n\nThe word answer alone is not a reference.\n").unwrap();
+        // The real refresh/materialize path uses a differently named disposable
+        // checkout. Existing fragments must keep working without source reindex.
+        RepositoryMap::build_from_fragments(root).unwrap();
+        fs::rename(&original, &relocated).unwrap();
+        let root = relocated.as_path();
+        let (map, _) = RepositoryMap::build_from_fragments(root).unwrap();
+        let sections = map
+            .docs
+            .iter()
+            .filter(|doc| doc.doc_type == "section")
+            .collect::<Vec<_>>();
+        assert_eq!(sections.len(), 3);
+        assert!(sections.iter().all(|doc| doc.path == "README.md"));
+        let ids = sections
+            .iter()
+            .map(|doc| doc.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids.len(),
+            3,
+            "same-heading sections keep distinct stable ids"
+        );
+        let target = map
+            .functions
+            .iter()
+            .find(|function| function.name == "answer")
+            .unwrap();
+        let links = map
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Documents && edge.to == target.id)
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|edge| ids.contains(edge.from.as_str())));
+        let (again, _) = RepositoryMap::build_from_fragments(root).unwrap();
+        assert_eq!(map.docs, again.docs);
+        crate::index_store::materialize_graph_store(root, &map, "fixture").unwrap();
+        let store = GraphStore::open_read_only(root).unwrap();
+        let docs = store.docs_for(target.id.as_str()).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(
+            docs.iter()
+                .all(|doc| doc.path == "README.md" && doc.title == "API")
+        );
+        for doc in docs {
+            assert!(store.get_node(&doc.id).unwrap().is_some());
+        }
     }
 
     #[test]

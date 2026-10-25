@@ -47,8 +47,8 @@ use crate::model::unresolved::UnresolvedNode;
 
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
-// Schema 11 is reserved for the documentation-section projection. Schema 12
-// additionally binds actual persisted File endpoints after checkout relocation.
+// v11 requires section endpoints; old derived stores must be rematerialized.
+// Schema 12 additionally binds actual persisted File endpoints after relocation.
 const SCHEMA_VERSION: u32 = 12;
 
 /// Public compatibility identity used by the immutable materialization cache.
